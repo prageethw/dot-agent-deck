@@ -3478,6 +3478,30 @@ impl AgentPtyRegistry {
             .retain(|_, holder| holder != pane_id);
     }
 
+    /// Fork issue #201 redesign: rebind whatever orchestration-name claim
+    /// `token` currently holds onto `pane_id` — the pre-provisioning claim
+    /// is keyed by a caller-minted token (no real pane id exists that
+    /// early), and this is called once the spawn genuinely succeeds and a
+    /// real pane id is known, so `StopAgent`'s existing by-pane-id
+    /// `release_orchestration_name` can free it on close.
+    ///
+    /// Returns `true` and rebinds the claim's holder from `token` to
+    /// `pane_id` when `token` holds a claim. Returns `false` and leaves
+    /// every claim untouched — exact-match, not "steal whatever's
+    /// there" — when `token` holds nothing, including when a different
+    /// token or pane id already holds the name.
+    pub fn confirm_orchestration_claim(&self, token: &str, pane_id: &str) -> bool {
+        let mut claims = self.orchestration_name_claims.lock().unwrap();
+        match claims.iter().find(|(_, holder)| holder.as_str() == token) {
+            Some((name, _)) => {
+                let name = name.clone();
+                claims.insert(name, pane_id.to_string());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Issue #424: install the daemon's sink for [`DeliveryNotice`]s. Called
     /// once from [`crate::daemon::run_daemon_with`]; a registry without one
     /// (every in-process unit test) simply drops notices.

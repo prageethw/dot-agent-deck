@@ -320,19 +320,29 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// *unit variant* on an externally-tagged enum carrying `#[serde(other)]`
 /// is a different shape and belongs on that list too (see the module doc).
 ///
-/// Issue #201 bumped 9 → 10: two new [`AttachRequest`] variants,
-/// [`AttachRequest::ClaimOrchestrationName`] and
+/// Issue #201 bumped 9 → 10: three new [`AttachRequest`] variants,
+/// [`AttachRequest::ClaimOrchestrationName`],
+/// [`AttachRequest::ConfirmOrchestrationClaim`], and
 /// [`AttachRequest::ReleaseOrchestrationName`] — squarely the module doc's
 /// first bullet ("new `AttachRequest` variants"), not the additive-field
-/// exception. An older daemon receiving either op fails to deserialize the
-/// externally-tagged `AttachRequest` at all (there is no `#[serde(other)]`
-/// catch-all on this enum, unlike `KeptReason` above) and returns a
-/// "malformed request" error rather than silently ignoring the call — a
-/// mixed pairing would make the New-Pane form's authoritative daemon-side
-/// exclusivity check fail closed to "daemon rejected the request" rather
-/// than silently behaving as though no claim exists, which is the
-/// intentionally loud failure mode for a same-wire safety check. See
-/// `changelog.d/201.breaking.md`.
+/// exception. `ConfirmOrchestrationClaim` was added, and the `pane_id`
+/// field on the other two renamed to `token`, in the claim-before-
+/// provisioning redesign that landed within this same unreleased bump (a
+/// caller-minted token now claims a name before any pane exists, then
+/// confirms/rebinds onto the real pane id once provisioning succeeds) — the
+/// field rename is still bump-worthy the same way a new variant is: these
+/// are struct-variants with no `#[serde(other)]` catch-all or
+/// `#[serde(default)]` on the field, so an old daemon (or a client sending
+/// the old `pane_id` key) fails to deserialize the request at all rather
+/// than silently misreading the field. An older daemon receiving any of
+/// these ops fails to deserialize the externally-tagged `AttachRequest` at
+/// all (there is no `#[serde(other)]` catch-all on this enum, unlike
+/// `KeptReason` above) and returns a "malformed request" error rather than
+/// silently ignoring the call — a mixed pairing would make the New-Pane
+/// form's authoritative daemon-side exclusivity check fail closed to
+/// "daemon rejected the request" rather than silently behaving as though no
+/// claim exists, which is the intentionally loud failure mode for a
+/// same-wire safety check. See `changelog.d/201.breaking.md`.
 pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
@@ -582,36 +592,48 @@ pub enum AttachRequest {
     RunNow {
         name: String,
     },
-    /// Issue #201 option (b): atomically claim an orchestrator pane's own
+    /// Fork issue #201 redesign: atomically claim an orchestrator's own
     /// name/title, checked against every other LIVE claim rather than a
     /// point-in-time `ListAgents` snapshot. Replies `ok = true` when `name`
-    /// was free (or already held by this exact `pane_id` — idempotent
-    /// re-claim) and `ok = false` when a *different* pane already holds it.
+    /// was free (or already held by this exact `token` — idempotent
+    /// re-claim) and `ok = false` when a *different* token already holds it.
     ///
-    /// `pane_id` is the real, daemon-minted `pane_id_env` of the START role
-    /// pane the caller is committing to. The New-Pane spawn path
-    /// (`Action::SpawnPane` in `src/ui.rs`) cannot know that id before the
-    /// role panes actually exist — `StartAgent` is what mints `pane_id`
-    /// (PRD #365 M2) — so the claim is sent right after
-    /// `TabManager::open_orchestration_tab` returns the real ids and BEFORE
-    /// the tab is treated as live; a refusal rolls back every just-spawned
-    /// role pane the same way a mid-spawn failure already does, so a lost
-    /// race never leaves a half-open orchestration behind.
+    /// `token` is a caller-minted opaque string, sent BEFORE any
+    /// worktree/pane provisioning happens and before any real pane id
+    /// exists — `Action::SpawnPane` (`src/ui.rs`) sends this as the very
+    /// first request of a New-Pane spawn, ahead of worktree/clone
+    /// provisioning and `open_orchestration_tab`, so a lost race never
+    /// leaves worktree or pane work half-done. Once the spawn genuinely
+    /// succeeds and a real pane id is known, [`AttachRequest::ConfirmOrchestrationClaim`]
+    /// rebinds this token's claim onto it.
     ClaimOrchestrationName {
         name: String,
+        token: String,
+    },
+    /// Fork issue #201 redesign: rebind the orchestration-name claim
+    /// currently held by `token` onto `pane_id`, once `Action::SpawnPane`'s
+    /// provisioning has genuinely succeeded and a real, daemon-minted pane
+    /// id is known. Replies `ok = true` on a successful rebind, `ok = false`
+    /// if `token` holds no claim (including a `pane_id` this daemon never
+    /// minted — see below) — in which case no claim is disturbed.
+    ///
+    /// The daemon validates `pane_id` against its own live `agent_records()`
+    /// before accepting the rebind (reviewer P2-6 / auditor A3): a claim
+    /// rebound onto a fabricated pane id could never be released by
+    /// `StopAgent`, and would squat the name for the daemon's whole
+    /// lifetime.
+    ConfirmOrchestrationClaim {
+        token: String,
         pane_id: String,
     },
-    /// Issue #201 option (b): release whatever orchestration-name claim (if
-    /// any) `pane_id` holds. A no-op (`ok = true`) if it holds none.
-    ///
-    /// Primarily used server-side (`StopAgent`'s handler releases the
-    /// closing pane's claim automatically) — exposed on the wire too so the
-    /// `Action::SpawnPane` rollback path above can release a claim it just
-    /// took for a role-pane spawn that failed AFTER the claim succeeded,
-    /// without waiting for a `StopAgent` that will never come for a pane
-    /// that was never fully registered.
+    /// Fork issue #201 redesign: release whatever orchestration-name claim
+    /// (if any) `token` holds. A no-op (`ok = true`) if it holds none.
+    /// `token` is a plain opaque holder key — either a pre-spawn token (the
+    /// `Action::SpawnPane` rollback-after-provisioning-failure case) or a
+    /// real pane id (`StopAgent`'s automatic release of a confirmed claim),
+    /// treated identically either way.
     ReleaseOrchestrationName {
-        pane_id: String,
+        token: String,
     },
 }
 
@@ -2216,12 +2238,21 @@ async fn handle_connection(
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
         }
-        AttachRequest::ClaimOrchestrationName { name, pane_id } => {
-            // Issue #201 option (b): the authoritative, race-free check —
-            // see the variant's own doc comment for why `pane_id` is the
-            // caller-supplied real pane id rather than something inferred
-            // from this (stateless, one-shot) connection.
-            if registry.claim_orchestration_name(&name, &pane_id) {
+        AttachRequest::ClaimOrchestrationName { name, token } => {
+            // Fork issue #201 redesign: the authoritative, race-free check
+            // — see the variant's own doc comment for why `token` is a
+            // caller-minted opaque string rather than a real pane id (none
+            // exists yet this early). Reject a name that wouldn't pass the
+            // same display-name discipline every other client-supplied
+            // name gets at this boundary (`validate_tab_membership`),
+            // rather than letting an invalid name squat a claim slot.
+            if !crate::agent_pty::is_valid_display_name(&name) {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!("orchestration name {name:?} is not valid")),
+                )
+                .await?;
+            } else if registry.claim_orchestration_name(&name, &token) {
                 write_resp(&mut stream, &AttachResponse::ok()).await?;
             } else {
                 write_resp(
@@ -2231,8 +2262,34 @@ async fn handle_connection(
                 .await?;
             }
         }
-        AttachRequest::ReleaseOrchestrationName { pane_id } => {
-            registry.release_orchestration_name(&pane_id);
+        AttachRequest::ConfirmOrchestrationClaim { token, pane_id } => {
+            // Fork issue #201 redesign (reviewer P2-6 / auditor A3): never
+            // trust a client-supplied `pane_id` at confirm/rebind time —
+            // validate it against the daemon's own live `agent_records()`
+            // first, so a claim can never be rebound onto a pane id nothing
+            // minted (which `StopAgent` could then never release).
+            let pane_id_is_real = registry
+                .agent_records()
+                .iter()
+                .any(|record| record.pane_id_env.as_deref() == Some(pane_id.as_str()));
+            if !pane_id_is_real {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!("pane id {pane_id:?} is not a live pane")),
+                )
+                .await?;
+            } else if registry.confirm_orchestration_claim(&token, &pane_id) {
+                write_resp(&mut stream, &AttachResponse::ok()).await?;
+            } else {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!("token {token:?} holds no orchestration claim")),
+                )
+                .await?;
+            }
+        }
+        AttachRequest::ReleaseOrchestrationName { token } => {
+            registry.release_orchestration_name(&token);
             write_resp(&mut stream, &AttachResponse::ok()).await?;
         }
     }

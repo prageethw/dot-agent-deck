@@ -882,6 +882,46 @@ fn read_resp_frame_blocking<R: std::io::Read>(
     serde_json::from_slice(&body).map_err(std::io::Error::other)
 }
 
+/// Per-process nonce (hashed from the pid + epoch nanos at first use, same
+/// scheme as `spawn.rs`'s `PANE_NONCE`/`PANE_SEQ`) plus sequence counter for
+/// [`mint_orchestration_claim_token`] — separate statics from `spawn.rs`'s
+/// own pane-id pair since a claim token and a pane id are minted from
+/// unrelated call sites and must never collide with each other's sequence.
+static ORCHESTRATION_CLAIM_TOKEN_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static ORCHESTRATION_CLAIM_TOKEN_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Fork issue #201 redesign: a fresh, unique opaque token for the pre-spawn
+/// `ClaimOrchestrationName` request `Action::SpawnPane` sends before any
+/// real pane id exists. Reuses `agent_pty::mint_nonce_seq`'s
+/// restart-resistant nonce+sequence scheme (the same one `spawn.rs`'s
+/// `next_pane_id` uses for pane ids) so two concurrent spawns — even across
+/// a daemon restart — never mint the same token.
+fn mint_orchestration_claim_token() -> String {
+    let (nonce, seq) = crate::agent_pty::mint_nonce_seq(
+        &ORCHESTRATION_CLAIM_TOKEN_NONCE,
+        &ORCHESTRATION_CLAIM_TOKEN_SEQ,
+    );
+    format!("claim-{nonce:016x}-{seq}")
+}
+
+/// Fork issue #201 redesign: release a pre-spawn token's orchestration-name
+/// claim after a provisioning failure that happened AFTER the claim already
+/// succeeded — `Action::SpawnPane`'s rollback path for every worktree/clone
+/// provisioning failure and for `open_orchestration_tab` itself failing.
+/// Best-effort and fire-and-forget: the claim isn't a resource the process
+/// has to closed cleanly, and a failed release here surfaces to the user no
+/// more usefully than a status line already covering the provisioning
+/// failure itself would.
+fn release_orchestration_claim_token(token: &str) {
+    let _ = send_daemon_request_blocking_with_timeout(
+        &crate::daemon_protocol::AttachRequest::ReleaseOrchestrationName {
+            token: token.to_string(),
+        },
+        DAEMON_REQUEST_TIMEOUT,
+    );
+}
+
 /// Names of schedules that currently have a live (non-exited) tab/agent —
 /// derived from the daemon's `ListAgents`. One-shot socket query at dialog-open
 /// time; a down daemon degrades to "no live tasks" (all idle).
@@ -10648,6 +10688,63 @@ fn dispatch_action(
                         ));
                         return Flow::Continue;
                     }
+                    // Fork issue #201 redesign (reviewer P1-1/P1-2, auditor
+                    // A1): claim the orchestration's name BEFORE any
+                    // worktree/clone provisioning happens and before any role
+                    // pane is spawned — a lost race here leaves NOTHING
+                    // behind to roll back, unlike the old post-spawn claim
+                    // (which had already provisioned a worktree and spawned
+                    // every role pane by the time it could be refused). No
+                    // real pane id exists this early, so the claim is keyed
+                    // by a caller-minted TOKEN instead; `open_orchestration_tab`
+                    // below rebinds it onto the real START-role pane id once
+                    // provisioning genuinely succeeds (see
+                    // `ConfirmOrchestrationClaim` further down). The claimed
+                    // name mirrors `open_orchestration_tab`'s own
+                    // `resolved_name` fallback (the form name when typed,
+                    // else the canonical config name, else the cwd
+                    // basename) so it matches the title the tab actually
+                    // ends up with in the common case — the one narrow edge
+                    // case this can't perfectly predict (both names empty
+                    // AND live-sibling auto-isolation later picks a
+                    // differently-named worktree) is accepted, since no
+                    // worktree decision has run yet.
+                    let orchestration_claim_name = if !req.name.is_empty() {
+                        req.name.clone()
+                    } else {
+                        crate::project_config::resolve_orchestration_name(
+                            &orch_config.name,
+                            &req.dir,
+                        )
+                    };
+                    let orchestration_claim_token = mint_orchestration_claim_token();
+                    let claim_result = send_daemon_request_blocking_with_timeout(
+                        &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
+                            name: orchestration_claim_name.clone(),
+                            token: orchestration_claim_token.clone(),
+                        },
+                        DAEMON_REQUEST_TIMEOUT,
+                    );
+                    let claimed = matches!(claim_result, Ok(ref resp) if resp.ok);
+                    if !claimed {
+                        // Nothing was created yet, so there is no half-open
+                        // state to roll back and no claim to release.
+                        let reason = match claim_result {
+                            Ok(resp) => resp.error.unwrap_or_else(|| {
+                                format!(
+                                    "orchestration name {orchestration_claim_name:?} is already held"
+                                )
+                            }),
+                            Err(e) => format!(
+                                "could not verify orchestration name availability: {e}"
+                            ),
+                        };
+                        ui.status_message = Some((
+                            format!("Orchestration failed: {reason}"),
+                            std::time::Instant::now(),
+                        ));
+                        return Flow::Continue;
+                    }
                     // Fork #122: when the form resolved a worktree path,
                     // create it now — before any tab/pane state exists — so a
                     // failure never leaves a half-open orchestration behind.
@@ -10755,6 +10852,7 @@ fn dispatch_action(
                                 SiblingScope::AnySharedCommonDir,
                             ) {
                                 Err(reason) => {
+                                    release_orchestration_claim_token(&orchestration_claim_token);
                                     ui.status_message = Some((
                                         live_sibling_check_failed_message(&req.dir, &reason),
                                         std::time::Instant::now(),
@@ -10779,6 +10877,9 @@ fn dispatch_action(
                                     Ok(
                                         crate::issue_dispatch_run::WorktreeCreation::AlreadyClaimed,
                                     ) => {
+                                        release_orchestration_claim_token(
+                                            &orchestration_claim_token,
+                                        );
                                         ui.status_message = Some((
                                             format!(
                                                 "Orchestration failed: worktree already exists at {}",
@@ -10823,6 +10924,9 @@ fn dispatch_action(
                                                 worktree_path.display()
                                             )
                                         };
+                                        release_orchestration_claim_token(
+                                            &orchestration_claim_token,
+                                        );
                                         ui.status_message = Some((
                                             format!(
                                                 "Orchestration failed: worktree add timed out at {} — {detail}",
@@ -10841,6 +10945,9 @@ fn dispatch_action(
                                     Ok(
                                         crate::issue_dispatch_run::WorktreeCreation::BranchExists,
                                     ) => {
+                                        release_orchestration_claim_token(
+                                            &orchestration_claim_token,
+                                        );
                                         ui.status_message = Some((
                                             format!(
                                                 "Orchestration failed: branch already exists for {}",
@@ -10851,6 +10958,9 @@ fn dispatch_action(
                                         return Flow::Continue;
                                     }
                                     Err(e) => {
+                                        release_orchestration_claim_token(
+                                            &orchestration_claim_token,
+                                        );
                                         ui.status_message = Some((
                                             format!("Orchestration failed: {e}"),
                                             std::time::Instant::now(),
@@ -10877,6 +10987,9 @@ fn dispatch_action(
                                         resolved_dir_str
                                     }
                                     Err(message) => {
+                                        release_orchestration_claim_token(
+                                            &orchestration_claim_token,
+                                        );
                                         ui.status_message =
                                             Some((message, std::time::Instant::now()));
                                         return Flow::Continue;
@@ -10905,6 +11018,7 @@ fn dispatch_action(
                             SiblingScope::ExactCwdOnly,
                         ) {
                             Err(reason) => {
+                                release_orchestration_claim_token(&orchestration_claim_token);
                                 ui.status_message = Some((
                                     live_sibling_check_failed_message(&req.dir, &reason),
                                     std::time::Instant::now(),
@@ -10917,6 +11031,9 @@ fn dispatch_action(
                                     match resolve_orchestration_worktree_path(&req.dir, &slug) {
                                         Ok(path) => path,
                                         Err(reason) => {
+                                            release_orchestration_claim_token(
+                                                &orchestration_claim_token,
+                                            );
                                             ui.status_message = Some((
                                                 format!("Orchestration failed: {reason}"),
                                                 std::time::Instant::now(),
@@ -10938,6 +11055,9 @@ fn dispatch_action(
                                         resolved_dir_str
                                     }
                                     Err(message) => {
+                                        release_orchestration_claim_token(
+                                            &orchestration_claim_token,
+                                        );
                                         ui.status_message =
                                             Some((message, std::time::Instant::now()));
                                         return Flow::Continue;
@@ -10959,24 +11079,15 @@ fn dispatch_action(
                     // name to the tab TITLE only, via `display_title`; the
                     // identity stays the canonical `orch_config.name`.
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
-                    // Issue #201 option (b): the START role's index and the
-                    // exact title this tab will carry — computed here,
-                    // ahead of the spawn, so both the post-spawn claim call
-                    // below and the delivery-identity capture further down
-                    // (`start_idx`, moved up from its old home there) read
-                    // ONE value rather than two independent derivations
-                    // that could drift apart. Mirrors `open_orchestration_tab`'s
-                    // own `resolved_name` fallback exactly (`display_title`
-                    // when non-empty, else `resolve_orchestration_name`),
-                    // since the claimed name must be the literal title the
-                    // tab ends up with.
+                    // Fork issue #201 redesign: the START role's index —
+                    // still needed here for the delivery-identity capture
+                    // further down and for the post-spawn
+                    // `ConfirmOrchestrationClaim` rebind, but the claimed
+                    // NAME itself was already resolved and claimed (by
+                    // token) before any of this provisioning ran — see
+                    // `orchestration_claim_name`/`orchestration_claim_token`
+                    // above.
                     let start_idx = orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
-                    let orchestration_claim_name = display_title.clone().unwrap_or_else(|| {
-                        crate::project_config::resolve_orchestration_name(
-                            &orch_config.name,
-                            std::path::Path::new(&dir_str),
-                        )
-                    });
                     // `None`: the interactive path carries no caller task — the user
                     // types their instructions after the orchestrator acknowledges.
                     // Output is byte-for-byte the pre-#222 text.
@@ -11020,57 +11131,32 @@ fn dispatch_action(
                         spawn_dims,
                     ) {
                         Ok((_tab_idx, role_pane_ids)) => {
-                            // Issue #201 option (b): the AUTHORITATIVE
-                            // exclusivity check — `form.name_collision()`
-                            // (the submit door this replaces as the source
-                            // of truth for) only ever compared against a
-                            // `live_orchestration_names` snapshot captured
-                            // ONCE at form-open, so two New-Pane forms
-                            // opened close together both read the same
-                            // stale list and neither submit was refused.
-                            // This is checked here, right after the role
-                            // panes actually exist, because the daemon
-                            // mints each pane's real `pane_id` at
-                            // `StartAgent` time (PRD #365 M2) — there is no
-                            // real id to claim with any earlier than this.
-                            // Fail CLOSED on any transport problem, mirroring
-                            // `root_checkout_has_live_sibling`'s policy for
-                            // this same class of daemon-side correctness
-                            // gate: an unreachable daemon here would silently
-                            // let fork issue #201's race back in.
-                            let claim_result = send_daemon_request_blocking_with_timeout(
-                                &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
-                                    name: orchestration_claim_name.clone(),
+                            // Fork issue #201 redesign: the exclusivity
+                            // decision already happened, before any of this
+                            // provisioning ran — see the pre-spawn
+                            // `ClaimOrchestrationName` (by token) above. Now
+                            // that role panes genuinely exist and the real,
+                            // daemon-minted START-role pane id is known,
+                            // rebind the token's claim onto it so
+                            // `StopAgent`'s existing by-pane-id
+                            // `ReleaseOrchestrationName` frees it on close —
+                            // without this rebind a closed orchestration's
+                            // name would stay stuck held by a token nothing
+                            // ever releases. Fire-and-forget: the spawn
+                            // already succeeded, so a confirm failure (e.g.
+                            // the daemon somehow not knowing about the pane
+                            // it just minted) is not a reason to tear down a
+                            // working orchestration — it would only leave
+                            // the name claimed under the token instead of
+                            // the pane id, a narrow bookkeeping gap rather
+                            // than a correctness one.
+                            let _ = send_daemon_request_blocking_with_timeout(
+                                &crate::daemon_protocol::AttachRequest::ConfirmOrchestrationClaim {
+                                    token: orchestration_claim_token.clone(),
                                     pane_id: role_pane_ids[start_idx].clone(),
                                 },
                                 DAEMON_REQUEST_TIMEOUT,
                             );
-                            let claimed = matches!(claim_result, Ok(ref resp) if resp.ok);
-                            if !claimed {
-                                // Never leave a half-open orchestration
-                                // behind: close every role pane this call
-                                // just created, the same rollback
-                                // `open_orchestration_tab`'s own per-role
-                                // spawn-failure path already performs.
-                                for id in &role_pane_ids {
-                                    let _ = pane.close_pane(id);
-                                }
-                                let reason = match claim_result {
-                                    Ok(resp) => resp.error.unwrap_or_else(|| {
-                                        format!(
-                                            "orchestration name {orchestration_claim_name:?} is already held"
-                                        )
-                                    }),
-                                    Err(e) => format!(
-                                        "could not verify orchestration name availability: {e}"
-                                    ),
-                                };
-                                ui.status_message = Some((
-                                    format!("Orchestration failed: {reason}"),
-                                    std::time::Instant::now(),
-                                ));
-                                return Flow::Continue;
-                            }
                             // PRD #110 followup: snapshot each role
                             // pane's daemon agent_id before the
                             // placeholder insert so the strict-
@@ -11268,6 +11354,16 @@ fn dispatch_action(
                             ));
                         }
                         Err(e) => {
+                            // Fork issue #201 redesign: `open_orchestration_tab`
+                            // failing means every role pane it managed to
+                            // spawn before hitting the failure was already
+                            // rolled back by its own per-role rollback
+                            // (untouched by this change) — but the pre-spawn
+                            // token claim above was never confirmed onto a
+                            // real pane id, so it must be released here or
+                            // it would squat the name until some pane that
+                            // never fully existed times out.
+                            release_orchestration_claim_token(&orchestration_claim_token);
                             ui.status_message = Some((
                                 format!("Orchestration failed: {e}"),
                                 std::time::Instant::now(),
@@ -13447,6 +13543,66 @@ pub fn run_tui(
                                         &role_pane_ids[saved_start_idx],
                                         pane.as_ref(),
                                     );
+                                }
+                                // Fork issue #201 redesign (gap #1): the
+                                // restore path spawns real role panes the
+                                // same way the live New-Pane path does, so
+                                // it must claim the orchestration's name too
+                                // — a restored session silently squatting a
+                                // name (or colliding with one already
+                                // claimed elsewhere) is the same identity
+                                // hole the live path's claim exists to
+                                // close. Unlike the live path, the title AND
+                                // the real, daemon-minted pane id are both
+                                // already known here — `open_orchestration_tab`
+                                // already returned successfully — so there is
+                                // no pre-provisioning window to protect the
+                                // way the live path's token needs to; claim
+                                // and confirm/rebind back to back instead. A
+                                // refusal is logged as a warning rather than
+                                // tearing the just-restored tab back down:
+                                // unlike the live path (nothing created yet
+                                // on refusal), these panes already exist, and
+                                // every other failure mode on this path (see
+                                // the `Err` arm below) degrades gracefully
+                                // rather than losing the user's prior
+                                // session.
+                                let restore_claim_name = orch_snap
+                                    .display_title
+                                    .as_deref()
+                                    .filter(|t| !t.is_empty())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| {
+                                        crate::project_config::resolve_orchestration_name(
+                                            &orch_config.name,
+                                            std::path::Path::new(&saved_pane.dir),
+                                        )
+                                    });
+                                let restore_claim_token = mint_orchestration_claim_token();
+                                let restore_claimed = matches!(
+                                    send_daemon_request_blocking_with_timeout(
+                                        &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
+                                            name: restore_claim_name.clone(),
+                                            token: restore_claim_token.clone(),
+                                        },
+                                        DAEMON_REQUEST_TIMEOUT,
+                                    ),
+                                    Ok(ref resp) if resp.ok
+                                );
+                                if restore_claimed {
+                                    let _ = send_daemon_request_blocking_with_timeout(
+                                        &crate::daemon_protocol::AttachRequest::ConfirmOrchestrationClaim {
+                                            token: restore_claim_token,
+                                            pane_id: role_pane_ids[saved_start_idx].clone(),
+                                        },
+                                        DAEMON_REQUEST_TIMEOUT,
+                                    );
+                                } else {
+                                    ui.session_warnings.push(format!(
+                                        "Warning: could not claim orchestration name {restore_claim_name:?} \
+                                         while restoring '{}' — another live orchestration already holds it",
+                                        saved_pane.name
+                                    ));
                                 }
                                 if first_restored_orch_tab.is_none() {
                                     first_restored_orch_tab = Some(tab_idx);
@@ -29462,6 +29618,12 @@ mod tests {
 
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): `Action::SpawnPane` now claims
+        // the orchestration name before any provisioning; with no daemon
+        // reachable both spawns below would be refused before either tab is
+        // ever pushed, sinking this test's actual point (split-stage
+        // adoption across tabs A and B).
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -29774,6 +29936,12 @@ mod tests {
     fn layout_006_cycle_split_stage_is_deck_global_across_tab_types() {
         let frame_area = Rect::new(0, 0, 100, 40);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): `Action::SpawnPane` now claims
+        // the orchestration name before any provisioning; with no daemon
+        // reachable the spawn below would be refused before the tab is ever
+        // pushed, sinking this test's actual point (the deck-global
+        // split-stage field is shared across tab types).
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone()); // tab 0 = Dashboard, always present
         let mut ui = default_ui();
@@ -33280,6 +33448,13 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join(FORM_TITLE);
         std::fs::create_dir_all(&cwd).expect("create cwd");
+        // Fork issue #201 redesign (gap #2): `Action::SpawnPane` now claims
+        // the orchestration name (by token) before any provisioning — with
+        // no daemon reachable that claim is refused and the whole spawn is
+        // refused before a tab is ever pushed, which would sink this test's
+        // actual point (identity survives once there IS a working daemon
+        // under it — not a claim of "no daemon needed").
+        let _daemon = with_empty_agents_daemon(tmp.path());
 
         // Canonical orchestration config as loaded from disk: name =
         // "dot-agent-deck", a worker role `coder` with clear = true (the
@@ -34919,10 +35094,10 @@ mod tests {
                     else {
                         continue;
                     };
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                        if let Some(op) = v.get("op").and_then(|o| o.as_str()) {
-                            log.lock().unwrap().push(op.to_string());
-                        }
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload)
+                        && let Some(op) = v.get("op").and_then(|o| o.as_str())
+                    {
+                        log.lock().unwrap().push(op.to_string());
                     }
                     let _ = crate::daemon_protocol::write_frame(
                         &mut stream,
@@ -40157,6 +40332,12 @@ mod tests {
     fn lock_002_new_orchestration_tab_starts_locked() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): `spawn_lock_test_orchestration`
+        // dispatches a real `Action::SpawnPane`, which now claims the
+        // orchestration name before any provisioning; with no daemon
+        // reachable the claim is refused and no orchestration tab is ever
+        // pushed.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -40198,6 +40379,8 @@ mod tests {
     fn lock_003_ctrl_e_toggles_the_lock() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): see `lock_002`'s comment.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -40359,6 +40542,11 @@ mod tests {
     fn lock_004_toggle_is_deck_global_across_orchestration_tabs() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): see `lock_002`'s comment. Both
+        // `spawn_lock_test_orchestration` calls below share this one guard
+        // and the same `tmp.path()` socket — the guard binds once for the
+        // whole test, not once per spawn.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -40563,6 +40751,8 @@ mod tests {
     fn lock_006_waiting_for_input_carve_out() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): see `lock_002`'s comment.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(FocusEchoPC::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -40715,6 +40905,8 @@ mod tests {
     fn lock_007_ambiguous_status_fails_closed() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): see `lock_002`'s comment.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(FocusEchoPC::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -40839,6 +41031,8 @@ mod tests {
     fn lock_013_untagged_status_provenance_fails_closed() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): see `lock_002`'s comment.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(FocusEchoPC::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -40947,6 +41141,8 @@ mod tests {
     fn lock_020_gate_paste_delivery_denies_when_locked() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): see `lock_002`'s comment.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(FocusEchoPC::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -41020,6 +41216,8 @@ mod tests {
     fn lock_021_gate_paste_delivery_delivers_with_injected_now_when_unlocked() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): see `lock_002`'s comment.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(FocusEchoPC::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
@@ -41096,6 +41294,8 @@ mod tests {
     fn lock_022_gate_paste_delivery_waiting_for_input_carve_out() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // Fork issue #201 redesign (gap #2): see `lock_002`'s comment.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let pc = Arc::new(FocusEchoPC::new());
         let mut tm = TabManager::new(pc.clone());
         let mut ui = default_ui();
