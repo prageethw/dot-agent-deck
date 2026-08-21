@@ -3037,22 +3037,33 @@ mod tests {
                 generation: Some(("original-generation".into(), Utc::now())),
                 can_report_prompts: true,
                 codex_hook_trust_failed: false,
-                deadline: Instant::now() + Duration::from_secs(3),
+                // Reviewer S1: a 3 s deadline clamps `window =
+                // unconfirmed_retry_delay(1).min(remaining)` to ~2.9 s, so the
+                // loop abandons at the deadline instead of ever reaching the
+                // `guarded_submit` call this sub-case exists to guard — the
+                // replacement-identity refusal was never exercised. Extended
+                // to 15 s, mirroring the #570 sub-case's bump below, so the
+                // full 10 s first window elapses and the loop actually
+                // attempts (and this guard actually refuses) the retry.
+                deadline: Instant::now() + Duration::from_secs(15),
             },
         ));
 
         // The first confirmation window is the deterministic blocked retry.
-        // Rebind while it is waiting, before the retry is resolved. Issue
-        // #422 item 2 raised the first unconfirmed-retry delay to 10 s, so
-        // against this task's 3 s deadline the window is now deadline-capped
-        // to ~2.9 s rather than the pre-fix 500 ms — the outer wait below
-        // must stay comfortably above that.
+        // Rebind while it is waiting, before the retry is resolved. With the
+        // 15 s deadline above, `window = min(10s, remaining≈15s) = 10s`, so
+        // the confirmation task blocks on that window (no matching event is
+        // ever sent on `event_tx` in this sub-case) before it reaches
+        // `guarded_submit` and the replacement-identity mismatch refuses the
+        // retry — total task lifetime is ~10 s, not the ~2.9 s the old 3 s
+        // deadline clamped it to. The outer wait below must stay comfortably
+        // above that 10 s window.
         tokio::time::sleep(Duration::from_millis(100)).await;
         registry
             .close_agent(&original_id)
             .expect("close original target");
         let replacement_id = spawn_shell_target(&registry, PANE_ID);
-        tokio::time::timeout(Duration::from_secs(4), confirmation)
+        tokio::time::timeout(Duration::from_secs(13), confirmation)
             .await
             .expect("replacement must terminate confirmation task")
             .expect("confirmation task must not panic");
@@ -3319,7 +3330,17 @@ mod tests {
                 generation: None,
                 can_report_prompts: false,
                 codex_hook_trust_failed: false,
-                deadline: Instant::now() + Duration::from_secs(3),
+                // Reviewer B3: with the old 3 s deadline, `window =
+                // unconfirmed_retry_delay(1).min(remaining)` clamped to the
+                // whole ~3 s remaining, so the window expired with
+                // `remaining_before(deadline).is_zero()` true and the loop
+                // returned WITHOUT EVER REACHING the write this sub-case
+                // guards — even a wrongly-armed claim could not have failed
+                // the assertion below. Extended to 15 s, mirroring the #570
+                // sub-case, so the full 10 s first window elapses and a
+                // regression that wrongly arms on this forged claim would
+                // actually reach the write.
+                deadline: Instant::now() + Duration::from_secs(15),
             },
         ));
         forged_tx
@@ -3330,7 +3351,10 @@ mod tests {
                 EventType::SessionStart,
             )))
             .expect("send unmarked forged capability claim");
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        // Must clear the new 10 s first-window delay before a wrongly-armed
+        // write could have landed (was 750ms against the old 500ms window) —
+        // same reasoning as the #570 sub-case's identical bump below.
+        tokio::time::sleep(Duration::from_millis(10_500)).await;
         let forged_output = forged_registry
             .snapshot(&forged_agent)
             .expect("forged capability target snapshot");
