@@ -2168,6 +2168,38 @@ pub fn open_orchestration_with_slug(deck: &TuiDeck, slug: &str) {
     deck.send_keys(b"\r"); // submit
 }
 
+/// Drive the new-pane dialog to open a fixture's (single) orchestration,
+/// accepting the form's blank default name/worktree. Most files in this
+/// suite deliberately keep their own copy of this sequence rather than
+/// sharing one (see `open_orchestration_with_slug`'s doc comment above) —
+/// this one copy is shared between `e2e_orchestration_newpane.rs` and
+/// `e2e_orchestration_remit.rs` specifically because SonarCloud's new-code
+/// duplication gate flagged the byte-identical match between those two
+/// (issue #521 fix round). Leaves the orchestrator (start) role focused in
+/// `PaneInput` mode.
+pub fn open_orchestration(deck: &TuiDeck) {
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_keys(b"\x1b[C"); // Right -> [Orch: …]
+    deck.send_keys(b"\r"); // Mode -> Name
+    deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
+}
+
+/// Write `contents` to `path` and mark it executable (unix `0o755`). Shared
+/// by `e2e_orchestration_newpane.rs` and `e2e_orchestration_remit.rs` for the
+/// same reason as `open_orchestration` immediately above — the two files'
+/// private copies were byte-identical apart from their `.expect(..)` message
+/// text, which SonarCloud's duplication tokenizer does not distinguish.
+#[cfg(unix)]
+pub fn write_executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, contents).expect("write executable test script");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod executable test script");
+}
+
 // ---------------------------------------------------------------------------
 // L1 buffer-render helpers
 // ---------------------------------------------------------------------------
