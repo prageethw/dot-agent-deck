@@ -34531,15 +34531,35 @@ mod tests {
         let worktree = tmp.path().join("dot-agent-deck-my-feature");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");
         let worktree_str = worktree.display().to_string();
-        // Issue #201 fix-round regression fix: `Action::SpawnPane`'s handler
-        // now claims the orchestration name over the attach socket
-        // (`ClaimOrchestrationName`) right after the role panes are created,
-        // unconditionally of the worktree-creation branch this test is
-        // actually about — so it needs a stub daemon too, the same seam
+        // Fork issue #201 redesign: `Action::SpawnPane`'s handler now claims
+        // the orchestration name (by TOKEN) before any provisioning, then
+        // CONFIRMS/rebinds the claim onto the real pane id once role panes
+        // exist — unconditionally of the worktree-creation branch this test
+        // is actually about, so it needs a stub daemon too, the same seam
         // `worktree_004` already uses for the pre-existing
-        // `root_checkout_has_live_sibling` gate. A fresh, empty registry
-        // claims any name, so this yields `AttachResponse::ok()`.
-        let _daemon = with_empty_agents_daemon(tmp.path());
+        // `root_checkout_has_live_sibling` gate. Since the confirm validates
+        // `pane_id` against the daemon's own live `agent_records()`
+        // (reviewer P2-6 / auditor A3), an EMPTY registry would refuse it —
+        // `CapturingPaneController` hands out synthetic ids ("pane-0",
+        // "pane-1", ...) that never touch the real registry on their own.
+        // `make_orchestration("review")` spawns its non-start role
+        // ("reviewer") first and its START role ("coder") last (fork #92
+        // P1's spawn order), so the START role — the id the confirm
+        // actually validates — gets "pane-1"; pre-register a real agent
+        // carrying that same `pane_id_env` so the confirm has something
+        // genuine to validate against.
+        const START_PANE_ID: &str = "pane-1";
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    START_PANE_ID.to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("pre-register the real pane id the claim confirm will validate against");
+        let _daemon = with_daemon_registry(tmp.path(), registry);
 
         let config = make_orchestration("review");
         let req = NewPaneRequest {
@@ -34645,6 +34665,33 @@ mod tests {
     }
 
     fn with_empty_agents_daemon(unique_dir: &std::path::Path) -> EmptyAgentsDaemonGuard {
+        with_daemon_registry(
+            unique_dir,
+            Arc::new(crate::agent_pty::AgentPtyRegistry::new()),
+        )
+    }
+
+    /// Fork issue #201 redesign: like [`with_empty_agents_daemon`], but lets
+    /// the caller supply an already-populated
+    /// [`crate::agent_pty::AgentPtyRegistry`] instead of always starting
+    /// from a fresh, empty one. Needed once `ConfirmOrchestrationClaim`
+    /// validates its `pane_id` against the daemon's own live
+    /// `agent_records()` (reviewer P2-6 / auditor A3): a test whose
+    /// `CapturingPaneController` hands out synthetic ids like `"pane-0"`
+    /// needs the stub daemon's registry to ALSO know about a real agent
+    /// carrying that same `pane_id_env`, or every confirm/rebind in the test
+    /// would be (correctly) refused as an unminted id. `AgentPtyRegistry`
+    /// itself needs no active tokio runtime to construct or to
+    /// `spawn_agent` into (plain `#[test]`s like
+    /// `registry_rejects_duplicate_pane_id_env` in `src/agent_pty.rs` do
+    /// exactly that), so the registry can be built and populated by the
+    /// CALLER, synchronously, before ever entering the listener thread —
+    /// only the bind itself needs the active runtime context, same as
+    /// `with_empty_agents_daemon`.
+    fn with_daemon_registry(
+        unique_dir: &std::path::Path,
+        registry: Arc<crate::agent_pty::AgentPtyRegistry>,
+    ) -> EmptyAgentsDaemonGuard {
         let env_lock = crate::config::STATE_DIR_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -34695,7 +34742,6 @@ mod tests {
                         }
                     };
                 let _ = ready_tx.send(Ok(()));
-                let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
                 let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
                 let _ = crate::daemon_protocol::serve_attach(listener, registry, event_tx).await;
             });
@@ -34808,6 +34854,497 @@ mod tests {
             _env_lock: env_lock,
             prev_attach,
         }
+    }
+
+    /// Fork issue #201 redesign: like [`with_crafted_response_daemon`], but
+    /// instead of a fixed canned response, records — into `log` — the `op`
+    /// of every request received, in arrival order, then answers every one
+    /// with `AttachResponse::ok()` (an always-available daemon that grants
+    /// every claim/confirm/release). Lets a test assert not just the FINAL
+    /// registry state but the SEQUENCE of daemon calls a dispatch actually
+    /// made — e.g. proving a release was sent at all, which registry state
+    /// alone can't distinguish from "never asked".
+    fn with_recording_daemon(
+        unique_dir: &std::path::Path,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("build stub recording-daemon runtime: {e}")));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ =
+                                ready_tx.send(Err(format!("bind stub recording listener: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let ok_payload = serde_json::to_vec(&crate::daemon_protocol::AttachResponse::ok())
+                    .expect("serialize AttachResponse::ok()");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(Some((_, payload))) =
+                        crate::daemon_protocol::read_frame(&mut stream).await
+                    else {
+                        continue;
+                    };
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                        if let Some(op) = v.get("op").and_then(|o| o.as_str()) {
+                            log.lock().unwrap().push(op.to_string());
+                        }
+                    }
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &ok_payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub recording daemon must report readiness within 10s")
+            .expect("stub recording daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
+    /// Fork issue #201 redesign: like [`with_recording_daemon`], but instead
+    /// of logging every request's `op`, invokes `on_request` synchronously
+    /// the instant the FIRST request of any kind arrives — before crafting
+    /// any response — then answers every request with `AttachResponse::ok()`
+    /// (an always-available daemon). Lets a test capture some OTHER
+    /// observable's state (e.g. how many panes a `PaneController` has
+    /// spawned so far) at the precise moment the daemon receives its first
+    /// request, isolating "was the claim sent before or after provisioning"
+    /// without needing to inspect the request's own payload at all.
+    fn with_ordering_probe_daemon(
+        unique_dir: &std::path::Path,
+        on_request: impl FnMut() + Send + 'static,
+    ) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let mut on_request = on_request;
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("build stub ordering-probe runtime: {e}")));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx
+                                .send(Err(format!("bind stub ordering-probe listener: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let ok_payload = serde_json::to_vec(&crate::daemon_protocol::AttachResponse::ok())
+                    .expect("serialize AttachResponse::ok()");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(Some(_)) = crate::daemon_protocol::read_frame(&mut stream).await else {
+                        continue;
+                    };
+                    on_request();
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &ok_payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub ordering-probe daemon must report readiness within 10s")
+            .expect("stub ordering-probe daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
+    /// A `PaneController` that succeeds for every `create_pane_with_options`
+    /// call except the `fail_at`-th (0-indexed), which it fails — modeling a
+    /// role-pane spawn that dies partway through
+    /// `TabManager::open_orchestration_tab`'s per-role loop, the scenario
+    /// fork issue #201's redesign needs to prove the pre-spawn TOKEN claim
+    /// gets released on. Records how many calls succeeded so a test can
+    /// assert exactly how far provisioning got.
+    struct PartialFailPaneController {
+        fail_at: usize,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl PartialFailPaneController {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                fail_at,
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl PaneController for PartialFailPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            let mut calls = self.calls.lock().unwrap();
+            let this_call = *calls;
+            *calls += 1;
+            if this_call == self.fail_at {
+                return Err(PaneError::CommandFailed(format!(
+                    "injected spawn failure at role pane #{this_call}"
+                )));
+            }
+            let resolved = opts.display_name.unwrap_or("role").to_string();
+            Ok((format!("pane-{this_call}"), resolved))
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "partial-fail"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Fork issue #201 redesign (reviewer P1-1/P1-2, auditor A1)
+    /// — a refused orchestration-name claim must happen BEFORE any role pane
+    /// is spawned and before any tab is pushed, so a lost race leaves
+    /// NOTHING behind to roll back. `req.dir` is deliberately NOT a git
+    /// repository, so `root_checkout_has_live_sibling` short-circuits
+    /// `Ok(false)` with no daemon round trip at all (the same property
+    /// `identity_001` relies on) — isolating this test to the ONE daemon
+    /// call that matters: the claim itself, answered with a crafted refusal
+    /// by [`with_crafted_response_daemon`]. Under the OLD "claim after
+    /// spawn" design this refusal arrives only after both role panes and
+    /// the tab already exist, so `pc.recorded_cwds()` would be non-empty and
+    /// `tm.tab_count()` would be 2 — this is the assertion that goes RED
+    /// against that design.
+    #[spec("orchestration/identity/016")]
+    #[test]
+    fn identity_016_refused_claim_happens_before_any_provisioning() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&dir).expect("create plain dir");
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::err(
+                "orchestration name \"foo\" is already held",
+            ),
+        );
+
+        let config = make_orchestration("review");
+        let req = NewPaneRequest {
+            dir,
+            name: "foo".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
+        };
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert!(
+            pc.recorded_cwds().is_empty(),
+            "a refused orchestration-name claim must be checked BEFORE any role pane is \
+             spawned — got {} spawned pane(s)",
+            pc.recorded_cwds().len()
+        );
+        assert_eq!(
+            tm.tab_count(),
+            1,
+            "a refused claim must never push an orchestration tab — the Dashboard tab \
+             must be the only one"
+        );
+        assert!(
+            ui.status_message
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("already held")),
+            "the refusal reason must reach the status message; got {:?}",
+            ui.status_message
+        );
+    }
+
+    /// Scenario: Fork issue #201 redesign — the orchestration-name claim
+    /// must be the FIRST request `Action::SpawnPane` sends to the daemon,
+    /// sent BEFORE any role pane is spawned (using a caller-minted token,
+    /// since no real pane id exists yet). A stub daemon records, the
+    /// instant it receives its first-ever request, how many role panes
+    /// `pc` had already spawned — 0 under the new design, but under the
+    /// OLD "claim after spawn" design both role panes for
+    /// `make_orchestration("review")` would already exist by then.
+    #[spec("orchestration/identity/017")]
+    #[test]
+    fn identity_017_claim_is_the_daemons_first_request_sent_before_any_pane_spawns() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&dir).expect("create plain dir");
+
+        let config = make_orchestration("review");
+        let pc = Arc::new(CapturingPaneController::new());
+        // Sentinel: no request has been observed yet.
+        let panes_at_first_request = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let recorded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let probe_pc = pc.clone();
+        let probe_panes_at_first_request = panes_at_first_request.clone();
+        let _daemon = with_ordering_probe_daemon(tmp.path(), move || {
+            if !recorded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                probe_panes_at_first_request.store(
+                    probe_pc.recorded_cwds().len(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        });
+
+        let req = NewPaneRequest {
+            dir,
+            name: "foo".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
+        };
+
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert_eq!(
+            panes_at_first_request.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the orchestration-name claim must be the daemon's FIRST request, sent before \
+             any role pane is spawned — under the old 'claim after spawn' design this would \
+             read 2 (both role panes already created)"
+        );
+    }
+
+    /// Scenario: Fork issue #201 redesign — a role-pane spawn failure that
+    /// happens AFTER the pre-spawn token claim already succeeded must
+    /// release that token-held claim, so the name is immediately claimable
+    /// again rather than stuck until some pane that never fully existed
+    /// times out. `PartialFailPaneController` fails the SECOND
+    /// `create_pane_with_options` call, so `open_orchestration_tab`'s own
+    /// pre-existing per-role rollback (close what was already spawned, then
+    /// return `Err` — never pushing a tab) fires; a stub daemon records the
+    /// SEQUENCE of ops it receives so the test can assert a release was
+    /// actually sent, not merely infer it from registry state. Under the
+    /// OLD "claim after spawn" design, `open_orchestration_tab` failing
+    /// means no claim is EVER sent (the claim uses the real pane id
+    /// `open_orchestration_tab` only returns on `Ok`) — so this test's op
+    /// log would be empty against that design.
+    #[spec("orchestration/identity/018")]
+    #[test]
+    fn identity_018_spawn_failure_after_a_successful_claim_releases_the_token() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&dir).expect("create plain dir");
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _daemon = with_recording_daemon(tmp.path(), ops.clone());
+
+        let config = make_orchestration("review");
+        // Fail on the SECOND role-pane spawn — `open_orchestration_tab`
+        // spawns the non-start role ("reviewer") first, so the START role
+        // ("coder") never gets created, exercising the per-role rollback.
+        let pc = Arc::new(PartialFailPaneController::new(1));
+        let req = NewPaneRequest {
+            dir,
+            name: "foo".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
+        };
+
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert_eq!(
+            tm.tab_count(),
+            1,
+            "a failed spawn must never push an orchestration tab"
+        );
+        assert_eq!(
+            pc.call_count(),
+            2,
+            "the failure must have been reached on the second role-pane spawn attempt"
+        );
+        let log = ops.lock().unwrap().clone();
+        assert!(
+            log.contains(&"claim-orchestration-name".to_string()),
+            "the pre-spawn token claim must have been sent before provisioning; got {log:?}"
+        );
+        assert!(
+            log.contains(&"release-orchestration-name".to_string()),
+            "a spawn failure AFTER a successful claim must release the token-held claim so \
+             the name is immediately claimable again, not stuck until some timeout; got {log:?}"
+        );
     }
 
     /// Precondition helper shared by the two tests below: a minimal, valid
@@ -35549,11 +36086,26 @@ mod tests {
     #[test]
     fn pane_input_016_orchestrator_prompt_captures_identity_at_tab_creation() {
         let tmp = tempdir().expect("tempdir");
-        // Issue #201 fix-round regression fix: see `worktree_003`'s matching
-        // comment — `Action::SpawnPane` now claims the orchestration name
-        // over the attach socket after spawning the role panes, so this
-        // dispatch needs the same stub daemon `worktree_004` already uses.
-        let _daemon = with_empty_agents_daemon(tmp.path());
+        // Fork issue #201 redesign: see `worktree_003`'s matching comment —
+        // `Action::SpawnPane` claims by token before provisioning, then
+        // confirms/rebinds onto the real pane id, which the daemon
+        // validates against its own live `agent_records()`. This config has
+        // a single, start role, so `CapturingPaneController` (counter
+        // starting at 0) hands it "pane-0" — pre-register a real agent
+        // carrying that id so the confirm has something genuine to
+        // validate against.
+        const START_PANE_ID: &str = "pane-0";
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    START_PANE_ID.to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("pre-register the real pane id the claim confirm will validate against");
+        let _daemon = with_daemon_registry(tmp.path(), registry);
         let config = OrchestrationConfig {
             name: "capture-at-creation".to_string(),
             roles: vec![OrchestrationRoleConfig {

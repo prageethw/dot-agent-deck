@@ -8211,6 +8211,93 @@ mod spawn_tests {
         assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"));
     }
 
+    /// Fork issue #201 redesign (reviewer P2-2/P2-5, auditor A1): the claim
+    /// now happens BEFORE any worktree/pane provisioning, keyed by a
+    /// caller-minted TOKEN rather than a real pane id — no real id exists
+    /// that early. Once the spawn genuinely succeeds and a real pane id is
+    /// known, `Action::SpawnPane` rebinds the token's claim onto it via
+    /// `confirm_orchestration_claim`, so `StopAgent`'s existing
+    /// by-pane-id `release_orchestration_name` still frees it on close —
+    /// without that rebind, a closed orchestration's name would be stuck
+    /// held by a token nothing ever releases.
+    ///
+    /// Scenario: claim a name by TOKEN (simulating the pre-spawn claim),
+    /// confirm/rebind it onto a real pane id (simulating the post-spawn
+    /// confirm), then prove two things: the name is still exclusively held
+    /// (a third party using either the old token or a fresh token is
+    /// refused), and releasing by the now-bound PANE id — exactly what
+    /// `StopAgent`'s handler already does — frees it.
+    #[spec("orchestration/identity/014")]
+    #[test]
+    fn identity_014_confirm_orchestration_claim_rebinds_token_to_real_pane_id() {
+        const NAME: &str = "myrepo-orchestrator-1";
+        const TOKEN: &str = "spawn-token-abc123";
+        const REAL_PANE_ID: &str = "pane-42";
+
+        let registry = AgentPtyRegistry::new();
+
+        // Pre-spawn: claim by token, before any pane exists.
+        assert!(registry.claim_orchestration_name(NAME, TOKEN));
+
+        // Post-spawn: the real pane id is now known — rebind onto it.
+        assert!(
+            registry.confirm_orchestration_claim(TOKEN, REAL_PANE_ID),
+            "confirming a claim actually held by this token must succeed"
+        );
+
+        // The name is still held — a fresh claimant (whether it guesses the
+        // old token or uses a new one) is refused.
+        assert!(!registry.claim_orchestration_name(NAME, TOKEN));
+        assert!(!registry.claim_orchestration_name(NAME, "some-other-token"));
+
+        // `StopAgent`'s existing release-by-pane-id mechanism must still
+        // work post-rebind — this is the whole point of confirming onto the
+        // real id instead of leaving the claim stuck under the token.
+        registry.release_orchestration_name(REAL_PANE_ID);
+        assert!(
+            registry.claim_orchestration_name(NAME, "new-claimant"),
+            "releasing the rebound pane id must free the name for a new claimant"
+        );
+    }
+
+    /// Scenario: a confirm naming the WRONG token (the caller raced, or
+    /// already confirmed once) must be refused and must not disturb the
+    /// claim actually held by the real token — proving confirm is exact-match,
+    /// not "steal whatever's there". Separately, releasing by the ORIGINAL
+    /// TOKEN before any confirm ever happens (the "spawn failed after a
+    /// successful claim" case `Action::SpawnPane`'s rollback needs) frees the
+    /// name immediately, matching `release_orchestration_name`'s existing
+    /// generic-string contract — no separate "release by token" method is
+    /// needed since the holder is just an opaque string either way.
+    #[spec("orchestration/identity/015")]
+    #[test]
+    fn identity_015_confirm_with_wrong_token_is_refused_and_release_by_token_frees_the_name() {
+        const NAME: &str = "myrepo-orchestrator-2";
+        const TOKEN: &str = "spawn-token-xyz789";
+
+        let registry = AgentPtyRegistry::new();
+        assert!(registry.claim_orchestration_name(NAME, TOKEN));
+
+        // A confirm naming a token that never claimed anything must be
+        // refused, and must not rebind or otherwise disturb the real claim.
+        assert!(!registry.confirm_orchestration_claim("wrong-token", "pane-99"));
+        assert!(
+            !registry.claim_orchestration_name(NAME, "some-other-token"),
+            "a rejected confirm must leave the original token's claim intact"
+        );
+
+        // The spawn that would have confirmed this claim failed instead —
+        // `Action::SpawnPane`'s rollback releases the TOKEN-held claim so
+        // the name is claimable again immediately, not stuck until some
+        // pane that never existed times out.
+        registry.release_orchestration_name(TOKEN);
+        assert!(
+            registry.claim_orchestration_name(NAME, "new-claimant"),
+            "releasing the token-held claim after a spawn failure must free the name \
+             immediately"
+        );
+    }
+
     #[test]
     fn registry_resize_rejects_zero_dims() {
         let registry = Arc::new(AgentPtyRegistry::new());
