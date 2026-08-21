@@ -746,9 +746,23 @@ pub fn submission_is_after_watermark(
     }
 }
 
-/// Backoff before re-submitting a written-but-UNCONFIRMED prompt: 0.5 s, 1 s,
-/// 2 s, 4 s, 8 s, then capped at 15 s. `attempts` is the number of submissions
-/// made so far (≥ 1).
+/// Backoff before re-submitting a written-but-UNCONFIRMED prompt: 10 s for the
+/// first retry, then capped at 15 s for every retry after that. `attempts` is
+/// the number of submissions made so far (≥ 1).
+///
+/// # Issue #422 item 2: the first retry must clear the genuine-confirmation window
+///
+/// The original 0.5/1/2/4/8/15 s schedule was tuned against `Unknown`- and
+/// `CannotReport`-capability panes (which arm no retry via this path at all —
+/// see [`ConfirmationCapability`]) and never against a real `Reports` producer's
+/// own confirmation latency. Issue #422's own measurements put a genuine Codex
+/// TEXT confirmation as far out as 8.45 s after the write; the old schedule's
+/// first three retries (at 0.5 s, 1 s and 2 s) all fired comfortably before that
+/// evidence could ever arrive, so a slow-but-healthy delivery was resubmitted
+/// — a bare-CR retry racing and preempting the confirmation that was already on
+/// its way. The first delay is pushed to 10 s, a margin past the measured
+/// worst case, so nothing here fires before a genuine confirmation has had a
+/// realistic chance to land.
 ///
 /// Deliberately NOT `crate::ui::send_retry_delay`'s 2 s-capped schedule, which
 /// exists for a target that is *refusing* delivery and may become live at any
@@ -756,14 +770,12 @@ pub fn submission_is_after_watermark(
 /// An unconfirmed write is the opposite case: the agent accepted the bytes and
 /// is booting, the wait can legitimately run to tens of seconds (5-6 MCP servers
 /// on the reported failure), and every retry is a *second copy of the prompt*
-/// typed into whatever the pane is showing. Escalating to a 15 s cap keeps the
-/// whole [`AUTOMATIC_PROMPT_DEADLINE`] window covered in single-digit attempts
-/// instead of ~30.
+/// typed into whatever the pane is showing. Capping at 15 s keeps the whole
+/// [`AUTOMATIC_PROMPT_DEADLINE`] window covered in single-digit attempts.
 pub fn unconfirmed_retry_delay(attempts: u32) -> std::time::Duration {
-    const BASE_MS: u64 = 500;
+    const FIRST_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
     const CAP: std::time::Duration = std::time::Duration::from_secs(15);
-    let shift = attempts.saturating_sub(1).min(8);
-    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
+    if attempts <= 1 { FIRST_DELAY } else { CAP }
 }
 
 /// Mint a GLOBALLY-UNIQUE logical delivery id for an automatic prompt.
@@ -1464,21 +1476,24 @@ mod tests {
 
     #[test]
     fn unconfirmed_backoff_escalates_then_caps() {
+        // Issue #422 item 2: the first retry must clear the 8.45 s measured
+        // worst-case genuine confirmation latency with margin, so nothing
+        // resubmits into a delivery that is already on its way to confirming.
         assert_eq!(
             unconfirmed_retry_delay(1),
-            std::time::Duration::from_millis(500)
+            std::time::Duration::from_secs(10)
         );
         assert_eq!(
             unconfirmed_retry_delay(2),
-            std::time::Duration::from_secs(1)
+            std::time::Duration::from_secs(15)
         );
         assert_eq!(
             unconfirmed_retry_delay(3),
-            std::time::Duration::from_secs(2)
+            std::time::Duration::from_secs(15)
         );
         assert_eq!(
             unconfirmed_retry_delay(5),
-            std::time::Duration::from_secs(8)
+            std::time::Duration::from_secs(15)
         );
         assert_eq!(
             unconfirmed_retry_delay(9),
