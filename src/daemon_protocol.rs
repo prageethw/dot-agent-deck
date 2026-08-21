@@ -1142,13 +1142,24 @@ async fn compute_write_and_submit_outcome(
                     })
                     .await
             } else {
+                // Issue #494: a paned target has no upstream gate equivalent to the
+                // paneless branch's `None => Writable::None` above — `Writable::Live`
+                // here is reached by `pane_writable` alone, keyed by `pane_id`, with
+                // no requirement that the caller named an agent at all. Mirroring PR
+                // #477's fix for issue #465's identical bug class (`state.rs`'s
+                // `dispatch_one_owned`): treat an unresolved/absent identity as no
+                // verified target rather than falling through to an unguarded write
+                // keyed by pane_id alone.
+                let Some(expected_agent_id) = extras.expected_agent_id.as_deref() else {
+                    return Ok(SendResult::NoLiveTarget);
+                };
                 let pane_for_check = pane_id.to_string();
                 let expected_session = extras.expected_session_id.clone();
                 registry
                     .write_and_submit_guarded(
                         pane_id,
                         text,
-                        extras.expected_agent_id.as_deref(),
+                        Some(expected_agent_id),
                         move || async move {
                             // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
                             // stale-pre-lock-snapshot CLASS close: this closure is
@@ -1188,13 +1199,44 @@ async fn compute_write_and_submit_outcome(
                             // (always). A `None` current-session (the session ended,
                             // or none was recorded) is refused too on an attached,
                             // live-interactive pane — never a silent accept.
-                            if let Some(expected) = expected_session.as_deref() {
-                                match guard.pane_hook_session_id(&pane_for_check) {
+                            //
+                            // Issue #494: that same "refused too" rule must also fire
+                            // when the CALLER'S `expected_session` is `None` — a
+                            // caller that named no session generation at all supplies
+                            // strictly less confidence than one whose named session
+                            // simply isn't recorded, so it cannot be treated more
+                            // permissively. Matching on `expected_session` (rather
+                            // than `if let Some`) makes that `None`-caller case an
+                            // explicit arm instead of a silently skipped one.
+                            //
+                            // Auditor finding A2: the unconditional form of this arm
+                            // refused EVERY `None`-caller write on an attached pane,
+                            // including the deck's own legitimate 10s
+                            // no-`SessionStart` fallback (`ui.rs`) for agent types
+                            // that never emit a `SessionStart` hook — and because the
+                            // refusal maps to the non-terminal `Stale`, every retry
+                            // was refused identically forever (a permanent deadlock).
+                            // Narrow the refusal to a pane that actually HAS a
+                            // conversation it failed to correctly name: either a
+                            // recorded hook session, or at least one prior
+                            // generation that closed. A pane with neither has
+                            // nothing to fail to name, so refusing it serves no
+                            // security purpose.
+                            match expected_session.as_deref() {
+                                Some(expected) => match guard.pane_hook_session_id(&pane_for_check)
+                                {
                                     Some(current) if current != expected => return false,
                                     Some(_) => {}
                                     None if has_live_attach => return false,
                                     None => {}
+                                },
+                                None if has_live_attach
+                                    && (guard.pane_hook_session_id(&pane_for_check).is_some()
+                                        || guard.pane_generation_closures(&pane_for_check) > 0) =>
+                                {
+                                    return false;
                                 }
+                                None => {}
                             }
                             true
                         },
@@ -2700,6 +2742,288 @@ mod tests {
             "a pane attached after the pre-lock check must be re-evaluated post-lock: with \
              its named session gone the stale prompt is refused as Stale (had the pre-lock \
              'unattached' value been trusted, it would have been Applied)"
+        );
+
+        drop(_attach);
+        reg.shutdown_all();
+    }
+
+    /// Issue #494: `compute_write_and_submit_outcome`'s **paned** branch forwards
+    /// `extras.expected_agent_id.as_deref()` straight into
+    /// `write_and_submit_guarded` with no gate of its own — when it is `None`,
+    /// `write_and_submit_guarded`'s pre-lock identity check
+    /// (`if let Some(expected) = expected_agent_id && expected != target.agent_id`)
+    /// is skipped entirely, and the paned re-resolution afterwards only compares
+    /// the pane's CURRENT agent against ITSELF (there is no separate "did the
+    /// caller name an agent at all" gate), so the write proceeds keyed by
+    /// `pane_id` alone. Contrast the **paneless** branch a few lines earlier in
+    /// the same function: `Writable::Live` there is reachable ONLY when
+    /// `extras.expected_agent_id` is `Some` (`None => Writable::None` at the
+    /// `pane_writable`/`agent_writable` match), so an absent agent id fails
+    /// closed before the guarded send is ever reached. The paned branch has no
+    /// equivalent upstream gate. This pins the gap: a live pane with a
+    /// registered agent, written to with `expected_agent_id: None`, must be
+    /// REFUSED (never `SendResult::Applied`) — mirroring the `let Some(...) else
+    /// { return ... }` shape PR #477 established for issue #465's identical bug
+    /// class at a different call site.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paned_write_refuses_missing_expected_agent_id() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-494-no-expected-agent-id";
+        let _id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        // No `expected_session_id` either, so the (separately buggy, separately
+        // pinned below) session gate can never be the reason this is refused —
+        // isolates the agent-id axis.
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: None,
+            expected_session_id: None,
+            ..Default::default()
+        };
+        let result = compute_write_and_submit_outcome(
+            &reg,
+            &state,
+            pane_id,
+            "printf 'SHOULD-NOT-BE-DELIVERED\\n'",
+            &extras,
+        )
+        .await;
+
+        // R5: tightened from `assert_ne!(.., Ok(Applied))`, which passes on any
+        // `Err` too. The paned branch's `let Some(expected_agent_id) = ... else`
+        // arm (daemon_protocol.rs) returns `NoLiveTarget` directly for a `None`
+        // agent id, before `write_and_submit_guarded` is ever reached — assert
+        // that exact variant.
+        assert_eq!(
+            result,
+            Ok(crate::event::SendResult::NoLiveTarget),
+            "a paned write-and-submit with NO expected_agent_id must fail closed with \
+             NoLiveTarget, not deliver (got {result:?}) — the caller named no target identity \
+             at all, so the write must not proceed keyed by pane_id alone"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #494 / auditor finding A2: `compute_write_and_submit_outcome`'s
+    /// **paned** branch only performs its session re-validation `if let
+    /// Some(expected) = expected_session.as_deref()` — when the CALLER'S
+    /// `expected_session_id` is `None`, that whole `match` is skipped, so the "a
+    /// `None` current-session ... is refused too on an attached, live-interactive
+    /// pane" rule the code's own comment describes is never reached. This pins
+    /// the gap the comment claims is already closed, precisely on the case A2
+    /// says must STAY closed: a pane that DOES have a conversation it failed to
+    /// correctly name — `pane_hook_session_id().is_some()` here, established
+    /// below via a genuine `SessionStart` — attached (live-interactive), written
+    /// to with `expected_session_id: None` but a correctly-named
+    /// `expected_agent_id` (so the agent-id axis pinned above is not the reason
+    /// for any refusal here), must be REFUSED as `Stale`. Contrast this test's
+    /// sibling `paned_write_allows_missing_expected_session_with_no_hook_history`
+    /// (case (a)): a pane with NO hook history at all must be let through — only
+    /// a pane that already has a conversation it named nothing for stays refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paned_write_refuses_missing_expected_session_on_attached_pane() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-494-no-expected-session";
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        // A2: this pane DOES have a conversation — a real `SessionStart` hook
+        // event establishes `pane_hook_session_id() == Some(..)` — distinguishing
+        // this test from its case-(a) sibling, whose pane never emits one at all.
+        // The exact session id doesn't matter: the code path under test (the
+        // top-level `None if has_live_attach` arm) is reached because the
+        // CALLER's `expected_session_id` is `None`, not because it fails to
+        // match some particular current value.
+        {
+            use crate::event::{AgentEvent, AgentType, EventType};
+            use chrono::Utc;
+            state.write().await.apply_event(AgentEvent {
+                session_id: "494-established-generation".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            });
+        }
+        assert!(
+            state.read().await.pane_hook_session_id(pane_id).is_some(),
+            "precondition: the pane must have recorded hook history for this to be case (b)"
+        );
+
+        // Keep the subscription alive so `pane_has_live_attach` reads `true` —
+        // an attached, live-interactive pane, exactly the case the code's own
+        // comment says a `None` current-session is "refused too" on.
+        let _attach = reg
+            .subscribe(&id)
+            .expect("attach for live-interactive pane");
+        assert!(
+            reg.pane_has_live_attach(pane_id),
+            "precondition: pane must read as ATTACHED"
+        );
+
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: Some(id.clone()),
+            expected_session_id: None,
+            ..Default::default()
+        };
+        let result = compute_write_and_submit_outcome(
+            &reg,
+            &state,
+            pane_id,
+            "printf 'SHOULD-NOT-BE-DELIVERED\\n'",
+            &extras,
+        )
+        .await;
+
+        // R5: tightened from `assert_ne!(.., Ok(Applied))`, which passes on any
+        // `Err` too. The refusal here goes through `write_and_submit_guarded`'s
+        // revalidation closure returning `false`, which always maps to
+        // `GuardedSend::Stale` — assert that exact variant.
+        assert_eq!(
+            result,
+            Ok(crate::event::SendResult::Stale),
+            "a paned write-and-submit on an ATTACHED pane with a recorded hook session but NO \
+             expected_session_id must fail closed with Stale, not deliver (got {result:?}) — \
+             the caller named no session generation at all for a pane that already has one, so \
+             a stale/unnamed prompt must not proceed"
+        );
+
+        drop(_attach);
+        reg.shutdown_all();
+    }
+
+    /// Issue #494 (deadlock defect) / auditor findings A1+A2: the `None if
+    /// has_live_attach => return false` arm this PR's fix for #494 added to the
+    /// paned branch's session re-validation closure refuses EVERY
+    /// `expected_session_id: None` write on an attached pane, with no regard for
+    /// whether the pane ever had a conversation to fail to name. That also
+    /// refuses the deck's own, already-documented 10s no-`SessionStart` fallback
+    /// (`ui.rs`'s `should_inject_spawn_time_prompt` caller), which deliberately
+    /// writes with `expected_session_id: None` for agent types — opencode-style
+    /// wrappers — that never emit a `SessionStart` hook at all. Because the
+    /// refusal maps to `SendResult::Stale`, which is non-terminal, and
+    /// `delivery.attempts` only increments on `Applied | Queued`, every retry is
+    /// refused identically forever: `bind_generation_before_retry` never advances
+    /// past `attempts == 0`, no hook ever arrives to advance it, and the
+    /// spawn-time role prompt is abandoned at `AUTOMATIC_PROMPT_DEADLINE` with no
+    /// escape — a permanent, full deadlock on every spawn of such an agent (see
+    /// the PR's own commit message / issue #494 for the traced call chain).
+    ///
+    /// This test models that exact fallback shape directly against
+    /// `compute_write_and_submit_outcome`: an attached pane with NO hook history
+    /// at all — `pane_hook_session_id()` stays `None` and
+    /// `pane_generation_closures()` stays `0`, i.e. a pane that has never had a
+    /// conversation, not merely a slow one — receiving a paned write with
+    /// `expected_session_id: None` (mirroring the deck's real 10s-fallback call
+    /// shape) and a correctly-named `expected_agent_id`. Per auditor finding A2's
+    /// narrowing (the eventual fix), a `None`-session write must be refused only
+    /// when the pane DOES have a conversation it failed to correctly name —
+    /// `pane_hook_session_id().is_some() || pane_generation_closures() > 0` — and
+    /// a pane with neither must be allowed through. So this write must succeed
+    /// (`Applied`), never deadlock as `Stale`. Contrast this test's sibling
+    /// `paned_write_refuses_missing_expected_session_on_attached_pane` (case (b)):
+    /// a pane that DOES have recorded hook history must stay refused — that is
+    /// issue #494's actual bug and must remain closed.
+    ///
+    /// RED against the fix landing in this PR alone (commit `b96f38f0`): the
+    /// unconditional `None if has_live_attach => return false` arm refuses this
+    /// write with `Stale` regardless of hook history, so this assertion currently
+    /// fails. It is expected to go GREEN once a follow-up narrows that arm to A2's
+    /// condition.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paned_write_allows_missing_expected_session_with_no_hook_history() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-494-no-hook-history";
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        // Keep the subscription alive so `pane_has_live_attach` reads `true` —
+        // an attached, live-interactive pane, exactly the deck's real spawn-time
+        // delivery shape (the TUI is always attached to a pane it drives).
+        let _attach = reg
+            .subscribe(&id)
+            .expect("attach for live-interactive pane");
+        assert!(
+            reg.pane_has_live_attach(pane_id),
+            "precondition: pane must read as ATTACHED"
+        );
+
+        // No `apply_event` call anywhere above: this pane has NEVER emitted a
+        // `SessionStart` hook, so it carries zero hook history — this is what
+        // distinguishes case (a) from case (b).
+        assert!(
+            state.read().await.pane_hook_session_id(pane_id).is_none(),
+            "precondition: the pane must have NO recorded hook session for this to be case (a)"
+        );
+        assert_eq!(
+            state.read().await.pane_generation_closures(pane_id),
+            0,
+            "precondition: the pane must have never closed a generation either"
+        );
+
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: Some(id.clone()),
+            expected_session_id: None,
+            ..Default::default()
+        };
+        let result = compute_write_and_submit_outcome(
+            &reg,
+            &state,
+            pane_id,
+            "printf 'SHOULD-BE-DELIVERED\\n'",
+            &extras,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Ok(crate::event::SendResult::Applied),
+            "a paned write-and-submit on an ATTACHED pane with NO hook history at all and NO \
+             expected_session_id must be DELIVERED, not permanently refused (got {result:?}) — \
+             this is the deck's real 10s no-SessionStart fallback shape (issue #494's traced \
+             deadlock), and a pane that never had a conversation has nothing to fail to name"
         );
 
         drop(_attach);
