@@ -2337,6 +2337,8 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         }
     }
 

@@ -213,6 +213,8 @@ async fn handle_connection(
                 rows,
                 cols,
                 live: None,
+                daemon_boot_id: None,
+                registration_generation: None,
             });
             write_resp(
                 &mut stream,
@@ -297,6 +299,8 @@ fn mode_record(fixture: &str, mode: &str, agent_id: &str, pane_id: &str) -> Agen
         rows: 24,
         cols: 80,
         live: None,
+        daemon_boot_id: None,
+        registration_generation: None,
     }
 }
 

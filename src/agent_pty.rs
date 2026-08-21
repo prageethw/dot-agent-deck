@@ -2356,6 +2356,27 @@ pub struct AgentRecord {
     /// no `PROTOCOL_VERSION` bump is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<crate::state::SessionSnapshot>,
+    /// Fork issue #513: this daemon's `AppState::daemon_boot_id`, joined in by
+    /// the `ListAgents` handler the same way `live` above is — the registry
+    /// itself has no notion of a boot id, so this is `None` here and always
+    /// `Some` by the time a `ListAgents` reply leaves the handler. Lets an
+    /// out-of-process caller (e.g. an L2 test's own `work-done` subprocess,
+    /// which cannot see a spawned pane's `DOT_AGENT_DECK_DAEMON_BOOT_ID` env
+    /// var) construct a legitimate `WorkDoneSignal` for a specific pane
+    /// without guessing it. Same-uid-gated like every other `ListAgents`
+    /// field: a caller with socket access to issue this query already has
+    /// the access needed to attempt a forged `work-done` signal, so exposing
+    /// this grants no new privilege. `skip_serializing_if` keeps the wire
+    /// shape backwards-compatible with daemons predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_boot_id: Option<String>,
+    /// Fork issue #513: sibling to `daemon_boot_id` above — this pane's
+    /// current `AppState::pane_registration_generation` entry, joined in by
+    /// the `ListAgents` handler from `pane_id_env`. `None` when the pane was
+    /// never registered as an orchestration role (no entry exists), or when
+    /// no live session/registry access is available (dummy-state test path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_generation: Option<u64>,
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -7298,6 +7319,12 @@ impl AgentPtyRegistry {
                 // `ListAgents` handler joins `AppState.sessions` in and
                 // overrides this when a matching live session exists.
                 live: None,
+                // Fork issue #513: same reasoning as `live` above — the
+                // registry has no notion of a daemon boot id or a pane's
+                // registration generation; the `ListAgents` handler joins
+                // both in from `AppState`.
+                daemon_boot_id: None,
+                registration_generation: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -11681,6 +11708,8 @@ mod spawn_tests {
             rows: 120,
             cols: 40,
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -11942,6 +11971,8 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
