@@ -98,6 +98,7 @@ fn pane_004_card_title_row() {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -144,6 +145,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     }
 }
 
@@ -537,6 +539,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -776,6 +779,7 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -868,6 +872,7 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -987,6 +992,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         // PRD fork#378: no model known — the badge must keep the bare
         // `<Label> · <name>` form asserted below unchanged.
         model: None,
+        expects_agent_report: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1324,6 +1330,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     };
     let placeholder_on = render_card_for_mode_to_buffer(
         &placeholder,
@@ -1838,6 +1845,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     }
 }
 
@@ -2540,6 +2548,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -2743,6 +2752,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: Some("Opus".to_string()),
+        expects_agent_report: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -3013,6 +3023,7 @@ fn filled_session() -> SessionState {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     }
 }
 
@@ -3685,6 +3696,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -3773,6 +3785,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         shell_synthetic_working: false,
         pending_permission_tool: None,
         model: None,
+        expects_agent_report: false,
     }
 }
 

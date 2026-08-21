@@ -500,6 +500,17 @@ pub fn declarable_agent_names() -> Vec<&'static str> {
         .collect()
 }
 
+/// Resolve an agent type from a devbox script name's hyphen-separated segments
+/// (this fork's convention: `claude-sonnet-devbox`, `codex-devbox`, `pi-big`, ...).
+/// A devbox script name is not itself a recognized basename, and its real
+/// underlying command is defined in `devbox.json`, not visible from the command
+/// string alone — so this resolves heuristically: the first segment that matches
+/// a recognized basename via [`detect_from_basename`] wins. `None` if no segment
+/// matches.
+pub fn detect_from_devbox_script(script: &str) -> Option<AgentType> {
+    script.split('-').find_map(detect_from_basename)
+}
+
 /// PRD #20 M9: resolve a `type:<alias>` dashboard-filter token to an agent
 /// type, matching case-insensitively against either the agent's human [`label`]
 /// (e.g. `type:codex`, `type:ClaudeCode`) or any of its detection basenames
@@ -565,6 +576,35 @@ mod tests {
         assert_eq!(detect_from_basename("sh"), None);
         assert_eq!(detect_from_basename("vim"), None);
         assert_eq!(detect_from_basename(""), None);
+    }
+
+    /// PRD #536 follow-up: `devbox run <script>` names a devbox.json script,
+    /// not a further shell command string to recurse into, so
+    /// `detect_from_devbox_script` resolves the agent type from the script
+    /// name's OWN hyphen-separated segments — this fork's committed
+    /// `.dot-agent-deck.toml` role commands are exactly this shape
+    /// (`claude-sonnet-devbox`, `claude-opus-devbox`, `codex-devbox`). The
+    /// first segment that resolves via [`detect_from_basename`] wins; a
+    /// script with no recognized segment (or whose only segment is the
+    /// literal word "devbox" itself) stays unrecognized.
+    #[test]
+    fn detect_from_devbox_script_resolves_hyphenated_segments() {
+        assert_eq!(
+            detect_from_devbox_script("claude-sonnet-devbox"),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            detect_from_devbox_script("claude-opus-devbox"),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            detect_from_devbox_script("codex-devbox"),
+            Some(AgentType::Codex)
+        );
+        assert_eq!(detect_from_devbox_script("pi-big"), Some(AgentType::Pi));
+        assert_eq!(detect_from_devbox_script("some-random-script"), None);
+        // The literal word "devbox" is not itself a recognized basename.
+        assert_eq!(detect_from_devbox_script("devbox"), None);
     }
 
     /// The public `from_command` entry point (event.rs) still infers the type

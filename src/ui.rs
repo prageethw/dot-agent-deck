@@ -27,7 +27,9 @@ use crate::features::Features;
 use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
-use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
+use crate::project_config::{
+    ModeConfig, OrchestrationConfig, OrchestrationRoleConfig, load_project_config,
+};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, attempt_delivery_id,
     attempt_writes_payload, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
@@ -10182,6 +10184,33 @@ fn auto_generate_worktree_slug(dir: &Path) -> String {
     format!("orchestrator-{}", std::process::id())
 }
 
+/// Shared by both `open_orchestration_tab` call sites (live-open and
+/// restore-from-saved-config): registers each role pane and seeds its
+/// placeholder session, snapshotting `expects_agent_report` from the role's
+/// configured command. `dir` differs per caller (`dir_str` vs
+/// `saved_pane.dir`), which is the only thing that varies between the two.
+fn insert_role_placeholder_sessions(
+    st: &mut AppState,
+    role_pane_ids: &[String],
+    role_agent_ids: &[Option<String>],
+    roles: &[OrchestrationRoleConfig],
+    dir: &str,
+) {
+    for (i, (id, agent_id)) in role_pane_ids.iter().zip(role_agent_ids.iter()).enumerate() {
+        st.register_pane(id.clone());
+        let expects_agent_report =
+            crate::event::AgentType::from_command_including_devbox(Some(&roles[i].command))
+                .is_some();
+        st.insert_placeholder_session_awaiting_report(
+            id.clone(),
+            Some(dir.to_string()),
+            None,
+            agent_id.clone(),
+            expects_agent_report,
+        );
+    }
+}
+
 /// PRD #80: the single funnel. Every command [`Action`] — whether it came from
 /// a keystroke (today) or a button click (M2 on) — executes here and nowhere
 /// else. The keystroke branch in `run_tui` is a thin `KeyEvent -> Option<
@@ -11302,17 +11331,13 @@ fn dispatch_action(
                                 // `SessionStart` hook fires — preserving
                                 // the orchestration readiness gate's
                                 // 10-second fallback (pre-M2.13 contract).
-                                for (id, agent_id) in
-                                    role_pane_ids.iter().zip(role_agent_ids.iter())
-                                {
-                                    st.register_pane(id.clone());
-                                    st.insert_placeholder_session(
-                                        id.clone(),
-                                        Some(dir_str.clone()),
-                                        None,
-                                        agent_id.clone(),
-                                    );
-                                }
+                                insert_role_placeholder_sessions(
+                                    &mut st,
+                                    &role_pane_ids,
+                                    &role_agent_ids,
+                                    &orch_config.roles,
+                                    &dir_str,
+                                );
                                 // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
                                 for (i, role) in orch_config.roles.iter().enumerate() {
                                     st.pane_role_map
@@ -11593,6 +11618,19 @@ fn dispatch_action(
                     };
                     // `spawn_agent_type` and the wrapped `launch_command` (used
                     // for `cmd` above) were both resolved before the dims block.
+                    // Deliberately a SEPARATE, fresh call rather than reading
+                    // `spawn_agent_type.is_some()`: the badge decision must use
+                    // the devbox-widened `from_command_including_devbox`, while
+                    // `spawn_agent_type` (moved into `AgentSpawnOptions` below)
+                    // stays on the unwidened `from_command` that feeds the
+                    // wrap-vs-bare decision (see the invariant documented at
+                    // `agent_pty.rs:5871-5911`).
+                    let spawn_expects_agent_report = if req.command.is_empty() {
+                        false
+                    } else {
+                        AgentType::from_command_including_devbox(Some(req.command.as_str()))
+                            .is_some()
+                    };
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&dir_str),
@@ -11621,11 +11659,12 @@ fn dispatch_action(
                             {
                                 let mut st = state.blocking_write();
                                 st.register_pane(new_id.clone());
-                                st.insert_placeholder_session(
+                                st.insert_placeholder_session_awaiting_report(
                                     new_id.clone(),
                                     Some(dir_str.clone()),
                                     None,
                                     new_agent_id,
+                                    spawn_expects_agent_report,
                                 );
                             }
                             ui.pane_display_names
@@ -13674,17 +13713,13 @@ pub fn run_tui(
                                     .collect();
                                 {
                                     let mut st = state.blocking_write();
-                                    for (id, agent_id) in
-                                        role_pane_ids.iter().zip(role_agent_ids.iter())
-                                    {
-                                        st.register_pane(id.clone());
-                                        st.insert_placeholder_session(
-                                            id.clone(),
-                                            Some(saved_pane.dir.clone()),
-                                            None,
-                                            agent_id.clone(),
-                                        );
-                                    }
+                                    insert_role_placeholder_sessions(
+                                        &mut st,
+                                        &role_pane_ids,
+                                        &role_agent_ids,
+                                        &orch_config.roles,
+                                        &saved_pane.dir,
+                                    );
                                     for (i, role) in orch_config.roles.iter().enumerate() {
                                         st.pane_role_map
                                             .insert(role_pane_ids[i].clone(), role.name.clone());
@@ -21154,7 +21189,10 @@ fn render_session_card(
         session.agent_type.clone()
     };
     let is_placeholder = shown_agent_type == crate::event::AgentType::None;
-    let (status_label, status_style) = if is_placeholder {
+    let is_pending = is_placeholder && session.expects_agent_report;
+    let (status_label, status_style) = if is_pending {
+        ("Starting…", text_primary())
+    } else if is_placeholder {
         ("No agent", text_primary())
     } else {
         status_style(&session.status)
@@ -21466,7 +21504,12 @@ fn render_session_card(
         )),
     ]));
 
-    if is_placeholder {
+    if is_pending {
+        lines.push(Line::from(Span::styled(
+            "Waiting for agent to report in…",
+            text_primary(),
+        )));
+    } else if is_placeholder {
         lines.push(Line::from(Span::styled(
             "Launch an agent to get started",
             text_primary(),
@@ -26369,6 +26412,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -27391,6 +27435,248 @@ mod tests {
             rendered.contains("Launch an agent to get started"),
             "unhydrated placeholder (agent_type=None) must render the \
              empty-state line; got:\n{rendered}"
+        );
+    }
+
+    /// Scenario: Insert a placeholder session explicitly flagged as
+    /// awaiting an agent report (the shape a freshly-spawned Orchestration-
+    /// tab role pane has while its recognized-agent-CLI harness is still
+    /// starting, e.g. sitting at a "trust this folder" prompt), render it,
+    /// and assert the card shows "Starting…" rather than "No agent" or
+    /// "Launch an agent to get started".
+    #[spec("dashboard/placeholder/001")]
+    #[test]
+    fn dashboard_placeholder_001_pending_agent_shows_starting_not_no_agent() {
+        // Third case, distinct from both siblings above: a placeholder with
+        // NO agent_type (still `AgentType::None`) but explicitly marked
+        // `expects_agent_report = true` — the shape a freshly-spawned
+        // Orchestration-tab role pane has, spawned running a command
+        // recognized as a real agent CLI, before it has reported in. This
+        // must render as "Starting…", not as the genuinely-empty "No agent"
+        // / "Launch an agent to get started" copy those siblings pin.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("Starting…"),
+            "pending placeholder (agent_type=None, agent_id=Some) must show \
+             the 'Starting…' status; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("No agent"),
+            "pending placeholder (agent_type=None, agent_id=Some) must not \
+             show the genuinely-empty 'No agent' status; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Launch an agent to get started"),
+            "pending placeholder (agent_type=None, agent_id=Some) must not \
+             show the genuinely-empty 'Launch an agent to get started' \
+             body line; got:\n{rendered}"
+        );
+    }
+
+    /// Scenario: Insert a placeholder session via the plain
+    /// `insert_placeholder_session` constructor with a real `agent_id` but
+    /// no `agent_type` — the shape a bare shell pane, an unrecognized
+    /// command (`sleep 600`, `cat`), or any other non-agent PTY has — and
+    /// assert the card shows "No agent" / "Launch an agent to get started"
+    /// rather than "Starting…".
+    #[spec("dashboard/placeholder/002")]
+    #[test]
+    fn dashboard_placeholder_002_non_agent_command_keeps_no_agent() {
+        // Negative case proving the discriminator no longer false-positives
+        // on non-agent panes: `agent_id.is_some()` alone used to be read as
+        // "pending", which also matched bare shell panes and arbitrary
+        // non-agent commands. The plain constructor seeds
+        // `expects_agent_report = false`, so this must render the
+        // genuinely-empty copy, never "Starting…".
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+        );
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            !rendered.contains("Starting…"),
+            "non-agent placeholder (agent_type=None, agent_id=Some, \
+             expects_agent_report=false) must not show 'Starting…'; \
+             got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("No agent"),
+            "non-agent placeholder (agent_type=None, agent_id=Some, \
+             expects_agent_report=false) must show the genuinely-empty \
+             'No agent' status; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "non-agent placeholder (agent_type=None, agent_id=Some, \
+             expects_agent_report=false) must show the genuinely-empty \
+             'Launch an agent to get started' body line; got:\n{rendered}"
+        );
+    }
+
+    /// Scenario: Call the actual production `insert_role_placeholder_sessions`
+    /// helper — the real Orchestration-tab wiring, not the detection function
+    /// in isolation — with one role whose command is a devbox-wrapped agent
+    /// launch and one role whose command is a plain non-agent binary, and
+    /// assert the two resulting sessions' `expects_agent_report` come out
+    /// `true` and `false` respectively.
+    #[spec("dashboard/placeholder/003")]
+    #[test]
+    fn dashboard_placeholder_003_role_wiring_seeds_expects_agent_report_for_devbox_and_non_agent() {
+        // PRD #536 follow-up: this pins the production call site directly,
+        // against the real `OrchestrationRoleConfig` shape this fork's own
+        // `.dot-agent-deck.toml` roles use — the near-miss this round is
+        // fixing (a devbox-launched role silently auto-wrapping on respawn)
+        // was only caught by a dedicated `agent_pty`/`event` regression test,
+        // never by anything exercising this actual wiring. The devbox role's
+        // session must still end up `expects_agent_report == true` (it IS a
+        // recognized agent CLI, just launched through devbox), derived via
+        // the presentation-only `AgentType::from_command_including_devbox` —
+        // never via the shared `AgentType::from_command` that also feeds the
+        // respawn wrap decision.
+        let mut state = AppState::default();
+        let role_pane_ids = vec!["1".to_string(), "2".to_string()];
+        let role_agent_ids = vec![Some("d-1".to_string()), Some("d-2".to_string())];
+        let roles = vec![
+            OrchestrationRoleConfig {
+                name: "reviewer".to_string(),
+                command: "devbox run claude-sonnet-devbox".to_string(),
+                agent: None,
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            },
+            OrchestrationRoleConfig {
+                name: "scratch".to_string(),
+                command: "cat".to_string(),
+                agent: None,
+                start: false,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            },
+        ];
+
+        insert_role_placeholder_sessions(
+            &mut state,
+            &role_pane_ids,
+            &role_agent_ids,
+            &roles,
+            "/tmp",
+        );
+
+        let devbox_session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("pane 1's placeholder session must have been inserted");
+        assert!(
+            devbox_session.expects_agent_report,
+            "a role launched via `devbox run claude-sonnet-devbox` must seed \
+             expects_agent_report=true (it IS a recognized agent CLI, just \
+             launched through devbox); got {devbox_session:?}"
+        );
+
+        let non_agent_session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("2"))
+            .expect("pane 2's placeholder session must have been inserted");
+        assert!(
+            !non_agent_session.expects_agent_report,
+            "a role launched via a plain non-agent command (`cat`) must seed \
+             expects_agent_report=false; got {non_agent_session:?}"
         );
     }
 
@@ -29301,6 +29587,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -31272,6 +31559,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         }
     }
 
@@ -31791,6 +32079,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
 
         // Spacious: get all 3
@@ -31828,6 +32117,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -31856,6 +32146,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

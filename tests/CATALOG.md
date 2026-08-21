@@ -282,6 +282,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `even_row_heights` arithmetic in isolation (covered by `even_row_heights_seven_rows_thirty_two_matches_expected_split`); this test pins that the same split reaches the actual render path.
 - **Platform coverage:** mac+linux+windows.
 
+#### dashboard/placeholder
+
+##### dashboard/placeholder/001 — A placeholder explicitly awaiting an agent report renders "Starting…", not "No agent".
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a placeholder session inserted via `insert_placeholder_session_awaiting_report(.., expects_agent_report: true)` — still `agent_type == AgentType::None` (the Orchestration-tab role-pane shape, spawned running a command recognized as a real agent CLI, before its harness has reported in) — renders `"Starting…"` and neither `"No agent"` nor `"Launch an agent to get started"`.
+- **Does not assert:** the genuinely-idle placeholder case (agent_id also `None`), covered by `dashboard_placeholder_without_agent_type_shows_launch_an_agent`; the hydrated-known-`agent_type` case, covered separately by `dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent`; the non-agent-command negative case (real `agent_id`, `expects_agent_report == false`), covered by `dashboard/placeholder/002`; the reconnect-hydration path (`seed_hydrated_session`), which defers `expects_agent_report` to `false` even when the original spawn command was a recognized agent — a known, deliberate scope limitation, not a regression (renders `"No agent"` there instead of `"Starting…"`, same as before this redesign).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/placeholder/002 — A placeholder for a non-agent command (real `agent_id`, unrecognized/bare-shell command) keeps "No agent", never "Starting…".
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a placeholder session inserted via the plain `insert_placeholder_session` (real `agent_id`, `agent_type == AgentType::None`) — the shape a bare shell pane, an unrecognized command (`sleep 600`, `cat`), or any other non-agent PTY has — seeds `expects_agent_report == false` and renders `"No agent"` / `"Launch an agent to get started"`, never `"Starting…"`. This is the negative case proving the discriminator no longer false-positives on `agent_id.is_some()` alone.
+- **Does not assert:** the awaiting-report positive case, covered by `dashboard/placeholder/001`.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/placeholder/003 — `insert_role_placeholder_sessions` (the actual Orchestration-tab wiring, not the detection function in isolation) seeds `expects_agent_report` correctly for a devbox-launched role and a non-agent role.
+- **Layer:** L1 (direct call into the production `insert_role_placeholder_sessions` helper; no render).
+- **Agent:** none.
+- **Asserts:** given a two-role `Vec<OrchestrationRoleConfig>` — one role's `command` a devbox-wrapped agent launch (`devbox run claude-sonnet-devbox`, this fork's own real role-command shape), the other a non-agent command (`cat`) — `insert_role_placeholder_sessions` seeds the devbox role's session with `expects_agent_report == true` and the non-agent role's session with `expects_agent_report == false`. PRD #536 follow-up: this is the production call site that must derive its answer from the devbox-aware, presentation-only classifier (`AgentType::from_command_including_devbox`), never from the shared `AgentType::from_command` that also feeds the respawn wrap decision — pinning it here, against the real wiring, is what should have caught the near-miss `spawn_007_hook_learned_badge_does_not_change_respawn_launch` regression before CI did.
+- **Does not assert:** the render-level "Starting…" copy (covered by `dashboard/placeholder/001`/`002`); the respawn wrap decision itself (covered by `tests/agent_detection.rs`'s `spawn_007`/`spawn_008`); `AgentType::from_command_including_devbox`'s own classification rules in isolation (covered by `from_command_including_devbox_recognizes_devbox_run` in `src/event.rs`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
@@ -1096,14 +1119,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** behaviour on non-Linux filesystems (APFS/HFS+ reject non-UTF-8 filenames outright, so this scenario cannot exist there); which specific byte is preserved, only that the exact bytes round-trip.
 - **Platform coverage:** linux.
 
-##### worktree/reclaim/062 — Two pending worktrees whose names differ only in one non-UTF-8 byte render as two DIFFERENT bullets, so the operator can tell which directory `--yes` would delete.
+##### worktree/reclaim/900 — Two pending worktrees whose names differ only in one non-UTF-8 byte render as two DIFFERENT bullets, so the operator can tell which directory `--yes` would delete.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
 - **Agent:** none (two worktree directories built from raw bytes via `OsStr::from_bytes`/`Command::arg`, named `candidate-\xff` and `candidate-\xfe`, both MERGED and clean and deliberately left unmarked so both land on the `ask` surface).
 - **Asserts:** a **fixture precondition** that the scratch dir holds an entry whose raw bytes exactly match each intended name, and that the two names genuinely differ — ruling out "the filesystem normalised one of them" as the reason the bullets do or do not collide; then, as in `003`/`004`/`005`/`008`, that the exit code/stderr rule out clap's own unrecognized-subcommand error; a **control** that a bare `reclaim` still leaves both directories on disk, so the report is a decision pending rather than a post-mortem; that exactly two bullet lines appear; and finally that those two lines differ. The comparison is made on the subprocess's **raw stdout bytes**, never through `String::from_utf8_lossy` — comparing lossy strings would apply the very conversion under test, so a correct byte-distinct rendering could be reported as colliding purely because the harness collapsed it. Pins issue #578: `format_reclaim_human` rendered paths through `Path::to_string_lossy`, which maps every invalid sequence to `U+FFFD`, so two byte-distinct directories printed as one identical line while the removal acted on the distinct byte-exact values.
 - **Does not assert:** the escape's exact syntax — "the two lines differ" accepts every shape the issue allows (reversible escaping, disambiguation, or refusing to offer the reclaim), rather than pinning the implementation's choice; that a literal `\xFF` in a name cannot alias the raw byte `0xFF` (the unit test `display_path_does_not_alias_a_raw_byte_with_its_literal_escape_text` in `src/worktree_reclaim.rs` covers that half of injectivity, which needs no worktree); the `worktree list` PATH column (unit-tested alongside it); the `--json` document, whose `path` field is still lossy by deliberate schema decision.
 - **Platform coverage:** linux (as `008`: APFS/HFS+ reject non-UTF-8 filenames outright, so this scenario cannot exist there).
 
-##### worktree/reclaim/063 — A worktree created through the deck's REAL creation path reads as deck-owned and reaches the unattended `remove` verdict, while an otherwise-identical hand-made sibling stays foreign.
+##### worktree/reclaim/901 — A worktree created through the deck's REAL creation path reads as deck-owned and reaches the unattended `remove` verdict, while an otherwise-identical hand-made sibling stays foreign.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with one addition: the subject worktree is created by calling the production `issue_dispatch_run::create_worktree` in-process — the only `git worktree add` in `src/`, and the function every dispatch and every issue-dispatch fire goes through — rather than by the fixture's own `git worktree add`.
 - **Agent:** none (two worktrees on the same repo, both clean, both with a canned `MERGED` PR; one created by the production path, one by a plain `git worktree add`).
 - **Asserts:** a **fixture precondition** that the production call returned `WorktreeCreation::Created` — the already-claimed arm is somebody else's directory and is deliberately never marked, so a test that accepted it would prove nothing; then that `worktree list --json`'s entry for the deck-created worktree carries `owned: true` and `verdict: "remove"`; and, as a **control**, that the hand-made sibling carries `owned: false` and `verdict: "ask"` — without it, `owned` could be reading `true` for every worktree and the test would still pass. Nothing calls the fixture's `mark_owned` helper: the marker has to arrive from the creation path itself. Pins issue #425, where `OWNER_MARKER_FILENAME` was defined and read but written nowhere in `src/`, so every deck-created worktree read as foreign and the `remove` tier was unreachable in normal use.

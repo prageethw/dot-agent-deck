@@ -776,6 +776,15 @@ pub struct SessionState {
     /// carrying `None` must NOT clear a previously-known model, since most
     /// events don't carry one. `None` until the first event that does.
     pub model: Option<String>,
+    /// Pending-status redesign: `true` only when this placeholder was minted
+    /// via [`Self::insert_placeholder_session_awaiting_report`] for a pane
+    /// spawned running a recognized agent CLI that has not yet reported in.
+    /// Replaces the old `agent_id.is_some()` guess in `render_session_card`,
+    /// which also matched bare shells, arbitrary non-agent commands, and
+    /// `SessionEnd`-restored placeholders whose `agent_id` is carried
+    /// forward only for the reuse guard. `false` for every other
+    /// placeholder.
+    pub expects_agent_report: bool,
 }
 
 impl SessionState {
@@ -6213,6 +6222,39 @@ impl AppState {
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
     ) -> String {
+        self.insert_placeholder_session_inner(pane_id, cwd, agent_type, agent_id, false)
+    }
+
+    /// Pending-status redesign: sibling of [`Self::insert_placeholder_session`]
+    /// for the three call sites that spawn a pane running a recognized agent
+    /// CLI and therefore know, at mint time, that the placeholder is awaiting
+    /// that agent's first report. Every other caller keeps using the plain
+    /// constructor above, which seeds `expects_agent_report = false`.
+    pub fn insert_placeholder_session_awaiting_report(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        expects_agent_report: bool,
+    ) -> String {
+        self.insert_placeholder_session_inner(
+            pane_id,
+            cwd,
+            agent_type,
+            agent_id,
+            expects_agent_report,
+        )
+    }
+
+    fn insert_placeholder_session_inner(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        expects_agent_report: bool,
+    ) -> String {
         let session_id = session_id_for_pane(&pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
@@ -6236,6 +6278,7 @@ impl AppState {
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
                 model: None,
+                expects_agent_report,
             },
         );
         session_id
@@ -8161,6 +8204,7 @@ impl AppState {
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
                 model: event.model.clone(),
+                expects_agent_report: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -12432,6 +12476,7 @@ clear = false
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
                 model: None,
+                expects_agent_report: false,
             },
         );
 
@@ -13548,6 +13593,68 @@ clear = false
             !state.codex_hook_trust_failed.contains("pane"),
             "a later successful respawn on the same pane id must clear a \
              stale recorded failure rather than latching it forever"
+        );
+    }
+
+    /// Scenario: pending-status redesign blocker 2 — a `SessionEnd` for a
+    /// session that carries a real `agent_id` (state.rs's terminal-frame
+    /// restoration branch) rebuilds a placeholder via the plain
+    /// `insert_placeholder_session`, which must seed
+    /// `expects_agent_report = false`. Drive `apply_event` with the
+    /// `SessionEnd` and assert the restored placeholder's field directly,
+    /// so a restored session whose agent already exited can never render
+    /// as "Starting…" merely because its `agent_id` was carried forward
+    /// for the reuse guard.
+    #[test]
+    fn session_end_restored_placeholder_does_not_expect_agent_report() {
+        let mut state = AppState::default();
+        state.register_pane("9".to_string());
+        state.insert_placeholder_session(
+            "9".to_string(),
+            Some("/tmp".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some("agent-99".to_string()),
+        );
+
+        let session_id = "pane-9".to_string();
+        state.apply_event(AgentEvent {
+            session_id: session_id.clone(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("9".to_string()),
+            agent_id: Some("agent-99".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let restored = state
+            .sessions
+            .get(&session_id)
+            .expect("SessionEnd must restore a placeholder for a managed pane");
+        assert_eq!(
+            restored.agent_type,
+            AgentType::None,
+            "the restored placeholder's agent_type is unknown post-end"
+        );
+        assert_eq!(
+            restored.agent_id.as_deref(),
+            Some("agent-99"),
+            "the dying agent's agent_id is carried forward for the reuse guard"
+        );
+        assert!(
+            !restored.expects_agent_report,
+            "a SessionEnd restoration must not claim the restored \
+             placeholder is awaiting an agent report -- that would render \
+             'Starting...' permanently for a pane whose agent already \
+             exited"
         );
     }
 }

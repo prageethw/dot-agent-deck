@@ -390,6 +390,7 @@ fn make_session(
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     }
 }
 
@@ -2775,6 +2776,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
