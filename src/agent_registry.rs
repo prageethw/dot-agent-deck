@@ -320,6 +320,17 @@ pub fn detect_from_basename(basename: &str) -> Option<AgentType> {
         .map(|spec| spec.agent_type.clone())
 }
 
+/// Resolve an agent type from a devbox script name's hyphen-separated segments
+/// (this fork's convention: `claude-sonnet-devbox`, `codex-devbox`, `pi-big`, ...).
+/// A devbox script name is not itself a recognized basename, and its real
+/// underlying command is defined in `devbox.json`, not visible from the command
+/// string alone — so this resolves heuristically: the first segment that matches
+/// a recognized basename via [`detect_from_basename`] wins. `None` if no segment
+/// matches.
+pub fn detect_from_devbox_script(script: &str) -> Option<AgentType> {
+    script.split('-').find_map(detect_from_basename)
+}
+
 /// PRD #20 M9: resolve a `type:<alias>` dashboard-filter token to an agent
 /// type, matching case-insensitively against either the agent's human [`label`]
 /// (e.g. `type:codex`, `type:ClaudeCode`) or any of its detection basenames

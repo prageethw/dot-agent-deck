@@ -245,6 +245,18 @@ fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
             return crate::agent_registry::detect_from_basename(basename);
         }
 
+        // devbox launcher: `devbox run <script> [args...]`. The script name is a
+        // devbox.json script, not a further shell command to recurse into — resolve
+        // it via `detect_from_devbox_script`'s hyphen-segment heuristic. Any tokens
+        // after `<script>` (e.g. `--permission-mode plan`) are ignored, matching how
+        // this fork's own `.dot-agent-deck.toml` role commands are shaped.
+        if basename == "devbox"
+            && tokens.get(idx + 1).map(String::as_str) == Some("run")
+            && let Some(script) = tokens.get(idx + 2)
+        {
+            return crate::agent_registry::detect_from_devbox_script(script);
+        }
+
         // An ordinary binary token — resolve it directly.
         return crate::agent_registry::detect_from_basename(basename);
     }
