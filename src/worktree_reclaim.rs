@@ -152,8 +152,12 @@ const KIND_LINKED: &str = "linked";
 const KIND_ISOLATED_CLONE: &str = "isolated_clone";
 
 /// `WorktreeReport::verdict` value for an isolated clone whose branch has a
-/// MERGED PR and whose own current HEAD SHA equals that PR's merge-commit
-/// SHA exactly (fork#325 M4c, maintainer-decided rule) — distinct from
+/// MERGED PR and whose own current HEAD commit SHA equals that PR's own
+/// `headRefOid` exactly — the PR branch's own tip commit, not the merge
+/// commit GitHub creates on the base branch (fork#325 M4c round 3, reviewer
+/// B2; round 2's now-abandoned design compared against the merge-commit SHA
+/// instead — see [`isolated_clone_report`]'s own doc comment for why that
+/// was replaced) — distinct from
 /// [`KIND_ISOLATED_CLONE`], which every other isolated-clone row still
 /// reports as its `verdict` unchanged (unmerged, or merged-but-diverged).
 /// `kind` stays [`KIND_ISOLATED_CLONE`] regardless — this is a `verdict`-only
@@ -2289,13 +2293,36 @@ fn isolated_clone_report(
                 .to_string(),
         )
     } else {
+        // Reviewer L2 (PR #526 final round): this reason string used to
+        // claim the whole CLASS of isolated clones is "never auto-removed
+        // ... regardless of PR state or cleanliness" -- false as of M4c,
+        // which made some rows genuinely eligible (the branch above). Name
+        // which of the five fork#325 M4c gates THIS row actually failed
+        // instead of restating the pre-M4c blanket claim.
+        let mut unmet_gates: Vec<&str> = Vec::new();
+        if !has_attach_lock {
+            unmet_gates.push("no deck attach-lock provenance artifact");
+        }
+        if !clean {
+            unmet_gates.push("working tree is not clean");
+        }
+        if !single_local_branch {
+            unmet_gates.push("does not have exactly one local branch");
+        }
+        if !stash_empty {
+            unmet_gates.push("git stash list is not empty");
+        }
+        if !head_matches_merge {
+            unmet_gates.push("HEAD commit SHA does not equal a merged PR's headRefOid");
+        }
         (
             KIND_ISOLATED_CLONE.to_string(),
-            "isolated clone: automatic reclaim is deferred to a documented follow-up \
-             milestone -- never auto-removed by `worktree reclaim`, with or without --yes, \
-             regardless of PR state or cleanliness (mirrors RemovalPolicy::IsolatedClone's \
-             daemon-side precedent; fork#325 M4a)"
-                .to_string(),
+            format!(
+                "isolated clone: not eligible for automatic reclaim -- {} (fork#325 M4c \
+                 requires all five: a deck attach-lock, a clean tree, exactly one local \
+                 branch, an empty stash, and HEAD == a merged PR's headRefOid)",
+                unmet_gates.join(", ")
+            ),
         )
     };
     // Discovery already required this marker to be `is_file()`, but its
@@ -2485,8 +2512,8 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// examination pass and this removal can be seconds to minutes apart on a
 /// large reclaim batch, and the clone could have been actively worked on in
 /// that window (a new commit, a stash push, a second branch, uncommitted
-/// content). Immediately before the actual `remove_dir_all`, every mutable
-/// signal [`isolated_clone_report`]'s eligibility gate reads is re-derived
+/// content). Immediately before the actual `remove_dir_all`, 4 of the 5
+/// signals [`isolated_clone_report`]'s eligibility gate reads are re-derived
 /// FRESH from `worktree_path` alone — cleanliness, the local branch list,
 /// the stash list, and the merged PR's `headRefOid` compared against a
 /// freshly re-resolved `git rev-parse HEAD` — rather than trusting anything
@@ -2495,6 +2522,29 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// its only input (matching [`worktree/reclaim/071`]'s direct-call contract)
 /// rather than threading the examination pass's cached values through, so a
 /// caller can never accidentally pass a stale expectation.
+///
+/// **`has_attach_lock` is deliberately the one signal NOT re-derived here**
+/// (auditor N5 / reviewer N3, PR #526 final round). The other four reflect
+/// content a legitimately concurrent process could change during the
+/// examination-to-removal window — a new commit, a stash push, a second
+/// branch, an untracked file — which is exactly the hazard this
+/// re-verification exists to catch. The attach-lock provenance artifact is
+/// nothing like that: it is written once, under `state_dir()`, at
+/// `provision_isolated_clone_sync` time, keyed by the clone's own canonical
+/// PATH rather than anything inside its tree, and — per
+/// [`candidate_has_attach_lock`]'s own documented "stale entries" limit — is
+/// never removed even once the clone it names has been deleted. Nothing a
+/// live orchestration does inside the clone touches it, so it cannot
+/// legitimately flip from present to absent in this window the way the other
+/// four can flip from safe to unsafe. And because the check is purely
+/// path-keyed rather than clone-identity-keyed, re-deriving it here would
+/// answer the identical question [`isolated_clone_report`] already answered
+/// at examination time — it cannot even detect the one adjacent hazard that
+/// sounds similar (a different directory swapped in at the same path),
+/// since a swapped-in directory at that path still reads as `owned` by the
+/// same stale-path marker. Re-checking it would cost one more `is_file()`
+/// call but would not close any window this removal doesn't already close by
+/// re-deriving the four signals that genuinely can change.
 fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), String> {
     if !worktree_path.join(".git").is_dir() {
         return Err(
@@ -2688,19 +2738,34 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
 
     if !outcome.pending.is_empty() {
         out.push_str(&format!(
-            "{} worktree(s) reclaimable pending confirmation (kept for now):\n",
+            "{} item(s) reclaimable pending confirmation (kept for now):\n",
             outcome.pending.len()
         ));
+        // Auditor N3 (PR #526 final round): a pending isolated clone is
+        // categorically higher-stakes than a pending linked worktree --
+        // deleting it destroys a full standalone repository whose objects
+        // exist nowhere else, not just a linked `git worktree remove`. Tag
+        // each row so the distinction is visible in the list itself, not
+        // just in the trailing sentence below.
         for r in &outcome.pending {
-            out.push_str(&format!(
-                "  - {}\n",
-                sanitize_path_for_terminal_display(&r.path)
-            ));
+            let path = sanitize_path_for_terminal_display(&r.path);
+            if r.verdict == VERDICT_ISOLATED_CLONE_RECLAIMABLE {
+                out.push_str(&format!(
+                    "  - {path} (isolated clone -- standalone repository)\n"
+                ));
+            } else {
+                out.push_str(&format!("  - {path}\n"));
+            }
         }
         out.push_str(
-            "Run `dot-agent-deck worktree reclaim --yes` to remove worktrees in this state, \
-             regardless of whether the deck created them. The set is re-evaluated on that \
-             run.\n\n",
+            "Run `dot-agent-deck worktree reclaim --yes` to remove everything in this state. \
+             For a plain worktree that means removing it regardless of whether the deck \
+             created it. For an isolated clone the stakes are categorically higher -- it \
+             deletes that clone's entire `.git`, not just a linked worktree, and its objects \
+             exist nowhere else -- but an isolated clone reaches this list at all only when \
+             the deck's own attach-lock provenance artifact was found for it, so, unlike a \
+             plain worktree, it is never removed \"regardless of whether the deck created \
+             it\". The set is re-evaluated on that run.\n\n",
         );
     }
 
