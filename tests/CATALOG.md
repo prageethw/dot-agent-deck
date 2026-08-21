@@ -1323,6 +1323,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the TOCTOU re-verification `remove_isolated_clone_dir` does NOT yet do (reviewer M1's own recommendation — re-running the full eligibility check, not just the `.git`-shape check, immediately before deleting) — that is a coder follow-up, not this test's scope.
 - **Platform coverage:** mac+linux+windows.
 
+##### worktree/reclaim/072 — M4c, PR #526 round 3, reviewer M3. `worktree/reclaim/052` passes for an undocumented reason: its `gh` stub omits `headRefOid` entirely, so it only ever exercises the "head ref unresolvable" (`None`) path, never the case where `headRefOid` is genuinely present in the response but simply does not match the clone's own HEAD. An owned, clean, single-branch, no-stash isolated clone whose merged PR carries a well-formed but MISMATCHED `headRefOid` must stay exactly as conservative as `"isolated_clone"` (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (inline stub `gh` script carrying a present-but-mismatched `headRefOid`) — built through the real provisioner; the mismatched SHA is the clone's own real HEAD SHA reversed (asserted different), mirroring `068`'s own decoy technique.
+- **Agent:** none.
+- **Asserts:** the sanity assertion that the mismatched `headRefOid` genuinely differs from the clone's own HEAD SHA; the clone's `verdict` equals exactly `"isolated_clone"`; neither a bare reclaim nor `--yes` removes it, and the directory still exists on disk afterward.
+- **Does not assert:** the omitted-field (`None`) path already covered by `052`, or the exact-match positive case (`062`).
+- **Platform coverage:** mac+linux.
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.

@@ -167,32 +167,30 @@ const VERDICT_ISOLATED_CLONE_RECLAIMABLE: &str = "isolated_clone_reclaimable";
 /// resolved. `Unresolvable` and `NoPr` both keep — the distinction is only
 /// for the reported reason.
 ///
-/// `Merged` carries the PR's merge-commit SHA (fork#325 M4c) — `gh pr list
-/// --json mergeCommit` returns `{"oid": "<sha>"}` for a merged PR, resolved
-/// by [`resolve_pr_state`]. `None` when `gh`'s response carries no
-/// `mergeCommit.oid` at all (malformed/absent field) — deliberately never
-/// treated as "unresolvable" at the `PrState` level (a merged PR is still a
-/// merged PR for [`decide`]'s purposes). `merge_tree_sha` (fork#325 M4c
-/// tightening, auditor A8) is the merge commit's **tree** SHA, resolved via
-/// [`resolve_pr_merge_tree_sha`]'s separate `gh api graphql` round trip —
-/// `gh pr list --json`'s flat field selection cannot reach `mergeCommit.tree.oid`
-/// at all. This is the field [`isolated_clone_report`]'s tightened
-/// eligibility check actually compares against a clone's own HEAD tree SHA:
-/// on a squash-merge repo a genuine clone's own commit SHA essentially never
-/// equals `merge_sha` (GitHub's squash merge creates a brand-new commit
-/// object), while the trees agree once nothing local remains. `merge_sha`
-/// is retained for realism/logging even though eligibility no longer reads
-/// it directly. Neither field being unresolvable (`None`) is ever treated as
-/// "unresolvable" at the `PrState` level — but [`isolated_clone_report`]'s
-/// M4c comparison must treat a `None` `merge_tree_sha` as never eligible for
-/// the reclaimable verdict: an ambiguous signal must never widen eligibility
-/// for a safety-relevant deletion decision.
+/// `Merged` carries `headRefOid` (fork#325 M4c, PR #526 round 3, reviewer
+/// B2) — the PR BRANCH's own head commit SHA, exposed directly as a flat
+/// field by `gh pr list --json headRefOid`, resolved by [`resolve_pr_state`].
+/// This replaces round 2's `merge_sha`/`merge_tree_sha` pair (the merge
+/// commit GitHub creates ON THE BASE BRANCH, and that commit's tree):
+/// reviewer B2 measured live against this repo that a deck-provisioned
+/// clone's own HEAD is never equal to `mergeCommit.oid` under any GitHub
+/// merge strategy (PR #481 head `7339edd5f440` vs merge `1ceb919349ef`; PR
+/// #477 head `11d6327f2421` vs merge `5742ad1f93dd`), so round 2's
+/// `mergeCommit`-tree comparison could (almost) never fire for a genuine
+/// clone. `headRefOid` is exactly the clone's own reachable commit history
+/// instead — no second `gh api graphql` round trip needed (round 2's
+/// `resolve_pr_merge_tree_sha` machinery is removed entirely), since `gh pr
+/// list --json` already exposes it as a flat field. `None` when `gh`'s
+/// response carries no `headRefOid` at all (malformed/absent field) —
+/// deliberately never treated as "unresolvable" at the `PrState` level (a
+/// merged PR is still a merged PR for [`decide`]'s purposes), but
+/// [`isolated_clone_report`]'s M4c comparison must treat a `None`
+/// `head_ref_oid` as never eligible for the reclaimable verdict: an
+/// ambiguous signal must never widen eligibility for a safety-relevant
+/// deletion decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrState {
-    Merged {
-        merge_sha: Option<String>,
-        merge_tree_sha: Option<String>,
-    },
+    Merged { head_ref_oid: Option<String> },
     Open,
     ClosedUnmerged,
     NoPr,
@@ -1513,7 +1511,7 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             "--repo",
             &repo_slug,
             "--json",
-            "state,headRefName,headRepositoryOwner,mergeCommit,number",
+            "state,headRefName,headRepositoryOwner,headRefOid",
         ])
         .output();
     let out = match out {
@@ -1554,18 +1552,11 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
         )),
         ([one], _) => match one.get("state").and_then(|s| s.as_str()) {
             Some("MERGED") => {
-                let merge_sha = one
-                    .get("mergeCommit")
-                    .and_then(|m| m.get("oid"))
+                let head_ref_oid = one
+                    .get("headRefOid")
                     .and_then(|o| o.as_str())
                     .map(|s| s.to_string());
-                let pr_number = one.get("number").and_then(|n| n.as_u64());
-                let merge_tree_sha =
-                    pr_number.and_then(|n| resolve_pr_merge_tree_sha(repo_dir, &repo_slug, n));
-                PrState::Merged {
-                    merge_sha,
-                    merge_tree_sha,
-                }
+                PrState::Merged { head_ref_oid }
             }
             Some("OPEN") => PrState::Open,
             Some("CLOSED") => PrState::ClosedUnmerged,
@@ -1577,45 +1568,6 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             owner_matches.len()
         )),
     }
-}
-
-/// Resolve a merged PR's merge-commit **tree** SHA via `gh api graphql`
-/// (fork#325 M4c tightening, auditor A8) — `gh pr list --json`'s flat field
-/// selection exposes a fixed set with no sub-selection into `mergeCommit`,
-/// so it cannot reach `mergeCommit.tree.oid` no matter which field names are
-/// requested (confirmed separately); a second `gh` subcommand able to name
-/// an explicit GraphQL query is the only way to reach it. `repo_slug` is
-/// split into `owner`/`name` for the query's own `repository(owner:...,
-/// name:...)` arguments — the same split [`resolve_pr_state`] already
-/// performs for `expected_owner`. Returns `None` on any spawn/exit/parse
-/// failure, an unparseable `repo_slug`, or a response missing the field at
-/// any point along `data.repository.pullRequest.mergeCommit.tree.oid` —
-/// every caller of this function fails closed on `None`, never treating an
-/// unresolvable tree SHA as a match.
-fn resolve_pr_merge_tree_sha(repo_dir: &Path, repo_slug: &str, pr_number: u64) -> Option<String> {
-    let (owner, name) = repo_slug.split_once('/')?;
-    let query = format!(
-        "query{{repository(owner:\"{owner}\",name:\"{name}\"){{pullRequest(number:{pr_number}){{mergeCommit{{oid tree{{oid}}}}}}}}}}"
-    );
-    let out = Command::new("gh")
-        .current_dir(repo_dir)
-        .args(["api", "graphql", "-f", &format!("query={query}")])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value
-        .get("data")?
-        .get("repository")?
-        .get("pullRequest")?
-        .get("mergeCommit")?
-        .get("tree")?
-        .get("oid")?
-        .as_str()
-        .map(|s| s.to_string())
 }
 
 /// Examine every linked worktree of the repo rooted at `repo_dir`: resolve PR
@@ -2093,22 +2045,24 @@ fn resolve_isolated_clone_branch(clone_dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(raw).into_owned())
 }
 
-/// Resolve an isolated clone's own current HEAD **tree** SHA via `git
-/// rev-parse HEAD^{tree}`, run inside the clone itself (fork#325 M4c
-/// tightening, auditor A8) — `None` on any spawn/exit/parse failure. Mirrors
+/// Resolve an isolated clone's own current HEAD **commit** SHA via `git
+/// rev-parse HEAD`, run inside the clone itself (fork#325 M4c, PR #526 round
+/// 3, reviewer B2) — `None` on any spawn/exit/parse failure. Mirrors
 /// [`resolve_isolated_clone_branch`]'s shape exactly, including running via
 /// [`git_in_untrusted_dir`] for the same reason: this is a `git` invocation
 /// with `current_dir` set inside an untrusted candidate. Used by
-/// [`isolated_clone_report`] to compare against a merged PR's merge-commit
-/// **tree** SHA ([`PrState::Merged::merge_tree_sha`], via
-/// [`resolve_pr_merge_tree_sha`]) — content equality, not the pre-tightening
-/// commit-SHA equality the earlier (removed) rule compared, since a
-/// squash-merge repo's commit SHAs essentially never agree between a clone
-/// still on its own work branch and the PR's own squash commit while their
-/// trees, once nothing local remains, do.
-fn resolve_isolated_clone_head_tree_sha(clone_dir: &Path) -> Option<String> {
+/// [`isolated_clone_report`] to compare against a merged PR's own
+/// `headRefOid` ([`PrState::Merged::head_ref_oid`]) — plain commit-SHA
+/// equality, replacing round 2's `HEAD^{tree}` comparison
+/// (`resolve_isolated_clone_head_tree_sha`, removed): `headRefOid` names the
+/// PR branch's own tip commit, which for a deck-provisioned clone that has
+/// merged cleanly and picked up no local drift IS the clone's own `git
+/// rev-parse HEAD` — no tree-level comparison needed once the round-2
+/// mismatch (comparing against the base-branch merge commit instead) is
+/// fixed at the source.
+fn resolve_isolated_clone_head_sha(clone_dir: &Path) -> Option<String> {
     let out = git_in_untrusted_dir(clone_dir)
-        .args(["rev-parse", "HEAD^{tree}"])
+        .args(["rev-parse", "HEAD"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -2211,21 +2165,45 @@ fn resolve_isolated_clone_stash_list(clone_dir: &Path) -> Option<Vec<String>> {
 /// may hold a second branch with commits no copy exists of elsewhere
 /// (auditor A3); (4) an empty `git stash list` — the same local-only-content
 /// hazard as (3), through git's other local-only ref namespace (auditor A3);
-/// and (5) a MERGED PR whose merge-commit **tree** SHA equals this clone's
-/// own current HEAD tree SHA exactly ([`VERDICT_ISOLATED_CLONE_RECLAIMABLE`])
-/// — tree equality, not the pre-tightening commit-SHA equality, because a
-/// squash-merge repo's commit SHAs essentially never agree between a clone
-/// still on its own work branch and the PR's own squash commit, while their
-/// trees, once nothing local remains, do (auditor A8 — the gap that made the
-/// first shipped rule inert for exactly the real clones this milestone
-/// exists to reclaim). [`run_reclaim`] gets a dedicated match arm for
-/// [`VERDICT_ISOLATED_CLONE_RECLAIMABLE`], using a removal primitive other
-/// than `remove_worktree_dir`'s `git worktree remove` (which fails loudly
-/// against a plain clone, not a linked worktree). Every other case is
-/// unaffected and still hard-codes [`KIND_ISOLATED_CLONE`] exactly as before
-/// this milestone. `None`/unresolvable anywhere in this five-way chain fails
-/// closed to "not eligible" — the same stance the pre-tightening rule took
-/// for an unresolvable merge SHA.
+/// and (5) a MERGED PR whose own `headRefOid` equals this clone's own
+/// current HEAD commit SHA exactly ([`VERDICT_ISOLATED_CLONE_RECLAIMABLE`],
+/// fork#325 M4c, PR #526 round 3, reviewer B2) — the PR BRANCH's own tip
+/// commit, not the merge commit GitHub creates on the base branch (round
+/// 2's now-removed `mergeCommit`-tree comparison): reviewer B2 measured
+/// live against this repo that a deck-provisioned clone's own HEAD is never
+/// equal to `mergeCommit.oid` under any GitHub merge strategy (PR #481 head
+/// `7339edd5f440` vs merge `1ceb919349ef`; PR #477 head `11d6327f2421` vs
+/// merge `5742ad1f93dd`), so round 2's rule could (almost) never fire for a
+/// genuine clone — `headRefOid` is exactly the clone's own reachable commit
+/// history instead (auditor A8's original tree-SHA tightening is
+/// superseded by this redesign, not layered on top of it). [`run_reclaim`]
+/// gets a dedicated match arm for [`VERDICT_ISOLATED_CLONE_RECLAIMABLE`],
+/// using a removal primitive other than `remove_worktree_dir`'s `git
+/// worktree remove` (which fails loudly against a plain clone, not a linked
+/// worktree). Every other case is unaffected and still hard-codes
+/// [`KIND_ISOLATED_CLONE`] exactly as before this milestone.
+/// `None`/unresolvable anywhere in this five-way chain fails closed to "not
+/// eligible" — the same stance the pre-tightening rule took for an
+/// unresolvable merge SHA.
+///
+/// **Known residual (M2, PR #526 round 3):** these five conditions prove
+/// PROVENANCE (the deck created this clone) and CONTENT SAFETY (nothing
+/// would be lost), never LIVENESS (whether the clone is currently in active
+/// use). Issue #325's original incident was exactly "an orchestration
+/// deleted another orchestration's actively-in-use worktree" — and a clone
+/// can satisfy every condition above while a live orchestration is still
+/// working in it (e.g. about to make a new commit). The daemon tracks
+/// liveness for its own dispatched worktrees in-process
+/// ([`crate::issue_dispatch_run::WorktreeRegistry`] /
+/// `worktree_still_in_use`), but `worktree reclaim` is a plain CLI
+/// subprocess (`run_worktree_reclaim_cli`) that never connects to the
+/// daemon socket at all — that in-memory signal is not reachable from this
+/// call path, and nothing here invents a substitute for it (a heuristic
+/// liveness probe would be worse than none: a false "not live" reads as
+/// license to delete). This is accepted as a residual rather than gated,
+/// consistent with this module's existing honesty about other limits (see
+/// `owned`'s same-uid caveat above) — closing it needs a signal `worktree
+/// reclaim` can actually reach, which is future work, not this milestone.
 ///
 /// Final round (reviewer F13 / auditor A1/B1): `owned` and `owner`/
 /// `owner_kind` below are now backed by `candidate.has_attach_lock` —
@@ -2278,16 +2256,15 @@ fn isolated_clone_report(
         ),
         None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
     };
-    // Fork#325 M4c tightened rule (maintainer-decided, after an audit found
-    // 3 blocker-severity gaps in the first shipped version): the only
-    // condition that ever widens this row's verdict past the
-    // permanently-conservative `KIND_ISOLATED_CLONE` default is the AND of
-    // all five gates below -- see this function's own doc comment for why
-    // each one is required. Every resolution here fails closed: a `None`
-    // anywhere in the chain (an unresolvable branch listing, stash list, or
-    // tree SHA) makes the corresponding gate `false`, never treated as a
-    // pass.
-    let head_tree_sha = resolve_isolated_clone_head_tree_sha(&path);
+    // Fork#325 M4c redesigned rule (maintainer-decided, PR #526 round 3,
+    // reviewer B2): the only condition that ever widens this row's verdict
+    // past the permanently-conservative `KIND_ISOLATED_CLONE` default is the
+    // AND of all five gates below -- see this function's own doc comment for
+    // why each one is required, and for M2's documented liveness residual.
+    // Every resolution here fails closed: a `None` anywhere in the chain (an
+    // unresolvable branch listing, stash list, or HEAD SHA) makes the
+    // corresponding gate `false`, never treated as a pass.
+    let head_sha = resolve_isolated_clone_head_sha(&path);
     let local_branches = resolve_isolated_clone_local_branches(&path);
     let stash_list = resolve_isolated_clone_stash_list(&path);
     let single_local_branch = branch
@@ -2295,22 +2272,20 @@ fn isolated_clone_report(
         .zip(local_branches.as_ref())
         .is_some_and(|(b, branches)| branches == &vec![b.clone()]);
     let stash_empty = stash_list.as_ref().is_some_and(Vec::is_empty);
-    let tree_matches_merge = matches!(
+    let head_matches_merge = matches!(
         &pr_state,
         PrState::Merged {
-            merge_tree_sha: Some(t),
-            ..
-        } if head_tree_sha.as_deref() == Some(t.as_str())
+            head_ref_oid: Some(oid),
+        } if head_sha.as_deref() == Some(oid.as_str())
     );
     let is_reclaim_eligible =
-        has_attach_lock && clean && single_local_branch && stash_empty && tree_matches_merge;
+        has_attach_lock && clean && single_local_branch && stash_empty && head_matches_merge;
     let (verdict, reason) = if is_reclaim_eligible {
         (
             VERDICT_ISOLATED_CLONE_RECLAIMABLE.to_string(),
             "isolated clone: owned, clean, has exactly one local branch and no stash entries, \
-             and this clone's HEAD tree SHA equals the merged PR's merge-commit tree SHA \
-             exactly -- eligible for automatic reclaim (fork#325 M4c, maintainer-decided \
-             tightened rule)"
+             and this clone's own HEAD commit SHA equals the merged PR's headRefOid exactly -- \
+             eligible for automatic reclaim (fork#325 M4c, PR #526 round 3, reviewer B2)"
                 .to_string(),
         )
     } else {
@@ -2503,6 +2478,23 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// `tracing::info!` trace on success, sanitized identically, so a
 /// post-incident reader has one place to grep `DOT_AGENT_DECK_LOG` for
 /// either removal path.
+///
+/// **M1 TOCTOU re-verification (fork#325 M4c, PR #526 round 3, reviewer
+/// M1):** the `.git`-shape check above is only a structural sanity check,
+/// not a re-run of the eligibility gate — [`examine_worktrees`]'s
+/// examination pass and this removal can be seconds to minutes apart on a
+/// large reclaim batch, and the clone could have been actively worked on in
+/// that window (a new commit, a stash push, a second branch, uncommitted
+/// content). Immediately before the actual `remove_dir_all`, every mutable
+/// signal [`isolated_clone_report`]'s eligibility gate reads is re-derived
+/// FRESH from `worktree_path` alone — cleanliness, the local branch list,
+/// the stash list, and the merged PR's `headRefOid` compared against a
+/// freshly re-resolved `git rev-parse HEAD` — rather than trusting anything
+/// computed during examination; any mismatch refuses (returns `Err`, never
+/// deletes). This deliberately takes the signature's own two arguments as
+/// its only input (matching [`worktree/reclaim/071`]'s direct-call contract)
+/// rather than threading the examination pass's cached values through, so a
+/// caller can never accidentally pass a stale expectation.
 fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), String> {
     if !worktree_path.join(".git").is_dir() {
         return Err(
@@ -2511,6 +2503,72 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
                 .to_string(),
         );
     }
+
+    let branch = resolve_isolated_clone_branch(worktree_path).ok_or_else(|| {
+        "refusing to remove: the clone's current branch could not be re-resolved immediately \
+         before deletion (detached HEAD, or the resolution itself failed) -- it could not have \
+         been examined as reclaim-eligible in the first place"
+            .to_string()
+    })?;
+    let cleanliness = check_cleanliness(worktree_path);
+    if cleanliness != Cleanliness::Clean {
+        return Err(format!(
+            "refusing to remove: the clone is no longer clean immediately before deletion \
+             ({cleanliness:?}) -- it may have been actively worked on since it was examined"
+        ));
+    }
+    let local_branches = resolve_isolated_clone_local_branches(worktree_path).ok_or_else(|| {
+        "refusing to remove: the clone's local branch list could not be re-resolved \
+         immediately before deletion"
+            .to_string()
+    })?;
+    if local_branches != vec![branch.clone()] {
+        return Err(
+            "refusing to remove: the clone no longer has exactly one local branch matching its \
+             current branch immediately before deletion -- a second local branch may have been \
+             created since it was examined"
+                .to_string(),
+        );
+    }
+    let stash_list = resolve_isolated_clone_stash_list(worktree_path).ok_or_else(|| {
+        "refusing to remove: the clone's stash list could not be re-resolved immediately \
+         before deletion"
+            .to_string()
+    })?;
+    if !stash_list.is_empty() {
+        return Err(
+            "refusing to remove: the clone now carries a non-empty stash list immediately \
+             before deletion -- a stash may have been pushed since it was examined"
+                .to_string(),
+        );
+    }
+    let head_ref_oid = match resolve_pr_state(worktree_path, &branch) {
+        PrState::Merged {
+            head_ref_oid: Some(oid),
+        } => oid,
+        other => {
+            return Err(format!(
+                "refusing to remove: the branch's PR state could not be re-resolved as \
+                 merged-with-a-known-headRefOid immediately before deletion (got {:?}) -- it \
+                 may have changed since the clone was examined",
+                other.label()
+            ));
+        }
+    };
+    let head_sha = resolve_isolated_clone_head_sha(worktree_path).ok_or_else(|| {
+        "refusing to remove: the clone's own HEAD commit SHA could not be re-resolved \
+         immediately before deletion"
+            .to_string()
+    })?;
+    if head_sha != head_ref_oid {
+        return Err(
+            "refusing to remove: the clone's own HEAD commit no longer equals the merged PR's \
+             headRefOid immediately before deletion -- a new local commit may have been made \
+             since it was examined"
+                .to_string(),
+        );
+    }
+
     std::fs::remove_dir_all(worktree_path).map_err(|e| {
         format!("failed to remove isolated clone directory (requested by {remover}): {e}")
     })?;
@@ -6744,6 +6802,120 @@ mod tests {
         assert!(
             clone_dir.join("some-file.txt").exists(),
             "the refusal must not touch the directory's other contents"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4c, PR #526 round 3, reviewer M3 --
+    /// `worktree_reclaim_052` passes for an undocumented reason: its `gh`
+    /// stub omits `headRefOid` entirely, so it only ever exercises the
+    /// "head ref unresolvable" (`None`) path, never the case where
+    /// `headRefOid` is genuinely PRESENT in the response but simply does
+    /// not match the clone's own HEAD. This test closes that gap
+    /// explicitly: an owned, clean, single-branch, no-stash isolated clone
+    /// whose merged PR carries a well-formed but MISMATCHED `headRefOid`
+    /// must stay exactly as conservative as `"isolated_clone"`.
+    #[spec("worktree/reclaim/072")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_072_head_ref_oid_present_but_mismatched_stays_conservative() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-mismatched-head-ref-oid");
+        let creator = "issue-dispatch:mismatched-head-ref-oid#2010";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "mismatched-head-ref-oid-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        // A well-formed 40-char hex `headRefOid` that is deliberately NOT
+        // the clone's own HEAD -- present, unlike worktree_reclaim_052's
+        // fixture, and reversing the real SHA guarantees it differs (not
+        // merely by construction -- asserted below), mirroring
+        // worktree_reclaim_068's own decoy technique.
+        let mismatched_head_ref_oid: String = clone_head_sha.chars().rev().collect();
+        assert_ne!(
+            mismatched_head_ref_oid, clone_head_sha,
+            "sanity: the mismatched headRefOid must actually differ from the clone's own HEAD, \
+             or this test would not be exercising the present-but-mismatched path at all"
+        );
+
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(
+            &bindir,
+            "mismatched-head-ref-oid-branch",
+            &mismatched_head_ref_oid,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+
+        assert_eq!(
+            clone_report.verdict.as_str(),
+            "isolated_clone",
+            "an owned, clean, single-branch, no-stash isolated clone whose merged PR carries a \
+             well-formed but MISMATCHED headRefOid must never report the redesigned M4c \
+             reclaim-eligible verdict -- got {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+
+        let bare = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !bare.removed.iter().any(|r| r.real_path == clone_dir),
+            "a bare `worktree reclaim` must never remove a mismatched-headRefOid isolated \
+             clone, got removed: {:?}",
+            bare.removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the mismatched-headRefOid isolated clone directory must still exist on disk after \
+             a bare reclaim"
+        );
+
+        let confirmed = run_reclaim(&repo, true, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !confirmed.removed.iter().any(|r| r.real_path == clone_dir),
+            "`worktree reclaim --yes` must never remove a mismatched-headRefOid isolated clone \
+             either, got removed: {:?}",
+            confirmed
+                .removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the mismatched-headRefOid isolated clone directory must still exist on disk after \
+             `reclaim --yes`"
         );
     }
 }

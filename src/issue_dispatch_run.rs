@@ -165,10 +165,22 @@ pub enum RemovalPolicy {
     /// removal under this policy at all — it always reports
     /// [`RemoveOutcome::Kept`] with
     /// [`crate::event::KeptReason::IsolatedClone`], regardless of
-    /// dirtiness, deferring an actually-safe automatic removal to PRD
-    /// fork#325 M4 (future, not this milestone — the same deferral
-    /// `provision_isolated_clone_sync`'s own doc comment already accepts
-    /// for `crate::worktree_reclaim`).
+    /// dirtiness. This stays true even now that PRD fork#325 M4c has
+    /// shipped an actually-safe automatic removal path
+    /// (`crate::worktree_reclaim::isolated_clone_report`'s five-condition,
+    /// `headRefOid`-based eligibility rule, plus `remove_isolated_clone_dir`)
+    /// — that path lives entirely on the separate `worktree reclaim` CLI
+    /// surface (a deliberate, operator-invoked, `--yes`-gated pass over
+    /// every discovered isolated clone), not on this daemon-side tab-close
+    /// removal path, which fires automatically the instant the last agent
+    /// rooted in a worktree closes. Reusing M4c's eligibility rule here
+    /// would need its own decision (the tab-close path has no equivalent of
+    /// `worktree reclaim`'s explicit `--yes` confirmation, and M4c's own
+    /// documented residual — no liveness signal, only provenance and
+    /// content safety, see that rule's own doc comment — is a materially
+    /// different risk on a path that runs unattended on every close rather
+    /// than only when an operator asks). Not attempted in this milestone;
+    /// this policy is unchanged by M4c.
     IsolatedClone,
 }
 
@@ -1313,12 +1325,16 @@ pub(crate) enum IsolatedCloneOutcome {
 /// target path now contend for the exact same lock file, not two unrelated
 /// ones.
 ///
-/// PRD fork#325 M4 (future, not this milestone): [`crate::worktree_reclaim`]'s
-/// ownership-marker scanning assumes every marked directory is a linked
-/// worktree of a known clone root; an isolated clone is its own independent
-/// repository, invisible to that scan today. The marker is still written
-/// (best-effort, matching every other creation path) so a future M4 fix has
-/// something to find — it just does not do anything yet.
+/// PRD fork#325 M4a (shipped, PR #510): the marker written here is what
+/// [`crate::worktree_reclaim::discover_isolated_clones`]'s dedicated
+/// sibling-directory scan now finds — [`crate::worktree_reclaim`]'s
+/// ownership-marker scanning for LINKED worktrees still assumes every marked
+/// directory is one of a known clone root, but an isolated clone is
+/// discovered through that separate scan instead, not through this one.
+/// M4c (shipped, PR #526) goes further still: a clone this scan finds can be
+/// automatically reclaimed under `isolated_clone_report`'s five-condition,
+/// `headRefOid`-based eligibility rule — see that function's own doc
+/// comment and `docs/develop/shared-clone-architecture.md`.
 ///
 /// PRD fork#325 fix round (reviewer P1-1, P1-2): two behaviors this function
 /// used to leave unfinished, both now handled after the clone succeeds —
