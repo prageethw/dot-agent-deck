@@ -119,6 +119,7 @@ fn selected_card_fixture() -> SessionState {
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     }
 }
 

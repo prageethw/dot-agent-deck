@@ -245,6 +245,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `even_row_heights` arithmetic in isolation (covered by `even_row_heights_seven_rows_thirty_two_matches_expected_split`); this test pins that the same split reaches the actual render path.
 - **Platform coverage:** mac+linux+windows.
 
+#### dashboard/placeholder
+
+##### dashboard/placeholder/001 — A placeholder explicitly awaiting an agent report renders "Starting…", not "No agent".
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a placeholder session inserted via `insert_placeholder_session_awaiting_report(.., expects_agent_report: true)` — still `agent_type == AgentType::None` (the Orchestration-tab role-pane shape, spawned running a command recognized as a real agent CLI, before its harness has reported in) — renders `"Starting…"` and neither `"No agent"` nor `"Launch an agent to get started"`.
+- **Does not assert:** the genuinely-idle placeholder case (agent_id also `None`), covered by `dashboard_placeholder_without_agent_type_shows_launch_an_agent`; the hydrated-known-`agent_type` case, covered separately by `dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent`; the non-agent-command negative case (real `agent_id`, `expects_agent_report == false`), covered by `dashboard/placeholder/002`; the reconnect-hydration path (`seed_hydrated_session`), which defers `expects_agent_report` to `false` even when the original spawn command was a recognized agent — a known, deliberate scope limitation, not a regression (renders `"No agent"` there instead of `"Starting…"`, same as before this redesign).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/placeholder/002 — A placeholder for a non-agent command (real `agent_id`, unrecognized/bare-shell command) keeps "No agent", never "Starting…".
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a placeholder session inserted via the plain `insert_placeholder_session` (real `agent_id`, `agent_type == AgentType::None`) — the shape a bare shell pane, an unrecognized command (`sleep 600`, `cat`), or any other non-agent PTY has — seeds `expects_agent_report == false` and renders `"No agent"` / `"Launch an agent to get started"`, never `"Starting…"`. This is the negative case proving the discriminator no longer false-positives on `agent_id.is_some()` alone.
+- **Does not assert:** the awaiting-report positive case, covered by `dashboard/placeholder/001`.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/placeholder/003 — `insert_role_placeholder_sessions` (the actual Orchestration-tab wiring, not the detection function in isolation) seeds `expects_agent_report` correctly for a devbox-launched role and a non-agent role.
+- **Layer:** L1 (direct call into the production `insert_role_placeholder_sessions` helper; no render).
+- **Agent:** none.
+- **Asserts:** given a two-role `Vec<OrchestrationRoleConfig>` — one role's `command` a devbox-wrapped agent launch (`devbox run claude-sonnet-devbox`, this fork's own real role-command shape), the other a non-agent command (`cat`) — `insert_role_placeholder_sessions` seeds the devbox role's session with `expects_agent_report == true` and the non-agent role's session with `expects_agent_report == false`. PRD #536 follow-up: this is the production call site that must derive its answer from the devbox-aware, presentation-only classifier (`AgentType::from_command_including_devbox`), never from the shared `AgentType::from_command` that also feeds the respawn wrap decision — pinning it here, against the real wiring, is what should have caught the near-miss `spawn_007_hook_learned_badge_does_not_change_respawn_launch` regression before CI did.
+- **Does not assert:** the render-level "Starting…" copy (covered by `dashboard/placeholder/001`/`002`); the respawn wrap decision itself (covered by `tests/agent_detection.rs`'s `spawn_007`/`spawn_008`); `AgentType::from_command_including_devbox`'s own classification rules in isolation (covered by `from_command_including_devbox_recognizes_devbox_run` in `src/event.rs`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
