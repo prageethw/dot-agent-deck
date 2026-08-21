@@ -20381,7 +20381,10 @@ fn render_session_card(
     show_agent_type_badge: bool,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
-    let (status_label, status_style) = if is_placeholder {
+    let is_pending = is_placeholder && session.agent_id.is_some();
+    let (status_label, status_style) = if is_pending {
+        ("Starting…", text_dim())
+    } else if is_placeholder {
         ("No agent", text_primary())
     } else {
         status_style(&session.status)
@@ -20690,7 +20693,12 @@ fn render_session_card(
         )),
     ]));
 
-    if is_placeholder {
+    if is_pending {
+        lines.push(Line::from(Span::styled(
+            "Waiting for agent to report in…",
+            text_dim(),
+        )));
+    } else if is_placeholder {
         lines.push(Line::from(Span::styled(
             "Launch an agent to get started",
             text_primary(),
