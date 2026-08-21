@@ -1340,6 +1340,90 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the no-provenance-file case (`worktree/reclaim/054`), the vacated-linked-worktree-lock case (`worktree/reclaim/056`), or the pre-planted-dispatch-path case (`worktree/reclaim/057`) — this is the bare self-planted-artifact forgery those three do not cover.
 - **Platform coverage:** mac+linux+windows.
 
+##### worktree/reclaim/062 — M4c REDESIGNED rule (RED), PR #526 round 3, reviewer B2. `mergeCommit.oid` (and round 2's switch to its tree) is the commit GitHub's merge creates on the BASE branch — never equal to a deck-provisioned clone's own HEAD under any GitHub merge strategy (measured live: PR #481 head `7339edd5f440` vs merge `1ceb919349ef`; PR #477 head `11d6327f2421` vs merge `5742ad1f93dd`), so round 2's rule could (almost) never fire in production. The redesigned rule compares against the PR's own `headRefOid` instead — the PR branch's own head commit, a flat `gh pr list --json` field needing no `gh api graphql` round trip at all. An isolated clone that is owned (a real attach-lock artifact via `provision_isolated_clone_sync`), clean, has exactly one local branch matching its resolved branch with an empty `git stash list`, and whose own `git rev-parse HEAD` equals the merged PR's `headRefOid` exactly must report as auto-reclaim-eligible (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script answering `pr list` with a flat `headRefOid` field) — built through the real production provisioner (`issue_dispatch_run::provision_isolated_clone_sync`), not a hand-assembled marker, so the genuine attach-lock artifact is what's examined.
+- **Agent:** none.
+- **Asserts:** a deck-owned, clean, single-local-branch, no-stash isolated clone whose own HEAD commit SHA equals a merged PR's `headRefOid` reports `verdict == "isolated_clone_reclaimable"`.
+- **Does not assert:** any of the six negative gates each pinned individually (`worktree/reclaim/063`-`067`), the decoy-mismatched-mergeCommit regression (`068`), or that `run_reclaim` actually removes the clone (`069`/`070`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/063 — M4c redesign, PR #526 round 3 (headRefOid-equality negative, the sibling `062` proves positively). An isolated clone that is owned, clean, and carries no extraneous local refs — otherwise a full match against the redesigned rule — but whose CURRENT HEAD commit has diverged from the merged PR's `headRefOid` (an extra local commit made after the point the PR merged) must stay exactly as conservative as `worktree/reclaim/052` — never an automatic-removal verdict, and never the redesigned M4c reclaim-eligible verdict either. Built through the real provisioner so this isolates the headRefOid-equality gate from the ownership/cleanliness/extraneous-refs gates `064`-`067` cover individually (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script).
+- **Agent:** none.
+- **Asserts:** the head-diverged clone's `verdict` remains exactly `"isolated_clone"`; neither a bare `worktree reclaim` nor `--yes` removes it.
+- **Does not assert:** the exact-match positive case (`worktree/reclaim/062`), or the other four negative gates (`064`-`067`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/064 — M4c redesign, PR #526 round 3. An isolated clone that is owned, has a single local branch matching its resolved branch, no stash entries, and a HEAD commit equal to the merged PR's `headRefOid` — otherwise a full match against the redesigned rule — but carries an UNCOMMITTED change must stay exactly as conservative as `"isolated_clone"`. `remove_dir_all` has no equivalent of `git worktree remove`'s own refusal against a dirty tree, so eligibility itself must consult cleanliness rather than leaving it a display-only field (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, then a single uncommitted file written after the SHA the stub claims to match is captured.
+- **Agent:** none.
+- **Asserts:** the fixture's `clean` field is genuinely `false` (sanity); the dirty clone's `verdict` remains exactly `"isolated_clone"`.
+- **Does not assert:** the ownership/extraneous-refs gates (`065`-`067`) or the headRefOid-equality gate (`062`/`063`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/065 — M4c redesign, PR #526 round 3 (the security-relevant case). An isolated clone that LOOKS otherwise fully eligible — a genuine `git clone`, a single local branch matching its resolved branch, clean, no stash, and a HEAD commit equal to the merged PR's `headRefOid` — but carries NO deck attach-lock provenance artifact (the exact M4b forgery shape `worktree/reclaim/054` already pins for the display `owned` field, now asserted against the deletion decision instead) must stay exactly as conservative as `"isolated_clone"`. The fixture is built the same way as a genuine deck-owned clone in every other respect, proving eligibility cannot rest entirely on evidence the candidate directory itself controls (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — a real `git clone` plus a hand-planted ownership marker (the pre-redesign `062`/`063` fixture shape), deliberately never calling `provision_isolated_clone_sync`.
+- **Agent:** none.
+- **Asserts:** the fixture's `owned` field is genuinely `false` (sanity); the unowned clone's `verdict` remains exactly `"isolated_clone"`.
+- **Does not assert:** the genuine-attach-lock positive case (`062`) or the other three negative gates (`063`/`064`/`066`/`067`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/066 — M4c redesign, PR #526 round 3. An isolated clone that is owned, clean, content-matching, and carries no stash, but has a SECOND local branch beyond the one it resolved/checked out, must stay exactly as conservative as `"isolated_clone"`. `git rev-parse HEAD` proves ONE ref is safe to discard; `remove_dir_all` destroys the WHOLE clone, including every other local branch, which may hold commits with no copy anywhere else (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, then a second local branch created (never checked out).
+- **Agent:** none.
+- **Asserts:** the extra-branch clone's `verdict` remains exactly `"isolated_clone"`.
+- **Does not assert:** the stash-entry variant of the same gate (`067`), or the other three negative gates (`063`-`065`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/067 — M4c redesign, PR #526 round 3 (the stash-entry half of the extraneous-local-refs gate). An isolated clone that is owned, clean (a stash push leaves the working tree exactly as committed), content-matching, and has exactly one local branch, but carries a NON-EMPTY `git stash list`, must stay exactly as conservative as `"isolated_clone"`. A stash entry is local-only content `remove_dir_all` would destroy with no copy anywhere else — the same hazard as an extra branch (`066`), through git's other local-only ref namespace (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, then a tracked-file edit stashed away.
+- **Agent:** none.
+- **Asserts:** the fixture's `clean` field is genuinely `true` after the stash push (sanity — a stash leaves the tree as committed); the clone's `verdict` remains exactly `"isolated_clone"`.
+- **Does not assert:** the extra-local-branch variant of the same gate (`066`), or the other three negative gates (`063`-`065`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/068 — M4c redesign, PR #526 round 3, reviewer B2 — the regression guard proving eligibility reads `headRefOid` and never `mergeCommit`, rather than merely happening to work on a fixture too simple to expose a regression back to the pre-redesign field. Real `gh` always returns a `mergeCommit` for a MERGED PR, and (per `062`'s own measurement) never one equal to the PR branch's own tip. An owned, clean, single-branch, no-stash clone whose HEAD commit equals the merged PR's `headRefOid` must still report the redesigned reclaim-eligible verdict even when the `gh` stub's raw response also carries a mismatched decoy `mergeCommit.oid` alongside it (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (inline stub `gh` script carrying both `headRefOid` and a decoy `mergeCommit.oid`) — built through the real provisioner; the decoy SHA is the clone's own real HEAD SHA reversed (asserted different, still 40 hex characters).
+- **Agent:** none.
+- **Asserts:** the sanity assertion that the decoy `mergeCommit` SHA genuinely differs from the clone's own HEAD SHA; the clone's `verdict` equals exactly `"isolated_clone_reclaimable"` despite the mismatched decoy field.
+- **Does not assert:** the ordinary matching positive case with no decoy field present (`062`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/069 — M4c, PR #526 round 3, reviewer H1 (RED — zero prior coverage of the deletion primitive). A genuinely eligible isolated clone (owned, clean, single-branch, no stash, HEAD commit equal to the merged PR's `headRefOid`) run through `worktree reclaim --yes` must actually be removed from disk, and the returned `ReclaimOutcome` must record it under `removed` with `removed_by` set to the caller-supplied remover identity (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, driving the production `run_reclaim(repo, yes: true, remover)` entry point end to end.
+- **Agent:** none.
+- **Asserts:** `outcome.removed` contains the clone with `removed_by == Some("test-remover")`; the clone directory no longer exists on disk afterward.
+- **Does not assert:** the bare-run pending case (`070`), or the removal-refusal primitive (`071`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/070 — M4c, PR #526 round 3, reviewer H1 (RED — the bare-run half `069` doesn't cover). A genuinely eligible isolated clone run through a BARE `worktree reclaim` (no `--yes`) must be left on disk untouched and reported under `pending`, never under `removed` — eligibility alone is not consent (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, driving `run_reclaim(repo, yes: false, remover)`.
+- **Agent:** none.
+- **Asserts:** `outcome.removed` does not contain the clone; `outcome.pending` does; the clone directory still exists on disk afterward.
+- **Does not assert:** the `--yes` removal case (`069`), or the removal-refusal primitive (`071`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/071 — M4c, PR #526 round 3, reviewer M1/H1. `remove_isolated_clone_dir`'s own last-moment structural check, exercised directly rather than through `run_reclaim`: when the path it is asked to delete no longer has a `.git` DIRECTORY at removal time (here reproduced by a `.git` FILE, the shape of a linked worktree's admin-dir redirect, not a plain clone's own repository), the function must refuse rather than delete (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — calls the private `remove_isolated_clone_dir` primitive directly against a hand-built, non-git fixture directory; no real git repo or `gh` stub needed.
+- **Agent:** none.
+- **Asserts:** the call returns `Err(_)`; the directory and its other contents still exist on disk afterward.
+- **Does not assert:** the TOCTOU re-verification `remove_isolated_clone_dir` also performs beyond the `.git`-shape check this test exercises — it re-derives 4 of its examination-time verdict's 5 AND'd conditions fresh immediately before deleting (cleanliness, single local branch, empty stash, HEAD-vs-merged-PR headRefOid), deliberately excluding `has_attach_lock` (examination-time-only, since it is derived from the deck's own provenance marker rather than anything that can change between examination and removal) — see `073` for that re-verification's own refusal-path coverage.
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/072 — M4c, PR #526 round 3, reviewer M3. `worktree/reclaim/052` passes for an undocumented reason: its `gh` stub omits `headRefOid` entirely, so it only ever exercises the "head ref unresolvable" (`None`) path, never the case where `headRefOid` is genuinely present in the response but simply does not match the clone's own HEAD. An owned, clean, single-branch, no-stash isolated clone whose merged PR carries a well-formed but MISMATCHED `headRefOid` must stay exactly as conservative as `"isolated_clone"` (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (inline stub `gh` script carrying a present-but-mismatched `headRefOid`) — built through the real provisioner; the mismatched SHA is the clone's own real HEAD SHA reversed (asserted different), mirroring `068`'s own decoy technique.
+- **Agent:** none.
+- **Asserts:** the sanity assertion that the mismatched `headRefOid` genuinely differs from the clone's own HEAD SHA; the clone's `verdict` equals exactly `"isolated_clone"`; neither a bare reclaim nor `--yes` removes it, and the directory still exists on disk afterward.
+- **Does not assert:** the omitted-field (`None`) path already covered by `052`, or the exact-match positive case (`062`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/073 — M4c, PR #526 round 4, reviewer/auditor N2. `remove_isolated_clone_dir`'s TOCTOU re-verification (cleanliness, single local branch, empty stash, HEAD-vs-merged-PR headRefOid, each re-derived fresh immediately before deleting) had zero test coverage — deleting that whole block would leave every existing test in the file green. A genuinely eligible isolated clone, confirmed reclaim-eligible via `examine_worktrees` first, is then dirtied (an untracked file written into it) before `remove_isolated_clone_dir` is called directly, carrying the now-stale eligibility `run_reclaim` would have handed it — proving re-verification rather than merely a check against an already-bad fixture (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, calling `examine_worktrees` then the private `remove_isolated_clone_dir` primitive directly.
+- **Agent:** none.
+- **Asserts:** the sanity assertion that the clone's `verdict` is exactly `isolated_clone_reclaimable` before the TOCTOU mutation; after dirtying, `remove_isolated_clone_dir` returns `Err(_)`; the clone directory and the dirtying file both still exist on disk afterward.
+- **Does not assert:** the other three re-checked conditions (single local branch, empty stash, HEAD-vs-headRefOid) — one convincing refusal path is covered here, not all four; the `has_attach_lock` condition, which is examination-time-only and not re-derived by this function at all (see `071`).
+- **Platform coverage:** mac+linux.
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.
