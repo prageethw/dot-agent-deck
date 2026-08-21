@@ -1440,6 +1440,43 @@ mod tests {
         );
     }
 
+    // PRD #536 follow-up: `devbox run <script>` is a launcher hop this fork's
+    // own committed `.dot-agent-deck.toml` uses for every orchestration role
+    // (`devbox run claude-sonnet-devbox`, `devbox run claude-opus-devbox
+    // --permission-mode plan`, …), but it is not one of the existing hops
+    // (`env`/`sudo` prefix-skip, `sh -c`/`bash -lc` recursion): `<script>` is a
+    // devbox.json script NAME, not a further shell command string, so there is
+    // nothing to tokenize-and-recurse into. `detect_from_tokens` must resolve
+    // it via `detect_from_devbox_script` on the script name's own hyphenated
+    // segments, with trailing args after the script name ignored exactly like
+    // every other launcher form above.
+    #[test]
+    fn agent_type_from_command_recognizes_devbox_run() {
+        assert_eq!(
+            AgentType::from_command(Some("devbox run claude-sonnet-devbox")),
+            Some(AgentType::ClaudeCode)
+        );
+        // Trailing args after the script name must not break detection — this
+        // is the EXACT shape of this fork's reviewer/auditor role commands.
+        assert_eq!(
+            AgentType::from_command(Some("devbox run claude-opus-devbox --permission-mode plan")),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            AgentType::from_command(Some("devbox run codex-devbox")),
+            Some(AgentType::Codex)
+        );
+        assert_eq!(
+            AgentType::from_command(Some("devbox run some-random-script")),
+            None
+        );
+        // `devbox shell` (this fork's `init_command`) is not a `run` and must
+        // NOT match.
+        assert_eq!(AgentType::from_command(Some("devbox shell")), None);
+        // No further tokens at all — must not panic or misdetect.
+        assert_eq!(AgentType::from_command(Some("devbox")), None);
+    }
+
     #[test]
     fn agent_type_from_command_returns_none_for_unknown_or_empty() {
         // Non-agent commands must NOT misclassify — the daemon would

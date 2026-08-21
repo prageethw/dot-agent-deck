@@ -387,6 +387,35 @@ mod tests {
         assert_eq!(detect_from_basename(""), None);
     }
 
+    /// PRD #536 follow-up: `devbox run <script>` names a devbox.json script,
+    /// not a further shell command string to recurse into, so
+    /// `detect_from_devbox_script` resolves the agent type from the script
+    /// name's OWN hyphen-separated segments — this fork's committed
+    /// `.dot-agent-deck.toml` role commands are exactly this shape
+    /// (`claude-sonnet-devbox`, `claude-opus-devbox`, `codex-devbox`). The
+    /// first segment that resolves via [`detect_from_basename`] wins; a
+    /// script with no recognized segment (or whose only segment is the
+    /// literal word "devbox" itself) stays unrecognized.
+    #[test]
+    fn detect_from_devbox_script_resolves_hyphenated_segments() {
+        assert_eq!(
+            detect_from_devbox_script("claude-sonnet-devbox"),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            detect_from_devbox_script("claude-opus-devbox"),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            detect_from_devbox_script("codex-devbox"),
+            Some(AgentType::Codex)
+        );
+        assert_eq!(detect_from_devbox_script("pi-big"), Some(AgentType::Pi));
+        assert_eq!(detect_from_devbox_script("some-random-script"), None);
+        // The literal word "devbox" is not itself a recognized basename.
+        assert_eq!(detect_from_devbox_script("devbox"), None);
+    }
+
     /// The public `from_command` entry point (event.rs) still infers the type
     /// from a full spawn command via the registry — same binary/path/arg
     /// handling as before.
