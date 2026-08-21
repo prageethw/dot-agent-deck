@@ -1869,6 +1869,13 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** `src/wrap.rs`'s own classification logic in isolation, or the daemon-owned `spawn::spawn` / seed-prompt delivery paths, which route through an equivalent but separately implemented `user_prompt` gate (`wait_for_prompt_submission`, `src/state.rs`) and are out of this layer's reach. That daemon-side gate is only incidentally pinned, by `src/state.rs`'s `wait_for_prompt_submission_reports_hook_trust_failure_even_when_a_later_event_arms_capability`, whose `other => panic!("expected Elapsed")` arm would catch a regression here but is named and documented as a hook-trust test, not a #422 guard.
 - **Platform coverage:** mac+linux+windows.
 
+##### prompt/pane-input/035 — Issue #422 item 2 regression guard: a genuine TEXT confirmation arriving late (8.45s) survives the first unconfirmed-retry window instead of being preempted by a bare-CR resubmission, and a retry that legitimately fires once that window elapses does not stop the confirmation that follows it from finalizing.
+- **Layer:** L1 (in-process orchestrator prompt consumer with a controllable `PaneController` and hook-derived state snapshot).
+- **Agent:** none.
+- **Asserts:** two scenarios on a reporting-capable Codex pane. First, ticking through sample points inside `unconfirmed_retry_delay`'s current 10s first-retry window (500ms/1s/2s/4s/8s) with no confirming event applied must not resubmit anything to the pane (`attempts` stays at 1) and the delivery must stay provisional throughout; only a subsequent event carrying the genuine matching submitted text — arriving at the issue's measured 8.45s worst-case latency — finalizes the delivery. Second, on an independent delivery, ticking past the 10s window with no confirmation applied lets a bare-CR retry legitimately fire (`attempts` becomes 2) without finalizing the delivery, and the genuine confirmation arriving immediately after that retry still finalizes cleanly. Complements `prompt/pane-input/034`, which proves a *no-attribution* event can't false-confirm; this test models a *genuine matching* event arriving late instead.
+- **Does not assert:** the daemon-side `confirm_prompt_delivery` retry loop (`src/spawn.rs`), which shares `unconfirmed_retry_delay` but is covered separately by `scheduler/dispatch/016`/`021`; nor the schedule's later 15s-capped escalation beyond the first retry, which `unconfirmed_backoff_escalates_then_caps` asserts directly.
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
