@@ -4584,6 +4584,44 @@ mod tests {
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Same shape as [`write_merged_gh_stub`], additionally carrying a
+    /// `mergeCommit.oid` field -- the field fork#325 M4c's rule needs and
+    /// `resolve_pr_state`'s current `--json state,headRefName,
+    /// headRepositoryOwner` request does not fetch at all (`gh pr list
+    /// --json` supports `mergeCommit` returning `{"oid": "<sha>"}`, matching
+    /// `gh`'s own field shape).
+    #[cfg(unix)]
+    fn write_merged_gh_stub_with_merge_sha(bindir: &Path, branch: &str, merge_sha: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}},\"mergeCommit\":{{\"oid\":\"{merge_sha}\"}}}}]'\n    \
+             exit 0\nfi\nexit 1\n"
+        );
+        std::fs::create_dir_all(bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// `git rev-parse HEAD` run inside `dir`, trimmed -- a fixture-only
+    /// helper for tests that need to assert on an isolated clone's actual
+    /// HEAD SHA (fork#325 M4c), mirroring `worktree_reclaim_054`'s own
+    /// inline `rev-parse HEAD` call.
+    fn git_rev_parse_head(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse HEAD must spawn");
+        assert!(
+            out.status.success(),
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// Scenario: A real, deck-owned isolated clone (a genuine `git clone`
     /// sibling of the repo, its own `.git` DIRECTORY, marked owned via the
     /// same `mark_worktree_owned` call `provision_isolated_clone_sync` uses)
@@ -5481,6 +5519,172 @@ mod tests {
         assert!(
             !is_mine(forged_report, "test-remover"),
             "the forged row must never satisfy --mine for any other identity either"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4c -- the maintainer-decided rule (not
+    /// yet implemented): a deck-owned isolated clone whose branch has a
+    /// MERGED PR and whose CURRENT HEAD SHA equals that PR's merge-commit
+    /// SHA exactly must report as auto-reclaim-eligible, distinct from the
+    /// permanently-conservative `"isolated_clone"` verdict M4a/M4b left in
+    /// place (`worktree_reclaim_052`). RED today: `isolated_clone_report`
+    /// never resolves the clone's own HEAD SHA or the PR's merge-commit SHA
+    /// at all, and unconditionally hard-codes `verdict: "isolated_clone"`
+    /// regardless of PR/merge state (see that function's own doc comment).
+    #[spec("worktree/reclaim/062")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_062_isolated_clone_at_exact_merge_sha_reports_reclaim_eligible() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-at-merge-sha");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-at-merge-sha#1009")
+            .expect("mark_worktree_owned must succeed");
+
+        // `git clone` checks out the source's HEAD branch ("main") with no
+        // local commits of its own yet -- the clone's HEAD right now is
+        // exactly the source repo's seed commit.
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_merge_sha(&bindir, "main", &clone_head_sha);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+
+        assert_eq!(
+            clone_report.verdict.as_str(),
+            "isolated_clone_reclaimable",
+            "an isolated clone whose branch has a MERGED PR and whose HEAD SHA equals that \
+             PR's merge-commit SHA exactly must report as auto-reclaim-eligible (fork#325 \
+             M4c, maintainer-decided rule) -- got verdict {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+    }
+
+    /// Scenario: fork issue #325 M4c's sibling negative case -- an isolated
+    /// clone whose branch has a MERGED PR but whose CURRENT HEAD has
+    /// DIVERGED from that PR's merge-commit SHA (an extra local commit made
+    /// after the merge) must stay exactly as conservative as
+    /// `worktree_reclaim_052` -- never an automatic-removal verdict, and
+    /// never the new M4c reclaim-eligible verdict either. This exercises
+    /// `052`'s already-shipped, already-correct behavior against a new
+    /// fixture, so it is expected to already be GREEN, proving M4c's new
+    /// rule doesn't loosen the existing conservative default for a clone
+    /// that has drifted past its merge point.
+    #[spec("worktree/reclaim/063")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_063_isolated_clone_diverged_from_merge_sha_stays_conservative() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-diverged");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-diverged#1010")
+            .expect("mark_worktree_owned must succeed");
+
+        // The PR's merge-commit SHA is the clone's HEAD right after
+        // cloning -- captured BEFORE the extra local commit below, so the
+        // fixture genuinely diverges from it afterward.
+        let merge_sha = git_rev_parse_head(&clone_dir);
+
+        // An extra local commit made after the merge -- HEAD now points
+        // past the merge SHA, the exact "diverged" shape the M4c rule must
+        // not treat as eligible. Still clean (`git status --porcelain` is
+        // empty for a committed change), so this isolates the SHA-equality
+        // gate from the pre-existing cleanliness gate.
+        std::fs::write(clone_dir.join("extra.txt"), "local work\n").unwrap();
+        let add_out = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["add", "extra.txt"])
+            .output()
+            .expect("git add must spawn");
+        assert!(
+            add_out.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add_out.stderr)
+        );
+        let commit_out = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["commit", "--quiet", "-m", "local work after merge"])
+            .output()
+            .expect("git commit must spawn");
+        assert!(
+            commit_out.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit_out.stderr)
+        );
+
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_merge_sha(&bindir, "main", &merge_sha);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+
+        assert_eq!(
+            clone_report.verdict.as_str(),
+            "isolated_clone",
+            "a PR-merged isolated clone whose HEAD has diverged past the merge SHA must stay \
+             exactly as conservative as worktree_reclaim_052 -- never an automatic-removal \
+             verdict, and never the new M4c reclaim-eligible verdict either -- got {:?} \
+             (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+
+        // Neither a bare reclaim nor `--yes` may actually delete it,
+        // mirroring worktree_reclaim_052's own removal assertions.
+        let bare = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !bare.removed.iter().any(|r| r.real_path == clone_dir),
+            "a bare `worktree reclaim` must never remove a diverged isolated clone, got \
+             removed: {:?}",
+            bare.removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the diverged isolated clone directory must still exist on disk after a bare \
+             reclaim"
+        );
+
+        let confirmed = run_reclaim(&repo, true, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !confirmed.removed.iter().any(|r| r.real_path == clone_dir),
+            "`worktree reclaim --yes` must never remove a diverged isolated clone either, got \
+             removed: {:?}",
+            confirmed
+                .removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the diverged isolated clone directory must still exist on disk after `reclaim \
+             --yes`"
         );
     }
 }

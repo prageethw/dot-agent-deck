@@ -1253,6 +1253,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the no-provenance-file case (`worktree/reclaim/054`), the vacated-linked-worktree-lock case (`worktree/reclaim/056`), or the pre-planted-dispatch-path case (`worktree/reclaim/057`) — this is the bare self-planted-artifact forgery those three do not cover.
 - **Platform coverage:** mac+linux+windows.
 
+##### worktree/reclaim/062 — M4c (RED), maintainer-decided rule (not yet implemented). An isolated clone whose branch has a MERGED PR and whose CURRENT HEAD SHA equals that PR's merge-commit SHA exactly must report as auto-reclaim-eligible — distinct from the permanently-conservative `"isolated_clone"` verdict `worktree/reclaim/052` pins. `isolated_clone_report` never resolves the clone's own HEAD SHA or the PR's merge-commit SHA today, and unconditionally hard-codes the `"isolated_clone"` verdict regardless of PR/merge state (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script).
+- **Agent:** none.
+- **Asserts:** a deck-owned isolated clone, PR-merged with a `mergeCommit.oid` equal to the clone's own current HEAD SHA, reports `verdict == "isolated_clone_reclaimable"`.
+- **Does not assert:** the diverged/negative case (`worktree/reclaim/063`), or that `run_reclaim` actually removes the clone — the new verdict's removal wiring is the coder's follow-up, not this milestone slice.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/063 — M4c sibling negative case. An isolated clone whose branch has a MERGED PR but whose CURRENT HEAD has diverged from that PR's merge-commit SHA (an extra local commit made after the merge) must stay exactly as conservative as `worktree/reclaim/052` — never an automatic-removal verdict, and never the new M4c reclaim-eligible verdict either. Exercises `052`'s already-shipped behavior against a new fixture; expected already GREEN, proving M4c's new rule doesn't loosen the existing conservative default for a clone that has drifted past its merge point (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script).
+- **Agent:** none.
+- **Asserts:** the diverged clone's `verdict` remains exactly `"isolated_clone"`; neither a bare `worktree reclaim` nor `--yes` removes it.
+- **Does not assert:** the exact-match positive case (`worktree/reclaim/062`).
+- **Platform coverage:** mac+linux.
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.
