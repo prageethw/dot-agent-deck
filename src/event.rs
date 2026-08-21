@@ -117,6 +117,32 @@ impl AgentType {
         let tokens = tokenize_command(cmd?);
         detect_from_tokens(&tokens, DETECT_RECURSION_BUDGET)
     }
+
+    /// Like [`from_command`], but ALSO recognizes `devbox run <script>` via
+    /// [`crate::agent_registry::detect_from_devbox_script`]'s hyphen-segment
+    /// heuristic. Deliberately SEPARATE from `from_command`: that function's
+    /// result also feeds `wrap_launch_command`'s wrap-vs-bare decision (see
+    /// the documented invariant at `agent_pty.rs:5871-5911`, which names
+    /// `devbox run codex-big` as its own "resolves to no agent type"
+    /// exemplar) — widening devbox recognition there silently auto-wraps a
+    /// devbox-launched agent, which broke
+    /// `spawn_007_hook_learned_badge_does_not_change_respawn_launch`. This
+    /// function is presentation-only (badge / "expects a report" display)
+    /// and must NEVER be used anywhere that decides whether to spawn,
+    /// respawn, or wrap a launch command.
+    pub fn from_command_including_devbox(cmd: Option<&str>) -> Option<Self> {
+        if let Some(t) = Self::from_command(cmd) {
+            return Some(t);
+        }
+        let tokens = tokenize_command(cmd?);
+        if tokens.first().map(String::as_str) == Some("devbox")
+            && tokens.get(1).map(String::as_str) == Some("run")
+            && let Some(script) = tokens.get(2)
+        {
+            return crate::agent_registry::detect_from_devbox_script(script);
+        }
+        None
+    }
 }
 
 /// PRD #20 finding R20-016: hard cap on shell-launcher recursion, decremented
@@ -243,18 +269,6 @@ fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
                 }
             }
             return crate::agent_registry::detect_from_basename(basename);
-        }
-
-        // devbox launcher: `devbox run <script> [args...]`. The script name is a
-        // devbox.json script, not a further shell command to recurse into — resolve
-        // it via `detect_from_devbox_script`'s hyphen-segment heuristic. Any tokens
-        // after `<script>` (e.g. `--permission-mode plan`) are ignored, matching how
-        // this fork's own `.dot-agent-deck.toml` role commands are shaped.
-        if basename == "devbox"
-            && tokens.get(idx + 1).map(String::as_str) == Some("run")
-            && let Some(script) = tokens.get(idx + 2)
-        {
-            return crate::agent_registry::detect_from_devbox_script(script);
         }
 
         // An ordinary binary token — resolve it directly.

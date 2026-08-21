@@ -9891,7 +9891,8 @@ fn insert_role_placeholder_sessions(
     for (i, (id, agent_id)) in role_pane_ids.iter().zip(role_agent_ids.iter()).enumerate() {
         st.register_pane(id.clone());
         let expects_agent_report =
-            crate::event::AgentType::from_command(Some(&roles[i].command)).is_some();
+            crate::event::AgentType::from_command_including_devbox(Some(&roles[i].command))
+                .is_some();
         st.insert_placeholder_session_awaiting_report(
             id.clone(),
             Some(dir.to_string()),
@@ -11290,9 +11291,19 @@ fn dispatch_action(
                     };
                     // `spawn_agent_type` and the wrapped `launch_command` (used
                     // for `cmd` above) were both resolved before the dims block.
-                    // Captured before the move into `AgentSpawnOptions` below —
-                    // the placeholder insert after spawn needs it too.
-                    let spawn_expects_agent_report = spawn_agent_type.is_some();
+                    // Deliberately a SEPARATE, fresh call rather than reading
+                    // `spawn_agent_type.is_some()`: the badge decision must use
+                    // the devbox-widened `from_command_including_devbox`, while
+                    // `spawn_agent_type` (moved into `AgentSpawnOptions` below)
+                    // stays on the unwidened `from_command` that feeds the
+                    // wrap-vs-bare decision (see the invariant documented at
+                    // `agent_pty.rs:5871-5911`).
+                    let spawn_expects_agent_report = if req.command.is_empty() {
+                        false
+                    } else {
+                        AgentType::from_command_including_devbox(Some(req.command.as_str()))
+                            .is_some()
+                    };
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&dir_str),
