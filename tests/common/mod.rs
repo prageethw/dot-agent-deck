@@ -6843,14 +6843,14 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
     count
 }
 
-/// Send one `AttachRequest` over a daemon attach socket and read back the
-/// single `AttachResponse`. Blocking; shared by `DaemonProc` and the
-/// `TuiDeck`-driven tests (which pass `deck.attach_socket_path()`).
+/// Send one already-serialized request payload over a daemon attach socket
+/// and read back the single `AttachResponse`. Shared wire logic behind
+/// [`attach_request_on`] and [`attach_json_request_on`], which differ only in
+/// how they produce `payload`.
 #[cfg(unix)]
-#[allow(dead_code)]
-pub fn attach_request_on(
+fn attach_payload_on(
     socket: &Path,
-    req: &dot_agent_deck::daemon_protocol::AttachRequest,
+    payload: &[u8],
 ) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
     use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
     use std::io::{Read, Write};
@@ -6859,12 +6859,11 @@ pub fn attach_request_on(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
-    let payload = serde_json::to_vec(req).expect("serialize AttachRequest");
     let mut header = [0u8; 5];
     header[0] = KIND_REQ;
     header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
     stream.write_all(&header)?;
-    stream.write_all(&payload)?;
+    stream.write_all(payload)?;
     stream.flush()?;
 
     let mut resp_header = [0u8; 5];
@@ -6886,6 +6885,19 @@ pub fn attach_request_on(
     serde_json::from_slice(&body).map_err(std::io::Error::other)
 }
 
+/// Send one `AttachRequest` over a daemon attach socket and read back the
+/// single `AttachResponse`. Blocking; shared by `DaemonProc` and the
+/// `TuiDeck`-driven tests (which pass `deck.attach_socket_path()`).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn attach_request_on(
+    socket: &Path,
+    req: &dot_agent_deck::daemon_protocol::AttachRequest,
+) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+    let payload = serde_json::to_vec(req).expect("serialize AttachRequest");
+    attach_payload_on(socket, &payload)
+}
+
 /// Send one raw JSON request over a daemon attach socket and read back the
 /// single `AttachResponse`. Same wire shape as [`attach_request_on`], but
 /// takes a hand-built [`serde_json::Value`] instead of a typed `AttachRequest`
@@ -6902,38 +6914,8 @@ pub fn attach_json_request_on(
     socket: &Path,
     req: &serde_json::Value,
 ) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
-    use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
-    use std::io::{Read, Write};
-
-    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
     let payload = serde_json::to_vec(req).expect("serialize JSON request");
-    let mut header = [0u8; 5];
-    header[0] = KIND_REQ;
-    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    stream.write_all(&header)?;
-    stream.write_all(&payload)?;
-    stream.flush()?;
-
-    let mut resp_header = [0u8; 5];
-    stream.read_exact(&mut resp_header)?;
-    if resp_header[0] != KIND_RESP {
-        return Err(std::io::Error::other(format!(
-            "expected RESP frame, got kind 0x{:02x}",
-            resp_header[0]
-        )));
-    }
-    let len = u32::from_be_bytes([
-        resp_header[1],
-        resp_header[2],
-        resp_header[3],
-        resp_header[4],
-    ]) as usize;
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body)?;
-    serde_json::from_slice(&body).map_err(std::io::Error::other)
+    attach_payload_on(socket, &payload)
 }
 
 /// Snapshot a daemon's live agent registry via `ListAgents` over `socket`.
