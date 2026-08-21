@@ -117,6 +117,32 @@ impl AgentType {
         let tokens = tokenize_command(cmd?);
         detect_from_tokens(&tokens, DETECT_RECURSION_BUDGET)
     }
+
+    /// Like [`from_command`], but ALSO recognizes `devbox run <script>` via
+    /// [`crate::agent_registry::detect_from_devbox_script`]'s hyphen-segment
+    /// heuristic. Deliberately SEPARATE from `from_command`: that function's
+    /// result also feeds `wrap_launch_command`'s wrap-vs-bare decision (see
+    /// the documented invariant at `agent_pty.rs:5871-5911`, which names
+    /// `devbox run codex-big` as its own "resolves to no agent type"
+    /// exemplar) — widening devbox recognition there silently auto-wraps a
+    /// devbox-launched agent, which broke
+    /// `spawn_007_hook_learned_badge_does_not_change_respawn_launch`. This
+    /// function is presentation-only (badge / "expects a report" display)
+    /// and must NEVER be used anywhere that decides whether to spawn,
+    /// respawn, or wrap a launch command.
+    pub fn from_command_including_devbox(cmd: Option<&str>) -> Option<Self> {
+        if let Some(t) = Self::from_command(cmd) {
+            return Some(t);
+        }
+        let tokens = tokenize_command(cmd?);
+        if tokens.first().map(String::as_str) == Some("devbox")
+            && tokens.get(1).map(String::as_str) == Some("run")
+            && let Some(script) = tokens.get(2)
+        {
+            return crate::agent_registry::detect_from_devbox_script(script);
+        }
+        None
+    }
 }
 
 /// PRD #20 finding R20-016: hard cap on shell-launcher recursion, decremented
@@ -1655,6 +1681,96 @@ mod tests {
         assert_eq!(
             AgentType::from_command(Some("opencode")),
             Some(AgentType::OpenCode)
+        );
+    }
+
+    // PRD #536 follow-up, retargeted after the regression in
+    // `spawn_007_hook_learned_badge_does_not_change_respawn_launch`:
+    // `devbox run <script>` is a launcher hop this fork's own committed
+    // `.dot-agent-deck.toml` uses for every orchestration role (`devbox run
+    // claude-sonnet-devbox`, `devbox run claude-opus-devbox --permission-mode
+    // plan`, …), but the SAME `AgentType::from_command` also feeds
+    // `wrap_launch_command`'s wrap-vs-bare respawn decision (see the
+    // documented invariant at `agent_pty.rs:5871-5911`, which names `devbox
+    // run codex-big` as its own "resolves to no agent type" exemplar) — so
+    // devbox recognition must live ONLY on the separate, presentation-only
+    // `AgentType::from_command_including_devbox`, never on `from_command`
+    // itself. See `agent_type_from_command_never_resolves_devbox_wrap_decision`
+    // just below for the regression-guard half of this split.
+    #[test]
+    fn from_command_including_devbox_recognizes_devbox_run() {
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some("devbox run claude-sonnet-devbox")),
+            Some(AgentType::ClaudeCode)
+        );
+        // Trailing args after the script name must not break detection — this
+        // is the EXACT shape of this fork's reviewer/auditor role commands.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some(
+                "devbox run claude-opus-devbox --permission-mode plan"
+            )),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some("devbox run codex-devbox")),
+            Some(AgentType::Codex)
+        );
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some("devbox run some-random-script")),
+            None
+        );
+        // `devbox shell` (this fork's `init_command`) is not a `run` and must
+        // NOT match.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some("devbox shell")),
+            None
+        );
+        // No further tokens at all — must not panic or misdetect.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some("devbox")),
+            None
+        );
+        // Pin the `from_command` fallback branch itself: a plain, non-devbox,
+        // already-recognized command must resolve exactly like `from_command`
+        // would. Every other assertion above is devbox-shaped, so nothing
+        // else in this test would catch that fallback line being deleted.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some("claude")),
+            Some(AgentType::ClaudeCode)
+        );
+    }
+
+    // Regression guard for `spawn_007_hook_learned_badge_does_not_change_respawn_launch`
+    // (`tests/agent_detection.rs:347`) — `spawn_007` is the ONLY test that actually
+    // catches this regression; its sibling `spawn_008` sets an explicit
+    // creation-time `agent_type: Some(Codex)` in its fixture, which makes its two
+    // code paths converge regardless of the badge, so it does NOT guard this
+    // invariant (it instead pins the separate "respawn wrap decision follows the
+    // launched command" scenario). The ORIGINAL, shared `AgentType::from_command`
+    // — which `wrap_launch_command`'s callers use
+    // to decide whether to auto-wrap a respawned launch command — must NEVER
+    // resolve a devbox-wrapped command to an agent type, no matter how
+    // agent-shaped the devbox script name looks. The documented invariant at
+    // `agent_pty.rs:5871-5911` names `devbox run codex-big` as its own
+    // "resolves to no agent type" exemplar specifically so a pane whose
+    // creation-time identity is frozen via `spawn_agent_type` doesn't get
+    // silently auto-wrapped on respawn. Devbox-script recognition belongs
+    // exclusively behind `AgentType::from_command_including_devbox`, used only
+    // by the badge / `expects_agent_report` call sites in `src/ui.rs`.
+    #[test]
+    fn agent_type_from_command_never_resolves_devbox_wrap_decision() {
+        assert_eq!(AgentType::from_command(Some("devbox run codex-big")), None);
+        assert_eq!(
+            AgentType::from_command(Some("devbox run claude-sonnet-devbox")),
+            None
+        );
+        assert_eq!(
+            AgentType::from_command(Some("devbox run claude-opus-devbox --permission-mode plan")),
+            None
+        );
+        assert_eq!(
+            AgentType::from_command(Some("devbox run codex-devbox")),
+            None
         );
     }
 
