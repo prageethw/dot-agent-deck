@@ -6886,6 +6886,56 @@ pub fn attach_request_on(
     serde_json::from_slice(&body).map_err(std::io::Error::other)
 }
 
+/// Send one raw JSON request over a daemon attach socket and read back the
+/// single `AttachResponse`. Same wire shape as [`attach_request_on`], but
+/// takes a hand-built [`serde_json::Value`] instead of a typed `AttachRequest`
+/// — needed for requests that carry additive fields the `AttachRequest` enum
+/// deliberately does not declare (e.g. `WriteAndSubmitExtras`'s
+/// `expected_agent_id` / `expected_session_id` / `delivery_id`, which
+/// `daemon_client::write_and_submit_with_identity` rides alongside the base
+/// `write-and-submit` shape as extra JSON keys — see that function's doc
+/// comment in `src/daemon_client.rs`). Blocking; shared by `DaemonProc` and
+/// the `TuiDeck`-driven tests (which pass `deck.attach_socket_path()`).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn attach_json_request_on(
+    socket: &Path,
+    req: &serde_json::Value,
+) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+    use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
+    use std::io::{Read, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+    let payload = serde_json::to_vec(req).expect("serialize JSON request");
+    let mut header = [0u8; 5];
+    header[0] = KIND_REQ;
+    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream.write_all(&header)?;
+    stream.write_all(&payload)?;
+    stream.flush()?;
+
+    let mut resp_header = [0u8; 5];
+    stream.read_exact(&mut resp_header)?;
+    if resp_header[0] != KIND_RESP {
+        return Err(std::io::Error::other(format!(
+            "expected RESP frame, got kind 0x{:02x}",
+            resp_header[0]
+        )));
+    }
+    let len = u32::from_be_bytes([
+        resp_header[1],
+        resp_header[2],
+        resp_header[3],
+        resp_header[4],
+    ]) as usize;
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
 /// Snapshot a daemon's live agent registry via `ListAgents` over `socket`.
 #[cfg(unix)]
 #[allow(dead_code)]

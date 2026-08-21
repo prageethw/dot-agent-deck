@@ -9,7 +9,6 @@ mod common;
 use std::time::Duration;
 
 use common::TuiDeck;
-use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::{
     AGENT_EVENT_SCHEMA_VERSION, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
 };
@@ -66,12 +65,25 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
         .pane_id
         .as_deref()
         .expect("managed wrapper event carries its pane id");
-    let response = common::attach_request_on(
+    // Issue #494: `compute_write_and_submit_outcome`'s paned branch fails
+    // closed on a missing `expected_agent_id` (and, when the dashboard's
+    // embedded live preview is attached to this pane, on a session mismatch
+    // too). A legitimate dashboard write carries both, mirroring exactly how
+    // `daemon_client::write_and_submit_with_identity` rides them alongside
+    // the base `write-and-submit` shape as additive JSON keys — this proves a
+    // real identity-bearing write still succeeds under the new gate, rather
+    // than proving the old permissive bare-2-field shape used to work.
+    let response = common::attach_json_request_on(
         deck.attach_socket_path(),
-        &AttachRequest::WriteAndSubmit {
-            pane_id: pane_id.to_string(),
-            text: "MANAGED-WRAPPER-WRITE".to_string(),
-        },
+        &serde_json::json!({
+            "op": "write-and-submit",
+            "pane_id": pane_id,
+            "text": "MANAGED-WRAPPER-WRITE",
+            "expected_agent_id": working.agent_id.as_deref().expect(
+                "managed wrapper event carries its agent id"
+            ),
+            "expected_session_id": working.session_id,
+        }),
     )
     .expect("write through managed wrapper pane");
     assert_eq!(
