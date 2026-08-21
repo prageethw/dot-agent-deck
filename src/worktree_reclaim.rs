@@ -172,13 +172,27 @@ const VERDICT_ISOLATED_CLONE_RECLAIMABLE: &str = "isolated_clone_reclaimable";
 /// by [`resolve_pr_state`]. `None` when `gh`'s response carries no
 /// `mergeCommit.oid` at all (malformed/absent field) — deliberately never
 /// treated as "unresolvable" at the `PrState` level (a merged PR is still a
-/// merged PR for [`decide`]'s purposes), but [`isolated_clone_report`]'s M4c
-/// comparison must treat a `None` SHA as never eligible for the new
-/// reclaimable verdict: an ambiguous signal must never widen eligibility for
-/// a safety-relevant deletion decision.
+/// merged PR for [`decide`]'s purposes). `merge_tree_sha` (fork#325 M4c
+/// tightening, auditor A8) is the merge commit's **tree** SHA, resolved via
+/// [`resolve_pr_merge_tree_sha`]'s separate `gh api graphql` round trip —
+/// `gh pr list --json`'s flat field selection cannot reach `mergeCommit.tree.oid`
+/// at all. This is the field [`isolated_clone_report`]'s tightened
+/// eligibility check actually compares against a clone's own HEAD tree SHA:
+/// on a squash-merge repo a genuine clone's own commit SHA essentially never
+/// equals `merge_sha` (GitHub's squash merge creates a brand-new commit
+/// object), while the trees agree once nothing local remains. `merge_sha`
+/// is retained for realism/logging even though eligibility no longer reads
+/// it directly. Neither field being unresolvable (`None`) is ever treated as
+/// "unresolvable" at the `PrState` level — but [`isolated_clone_report`]'s
+/// M4c comparison must treat a `None` `merge_tree_sha` as never eligible for
+/// the reclaimable verdict: an ambiguous signal must never widen eligibility
+/// for a safety-relevant deletion decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrState {
-    Merged { merge_sha: Option<String> },
+    Merged {
+        merge_sha: Option<String>,
+        merge_tree_sha: Option<String>,
+    },
     Open,
     ClosedUnmerged,
     NoPr,
@@ -1499,7 +1513,7 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             "--repo",
             &repo_slug,
             "--json",
-            "state,headRefName,headRepositoryOwner,mergeCommit",
+            "state,headRefName,headRepositoryOwner,mergeCommit,number",
         ])
         .output();
     let out = match out {
@@ -1545,7 +1559,13 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
                     .and_then(|m| m.get("oid"))
                     .and_then(|o| o.as_str())
                     .map(|s| s.to_string());
-                PrState::Merged { merge_sha }
+                let pr_number = one.get("number").and_then(|n| n.as_u64());
+                let merge_tree_sha =
+                    pr_number.and_then(|n| resolve_pr_merge_tree_sha(repo_dir, &repo_slug, n));
+                PrState::Merged {
+                    merge_sha,
+                    merge_tree_sha,
+                }
             }
             Some("OPEN") => PrState::Open,
             Some("CLOSED") => PrState::ClosedUnmerged,
@@ -1557,6 +1577,45 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             owner_matches.len()
         )),
     }
+}
+
+/// Resolve a merged PR's merge-commit **tree** SHA via `gh api graphql`
+/// (fork#325 M4c tightening, auditor A8) — `gh pr list --json`'s flat field
+/// selection exposes a fixed set with no sub-selection into `mergeCommit`,
+/// so it cannot reach `mergeCommit.tree.oid` no matter which field names are
+/// requested (confirmed separately); a second `gh` subcommand able to name
+/// an explicit GraphQL query is the only way to reach it. `repo_slug` is
+/// split into `owner`/`name` for the query's own `repository(owner:...,
+/// name:...)` arguments — the same split [`resolve_pr_state`] already
+/// performs for `expected_owner`. Returns `None` on any spawn/exit/parse
+/// failure, an unparseable `repo_slug`, or a response missing the field at
+/// any point along `data.repository.pullRequest.mergeCommit.tree.oid` —
+/// every caller of this function fails closed on `None`, never treating an
+/// unresolvable tree SHA as a match.
+fn resolve_pr_merge_tree_sha(repo_dir: &Path, repo_slug: &str, pr_number: u64) -> Option<String> {
+    let (owner, name) = repo_slug.split_once('/')?;
+    let query = format!(
+        "query{{repository(owner:\"{owner}\",name:\"{name}\"){{pullRequest(number:{pr_number}){{mergeCommit{{oid tree{{oid}}}}}}}}}}"
+    );
+    let out = Command::new("gh")
+        .current_dir(repo_dir)
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("data")?
+        .get("repository")?
+        .get("pullRequest")?
+        .get("mergeCommit")?
+        .get("tree")?
+        .get("oid")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// Examine every linked worktree of the repo rooted at `repo_dir`: resolve PR
@@ -1891,11 +1950,15 @@ fn candidate_has_attach_lock(candidate_path: &Path) -> bool {
 /// only a forged marker (no genuine attach lock) is therefore still listed
 /// — same as a foreign linked worktree is still listed — but reports
 /// `owned: false`, so it can never be misattributed to a victim identity
-/// via `worktree list --mine` the way auditor B1 demonstrated. Nothing on
-/// this path can ever reach a deletion regardless (see
-/// [`isolated_clone_report`]'s own doc comment and [`run_reclaim`]'s
-/// exhaustive match trace), so a bogus row surviving discovery is a display
-/// nuisance, never a safety issue.
+/// via `worktree list --mine` the way auditor B1 demonstrated. The
+/// tightened M4c eligibility rule (see [`isolated_clone_report`]'s own doc
+/// comment) requires `has_attach_lock` as one of its five AND'd conditions
+/// — a forged clone with no genuine attach lock cannot produce the deck's
+/// own provenance artifact, so it can never satisfy that condition — meaning
+/// a bogus row surviving discovery cannot become eligible for auto-removal
+/// (auditor A2, per the maintainer-decided tightening; this was NOT true of
+/// the rule's first, since-tightened version, which compared only a
+/// commit-SHA equality a forged row could in principle be made to satisfy).
 ///
 /// Auditor A5 (not fixed here, deliberately): per-sibling work is uncapped.
 /// [`isolated_clone_report`] spawns 3-5 `git`/`gh` processes per accepted
@@ -2030,18 +2093,22 @@ fn resolve_isolated_clone_branch(clone_dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(raw).into_owned())
 }
 
-/// Resolve an isolated clone's own current HEAD commit SHA via `git
-/// rev-parse HEAD`, run inside the clone itself (fork#325 M4c) — `None` on
-/// any spawn/exit/parse failure. Mirrors [`resolve_isolated_clone_branch`]'s
-/// shape exactly, including running via [`git_in_untrusted_dir`] for the
-/// same reason: this is a `git` invocation with `current_dir` set inside an
-/// untrusted candidate. Used by [`isolated_clone_report`] to compare against
-/// a merged PR's merge-commit SHA — an exact match is the only signal that
-/// widens a row's verdict past the permanently-conservative
-/// `"isolated_clone"` default.
-fn resolve_isolated_clone_head_sha(clone_dir: &Path) -> Option<String> {
+/// Resolve an isolated clone's own current HEAD **tree** SHA via `git
+/// rev-parse HEAD^{tree}`, run inside the clone itself (fork#325 M4c
+/// tightening, auditor A8) — `None` on any spawn/exit/parse failure. Mirrors
+/// [`resolve_isolated_clone_branch`]'s shape exactly, including running via
+/// [`git_in_untrusted_dir`] for the same reason: this is a `git` invocation
+/// with `current_dir` set inside an untrusted candidate. Used by
+/// [`isolated_clone_report`] to compare against a merged PR's merge-commit
+/// **tree** SHA ([`PrState::Merged::merge_tree_sha`], via
+/// [`resolve_pr_merge_tree_sha`]) — content equality, not the pre-tightening
+/// commit-SHA equality the earlier (removed) rule compared, since a
+/// squash-merge repo's commit SHAs essentially never agree between a clone
+/// still on its own work branch and the PR's own squash commit while their
+/// trees, once nothing local remains, do.
+fn resolve_isolated_clone_head_tree_sha(clone_dir: &Path) -> Option<String> {
     let out = git_in_untrusted_dir(clone_dir)
-        .args(["rev-parse", "HEAD"])
+        .args(["rev-parse", "HEAD^{tree}"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -2052,6 +2119,61 @@ fn resolve_isolated_clone_head_sha(clone_dir: &Path) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(raw).into_owned())
+}
+
+/// Resolve an isolated clone's local branches via `git for-each-ref
+/// --format=%(refname:short) refs/heads`, run inside the clone itself
+/// (fork#325 M4c tightening, auditor A3) — one line per local branch,
+/// `None` on any spawn/exit failure (fails closed: eligibility must never
+/// be decided from a branch listing that could not be resolved). Mirrors
+/// [`resolve_isolated_clone_branch`]'s shape, including running via
+/// [`git_in_untrusted_dir`]. Used by [`isolated_clone_report`] to require
+/// EXACTLY one local branch (the resolved current branch, no others) before
+/// treating a clone as reclaim-eligible: `git rev-parse HEAD`/its tree
+/// proves only that ONE ref is safe to discard, while `remove_dir_all`
+/// destroys the whole clone, including any other local branch that may hold
+/// commits with no copy anywhere else.
+fn resolve_isolated_clone_local_branches(clone_dir: &Path) -> Option<Vec<String>> {
+    let out = git_in_untrusted_dir(clone_dir)
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(
+        text.lines()
+            .map(|line| line.to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+    )
+}
+
+/// Resolve an isolated clone's `git stash list` via `git stash list`, run
+/// inside the clone itself (fork#325 M4c tightening, auditor A3's other
+/// half) — one line per stash entry, `None` on any spawn/exit failure
+/// (fails closed, same reasoning as [`resolve_isolated_clone_local_branches`]).
+/// Mirrors that function's shape, including running via
+/// [`git_in_untrusted_dir`]. Used by [`isolated_clone_report`] to require an
+/// EMPTY stash list before treating a clone as reclaim-eligible: a stash
+/// entry is local-only content `remove_dir_all` would destroy with no copy
+/// anywhere else, the same hazard an extra local branch is.
+fn resolve_isolated_clone_stash_list(clone_dir: &Path) -> Option<Vec<String>> {
+    let out = git_in_untrusted_dir(clone_dir)
+        .args(["stash", "list"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(
+        text.lines()
+            .map(|line| line.to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+    )
 }
 
 /// Build the report row for one discovered isolated clone (fork#325 M4a).
@@ -2074,15 +2196,36 @@ fn resolve_isolated_clone_head_sha(clone_dir: &Path) -> Option<String> {
 /// match falls through to its `_ => kept.push(r)` arm unconditionally,
 /// with no new match arm needed there at all.
 ///
-/// **Fork#325 M4c exception (maintainer-decided rule):** the one condition
-/// under which `verdict` is NOT hard-coded to [`KIND_ISOLATED_CLONE`] is a
-/// MERGED PR whose merge-commit SHA equals this clone's own current HEAD SHA
-/// exactly ([`VERDICT_ISOLATED_CLONE_RECLAIMABLE`]) — [`run_reclaim`] gets a
-/// dedicated match arm for that value, using a removal primitive other than
-/// `remove_worktree_dir`'s `git worktree remove` (which fails loudly against
-/// a plain clone, not a linked worktree). Every other case — unmerged, or
-/// merged-but-diverged — is unaffected and still hard-codes
-/// [`KIND_ISOLATED_CLONE`] exactly as before this milestone.
+/// **Fork#325 M4c exception (maintainer-decided rule, tightened after an
+/// audit found the first shipped version had 3 blocker-severity gaps):** the
+/// one condition under which `verdict` is NOT hard-coded to
+/// [`KIND_ISOLATED_CLONE`] is the AND of all five: (1) `has_attach_lock` —
+/// the deck's own provenance artifact, since a forged sibling directory can
+/// satisfy every other condition below with no deck involvement at all
+/// (auditor A2); (2) the working tree is [`Cleanliness::Clean`] —
+/// `remove_dir_all` has no equivalent of `git worktree remove`'s own refusal
+/// against a dirty tree, so eligibility must consult cleanliness directly
+/// rather than leaving it a display-only field (auditor A1); (3) exactly one
+/// local branch, the resolved current one — HEAD-equality proves one ref
+/// safe to discard, never the whole clone `remove_dir_all` destroys, which
+/// may hold a second branch with commits no copy exists of elsewhere
+/// (auditor A3); (4) an empty `git stash list` — the same local-only-content
+/// hazard as (3), through git's other local-only ref namespace (auditor A3);
+/// and (5) a MERGED PR whose merge-commit **tree** SHA equals this clone's
+/// own current HEAD tree SHA exactly ([`VERDICT_ISOLATED_CLONE_RECLAIMABLE`])
+/// — tree equality, not the pre-tightening commit-SHA equality, because a
+/// squash-merge repo's commit SHAs essentially never agree between a clone
+/// still on its own work branch and the PR's own squash commit, while their
+/// trees, once nothing local remains, do (auditor A8 — the gap that made the
+/// first shipped rule inert for exactly the real clones this milestone
+/// exists to reclaim). [`run_reclaim`] gets a dedicated match arm for
+/// [`VERDICT_ISOLATED_CLONE_RECLAIMABLE`], using a removal primitive other
+/// than `remove_worktree_dir`'s `git worktree remove` (which fails loudly
+/// against a plain clone, not a linked worktree). Every other case is
+/// unaffected and still hard-codes [`KIND_ISOLATED_CLONE`] exactly as before
+/// this milestone. `None`/unresolvable anywhere in this five-way chain fails
+/// closed to "not eligible" — the same stance the pre-tightening rule took
+/// for an unresolvable merge SHA.
 ///
 /// Final round (reviewer F13 / auditor A1/B1): `owned` and `owner`/
 /// `owner_kind` below are now backed by `candidate.has_attach_lock` —
@@ -2135,27 +2278,39 @@ fn isolated_clone_report(
         ),
         None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
     };
-    // Fork#325 M4c (maintainer-decided rule): the only condition that ever
-    // widens this row's verdict past the permanently-conservative
-    // `KIND_ISOLATED_CLONE` default -- a MERGED PR whose merge-commit SHA
-    // was itself resolvable (`merge_sha: Some(..)`) AND equals this clone's
-    // OWN current HEAD SHA exactly. A merged-but-SHA-unresolvable PR
-    // (`merge_sha: None`) never qualifies -- the match below falls through
-    // to `false` for that case -- an ambiguous signal must never widen
-    // eligibility for a safety-relevant deletion decision.
-    let head_sha = resolve_isolated_clone_head_sha(&path);
-    let is_reclaim_eligible = match &pr_state {
+    // Fork#325 M4c tightened rule (maintainer-decided, after an audit found
+    // 3 blocker-severity gaps in the first shipped version): the only
+    // condition that ever widens this row's verdict past the
+    // permanently-conservative `KIND_ISOLATED_CLONE` default is the AND of
+    // all five gates below -- see this function's own doc comment for why
+    // each one is required. Every resolution here fails closed: a `None`
+    // anywhere in the chain (an unresolvable branch listing, stash list, or
+    // tree SHA) makes the corresponding gate `false`, never treated as a
+    // pass.
+    let head_tree_sha = resolve_isolated_clone_head_tree_sha(&path);
+    let local_branches = resolve_isolated_clone_local_branches(&path);
+    let stash_list = resolve_isolated_clone_stash_list(&path);
+    let single_local_branch = branch
+        .as_ref()
+        .zip(local_branches.as_ref())
+        .is_some_and(|(b, branches)| branches == &vec![b.clone()]);
+    let stash_empty = stash_list.as_ref().is_some_and(Vec::is_empty);
+    let tree_matches_merge = matches!(
+        &pr_state,
         PrState::Merged {
-            merge_sha: Some(merge_sha),
-        } => head_sha.as_deref() == Some(merge_sha.as_str()),
-        _ => false,
-    };
+            merge_tree_sha: Some(t),
+            ..
+        } if head_tree_sha.as_deref() == Some(t.as_str())
+    );
+    let is_reclaim_eligible =
+        has_attach_lock && clean && single_local_branch && stash_empty && tree_matches_merge;
     let (verdict, reason) = if is_reclaim_eligible {
         (
             VERDICT_ISOLATED_CLONE_RECLAIMABLE.to_string(),
-            "isolated clone: branch's pull request is merged and this clone's HEAD SHA equals \
-             the PR's merge-commit SHA exactly -- eligible for automatic reclaim (fork#325 M4c, \
-             maintainer-decided rule)"
+            "isolated clone: owned, clean, has exactly one local branch and no stash entries, \
+             and this clone's HEAD tree SHA equals the merged PR's merge-commit tree SHA \
+             exactly -- eligible for automatic reclaim (fork#325 M4c, maintainer-decided \
+             tightened rule)"
                 .to_string(),
         )
     } else {
@@ -2572,7 +2727,10 @@ mod tests {
     #[test]
     fn decide_merged_clean_owned_removes() {
         let v = decide(
-            &PrState::Merged { merge_sha: None },
+            &PrState::Merged {
+                merge_sha: None,
+                merge_tree_sha: None,
+            },
             &Cleanliness::Clean,
             Ownership::Ours,
         );
@@ -2582,7 +2740,10 @@ mod tests {
     #[test]
     fn decide_merged_clean_foreign_asks() {
         let v = decide(
-            &PrState::Merged { merge_sha: None },
+            &PrState::Merged {
+                merge_sha: None,
+                merge_tree_sha: None,
+            },
             &Cleanliness::Clean,
             Ownership::Foreign,
         );
@@ -2592,12 +2753,18 @@ mod tests {
     #[test]
     fn decide_merged_dirty_keeps_regardless_of_ownership() {
         let owned = decide(
-            &PrState::Merged { merge_sha: None },
+            &PrState::Merged {
+                merge_sha: None,
+                merge_tree_sha: None,
+            },
             &Cleanliness::Dirty,
             Ownership::Ours,
         );
         let foreign = decide(
-            &PrState::Merged { merge_sha: None },
+            &PrState::Merged {
+                merge_sha: None,
+                merge_tree_sha: None,
+            },
             &Cleanliness::Dirty,
             Ownership::Foreign,
         );
@@ -2608,7 +2775,10 @@ mod tests {
     #[test]
     fn decide_merged_unresolvable_cleanliness_keeps_without_calling_it_dirty() {
         let v = decide(
-            &PrState::Merged { merge_sha: None },
+            &PrState::Merged {
+                merge_sha: None,
+                merge_tree_sha: None,
+            },
             &Cleanliness::Unresolvable("spawn failed".to_string()),
             Ownership::Ours,
         );
