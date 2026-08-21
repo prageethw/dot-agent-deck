@@ -2,6 +2,8 @@
 
 This page describes how changes reach `main`, who may approve them, and — because the two are inseparable here — why turning the gate on requires a CI change first. It is maintainer-facing and deliberately unpublished (CLAUDE.md rule 11).
 
+**Everything below describes `vfarcic/dot-agent-deck` (upstream) — not this fork.** `prageethw/dot-agent-deck` has no ruleset, no required checks, no required approval, and no restriction on force-push or deletion of `main`; that is a deliberate choice (force-push is part of this fork's own routine re-curation workflow), stated explicitly with the reasoning in CLAUDE.md rule 8, fork issue #356. This page's mechanisms — `main-protected`, required review-thread resolution, the Renovate bypass, auto-merge — are all upstream-only; where a passage below reads as though it applies "here", it means upstream's repo, not this one.
+
 ## The model
 
 `main` is protected by a repository ruleset named `main-protected`. Every change lands through a pull request with at least one approving review. A maintainer's own pull request is reviewed by another maintainer. The repository owner retains ownership and can override anything, either by holding the `admin` bypass or by disabling the ruleset outright.
@@ -37,7 +39,7 @@ With `CODEOWNERS` in place this normally happens on its own. The commands are fo
 
 Three rules about sequencing, each of which exists because of a specific ruleset setting:
 
-- **Request review last, not first.** `dismiss_stale_reviews_on_push: true`, so any push after an approval silently voids it. Settle CI, resolve the delegated `reviewer`/`auditor` findings (CLAUDE.md rule 8 — no bot posts an automated review here), push the fixes, resolve the threads — *then* ask for review. Requesting earlier buys a guaranteed second round trip.
+- **Request review last, not first.** `dismiss_stale_reviews_on_push: true`, so any push after an approval silently voids it. Settle CI, resolve the delegated `reviewer`/`auditor` findings (CLAUDE.md rule 8 — no bot posts an automated review on this fork), push the fixes, resolve the threads — *then* ask for review. Requesting earlier buys a guaranteed second round trip.
 - **Resolve every review thread.** `required_review_thread_resolution: true` is what turns "read the review comments" from a habit into something the merge button enforces — see [What is gated](#what-is-gated).
 - **The author merges after approval, or arms auto-merge.** Nothing in the ruleset constrains who presses the button (`require_last_push_approval` is `false`), and the approving maintainer is under no obligation to. Reviewer-merges is a Prow/Kubernetes convention in which a *bot* merges on `/lgtm`; the GitHub-native equivalent is auto-merge, queued by the author. **Auto-merge was enabled on 2026-08-11** (`allow_auto_merge: true`), so an author may arm a pull request and let GitHub land it when the ruleset is satisfied. The objection previously recorded here — that arming it early lets the author "never return to the pull request" — does not survive the two rules above: auto-merge waits for the required approval, so a human still reads and judges, and `required_review_thread_resolution: true` means an armed pull request cannot merge while the delegated review's threads sit unresolved. Someone must still clear them by hand. **That safety rests entirely on the ruleset being in force**, though, because `allow_auto_merge` is a repository setting the ruleset knows nothing about: lift the gate with an armed pull request outstanding and it lands unreviewed on the spot. [Emergency override](#emergency-override) therefore disarms before it deletes.
 
@@ -120,13 +122,13 @@ It is enabled by default deliberately. While approvals are 0 the entry is inert,
 
 One consequence to accept: with the bypass in place, CI gating on dependency pull requests rests on Renovate's own configuration (it waits for branch status before merging), not on the ruleset. Adding `required_status_checks` in step 6 did not change that, because a bypass actor bypasses those too — **confirmed on 2026-08-11 by #510**, authored and merged by `app/renovate` with `reviewDecision: REVIEW_REQUIRED` and all four required checks reporting `SKIPPED`. So this lane merges to `main` with no human approval and, on the devbox-only and flake-only paths, with no Rust job having run at all; the post-merge `ci.yml` run on `main` is the whole net. Both halves are deliberate, but they are the reason `renovate.json`'s automerge groups deserve the same scrutiny as the ruleset itself — see [step 6](#rollout) for the measurement, and `RENOVATE_BYPASS=false` to close the lane.
 
-The `required_review_thread_resolution` rule is not a problem here in practice — no bot posts a review or inline comments on Renovate pull requests (verified on #426, #389 and #384; CLAUDE.md rule 8 — no automated code reviewer runs on this fork at all). It would become one if that ever changed.
+The `required_review_thread_resolution` rule is not a problem here in practice — no bot posts a review or inline comments on Renovate pull requests (verified on #426, #389 and #384). It would become one if that ever changed.
 
 ## What is gated
 
 Everything that lands on `main`, uniformly: one approving review from a maintainer, all review threads resolved, no deletion, no force-push. There is no path scoping — see [Who counts as a maintainer](#who-counts-as-a-maintainer) for why, and for the round-trip-on-a-typo cost that comes with it.
 
-The requirement that review threads resolve before merge is doing specific work. No bot reviews pull requests on this fork (CLAUDE.md rule 8). The delegated `reviewer`/`auditor` pass leaves its findings in a file under the root checkout's `.dot-agent-deck/` (rule 15), never on the pull request — so the only thing that populates review threads here is the human maintainer's review, and a green check board never proves those comments were read. Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
+The requirement that review threads resolve before merge is doing specific work **on upstream, where `required_review_thread_resolution` exists** — this fork has no such rule mechanically enforcing it (see the note at the top of this page). No bot reviews pull requests on this fork (CLAUDE.md rule 8). The delegated `reviewer`/`auditor` pass leaves its findings in a file under the root checkout's `.dot-agent-deck/` (rule 15), never on the pull request — so on this fork, thread resolution is a habit to keep, not something the merge button enforces; only on upstream does thread resolution turn "read the inline comments" from a habit into a mechanical gate.
 
 ## Making the gate bind the owner too
 
