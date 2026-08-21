@@ -26051,6 +26051,80 @@ mod tests {
         );
     }
 
+    /// Scenario: Call the actual production `insert_role_placeholder_sessions`
+    /// helper — the real Orchestration-tab wiring, not the detection function
+    /// in isolation — with one role whose command is a devbox-wrapped agent
+    /// launch and one role whose command is a plain non-agent binary, and
+    /// assert the two resulting sessions' `expects_agent_report` come out
+    /// `true` and `false` respectively.
+    #[spec("dashboard/placeholder/003")]
+    #[test]
+    fn dashboard_placeholder_003_role_wiring_seeds_expects_agent_report_for_devbox_and_non_agent() {
+        // PRD #536 follow-up: this pins the production call site directly,
+        // against the real `OrchestrationRoleConfig` shape this fork's own
+        // `.dot-agent-deck.toml` roles use — the near-miss this round is
+        // fixing (a devbox-launched role silently auto-wrapping on respawn)
+        // was only caught by a dedicated `agent_pty`/`event` regression test,
+        // never by anything exercising this actual wiring. The devbox role's
+        // session must still end up `expects_agent_report == true` (it IS a
+        // recognized agent CLI, just launched through devbox), derived via
+        // the presentation-only `AgentType::from_command_including_devbox` —
+        // never via the shared `AgentType::from_command` that also feeds the
+        // respawn wrap decision.
+        let mut state = AppState::default();
+        let role_pane_ids = vec!["1".to_string(), "2".to_string()];
+        let role_agent_ids = vec![Some("d-1".to_string()), Some("d-2".to_string())];
+        let roles = vec![
+            OrchestrationRoleConfig {
+                name: "reviewer".to_string(),
+                command: "devbox run claude-sonnet-devbox".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            },
+            OrchestrationRoleConfig {
+                name: "scratch".to_string(),
+                command: "cat".to_string(),
+                start: false,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            },
+        ];
+
+        insert_role_placeholder_sessions(
+            &mut state,
+            &role_pane_ids,
+            &role_agent_ids,
+            &roles,
+            "/tmp",
+        );
+
+        let devbox_session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("pane 1's placeholder session must have been inserted");
+        assert!(
+            devbox_session.expects_agent_report,
+            "a role launched via `devbox run claude-sonnet-devbox` must seed \
+             expects_agent_report=true (it IS a recognized agent CLI, just \
+             launched through devbox); got {devbox_session:?}"
+        );
+
+        let non_agent_session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("2"))
+            .expect("pane 2's placeholder session must have been inserted");
+        assert!(
+            !non_agent_session.expects_agent_report,
+            "a role launched via a plain non-agent command (`cat`) must seed \
+             expects_agent_report=false; got {non_agent_session:?}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------

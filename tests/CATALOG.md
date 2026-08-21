@@ -261,6 +261,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the awaiting-report positive case, covered by `dashboard/placeholder/001`.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/placeholder/003 — `insert_role_placeholder_sessions` (the actual Orchestration-tab wiring, not the detection function in isolation) seeds `expects_agent_report` correctly for a devbox-launched role and a non-agent role.
+- **Layer:** L1 (direct call into the production `insert_role_placeholder_sessions` helper; no render).
+- **Agent:** none.
+- **Asserts:** given a two-role `Vec<OrchestrationRoleConfig>` — one role's `command` a devbox-wrapped agent launch (`devbox run claude-sonnet-devbox`, this fork's own real role-command shape), the other a non-agent command (`cat`) — `insert_role_placeholder_sessions` seeds the devbox role's session with `expects_agent_report == true` and the non-agent role's session with `expects_agent_report == false`. PRD #536 follow-up: this is the production call site that must derive its answer from the devbox-aware, presentation-only classifier (`AgentType::from_command_including_devbox`), never from the shared `AgentType::from_command` that also feeds the respawn wrap decision — pinning it here, against the real wiring, is what should have caught the near-miss `spawn_007_hook_learned_badge_does_not_change_respawn_launch` regression before CI did.
+- **Does not assert:** the render-level "Starting…" copy (covered by `dashboard/placeholder/001`/`002`); the respawn wrap decision itself (covered by `tests/agent_detection.rs`'s `spawn_007`/`spawn_008`); `AgentType::from_command_including_devbox`'s own classification rules in isolation (covered by `from_command_including_devbox_recognizes_devbox_run` in `src/event.rs`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
