@@ -392,6 +392,7 @@ fn make_session(
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         model: None,
+        expects_agent_report: false,
     }
 }
 
@@ -3231,6 +3232,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         model: None,
+        expects_agent_report: false,
     };
     let (buffer, _) = render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, 80, 20);
     let area = *buffer.area();
@@ -3345,6 +3347,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         model: None,
+        expects_agent_report: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as

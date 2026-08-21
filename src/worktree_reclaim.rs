@@ -1804,7 +1804,7 @@ fn git_in_untrusted_dir(dir: &Path) -> Command {
 ///   never under any repository's `.git` at all — that
 ///   [`create_worktree_sync`] never writes into under any circumstance, so
 ///   there is nothing left for a forged occupant to inherit
-///   (`worktree/reclaim/062`).
+///   (`worktree/reclaim/074`).
 /// - **Auditor C1 — the old lock was acquired before `clone_dir.exists()`
 ///   was checked.** `provision_isolated_clone_sync`'s attach lock (still
 ///   used, unchanged, for cross-process mutual exclusion — see
@@ -1816,7 +1816,7 @@ fn git_in_untrusted_dir(dir: &Path) -> Command {
 ///   is written only afterward, once the clone this call performed has
 ///   actually succeeded — a pre-planted directory hits
 ///   `IsolatedCloneOutcome::AlreadyClaimed` and returns before that write is
-///   ever reached, so it is never vouched for (`worktree/reclaim/063`).
+///   ever reached, so it is never vouched for (`worktree/reclaim/075`).
 ///
 /// **Bonus, from the same design (reviewer F2, `worktree/reclaim/058`):**
 /// M4a's mechanism required knowing the enumerating repo's own common
@@ -5795,9 +5795,9 @@ mod tests {
     /// asserts the CORRECT, not-yet-shipped behavior (the forged occupant
     /// must never report `owned: true`), so it is RED today: the inherited
     /// lock currently makes it pass.
-    #[spec("worktree/reclaim/062")]
+    #[spec("worktree/reclaim/074")]
     #[test]
-    fn worktree_reclaim_062_forged_directory_inherits_a_vacated_linked_worktree_lock() {
+    fn worktree_reclaim_074_forged_directory_inherits_a_vacated_linked_worktree_lock() {
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         init_repo_with_origin(&repo);
@@ -5878,9 +5878,9 @@ mod tests {
     /// `AlreadyClaimed` and nothing ever actually attaches into the
     /// planted directory. Asserts the CORRECT, not-yet-shipped behavior --
     /// RED today.
-    #[spec("worktree/reclaim/063")]
+    #[spec("worktree/reclaim/075")]
     #[test]
-    fn worktree_reclaim_063_pre_planted_directory_survives_already_claimed_as_owned() {
+    fn worktree_reclaim_075_pre_planted_directory_survives_already_claimed_as_owned() {
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         init_repo_with_origin(&repo);

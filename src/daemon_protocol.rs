@@ -6245,6 +6245,7 @@ mod tests {
             shell_synthetic_working: false,
             orchestration_orphaned: false,
             model: None,
+            expects_agent_report: false,
         };
         let snap = session.live_snapshot();
         assert_eq!(

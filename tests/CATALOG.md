@@ -292,6 +292,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `even_row_heights` arithmetic in isolation (covered by `even_row_heights_seven_rows_thirty_two_matches_expected_split`); this test pins that the same split reaches the actual render path.
 - **Platform coverage:** mac+linux+windows.
 
+#### dashboard/placeholder
+
+##### dashboard/placeholder/001 — A placeholder explicitly awaiting an agent report renders "Starting…", not "No agent".
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a placeholder session inserted via `insert_placeholder_session_awaiting_report(.., expects_agent_report: true)` — still `agent_type == AgentType::None` (the Orchestration-tab role-pane shape, spawned running a command recognized as a real agent CLI, before its harness has reported in) — renders `"Starting…"` and neither `"No agent"` nor `"Launch an agent to get started"`.
+- **Does not assert:** the genuinely-idle placeholder case (agent_id also `None`), covered by `dashboard_placeholder_without_agent_type_shows_launch_an_agent`; the hydrated-known-`agent_type` case, covered separately by `dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent`; the non-agent-command negative case (real `agent_id`, `expects_agent_report == false`), covered by `dashboard/placeholder/002`; the reconnect-hydration path (`seed_hydrated_session`), which defers `expects_agent_report` to `false` even when the original spawn command was a recognized agent — a known, deliberate scope limitation, not a regression (renders `"No agent"` there instead of `"Starting…"`, same as before this redesign).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/placeholder/002 — A placeholder for a non-agent command (real `agent_id`, unrecognized/bare-shell command) keeps "No agent", never "Starting…".
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a placeholder session inserted via the plain `insert_placeholder_session` (real `agent_id`, `agent_type == AgentType::None`) — the shape a bare shell pane, an unrecognized command (`sleep 600`, `cat`), or any other non-agent PTY has — seeds `expects_agent_report == false` and renders `"No agent"` / `"Launch an agent to get started"`, never `"Starting…"`. This is the negative case proving the discriminator no longer false-positives on `agent_id.is_some()` alone.
+- **Does not assert:** the awaiting-report positive case, covered by `dashboard/placeholder/001`.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/placeholder/003 — `insert_role_placeholder_sessions` (the actual Orchestration-tab wiring, not the detection function in isolation) seeds `expects_agent_report` correctly for a devbox-launched role and a non-agent role.
+- **Layer:** L1 (direct call into the production `insert_role_placeholder_sessions` helper; no render).
+- **Agent:** none.
+- **Asserts:** given a two-role `Vec<OrchestrationRoleConfig>` — one role's `command` a devbox-wrapped agent launch (`devbox run claude-sonnet-devbox`, this fork's own real role-command shape), the other a non-agent command (`cat`) — `insert_role_placeholder_sessions` seeds the devbox role's session with `expects_agent_report == true` and the non-agent role's session with `expects_agent_report == false`. PRD #536 follow-up: this is the production call site that must derive its answer from the devbox-aware, presentation-only classifier (`AgentType::from_command_including_devbox`), never from the shared `AgentType::from_command` that also feeds the respawn wrap decision — pinning it here, against the real wiring, is what should have caught the near-miss `spawn_007_hook_learned_badge_does_not_change_respawn_launch` regression before CI did.
+- **Does not assert:** the render-level "Starting…" copy (covered by `dashboard/placeholder/001`/`002`); the respawn wrap decision itself (covered by `tests/agent_detection.rs`'s `spawn_007`/`spawn_008`); `AgentType::from_command_including_devbox`'s own classification rules in isolation (covered by `from_command_including_devbox_recognizes_devbox_run` in `src/event.rs`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
@@ -1343,14 +1366,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** any deeper nesting than one subdirectory level, or the linked-worktree enumeration's own behavior from a subdirectory (unaffected by this milestone).
 - **Platform coverage:** mac+linux+windows.
 
-##### worktree/reclaim/062 — M4b (RED), reviewer P1. The attach-lock namespace `candidate_has_attach_lock` checks is the SAME one `create_worktree_sync` writes into for an ordinary linked worktree, not isolated-clone-specific: a linked worktree is created through the real production path, removed normally via `git worktree remove`, and a same-uid attacker then plants a forged `.git` directory plus a forged ownership marker at the exact now-vacant path — inheriting the genuine, never-cleaned-up lock without forging it. Asserts the forged occupant must never report `owned: true` (fork issue #325 M4b).
+##### worktree/reclaim/074 — M4b (RED), reviewer P1. The attach-lock namespace `candidate_has_attach_lock` checks is the SAME one `create_worktree_sync` writes into for an ordinary linked worktree, not isolated-clone-specific: a linked worktree is created through the real production path, removed normally via `git worktree remove`, and a same-uid attacker then plants a forged `.git` directory plus a forged ownership marker at the exact now-vacant path — inheriting the genuine, never-cleaned-up lock without forging it. Asserts the forged occupant must never report `owned: true` (fork issue #325 M4b).
 - **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — real `create_worktree_sync` + real `git worktree remove`, then a hand-planted 2-file forgery at the vacated path.
 - **Agent:** none.
 - **Asserts:** the forged directory is discovered but `owned` is `false`, and `is_mine` returns `false` for the identity its own forged marker claims.
 - **Does not assert:** which of the two fix mechanisms the PRD names (a clone-specific provenance artifact vs. unlinking the lock on `AlreadyClaimed`) coder picks — only the observable contract.
 - **Platform coverage:** mac+linux+windows.
 
-##### worktree/reclaim/063 — M4b (RED), auditor C1. `provision_isolated_clone_sync` acquires the attach lock (writing the artifact unconditionally) BEFORE checking whether `clone_dir` already exists. A same-uid attacker pre-plants a forged `.git` dir plus a forged ownership marker at the fully deterministic dispatch path; the real provisioner then writes a genuine attach-lock artifact vouching for it even though the dispatch itself visibly fails as `AlreadyClaimed` and never attaches into the planted directory. Asserts the pre-planted directory must never report `owned: true` (fork issue #325 M4b).
+##### worktree/reclaim/075 — M4b (RED), auditor C1. `provision_isolated_clone_sync` acquires the attach lock (writing the artifact unconditionally) BEFORE checking whether `clone_dir` already exists. A same-uid attacker pre-plants a forged `.git` dir plus a forged ownership marker at the fully deterministic dispatch path; the real provisioner then writes a genuine attach-lock artifact vouching for it even though the dispatch itself visibly fails as `AlreadyClaimed` and never attaches into the planted directory. Asserts the pre-planted directory must never report `owned: true` (fork issue #325 M4b).
 - **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — calls the real `issue_dispatch_run::provision_isolated_clone_sync` against a pre-existing forged directory.
 - **Agent:** none.
 - **Asserts:** the provisioner reports `AlreadyClaimed` without deleting or modifying the pre-existing directory; `examine_worktrees` reports it discovered but `owned: false`, and `is_mine` returns `false` for the forged identity.
@@ -1382,7 +1405,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`.
 - **Agent:** none.
 - **Asserts:** the forged directory is still discovered (discovery stays purely structural); `owned` is `false`; `owner` is `None`; `is_mine` is `false` for the forged identity and for any other identity.
-- **Does not assert:** the no-provenance-file case (`worktree/reclaim/054`), the vacated-linked-worktree-lock case (`worktree/reclaim/062`), or the pre-planted-dispatch-path case (`worktree/reclaim/063`) — this is the bare self-planted-artifact forgery those three do not cover.
+- **Does not assert:** the no-provenance-file case (`worktree/reclaim/054`), the vacated-linked-worktree-lock case (`worktree/reclaim/074`), or the pre-planted-dispatch-path case (`worktree/reclaim/075`) — this is the bare self-planted-artifact forgery those three do not cover.
 - **Platform coverage:** mac+linux+windows.
 
 ##### worktree/reclaim/062 — M4c REDESIGNED rule (RED), PR #526 round 3, reviewer B2. `mergeCommit.oid` (and round 2's switch to its tree) is the commit GitHub's merge creates on the BASE branch — never equal to a deck-provisioned clone's own HEAD under any GitHub merge strategy (measured live: PR #481 head `7339edd5f440` vs merge `1ceb919349ef`; PR #477 head `11d6327f2421` vs merge `5742ad1f93dd`), so round 2's rule could (almost) never fire in production. The redesigned rule compares against the PR's own `headRefOid` instead — the PR branch's own head commit, a flat `gh pr list --json` field needing no `gh api graphql` round trip at all. An isolated clone that is owned (a real attach-lock artifact via `provision_isolated_clone_sync`), clean, has exactly one local branch matching its resolved branch with an empty `git stash list`, and whose own `git rev-parse HEAD` equals the merged PR's `headRefOid` exactly must report as auto-reclaim-eligible (fork issue #325 M4c).

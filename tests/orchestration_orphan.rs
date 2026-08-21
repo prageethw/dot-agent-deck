@@ -123,6 +123,7 @@ fn card(orphaned: bool) -> SessionState {
         shell_synthetic_working: false,
         orchestration_orphaned: orphaned,
         model: None,
+        expects_agent_report: false,
     }
 }
 
