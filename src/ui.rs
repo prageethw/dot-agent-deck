@@ -10959,6 +10959,24 @@ fn dispatch_action(
                     // name to the tab TITLE only, via `display_title`; the
                     // identity stays the canonical `orch_config.name`.
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
+                    // Issue #201 option (b): the START role's index and the
+                    // exact title this tab will carry — computed here,
+                    // ahead of the spawn, so both the post-spawn claim call
+                    // below and the delivery-identity capture further down
+                    // (`start_idx`, moved up from its old home there) read
+                    // ONE value rather than two independent derivations
+                    // that could drift apart. Mirrors `open_orchestration_tab`'s
+                    // own `resolved_name` fallback exactly (`display_title`
+                    // when non-empty, else `resolve_orchestration_name`),
+                    // since the claimed name must be the literal title the
+                    // tab ends up with.
+                    let start_idx = orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                    let orchestration_claim_name = display_title.clone().unwrap_or_else(|| {
+                        crate::project_config::resolve_orchestration_name(
+                            &orch_config.name,
+                            std::path::Path::new(&dir_str),
+                        )
+                    });
                     // `None`: the interactive path carries no caller task — the user
                     // types their instructions after the orchestrator acknowledges.
                     // Output is byte-for-byte the pre-#222 text.
@@ -11002,6 +11020,57 @@ fn dispatch_action(
                         spawn_dims,
                     ) {
                         Ok((_tab_idx, role_pane_ids)) => {
+                            // Issue #201 option (b): the AUTHORITATIVE
+                            // exclusivity check — `form.name_collision()`
+                            // (the submit door this replaces as the source
+                            // of truth for) only ever compared against a
+                            // `live_orchestration_names` snapshot captured
+                            // ONCE at form-open, so two New-Pane forms
+                            // opened close together both read the same
+                            // stale list and neither submit was refused.
+                            // This is checked here, right after the role
+                            // panes actually exist, because the daemon
+                            // mints each pane's real `pane_id` at
+                            // `StartAgent` time (PRD #365 M2) — there is no
+                            // real id to claim with any earlier than this.
+                            // Fail CLOSED on any transport problem, mirroring
+                            // `root_checkout_has_live_sibling`'s policy for
+                            // this same class of daemon-side correctness
+                            // gate: an unreachable daemon here would silently
+                            // let fork issue #201's race back in.
+                            let claim_result = send_daemon_request_blocking_with_timeout(
+                                &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
+                                    name: orchestration_claim_name.clone(),
+                                    pane_id: role_pane_ids[start_idx].clone(),
+                                },
+                                DAEMON_REQUEST_TIMEOUT,
+                            );
+                            let claimed = matches!(claim_result, Ok(ref resp) if resp.ok);
+                            if !claimed {
+                                // Never leave a half-open orchestration
+                                // behind: close every role pane this call
+                                // just created, the same rollback
+                                // `open_orchestration_tab`'s own per-role
+                                // spawn-failure path already performs.
+                                for id in &role_pane_ids {
+                                    let _ = pane.close_pane(id);
+                                }
+                                let reason = match claim_result {
+                                    Ok(resp) => resp.error.unwrap_or_else(|| {
+                                        format!(
+                                            "orchestration name {orchestration_claim_name:?} is already held"
+                                        )
+                                    }),
+                                    Err(e) => format!(
+                                        "could not verify orchestration name availability: {e}"
+                                    ),
+                                };
+                                ui.status_message = Some((
+                                    format!("Orchestration failed: {reason}"),
+                                    std::time::Instant::now(),
+                                ));
+                                return Flow::Continue;
+                            }
                             // PRD #110 followup: snapshot each role
                             // pane's daemon agent_id before the
                             // placeholder insert so the strict-
@@ -11047,8 +11116,8 @@ fn dispatch_action(
                                 ui.pane_names
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
                             }
-                            let start_idx =
-                                orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            // `start_idx` computed above, ahead of the spawn
+                            // (issue #201's claim needs it too).
                             // PRD #20 R20-003 (finding #5): capture the START
                             // role's delivery IDENTITY *now* — immediately after
                             // `open_orchestration_tab` created the role panes —

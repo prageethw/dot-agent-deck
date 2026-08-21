@@ -319,7 +319,21 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// field*, already covered by the module doc's bullet list; an additive
 /// *unit variant* on an externally-tagged enum carrying `#[serde(other)]`
 /// is a different shape and belongs on that list too (see the module doc).
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// Issue #201 bumped 9 → 10: two new [`AttachRequest`] variants,
+/// [`AttachRequest::ClaimOrchestrationName`] and
+/// [`AttachRequest::ReleaseOrchestrationName`] — squarely the module doc's
+/// first bullet ("new `AttachRequest` variants"), not the additive-field
+/// exception. An older daemon receiving either op fails to deserialize the
+/// externally-tagged `AttachRequest` at all (there is no `#[serde(other)]`
+/// catch-all on this enum, unlike `KeptReason` above) and returns a
+/// "malformed request" error rather than silently ignoring the call — a
+/// mixed pairing would make the New-Pane form's authoritative daemon-side
+/// exclusivity check fail closed to "daemon rejected the request" rather
+/// than silently behaving as though no claim exists, which is the
+/// intentionally loud failure mode for a same-wire safety check. See
+/// `changelog.d/201.breaking.md`.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -567,6 +581,37 @@ pub enum AttachRequest {
     /// such task is registered.
     RunNow {
         name: String,
+    },
+    /// Issue #201 option (b): atomically claim an orchestrator pane's own
+    /// name/title, checked against every other LIVE claim rather than a
+    /// point-in-time `ListAgents` snapshot. Replies `ok = true` when `name`
+    /// was free (or already held by this exact `pane_id` — idempotent
+    /// re-claim) and `ok = false` when a *different* pane already holds it.
+    ///
+    /// `pane_id` is the real, daemon-minted `pane_id_env` of the START role
+    /// pane the caller is committing to. The New-Pane spawn path
+    /// (`Action::SpawnPane` in `src/ui.rs`) cannot know that id before the
+    /// role panes actually exist — `StartAgent` is what mints `pane_id`
+    /// (PRD #365 M2) — so the claim is sent right after
+    /// `TabManager::open_orchestration_tab` returns the real ids and BEFORE
+    /// the tab is treated as live; a refusal rolls back every just-spawned
+    /// role pane the same way a mid-spawn failure already does, so a lost
+    /// race never leaves a half-open orchestration behind.
+    ClaimOrchestrationName {
+        name: String,
+        pane_id: String,
+    },
+    /// Issue #201 option (b): release whatever orchestration-name claim (if
+    /// any) `pane_id` holds. A no-op (`ok = true`) if it holds none.
+    ///
+    /// Primarily used server-side (`StopAgent`'s handler releases the
+    /// closing pane's claim automatically) — exposed on the wire too so the
+    /// `Action::SpawnPane` rollback path above can release a claim it just
+    /// took for a role-pane spawn that failed AFTER the claim succeeded,
+    /// without waiting for a `StopAgent` that will never come for a pane
+    /// that was never fully registered.
+    ReleaseOrchestrationName {
+        pane_id: String,
     },
 }
 
@@ -1739,6 +1784,13 @@ async fn handle_connection(
                 // backoff window to stop being retried into, and the
                 // abandonment notice has nowhere left to go.
                 crate::spawn::cancel_prompt_confirmation(pane_id);
+                // Issue #201 option (b): free whatever orchestration-name
+                // claim this pane holds, if any — a no-op for a worker pane
+                // or a plain agent that never claimed one. Piggybacks on
+                // the same pre-removal capture `dispatched_worktree` above
+                // uses, so a name is never left claimed by a pane that no
+                // longer exists.
+                registry.release_orchestration_name(pane_id);
             }
             // PRD #92 F8 followup (auditor #1): `close_agent` runs the
             // synchronous SIGTERM-with-grace loop in
@@ -2163,6 +2215,25 @@ async fn handle_connection(
                 }
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
+        }
+        AttachRequest::ClaimOrchestrationName { name, pane_id } => {
+            // Issue #201 option (b): the authoritative, race-free check —
+            // see the variant's own doc comment for why `pane_id` is the
+            // caller-supplied real pane id rather than something inferred
+            // from this (stateless, one-shot) connection.
+            if registry.claim_orchestration_name(&name, &pane_id) {
+                write_resp(&mut stream, &AttachResponse::ok()).await?;
+            } else {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!("orchestration name {name:?} is already held")),
+                )
+                .await?;
+            }
+        }
+        AttachRequest::ReleaseOrchestrationName { pane_id } => {
+            registry.release_orchestration_name(&pane_id);
+            write_resp(&mut stream, &AttachResponse::ok()).await?;
         }
     }
     Ok(())
@@ -3609,6 +3680,54 @@ mod tests {
                 assert_eq!(id, "agent-7");
                 assert_eq!(rows, 50);
                 assert_eq!(cols, 200);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn claim_orchestration_name_request_serde_round_trip() {
+        // Issue #201: wire shape must be `op = "claim-orchestration-name"`
+        // (kebab-case), matching the resize/set-agent-label precedent above
+        // — `AgentPtyRegistry::claim_orchestration_name`'s own exclusivity
+        // contract is covered directly by `identity_012`/`identity_013` in
+        // `src/agent_pty.rs`; this pins the REQUEST's wire shape, the part
+        // those registry-level tests can't see.
+        let req = AttachRequest::ClaimOrchestrationName {
+            name: "myrepo-orchestrator-1".into(),
+            pane_id: "pane-42".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "claim-orchestration-name");
+        assert_eq!(v["name"], "myrepo-orchestrator-1");
+        assert_eq!(v["pane_id"], "pane-42");
+
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::ClaimOrchestrationName { name, pane_id } => {
+                assert_eq!(name, "myrepo-orchestrator-1");
+                assert_eq!(pane_id, "pane-42");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn release_orchestration_name_request_serde_round_trip() {
+        // Issue #201: wire shape must be `op = "release-orchestration-name"`.
+        let req = AttachRequest::ReleaseOrchestrationName {
+            pane_id: "pane-42".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["op"], "release-orchestration-name");
+        assert_eq!(v["pane_id"], "pane-42");
+
+        let back: AttachRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            AttachRequest::ReleaseOrchestrationName { pane_id } => {
+                assert_eq!(pane_id, "pane-42");
             }
             _ => panic!("wrong variant"),
         }

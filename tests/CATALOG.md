@@ -3642,6 +3642,13 @@ without depending on the config struct API.
 - **Does not assert:** the wire-protocol surface a `ClaimOrchestrationName`/release `AttachRequest` variant would add, or the TUI-side `Action::SpawnPane` call site that would invoke it over the daemon socket — scoped to the registry method such a handler would call, not the RPC itself; automatic release driven by `StopAgent`'s pane-close handler (left to the coder's implementation, plus a possible follow-up L2/PTY test per CLAUDE.md rule 4); the UI form-level advisory refusal path, which `orchestration/identity/003` already covers and this test does not touch.
 - **Platform coverage:** mac+linux+windows (pure `Mutex`/`HashMap`/thread logic, no PTY).
 
+##### orchestration/identity/013 — The non-race edges of the daemon-side name claim `identity_012` doesn't cover, all exercised by the production caller `Action::SpawnPane` (`src/ui.rs`) adds: distinct names never cross-block each other; a pane re-claiming its OWN already-held name is idempotent (succeeds) while a DIFFERENT pane is still refused; releasing a pane id that holds no claim is a silent no-op that leaves every other live claim untouched (`StopAgent`'s handler calls `release_orchestration_name` unconditionally for every closing pane, claim or not).
+- **Layer:** fast unit test, in-process (`src/agent_pty.rs`, `#[cfg(test)] mod tests`). Straight-line calls against one `AgentPtyRegistry` — no threads, no daemon, no PTY, no wire-protocol round-trip.
+- **Agent:** none.
+- **Asserts:** (1) claiming two distinct names from two distinct pane ids both succeed; (2) the SAME pane re-claiming its own name returns `true` and a THIRD pane is still refused afterward (proves the idempotent re-claim didn't release or transfer ownership); (3) `release_orchestration_name` on a pane id holding no claim leaves an unrelated live claim refusable by a different pane, and the real holder's later release still frees its own name correctly.
+- **Does not assert:** the exclusive-race guarantee under concurrent claims (covered by `orchestration/identity/012`); the wire-protocol surface (covered by `claim_orchestration_name_request_serde_round_trip` / `release_orchestration_name_request_serde_round_trip` in `src/daemon_protocol.rs`'s `#[cfg(test)] mod tests`, uncatalogued like their `resize`/`subscribe-events` wire-shape siblings); the `Action::SpawnPane` call site or `StopAgent`'s automatic-release handler themselves.
+- **Platform coverage:** mac+linux+windows (pure `Mutex`/`HashMap` logic, no PTY).
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).

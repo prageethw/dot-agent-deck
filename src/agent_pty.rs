@@ -2972,6 +2972,18 @@ pub struct AgentPtyRegistry {
     /// running daemon can reach, and the drop-driven cancellation below now
     /// retires stale tasks long before they could collide anyway.
     delegation_seq: AtomicU64,
+    /// Issue #201 option (b): daemon-side exclusive claim on an
+    /// orchestrator pane's own name/title, checked atomically at the
+    /// moment a claim is actually taken rather than against a
+    /// point-in-time snapshot. Root cause this replaces: `name_collision()`
+    /// (`src/ui.rs`) refuses a New-Pane form submit against
+    /// `live_orchestration_names`, a list captured ONCE at form-open via a
+    /// single `ListAgents` round-trip — two forms opened close together
+    /// both read the same stale snapshot, so neither submit is refused even
+    /// though both would claim the same name. Keyed by name, valued by the
+    /// owning pane id (see [`Self::claim_orchestration_name`] /
+    /// [`Self::release_orchestration_name`]).
+    orchestration_name_claims: Mutex<HashMap<String, String>>,
 }
 
 /// PRD #126: the outstanding-delegation side state — records plus the
@@ -3414,6 +3426,7 @@ impl AgentPtyRegistry {
             delivery_notice_sink: Mutex::new(None),
             delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
+            orchestration_name_claims: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3426,6 +3439,43 @@ impl AgentPtyRegistry {
     /// socket for its lifetime, so a second call would carry the same path.
     pub fn set_hook_socket(&self, path: PathBuf) {
         *self.hook_socket.lock().unwrap() = Some(path);
+    }
+
+    /// Issue #201 option (b): atomically claim an orchestrator pane's own
+    /// name/title. Returns `true` when `name` was unclaimed (now claimed by
+    /// `pane_id`) OR already claimed by this exact `pane_id` (idempotent
+    /// re-claim — a caller confirming its own already-held claim is not a
+    /// conflict). Returns `false` when `name` is held by a *different*
+    /// `pane_id`.
+    ///
+    /// The wire-level caller (`AttachRequest::ClaimOrchestrationName`,
+    /// `src/daemon_protocol.rs`) uses the New-Pane spawn path's real,
+    /// daemon-minted `pane_id_env` for the START role pane — see the
+    /// `Action::SpawnPane` handler in `src/ui.rs`, which claims only once
+    /// that real id is known (the daemon mints `pane_id` in `StartAgent`,
+    /// so no pane id exists yet at form-submit time) and rolls the spawn
+    /// back on refusal.
+    pub fn claim_orchestration_name(&self, name: &str, pane_id: &str) -> bool {
+        let mut claims = self.orchestration_name_claims.lock().unwrap();
+        match claims.get(name) {
+            Some(holder) => holder == pane_id,
+            None => {
+                claims.insert(name.to_string(), pane_id.to_string());
+                true
+            }
+        }
+    }
+
+    /// Issue #201 option (b): release whatever orchestration-name claim (if
+    /// any) belongs to `pane_id` — a no-op if that pane holds no claim.
+    /// Called from `StopAgent`'s handler (`src/daemon_protocol.rs`) for the
+    /// closing pane id, so a claim is freed the moment its owning
+    /// orchestrator pane closes rather than lingering forever.
+    pub fn release_orchestration_name(&self, pane_id: &str) {
+        self.orchestration_name_claims
+            .lock()
+            .unwrap()
+            .retain(|_, holder| holder != pane_id);
     }
 
     /// Issue #424: install the daemon's sink for [`DeliveryNotice`]s. Called
@@ -8115,6 +8165,50 @@ mod spawn_tests {
             registry.claim_orchestration_name(NAME, "pane-c"),
             "releasing the winner's claim must free the name for a later claimant"
         );
+    }
+
+    /// Scenario: covers the three non-race edges `identity_012` (its
+    /// exclusive-race guarantee) does not touch, all needed by the
+    /// production caller `Action::SpawnPane` adds in `src/ui.rs`. (1)
+    /// Distinct names must never cross-block each other, so two orchestrator
+    /// panes with different titles both succeed. (2) A pane re-claiming the
+    /// SAME name it already holds must be idempotent — the `Action::SpawnPane`
+    /// rollback path never re-claims deliberately, but a caller-side retry
+    /// after a lost/ambiguous daemon response must not misread its own
+    /// prior success as a conflict. (3) Releasing a pane id that holds no
+    /// claim (a worker pane, a plain agent, or a rollback double-release)
+    /// must be a silent no-op that leaves every OTHER live claim untouched —
+    /// `StopAgent`'s handler calls `release_orchestration_name`
+    /// unconditionally for every closing pane, claim or not.
+    #[spec("orchestration/identity/013")]
+    #[test]
+    fn identity_013_daemon_side_name_claim_distinct_names_idempotent_reclaim_and_noop_release() {
+        let registry = AgentPtyRegistry::new();
+
+        // (1) distinct names never cross-block.
+        assert!(registry.claim_orchestration_name("repo-orchestrator-1", "pane-x"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-y"));
+
+        // (2) idempotent re-claim by the SAME holder.
+        assert!(
+            registry.claim_orchestration_name("repo-orchestrator-1", "pane-x"),
+            "a pane re-claiming its own already-held name must succeed, not be refused"
+        );
+        // A DIFFERENT pane is still refused after that idempotent re-claim —
+        // proves the re-claim didn't accidentally release or transfer it.
+        assert!(!registry.claim_orchestration_name("repo-orchestrator-1", "pane-z"));
+
+        // (3) releasing a pane with no claim is a no-op, and never touches
+        // an unrelated pane's live claim.
+        registry.release_orchestration_name("pane-never-claimed-anything");
+        assert!(
+            !registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"),
+            "an unrelated no-op release must not have freed pane-y's claim"
+        );
+
+        // Releasing the real holder still works after the no-op release above.
+        registry.release_orchestration_name("pane-y");
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"));
     }
 
     #[test]
