@@ -245,6 +245,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `even_row_heights` arithmetic in isolation (covered by `even_row_heights_seven_rows_thirty_two_matches_expected_split`); this test pins that the same split reaches the actual render path.
 - **Platform coverage:** mac+linux+windows.
 
+#### dashboard/placeholder
+
+##### dashboard/placeholder/001 — A placeholder session with a real `agent_id` but no `agent_type` yet renders "Starting…", not "No agent".
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a placeholder session with a real `agent_id` but `agent_type == AgentType::None` (the Orchestration-tab role-pane shape while its harness hasn't reported in yet) renders `"Starting…"` and neither `"No agent"` nor `"Launch an agent to get started"`.
+- **Does not assert:** the genuinely-idle placeholder case (agent_id also `None`), covered by the existing sibling tests `dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent` and `dashboard_placeholder_without_agent_type_shows_launch_an_agent`.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.

@@ -25860,8 +25860,14 @@ mod tests {
         );
     }
 
+    /// Scenario: Insert a placeholder session with a real `agent_id` but no
+    /// `agent_type` yet (the shape an Orchestration-tab role pane has while
+    /// its harness is still starting, e.g. sitting at a "trust this folder"
+    /// prompt), render it, and assert the card shows "Starting…" rather than
+    /// "No agent" or "Launch an agent to get started".
+    #[spec("dashboard/placeholder/001")]
     #[test]
-    fn dashboard_placeholder_pending_agent_shows_starting_not_no_agent() {
+    fn dashboard_placeholder_001_pending_agent_shows_starting_not_no_agent() {
         // Third case, distinct from both siblings above: a placeholder with
         // NO agent_type (still `AgentType::None`) but a real `agent_id` —
         // the shape a freshly-spawned Orchestration-tab role pane has before
