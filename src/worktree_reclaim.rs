@@ -5607,6 +5607,33 @@ mod tests {
         // not treat as eligible. Still clean (`git status --porcelain` is
         // empty for a committed change), so this isolates the SHA-equality
         // gate from the pre-existing cleanliness gate.
+        //
+        // `git clone` does not inherit `repo`'s local `user.email`/
+        // `user.name` (those are per-repo config in `init_repo_with_origin`,
+        // never global), and a CI runner has no global git identity either
+        // -- so committing here needs its own identity config, exactly like
+        // `init_repo_with_origin`'s own two `git config` calls.
+        let config_email = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .expect("git config user.email must spawn");
+        assert!(
+            config_email.status.success(),
+            "git config user.email failed: {}",
+            String::from_utf8_lossy(&config_email.stderr)
+        );
+        let config_name = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .expect("git config user.name must spawn");
+        assert!(
+            config_name.status.success(),
+            "git config user.name failed: {}",
+            String::from_utf8_lossy(&config_name.stderr)
+        );
+
         std::fs::write(clone_dir.join("extra.txt"), "local work\n").unwrap();
         let add_out = std::process::Command::new("git")
             .current_dir(&clone_dir)
