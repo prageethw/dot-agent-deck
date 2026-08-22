@@ -29115,6 +29115,9 @@ mod tests {
 
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
+        // PRD fork#544 M2b: isolation is unconditional now, so both spawns
+        // below need `tmp.path()` to be a real, committed git repository.
+        init_committed_git_repo(tmp.path());
         // Fork issue #201 redesign (gap #2): `Action::SpawnPane` now claims
         // the orchestration name before any provisioning; with no daemon
         // reachable both spawns below would be refused before either tab is
@@ -29427,6 +29430,9 @@ mod tests {
     fn layout_006_cycle_split_stage_is_deck_global_across_tab_types() {
         let frame_area = Rect::new(0, 0, 100, 40);
         let tmp = tempdir().expect("tempdir");
+        // PRD fork#544 M2b: isolation is unconditional now, so the spawn
+        // below needs `tmp.path()` to be a real, committed git repository.
+        init_committed_git_repo(tmp.path());
         // Fork issue #201 redesign (gap #2): `Action::SpawnPane` now claims
         // the orchestration name before any provisioning; with no daemon
         // reachable the spawn below would be refused before the tab is ever
@@ -32926,7 +32932,10 @@ mod tests {
         // A worktree-like cwd whose basename differs from the config name.
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join(FORM_TITLE);
-        std::fs::create_dir_all(&cwd).expect("create cwd");
+        // PRD fork#544 M2b: isolation is unconditional now, so `cwd` must be
+        // a real, committed git repository for the resulting isolated clone
+        // to succeed at all.
+        init_committed_git_repo(&cwd);
         // Fork issue #201 redesign (gap #2): `Action::SpawnPane` now claims
         // the orchestration name (by token) before any provisioning — with
         // no daemon reachable that claim is refused and the whole spawn is
@@ -33936,30 +33945,57 @@ mod tests {
         );
     }
 
-    /// Scenario: Submit a new-pane orchestration request whose `dir` is
-    /// ALREADY the resolved worktree path (simulating that a worktree was
-    /// created and its path threaded into the request), and dispatch the
-    /// real `Action::SpawnPane`. Every role pane must be spawned with that
-    /// worktree as its `cwd`, and `AppState.pane_cwd_map` — the map
-    /// `work-done` resolution keys off — must resolve every role pane to the
-    /// SAME worktree, not the deck's shared cwd. This is a characterization
-    /// test of the EXISTING cwd-threading mechanism
-    /// (`create_pane_with_options(cwd)`) fork #122 builds on: it needs no new
-    /// API and may already pass today.
+    /// Scenario: Submit a new-pane orchestration request with a typed Name
+    /// against a real git repository, and dispatch the real
+    /// `Action::SpawnPane`. Every role pane must be spawned with the
+    /// resolved, name-derived isolated workspace as its `cwd`, and
+    /// `AppState.pane_cwd_map` — the map `work-done` resolution keys off —
+    /// must resolve every role pane to that SAME workspace, not `req.dir`
+    /// or the deck's shared cwd. This is a characterization test of the
+    /// EXISTING cwd-threading mechanism (`create_pane_with_options(cwd)`)
+    /// fork #122 builds on. PRD fork#544 M2b: `req.dir` can no longer BE
+    /// the resolved workspace path directly (isolation is unconditional —
+    /// every submission provisions a NEW isolated clone next to `req.dir`),
+    /// so this test's premise inverts from "dir is already the worktree" to
+    /// "dir is the root checkout the workspace gets provisioned FROM" — the
+    /// same shape `worktree_004` already exercises; this test's own
+    /// distinct value is the daemon-claim-confirm seam pinned below.
     #[spec("orchestration/worktree/003")]
     #[test]
     fn worktree_003_role_panes_root_in_the_worktree() {
         let tmp = tempdir().expect("tempdir");
-        let worktree = tmp.path().join("dot-agent-deck-my-feature");
-        std::fs::create_dir_all(&worktree).expect("create worktree dir");
-        let worktree_str = worktree.display().to_string();
+        let repo = tmp.path().join("repo");
+        init_git_repo(&repo);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        std::fs::write(repo.join("README.md"), "worktree_003 fixture\n").expect("write README");
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        let workspace = resolve_workspace_path(&repo, "my-feature");
+        let workspace_str = workspace.display().to_string();
         // Fork issue #201 redesign: `Action::SpawnPane`'s handler now claims
         // the orchestration name (by TOKEN) before any provisioning, then
         // CONFIRMS/rebinds the claim onto the real pane id once role panes
-        // exist — unconditionally of the worktree-creation branch this test
-        // is actually about, so it needs a stub daemon too, the same seam
-        // `worktree_004` already uses for the pre-existing
-        // `root_checkout_has_live_sibling` gate. Since the confirm validates
+        // exist — unconditionally of the workspace-provisioning branch this
+        // test is actually about, so it needs a stub daemon too, the same
+        // seam `worktree_004` already uses. Since the confirm validates
         // `pane_id` against the daemon's own live `agent_records()`
         // (reviewer P2-6 / auditor A3), an EMPTY registry would refuse it —
         // `CapturingPaneController` hands out synthetic ids ("pane-0",
@@ -33985,8 +34021,8 @@ mod tests {
 
         let config = make_orchestration("review");
         let req = NewPaneRequest {
-            dir: worktree.clone(),
-            name: String::new(),
+            dir: repo.clone(),
+            name: "my-feature".to_string(),
             command: String::new(),
             mode_config: None,
             orchestration_config: Some(config.clone()),
@@ -34012,23 +34048,24 @@ mod tests {
         );
 
         // Every role pane's create_pane_with_options call carried the
-        // worktree as its cwd.
+        // resolved workspace as its cwd.
         let cwds = pc.recorded_cwds();
         assert_eq!(cwds.len(), config.roles.len(), "one pane per role");
         for cwd in &cwds {
             assert_eq!(
                 cwd.as_deref(),
-                Some(worktree_str.as_str()),
-                "every role pane must be spawned rooted in the orchestration's own worktree"
+                Some(workspace_str.as_str()),
+                "every role pane must be spawned rooted in the orchestration's own workspace"
             );
         }
 
         // pane_cwd_map — what work-done resolution keys off — must resolve
-        // every role pane to the SAME worktree, not the deck's shared cwd.
+        // every role pane to the SAME workspace, not `req.dir` or the deck's
+        // shared cwd.
         let st = state.blocking_read();
         assert_eq!(st.pane_cwd_map.len(), config.roles.len());
         for cwd in st.pane_cwd_map.values() {
-            assert_eq!(cwd, &worktree_str);
+            assert_eq!(cwd, &workspace_str);
         }
     }
 
@@ -34810,7 +34847,10 @@ mod tests {
     fn identity_018_spawn_failure_after_a_successful_claim_releases_the_token() {
         let tmp = tempdir().expect("tempdir");
         let dir = tmp.path().join("plain-dir");
-        std::fs::create_dir_all(&dir).expect("create plain dir");
+        // PRD fork#544 M2b: isolation is unconditional now, so `dir` must be
+        // a real, committed git repository — otherwise provisioning itself
+        // fails before ever reaching the role-pane spawn this test is about.
+        init_committed_git_repo(&dir);
 
         let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let _daemon = with_recording_daemon(tmp.path(), ops.clone());
@@ -34889,7 +34929,10 @@ mod tests {
     fn identity_020_confirm_refusal_after_a_successful_claim_releases_the_token() {
         let tmp = tempdir().expect("tempdir");
         let dir = tmp.path().join("plain-dir");
-        std::fs::create_dir_all(&dir).expect("create plain dir");
+        // PRD fork#544 M2b: isolation is unconditional now, so `dir` must be
+        // a real, committed git repository — otherwise provisioning itself
+        // fails before ever reaching the role-pane spawn this test is about.
+        init_committed_git_repo(&dir);
 
         let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let _daemon = with_recording_daemon_refusing_op(
@@ -34964,6 +35007,75 @@ mod tests {
             .status()
             .expect("run git init");
         assert!(status.success(), "git init must succeed");
+    }
+
+    /// PRD fork#544 M2b: [`init_git_repo`] plus one commit — isolation is
+    /// unconditional now, so any orchestration-config `NewPaneRequest.dir`
+    /// must be a real, committed git repository for the resulting isolated
+    /// clone to succeed at all (an unborn HEAD has no ref to branch from).
+    /// A plain `create_dir_all`, sufficient before this PRD's M2b, is not
+    /// sufficient any more.
+    fn init_committed_git_repo(dir: &std::path::Path) {
+        init_git_repo(dir);
+        std::fs::write(dir.join("README.md"), "test fixture\n").expect("write README");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {dir:?}");
+        };
+        run_git(&["add", "README.md"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+    }
+
+    /// PRD fork#544 M2b: read the `created-by:` identity directly off an
+    /// isolated CLONE's own git-dir, via `git rev-parse --git-dir` run
+    /// inside it — mirroring `create_worktree_records_creator_identity`'s
+    /// pattern in `issue_dispatch_run.rs`. `crate::worktree_reclaim::owner_of`
+    /// is the wrong tool here: its containment check requires the git-dir to
+    /// sit under a SEPARATE repo's own common dir's `worktrees/`, a
+    /// precondition only a linked worktree satisfies — an independent clone
+    /// never will, so `owner_of` always reads back `None` for one regardless
+    /// of whether the marker was written.
+    fn isolated_clone_marker_owner(clone_dir: &std::path::Path) -> Option<String> {
+        let git_dir_out = std::process::Command::new("git")
+            .current_dir(clone_dir)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .expect("git rev-parse --git-dir must spawn");
+        if !git_dir_out.status.success() {
+            return None;
+        }
+        let git_dir_raw = String::from_utf8_lossy(&git_dir_out.stdout)
+            .trim()
+            .to_string();
+        let git_dir = if std::path::Path::new(&git_dir_raw).is_absolute() {
+            PathBuf::from(git_dir_raw)
+        } else {
+            clone_dir.join(git_dir_raw)
+        };
+        std::fs::read_to_string(git_dir.join(crate::worktree_reclaim::OWNER_MARKER_FILENAME))
+            .ok()
+            .and_then(|content| {
+                content
+                    .lines()
+                    .find_map(|line| line.strip_prefix("created-by: "))
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
     }
 
     /// Scenario: PRD fork#325 fix round (reviewer P2-1 / auditor A1). Point
@@ -35198,7 +35310,11 @@ mod tests {
                 worktree.display()
             );
 
-            crate::worktree_reclaim::owner_of(repo, &worktree)
+            // PRD fork#544 M2b: `worktree` is now an independent isolated
+            // clone, not a linked worktree of `repo` — see
+            // `isolated_clone_marker_owner`'s own doc comment for why
+            // `crate::worktree_reclaim::owner_of` cannot be used here.
+            isolated_clone_marker_owner(&worktree)
         }
 
         let tmp = tempdir().expect("tempdir");
@@ -35385,7 +35501,11 @@ mod tests {
             worktree.display()
         );
 
-        let marker_owner = crate::worktree_reclaim::owner_of(&repo, &worktree);
+        // PRD fork#544 M2b: `worktree` is now an independent isolated
+        // clone, not a linked worktree of `repo` — see
+        // `isolated_clone_marker_owner`'s own doc comment for why
+        // `crate::worktree_reclaim::owner_of` cannot be used here.
+        let marker_owner = isolated_clone_marker_owner(&worktree);
         assert!(
             marker_owner.is_some(),
             "the worktree marker must record an owner after a live orchestration spawn"
@@ -35668,6 +35788,10 @@ mod tests {
     #[test]
     fn pane_input_016_orchestrator_prompt_captures_identity_at_tab_creation() {
         let tmp = tempdir().expect("tempdir");
+        // PRD fork#544 M2b: isolation is unconditional now, so `tmp.path()`
+        // must be a real, committed git repository for provisioning to
+        // succeed at all.
+        init_committed_git_repo(tmp.path());
         // Fork issue #201 redesign: see `worktree_003`'s matching comment —
         // `Action::SpawnPane` claims by token before provisioning, then
         // confirms/rebinds onto the real pane id, which the daemon
@@ -39616,9 +39740,50 @@ mod tests {
         }
     }
 
+    /// PRD fork#544 M2b: idempotent git-repo setup for
+    /// [`spawn_lock_test_orchestration`] — a repeat call on an
+    /// already-initialized `dir` (some lock tests open two orchestrations
+    /// in the SAME directory) is a no-op.
+    fn init_lock_test_repo(dir: &std::path::Path) {
+        if dir.join(".git").exists() {
+            return;
+        }
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {dir:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(dir.join("README.md"), "lock test fixture\n").expect("write README");
+        run_git(&["add", "README.md"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+    }
+
     /// Dispatches a real `Action::SpawnPane` opening a fresh orchestration
     /// (via [`lock_test_orch_config`]) against `tm`, making it the active tab.
     /// Shared setup for the lock tests below.
+    ///
+    /// PRD fork#544 M2b: isolation is unconditional now, so `tmp_dir` must
+    /// be a real, committed git repository for the resulting isolated-clone
+    /// provisioning to succeed at all — `git init` a specific explicit file
+    /// (never `-A`/`.`) rather than the whole directory, since `tmp_dir`
+    /// also holds the stub daemon's own hook/attach Unix sockets by the
+    /// time this runs, which a blanket add would try (and for the sockets,
+    /// fail) to walk.
     #[allow(clippy::too_many_arguments)]
     fn spawn_lock_test_orchestration(
         tm: &mut TabManager,
@@ -39630,6 +39795,7 @@ mod tests {
         tmp_dir: &std::path::Path,
         name: &str,
     ) {
+        init_lock_test_repo(tmp_dir);
         let req = NewPaneRequest {
             dir: tmp_dir.to_path_buf(),
             name: name.to_string(),
