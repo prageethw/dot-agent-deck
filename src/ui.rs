@@ -35737,6 +35737,7 @@ mod tests {
     /// collision rather than silently resolving to `Resumed` — pinning the
     /// refusal as a PROPERTY, not a specific error string, since the fix's
     /// exact mechanism is left to coder.
+    #[spec("orchestration/workspace/026")]
     #[test]
     fn workspace_026_distinct_names_colliding_after_sanitization_refuse_second_open() {
         let tmp = tempdir().expect("tempdir");
