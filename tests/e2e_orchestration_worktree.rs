@@ -27,6 +27,14 @@
 //! `sleep` — no real LLM tokens spent. Reading the log CONTENT (not just its
 //! presence) is what proves each role pane was spawned rooted in the created
 //! worktree rather than the fixture directory itself.
+//!
+//! PRD fork#544 M2/M2b (`orchestration/workspace/*`, below): the naming
+//! derivation and gate-retirement RED round. These reuse the `orch-clone-gate`
+//! fixture (`orchestration/worktree/014`/`016`'s own) rather than introducing
+//! a new one — its single role already appends `DOT_AGENT_DECK_WORKTREE_OWNER`
+//! plus `pwd` to a shared, HOME-relative log file, which is exactly the
+//! after-the-fact "where did this instance actually land on disk" evidence
+//! this milestone's tests need too.
 
 mod common;
 
@@ -870,4 +878,210 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
              disturbed"
         );
     }
+}
+
+/// Read a `owner pwd` log line written by the `orch-clone-gate` fixture's
+/// `solo` role (`$DOT_AGENT_DECK_WORKTREE_OWNER` followed by `$(pwd)`,
+/// space-separated) and return the `pwd` recorded for `owner`, if any line
+/// matches. Shared by the `orchestration/workspace/*` tests below —
+/// `orchestration/worktree/014`/`016` inline the same parse themselves
+/// rather than share a helper, since each of those has more than one owner
+/// to look up from a single read; the workspace tests below each look up
+/// exactly one, so a helper is worth it here instead.
+fn pwd_for_owner(log_contents: &str, owner: &str) -> Option<PathBuf> {
+    log_contents.lines().find_map(|line| {
+        line.split_once(' ')
+            .filter(|(found, _)| *found == owner)
+            .map(|(_, pwd)| PathBuf::from(pwd))
+    })
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
+/// one orchestration exactly ONCE — no concurrent sibling orchestration
+/// exists at all, the PRD's own "1st orchestration against a root checkout"
+/// case. Clear the form's suggested Name and type a distinctive one instead,
+/// then submit directly from the Name field (Command is hidden for an
+/// orchestration, so Enter there submits) with the Worktree-slug field left
+/// untouched/blank. PRD fork#544 M2b retires the Nth-concurrent-only
+/// isolation gate: even this very first orchestration against the root
+/// checkout must land in its own isolated workspace — never a `git worktree
+/// add` sibling sharing the launch directory's own git object store, which
+/// is what today's code still does for a 1st orchestration. M2's naming
+/// derivation says that workspace must be named
+/// `<root-checkout-basename>-<sanitized-name>`, derived from the typed Name
+/// alone — never the separate Worktree-slug field (blank here) and never
+/// `auto_generate_worktree_slug`'s `orchestrator-N` counter.
+#[spec("orchestration/workspace/001")]
+#[test]
+fn workspace_001_first_orchestration_gets_named_isolated_workspace() {
+    const NAME: &str = "workspace001fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_keys(b"\x1b[C"); // Right -> [Orch: clone-gate-demo] (the fixture's only orchestration)
+    deck.send_keys(b"\r"); // Mode -> Name
+    // Backspace x80 -> clear the pre-filled suggested Name (fork#192 M1.0);
+    // extra pops on an already-empty field are no-ops, same idiom as
+    // `e2e_new_pane_seed.rs`/`e2e_mode_seed_prompt.rs`.
+    deck.send_keys(&[0x7fu8; 80]);
+    deck.send_keys(NAME.as_bytes());
+    deck.send_keys(b"\r"); // submit directly from Name; Worktree-slug stays blank
+
+    deck.wait_for_absence("New Agent"); // form closed -> orchestration tab up
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let owner = format!("orchestration:{NAME}");
+    let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
+    });
+
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+    assert_eq!(
+        pwd,
+        expected_path,
+        "PRD fork#544 M2: the workspace directory must be derived from the orchestration Name \
+         alone (`<root-checkout-basename>-<sanitized-name>`) — not from the separate \
+         Worktree-slug field (blank here) and not from `orchestrator-N` auto-numbering; today's \
+         code, for a 1st orchestration with a blank slug, leaves the pane rooted in the launch \
+         directory itself ({}) instead",
+        work.display()
+    );
+
+    let work_common = git_common_dir(&work);
+    let pwd_common = git_common_dir(&pwd);
+    assert_ne!(
+        pwd_common,
+        work_common,
+        "PRD fork#544 M2b: the isolation gate is unconditional now — even the FIRST \
+         orchestration against a root checkout must provision its own isolated clone (a \
+         distinct git common dir/object store), never a `git worktree add` sibling sharing \
+         {}'s own object store the way today's code still does for a 1st orchestration",
+        work.display()
+    );
+}
+
+/// Scenario: run the identical single-orchestration flow `workspace_001`
+/// drives — clear the suggested Name, type one fixed literal, submit with a
+/// blank Worktree-slug — TWICE, as two fully independent scenarios (two
+/// separate `TuiDeck` launches, each its own fresh root checkout with its
+/// own randomly-named tempdir, the second launched only after the first has
+/// been torn down). Both runs type the exact same Name. PRD fork#544 M2's
+/// naming derivation must be a pure function of `(root-checkout-basename,
+/// Name)` — not of any session-local counter state such as
+/// `auto_generate_worktree_slug`'s `orchestrator-N`, which would happily
+/// produce the identical `orchestrator-1` slug on both independent runs too,
+/// so this test's point is specifically the FORMULA holding independently
+/// in each scenario, not merely that some slug repeats. So each run's
+/// resulting workspace directory must resolve to that run's OWN
+/// `<its-own-root-checkout-basename>-<the-shared-typed-name>` — proving the
+/// same deterministic rule applies each time, regardless of which root
+/// checkout or how many prior orchestrations either one has seen.
+#[spec("orchestration/workspace/002")]
+#[test]
+fn workspace_002_naming_is_deterministic_from_name_alone_across_separate_runs() {
+    const NAME: &str = "detnamefixed";
+
+    fn run_once(basename_out: &mut String, pwd_out: &mut PathBuf) {
+        let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+        let work = deck.workdir().to_path_buf();
+        commit_fixture(&work);
+
+        deck.wait_for_string("No active sessions");
+
+        *basename_out = work
+            .file_name()
+            .expect("launch dir must have a basename")
+            .to_string_lossy()
+            .into_owned();
+
+        deck.send_keys(b"\x0e");
+        deck.send_keys(b" ");
+        deck.wait_for_string("No mode");
+        deck.send_keys(b"\x1b[C");
+        deck.send_keys(b"\r");
+        deck.send_keys(&[0x7fu8; 80]);
+        deck.send_keys(NAME.as_bytes());
+        deck.send_keys(b"\r");
+
+        deck.wait_for_absence("New Agent");
+
+        let log_path = deck.home_dir().join("clone-gate-pwd.log");
+        common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+            panic!(
+                "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+                 === rendered grid ===\n{}",
+                deck.snapshot_grid()
+            )
+        });
+
+        let contents =
+            std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+        let owner = format!("orchestration:{NAME}");
+        *pwd_out = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
+            panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
+        });
+
+        // Explicit, not left to scope-exit ordering: the second run must not
+        // start until this deck's process tree/tempdir/socket are fully torn
+        // down, so the two runs are genuinely independent scenarios rather
+        // than two decks alive at once.
+        drop(deck);
+    }
+
+    let mut basename_1 = String::new();
+    let mut pwd_1 = PathBuf::new();
+    run_once(&mut basename_1, &mut pwd_1);
+
+    let mut basename_2 = String::new();
+    let mut pwd_2 = PathBuf::new();
+    run_once(&mut basename_2, &mut pwd_2);
+
+    assert_ne!(
+        basename_1, basename_2,
+        "sanity precondition: the two runs' root checkouts must have DIFFERENT basenames \
+         (independent tempdirs) — otherwise this test can't tell a name-derived path from a \
+         coincidentally-matching one"
+    );
+
+    let expected_1 = PathBuf::from(pwd_1.parent().expect("pwd_1 must have a parent"))
+        .join(format!("{basename_1}-{NAME}"));
+    let expected_2 = PathBuf::from(pwd_2.parent().expect("pwd_2 must have a parent"))
+        .join(format!("{basename_2}-{NAME}"));
+
+    assert_eq!(
+        pwd_1, expected_1,
+        "PRD fork#544 M2: run 1's workspace directory must equal \
+         `<run-1's-own-root-checkout-basename>-{NAME}`"
+    );
+    assert_eq!(
+        pwd_2, expected_2,
+        "PRD fork#544 M2: run 2's workspace directory must equal \
+         `<run-2's-own-root-checkout-basename>-{NAME}` — the SAME derivation rule as run 1, \
+         applied independently, proving the naming is a pure function of \
+         (root-checkout-basename, Name) rather than of session-local counter state like \
+         `orchestrator-N`"
+    );
 }
