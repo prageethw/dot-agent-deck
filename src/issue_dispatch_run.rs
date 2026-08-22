@@ -7186,6 +7186,70 @@ exit 0
         );
     }
 
+    /// Scenario: PRD fork#544 M6's own tab-close persistence guarantee for a
+    /// NAMED isolated-clone workspace (Design step 6: "Pin with a test that
+    /// tab-close never deletes a named workspace"). A real workspace,
+    /// provisioned via `provision_isolated_clone_sync` under a typed
+    /// orchestration Name exactly as Model A creates one, is handed to
+    /// `remove_worktree` under its own `RemovalPolicy::IsolatedClone` — the
+    /// same policy this milestone's registration fix
+    /// (`orchestration/workspace/018`) makes Model A's entries carry. The
+    /// outcome must be `Kept(IsolatedClone)`, and the directory and its
+    /// checked-out branch must survive untouched. This is a REGRESSION
+    /// GUARD, not a fresh RED: `remove_worktree`'s `RemovalPolicy::IsolatedClone`
+    /// arm already reports `Kept` unconditionally today (Problem Statement
+    /// #3) — this pins that guarantee explicitly, under this milestone's own
+    /// catalog family, against a genuinely NAMED workspace rather than
+    /// relying solely on `src/dispatch.rs`'s pre-existing
+    /// `isolated_clone_is_always_kept_on_tab_close_even_when_clean` (written
+    /// for Model C / issue #490) to cover it by proxy.
+    #[spec("orchestration/workspace/019")]
+    #[tokio::test]
+    async fn workspace_019_named_isolated_clone_is_kept_unconditionally_on_tab_close() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("named-workspace-019");
+        let created =
+            provision_isolated_clone_sync(&source, &clone_dir, "workspace019fixed", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: provisioning a fresh named workspace must succeed, got {created:?}"
+        );
+        let head_before = head_sha(&clone_dir);
+
+        let outcome = remove_worktree(
+            &clone_dir,
+            &source,
+            RemovalPolicy::IsolatedClone,
+            "tab-close",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RemoveOutcome::Kept(crate::event::KeptReason::IsolatedClone),
+            "PRD fork#544 M6: a named isolated-clone workspace must always be reported Kept on \
+             tab close — never removed via that path — regardless of dirtiness, got {outcome:?}"
+        );
+        assert!(
+            clone_dir.is_dir(),
+            "the named workspace directory must still exist on disk after the tab-close \
+             removal attempt"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_before,
+            "the workspace's checked-out branch must be untouched by the tab-close removal \
+             attempt"
+        );
+    }
+
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B), extended by
     /// round 3 (reviewer C1/C2, auditor C1/C2). Unit tests
     /// `handle_isolated_clone_add_error` directly rather than inducing a

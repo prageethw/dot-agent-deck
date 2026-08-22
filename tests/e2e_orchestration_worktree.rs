@@ -1397,3 +1397,82 @@ fn workspace_005_reopening_name_held_by_live_orchestration_refuses_without_suffi
         expected_path.display()
     );
 }
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture, open its one
+/// orchestration under a fixed Name via the real `Action::SpawnPane` ->
+/// `provision_isolated_clone_sync` path (Model A), then close the whole tab
+/// (Ctrl+D -> Ctrl+W -> confirm). PRD fork#544 M6 Design step 6: Model A's
+/// isolated-clone provisioning must call `record_worktree`, the same as
+/// Models B/C already do -- today it never does, so these clones are
+/// invisible to the daemon's `WorktreeRegistry`. The only way that
+/// registration is observable end-to-end (the registry itself exposes no
+/// query surface) is via the tab-close cleanup path it feeds: once an entry
+/// is registered, closing the tab makes `remove_worktree`'s
+/// `RemovalPolicy::IsolatedClone` arm actually run and report `Kept`, which
+/// the daemon broadcasts and the TUI renders as a status-bar notice
+/// ("Worktree kept at ...: it is an isolated clone, not a linked worktree
+/// ..."). Today, Model A's clone is never registered, so `take_worktree`
+/// finds no entry on close, `remove_worktree` never runs, and no notice
+/// ever appears — the directory survives by silent omission (as
+/// `workspace_003` already separately proves), not by an active Kept
+/// decision. This test's RED signature is `wait_for_string` timing out
+/// waiting for that notice.
+#[spec("orchestration/workspace/018")]
+#[test]
+fn workspace_018_model_a_isolated_clone_is_registered_so_tab_close_reports_kept() {
+    const NAME: &str = "workspace018fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    assert!(
+        expected_path.is_dir(),
+        "sanity: the workspace must have been provisioned at the derived path {}",
+        expected_path.display()
+    );
+
+    // --- Close the whole tab. ---
+    deck.send_keys(b"\x04"); // Ctrl+D -> command mode
+    deck.send_keys(b"\x17"); // Ctrl+W -> arm close confirmation
+    deck.wait_for_string("Close this tab and all its panes?");
+    deck.send_keys(b"\x1b[B"); // Down -> select Close
+    deck.send_keys(b"\r"); // Enter -> confirm
+    deck.wait_for_string("No active sessions"); // back to an empty Dashboard
+
+    // PRD fork#544 M6: this notice fires ONLY if the daemon's tab-close
+    // cleanup handler found a registered entry for the workspace — proof
+    // Model A's provisioning called `record_worktree`. The notice's
+    // underlying guarantee (`RemovalPolicy::IsolatedClone` always reporting
+    // `Kept`, regardless of dirtiness) is already pinned directly,
+    // independent of any PTY/daemon, by `orchestration/workspace/019`; this
+    // test is specifically about whether an entry is there to be found on
+    // close at all.
+    deck.wait_for_string("it is an isolated clone, not a linked worktree");
+
+    assert!(
+        expected_path.is_dir(),
+        "the workspace directory at {} must still exist on disk after closing its tab",
+        expected_path.display()
+    );
+}
