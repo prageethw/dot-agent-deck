@@ -268,6 +268,14 @@ pub struct AgentSpawnOptions<'a> {
     /// `worktree list --mine` can match it. `None` for a pane that is not
     /// part of a worktree-owning orchestration (e.g. a plain dashboard pane).
     pub owner: Option<String>,
+    /// PRD fork#544 M6: forwarded to the daemon as
+    /// `StartAgentOptions.isolated_clone_origin` /
+    /// `AttachRequest::StartAgent.isolated_clone_origin` — see that
+    /// field's doc for the full contract. `None` for every pane except an
+    /// orchestration role pane spawned into a client-side-provisioned
+    /// isolated clone (`src/tab.rs`'s
+    /// `open_orchestration_tab_with_isolated_clone_origin`).
+    pub isolated_clone_origin: Option<String>,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -283,6 +291,7 @@ impl Default for AgentSpawnOptions<'_> {
             agent_type: None,
             seed: None,
             owner: None,
+            isolated_clone_origin: None,
         }
     }
 }

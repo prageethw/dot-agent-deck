@@ -10742,13 +10742,23 @@ fn dispatch_action(
                         PaneLayout::Tiled,
                         true,
                     );
-                    match tab_manager.open_orchestration_tab(
+                    // PRD fork#544 M6: `req.dir` is the root checkout this
+                    // orchestration's isolated clone (`dir_str`, now the
+                    // workspace path — `req.dir` was shadowed above) was
+                    // provisioned FROM. Thread it through so the daemon-side
+                    // `StartAgent` handler can register the workspace in its
+                    // own `WorktreeRegistry` — see
+                    // `open_orchestration_tab_with_isolated_clone_origin`'s
+                    // doc for why Model A needs this and Model B/C don't.
+                    let isolated_clone_origin = req.dir.display().to_string();
+                    match tab_manager.open_orchestration_tab_with_isolated_clone_origin(
                         &orch_config,
                         &dir_str,
                         prompt,
                         display_title.as_deref(),
                         Some(creator.as_str()),
                         spawn_dims,
+                        Some(isolated_clone_origin.as_str()),
                     ) {
                         Ok((_tab_idx, role_pane_ids)) => {
                             // Fork issue #201 redesign: the exclusivity
@@ -11120,6 +11130,7 @@ fn dispatch_action(
                             // orchestrator — no native seed.
                             seed: None,
                             owner: None,
+                            isolated_clone_origin: None,
                         },
                     ) {
                         Ok((new_id, resolved_name)) => {
@@ -13329,6 +13340,7 @@ pub fn run_tui(
                     // PRD #201: single-pane spawn — no native seed.
                     seed: None,
                     owner: None,
+                    isolated_clone_origin: None,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -13411,6 +13423,7 @@ pub fn run_tui(
                     // PRD #201: mode agent pane, not a Pi orchestrator — no seed.
                     seed: None,
                     owner: None,
+                    isolated_clone_origin: None,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -13499,6 +13512,7 @@ pub fn run_tui(
                                     // PRD #201: restore fallback spawn — no seed.
                                     seed: None,
                                     owner: None,
+                                    isolated_clone_origin: None,
                                 },
                             ) {
                                 Ok((fb_id, _resolved)) => {
@@ -13568,6 +13582,7 @@ pub fn run_tui(
                             // PRD #201: restore fallback spawn — no seed.
                             seed: None,
                             owner: None,
+                            isolated_clone_origin: None,
                         },
                     ) {
                         Ok((fb_id, _resolved)) => {
