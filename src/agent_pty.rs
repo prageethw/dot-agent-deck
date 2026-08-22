@@ -6808,6 +6808,12 @@ impl AgentPtyRegistry {
             rows: agent.pty_rows,
             cols: agent.pty_cols,
             live: None,
+            // Fork issue #513: same reasoning as `live` above — the registry
+            // has no notion of a daemon boot id or a pane's registration
+            // generation; callers that need both join them in from
+            // `AppState` themselves.
+            daemon_boot_id: None,
+            registration_generation: None,
         })
     }
 
@@ -9140,9 +9146,9 @@ mod spawn_tests {
     /// together that neither's stale snapshot would have refused the other.
     /// Exactly one claim succeeds; releasing the winner's claim then lets a
     /// third, later claimant take the freed name.
-    #[spec("orchestration/identity/012")]
+    #[spec("orchestration/identity/021")]
     #[test]
-    fn identity_012_daemon_side_name_claim_is_exclusive_under_race() {
+    fn identity_021_daemon_side_name_claim_is_exclusive_under_race() {
         const NAME: &str = "myrepo-orchestrator-1";
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -9178,7 +9184,7 @@ mod spawn_tests {
         );
     }
 
-    /// Scenario: covers the three non-race edges `identity_012` (its
+    /// Scenario: covers the three non-race edges `identity_021` (its
     /// exclusive-race guarantee) does not touch, all needed by the
     /// production caller `Action::SpawnPane` adds in `src/ui.rs`. (1)
     /// Distinct names must never cross-block each other, so two orchestrator
@@ -9191,9 +9197,9 @@ mod spawn_tests {
     /// must be a silent no-op that leaves every OTHER live claim untouched —
     /// `StopAgent`'s handler calls `release_orchestration_name`
     /// unconditionally for every closing pane, claim or not.
-    #[spec("orchestration/identity/013")]
+    #[spec("orchestration/identity/022")]
     #[test]
-    fn identity_013_daemon_side_name_claim_distinct_names_idempotent_reclaim_and_noop_release() {
+    fn identity_022_daemon_side_name_claim_distinct_names_idempotent_reclaim_and_noop_release() {
         let registry = AgentPtyRegistry::new();
 
         // (1) distinct names never cross-block.
@@ -9238,9 +9244,9 @@ mod spawn_tests {
     /// (a third party using either the old token or a fresh token is
     /// refused), and releasing by the now-bound PANE id — exactly what
     /// `StopAgent`'s handler already does — frees it.
-    #[spec("orchestration/identity/014")]
+    #[spec("orchestration/identity/023")]
     #[test]
-    fn identity_014_confirm_orchestration_claim_rebinds_token_to_real_pane_id() {
+    fn identity_023_confirm_orchestration_claim_rebinds_token_to_real_pane_id() {
         const NAME: &str = "myrepo-orchestrator-1";
         const TOKEN: &str = "spawn-token-abc123";
         const REAL_PANE_ID: &str = "pane-42";
@@ -9280,9 +9286,9 @@ mod spawn_tests {
     /// name immediately, matching `release_orchestration_name`'s existing
     /// generic-string contract — no separate "release by token" method is
     /// needed since the holder is just an opaque string either way.
-    #[spec("orchestration/identity/015")]
+    #[spec("orchestration/identity/024")]
     #[test]
-    fn identity_015_confirm_with_wrong_token_is_refused_and_release_by_token_frees_the_name() {
+    fn identity_024_confirm_with_wrong_token_is_refused_and_release_by_token_frees_the_name() {
         const NAME: &str = "myrepo-orchestrator-2";
         const TOKEN: &str = "spawn-token-xyz789";
 
@@ -9311,7 +9317,7 @@ mod spawn_tests {
 
     /// Scenario: fork issue #201 round 3 (auditor B1/C2) — a CONFIRMED
     /// orchestration-name claim (already rebound onto a real pane id, as
-    /// `identity_014` proves `confirm_orchestration_claim` does) must not
+    /// `identity_023` proves `confirm_orchestration_claim` does) must not
     /// squat the name forever if the underlying process dies on its own,
     /// with no client ever sending `StopAgent`. Spawn a briefly-alive
     /// agent, claim the name directly by its real `pane_id_env` (simulating
@@ -9319,9 +9325,9 @@ mod spawn_tests {
     /// release path), let the process exit on its own and wait for the
     /// reader thread to observe EOF, then prove the claim was released
     /// without any explicit close: a fresh claimant can take the name.
-    #[spec("orchestration/identity/019")]
+    #[spec("orchestration/identity/028")]
     #[tokio::test]
-    async fn identity_019_a_confirmed_claim_is_released_when_its_pane_exits_without_stop_agent() {
+    async fn identity_028_a_confirmed_claim_is_released_when_its_pane_exits_without_stop_agent() {
         const NAME: &str = "myrepo-orchestrator-3";
         const PANE_ID_ENV: &str = "issue-201-crash-pane";
 
@@ -9336,7 +9342,7 @@ mod spawn_tests {
 
         // Simulates the post-confirm state: the claim is bound to the
         // real, daemon-known pane id, exactly as `confirm_orchestration_claim`
-        // leaves it — see `identity_014`.
+        // leaves it — see `identity_023`.
         assert!(registry.claim_orchestration_name(NAME, PANE_ID_ENV));
 
         // Wait for the reader thread to observe EOF on its own (no

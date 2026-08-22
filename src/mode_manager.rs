@@ -285,6 +285,7 @@ impl ModeManager {
                             // PRD #201: not a Pi orchestrator pane — no seed.
                             seed: None,
                             owner: None,
+                            isolated_clone_origin: None,
                         },
                     )?;
                     created_pane_ids.push(pane_id.clone());
@@ -316,6 +317,7 @@ impl ModeManager {
                             // PRD #201: not a Pi orchestrator pane — no seed.
                             seed: None,
                             owner: None,
+                            isolated_clone_origin: None,
                         },
                     )?;
                     created_pane_ids.push(pane_id.clone());
@@ -527,6 +529,7 @@ impl ModeManager {
                     // PRD #201: not a Pi orchestrator pane — no seed.
                     seed: None,
                     owner: None,
+                    isolated_clone_origin: None,
                 },
             )?;
             mode.reactive_pool

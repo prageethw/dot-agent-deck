@@ -2105,11 +2105,17 @@ fn answer_terminal_queries(chunk: &[u8], scan: &mut Vec<u8>, writer: &mut dyn Wr
 // Git-fixture / orchestration-open helpers
 // ---------------------------------------------------------------------------
 //
-// Issue #489: `run_git`, `commit_fixture`, and `open_orchestration_with_slug`
-// were independently duplicated across `tests/e2e_orchestration_worktree.rs`,
+// Issue #489: `run_git` and `commit_fixture` were independently duplicated
+// across `tests/e2e_orchestration_worktree.rs`,
 // `tests/e2e_orchestration_identity.rs`, and `tests/e2e_orchestration_pane_column.rs`,
 // which tripped SonarCloud's `new_duplicated_lines_density` gate. Hoisted here
 // as the single shared copy each of those three files now calls.
+//
+// PRD fork#544 M2: `open_orchestration_with_slug`, previously hoisted here
+// for the same reason, is retired along with the Worktree-slug form field it
+// drove — M2b's unconditional isolation also removes the blank-slug
+// exact-cwd collision refusal it existed to route around, so every caller
+// now uses the plain `open_orchestration` below instead.
 
 /// Run a `git` subcommand against `dir`, panicking on non-zero exit.
 pub fn run_git(dir: &Path, args: &[&str]) {
@@ -2122,10 +2128,9 @@ pub fn run_git(dir: &Path, args: &[&str]) {
 }
 
 /// Commit the fixture's own `.dot-agent-deck.toml` into `dir` (which the
-/// harness already ran `git init --quiet` on) so a typed Worktree slug's
-/// `git worktree add`/isolated-clone provisioning (issue #489's unaffected
-/// typed-slug arm) has a ref to branch from — it cannot create a worktree
-/// from an unborn HEAD. Identity pinned inline: CI runners carry no global
+/// harness already ran `git init --quiet` on) so isolated-clone provisioning
+/// has a ref to branch from — it cannot create a clone/checkout from an
+/// unborn HEAD. Identity pinned inline: CI runners carry no global
 /// `user.email`/`user.name`. Adds that ONE explicit path rather than
 /// `-A`/`.` — by the time this runs, `dir` also holds the harness's own
 /// per-test `home/` dir and its hook/attach Unix sockets, which a blanket
@@ -2149,33 +2154,14 @@ pub fn commit_fixture(dir: &Path) {
     );
 }
 
-/// Drive the new-pane dialog to open a fixture's (single) orchestration with
-/// a TYPED Worktree slug instead of accepting the form's blank default, so
-/// the request goes through issue #489's unaffected typed-slug arm
-/// (`SiblingScope::ExactCwdOnly` only gates a BLANK slug) instead of being
-/// refused as an exact-cwd collision with another live orchestration.
-/// Otherwise identical to each caller's own `open_orchestration`.
-pub fn open_orchestration_with_slug(deck: &TuiDeck, slug: &str) {
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.wait_for_string("Select Directory");
-    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
-    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_keys(b"\x1b[C"); // Right -> the fixture's one orchestration
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\t"); // Tab: Name -> Worktree (Command hidden for an orchestration)
-    deck.send_keys(slug.as_bytes());
-    deck.send_keys(b"\r"); // submit
-}
-
 /// Drive the new-pane dialog to open a fixture's (single) orchestration,
 /// accepting the form's blank default name/worktree. Most files in this
 /// suite deliberately keep their own copy of this sequence rather than
-/// sharing one (see `open_orchestration_with_slug`'s doc comment above) —
-/// this one copy is shared between `e2e_orchestration_newpane.rs` and
-/// `e2e_orchestration_remit.rs` specifically because SonarCloud's new-code
-/// duplication gate flagged the byte-identical match between those two
-/// (issue #521 fix round). Leaves the orchestrator (start) role focused in
-/// `PaneInput` mode.
+/// sharing one — this one copy is shared between `e2e_orchestration_newpane.rs`
+/// and `e2e_orchestration_remit.rs` specifically because SonarCloud's
+/// new-code duplication gate flagged the byte-identical match between those
+/// two (issue #521 fix round). Leaves the orchestrator (start) role focused
+/// in `PaneInput` mode.
 pub fn open_orchestration(deck: &TuiDeck) {
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form

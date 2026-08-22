@@ -10,7 +10,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, find_pane_box_left_edge};
+use common::{TuiDeck, commit_fixture, find_pane_box_left_edge};
 use spec::spec;
 
 /// Scenario: launch the deck with a Dashboard pane already live and
@@ -75,6 +75,7 @@ fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active(
     // — this precondition is the whole point; an empty Dashboard reproduces
     // nothing (`orchestration_006` / `identity_004` cover that case and both
     // pass).
+    commit_fixture(deck.workdir());
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused

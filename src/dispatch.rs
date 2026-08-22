@@ -432,6 +432,16 @@ pub async fn handle_dispatch(
             provision_isolated_clone_sync(&source_dir, &clone_target, &branch, &creator_for_clone)
         })
         .await;
+        // PRD fork#544 M3 fix round: release this process-local resume
+        // registration the moment provisioning returns, on every outcome —
+        // the has-live-sibling daemon query above already durably
+        // established liveness for this path before provisioning even ran,
+        // so the registry's brief defense-in-depth job is done here
+        // regardless of whether provisioning resumed, created, or refused.
+        // See `resumed_isolated_clones`'s doc comment
+        // (`src/issue_dispatch_run.rs`) for why this is correct rather than
+        // a weakening of the race protection.
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&paths.worktree_dir);
         match outcome {
             // Issue #164: a marker-write warning is not surfaced on this ad
             // hoc `dispatch` CLI path, matching the shared-checkout arm's
@@ -459,6 +469,23 @@ pub async fn handle_dispatch(
                         crate::terminal_sanitize::sanitize_path_for_terminal_display(
                             &paths.worktree_dir
                         )
+                    ),
+                };
+            }
+            // PRD fork#544 M3: resuming an existing, eligible isolated clone
+            // is a success just like `Created` above — this ad hoc
+            // `dispatch` CLI path does not surface a warning on `Created`
+            // either (`marker_warning: _` above), so `fetch_warning` is
+            // dropped here for the same reason.
+            Ok(Ok(IsolatedCloneOutcome::Resumed { fetch_warning: _ })) => {}
+            Ok(Ok(IsolatedCloneOutcome::Rejected(reason))) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: cannot use the isolated clone at {} — {}",
+                        paths.worktree_dir.display(),
+                        reason.describe(),
                     ),
                 };
             }
@@ -2225,6 +2252,15 @@ mod tests {
     /// failure branch otherwise requires a filesystem-permission race
     /// against `provision_isolated_clone_sync`'s own single synchronous
     /// call, which this sidesteps entirely.
+    ///
+    /// Final cleanup round (nit 7): this stub matches `$1`/`$2` positionally
+    /// -- the same fragility `e663edf2` had to fix elsewhere in this round.
+    /// Safe today only because `point_isolated_clone_origin`'s real call
+    /// site is a raw `std::process::Command`, not the shared hardened core
+    /// (`spawn_git_status_child` et al.), which prepends `-c core.fsmonitor=`
+    /// and would shift `remote`/`set-url` off positions `$1`/`$2`. If that
+    /// call site is ever routed through the shared core, this stub silently
+    /// stops matching and needs updating alongside it.
     #[cfg(unix)]
     fn with_git_remote_set_url_failing(scratch: &Path) -> FakeGitOnPathGuard {
         use std::os::unix::fs::PermissionsExt;
@@ -2265,6 +2301,19 @@ mod tests {
     /// `handle_isolated_clone_add_error` takes its ordinary
     /// leaves-a-half-created-directory `Failed` path rather than the
     /// `!clone_dir.exists()` early `Err` branch.
+    ///
+    /// PRD fork#544 review-findings fix round 3: detects `clone` as ANY
+    /// argument, not `$1` positionally -- `spawn_git_status_child`'s new
+    /// `-c core.fsmonitor=` hardening now prepends two global-option args
+    /// ahead of the subcommand on every call through that shared core
+    /// (`provision_isolated_clone_sync`'s own `git clone` included), so
+    /// `$1` is `-c`, not `clone`, on the invocation this test actually
+    /// drives. A positional check silently fell through to `exec
+    /// {real_git}`, which then genuinely cloned `repo` (a valid
+    /// repository) instead of simulating a failure -- this stub's job is
+    /// to recognize an invocation AS a clone regardless of what global
+    /// options precede the subcommand, the same way real `git` itself
+    /// does.
     #[cfg(unix)]
     fn with_git_clone_failing_with_hostile_stderr(scratch: &Path) -> FakeGitOnPathGuard {
         use std::os::unix::fs::PermissionsExt;
@@ -2277,7 +2326,11 @@ mod tests {
             &stub,
             format!(
                 "#!/bin/sh\n\
-                 if [ \"$1\" = clone ]; then\n\
+                 is_clone=0\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$a\" = clone ]; then is_clone=1; fi\n\
+                 done\n\
+                 if [ \"$is_clone\" = 1 ]; then\n\
                  \x20\x20dest=\"\"\n\
                  \x20\x20for a in \"$@\"; do dest=\"$a\"; done\n\
                  \x20\x20mkdir -p \"$dest/.git\"\n\

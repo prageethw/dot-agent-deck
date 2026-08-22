@@ -740,7 +740,56 @@ impl TabManager {
     /// Open a new orchestration tab. Creates one pane per role.
     /// `orchestrator_prompt` is injected into the start role once its agent is ready.
     /// Returns `(tab_index, role_pane_ids)`.
+    ///
+    /// PRD fork#544 M6: thin wrapper over
+    /// [`Self::open_orchestration_tab_with_isolated_clone_origin`] with
+    /// `isolated_clone_origin: None` — every existing caller (every test in
+    /// this module and `src/ui.rs`, plus the cold-start snapshot-restore
+    /// path) keeps this exact signature and behavior unchanged. Only the
+    /// live new-orchestration spawn call site (`src/ui.rs`'s
+    /// `Action::SpawnPane` orchestration branch) needs to pass a real
+    /// origin, so it alone calls the other method directly.
     pub fn open_orchestration_tab(
+        &mut self,
+        config: &OrchestrationConfig,
+        cwd: &str,
+        orchestrator_prompt: Option<String>,
+        display_title: Option<&str>,
+        creator: Option<&str>,
+        spawn_dims: (u16, u16),
+    ) -> Result<(usize, Vec<String>), TabError> {
+        self.open_orchestration_tab_with_isolated_clone_origin(
+            config,
+            cwd,
+            orchestrator_prompt,
+            display_title,
+            creator,
+            spawn_dims,
+            None,
+        )
+    }
+
+    /// Like [`Self::open_orchestration_tab`], but additionally carries
+    /// `isolated_clone_origin` — the root checkout this orchestration's
+    /// isolated clone (`cwd`) was provisioned FROM — into every role pane's
+    /// `AgentSpawnOptions.isolated_clone_origin`, forwarded to the daemon as
+    /// `AttachRequest::StartAgent.isolated_clone_origin` (PRD fork#544 M6).
+    ///
+    /// This exists because Model A's own isolated-clone provisioning
+    /// (`src/ui.rs`'s `provision_isolated_clone_or_status`, wrapping
+    /// `crate::issue_dispatch_run::provision_isolated_clone_sync`) runs
+    /// CLIENT-side, in the TUI process — unlike Model B/C, which provision
+    /// and call `record_worktree` daemon-side, in the same process that owns
+    /// the `WorktreeRegistry` (`src/dispatch.rs`, `src/issue_dispatch_run.rs`).
+    /// The TUI has no access to that registry, so without this field nothing
+    /// ever registered Model A's workspace for tab-close cleanup — closing
+    /// the tab found no entry and skipped the "kept: isolated clone" notice
+    /// entirely, even though the clone itself was correctly preserved on
+    /// disk (`RemovalPolicy::IsolatedClone`'s guarantee never ran because
+    /// nothing recorded which policy applied). `None` reproduces
+    /// `open_orchestration_tab`'s exact prior behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_orchestration_tab_with_isolated_clone_origin(
         &mut self,
         config: &OrchestrationConfig,
         cwd: &str,
@@ -772,6 +821,11 @@ impl TabManager {
         // pass reconciles each role pane to its exact inner area (and the
         // active tab's focus state) on the first frame.
         spawn_dims: (u16, u16),
+        // PRD fork#544 M6: see this method's own doc comment. `None` when
+        // this orchestration's workspace was NOT provisioned as a
+        // client-side isolated clone (e.g. it's a restore, or a future
+        // caller working directly in a shared checkout).
+        isolated_clone_origin: Option<&str>,
     ) -> Result<(usize, Vec<String>), TabError> {
         let (spawn_rows, spawn_cols) = spawn_dims;
 
@@ -915,6 +969,13 @@ impl TabManager {
                 // derivation of it. `None` when this orchestration owns no
                 // worktree (e.g. started directly in `main`).
                 owner: creator.map(str::to_string),
+                // PRD fork#544 M6: same value on EVERY role pane, mirroring
+                // `owner` immediately above — the daemon-side registration
+                // this drives (`record_worktree` under
+                // `RemovalPolicy::IsolatedClone`) is idempotent per
+                // worktree path, so it's fine (and simpler) to carry it on
+                // every role's spawn rather than singling out one.
+                isolated_clone_origin: isolated_clone_origin.map(str::to_string),
             };
             let (pane_id, _resolved) = match self.pane_controller.create_pane_with_options(
                 Some(&role.command),

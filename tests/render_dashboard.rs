@@ -3537,6 +3537,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         shell_synthetic_working: false,
         pending_permission_tool: None,
         model: None,
+        expects_agent_report: false,
     }
 }
 

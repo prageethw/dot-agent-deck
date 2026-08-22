@@ -7,7 +7,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use spec::spec;
 
 #[cfg(unix)]
@@ -136,6 +136,7 @@ fn spawn_003_orchestration_role_wraps_codex() {
         .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
         .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
         .launch_with_fixture("codex-spawn-paths");
+    commit_fixture(deck.workdir());
     open_form(&deck);
     deck.send_keys(b"\x1b[C\x1b[C");
     deck.wait_for_absence("Command:");

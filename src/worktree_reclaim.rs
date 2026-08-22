@@ -5705,10 +5705,20 @@ mod tests {
     /// attacker who pre-plants a forged `.git` dir plus a forged ownership
     /// marker at the fully deterministic dispatch path gets the deck's own
     /// provisioner to write a genuine attach-lock artifact vouching for it,
-    /// even though the dispatch itself then visibly fails as
-    /// `AlreadyClaimed` and nothing ever actually attaches into the
-    /// planted directory. Asserts the CORRECT, not-yet-shipped behavior --
-    /// RED today.
+    /// even though the dispatch itself then visibly refuses it and nothing
+    /// ever actually attaches into the planted directory.
+    ///
+    /// PRD fork#544 M3: the refusal this asserts is now
+    /// `Rejected(ResumeRejection::Stranger)` rather than the old flat
+    /// `AlreadyClaimed` -- the forged in-tree `OWNER_MARKER_FILENAME` this
+    /// fixture writes carries no weight with M3's eligibility check at all
+    /// (it never reads that file), and the OUT-of-tree M4b evidence
+    /// `isolated_clone_provenance_path` looks for was never written for
+    /// this canonical path, so this is exactly the "stranger directory"
+    /// case `orchestration/workspace/006` also covers -- the security
+    /// property this test protects (never silently attach, never report
+    /// `owned: true`) is unchanged by which specific refusal variant names
+    /// it.
     #[spec("worktree/reclaim/057")]
     #[test]
     fn worktree_reclaim_057_pre_planted_directory_survives_already_claimed_as_owned() {
@@ -5737,10 +5747,13 @@ mod tests {
         assert!(
             matches!(
                 outcome,
-                crate::issue_dispatch_run::IsolatedCloneOutcome::AlreadyClaimed
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Rejected(
+                    crate::issue_dispatch_run::ResumeRejection::Stranger
+                )
             ),
-            "sanity: a pre-existing directory at the deterministic dispatch path must be \
-             reported as AlreadyClaimed, not silently cloned into, got {outcome:?}"
+            "sanity: a pre-existing directory at the deterministic dispatch path, with no \
+             out-of-tree M4b evidence, must be reported as Rejected(Stranger), not silently \
+             cloned into, got {outcome:?}"
         );
 
         let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
@@ -5752,7 +5765,7 @@ mod tests {
         assert!(
             !forged_report.owned,
             "a directory that merely happened to occupy a path BEFORE a legitimate dispatch \
-             attempt acquired the lock for it (bounded by AlreadyClaimed) must never report \
+             attempt acquired the lock for it (bounded by a Stranger refusal) must never report \
              owned: true -- fork#325 M4b (auditor C1); got {forged_report:?}"
         );
         assert!(
@@ -5762,7 +5775,7 @@ mod tests {
         );
         assert!(
             target_dir.exists(),
-            "sanity: AlreadyClaimed must never delete or modify the pre-existing directory"
+            "sanity: a Stranger refusal must never delete or modify the pre-existing directory"
         );
     }
 
