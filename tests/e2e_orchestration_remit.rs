@@ -235,11 +235,20 @@ fn inject_compacting(
 
 /// Open the orchestration, write and launch the orchestrator's synthetic
 /// script, and confirm the spawn-time remit pointer lands once. Returns the
-/// daemon socket path, the start role's `(pane_id, agent_id)`, and the log
-/// path every test in this file asserts delivery counts against.
+/// daemon socket path, the start role's `(pane_id, agent_id)`, the log path
+/// every test in this file asserts delivery counts against, and the role's
+/// own cwd (the isolated clone, per PRD fork#544 M2b — NOT
+/// `deck.workdir()`) for tests that need to write further trigger files
+/// there themselves.
 fn open_and_confirm_initial_delivery(
     deck: &TuiDeck,
-) -> (std::path::PathBuf, String, String, std::path::PathBuf) {
+) -> (
+    std::path::PathBuf,
+    String,
+    String,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     deck.wait_for_string("No active sessions");
     write_executable(
         &deck.workdir().join("orchestrator-remit.sh"),
@@ -288,7 +297,8 @@ fn open_and_confirm_initial_delivery(
         .cwd
         .clone()
         .expect("orchestrator role pane must have a recorded cwd");
-    let log = std::path::PathBuf::from(role_cwd).join("orchestrator-prompt.log");
+    let role_cwd = std::path::PathBuf::from(role_cwd);
+    let log = role_cwd.join("orchestrator-prompt.log");
     let initial_delivered =
         common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 1, Duration::from_secs(10));
     assert!(
@@ -298,7 +308,7 @@ fn open_and_confirm_initial_delivery(
         deck.snapshot_grid()
     );
 
-    (socket, pane_id, agent_id, log)
+    (socket, pane_id, agent_id, log, role_cwd)
 }
 
 /// Scenario: Open a real orchestration tab and let the start role's
@@ -311,7 +321,7 @@ fn open_and_confirm_initial_delivery(
 #[cfg(unix)]
 fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
     let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
-    let (socket, pane_id, agent_id, log) = open_and_confirm_initial_delivery(&deck);
+    let (socket, pane_id, agent_id, log, _role_cwd) = open_and_confirm_initial_delivery(&deck);
 
     inject_compacting(
         &deck,
@@ -345,7 +355,8 @@ fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
 #[cfg(unix)]
 fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
     let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
-    let (socket, orch_pane_id, orch_agent_id, log) = open_and_confirm_initial_delivery(&deck);
+    let (socket, orch_pane_id, orch_agent_id, log, _role_cwd) =
+        open_and_confirm_initial_delivery(&deck);
 
     let worker_record = role_agent_record(&socket, "worker");
     let worker_pane_id = worker_record
@@ -407,13 +418,17 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
 #[cfg(unix)]
 fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
     let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
-    let (socket, pane_id, agent_id, log) = open_and_confirm_initial_delivery(&deck);
+    let (socket, pane_id, agent_id, log, role_cwd) = open_and_confirm_initial_delivery(&deck);
 
-    std::fs::write(deck.workdir().join("go-history-only"), "")
+    // PRD fork#544 M2b: isolation is unconditional, so the orchestrator
+    // role's script polls for these trigger files (and writes its own
+    // marker) inside its own isolated clone, not `deck.workdir()` — use the
+    // role's own recorded cwd, exactly as `log` above already does.
+    std::fs::write(role_cwd.join("go-history-only"), "")
         .expect("trigger the fixture script's history-only phase");
     assert!(
         common::wait_until(Duration::from_secs(5), || {
-            deck.workdir().join("history-only-emitted").exists()
+            role_cwd.join("history-only-emitted").exists()
         }),
         "the fixture script never emitted its history-only session_start within 5s"
     );
@@ -448,7 +463,7 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
         Duration::from_secs(5),
     );
 
-    std::fs::write(deck.workdir().join("go-live-again"), "")
+    std::fs::write(role_cwd.join("go-live-again"), "")
         .expect("trigger the fixture script's return-to-live phase");
     let delivered_once_live =
         common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
