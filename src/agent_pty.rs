@@ -7980,6 +7980,10 @@ impl AgentPtyRegistry {
             live: None,
             // PRD #745 M11: absent unless THIS registry forked the child.
             spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+            // Fork issue #513: same reasoning as `live` above — the registry
+            // has no notion of a daemon boot id or a pane's registration
+            // generation; callers that need both join them in from
+            // `AppState` themselves.
             daemon_boot_id: None,
             registration_generation: None,
             // Issue #856: stamped at the wire boundary by `attach_cli_names`,

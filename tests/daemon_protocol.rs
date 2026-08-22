@@ -195,6 +195,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         },
     )
     .await;
@@ -230,6 +231,7 @@ async fn start_agent_for_pane(
             tab_membership: None,
             agent_type: Some(AgentType::Codex),
             seed: None,
+            isolated_clone_origin: None,
         },
     )
     .await;
@@ -260,6 +262,7 @@ async fn start_plain_agent_for_pane(
             tab_membership: None,
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         },
     )
     .await;
@@ -505,6 +508,7 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             tab_membership: Some(membership),
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         },
     )
     .await;
@@ -568,6 +572,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
             }),
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         },
     )
     .await;
@@ -654,6 +659,7 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         tab_membership: None,
         agent_type: None,
         seed: None,
+        isolated_clone_origin: None,
     };
 
     // Wire round-trip: encode + decode via the same serde path the daemon
@@ -765,6 +771,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         tab_membership: None,
         agent_type: Some(AgentType::ClaudeCode),
         seed: None,
+        isolated_clone_origin: None,
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -794,6 +801,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         tab_membership: None,
         agent_type: Some(AgentType::OpenCode),
         seed: None,
+        isolated_clone_origin: None,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
     let back_oc: AttachRequest = serde_json::from_str(&json_oc).unwrap();
@@ -1166,6 +1174,7 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 tab_membership: Some(TabMembership::Mode { name: name.clone() }),
                 agent_type: None,
                 seed: None,
+                isolated_clone_origin: None,
             },
         )
         .await;
@@ -4087,6 +4096,7 @@ async fn start_agent_rejects_blank_command() {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         },
     )
     .await;

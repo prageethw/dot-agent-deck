@@ -23,7 +23,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, commit_fixture, find_pane_box_left_edge, open_orchestration_with_slug};
+use common::{TuiDeck, commit_fixture, find_pane_box_left_edge};
 use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
@@ -63,10 +63,9 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    // Issue #489: tab B below opens with a TYPED Worktree slug rather than
-    // sharing tab A's exact cwd — `git worktree add`/the isolated-clone arm
-    // it goes through both need a ref to branch from, which an unborn HEAD
-    // (the harness's own bare `git init`) does not provide.
+    // Tab B below's isolated-clone provisioning needs a ref to branch from,
+    // which an unborn HEAD (the harness's own bare `git init`) does not
+    // provide.
     commit_fixture(deck.workdir());
     deck.wait_for_string("No active sessions");
 
@@ -124,14 +123,13 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     );
 
     // Open a SECOND orchestration tab (tab B) against the same directory
-    // PICKED in the form, via a TYPED Worktree slug — issue #489 refuses a
-    // second BLANK-slug open that exactly collides with tab A's own live
-    // directory, so tab B must go through the unaffected typed-slug arm
-    // instead (unrelated to this test's own point: PRD #387 decision 2, a
+    // PICKED in the form — PRD fork#544 M2b: isolation is unconditional now,
+    // so there is no longer a blank-slug exact-cwd collision to route
+    // around (unrelated to this test's own point: PRD #387 decision 2, a
     // fresh tab now ADOPTS the current deck-global stage — tab B must open
     // already-Narrow, matching tab A's toggled stage, not its own untoggled
     // Default).
-    open_orchestration_with_slug(&deck, "paneb");
+    open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab B is up
     // Deliberately unguarded: three separate guard attempts here were each
     // satisfiable by a stale tab-A frame instead of tab B's real one (any
@@ -313,6 +311,9 @@ fn orchestration_024_ctrl_l_forwards_to_pty_on_focused_orchestration_role_pane()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-bash-role");
     deck.wait_for_string("No active sessions");
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up, orchestrator focused
@@ -360,6 +361,9 @@ fn orchestration_015_active_tab_bold_status_color_no_underline() {
     let active_label = format!("{launch_dir_basename}-orchestrator-1");
 
     deck.wait_for_string("No active sessions");
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab is up
     deck.wait_for_string(&format!(" {active_label} ")); // tab strip renders the active tab's label
@@ -494,6 +498,29 @@ fn write_beta_agent(deck: &TuiDeck) {
 /// selects the orchestration; selecting an orchestration hides the Command
 /// field, so a second Enter submits the form.
 fn open_focus_lifecycle_orchestration(deck: &TuiDeck) {
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one. `git
+    // clone` only carries COMMITTED content into the isolated clone, so
+    // `beta`'s `./beta-agent.sh` role command (written by `write_beta_agent`
+    // before this call) must be committed too, or its spawn fails inside
+    // the clone with the script missing.
+    commit_fixture(deck.workdir());
+    common::run_git(deck.workdir(), &["add", "beta-agent.sh"]);
+    common::run_git(
+        deck.workdir(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "beta script",
+        ],
+    );
     deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode");

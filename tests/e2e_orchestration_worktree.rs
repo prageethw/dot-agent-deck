@@ -1,32 +1,33 @@
 #![cfg(feature = "e2e")]
 
-//! L2 real-binary proof of fork #122's worktree-slug form field
-//! (`orchestration/worktree/005`), the CLAUDE.md rule 4 PTY-attached test for
-//! this feature. `orchestration/worktree/001`-`004` (`src/ui.rs` unit tests)
-//! each characterize one mechanism in isolation — the slug-to-path resolution,
-//! the fail-loud refusal, the pre-existing cwd-threading, the actual on-disk
-//! creation via `dispatch_action` — but none of them drives the real keyboard
-//! path a user actually types: `Ctrl+n` -> directory picker -> form -> cycle
-//! Mode to an orchestration -> **Tab to the Worktree field** -> type a slug ->
-//! submit. That exact path regressed once already on this PR (an Enter-chain
-//! break was found only as collateral damage in seven unrelated e2e helpers,
-//! not by a test driving this field directly) — this test exists to catch
-//! that class of regression head-on.
+//! L2 real-binary proof of fork #122's worktree-provisioning feature and PRD
+//! fork#544 M2/M2b's naming-derivation and unconditional-isolation
+//! follow-up, the CLAUDE.md rule 4 PTY-attached tests for both.
+//! `orchestration/worktree/002`-`004` (`src/ui.rs` unit tests) each
+//! characterize one mechanism in isolation — the fail-loud refusal, the
+//! pre-existing cwd-threading, the actual on-disk creation via
+//! `dispatch_action` — but none of them drives the real keyboard path a user
+//! actually types: `Ctrl+n` -> directory picker -> form -> cycle Mode to an
+//! orchestration -> type/clear the Name -> submit. `orchestration/workspace/001`
+//! /`002` below are what drive that path on the real binary post-M2/M2b (the
+//! separate Worktree-slug field `orchestration/worktree/005` used to exercise
+//! is retired outright — Name is now the sole input to the resolved path).
 //!
-//! `create_worktree_sync` shells out to real `git`, so the directory the deck
-//! is launched in must be a git repository with at least one commit before the
+//! Provisioning shells out to real `git`, so the directory the deck is
+//! launched in must be a git repository with at least one commit before the
 //! form is submitted. `TuiDeck::try_launch_inner` already runs `git init
 //! --quiet` in the copied fixture unconditionally (some deck paths probe
-//! `.git`) — this test adds the one thing that's missing, a commit, using the
-//! same inline-identity pattern as `init_remote_with_orch_toml`
-//! (`tests/e2e_issue_dispatch.rs`) and `worktree_004`'s fixture
-//! (`src/ui.rs`), since CI runners carry no global git config.
+//! `.git`) — every test here adds the one thing that's missing, a commit,
+//! using the same inline-identity pattern as `init_remote_with_orch_toml`
+//! (`tests/e2e_issue_dispatch.rs`) and `worktree_004`'s fixture (`src/ui.rs`),
+//! since CI runners carry no global git config.
 //!
-//! Uses the `orch-worktree` fixture: a single orchestration with two roles,
-//! each dumping its OWN `pwd` to a role-named log file before staying alive on
-//! `sleep` — no real LLM tokens spent. Reading the log CONTENT (not just its
-//! presence) is what proves each role pane was spawned rooted in the created
-//! worktree rather than the fixture directory itself.
+//! `orchestration/worktree/014`/`016` and `orchestration/workspace/001`/`002`
+//! all reuse the `orch-clone-gate` fixture: a single orchestration whose one
+//! role appends its own `DOT_AGENT_DECK_WORKTREE_OWNER` identity plus `pwd`
+//! to one shared, HOME-relative log file — the after-the-fact "where did
+//! this instance actually land on disk, and under which identity" evidence
+//! every test in this family needs.
 
 mod common;
 
@@ -37,174 +38,15 @@ use std::time::Duration;
 use common::{TuiDeck, commit_fixture, run_git};
 use spec::spec;
 
-/// Resolve the sibling worktree path fork #122's `resolve_orchestration_worktree_path`
-/// (`src/ui.rs`) would produce for `dir` + `slug`: `<dir>-<slug>`, next to `dir`
-/// itself. Duplicated here deliberately rather than made `pub(crate)` and
-/// imported — this test asserts the OBSERVABLE path a user would find on disk,
-/// not the production helper's internals.
-fn sibling_worktree_path(dir: &std::path::Path, slug: &str) -> PathBuf {
-    let mut name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    name.push('-');
-    name.push_str(slug);
-    dir.with_file_name(name)
-}
-
-/// Resolve `worktree_dir`'s git metadata dir via `git rev-parse --git-dir` —
-/// the same resolution `mark_worktree_owned` (`src/worktree_reclaim.rs`)
-/// uses to place the `dot-agent-deck-owner` marker outside the working
-/// tree, so writing it can never leave the worktree permanently dirty.
-/// Mirrors `create_worktree_records_creator_identity`'s helper
-/// (`src/issue_dispatch_run.rs`), which proves the same marker on the async
-/// path.
-fn resolve_git_dir(worktree_dir: &std::path::Path) -> PathBuf {
-    let out = std::process::Command::new("git")
-        .current_dir(worktree_dir)
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .expect("git rev-parse --git-dir must spawn");
-    assert!(
-        out.status.success(),
-        "git rev-parse --git-dir failed in {worktree_dir:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let git_dir = PathBuf::from(raw);
-    if git_dir.is_absolute() {
-        git_dir
-    } else {
-        worktree_dir.join(git_dir)
-    }
-}
-
-/// Scenario: launch the deck in the `orch-worktree` fixture (a real git repo
-/// after `commit_fixture`), then drive the exact user-facing keyboard path:
-/// `Ctrl+n` -> directory picker (Space confirms cwd) -> new-pane form -> Right
-/// selects the fixture's one orchestration -> Enter (Mode -> Name) -> Tab
-/// (Name -> Worktree, since selecting an orchestration hides the Command
-/// field) -> type a slug -> Enter submits. Assert the resolved sibling
-/// worktree directory exists on disk, and that BOTH role panes' `pwd` logs —
-/// written by each role's own shell command before it goes to sleep — report
-/// the worktree path, not the fixture directory the deck was launched in.
-/// Also assert the `dot-agent-deck-owner` marker (issue #425) written into
-/// the worktree's git metadata dir records `created-by:
-/// orchestration:<launch-dir-basename>-orchestrator-1` — on this keyboard
-/// path the Name field is never typed into, so it keeps the value selecting
-/// the orchestration pre-filled it with (fork#192 M1.0): the next free
-/// `<basename>-orchestrator-N` suggestion, `N=1` since no orchestration is
-/// live yet in this fresh single-open test. That typed-Name value takes
-/// precedence over `orch_config.name` at the `create_worktree_sync` call
-/// site, so it — not the fixture's config name `worktree-demo` — is the
-/// creator this path actually derives.
-#[spec("orchestration/worktree/005")]
-#[test]
-fn worktree_005_form_worktree_field_creates_and_roots_role_panes_on_real_binary() {
-    const SLUG: &str = "worktree005";
-
-    let deck = TuiDeck::launch_with_fixture("orch-worktree");
-    let work = deck.workdir().to_path_buf();
-    commit_fixture(&work);
-
-    deck.wait_for_string("No active sessions");
-
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
-    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_keys(b"\x1b[C"); // Right -> [Orch: worktree-demo] (the fixture's only orchestration)
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\t"); // Tab: Name -> Worktree (Command is hidden for an orchestration)
-    deck.send_keys(SLUG.as_bytes());
-    deck.send_keys(b"\r"); // submit
-
-    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up
-
-    let worktree = sibling_worktree_path(&work, SLUG);
-    assert!(
-        common::wait_for_path(&worktree, Duration::from_secs(15)),
-        "submitting the form with a typed Worktree slug must create the \
-         resolved sibling worktree {} on disk\n=== rendered grid ===\n{}",
-        worktree.display(),
-        deck.snapshot_grid()
-    );
-
-    // fork issue #425 follow-up, updated for fork#192 M1.0: the Name field
-    // was never typed into on this keyboard path (Mode -> Name -> Tab
-    // straight to Worktree), so it keeps its pre-filled value -- since M1.0,
-    // the suggested `<launch-dir-basename>-orchestrator-1` that selecting the
-    // orchestration writes into the Name field (`N=1`: no orchestration is
-    // live yet in this fresh single-open test). That typed-Name value takes
-    // precedence over `orch_config.name` at the `create_worktree_sync` call
-    // site (`src/ui.rs`), so the creator this path actually derives is
-    // `orchestration:<launch-dir basename>-orchestrator-1`, not the fixture's
-    // config name `worktree-demo`. Compute the expected basename from the
-    // launch dir this test itself set up, rather than hardcoding it.
-    let launch_dir_basename = work
-        .file_name()
-        .expect("launch dir must have a basename")
-        .to_string_lossy()
-        .into_owned();
-    let expected_creator =
-        format!("created-by: orchestration:{launch_dir_basename}-orchestrator-1");
-    let git_dir = resolve_git_dir(&worktree);
-    let marker = std::fs::read_to_string(
-        git_dir.join(dot_agent_deck::worktree_owner::OWNER_MARKER_FILENAME),
-    )
-    .expect("ownership marker must exist and be readable in the worktree's git-dir");
-    assert!(
-        marker.contains(&expected_creator),
-        "the ownership marker written through the real keyboard path must \
-         record the creator `src/ui.rs` actually derives from the launch \
-         directory's basename (the Name field's pre-filled value), expected \
-         {expected_creator:?}, got {marker:?}"
-    );
-
-    let orchestrator_log = worktree.join("pwd-orchestrator.log");
-    let worker_log = worktree.join("pwd-worker.log");
-    assert!(
-        common::wait_for_path(&orchestrator_log, Duration::from_secs(15)),
-        "the orchestrator role pane never wrote its pwd log inside the \
-         worktree — expected it spawned rooted there\n=== rendered grid ===\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        common::wait_for_path(&worker_log, Duration::from_secs(15)),
-        "the worker role pane never wrote its pwd log inside the worktree — \
-         expected it spawned rooted there\n=== rendered grid ===\n{}",
-        deck.snapshot_grid()
-    );
-
-    let canonical_worktree = worktree
-        .canonicalize()
-        .expect("created worktree must resolve to a real path");
-    for (role, log) in [("orchestrator", &orchestrator_log), ("worker", &worker_log)] {
-        let recorded = std::fs::read_to_string(log)
-            .unwrap_or_else(|e| panic!("read {role}'s pwd log {log:?}: {e}"));
-        let recorded_path = std::path::Path::new(recorded.trim());
-        let canonical_recorded = recorded_path.canonicalize().unwrap_or_else(|e| {
-            panic!("canonicalize {role}'s recorded pwd {recorded_path:?}: {e}")
-        });
-        assert_eq!(
-            canonical_recorded, canonical_worktree,
-            "the {role} role pane's own `pwd` (recorded as {recorded:?}) must \
-             resolve to the created worktree, not the fixture directory the \
-             deck was launched in — every role pane must be rooted in the \
-             orchestration's own worktree"
-        );
-    }
-}
-
 /// Resolve `dir`'s git COMMON dir via `git -C dir rev-parse --git-common-dir`
 /// — for a linked worktree this resolves to the MAIN repository's `.git` (the
 /// same value every other worktree of that repository resolves to); for a
 /// genuinely separate clone it resolves to that clone's own `.git`. This is
-/// the observable signature PRD fork#325 M3's gate is about: whether the
-/// Nth-concurrent orchestration shares the 1st's object store (today, always)
-/// or gets its own (the fix). Mirrors `resolve_git_dir` above, which reads
-/// `--git-dir` instead — deliberately duplicated rather than generalized,
-/// following this file's existing convention of asserting the OBSERVABLE
-/// path a user/tool would see, not a shared internal helper.
+/// the observable signature PRD fork#325 M3's gate — and, since PRD
+/// fork#544 M2b, EVERY orchestration's own isolation — is about: whether an
+/// orchestration shares the launch directory's object store (never, as of
+/// M2b) or gets its own (always). Asserts the OBSERVABLE path a user/tool
+/// would see, not a shared internal helper.
 fn git_common_dir(dir: &std::path::Path) -> PathBuf {
     let out = std::process::Command::new("git")
         .current_dir(dir)
@@ -264,42 +106,43 @@ fn remote_origin_url(dir: &std::path::Path) -> Option<String> {
 }
 
 /// Drive the new-pane form's real keyboard path to open the `orch-clone-gate`
-/// fixture's one orchestration with a TYPED worktree slug — `Ctrl+n` ->
-/// directory picker -> confirm -> Mode cycled to the orchestration -> Tab to
-/// Worktree -> slug -> submit. A typed (non-blank) slug is required to reach
-/// `create_worktree_sync`/the M3 gate at all — an accepted-blank Worktree
-/// field (as `e2e_orchestration_identity.rs::open_orchestration` uses) never
-/// provisions a worktree at all, so it can't exercise this feature.
-fn open_orchestration_with_slug(deck: &TuiDeck, slug: &str) {
+/// fixture's one orchestration with a TYPED Name — `Ctrl+n` -> directory
+/// picker -> confirm -> Mode cycled to the orchestration -> clear the
+/// pre-filled suggested Name -> type `name` -> submit directly from Name
+/// (Command is hidden for an orchestration). PRD fork#544 M2 retires the
+/// separate Worktree-slug field this helper used to type into — Name is now
+/// the sole input to the resolved path, so a distinct typed Name is what
+/// this family of tests needs instead of a distinct typed slug.
+fn open_orchestration_with_name(deck: &TuiDeck, name: &str) {
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
     deck.send_keys(b"\x1b[C"); // Right -> [Orch: clone-gate-demo] (the fixture's only orchestration)
     deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\t"); // Tab: Name -> Worktree (Command is hidden for an orchestration)
-    deck.send_keys(slug.as_bytes());
+    // Backspace x80 -> clear the pre-filled suggested Name (fork#192 M1.0);
+    // extra pops on an already-empty field are no-ops, same idiom as
+    // `workspace_001`/`002` below.
+    deck.send_keys(&[0x7fu8; 80]);
+    deck.send_keys(name.as_bytes());
     deck.send_keys(b"\r"); // submit
 }
 
 /// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
 /// one orchestration TWICE against the SAME directory — with distinct typed
-/// worktree slugs, the second one while the first is still live — mirroring
-/// the N-concurrent-orchestrations shape of issue #325's actual incident
-/// (three-plus, here reduced to the PRD's own stated M3 starting case: the
+/// Names, the second one while the first is still live — mirroring the
+/// N-concurrent-orchestrations shape of issue #325's actual incident
+/// (three-plus, here reduced to the PRD fork#325 M3 starting case: the
 /// simplest 2nd-against-a-live-1st collision). Each instance's role pane
 /// appends its own `DOT_AGENT_DECK_WORKTREE_OWNER` identity plus its own
 /// `pwd` to one shared, HOME-relative log file, so the 1st and 2nd
 /// instances' actual working directories can be read back and told apart by
 /// owner string once both role panes have run — without this test needing to
 /// know in advance where either instance's worktree/clone lands on disk.
-/// Assert the 1st instance's directory shares the launch dir's git common
-/// dir (unaffected, per the PRD's own "the 1st orchestration is out of
-/// scope" note — no behavior change for the common case), and the 2nd
-/// instance's directory does NOT — it must have its own isolated clone (a
-/// distinct git object store), never a `git worktree add` sibling reusing
-/// the shared checkout's common dir the way `create_worktree_sync` does
-/// today unconditionally, regardless of how many orchestrations are already
-/// live against it.
+/// PRD fork#544 M2b inverts this test's original "1st shares, 2nd isolates"
+/// shape: isolation is now unconditional, so BOTH instances' directories
+/// must have their own isolated clone (a distinct git object store) —
+/// neither may share the launch directory's, and the two must not share
+/// each other's either.
 #[spec("orchestration/worktree/014")]
 #[test]
 fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
@@ -314,21 +157,15 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
 
     deck.wait_for_string("No active sessions");
 
-    let launch_dir_basename = work
-        .file_name()
-        .expect("launch dir must have a basename")
-        .to_string_lossy()
-        .into_owned();
-    // fork#192 M1.0: the Name field is never typed into on this keyboard
-    // path (Mode -> Tab straight to Worktree), so it keeps its pre-filled
-    // suggestion — the next free `<basename>-orchestrator-N` — and that
-    // value is what `Action::SpawnPane` actually derives as the
-    // creator/owner identity (see `orchestration/worktree/005` above).
-    let owner_1 = format!("orchestration:{launch_dir_basename}-orchestrator-1");
-    let owner_2 = format!("orchestration:{launch_dir_basename}-orchestrator-2");
-    let second_label = format!(" {launch_dir_basename}-orchestrator-2 ");
+    // PRD fork#544 M2: the typed Name is now the sole input to both the
+    // resolved workspace path and the creator/owner identity — no more
+    // reading the pre-filled `<basename>-orchestrator-N` suggestion, since
+    // this helper clears and types over it.
+    let owner_1 = "orchestration:clonegate1".to_string();
+    let owner_2 = "orchestration:clonegate2".to_string();
+    let second_label = " clonegate2 ";
 
-    open_orchestration_with_slug(&deck, "clonegate1");
+    open_orchestration_with_name(&deck, "clonegate1");
     deck.wait_for_absence("New Agent"); // first orchestration's form closed -> tab up
 
     // Back to the Dashboard to open a second orchestration in the same dir,
@@ -337,8 +174,8 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
     deck.send_keys(b"\x1b[D"); // Left -> previous tab -> Dashboard
     deck.wait_for_string("session(s)");
 
-    open_orchestration_with_slug(&deck, "clonegate2");
-    deck.wait_for_string(&second_label); // second orchestration deck is up, distinctly labeled
+    open_orchestration_with_name(&deck, "clonegate2");
+    deck.wait_for_string(second_label); // second orchestration deck is up, distinctly labeled
 
     let log_path = deck.home_dir().join("clone-gate-pwd.log");
     common::wait_for_file_lines(&log_path, 2, Duration::from_secs(15)).unwrap_or_else(|e| {
@@ -369,11 +206,14 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
     let pwd_1_common = git_common_dir(pwd_1);
     let pwd_2_common = git_common_dir(pwd_2);
 
-    assert_eq!(
-        pwd_1_common, work_common,
-        "the 1ST orchestration against a root checkout must be unaffected — \
-         it shares the launch dir's git common dir exactly as today, per the \
-         PRD's own out-of-scope note"
+    assert_ne!(
+        pwd_1_common,
+        work_common,
+        "PRD fork#544 M2b: isolation is unconditional now — even the 1ST \
+         orchestration against a root checkout must provision its own \
+         isolated clone, never a `git worktree add` sibling sharing {}'s \
+         own object store",
+        work.display()
     );
     assert_ne!(
         pwd_2_common,
@@ -381,38 +221,48 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
         "the 2ND (Nth-concurrent) orchestration against the SAME root \
          checkout, spawned while the 1st is still live, must provision its \
          OWN isolated clone — a distinct git common dir/object store — \
-         instead of sharing {}'s via a `git worktree add` sibling the way \
-         `create_worktree_sync` does today unconditionally, regardless of \
-         how many orchestrations are already live against it",
+         instead of sharing {}'s",
         work.display()
     );
+    assert_ne!(
+        pwd_1_common, pwd_2_common,
+        "the 1st and 2nd orchestrations must not share EACH OTHER's isolated \
+         clone either — each gets its own separate object store"
+    );
 
-    // Issue #325 reviewer P1-2: both arms must land on the SLUG the user
-    // typed, not silently stay on the source's HEAD branch — the absence of
-    // this assertion is exactly what let the isolated arm's dropped
-    // `branch` argument through a green suite.
+    // Issue #325 reviewer P1-2: both must land on the Name the user typed,
+    // not silently stay on the source's HEAD branch — the absence of this
+    // assertion is exactly what let the isolated arm's dropped `branch`
+    // argument through a green suite.
     assert_eq!(
         current_branch(pwd_1),
         "clonegate1",
-        "the 1st (shared-worktree) orchestration must be on the typed slug's branch"
+        "the 1st orchestration must be checked out on its typed Name's branch"
     );
     assert_eq!(
         current_branch(pwd_2),
         "clonegate2",
-        "the 2nd (isolated-clone) orchestration must be checked out on the typed \
-         slug's branch, not the source's HEAD branch — this is issue #325 \
+        "the 2nd orchestration must be checked out on its typed Name's \
+         branch, not the source's HEAD branch — this is issue #325 \
          reviewer P1-2's fix"
     );
 
-    // Issue #325 reviewer P1-1: the isolated clone's `origin` must be the
+    // Issue #325 reviewer P1-1: every isolated clone's `origin` must be the
     // SOURCE's own origin URL, never the local filesystem path a plain
     // `git clone` defaults `origin` to — a `git push origin` from the clone
     // would otherwise land silently in `work`, the user's own root checkout.
     assert_eq!(
+        remote_origin_url(pwd_1).as_deref(),
+        Some(fake_origin),
+        "the 1st orchestration's isolated clone must carry the source \
+         checkout's own origin URL, not a local path pointing back at {}",
+        work.display()
+    );
+    assert_eq!(
         remote_origin_url(pwd_2).as_deref(),
         Some(fake_origin),
-        "the isolated clone's origin must be the source checkout's own \
-         origin URL, not a local path pointing back at {}",
+        "the 2nd orchestration's isolated clone must carry the source \
+         checkout's own origin URL, not a local path pointing back at {}",
         work.display()
     );
 }
@@ -495,7 +345,7 @@ fn attempt_worktree_remove(from_dir: &std::path::Path, target: &std::path::Path)
 /// the vt100 harness's plain-text `snapshot_grid`/`wait_for_string` cannot
 /// see. A wrong step count is harmless regardless: `Ctrl+n`'s directory
 /// picker roots at the deck process's own `std::env::current_dir()`
-/// (`src/ui.rs`), not at anything tab-scoped, so `open_orchestration_with_slug`
+/// (`src/ui.rs`), not at anything tab-scoped, so `open_orchestration_with_name`
 /// resolves to the same launch directory no matter which tab is active when
 /// it runs.
 fn go_to_dashboard(deck: &TuiDeck, steps_back: usize) {
@@ -507,31 +357,28 @@ fn go_to_dashboard(deck: &TuiDeck, steps_back: usize) {
 
 /// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
 /// one orchestration THREE times against the SAME directory — with distinct
-/// typed worktree slugs, the 2nd and 3rd each while an earlier one is still
-/// live — reproducing issue #325's own original incident shape verbatim
-/// (the issue's own words: "three-plus concurrent orchestrations... on one
-/// deck"), not `014`'s reduced 2-orchestration starting case. First proves
-/// the PRD fork#325 M3 gate holds at N=3: the 1st shares the launch dir's
-/// git common dir exactly as today, the 2nd and 3rd each land on their OWN
-/// distinct common dir — no two of the three sharing one, so the 2nd and
-/// 3rd are isolated from EACH OTHER too, not just from the 1st. Then
+/// typed Names, the 2nd and 3rd each while an earlier one is still live —
+/// reproducing issue #325's own original incident shape verbatim (the
+/// issue's own words: "three-plus concurrent orchestrations... on one
+/// deck"), not `014`'s reduced 2-orchestration starting case. PRD fork#544
+/// M2b: isolation is unconditional now, so ALL THREE — not just the 2nd and
+/// 3rd — must land on their own distinct git common dir; no two of the
+/// three, including the launch directory itself, may share one. Then
 /// reproduces the issue's own two concrete failures directly and proves
 /// neither can recur: (1) with all three live, attempts `git worktree
 /// remove` from one orchestration's repository targeting another's
-/// directory — in every direction the incident named, including an
-/// isolated clone attacking the SHARED checkout's own worktree, which is
-/// the exact shape issue #325 reported (worktrees belonging to the root
-/// checkout deleted by an orchestration that did not own them) — cross-repo,
-/// this must now fail outright with a `… is not a working tree` stderr (the
-/// target isn't even registered in the attacking repo's worktree list),
-/// leaving the target's directory, branch, and HEAD commit completely
-/// undisturbed; (2)
-/// a `git fetch --depth 1` performed in the 1st (shared-checkout)
-/// orchestration's directory makes the LAUNCH DIRECTORY'S shared object
-/// store shallow, exactly as the issue reported, while the 2nd and 3rd
-/// orchestrations' isolated clones — genuinely separate object stores now —
-/// remain unaffected and their HEAD commits stay byte-identical to before
-/// the fetch.
+/// directory — in every direction the incident named — must now fail
+/// outright with a `… is not a working tree` stderr (the target isn't even
+/// registered in the attacking repo's worktree list), leaving the target's
+/// directory, branch, and HEAD commit completely undisturbed — reframed from
+/// `014`'s pre-M2b "1st shares, Nth isolates" shape to "the protection holds
+/// between any N isolated clones", which is what M2b's unconditional
+/// isolation actually produces; (2) a `git fetch --depth 1` performed in the
+/// 1st orchestration's OWN isolated clone makes ONLY that clone's object
+/// store shallow — since M2b it no longer shares the launch directory's
+/// common dir, so the launch directory itself, and the 2nd/3rd
+/// orchestrations' own isolated clones, must all remain unaffected and their
+/// HEAD commits byte-identical to before the fetch.
 #[spec("orchestration/worktree/016")]
 #[test]
 fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_without_colliding() {
@@ -543,31 +390,28 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
 
     deck.wait_for_string("No active sessions");
 
-    let launch_dir_basename = work
-        .file_name()
-        .expect("launch dir must have a basename")
-        .to_string_lossy()
-        .into_owned();
-    let owner_1 = format!("orchestration:{launch_dir_basename}-orchestrator-1");
-    let owner_2 = format!("orchestration:{launch_dir_basename}-orchestrator-2");
-    let owner_3 = format!("orchestration:{launch_dir_basename}-orchestrator-3");
-    let second_label = format!(" {launch_dir_basename}-orchestrator-2 ");
-    let third_label = format!(" {launch_dir_basename}-orchestrator-3 ");
+    // PRD fork#544 M2: the typed Name is now the sole input to both the
+    // resolved workspace path and the creator/owner identity.
+    let owner_1 = "orchestration:clonegate1".to_string();
+    let owner_2 = "orchestration:clonegate2".to_string();
+    let owner_3 = "orchestration:clonegate3".to_string();
+    let second_label = " clonegate2 ";
+    let third_label = " clonegate3 ";
 
-    // 1st orchestration: shares the launch dir's checkout, as today.
-    open_orchestration_with_slug(&deck, "clonegate1");
+    // 1st orchestration — PRD fork#544 M2b: isolates too, same as 2nd/3rd.
+    open_orchestration_with_name(&deck, "clonegate1");
     deck.wait_for_absence("New Agent");
     go_to_dashboard(&deck, 1); // orch1 (index 1) -> Dashboard (index 0)
 
     // 2nd, while the 1st is still live: must get its own isolated clone.
-    open_orchestration_with_slug(&deck, "clonegate2");
-    deck.wait_for_string(&second_label);
+    open_orchestration_with_name(&deck, "clonegate2");
+    deck.wait_for_string(second_label);
     go_to_dashboard(&deck, 2); // orch2 (index 2) -> orch1 (1) -> Dashboard (0)
 
     // 3rd, while BOTH the 1st and 2nd are still live: this is #325's own
     // actual incident shape (three-plus concurrent, not two).
-    open_orchestration_with_slug(&deck, "clonegate3");
-    deck.wait_for_string(&third_label);
+    open_orchestration_with_name(&deck, "clonegate3");
+    deck.wait_for_string(third_label);
 
     let log_path = deck.home_dir().join("clone-gate-pwd.log");
     common::wait_for_file_lines(&log_path, 3, Duration::from_secs(15)).unwrap_or_else(|e| {
@@ -597,17 +441,20 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         panic!("no line in {log_path:?} for owner {owner_3:?}; got: {contents:?}")
     });
 
-    // --- Structural proof: no two of the three share a git common dir,
-    // except the 1st, which shares the launch dir's exactly as intended. ---
+    // --- Structural proof: no two of the four (the launch dir plus all
+    // three orchestrations) share a git common dir — PRD fork#544 M2b's
+    // unconditional isolation means the 1st is no longer the exception. ---
     let work_common = git_common_dir(&work);
     let pwd_1_common = git_common_dir(pwd_1);
     let pwd_2_common = git_common_dir(pwd_2);
     let pwd_3_common = git_common_dir(pwd_3);
 
-    assert_eq!(
-        pwd_1_common, work_common,
-        "the 1ST orchestration must be unaffected — it shares the launch \
-         dir's git common dir exactly as today"
+    assert_ne!(
+        pwd_1_common,
+        work_common,
+        "PRD fork#544 M2b: the 1ST orchestration must provision its own \
+         isolated clone too, not share the launch dir's ({}) object store",
+        work.display()
     );
     assert_ne!(
         pwd_2_common,
@@ -624,6 +471,16 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         work.display()
     );
     assert_ne!(
+        pwd_1_common, pwd_2_common,
+        "the 1ST and 2ND orchestrations must not share each other's \
+         isolated clone either — each gets its own separate object store"
+    );
+    assert_ne!(
+        pwd_1_common, pwd_3_common,
+        "the 1ST and 3RD orchestrations must not share each other's \
+         isolated clone either — each gets its own separate object store"
+    );
+    assert_ne!(
         pwd_2_common, pwd_3_common,
         "the 2ND and 3RD orchestrations must NOT share each other's \
          isolated clone either — each gets its own separate object store"
@@ -632,17 +489,22 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
     assert_eq!(
         current_branch(pwd_1),
         "clonegate1",
-        "the 1st (shared-worktree) orchestration must be on its typed slug's branch"
+        "the 1st orchestration must be on its typed Name's branch"
     );
     assert_eq!(
         current_branch(pwd_2),
         "clonegate2",
-        "the 2nd (isolated-clone) orchestration must be on its typed slug's branch"
+        "the 2nd orchestration must be on its typed Name's branch"
     );
     assert_eq!(
         current_branch(pwd_3),
         "clonegate3",
-        "the 3rd (isolated-clone) orchestration must be on its typed slug's branch"
+        "the 3rd orchestration must be on its typed Name's branch"
+    );
+    assert_eq!(
+        remote_origin_url(pwd_1).as_deref(),
+        Some(fake_origin),
+        "the 1st orchestration's isolated clone must carry the source's own origin URL"
     );
     assert_eq!(
         remote_origin_url(pwd_2).as_deref(),
@@ -655,6 +517,7 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         "the 3rd orchestration's isolated clone must carry the source's own origin URL"
     );
 
+    let work_head_baseline = head_sha(&work);
     let pwd_1_head_baseline = head_sha(pwd_1);
     let pwd_2_head_baseline = head_sha(pwd_2);
     let pwd_3_head_baseline = head_sha(pwd_3);
@@ -669,22 +532,21 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
 
     // --- Behavioral proof of failure #1: "an orchestration deleted five
     // worktrees it did not own, mid-use". Attempt cross-repo `git worktree
-    // remove` in every direction the incident's own report names: from the
-    // shared worktree against an isolated clone, from one isolated clone
-    // against another, AND from an isolated clone against the shared
-    // checkout's own worktree — issue #325's actual incident was
-    // orchestrations deleting worktrees belonging to the root checkout,
-    // which only this last direction reproduces (reviewer P2-3). Every
-    // attempt must fail outright (the target is not even registered in the
-    // attacking repo's worktree list), and every target must remain
-    // completely intact afterward. ---
+    // remove` in every direction the incident's own report names, and
+    // between every pair of the three orchestrations' own isolated clones
+    // too — reframed from the pre-M2b "1st shares, Nth isolates" shape to
+    // "the protection holds between any N isolated clones", since PRD
+    // fork#544 M2b's unconditional isolation means all three (not just the
+    // 2nd and 3rd) are now isolated clones. Every attempt must fail outright
+    // (the target is not even registered in the attacking repo's worktree
+    // list), and every target must remain completely intact afterward. ---
     let (removed_2_from_1, stderr_2_from_1) = attempt_worktree_remove(pwd_1, pwd_2);
     assert!(
         !removed_2_from_1,
-        "`git worktree remove` run from the 1st (shared-checkout) \
-         orchestration's directory must NOT be able to remove the 2nd's \
-         isolated clone at {} — this is issue #325 failure #1, and it \
-         succeeding here would mean the isolation regressed\nstderr: {}",
+        "`git worktree remove` run from the 1st orchestration's directory \
+         must NOT be able to remove the 2nd's isolated clone at {} — this \
+         is issue #325 failure #1, and it succeeding here would mean the \
+         isolation regressed\nstderr: {}",
         pwd_2.display(),
         stderr_2_from_1
     );
@@ -727,18 +589,17 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         stderr_3_from_2
     );
 
-    // The direction issue #325 actually reported: an isolated clone
-    // attacking the SHARED checkout's own worktree, not the reverse. This
-    // is the higher-consequence direction — the target is the user's own
-    // root-checkout worktree, not a disposable clone.
+    // The direction issue #325 actually reported: one orchestration's clone
+    // attacking another's, including the 1st's — the higher-consequence
+    // direction the incident named, now applicable to the 1st too since it
+    // is no longer the launch directory's own worktree.
     let (removed_1_from_2, stderr_1_from_2) = attempt_worktree_remove(pwd_2, pwd_1);
     assert!(
         !removed_1_from_2,
         "`git worktree remove` run from the 2nd orchestration's isolated \
-         clone must NOT be able to remove the 1st (shared-checkout) \
-         orchestration's own worktree at {} — this is the exact direction \
-         issue #325 reported: an orchestration deleting worktrees \
-         belonging to the root checkout it did not own\nstderr: {}",
+         clone must NOT be able to remove the 1st orchestration's isolated \
+         clone at {} — this is the exact direction issue #325 reported: an \
+         orchestration deleting a worktree/clone it did not own\nstderr: {}",
         pwd_1.display(),
         stderr_1_from_2
     );
@@ -747,6 +608,42 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         "the removal must fail specifically because the 1st orchestration's \
          worktree is not registered in the 2nd's worktree list, got: {}",
         stderr_1_from_2
+    );
+
+    // The scenario issue #325 reported LITERALLY: an orchestration deleting
+    // a worktree belonging to the ROOT CHECKOUT itself, not to another
+    // orchestration's clone. Under M2b every orchestration is its own
+    // isolated clone, so this is the one direction the three pairwise
+    // attempts above don't already cover.
+    let (removed_work_from_1, stderr_work_from_1) = attempt_worktree_remove(pwd_1, &work);
+    assert!(
+        !removed_work_from_1,
+        "`git worktree remove` run from the 1st orchestration's isolated \
+         clone must NOT be able to remove the LAUNCH DIRECTORY's own \
+         worktree at {} — this is issue #325's original incident shape: an \
+         orchestration deleting worktrees belonging to the root checkout it \
+         did not own\nstderr: {}",
+        work.display(),
+        stderr_work_from_1
+    );
+    assert!(
+        stderr_work_from_1.contains(NOT_A_WORKING_TREE),
+        "the removal must fail specifically because the launch directory is \
+         not registered in the 1st orchestration's worktree list, got: {}",
+        stderr_work_from_1
+    );
+    assert!(
+        work.is_dir(),
+        "the launch directory at {} must still exist after the failed \
+         removal attempt targeting it",
+        work.display()
+    );
+    assert_eq!(
+        head_sha(&work),
+        work_head_baseline,
+        "the launch directory's HEAD commit must be byte-identical to \
+         before the failed removal attempt — nothing in its git state was \
+         disturbed"
     );
 
     for (label, pwd, expected_branch, expected_head) in [
@@ -776,12 +673,15 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
     }
 
     // --- Behavioral proof of failure #2: "an orchestration made the shared
-    // repository shallow, breaking merges in every worktree". Perform a
-    // real `git fetch --depth 1` in the 1st (shared-checkout) orchestration's
-    // directory — the exact operation the issue reported (a shallow fetch
-    // against the shared object store) — and confirm the 2nd and 3rd
-    // orchestrations' isolated clones, genuinely separate object stores now,
-    // are structurally unable to be affected. ---
+    // repository shallow, breaking merges in every worktree". Perform a real
+    // `git fetch --depth 1` in the 1st orchestration's own isolated clone —
+    // the exact operation the issue reported — and confirm the LAUNCH
+    // DIRECTORY itself, plus the 2nd and 3rd orchestrations' isolated
+    // clones, are all structurally unable to be affected: PRD fork#544 M2b
+    // means none of them shares the 1st's object store any more, which
+    // inverts this test's pre-M2b shape (a shallow fetch in the 1st USED to
+    // reach the launch directory, since the two shared a common dir; now it
+    // must not). ---
     let fake_upstream_root = common::race_safe_tempdir();
     let fake_upstream = fake_upstream_root.path().join("fake-upstream");
     run_git(
@@ -842,12 +742,19 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
          reproduction never exercised the issue's own failure mode at all"
     );
     assert!(
-        is_shallow_repository(&work),
-        "because the 1st orchestration shares the launch directory's git \
-         common dir, the shallow fetch must be visible from the launch \
-         directory too — exactly as issue #325 reported \
-         (`$ git rev-parse --is-shallow-repository` / `true`, observed from \
-         a DIFFERENT worktree than the one that ran the fetch)"
+        !is_shallow_repository(&work),
+        "PRD fork#544 M2b: the 1st orchestration no longer shares the \
+         launch directory's git common dir (it is its own isolated clone \
+         now), so the shallow fetch performed inside it must be \
+         structurally unable to reach the launch directory — the exact \
+         inverse of what issue #325 originally reported, and the whole \
+         point of M2b's unconditional isolation"
+    );
+    assert_eq!(
+        head_sha(&work),
+        work_head_baseline,
+        "the launch directory's HEAD commit must be byte-identical to \
+         before the shallow fetch — nothing in its git state was disturbed"
     );
 
     for (label, pwd, expected_head) in [
@@ -858,7 +765,7 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
             !is_shallow_repository(pwd),
             "the {label} orchestration's isolated clone at {} must remain a \
              FULL, non-shallow repository — the shallow fetch performed \
-             against the 1st orchestration's shared checkout must be \
+             against the 1st orchestration's own isolated clone must be \
              structurally unable to reach a separate object store",
             pwd.display()
         );
@@ -870,4 +777,702 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
              disturbed"
         );
     }
+}
+
+/// Read a `owner pwd` log line written by the `orch-clone-gate` fixture's
+/// `solo` role (`$DOT_AGENT_DECK_WORKTREE_OWNER` followed by `$(pwd)`,
+/// space-separated) and return the `pwd` recorded for `owner`, if any line
+/// matches. Shared by the `orchestration/workspace/*` tests below —
+/// `orchestration/worktree/014`/`016` inline the same parse themselves
+/// rather than share a helper, since each of those has more than one owner
+/// to look up from a single read; the workspace tests below each look up
+/// exactly one, so a helper is worth it here instead.
+fn pwd_for_owner(log_contents: &str, owner: &str) -> Option<PathBuf> {
+    log_contents.lines().find_map(|line| {
+        line.split_once(' ')
+            .filter(|(found, _)| *found == owner)
+            .map(|(_, pwd)| PathBuf::from(pwd))
+    })
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
+/// one orchestration exactly ONCE — no concurrent sibling orchestration
+/// exists at all, the PRD's own "1st orchestration against a root checkout"
+/// case. Clear the form's suggested Name and type a distinctive one instead,
+/// then submit directly from the Name field (Command is hidden for an
+/// orchestration, so Enter there submits) with the Worktree-slug field left
+/// untouched/blank. PRD fork#544 M2b retires the Nth-concurrent-only
+/// isolation gate: even this very first orchestration against the root
+/// checkout must land in its own isolated workspace — never a `git worktree
+/// add` sibling sharing the launch directory's own git object store, which
+/// is what today's code still does for a 1st orchestration. M2's naming
+/// derivation says that workspace must be named
+/// `<root-checkout-basename>-<sanitized-name>`, derived from the typed Name
+/// alone — never the separate Worktree-slug field (blank here) and never
+/// `auto_generate_worktree_slug`'s `orchestrator-N` counter.
+#[spec("orchestration/workspace/001")]
+#[test]
+fn workspace_001_first_orchestration_gets_named_isolated_workspace() {
+    const NAME: &str = "workspace001fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_keys(b"\x1b[C"); // Right -> [Orch: clone-gate-demo] (the fixture's only orchestration)
+    deck.send_keys(b"\r"); // Mode -> Name
+    // Backspace x80 -> clear the pre-filled suggested Name (fork#192 M1.0);
+    // extra pops on an already-empty field are no-ops, same idiom as
+    // `e2e_new_pane_seed.rs`/`e2e_mode_seed_prompt.rs`.
+    deck.send_keys(&[0x7fu8; 80]);
+    deck.send_keys(NAME.as_bytes());
+    deck.send_keys(b"\r"); // submit directly from Name; Worktree-slug stays blank
+
+    deck.wait_for_absence("New Agent"); // form closed -> orchestration tab up
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let owner = format!("orchestration:{NAME}");
+    let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
+    });
+
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+    assert_eq!(
+        pwd,
+        expected_path,
+        "PRD fork#544 M2: the workspace directory must be derived from the orchestration Name \
+         alone (`<root-checkout-basename>-<sanitized-name>`) — not from the separate \
+         Worktree-slug field (blank here) and not from `orchestrator-N` auto-numbering; today's \
+         code, for a 1st orchestration with a blank slug, leaves the pane rooted in the launch \
+         directory itself ({}) instead",
+        work.display()
+    );
+
+    let work_common = git_common_dir(&work);
+    let pwd_common = git_common_dir(&pwd);
+    assert_ne!(
+        pwd_common,
+        work_common,
+        "PRD fork#544 M2b: the isolation gate is unconditional now — even the FIRST \
+         orchestration against a root checkout must provision its own isolated clone (a \
+         distinct git common dir/object store), never a `git worktree add` sibling sharing \
+         {}'s own object store the way today's code still does for a 1st orchestration",
+        work.display()
+    );
+}
+
+/// Scenario: run the identical single-orchestration flow `workspace_001`
+/// drives — clear the suggested Name, type one fixed literal, submit with a
+/// blank Worktree-slug — TWICE, as two fully independent scenarios (two
+/// separate `TuiDeck` launches, each its own fresh root checkout with its
+/// own randomly-named tempdir, the second launched only after the first has
+/// been torn down). Both runs type the exact same Name. PRD fork#544 M2's
+/// naming derivation must be a pure function of `(root-checkout-basename,
+/// Name)` — not of any session-local counter state such as
+/// `auto_generate_worktree_slug`'s `orchestrator-N`, which would happily
+/// produce the identical `orchestrator-1` slug on both independent runs too,
+/// so this test's point is specifically the FORMULA holding independently
+/// in each scenario, not merely that some slug repeats. So each run's
+/// resulting workspace directory must resolve to that run's OWN
+/// `<its-own-root-checkout-basename>-<the-shared-typed-name>` — proving the
+/// same deterministic rule applies each time, regardless of which root
+/// checkout or how many prior orchestrations either one has seen.
+#[spec("orchestration/workspace/002")]
+#[test]
+fn workspace_002_naming_is_deterministic_from_name_alone_across_separate_runs() {
+    const NAME: &str = "detnamefixed";
+
+    fn run_once(basename_out: &mut String, pwd_out: &mut PathBuf) {
+        let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+        let work = deck.workdir().to_path_buf();
+        commit_fixture(&work);
+
+        deck.wait_for_string("No active sessions");
+
+        *basename_out = work
+            .file_name()
+            .expect("launch dir must have a basename")
+            .to_string_lossy()
+            .into_owned();
+
+        deck.send_keys(b"\x0e");
+        deck.send_keys(b" ");
+        deck.wait_for_string("No mode");
+        deck.send_keys(b"\x1b[C");
+        deck.send_keys(b"\r");
+        deck.send_keys(&[0x7fu8; 80]);
+        deck.send_keys(NAME.as_bytes());
+        deck.send_keys(b"\r");
+
+        deck.wait_for_absence("New Agent");
+
+        let log_path = deck.home_dir().join("clone-gate-pwd.log");
+        common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+            panic!(
+                "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+                 === rendered grid ===\n{}",
+                deck.snapshot_grid()
+            )
+        });
+
+        let contents =
+            std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+        let owner = format!("orchestration:{NAME}");
+        *pwd_out = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
+            panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
+        });
+
+        // Explicit, not left to scope-exit ordering: the second run must not
+        // start until this deck's process tree/tempdir/socket are fully torn
+        // down, so the two runs are genuinely independent scenarios rather
+        // than two decks alive at once.
+        drop(deck);
+    }
+
+    let mut basename_1 = String::new();
+    let mut pwd_1 = PathBuf::new();
+    run_once(&mut basename_1, &mut pwd_1);
+
+    let mut basename_2 = String::new();
+    let mut pwd_2 = PathBuf::new();
+    run_once(&mut basename_2, &mut pwd_2);
+
+    assert_ne!(
+        basename_1, basename_2,
+        "sanity precondition: the two runs' root checkouts must have DIFFERENT basenames \
+         (independent tempdirs) — otherwise this test can't tell a name-derived path from a \
+         coincidentally-matching one"
+    );
+
+    let expected_1 = PathBuf::from(pwd_1.parent().expect("pwd_1 must have a parent"))
+        .join(format!("{basename_1}-{NAME}"));
+    let expected_2 = PathBuf::from(pwd_2.parent().expect("pwd_2 must have a parent"))
+        .join(format!("{basename_2}-{NAME}"));
+
+    assert_eq!(
+        pwd_1, expected_1,
+        "PRD fork#544 M2: run 1's workspace directory must equal \
+         `<run-1's-own-root-checkout-basename>-{NAME}`"
+    );
+    assert_eq!(
+        pwd_2, expected_2,
+        "PRD fork#544 M2: run 2's workspace directory must equal \
+         `<run-2's-own-root-checkout-basename>-{NAME}` — the SAME derivation rule as run 1, \
+         applied independently, proving the naming is a pure function of \
+         (root-checkout-basename, Name) rather than of session-local counter state like \
+         `orchestrator-N`"
+    );
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture, open its one
+/// orchestration under a fixed Name, write an uncommitted change and make a
+/// local-only commit directly in the resulting workspace, close the whole
+/// tab (Ctrl+D -> Ctrl+W -> confirm), then reopen the SAME orchestration
+/// under the IDENTICAL Name a second time. PRD fork#544 M3: the second open
+/// must RESUME the existing workspace directory rather than refuse it — the
+/// exact directory, with the uncommitted file and the local-only commit
+/// both still present, byte-identical, never a fresh clone and never the
+/// blanket "already exists" refusal today's pre-M3 code reports for every
+/// present-directory case.
+#[spec("orchestration/workspace/003")]
+#[test]
+fn workspace_003_reopening_same_name_resumes_existing_workspace_preserving_local_state() {
+    const NAME: &str = "workspace003fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+
+    // --- First open: creates the workspace. ---
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let owner = format!("orchestration:{NAME}");
+    let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
+    });
+    assert_eq!(
+        pwd, expected_path,
+        "sanity: the first open must land at the derived workspace path, matching workspace_001"
+    );
+
+    // Write an uncommitted change AND make a local-only commit directly in
+    // the workspace — the exact state a resumed session must never lose
+    // (the PRD's own biggest-hazard mitigation: zero destructive git
+    // mutation on resume).
+    let uncommitted_path = pwd.join("uncommitted-003.txt");
+    let uncommitted_content = "uncommitted change made before closing\n";
+    std::fs::write(&uncommitted_path, uncommitted_content)
+        .expect("write uncommitted file into the workspace");
+
+    let local_only_path = pwd.join("local-only-003.txt");
+    std::fs::write(&local_only_path, "local-only commit content\n")
+        .expect("write local-only file into the workspace");
+    run_git(&pwd, &["add", "local-only-003.txt"]);
+    run_git(
+        &pwd,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "local-only commit before close",
+        ],
+    );
+    let head_before_close = head_sha(&pwd);
+
+    // --- Close the whole tab. ---
+    deck.send_keys(b"\x04"); // Ctrl+D -> command mode
+    deck.send_keys(b"\x17"); // Ctrl+W -> arm close confirmation
+    deck.wait_for_string("Close this tab and all its panes?");
+    deck.send_keys(b"\x1b[B"); // Down -> select Close
+    deck.send_keys(b"\r"); // Enter -> confirm
+    deck.wait_for_string("No active sessions"); // back to an empty Dashboard
+
+    // The workspace directory itself must never be removed by closing its
+    // tab (PRD fork#544 M6/M4c: persistence is a decision, not an absence).
+    assert!(
+        pwd.is_dir(),
+        "the workspace directory at {} must still exist on disk after closing its tab",
+        pwd.display()
+    );
+
+    // --- Second open: same fixture, same directory-picker target, same
+    // typed Name — PRD fork#544 M3's resume arm. ---
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    common::wait_for_file_lines(&log_path, 2, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the resumed role pane must have appended a second owner+pwd line to {log_path:?}: \
+             {e}\n=== rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    let contents_after =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    // Last-line-wins by owner (matching `worktree_014`/`016`'s own idiom):
+    // the SAME owner string is written by both opens, so the FIRST match
+    // alone (`pwd_for_owner`) would silently keep proving the first open's
+    // path even if resume actually landed somewhere else.
+    let mut pwd_by_owner: HashMap<String, PathBuf> = HashMap::new();
+    for line in contents_after.lines() {
+        if let Some((o, p)) = line.split_once(' ') {
+            pwd_by_owner.insert(o.to_string(), PathBuf::from(p));
+        }
+    }
+    let pwd_after = pwd_by_owner.get(&owner).unwrap_or_else(|| {
+        panic!(
+            "no line in {log_path:?} for owner {owner:?} after reopening; got: {contents_after:?}"
+        )
+    });
+
+    assert_eq!(
+        pwd_after, &pwd,
+        "PRD fork#544 M3: reopening under the IDENTICAL Name must RESUME the exact SAME \
+         workspace directory, never a different/freshly-numbered one"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&uncommitted_path).unwrap_or_else(|e| panic!(
+            "read back uncommitted file {uncommitted_path:?} after reopening: {e}"
+        )),
+        uncommitted_content,
+        "the uncommitted change made before closing must still be present, byte-identical, \
+         after resuming — resume must perform ZERO destructive git mutation"
+    );
+
+    assert_eq!(
+        head_sha(&pwd),
+        head_before_close,
+        "the local-only commit made before closing must still be the workspace's HEAD after \
+         resuming — resume must never rebase, merge, or otherwise move the checked-out branch"
+    );
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture with the
+/// launch directory's `origin` pointed at a REAL, separately-advanceable
+/// local repository, open its one orchestration under a fixed Name, close
+/// the whole tab, advance that real "upstream" repository with extra
+/// commits while the workspace is closed, then reopen under the IDENTICAL
+/// Name. PRD fork#544 M3: resume must perform EXACTLY one read-only `git
+/// fetch` (updating only the `origin/<default-branch>` remote-tracking ref)
+/// and ZERO other git mutation — the checked-out branch's own HEAD commit
+/// must be byte-identical before and after, even though `origin` has
+/// genuinely moved ahead in the meantime.
+#[spec("orchestration/workspace/004")]
+#[test]
+fn workspace_004_resume_fetches_read_only_and_leaves_checked_out_branch_untouched() {
+    const NAME: &str = "workspace004fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+    let default_branch = current_branch(&work);
+
+    // A REAL, separately-advanceable local repository as `origin` — unlike
+    // the other tests in this family, this one is a genuine local clone the
+    // resumed workspace's own `git fetch origin` can actually reach, not an
+    // unreachable `https://example.invalid/...` placeholder.
+    let upstream_root = common::race_safe_tempdir();
+    let upstream = upstream_root.path().join("upstream");
+    run_git(
+        upstream_root.path(),
+        &[
+            "clone",
+            "-q",
+            work.to_str().expect("work path must be valid UTF-8"),
+            upstream
+                .to_str()
+                .expect("upstream path must be valid UTF-8"),
+        ],
+    );
+    run_git(
+        &work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            upstream
+                .to_str()
+                .expect("upstream path must be valid UTF-8"),
+        ],
+    );
+
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let owner = format!("orchestration:{NAME}");
+    let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
+    });
+
+    assert_eq!(
+        remote_origin_url(&pwd).as_deref(),
+        Some(
+            upstream
+                .to_str()
+                .expect("upstream path must be valid UTF-8")
+        ),
+        "sanity: the isolated clone's origin must be the source's own real origin URL"
+    );
+
+    let head_before_close = head_sha(&pwd);
+
+    // --- Close the whole tab. ---
+    deck.send_keys(b"\x04");
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close this tab and all its panes?");
+    deck.send_keys(b"\x1b[B");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("No active sessions");
+
+    // Advance the real upstream repository while the workspace is closed —
+    // extra commits the resumed workspace's own checked-out branch (its own
+    // NAME branch, forked off the ORIGINAL source HEAD) must never pick up
+    // automatically, but the `origin/<default-branch>` remote-tracking ref
+    // SHOULD reflect once resumed.
+    for msg in ["extra-upstream-1", "extra-upstream-2"] {
+        run_git(
+            &upstream,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                msg,
+            ],
+        );
+    }
+    let upstream_head_after_advance = head_sha(&upstream);
+
+    // --- Reopen under the IDENTICAL Name — PRD fork#544 M3's resume arm. ---
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    common::wait_for_file_lines(&log_path, 2, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the resumed role pane must have appended a second owner+pwd line to {log_path:?}: \
+             {e}\n=== rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    let contents_after =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let mut pwd_by_owner: HashMap<String, PathBuf> = HashMap::new();
+    for line in contents_after.lines() {
+        if let Some((o, p)) = line.split_once(' ') {
+            pwd_by_owner.insert(o.to_string(), PathBuf::from(p));
+        }
+    }
+    let pwd_after = pwd_by_owner.get(&owner).unwrap_or_else(|| {
+        panic!(
+            "no line in {log_path:?} for owner {owner:?} after reopening; got: {contents_after:?}"
+        )
+    });
+    assert_eq!(
+        pwd_after, &pwd,
+        "reopening under the IDENTICAL Name must resume the same workspace directory"
+    );
+
+    assert_eq!(
+        head_sha(&pwd),
+        head_before_close,
+        "PRD fork#544 M3: resume must perform ZERO mutation of the checked-out branch — its \
+         HEAD commit must be byte-identical to before closing, even though origin has genuinely \
+         moved ahead in the meantime"
+    );
+
+    let remote_tracking_ref = format!("refs/remotes/origin/{default_branch}");
+    let remote_tracking_head = std::process::Command::new("git")
+        .current_dir(&pwd)
+        .args(["rev-parse", &remote_tracking_ref])
+        .output()
+        .expect("git rev-parse must spawn");
+    assert!(
+        remote_tracking_head.status.success(),
+        "PRD fork#544 M3: resume must run a read-only `git fetch origin`, populating \
+         {remote_tracking_ref} — it does not resolve at all, meaning no fetch ran: {}",
+        String::from_utf8_lossy(&remote_tracking_head.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&remote_tracking_head.stdout).trim(),
+        upstream_head_after_advance,
+        "PRD fork#544 M3: resume's read-only fetch must bring {remote_tracking_ref} up to date \
+         with the real upstream's CURRENT (advanced) HEAD, proving a genuine `git fetch origin` \
+         ran on resume rather than none at all"
+    );
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
+/// one orchestration under a fixed Name — WITHOUT closing it — then attempt
+/// to open a SECOND orchestration under the IDENTICAL Name while the first
+/// is still live. PRD fork#544 M3's own eligibility check (a) reuses the
+/// EXISTING fork#192 live-name query as the FIRST gate, ahead of the new
+/// resume logic — this test exercises that ordering directly: the second
+/// attempt must be refused as "name in use" (the New Pane form stays open,
+/// no second tab opens), and critically it must NEVER silently fall back to
+/// a numeric-suffixed sibling path the way a naive "directory exists, so
+/// pick another slug" implementation could.
+#[spec("orchestration/workspace/005")]
+#[test]
+fn workspace_005_reopening_name_held_by_live_orchestration_refuses_without_suffix_fallback() {
+    const NAME: &str = "workspace005fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+
+    // First open — creates and stays live for the rest of this test.
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+
+    // Back to Dashboard WITHOUT closing the first orchestration — it stays
+    // live throughout this test.
+    deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode
+    deck.send_keys(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    // Attempt a second open under the IDENTICAL Name while the first is
+    // still live.
+    open_orchestration_with_name(&deck, NAME);
+
+    // The refusal must be visible on screen — the new-pane form stays open,
+    // never silently closing into a second, differently-pathed tab.
+    deck.wait_until_grid(
+        "New Agent form remains open after a live-name collision, no second tab opened",
+        |g| g.contains("New Agent"),
+    );
+
+    // No numeric-suffix fallback directory (`<basename>-{NAME}-2` or any
+    // similarly auto-renumbered sibling path) may exist on disk — the ONLY
+    // directory this Name may ever resolve to is `expected_path`, still
+    // owned by the still-live first orchestration.
+    let suffixed_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}-2"));
+    assert!(
+        !suffixed_path.exists(),
+        "PRD fork#544 M3/fork#192: a Name collision with a LIVE orchestration must never fall \
+         back to a numeric-suffixed sibling path such as {} — it must refuse outright",
+        suffixed_path.display()
+    );
+
+    // Only ONE role pane must ever have appended to the shared log — the
+    // refused second attempt must never have provisioned or spawned
+    // anything at all.
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    assert_eq!(
+        contents.lines().count(),
+        1,
+        "the refused second attempt must never have spawned a role pane at all — expected \
+         exactly 1 line in {log_path:?}, got: {contents:?}"
+    );
+
+    // The first orchestration's own workspace must be completely
+    // undisturbed by the refused second attempt.
+    assert!(
+        expected_path.is_dir(),
+        "the first (still-live) orchestration's workspace at {} must remain intact",
+        expected_path.display()
+    );
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture, open its one
+/// orchestration under a fixed Name via the real `Action::SpawnPane` ->
+/// `provision_isolated_clone_sync` path (Model A), then close the whole tab
+/// (Ctrl+D -> Ctrl+W -> confirm). PRD fork#544 M6 Design step 6: Model A's
+/// isolated-clone provisioning must call `record_worktree`, the same as
+/// Models B/C already do -- today it never does, so these clones are
+/// invisible to the daemon's `WorktreeRegistry`. The only way that
+/// registration is observable end-to-end (the registry itself exposes no
+/// query surface) is via the tab-close cleanup path it feeds: once an entry
+/// is registered, closing the tab makes `remove_worktree`'s
+/// `RemovalPolicy::IsolatedClone` arm actually run and report `Kept`, which
+/// the daemon broadcasts and the TUI renders as a status-bar notice
+/// ("Worktree kept at ...: it is an isolated clone, not a linked worktree
+/// ..."). Today, Model A's clone is never registered, so `take_worktree`
+/// finds no entry on close, `remove_worktree` never runs, and no notice
+/// ever appears — the directory survives by silent omission (as
+/// `workspace_003` already separately proves), not by an active Kept
+/// decision. This test's RED signature is `wait_for_string` timing out
+/// waiting for that notice.
+#[spec("orchestration/workspace/018")]
+#[test]
+fn workspace_018_model_a_isolated_clone_is_registered_so_tab_close_reports_kept() {
+    const NAME: &str = "workspace018fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    assert!(
+        expected_path.is_dir(),
+        "sanity: the workspace must have been provisioned at the derived path {}",
+        expected_path.display()
+    );
+
+    // --- Close the whole tab. ---
+    deck.send_keys(b"\x04"); // Ctrl+D -> command mode
+    deck.send_keys(b"\x17"); // Ctrl+W -> arm close confirmation
+    deck.wait_for_string("Close this tab and all its panes?");
+    deck.send_keys(b"\x1b[B"); // Down -> select Close
+    deck.send_keys(b"\r"); // Enter -> confirm
+    deck.wait_for_string("No active sessions"); // back to an empty Dashboard
+
+    // PRD fork#544 M6: this notice fires ONLY if the daemon's tab-close
+    // cleanup handler found a registered entry for the workspace — proof
+    // Model A's provisioning called `record_worktree`. The notice's
+    // underlying guarantee (`RemovalPolicy::IsolatedClone` always reporting
+    // `Kept`, regardless of dirtiness) is already pinned directly,
+    // independent of any PTY/daemon, by `orchestration/workspace/019`; this
+    // test is specifically about whether an entry is there to be found on
+    // close at all.
+    deck.wait_for_string("it is an isolated clone, not a linked worktree");
+
+    assert!(
+        expected_path.is_dir(),
+        "the workspace directory at {} must still exist on disk after closing its tab",
+        expected_path.display()
+    );
 }

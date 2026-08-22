@@ -34,7 +34,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use spec::spec;
 
@@ -46,6 +46,9 @@ use spec::spec;
 /// the Command field, so a second Enter submits the form. Lands with the
 /// orchestrator (start) role focused in `PaneInput` mode.
 fn open_orchestration(deck: &TuiDeck) {
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"

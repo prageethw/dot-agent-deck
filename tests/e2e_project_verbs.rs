@@ -165,6 +165,8 @@ fn start_seed_agent(daemon: &DaemonProc, label: &str, cwd: &Path) {
             tab_membership: None,
             agent_type: None,
             seed: None,
+
+            isolated_clone_origin: None,
         })
         .expect("StartAgent over the attach socket");
     assert!(

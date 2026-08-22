@@ -23,7 +23,7 @@ mod common;
 use std::cell::RefCell;
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use dot_agent_deck::daemon_protocol::TabMembership;
 use dot_agent_deck::state::work_done_file_name;
 use spec::spec;
@@ -118,6 +118,9 @@ fn wait_for_pane_string(deck: &TuiDeck, needle: &str, timeout: Duration) -> bool
 /// `[Orch: demo-orch]` chip → Enter → Enter. This is the only path that registers
 /// the daemon-side role maps `handle_work_done` routes on.
 fn open_orchestration(deck: &TuiDeck) {
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.send_keys(b" ");
     deck.wait_for_string("No mode");

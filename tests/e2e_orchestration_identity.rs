@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{TuiDeck, commit_fixture, open_orchestration_with_slug};
+use common::{TuiDeck, commit_fixture};
 use spec::spec;
 
 /// `role` appears somewhere on the settled grid as its own token — bounded
@@ -49,23 +49,23 @@ fn open_orchestration(deck: &TuiDeck) {
 /// Scenario: launch the deck in the `orch-deck` fixture and open its one
 /// orchestration TWICE against the SAME directory picked in the form,
 /// accepting the form's suggested Name both times with a single Enter each,
-/// never typing a character into it. Issue #489 refuses a second BLANK-slug
-/// open that exactly collides with the first orchestration's own live
-/// directory, so the second open types a Worktree slug — unrelated to this
-/// test's own point, which is the tab-naming behavior, not the Worktree
-/// field — to go through the unaffected typed-slug arm instead. Confirm the
-/// tab strip shows two DISTINCT, non-blank labels for the two orchestration
-/// tabs — `<basename>-orchestrator-1` and `<basename>-orchestrator-2` —
-/// never the identical basename-derived title recorded twice, which is the
-/// exact fork #74 collision this PRD exists to stop.
+/// never typing a character into it. PRD fork#544 M2b retires the
+/// blank-slug exact-cwd collision refusal issue #489 introduced (isolation
+/// is unconditional now, so there is no longer a shared-checkout case for a
+/// second blank open to collide with) — the second open no longer needs a
+/// typed Worktree slug (a field M2 also retires outright) to route around
+/// it, so both opens use the identical plain path. Confirm the tab strip
+/// shows two DISTINCT, non-blank labels for the two orchestration tabs —
+/// `<basename>-orchestrator-1` and `<basename>-orchestrator-2` — never the
+/// identical basename-derived title recorded twice, which is the exact
+/// fork #74 collision this PRD exists to stop.
 #[spec("orchestration/identity/013")]
 #[test]
 fn identity_013_two_orchestration_opens_land_as_distinctly_named_tabs() {
     let deck = TuiDeck::launch_with_fixture("orch-deck");
     let work = deck.workdir().to_path_buf();
-    // Issue #489: the second `open_orchestration_with_slug` call below needs
-    // a ref to branch from — `git worktree add`/the isolated-clone arm it
-    // goes through both fail against an unborn HEAD (the harness's own bare
+    // The second open's isolated-clone provisioning needs a ref to branch
+    // from — it fails against an unborn HEAD (the harness's own bare
     // `git init`).
     commit_fixture(&work);
     deck.wait_for_string("No active sessions");
@@ -88,7 +88,7 @@ fn identity_013_two_orchestration_opens_land_as_distinctly_named_tabs() {
     deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
     deck.wait_for_string("session(s)");
 
-    open_orchestration_with_slug(&deck, "identityb");
+    open_orchestration(&deck);
     // fork#192 review F7: waiting on " worker " here was vacuous — the grid
     // already shows it from the FIRST orchestration's panes before the
     // second has even opened (the fixture's second role is literally named
