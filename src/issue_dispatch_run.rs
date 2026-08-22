@@ -6468,6 +6468,40 @@ exit 0
         git(dir, &["commit", "--quiet", "-m", "seed"]);
     }
 
+    /// Run `git <args>` with `dir` as cwd, asserting success — hoisted
+    /// module-level plumbing (mirroring `seed_source_repo`'s own hoisting
+    /// rationale) for the PRD fork#544 M7 post-merge-sync tests below, which
+    /// need to script a real merge landing on a separate "origin" repository
+    /// (clone / fetch-a-branch-into-origin / merge --ff-only), not just seed
+    /// one initial commit.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The capturing twin of [`git`] above — trimmed stdout.
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// Scenario: PRD fork#544 M3. `provision_isolated_clone_sync` is called
     /// against a `clone_dir` that already exists on disk but was never
     /// created by this deck — no M4b provenance artifact exists for it (a
@@ -7247,6 +7281,406 @@ exit 0
             head_before,
             "the workspace's checked-out branch must be untouched by the tab-close removal \
              attempt"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M7 (Design step 7 / Decisions table row "What
+    /// happens to other live workspaces, and to this one, when a merge
+    /// lands?"). The workspace whose OWN branch was just confirmed merged
+    /// has a completely clean tree, and its checked-out branch's HEAD is now
+    /// fully contained in `origin/main` because a real merge landed it there
+    /// (simulated by fetching the feature commit into a real, independent
+    /// "origin" repository and fast-forwarding its own main onto it — the
+    /// same real-git-state discipline `006`-`017` already use). Calling the
+    /// new `sync_merged_workspace_to_main` function must auto-switch: check
+    /// out `main` and fast-forward it to match `origin/main` exactly,
+    /// reporting `SwitchedToMain`. `sync_merged_workspace_to_main` does not
+    /// exist yet, so — mirroring `workspace_014`-`017`'s own precedent (M5
+    /// had no existing production entry point either) — this is a
+    /// compile-time RED (`cannot find function`/`cannot find type`), not a
+    /// runtime one.
+    #[spec("orchestration/workspace/020")]
+    #[test]
+    fn workspace_020_post_merge_switch_to_main_succeeds_on_clean_tree() {
+        let ws = tempfile::tempdir().unwrap();
+
+        // "origin" -- a real, independently-fetchable local repository, not
+        // just a URL string (unlike `provision_isolated_clone_sync_sets_
+        // origin_and_branch_when_source_has_origin`'s fake `.invalid` URL):
+        // this test must genuinely fetch a real advance.
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        // The just-merged workspace: a real clone of origin, checked out on
+        // its own feature branch with one real commit -- the PR's own
+        // content.
+        let clone_dir = ws.path().join("workspace-020");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["checkout", "--quiet", "-b", "feat-020"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-020 work"]);
+        let feature_head = head_sha(&clone_dir);
+
+        // Simulate the merge landing on origin's own main: fetch the
+        // feature branch's commit into `origin_repo` directly (they share
+        // history via the clone) and fast-forward origin's main onto it --
+        // exactly what a real GitHub merge does to `origin/main` from this
+        // workspace's point of view. (A `git push` from the clone straight
+        // into `origin_repo`'s checked-out branch is deliberately avoided --
+        // that fails by default against a non-bare repo's current branch.)
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-020:refs/heads/feat-020",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-020"]);
+        let merged_main_head = head_sha(&origin_repo);
+        assert_eq!(
+            merged_main_head, feature_head,
+            "setup: origin's main must now BE the feature commit (a real fast-forward merge), \
+             not merely contain it"
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        assert!(
+            matches!(result, Ok(PostMergeSyncOutcome::SwitchedToMain)),
+            "PRD fork#544 M7: a clean workspace whose HEAD is now fully contained in the \
+             just-advanced origin/main must auto-switch, got {result:?}"
+        );
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main",
+            "a successful switch must leave the workspace checked out on main, not the old \
+             feature branch"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            merged_main_head,
+            "a successful switch must fast-forward local main to match origin/main exactly"
+        );
+        assert!(
+            clone_dir.join("feature.txt").exists(),
+            "the merged content must be present in the working tree after switching"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M7's Risks section — "the single biggest
+    /// silent-data-loss risk in the whole PRD". The just-merged workspace
+    /// carries a genuine UNCOMMITTED change the merge never captured (the
+    /// tree is dirty). Calling `sync_merged_workspace_to_main` must refuse
+    /// the auto-switch entirely — leave the checked-out branch, its HEAD,
+    /// and the uncommitted edit itself completely untouched — and report
+    /// `LeftUntouched` carrying a non-empty note, never silently discard the
+    /// edit by switching/checking-out over it.
+    #[spec("orchestration/workspace/021")]
+    #[test]
+    fn workspace_021_post_merge_switch_refused_when_uncommitted_change_present() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-021");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["checkout", "--quiet", "-b", "feat-021"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-021 work"]);
+        let feature_head = head_sha(&clone_dir);
+
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-021:refs/heads/feat-021",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-021"]);
+
+        // Genuinely unprotected work: a real uncommitted edit the merge
+        // never saw.
+        std::fs::write(
+            clone_dir.join("feature.txt"),
+            "an uncommitted edit the merge never saw\n",
+        )
+        .unwrap();
+        let branch_before = git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        match &result {
+            Ok(PostMergeSyncOutcome::LeftUntouched { reason }) => {
+                assert!(
+                    !reason.is_empty(),
+                    "a refusal must surface a non-empty note the caller can show the user"
+                );
+            }
+            other => panic!(
+                "PRD fork#544 M7 -- the single biggest silent-data-loss risk in the whole PRD: \
+                 an uncommitted change the merge never captured must refuse the auto-switch and \
+                 surface a note, never silently switch/discard it, got {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before,
+            "a refused switch must leave the checked-out branch completely untouched"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            feature_head,
+            "a refused switch must leave the workspace's committed HEAD completely untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("feature.txt")).unwrap(),
+            "an uncommitted edit the merge never saw\n",
+            "a refused switch must leave the uncommitted edit itself completely untouched -- \
+             this is the exact content the PRD's Risks section calls out as unprotected work"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M7's Risks section, the OTHER half of "carries
+    /// nothing beyond what was merged" — a real LOCAL COMMIT made after the
+    /// content the merge captured (e.g. the orchestration kept working in
+    /// this workspace before the merge phase ran), with the tree otherwise
+    /// fully clean. Isolates this signal from `workspace_021`'s
+    /// uncommitted-change signal: a clean-tree-only check would wrongly
+    /// treat this workspace as safe to switch and silently strand (or
+    /// worse, discard by hard-resetting to origin/main) the extra commit.
+    /// Calling `sync_merged_workspace_to_main` must refuse here too.
+    #[spec("orchestration/workspace/022")]
+    #[test]
+    fn workspace_022_post_merge_switch_refused_when_local_commit_beyond_merge() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-022");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["checkout", "--quiet", "-b", "feat-022"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-022 work"]);
+
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-022:refs/heads/feat-022",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-022"]);
+
+        // A real local commit made AFTER the content the merge captured.
+        // The tree is fully clean (this commit IS committed), so an
+        // uncommitted-changes check alone would wrongly pass this case.
+        std::fs::write(clone_dir.join("extra.txt"), "local work after the merge\n").unwrap();
+        git(&clone_dir, &["add", "extra.txt"]);
+        git(
+            &clone_dir,
+            &["commit", "--quiet", "-m", "local work after the merge"],
+        );
+        let head_with_extra_commit = head_sha(&clone_dir);
+        let branch_before = git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        assert_eq!(
+            git_output(&clone_dir, &["status", "--porcelain"]),
+            "",
+            "setup: the tree must be genuinely clean -- this test isolates the EXTRA-COMMIT \
+             signal from the uncommitted-change signal workspace_021 already covers"
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        match &result {
+            Ok(PostMergeSyncOutcome::LeftUntouched { reason }) => {
+                assert!(
+                    !reason.is_empty(),
+                    "a refusal must surface a non-empty note the caller can show the user"
+                );
+            }
+            other => panic!(
+                "PRD fork#544 M7: a local commit not yet on origin/main -- committed after the \
+                 merge's own content -- must also refuse the auto-switch, even though the tree \
+                 is fully clean; a clean-tree-only check would silently strand or discard this \
+                 commit, got {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before,
+            "a refused switch must leave the checked-out branch completely untouched"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_with_extra_commit,
+            "a refused switch must never discard or strand the extra local commit"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M7's Decisions table row, the "other live
+    /// workspaces" half — on an UNRELATED merge (this workspace's own
+    /// branch did not just merge), only a proactive, read-only `git fetch`
+    /// runs: the `origin/main` remote-tracking ref updates, but the
+    /// checked-out local branch and working tree are completely untouched.
+    /// Simulates a genuine unrelated merge by fast-forwarding `origin`'s own
+    /// main from a second, independent clone, then calls the new
+    /// `fetch_other_live_workspace` function against a THIRD, unrelated
+    /// clone standing in for another live orchestration's own workspace.
+    #[spec("orchestration/workspace/023")]
+    #[test]
+    fn workspace_023_other_live_workspace_gets_read_only_fetch_only() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        // A SEPARATE, unrelated live workspace -- an ordinary clone/checkout
+        // standing in for another orchestration's own workspace that is NOT
+        // the one whose branch just merged.
+        let other_clone = ws.path().join("workspace-023-other");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                other_clone.to_str().unwrap(),
+            ],
+        );
+        git(
+            &other_clone,
+            &["checkout", "--quiet", "-b", "unrelated-feature"],
+        );
+        let branch_before = git_output(&other_clone, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let head_before = head_sha(&other_clone);
+        let origin_tracking_ref_before = git_output(&other_clone, &["rev-parse", "origin/main"]);
+
+        // The UNRELATED merge: origin's own main genuinely advances while
+        // `other_clone` was untouched -- exactly the Decisions table's "on
+        // an unrelated merge" scenario. Landed the same way `020`-`022`
+        // simulate a merge: fetch a third clone's commit into `origin_repo`
+        // directly and fast-forward main onto it (never a `git push` into
+        // origin's own checked-out branch).
+        let other_committer = ws.path().join("other-committer");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                other_committer.to_str().unwrap(),
+            ],
+        );
+        git(
+            &other_committer,
+            &["config", "user.email", "test@example.com"],
+        );
+        git(&other_committer, &["config", "user.name", "Test"]);
+        git(&other_committer, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            other_committer.join("unrelated.txt"),
+            "someone else's merged PR\n",
+        )
+        .unwrap();
+        git(&other_committer, &["add", "unrelated.txt"]);
+        git(
+            &other_committer,
+            &["commit", "--quiet", "-m", "unrelated merge"],
+        );
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                other_committer.to_str().unwrap(),
+                "main:refs/heads/incoming-main",
+            ],
+        );
+        git(
+            &origin_repo,
+            &["merge", "--quiet", "--ff-only", "incoming-main"],
+        );
+        let advanced_origin_main = head_sha(&origin_repo);
+        assert_ne!(
+            advanced_origin_main, origin_tracking_ref_before,
+            "setup: origin's main must have genuinely advanced past what other_clone's stale \
+             origin/main remote-tracking ref still shows"
+        );
+
+        let result = fetch_other_live_workspace(&other_clone);
+
+        assert!(
+            result.is_ok(),
+            "PRD fork#544 M7: a proactive read-only fetch for another live workspace on an \
+             unrelated merge must succeed, got {result:?}"
+        );
+        assert_eq!(
+            git_output(&other_clone, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before,
+            "a proactive fetch must never touch the checked-out local branch"
+        );
+        assert_eq!(
+            head_sha(&other_clone),
+            head_before,
+            "a proactive fetch must never touch the working tree/local HEAD"
+        );
+        assert!(
+            !other_clone.join("unrelated.txt").exists(),
+            "a proactive fetch must never merge/checkout the advanced content into the working \
+             tree"
+        );
+        assert_eq!(
+            git_output(&other_clone, &["rev-parse", "origin/main"]),
+            advanced_origin_main,
+            "the read-only fetch must bring the origin/main remote-tracking ref itself up to \
+             date -- this is the one thing it IS supposed to do"
         );
     }
 
