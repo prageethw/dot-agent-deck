@@ -432,6 +432,16 @@ pub async fn handle_dispatch(
             provision_isolated_clone_sync(&source_dir, &clone_target, &branch, &creator_for_clone)
         })
         .await;
+        // PRD fork#544 M3 fix round: release this process-local resume
+        // registration the moment provisioning returns, on every outcome —
+        // the has-live-sibling daemon query above already durably
+        // established liveness for this path before provisioning even ran,
+        // so the registry's brief defense-in-depth job is done here
+        // regardless of whether provisioning resumed, created, or refused.
+        // See `resumed_isolated_clones`'s doc comment
+        // (`src/issue_dispatch_run.rs`) for why this is correct rather than
+        // a weakening of the race protection.
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&paths.worktree_dir);
         match outcome {
             // Issue #164: a marker-write warning is not surfaced on this ad
             // hoc `dispatch` CLI path, matching the shared-checkout arm's
@@ -459,6 +469,23 @@ pub async fn handle_dispatch(
                         crate::terminal_sanitize::sanitize_path_for_terminal_display(
                             &paths.worktree_dir
                         )
+                    ),
+                };
+            }
+            // PRD fork#544 M3: resuming an existing, eligible isolated clone
+            // is a success just like `Created` above — this ad hoc
+            // `dispatch` CLI path does not surface a warning on `Created`
+            // either (`marker_warning: _` above), so `fetch_warning` is
+            // dropped here for the same reason.
+            Ok(Ok(IsolatedCloneOutcome::Resumed { fetch_warning: _ })) => {}
+            Ok(Ok(IsolatedCloneOutcome::Rejected(reason))) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: cannot use the isolated clone at {} — {}",
+                        paths.worktree_dir.display(),
+                        reason.describe(),
                     ),
                 };
             }

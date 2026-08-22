@@ -78,6 +78,7 @@ use crate::issue_dispatch::{
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnKind, SpawnRequest, spawn};
+use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_terminal_display};
 
 // ---------------------------------------------------------------------------
 // M2.4 — daemon-side worktree registry (close → cleanup plumbing)
@@ -1265,6 +1266,21 @@ pub(crate) enum IsolatedCloneOutcome {
         error: String,
         cleaned_up_by: Option<String>,
     },
+    /// PRD fork#544 M3: `clone_dir` existed, and
+    /// [`resume_existing_isolated_clone`]'s three-part eligibility check
+    /// plus health probe all passed — reattached with a read-only `git
+    /// fetch origin` (never a fast-forward/rebase/merge/checkout of a
+    /// different ref) and otherwise zero git mutation. `fetch_warning` is
+    /// `Some` only when that best-effort fetch itself failed (e.g. no
+    /// `origin` configured); it never fails resumption itself.
+    Resumed {
+        fetch_warning: Option<String>,
+    },
+    /// PRD fork#544 M3: `clone_dir` existed but failed
+    /// [`resume_existing_isolated_clone`]'s eligibility check — see
+    /// [`ResumeRejection`] for which of the four distinguishable reasons.
+    /// Never auto-deletes or auto-repairs the directory; refuses only.
+    Rejected(ResumeRejection),
 }
 
 /// PRD fork#325 M3 sync twin, structurally mirroring [`provision_repo`]'s
@@ -1416,7 +1432,13 @@ pub(crate) fn provision_isolated_clone_sync(
             })?;
 
     if clone_dir.exists() {
-        return Ok(IsolatedCloneOutcome::AlreadyClaimed);
+        // PRD fork#544 M3: a present directory is no longer an unconditional
+        // refusal — `resume_existing_isolated_clone` runs the three-part
+        // eligibility check plus health probe and either resumes it or
+        // reports a distinguishable rejection reason. This REPLACES the
+        // flat `AlreadyClaimed` this branch used to return; it does not run
+        // alongside it.
+        return resume_existing_isolated_clone(source_dir, clone_dir, creator);
     }
 
     // Issue #325 auditor A2: `--` end-of-options separator before both
@@ -1468,7 +1490,7 @@ pub(crate) fn provision_isolated_clone_sync(
     // failure here does not fail the whole provisioning call, since the
     // clone itself is already fully usable — it only means this clone will
     // never report `owned: true` from `worktree list`.
-    if let Err(e) = write_isolated_clone_provenance(clone_dir) {
+    if let Err(e) = write_isolated_clone_provenance(source_dir, clone_dir, branch) {
         tracing::warn!(
             clone = %clone_dir.display(),
             error = %e,
@@ -1617,6 +1639,39 @@ pub(crate) fn provision_isolated_clone_sync(
         // comment above for why this is deferred rather than run
         // immediately after the clone).
         origin_warning = remove_isolated_clone_origin_default(clone_dir);
+    } else {
+        // PRD fork#544 M2 Decisions table: a plain local `git clone` only
+        // ever contains whatever `source_dir`'s own refs happened to hold
+        // at clone time — it is not, on its own, guaranteed fresh against
+        // the real `origin/main`. Now that `origin` is pointed at the
+        // source's real URL (the `if` branch above only fires when there
+        // was none to point at), fetch it once, updating only this NEW
+        // clone's own `origin/*` remote-tracking refs — the source/root
+        // checkout is never touched. Best-effort and read-only: a failure
+        // here (offline, auth) does not fail provisioning, since the clone
+        // is already fully usable from its local-clone snapshot; it only
+        // means this workspace starts from whatever `main` looked like at
+        // clone time instead of the true HEAD.
+        if let Err(err) = run_status_sync(
+            "git",
+            &[
+                "-C".to_string(),
+                clone_dir.to_string_lossy().into_owned(),
+                "fetch".to_string(),
+                "origin".to_string(),
+            ],
+            WORKTREE_GIT_TIMEOUT,
+        ) {
+            let e = match err {
+                AddError::TimedOut(e) | AddError::Failed(e) => e,
+            };
+            tracing::warn!(
+                clone = %clone_dir.display(),
+                error = %e,
+                "issue-dispatch: could not fetch origin for freshness after isolated clone; \
+                 workspace starts from the clone-time snapshot instead of the true HEAD"
+            );
+        }
     }
 
     let marker_warning = mark_worktree_owned_best_effort(clone_dir, creator);
@@ -2659,6 +2714,18 @@ pub(crate) fn isolated_clone_provenance_path(clone_dir: &Path) -> PathBuf {
 /// succeeded, so this genuinely vouches for a clone this call itself just
 /// created.
 ///
+/// PRD fork#544 M4: the artifact is no longer the content-free `b"deck\n"`
+/// bytes — it now carries plain `key=value` lines: a `schema=` tag for a
+/// future consumer to branch on, a `root-hash=` of `source_dir`'s own
+/// canonical path (hashed with the same [`crate::platform::lock::fnv1a64`]
+/// keying scheme [`isolated_clone_provenance_path`] already uses for the
+/// clone path, rather than inventing a second hash), the orchestration
+/// `name` typed for this workspace, and the clone's own canonical `path`.
+/// This is additive evidence for future tooling, not a new requirement:
+/// [`resume_existing_isolated_clone`]'s eligibility check (b) below still
+/// only tests file presence, so a pre-M4 `b"deck\n"` artifact keeps
+/// resuming exactly as before (`orchestration/workspace/012`).
+///
 /// Atomic write-then-rename, mirroring [`mark_worktree_owned`]'s own
 /// pattern in `worktree_reclaim.rs` for the identical reason: on ENOSPC or
 /// a process kill mid-write, a plain `std::fs::write` could leave a
@@ -2678,7 +2745,11 @@ pub(crate) fn isolated_clone_provenance_path(clone_dir: &Path) -> PathBuf {
 /// every mechanism here shares with [`crate::worktree_reclaim::owned_git_dir`]).
 ///
 /// [`mark_worktree_owned`]: crate::worktree_reclaim::mark_worktree_owned
-fn write_isolated_clone_provenance(clone_dir: &Path) -> Result<(), String> {
+fn write_isolated_clone_provenance(
+    source_dir: &Path,
+    clone_dir: &Path,
+    name: &str,
+) -> Result<(), String> {
     let marker_path = isolated_clone_provenance_path(clone_dir);
     let parent = marker_path.parent().expect(
         "isolated_clone_provenance_path always nests under state_dir(), which has a parent",
@@ -2695,7 +2766,18 @@ fn write_isolated_clone_provenance(clone_dir: &Path) -> Result<(), String> {
         .unwrap_or("provenance");
     let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
 
-    std::fs::write(&tmp_path, b"deck\n").map_err(|e| {
+    let root_hash = crate::platform::lock::fnv1a64(
+        canonicalize_best_effort(source_dir)
+            .to_string_lossy()
+            .as_bytes(),
+    );
+    let canonical_clone_dir = canonicalize_best_effort(clone_dir);
+    let content = format!(
+        "schema=2\nroot-hash={root_hash:016x}\nname={name}\npath={}\n",
+        canonical_clone_dir.display()
+    );
+
+    std::fs::write(&tmp_path, content.as_bytes()).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
         format!("failed to write isolated-clone provenance artifact: {e}")
     })?;
@@ -2703,6 +2785,533 @@ fn write_isolated_clone_provenance(clone_dir: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp_path);
         format!("failed to finalize isolated-clone provenance artifact: {e}")
     })
+}
+
+/// PRD fork#544 M5: the only deliberate way a named workspace is ever
+/// cleared — modeled on this codebase's existing `issue claim --takeover
+/// --confirm-stopped` pattern (refuse by default, require an explicit
+/// confirming flag) rather than on
+/// [`crate::worktree_reclaim::remove_isolated_clone_dir`]. That function's
+/// checks (branch re-resolution, a clean tree, an empty stash list, and —
+/// the one that actually rules it out — the clone's HEAD matching a
+/// **merged PR's** `headRefOid`) all encode "this was already reclaimed
+/// after its PR merged"; a persistent workspace being explicitly forgotten
+/// has no such PR, may be mid-work, and may carry uncommitted changes the
+/// caller has every right to discard on purpose. Requiring those
+/// preconditions here would make `forget` refuse in exactly the cases a
+/// caller asked it to handle. It is also private (`fn`, not `pub(crate)`)
+/// to `worktree_reclaim.rs`. So this reimplements only the directory
+/// removal, not the reclaim-specific revalidation.
+///
+/// Ownership is proven the same way [`resume_existing_isolated_clone`]
+/// already proves it for resume: presence of the M4b provenance artifact
+/// at [`isolated_clone_provenance_path`]. A confirming flag alone only
+/// proves the caller wants to remove *a* workspace of its own — not that
+/// `clone_dir` *is* one, which is exactly the stranger-directory hazard
+/// `ResumeRejection::Stranger` already guards against on the resume side.
+///
+/// `#[allow(dead_code)]`: PRD fork#544 M5 deliberately ships no CLI wiring
+/// yet (that is a later milestone) — this function is exercised directly
+/// by `orchestration/workspace/014`-`017` and nothing else calls it today,
+/// the same honest state [`create_worktree_sync`]'s own `#[allow(dead_code)]`
+/// documents rather than papering over with a synthetic caller.
+#[allow(dead_code)]
+pub(crate) fn forget_isolated_workspace(
+    clone_dir: &Path,
+    confirmed: bool,
+    remover: &str,
+) -> Result<(), String> {
+    if !confirmed {
+        return Err(
+            "refusing to forget: pass an explicit confirming flag to acknowledge that this \
+             permanently removes the workspace directory and its provenance record -- nothing \
+             was touched"
+                .to_string(),
+        );
+    }
+
+    let marker_path = isolated_clone_provenance_path(clone_dir);
+    if !marker_path.is_file() {
+        return Err(format!(
+            "refusing to forget {}: no M4b ownership evidence found for this workspace \
+             (expected a provenance artifact at {}) -- it may never have been created by this \
+             deck, or may already have been forgotten",
+            clone_dir.display(),
+            marker_path.display()
+        ));
+    }
+
+    // Tolerate the directory already being gone (fork#325/M4b's own
+    // `remove_isolated_clone_dir` precedent): the provenance artifact is
+    // the durable ownership record, so a caller retrying a forget whose
+    // directory removal previously succeeded but whose artifact removal
+    // then failed must still be able to finish the job.
+    if let Err(e) = std::fs::remove_dir_all(clone_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!(
+            "failed to remove workspace directory {} (requested by {remover}): {e}",
+            clone_dir.display()
+        ));
+    }
+    std::fs::remove_file(&marker_path).map_err(|e| {
+        format!(
+            "failed to remove provenance artifact {} (requested by {remover}): {e}",
+            marker_path.display()
+        )
+    })?;
+
+    // Issue #325 / reviewer B1 / auditor F2 precedent, carried to this
+    // removal path too: the ONLY durable trace of a confirmed removal.
+    // `remover` is an unauthenticated, caller-supplied string, sanitized
+    // here exactly as `remove_isolated_clone_dir` sanitizes its own.
+    tracing::info!(
+        path = %sanitize_path_for_terminal_display(clone_dir),
+        remover = %sanitize_for_terminal_display(remover),
+        "isolated workspace forgotten"
+    );
+    Ok(())
+}
+
+/// Read-only `git fetch origin` in `clone_dir` — updates only the
+/// `origin/*` remote-tracking refs, never the checked-out local branch or
+/// working tree. Shared by [`sync_merged_workspace_to_main`] (which needs an
+/// up-to-date `origin/<default_branch>` before it can check ancestry) and
+/// [`fetch_other_live_workspace`] (for which this fetch IS the entire
+/// operation).
+fn fetch_origin(clone_dir: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["fetch", "--quiet", "origin"])
+        .output()
+        .map_err(|e| format!("failed to fetch origin in {}: {e}", clone_dir.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git fetch origin failed in {}: {}",
+            clone_dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// PRD fork#544 M7 (Design step 7 / Decisions table row "What happens to
+/// other live workspaces, and to this one, when a merge lands?"). Outcome of
+/// [`sync_merged_workspace_to_main`] — its own `Debug` output is what
+/// `orchestration/workspace/020`-`022` match against.
+///
+/// `#[allow(dead_code)]`: the `reason` field is only ever constructed by
+/// [`sync_merged_workspace_to_main`], which carries its own
+/// `#[allow(dead_code)]` for the same "no caller yet" reason — without this,
+/// dead-code analysis treats the field as unread because nothing reachable
+/// from the crate root ever constructs it outside tests.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum PostMergeSyncOutcome {
+    /// Both preconditions held: local `<default_branch>` now sits exactly
+    /// at `origin/<default_branch>`'s SHA, and the workspace is checked out
+    /// on it.
+    SwitchedToMain,
+    /// At least one precondition failed — nothing was touched (no checkout,
+    /// no merge, no mutation of any kind). `reason` names which one, for a
+    /// caller to show the user.
+    LeftUntouched { reason: String },
+}
+
+/// PRD fork#544 M7: auto-switch a just-merged workspace onto
+/// `default_branch` — but only when it is safe to do so without discarding
+/// or stranding anything the merge itself did not capture. Two independent
+/// preconditions, both checked (per the Risks section: a tree-cleanliness-
+/// only check would wrongly pass `orchestration/workspace/022`'s extra-
+/// local-commit case, and an ancestry-only check would wrongly pass
+/// `021`'s uncommitted-edit case):
+///
+/// 1. No uncommitted changes (`git status --porcelain` is empty — this one
+///    check already covers staged, unstaged, and untracked files).
+/// 2. No local commits beyond the merge: after fetching `origin`, `HEAD` is
+///    fully contained in `origin/<default_branch>`'s history
+///    (`git merge-base --is-ancestor HEAD origin/<default_branch>`).
+///
+/// If both hold, checks out `default_branch` — git's DWIM creates a local
+/// tracking branch from `origin/<default_branch>` when none exists yet, the
+/// same mechanism `provision_isolated_clone_sync_attaches_branch_that_
+/// exists_only_as_remote_tracking_ref` already relies on elsewhere in this
+/// module — and then fast-forwards it with `git merge --ff-only
+/// origin/<default_branch>`. `--ff-only`, deliberately never `reset --hard`:
+/// an incorrect ancestry check then fails loudly instead of silently
+/// discarding anything, and the explicit merge step is what actually lands
+/// local `default_branch` exactly on `origin/<default_branch>`'s SHA in the
+/// (typical) case where a local branch of that name already exists from the
+/// clone's own initial checkout, stale, rather than only being created fresh
+/// by the DWIM.
+///
+/// `#[allow(dead_code)]`: PRD fork#544 M7 ships no CLI/caller wiring yet,
+/// the same honest state [`forget_isolated_workspace`]'s own
+/// `#[allow(dead_code)]` documents — this function is exercised directly by
+/// `orchestration/workspace/020`-`022` and nothing else calls it today.
+#[allow(dead_code)]
+pub(crate) fn sync_merged_workspace_to_main(
+    clone_dir: &Path,
+    default_branch: &str,
+) -> Result<PostMergeSyncOutcome, String> {
+    let status_out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to check {} for uncommitted changes: {e}",
+                clone_dir.display()
+            )
+        })?;
+    if !status_out.status.success() {
+        return Err(format!(
+            "git status --porcelain failed in {}: {}",
+            clone_dir.display(),
+            String::from_utf8_lossy(&status_out.stderr).trim()
+        ));
+    }
+    if !status_out.stdout.is_empty() {
+        return Ok(PostMergeSyncOutcome::LeftUntouched {
+            reason: "the workspace has uncommitted changes -- refusing to switch and \
+                     potentially discard unprotected work"
+                .to_string(),
+        });
+    }
+
+    fetch_origin(clone_dir)?;
+
+    let remote_ref = format!("origin/{default_branch}");
+    let ancestor_out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["merge-base", "--is-ancestor", "HEAD", &remote_ref])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to check whether HEAD is an ancestor of {remote_ref} in {}: {e}",
+                clone_dir.display()
+            )
+        })?;
+    if !ancestor_out.status.success() {
+        return Ok(PostMergeSyncOutcome::LeftUntouched {
+            reason: format!(
+                "the workspace's HEAD is not fully contained in {remote_ref} -- it carries a \
+                 local commit the merge never captured, refusing to switch and potentially \
+                 strand or discard it"
+            ),
+        });
+    }
+
+    let checkout_out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["checkout", "--quiet", default_branch])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to check out {default_branch} in {}: {e}",
+                clone_dir.display()
+            )
+        })?;
+    if !checkout_out.status.success() {
+        return Err(format!(
+            "git checkout {default_branch} failed in {}: {}",
+            clone_dir.display(),
+            String::from_utf8_lossy(&checkout_out.stderr).trim()
+        ));
+    }
+
+    let merge_out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["merge", "--quiet", "--ff-only", "--", &remote_ref])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to fast-forward {default_branch} to {remote_ref} in {}: {e}",
+                clone_dir.display()
+            )
+        })?;
+    if !merge_out.status.success() {
+        return Err(format!(
+            "git merge --ff-only {remote_ref} failed in {}: {}",
+            clone_dir.display(),
+            String::from_utf8_lossy(&merge_out.stderr).trim()
+        ));
+    }
+
+    Ok(PostMergeSyncOutcome::SwitchedToMain)
+}
+
+/// PRD fork#544 M7 (Decisions table row, "other live workspaces" half): on
+/// an UNRELATED merge (this workspace's own branch did not just merge),
+/// only a proactive, read-only fetch runs — see [`fetch_origin`] for what
+/// that does and does not touch.
+///
+/// `#[allow(dead_code)]`: same honest state as
+/// [`sync_merged_workspace_to_main`] above — exercised directly by
+/// `orchestration/workspace/023` and nothing else calls it today.
+#[allow(dead_code)]
+pub(crate) fn fetch_other_live_workspace(clone_dir: &Path) -> Result<(), String> {
+    fetch_origin(clone_dir)
+}
+
+/// PRD fork#544 M3: distinguishable refusal reasons for
+/// [`resume_existing_isolated_clone`] — this enum's own `Debug` output is
+/// the interface `orchestration/workspace/006`-`008` assert substrings
+/// against (`"stranger"`, `"ancestry"`, `"unhealthy"`), so the variant
+/// names are chosen to read naturally in that form rather than for any
+/// other convention.
+#[derive(Debug)]
+pub(crate) enum ResumeRejection {
+    /// No M4b ownership evidence for this canonical path at all — a
+    /// directory this deck never created (or wrote evidence for) at this
+    /// exact location.
+    Stranger,
+    /// M4b evidence is present, but `clone_dir`'s origin/shared history
+    /// does not match `source_dir` — the same Name typed against a
+    /// different underlying project (Problem Statement #4).
+    AncestryMismatch,
+    /// The directory's git state could not be read (`git rev-parse HEAD`
+    /// failed) — refused only, never auto-deleted or auto-repaired.
+    Unhealthy,
+    /// Evidence, ancestry and health all passed, but another call already
+    /// resumed this exact canonical path first, inside the very attach-lock
+    /// window this call also went through — the loser of the race the
+    /// PRD's own Design step 3 names.
+    Contested,
+}
+
+impl ResumeRejection {
+    /// A single, shared human-readable description of the refusal — reused
+    /// by both real callers of [`IsolatedCloneOutcome::Rejected`]
+    /// (`src/ui.rs`'s `Action::SpawnPane` dispatch and `src/dispatch.rs`'s
+    /// ad hoc `dispatch <name>` CLI path) so the wording can't drift
+    /// between them.
+    pub(crate) fn describe(&self) -> &'static str {
+        match self {
+            Self::Stranger => {
+                "a directory already exists there but was not created by this deck (no \
+                 ownership evidence found) — remove it manually, or pick a different Name"
+            }
+            Self::AncestryMismatch => {
+                "the existing directory's history does not match this project (wrong repo, or \
+                 stale) — remove it manually, or pick a different Name"
+            }
+            Self::Unhealthy => {
+                "the existing directory's git state could not be read (it may be corrupt or \
+                 mid-delete) — it was left untouched; repair or remove it manually"
+            }
+            Self::Contested => "another request just resumed it first — try again",
+        }
+    }
+}
+
+/// PRD fork#544 M3: process-local record of which isolated-clone canonical
+/// paths have already been resumed once. Deliberately IN-PROCESS rather
+/// than a persistent on-disk artifact next to the M4b evidence file it sits
+/// beside in this source file: both real callers today
+/// (`Action::SpawnPane`'s dispatch in `src/ui.rs`, arbitrated by fork#192's
+/// `ClaimOrchestrationName` daemon registry; `src/dispatch.rs`'s ad hoc
+/// `dispatch <name>` CLI path, arbitrated by its own has-live-sibling
+/// daemon query) already run their OWN liveness check/claim before
+/// [`provision_isolated_clone_sync`] is ever reached, so a genuine
+/// same-Name concurrent resume never reaches this function in production —
+/// this registry exists as THIS function's own defense-in-depth for the
+/// brief window between that check and this in-process registration (a
+/// window a direct test such as `orchestration/workspace/009` can exercise
+/// with no daemon involved at all), and it resets for free on every process
+/// restart.
+///
+/// PRD fork#544 M3 fix round: an entry now gets released by
+/// [`release_resumed_isolated_clone_registration`], called by both real
+/// callers immediately after `provision_isolated_clone_sync` returns —
+/// NOT tied to tab close. That is deliberately early rather than late: by
+/// the time either caller reaches this function at all, its own liveness
+/// check/claim has already durably established that this orchestration is
+/// the sole live user of the path, so this registry's job is done the
+/// moment provisioning returns to it. Previously nothing released an entry
+/// at all, so within one process a given canonical path could only ever
+/// win this registration once — a THIRD open of the same Name in the same
+/// still-running process (open, close, reopen [1st resume, works], close,
+/// reopen again [2nd resume]) incorrectly saw
+/// [`ResumeRejection::Contested`] on that second reopen; see
+/// `orchestration/workspace/009`'s extension for the regression test.
+fn resumed_isolated_clones() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// PRD fork#544 M3 fix round: releases `clone_dir`'s entry (if any) from
+/// [`resumed_isolated_clones`]. Called by both real `provision_isolated_clone_sync`
+/// callers (`src/ui.rs`, `src/dispatch.rs`) immediately after provisioning
+/// returns, on every outcome — `Resumed`, `Created`, a `Rejected` refusal,
+/// or an `Err` — so a caller need not match on the outcome to know whether
+/// to call it: idempotent (a no-op `HashSet::remove` when no entry was ever
+/// inserted, which is every outcome except `Resumed`). Deliberately NOT
+/// hooked to tab close or any other teardown path — see
+/// [`resumed_isolated_clones`]'s doc comment for why releasing this early
+/// is correct rather than a weakening of the race protection.
+pub(crate) fn release_resumed_isolated_clone_registration(clone_dir: &Path) {
+    let canonical = canonicalize_best_effort(clone_dir);
+    resumed_isolated_clones()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&canonical);
+}
+
+/// PRD fork#544 M3: `provision_isolated_clone_sync`'s resume arm, called in
+/// place of the flat `AlreadyClaimed` return the directory-exists branch
+/// used to give unconditionally — from INSIDE the same
+/// `worktree_attach_lock_path` attach lock that call already holds for its
+/// whole duration, so this whole check-then-register sequence is itself
+/// serialized against any other racing call for the identical `clone_dir`
+/// (PRD's own Design step 3; see `orchestration/workspace/009`).
+///
+/// Three-part eligibility, checked in an order that keeps a corrupt
+/// directory from being misdiagnosed as an ancestry mismatch: (b) M4b
+/// ownership evidence for this canonical path; a health probe (`git
+/// rev-parse HEAD`) BEFORE the ancestry probe below, since a directory with
+/// no `.git` at all would otherwise fail the ancestry probe's own git
+/// invocations for the wrong reason; then (c) ancestry — does `clone_dir`'s
+/// history genuinely derive from `source_dir`, via
+/// [`isolated_clone_ancestry_matches_source`]. Check (a), name-liveness,
+/// already ran ahead of this call entirely — see [`IsolatedCloneOutcome`]'s
+/// own doc comment; this function never duplicates it.
+///
+/// A full pass registers this exact canonical path in
+/// [`resumed_isolated_clones`] — the FIRST caller to do so (inside the
+/// attach lock, so no two callers can race the registration itself) wins
+/// and resumes; a caller that finds the path already registered lost the
+/// race and is refused as [`ResumeRejection::Contested`] without touching
+/// git again.
+fn resume_existing_isolated_clone(
+    source_dir: &Path,
+    clone_dir: &Path,
+    creator: &str,
+) -> Result<IsolatedCloneOutcome, String> {
+    if !isolated_clone_provenance_path(clone_dir).is_file() {
+        return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Stranger));
+    }
+    if !isolated_clone_git_state_readable(clone_dir) {
+        return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Unhealthy));
+    }
+    if !isolated_clone_ancestry_matches_source(source_dir, clone_dir) {
+        return Ok(IsolatedCloneOutcome::Rejected(
+            ResumeRejection::AncestryMismatch,
+        ));
+    }
+
+    let canonical = canonicalize_best_effort(clone_dir);
+    let first_to_claim = resumed_isolated_clones()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(canonical);
+    if !first_to_claim {
+        return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Contested));
+    }
+
+    tracing::info!(
+        clone = %clone_dir.display(),
+        creator = %creator,
+        "issue-dispatch: resuming existing isolated clone"
+    );
+
+    // PRD fork#544 M3 Decisions table: read-only fetch only — updates
+    // `origin/<default-branch>`'s remote-tracking ref, touches no local
+    // branch and no working tree. Best-effort: a source with no `origin`
+    // configured (the `orch-clone-gate` fixture's own shape) leaves this
+    // clone with no `origin` remote at all after creation (see
+    // `remove_isolated_clone_origin_default`) — `git fetch origin` then
+    // fails loudly with "No such remote", which is fine here, not a
+    // provisioning failure.
+    let fetch_warning = match run_status_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir.to_string_lossy().into_owned(),
+            "fetch".to_string(),
+            "origin".to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    ) {
+        Ok(()) => None,
+        Err(err) => {
+            let e = match err {
+                AddError::TimedOut(e) | AddError::Failed(e) => e,
+            };
+            tracing::warn!(
+                clone = %clone_dir.display(),
+                error = %e,
+                "issue-dispatch: could not fetch origin on resume; ahead/behind info may be stale"
+            );
+            Some(e)
+        }
+    };
+
+    Ok(IsolatedCloneOutcome::Resumed { fetch_warning })
+}
+
+/// PRD fork#544 M3 check (c): does `clone_dir`'s history genuinely derive
+/// from `source_dir`, rather than an unrelated repository that merely
+/// landed on the same canonical path? Two signals, both must hold when
+/// applicable:
+///
+/// - **Origin URL**, when BOTH sides have one configured — reusing
+///   [`read_source_origin_url`] rather than inventing a second way to read
+///   it. Deliberately not required when either side has none: a plain
+///   local `git clone` of a no-origin source ends this call's own `origin`
+///   fixup with NO `origin` remote at all (see
+///   [`remove_isolated_clone_origin_default`]), so "both absent" is the
+///   expected shape for that case, not evidence of anything.
+/// - **Shared history**, via `git merge-base --is-ancestor <source HEAD>
+///   HEAD` run inside `clone_dir` — a plain local `git clone` hardlinks
+///   `source_dir`'s object store, so `source_dir`'s HEAD at clone time is
+///   always a real object inside `clone_dir`'s own database; an unrelated
+///   repository's HEAD never is. This is the decisive signal for the
+///   `orchestration/workspace/007` fixture specifically, where neither
+///   repository has an `origin` configured at all, so the URL signal above
+///   can't distinguish them.
+fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -> bool {
+    if let (Some(source_url), Some(clone_url)) = (
+        read_source_origin_url(source_dir),
+        read_source_origin_url(clone_dir),
+    ) && source_url != clone_url
+    {
+        return false;
+    }
+
+    let Some(source_head) = isolated_clone_head_sha(source_dir) else {
+        return false;
+    };
+    std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["merge-base", "--is-ancestor", &source_head, "HEAD"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// `git rev-parse HEAD` in `dir`, `None` on any spawn/exit failure — shared
+/// by [`isolated_clone_ancestry_matches_source`] and
+/// [`isolated_clone_git_state_readable`].
+fn isolated_clone_head_sha(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// PRD fork#544 M3 health probe: is `clone_dir`'s git state usable at all?
+/// `git rev-parse HEAD` failing (no `.git`, corrupt, mid-delete) is refused
+/// distinguishably as [`ResumeRejection::Unhealthy`] — the directory is
+/// never auto-deleted or auto-repaired on this path, only refused.
+fn isolated_clone_git_state_readable(clone_dir: &Path) -> bool {
+    isolated_clone_head_sha(clone_dir).is_some()
 }
 
 /// Issue #164: surface a [`WorktreeCreation::Created`] marker-write warning
@@ -3113,6 +3722,17 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 /// prevent, ahead of the bounded calls it protects. On expiry the acquisition
 /// refuses with an error rather than proceeding unlocked — this function
 /// never reaches `git worktree add` without holding the lock.
+///
+/// PRD fork#544 M2b: Model A's own call site (the TUI's `Action::SpawnPane`,
+/// `src/ui.rs`) is retired — isolation is now unconditional, so the shared-
+/// checkout `git worktree add` sibling this function provisions is no
+/// longer reachable from the interactive spawn path at all. Kept rather
+/// than deleted (a deliberate scope decision, not an oversight) since it
+/// remains exercised directly by this module's and `worktree_reclaim.rs`'s
+/// own tests, and nothing about the mechanism itself is wrong — only its
+/// one caller went away. `#[allow(dead_code)]` reflects that production-code
+/// state honestly rather than papering over it with a synthetic caller.
+#[allow(dead_code)]
 pub(crate) fn create_worktree_sync(
     clone_dir: &Path,
     worktree_dir: &Path,
@@ -5889,9 +6509,19 @@ exit 0
     /// `provision_isolated_clone_sync` for the SAME `source_dir`/`clone_dir`
     /// pair concurrently — the new attach lock (auditor A3) exists
     /// specifically to serialize this. Asserts exactly one thread reports
-    /// `Created` and the other reports `AlreadyClaimed`, across many
-    /// trials, mirroring `worktree/create/001`'s own reasoning for why a
-    /// single trial proves nothing.
+    /// `Created` and the other reports a second, distinguishable success,
+    /// across many trials, mirroring `worktree/create/001`'s own reasoning
+    /// for why a single trial proves nothing.
+    ///
+    /// PRD fork#544 M3: the loser used to report `AlreadyClaimed`
+    /// (round 2's original assertion) — that outcome no longer exists for
+    /// this scenario. Once the winner's `git clone` makes `clone_dir`
+    /// genuinely present, it is ALSO fully resume-eligible (real M4b
+    /// evidence, matching ancestry, healthy), so the loser now correctly
+    /// resumes it instead of being refused — this is M3's whole point, not
+    /// a regression: see `orchestration/workspace/009` for the same
+    /// winner/loser shape applied to a pre-existing (rather than
+    /// just-created) directory.
     ///
     /// `#[cfg(unix)]` matches `worktree/create/001`'s own precedent — many
     /// trials of real `git` subprocesses (here, full clones, heavier than
@@ -5957,19 +6587,1756 @@ exit 0
                 .iter()
                 .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::Created { .. })))
                 .count();
-            let claimed_count = pair
+            let resumed_count = pair
                 .iter()
-                .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::AlreadyClaimed)))
+                .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::Resumed { .. })))
                 .count();
             assert_eq!(
                 created_count, 1,
                 "trial {i}: exactly one caller must report Created, got {pair:?}"
             );
             assert_eq!(
-                claimed_count, 1,
-                "trial {i}: exactly one caller must report AlreadyClaimed, got {pair:?}"
+                resumed_count, 1,
+                "trial {i}: PRD fork#544 M3 — the loser must now resume the winner's freshly \
+                 created (and therefore fully resume-eligible) clone rather than being refused, \
+                 got {pair:?}"
             );
         }
+    }
+
+    /// Read `dir`'s HEAD commit SHA via `git rev-parse HEAD` — shared by the
+    /// PRD fork#544 M3 resume-eligibility tests below, mirroring the
+    /// identically-named helper in `tests/e2e_orchestration_worktree.rs`.
+    fn head_sha(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse HEAD must spawn");
+        assert!(
+            out.status.success(),
+            "git rev-parse HEAD failed in {dir:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `git init` + inline-identity-configure + one commit, shared setup for
+    /// the PRD fork#544 M3 resume-eligibility tests below — the same
+    /// sequence `provision_isolated_clone_sync_sets_origin_and_branch_when_source_has_origin`
+    /// and its siblings above already inline per-test; hoisted here since
+    /// four more tests need the identical seed.
+    fn seed_source_repo(dir: &Path, seed_content: &str) {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("README.md"), seed_content).unwrap();
+        git(dir, &["add", "README.md"]);
+        git(dir, &["commit", "--quiet", "-m", "seed"]);
+    }
+
+    /// Run `git <args>` with `dir` as cwd, asserting success — hoisted
+    /// module-level plumbing (mirroring `seed_source_repo`'s own hoisting
+    /// rationale) for the PRD fork#544 M7 post-merge-sync tests below, which
+    /// need to script a real merge landing on a separate "origin" repository
+    /// (clone / fetch-a-branch-into-origin / merge --ff-only), not just seed
+    /// one initial commit.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The capturing twin of [`git`] above — trimmed stdout.
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Scenario: PRD fork#544 M3. `provision_isolated_clone_sync` is called
+    /// against a `clone_dir` that already exists on disk but was never
+    /// created by this deck — no M4b provenance artifact exists for it (a
+    /// directory a human happened to create at the same derived path, with
+    /// its own unrelated git history). Asserts the outcome refuses to
+    /// silently attach and, once PRD fork#544 M3's eligibility check exists,
+    /// names the refusal distinguishably as a stranger directory rather than
+    /// folding it into the generic `AlreadyClaimed` outcome every
+    /// present-directory case reports pre-M3. `DOT_AGENT_DECK_STATE_DIR` is
+    /// pinned so the M4b evidence lookup this test's assertion depends on
+    /// resolves deterministically regardless of what else runs in this
+    /// process.
+    #[spec("orchestration/workspace/006")]
+    #[test]
+    fn workspace_006_stranger_directory_refused_with_no_evidence() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-my-feature");
+        // A stranger directory: present on disk with its own unrelated git
+        // history, but never created by `provision_isolated_clone_sync` —
+        // no M4b provenance artifact was ever written for this canonical
+        // path.
+        seed_source_repo(&clone_dir, "not the deck's\n");
+        let stranger_head_before = head_sha(&clone_dir);
+
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        let debug = format!("{result:?}");
+
+        assert!(
+            !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "a stranger directory with no ownership evidence must never be silently (re)created \
+             over, got {debug}"
+        );
+        assert!(
+            debug.to_lowercase().contains("stranger"),
+            "PRD fork#544 M3: a directory with NO matching M4b ownership evidence must be \
+             refused with a distinguishable 'stranger directory' reason (per the PRD's own \
+             compatibility table) — pre-M3 code reports the generic AlreadyClaimed outcome for \
+             every present-directory case with no such distinction, got {debug}"
+        );
+
+        assert_eq!(
+            head_sha(&clone_dir),
+            stranger_head_before,
+            "a refused stranger directory's git state must be completely untouched"
+        );
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "a refused stranger directory's working tree must be completely untouched"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M3. A `clone_dir` that DOES carry genuine M4b
+    /// ownership evidence — because it was actually created by a real prior
+    /// `provision_isolated_clone_sync` call — is reopened against a SECOND,
+    /// entirely unrelated source repository at the same derived path (the
+    /// same Name typed against a different underlying project — Problem
+    /// Statement #4's exact hazard: content-free evidence alone can't prove
+    /// WHICH repository a directory belongs to). Asserts the mismatched
+    /// ancestry refuses the resume distinguishably, never silently
+    /// attaching the new source's session onto foreign history.
+    #[spec("orchestration/workspace/007")]
+    #[test]
+    fn workspace_007_ancestry_mismatch_refused_as_wrong_repo() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source_a = ws.path().join("source-a");
+        seed_source_repo(&source_a, "seed-a\n");
+
+        let clone_dir = ws.path().join("workspace-my-feature");
+        let created = provision_isolated_clone_sync(&source_a, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone from source A must succeed, got {created:?}"
+        );
+        let clone_head_before = head_sha(&clone_dir);
+
+        // A SECOND, entirely unrelated source repository — no shared
+        // history, no shared origin — happening to want the SAME clone_dir.
+        let source_b = ws.path().join("source-b");
+        seed_source_repo(&source_b, "seed-b-unrelated-history\n");
+
+        let result = provision_isolated_clone_sync(&source_b, &clone_dir, "my-feature", "tester");
+        let debug = format!("{result:?}");
+
+        assert!(
+            !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "a directory with REAL M4b evidence but UNRELATED ancestry to the newly-opened \
+             source must never be silently created/attached over, got {debug}"
+        );
+        assert!(
+            debug.to_lowercase().contains("ancestry")
+                || debug.to_lowercase().contains("wrong repo")
+                || debug.to_lowercase().contains("stale")
+                || debug.to_lowercase().contains("unrelated"),
+            "PRD fork#544 M3: a directory whose origin/ancestry does not match the source being \
+             opened must be refused with a distinguishable wrong/stale-repo reason (per the \
+             PRD's own compatibility table) — pre-M3 code reports the generic AlreadyClaimed \
+             outcome for every present-directory case with no such distinction, got {debug}"
+        );
+
+        assert_eq!(
+            head_sha(&clone_dir),
+            clone_head_before,
+            "the existing clone's git state (unrelated to source B) must be untouched by the \
+             refused attempt"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M3. A `clone_dir` that carries genuine M4b
+    /// evidence AND matching ancestry (both would pass) is corrupted —
+    /// its `.git` directory is removed entirely, simulating a directory
+    /// mid-delete or otherwise unhealthy — before a second
+    /// `provision_isolated_clone_sync` call against the SAME source.
+    /// Asserts the health probe's failure refuses distinguishably, and
+    /// critically that the refusal never auto-deletes or silently replaces
+    /// the unhealthy directory (the PRD's own explicit "never auto-delete"
+    /// decision).
+    #[spec("orchestration/workspace/008")]
+    #[test]
+    fn workspace_008_unhealthy_directory_refused_without_deleting() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-my-feature");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        // Corrupt the clone's git state — remove `.git` entirely, simulating
+        // a directory mid-delete or otherwise unhealthy, while leaving the
+        // working-tree files (and the M4b evidence, which lives OUTSIDE the
+        // directory under state_dir()) untouched.
+        std::fs::remove_dir_all(clone_dir.join(".git")).expect("corrupt clone's .git");
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "sanity: working-tree files survive the corruption, only .git is gone"
+        );
+
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        let debug = format!("{result:?}");
+
+        assert!(
+            !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "an unhealthy directory (evidence + ancestry would otherwise match) must never be \
+             silently treated as fresh/created-over, got {debug}"
+        );
+        assert!(
+            debug.to_lowercase().contains("unhealthy")
+                || debug.to_lowercase().contains("corrupt")
+                || debug.to_lowercase().contains("health"),
+            "PRD fork#544 M3: a directory that fails the health probe (e.g. `git rev-parse \
+             HEAD` no longer succeeding) must be refused with a distinguishable 'unhealthy' \
+             reason — pre-M3 code reports the generic AlreadyClaimed outcome for every \
+             present-directory case with no such distinction, got {debug}"
+        );
+
+        // Never auto-deleted, and never silently repaired/replaced either.
+        assert!(
+            clone_dir.is_dir(),
+            "the unhealthy directory must never be auto-deleted on refusal"
+        );
+        assert!(
+            !clone_dir.join(".git").exists(),
+            "the directory must still be missing its .git — confirms the refusal did not \
+             silently repair or replace it"
+        );
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "working-tree files must remain untouched by the refusal"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M3's attach-lock reuse for the resume race.
+    /// Mirrors `provision_isolated_clone_sync_concurrent_calls_never_both_create`'s
+    /// own barrier-synchronized two-thread pattern, but races a RESUME
+    /// (the directory already exists and is genuinely resume-eligible —
+    /// created once via a real prior call, so it carries matching M4b
+    /// evidence and ancestry) rather than a fresh CREATE. Asserts the two
+    /// racers' outcomes are DISTINGUISHABLE — one attaches/resumes, the
+    /// other refuses because it lost the race — never both reporting the
+    /// identical outcome, which is exactly what pre-M3 code does today
+    /// (both simply see the directory present and report the generic
+    /// `AlreadyClaimed`, with no winner/loser distinction at all, since
+    /// resume doesn't exist yet).
+    ///
+    /// `#[cfg(unix)]` matches the precedent this mirrors — many trials of
+    /// real `git` subprocesses on a shared CI runner.
+    #[cfg(unix)]
+    #[spec("orchestration/workspace/009")]
+    #[test]
+    fn workspace_009_concurrent_resume_attempts_report_distinguishable_outcomes() {
+        const TRIALS: usize = 10;
+
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let barriers: Vec<std::sync::Barrier> =
+            (0..TRIALS).map(|_| std::sync::Barrier::new(2)).collect();
+
+        let results: Vec<[Result<IsolatedCloneOutcome, String>; 2]> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(TRIALS);
+            for (i, barrier) in barriers.iter().enumerate() {
+                let source = &source;
+                let clone_dir = ws.path().join(format!("source-resume-race-{i}"));
+                // Pre-create the resume-eligible directory ONCE, before the
+                // race: a real prior clone, carrying genuine M4b evidence
+                // and matching ancestry — the race is over RESUMING it, not
+                // creating it.
+                let setup = provision_isolated_clone_sync(source, &clone_dir, "race", "setup");
+                assert!(
+                    matches!(setup, Ok(IsolatedCloneOutcome::Created { .. })),
+                    "trial {i} setup: the initial clone must succeed, got {setup:?}"
+                );
+
+                let clone_dir_a = clone_dir.clone();
+                let clone_dir_b = clone_dir.clone();
+                let h_a = s.spawn(move || {
+                    barrier.wait();
+                    provision_isolated_clone_sync(source, &clone_dir_a, "race", "racer-a")
+                });
+                let h_b = s.spawn(move || {
+                    barrier.wait();
+                    provision_isolated_clone_sync(source, &clone_dir_b, "race", "racer-b")
+                });
+                handles.push((h_a, h_b));
+            }
+            handles
+                .into_iter()
+                .map(|(a, b)| [a.join().unwrap(), b.join().unwrap()])
+                .collect()
+        });
+
+        for (i, pair) in results.iter().enumerate() {
+            let [a, b] = pair;
+            let debug_a = format!("{a:?}");
+            let debug_b = format!("{b:?}");
+            assert_ne!(
+                debug_a, debug_b,
+                "trial {i}: PRD fork#544 M3 — two near-simultaneous resume attempts against the \
+                 SAME already-eligible directory must serialize on the reused attach lock into \
+                 DISTINGUISHABLE outcomes (one resumes/attaches, the other refuses because it \
+                 lost the race), never the identical outcome for both — pre-M3 code reports the \
+                 identical generic AlreadyClaimed for both racers here, with no winner at all, \
+                 got {debug_a} / {debug_b}"
+            );
+        }
+    }
+
+    /// Scenario: PRD fork#544 M3 fix round. Resumes the SAME already-eligible
+    /// directory TWICE in a row, in one still-running process, releasing
+    /// `resumed_isolated_clones()`'s registration in between each resume —
+    /// exactly what both real callers (`src/ui.rs`, `src/dispatch.rs`) now do
+    /// immediately after `provision_isolated_clone_sync` returns. Before the
+    /// fix, nothing ever released an entry, so the SECOND resume in this
+    /// sequence incorrectly saw `Rejected(Contested)`; this pins that it now
+    /// resumes successfully, matching the PRD's own stated purpose (a named
+    /// workspace resumable repeatedly, not once). A trailing THIRD attempt
+    /// made WITHOUT releasing in between still correctly loses to
+    /// `Contested`, proving the fix didn't accidentally stop the registry
+    /// from protecting the still-open race window at all.
+    #[spec("orchestration/workspace/010")]
+    #[test]
+    fn workspace_010_repeated_resume_in_same_process_succeeds_after_registration_release() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-repeat-resume");
+
+        // Open #1: a real CREATE, establishing M4b evidence and ancestry.
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "repeat", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        // Reopen #1 (1st resume): the one legitimate resume every pre-fix
+        // test already exercised — must succeed.
+        let resume_1 = provision_isolated_clone_sync(&source, &clone_dir, "repeat", "opener");
+        assert!(
+            matches!(resume_1, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "the 1st resume must succeed, got {resume_1:?}"
+        );
+
+        // Mirrors what `src/ui.rs`/`src/dispatch.rs` now do immediately
+        // after `provision_isolated_clone_sync` returns, on every outcome —
+        // their own liveness check/claim (fork#192's `ClaimOrchestrationName`
+        // for the former, the has-live-sibling daemon query for the latter)
+        // already ran BEFORE provisioning, so releasing here is safe.
+        release_resumed_isolated_clone_registration(&clone_dir);
+
+        // Reopen #2 (2nd resume, the PRD fork#544's own stated purpose — a
+        // named workspace resumable repeatedly, not once): before the fix
+        // this incorrectly saw `Rejected(Contested)`, since nothing ever
+        // released the 1st resume's registration.
+        let resume_2 = provision_isolated_clone_sync(&source, &clone_dir, "repeat", "opener");
+        assert!(
+            matches!(resume_2, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "the 2nd resume, after the 1st resume's registration was released, must succeed — \
+             not Rejected(Contested) — got {resume_2:?}"
+        );
+
+        // Reopen #3, attempted WITHOUT releasing `resume_2`'s registration
+        // first: `009`'s own race-distinguishing property must still hold —
+        // the registry must still refuse a resume that finds an
+        // unreleased entry already there.
+        let resume_3 = provision_isolated_clone_sync(&source, &clone_dir, "repeat", "opener");
+        assert!(
+            matches!(
+                resume_3,
+                Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Contested))
+            ),
+            "a resume attempted before the prior resume's registration is released must still \
+             be refused as Contested — the registry's own race protection must survive the fix, \
+             got {resume_3:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M4. After a real `provision_isolated_clone_sync`
+    /// call creates a fresh isolated clone (and, as a side effect, writes the
+    /// M4b provenance artifact), the artifact's raw file content is read
+    /// directly off disk and must contain a hash of the root checkout's
+    /// (`source_dir`'s) own canonical path, the orchestration Name typed for
+    /// this workspace, and the clone's own canonical path — all as real,
+    /// extractable data, not merely a content-free presence marker. Today the
+    /// artifact is still the literal bytes `b"deck\n"`, so this fails on the
+    /// very first assertion.
+    #[spec("orchestration/workspace/011")]
+    #[test]
+    fn workspace_011_provenance_artifact_round_trips_schema_hash_name_and_path() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-my-feature");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        let content = std::fs::read_to_string(&marker_path).unwrap_or_else(|e| {
+            panic!("provenance artifact must be readable at {marker_path:?}: {e}")
+        });
+
+        let expected_root_hash = format!(
+            "{:016x}",
+            crate::platform::lock::fnv1a64(
+                canonicalize_best_effort(&source)
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        );
+        let expected_path = canonicalize_best_effort(&clone_dir)
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(
+            content.trim() != "deck",
+            "PRD fork#544 M4: the provenance artifact must carry structured data (schema tag, \
+             root-checkout-path hash, orchestration Name, canonical workspace path) — today it \
+             is still the content-free M4b bytes `b\"deck\\n\"`, got {content:?}"
+        );
+        assert!(
+            content.contains(&expected_root_hash),
+            "PRD fork#544 M4: the artifact must record a hash of the root checkout's \
+             (source_dir's) canonical path at write time, keyed the same way \
+             `isolated_clone_provenance_path` already keys the clone path itself — expected to \
+             find {expected_root_hash} somewhere in {content:?}"
+        );
+        assert!(
+            content.contains("my-feature"),
+            "PRD fork#544 M4: the artifact must record the orchestration Name as explicit \
+             structured data — expected to find the Name \"my-feature\" somewhere in {content:?}"
+        );
+        assert!(
+            content.contains(&expected_path),
+            "PRD fork#544 M4: the artifact must record the canonical workspace path as explicit \
+             structured data — expected to find {expected_path:?} somewhere in {content:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M4. A pre-M4 provenance artifact — the literal
+    /// bytes `b"deck\n"` written directly to disk, bypassing the writer
+    /// entirely, simulating a workspace created by a build that predates the
+    /// M4 fields — must still be treated as valid M4b ownership evidence:
+    /// reopening the same Name against the same source must still resume
+    /// rather than being refused as a stranger directory. This exercises
+    /// EXISTING M3 behavior (`resume_existing_isolated_clone`'s eligibility
+    /// check (b) only ever tested file presence via `is_file()`, never
+    /// content), so unlike `011` this may already be green — reported
+    /// honestly either way, not forced.
+    #[spec("orchestration/workspace/012")]
+    #[test]
+    fn workspace_012_old_format_content_free_evidence_still_valid_for_resume() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-legacy-workspace");
+        let created =
+            provision_isolated_clone_sync(&source, &clone_dir, "legacy-workspace", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        // Simulate a pre-M4 artifact: overwrite whatever the writer just
+        // produced with the OLD content-free bytes, bypassing the writer
+        // entirely — this is deliberately NOT calling any writer function,
+        // to prove the READ path tolerates a genuinely pre-M4 file rather
+        // than merely tolerating today's writer's own output.
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        std::fs::write(&marker_path, b"deck\n").expect("overwrite with pre-M4 format");
+
+        // Release the prior registration so this resume attempt isn't
+        // refused as Contested for a reason unrelated to what this test
+        // checks.
+        release_resumed_isolated_clone_registration(&clone_dir);
+
+        let result =
+            provision_isolated_clone_sync(&source, &clone_dir, "legacy-workspace", "opener");
+        assert!(
+            matches!(result, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "PRD fork#544 M4: an old-format (pre-M4) `b\"deck\\n\"` provenance artifact must \
+             still be treated as valid ownership evidence — M3's eligibility check (b) must keep \
+             passing for it, not reject it as a stranger directory just because it predates the \
+             M4 fields, got {result:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M4. After a real `provision_isolated_clone_sync`
+    /// call writes today's provenance artifact, the artifact's schema tag
+    /// must round-trip as real, readable data — a `schema=<CURRENT>` marker
+    /// a future consumer could branch on — not merely be present-but-unread.
+    /// No second, genuinely pre-M4 schema value exists yet to compare
+    /// against (M4 is the first schema tag this artifact has ever carried),
+    /// so this only proves TODAY's tag is real extractable data, per the
+    /// PRD's own explicit carve-out ("you don't need a second real 'old
+    /// naming scheme' to compare against").
+    #[spec("orchestration/workspace/013")]
+    #[test]
+    fn workspace_013_schema_tag_is_real_readable_data_not_merely_present() {
+        // Tester's proposed encoding for the M4 artifact, since none is
+        // specified beyond "content-minimal, no untrusted payload": plain
+        // `key=value` lines, one per field. `CURRENT_SCHEMA` is this test's
+        // own stand-in for whatever tag value the real implementation picks
+        // for "today's schema" — see this test's `work-done` report for the
+        // full recommendation.
+        const CURRENT_SCHEMA: &str = "2";
+
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-schema-check");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "schema-check", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        let content = std::fs::read_to_string(&marker_path).unwrap_or_else(|e| {
+            panic!("provenance artifact must be readable at {marker_path:?}: {e}")
+        });
+
+        let schema_tag = content
+            .lines()
+            .find_map(|line| line.strip_prefix("schema=").map(str::trim));
+        assert_eq!(
+            schema_tag,
+            Some(CURRENT_SCHEMA),
+            "PRD fork#544 M4: reading the artifact back must report today's schema tag as real, \
+             extractable data a future consumer could branch on to distinguish it from an older \
+             naming-scheme's evidence — expected a `schema={CURRENT_SCHEMA}` line, got {content:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M5. `forget_isolated_workspace` is the new
+    /// explicit "forget this workspace" action, modeled on this codebase's
+    /// existing `issue claim --takeover --confirm-stopped` pattern: calling
+    /// it against a real, live isolated-clone workspace with `confirmed:
+    /// false` must refuse rather than silently no-op, and must leave BOTH
+    /// the directory and its M4b provenance artifact completely untouched.
+    /// `forget_isolated_workspace` does not exist yet (M5 has not
+    /// implemented it), so this is a compile-time RED — the expected RED
+    /// reason for this milestone, matching this task's own framing ("the
+    /// action doesn't exist yet").
+    #[spec("orchestration/workspace/014")]
+    #[test]
+    fn workspace_014_refusal_without_confirmation_leaves_everything_untouched() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-forget-me-not");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "forget-me-not", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        let marker_before = std::fs::read_to_string(&marker_path)
+            .unwrap_or_else(|e| panic!("setup: provenance artifact must be readable: {e}"));
+        let head_before = head_sha(&clone_dir);
+
+        let result = forget_isolated_workspace(&clone_dir, false, "tester");
+
+        assert!(
+            result.is_err(),
+            "PRD fork#544 M5: forgetting without an explicit confirming flag must refuse, never \
+             silently no-op and never report success, got {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("confirm"),
+            "the refusal reason must name the missing confirmation (mirroring this codebase's \
+             `--confirm-stopped` precedent), got {err:?}"
+        );
+
+        assert!(
+            clone_dir.is_dir(),
+            "an unconfirmed forget attempt must never remove the workspace directory"
+        );
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "an unconfirmed forget attempt must never touch the workspace's working tree"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_before,
+            "an unconfirmed forget attempt must never touch the workspace's git state"
+        );
+        assert!(
+            marker_path.is_file(),
+            "an unconfirmed forget attempt must never remove the M4b provenance artifact"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).unwrap(),
+            marker_before,
+            "an unconfirmed forget attempt must never modify the M4b provenance artifact's \
+             content"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M5. Calling `forget_isolated_workspace` with
+    /// `confirmed: true` against a real, live isolated-clone workspace must
+    /// remove BOTH the workspace directory and its M4b provenance artifact
+    /// — never one without the other. This is the milestone's headline
+    /// behavior: the only way a named workspace is ever cleared.
+    #[spec("orchestration/workspace/015")]
+    #[test]
+    fn workspace_015_confirmed_forget_atomically_removes_directory_and_provenance() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-forget-me");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "forget-me", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        assert!(
+            marker_path.is_file(),
+            "setup: the provenance artifact must exist before the forget call"
+        );
+
+        let result = forget_isolated_workspace(&clone_dir, true, "tester");
+        assert!(
+            result.is_ok(),
+            "PRD fork#544 M5: a confirmed forget against a real, existing workspace must \
+             succeed, got {result:?}"
+        );
+
+        assert!(
+            !clone_dir.exists(),
+            "a confirmed forget must remove the workspace directory — don't just check the \
+             provenance artifact and assume the directory followed"
+        );
+        assert!(
+            !marker_path.exists(),
+            "a confirmed forget must remove the M4b provenance artifact — don't just check the \
+             directory and assume the artifact followed"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M5's own "consider" coverage. Calling
+    /// `forget_isolated_workspace` with `confirmed: true` against a
+    /// `clone_dir` that has never existed at all — no directory, no
+    /// provenance artifact — must not panic and must not falsely report
+    /// success; there is nothing there to forget.
+    #[spec("orchestration/workspace/016")]
+    #[test]
+    fn workspace_016_forgetting_a_nonexistent_workspace_does_not_falsely_succeed() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let clone_dir = ws.path().join("source-never-existed");
+        assert!(
+            !clone_dir.exists(),
+            "sanity: this path must genuinely never have been created"
+        );
+
+        let result = forget_isolated_workspace(&clone_dir, true, "tester");
+
+        assert!(
+            result.is_err(),
+            "PRD fork#544 M5: forgetting a workspace that was never created must not falsely \
+             report success — there is nothing there to forget, got {result:?}"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "a forget attempt against a nonexistent workspace must not create anything either"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M5's own "consider" coverage, and the
+    /// codebase's general never-auto-delete-unowned-content safety property
+    /// (the same reasoning `resume_existing_isolated_clone`'s stranger-
+    /// directory refusal already applies). A directory sitting at the
+    /// derived `clone_dir` path with its own real, independent git history
+    /// — but never created by `provision_isolated_clone_sync`, so it
+    /// carries no M4b provenance artifact — must be refused, not deleted,
+    /// even with `confirmed: true`: a confirming flag proves the CALLER
+    /// wants to remove ITS workspace, not that this directory IS one.
+    #[spec("orchestration/workspace/017")]
+    #[test]
+    fn workspace_017_stranger_directory_with_no_provenance_is_refused_not_deleted() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let clone_dir = ws.path().join("source-not-ours");
+        // A stranger directory: present on disk with its own unrelated git
+        // history, but never created by `provision_isolated_clone_sync` —
+        // no M4b provenance artifact was ever written for this canonical
+        // path.
+        seed_source_repo(&clone_dir, "not the deck's\n");
+        let head_before = head_sha(&clone_dir);
+
+        let result = forget_isolated_workspace(&clone_dir, true, "tester");
+
+        assert!(
+            result.is_err(),
+            "PRD fork#544 M5: a confirmed forget against a directory with NO matching M4b \
+             ownership evidence must refuse rather than deleting someone else's real content, \
+             got {result:?}"
+        );
+        assert!(
+            clone_dir.is_dir(),
+            "a stranger directory must never be deleted by forget, confirmed or not"
+        );
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "a stranger directory's working tree must remain untouched"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_before,
+            "a stranger directory's git state must remain untouched"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M6's own tab-close persistence guarantee for a
+    /// NAMED isolated-clone workspace (Design step 6: "Pin with a test that
+    /// tab-close never deletes a named workspace"). A real workspace,
+    /// provisioned via `provision_isolated_clone_sync` under a typed
+    /// orchestration Name exactly as Model A creates one, is handed to
+    /// `remove_worktree` under its own `RemovalPolicy::IsolatedClone` — the
+    /// same policy this milestone's registration fix
+    /// (`orchestration/workspace/018`) makes Model A's entries carry. The
+    /// outcome must be `Kept(IsolatedClone)`, and the directory and its
+    /// checked-out branch must survive untouched. This is a REGRESSION
+    /// GUARD, not a fresh RED: `remove_worktree`'s `RemovalPolicy::IsolatedClone`
+    /// arm already reports `Kept` unconditionally today (Problem Statement
+    /// #3) — this pins that guarantee explicitly, under this milestone's own
+    /// catalog family, against a genuinely NAMED workspace rather than
+    /// relying solely on `src/dispatch.rs`'s pre-existing
+    /// `isolated_clone_is_always_kept_on_tab_close_even_when_clean` (written
+    /// for Model C / issue #490) to cover it by proxy.
+    #[spec("orchestration/workspace/019")]
+    #[tokio::test]
+    async fn workspace_019_named_isolated_clone_is_kept_unconditionally_on_tab_close() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("named-workspace-019");
+        let created =
+            provision_isolated_clone_sync(&source, &clone_dir, "workspace019fixed", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: provisioning a fresh named workspace must succeed, got {created:?}"
+        );
+        let head_before = head_sha(&clone_dir);
+
+        let outcome = remove_worktree(
+            &clone_dir,
+            &source,
+            RemovalPolicy::IsolatedClone,
+            "tab-close",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RemoveOutcome::Kept(crate::event::KeptReason::IsolatedClone),
+            "PRD fork#544 M6: a named isolated-clone workspace must always be reported Kept on \
+             tab close — never removed via that path — regardless of dirtiness, got {outcome:?}"
+        );
+        assert!(
+            clone_dir.is_dir(),
+            "the named workspace directory must still exist on disk after the tab-close \
+             removal attempt"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_before,
+            "the workspace's checked-out branch must be untouched by the tab-close removal \
+             attempt"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M7 (Design step 7 / Decisions table row "What
+    /// happens to other live workspaces, and to this one, when a merge
+    /// lands?"). The workspace whose OWN branch was just confirmed merged
+    /// has a completely clean tree, and its checked-out branch's HEAD is now
+    /// fully contained in `origin/main` because a real merge landed it there
+    /// (simulated by fetching the feature commit into a real, independent
+    /// "origin" repository and fast-forwarding its own main onto it — the
+    /// same real-git-state discipline `006`-`017` already use). Calling the
+    /// new `sync_merged_workspace_to_main` function must auto-switch: check
+    /// out `main` and fast-forward it to match `origin/main` exactly,
+    /// reporting `SwitchedToMain`. `sync_merged_workspace_to_main` does not
+    /// exist yet, so — mirroring `workspace_014`-`017`'s own precedent (M5
+    /// had no existing production entry point either) — this is a
+    /// compile-time RED (`cannot find function`/`cannot find type`), not a
+    /// runtime one.
+    #[spec("orchestration/workspace/020")]
+    #[test]
+    fn workspace_020_post_merge_switch_to_main_succeeds_on_clean_tree() {
+        let ws = tempfile::tempdir().unwrap();
+
+        // "origin" -- a real, independently-fetchable local repository, not
+        // just a URL string (unlike `provision_isolated_clone_sync_sets_
+        // origin_and_branch_when_source_has_origin`'s fake `.invalid` URL):
+        // this test must genuinely fetch a real advance.
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        // The just-merged workspace: a real clone of origin, checked out on
+        // its own feature branch with one real commit -- the PR's own
+        // content.
+        let clone_dir = ws.path().join("workspace-020");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["checkout", "--quiet", "-b", "feat-020"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-020 work"]);
+        let feature_head = head_sha(&clone_dir);
+
+        // Simulate the merge landing on origin's own main: fetch the
+        // feature branch's commit into `origin_repo` directly (they share
+        // history via the clone) and fast-forward origin's main onto it --
+        // exactly what a real GitHub merge does to `origin/main` from this
+        // workspace's point of view. (A `git push` from the clone straight
+        // into `origin_repo`'s checked-out branch is deliberately avoided --
+        // that fails by default against a non-bare repo's current branch.)
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-020:refs/heads/feat-020",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-020"]);
+        let merged_main_head = head_sha(&origin_repo);
+        assert_eq!(
+            merged_main_head, feature_head,
+            "setup: origin's main must now BE the feature commit (a real fast-forward merge), \
+             not merely contain it"
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        assert!(
+            matches!(result, Ok(PostMergeSyncOutcome::SwitchedToMain)),
+            "PRD fork#544 M7: a clean workspace whose HEAD is now fully contained in the \
+             just-advanced origin/main must auto-switch, got {result:?}"
+        );
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main",
+            "a successful switch must leave the workspace checked out on main, not the old \
+             feature branch"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            merged_main_head,
+            "a successful switch must fast-forward local main to match origin/main exactly"
+        );
+        assert!(
+            clone_dir.join("feature.txt").exists(),
+            "the merged content must be present in the working tree after switching"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M7's Risks section — "the single biggest
+    /// silent-data-loss risk in the whole PRD". The just-merged workspace
+    /// carries a genuine UNCOMMITTED change the merge never captured (the
+    /// tree is dirty). Calling `sync_merged_workspace_to_main` must refuse
+    /// the auto-switch entirely — leave the checked-out branch, its HEAD,
+    /// and the uncommitted edit itself completely untouched — and report
+    /// `LeftUntouched` carrying a non-empty note, never silently discard the
+    /// edit by switching/checking-out over it.
+    #[spec("orchestration/workspace/021")]
+    #[test]
+    fn workspace_021_post_merge_switch_refused_when_uncommitted_change_present() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-021");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["checkout", "--quiet", "-b", "feat-021"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-021 work"]);
+        let feature_head = head_sha(&clone_dir);
+
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-021:refs/heads/feat-021",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-021"]);
+
+        // Genuinely unprotected work: a real uncommitted edit the merge
+        // never saw.
+        std::fs::write(
+            clone_dir.join("feature.txt"),
+            "an uncommitted edit the merge never saw\n",
+        )
+        .unwrap();
+        let branch_before = git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        match &result {
+            Ok(PostMergeSyncOutcome::LeftUntouched { reason }) => {
+                assert!(
+                    !reason.is_empty(),
+                    "a refusal must surface a non-empty note the caller can show the user"
+                );
+            }
+            other => panic!(
+                "PRD fork#544 M7 -- the single biggest silent-data-loss risk in the whole PRD: \
+                 an uncommitted change the merge never captured must refuse the auto-switch and \
+                 surface a note, never silently switch/discard it, got {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before,
+            "a refused switch must leave the checked-out branch completely untouched"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            feature_head,
+            "a refused switch must leave the workspace's committed HEAD completely untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("feature.txt")).unwrap(),
+            "an uncommitted edit the merge never saw\n",
+            "a refused switch must leave the uncommitted edit itself completely untouched -- \
+             this is the exact content the PRD's Risks section calls out as unprotected work"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M7's Risks section, the OTHER half of "carries
+    /// nothing beyond what was merged" — a real LOCAL COMMIT made after the
+    /// content the merge captured (e.g. the orchestration kept working in
+    /// this workspace before the merge phase ran), with the tree otherwise
+    /// fully clean. Isolates this signal from `workspace_021`'s
+    /// uncommitted-change signal: a clean-tree-only check would wrongly
+    /// treat this workspace as safe to switch and silently strand (or
+    /// worse, discard by hard-resetting to origin/main) the extra commit.
+    /// Calling `sync_merged_workspace_to_main` must refuse here too.
+    #[spec("orchestration/workspace/022")]
+    #[test]
+    fn workspace_022_post_merge_switch_refused_when_local_commit_beyond_merge() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-022");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["checkout", "--quiet", "-b", "feat-022"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-022 work"]);
+
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-022:refs/heads/feat-022",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-022"]);
+
+        // A real local commit made AFTER the content the merge captured.
+        // The tree is fully clean (this commit IS committed), so an
+        // uncommitted-changes check alone would wrongly pass this case.
+        std::fs::write(clone_dir.join("extra.txt"), "local work after the merge\n").unwrap();
+        git(&clone_dir, &["add", "extra.txt"]);
+        git(
+            &clone_dir,
+            &["commit", "--quiet", "-m", "local work after the merge"],
+        );
+        let head_with_extra_commit = head_sha(&clone_dir);
+        let branch_before = git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        assert_eq!(
+            git_output(&clone_dir, &["status", "--porcelain"]),
+            "",
+            "setup: the tree must be genuinely clean -- this test isolates the EXTRA-COMMIT \
+             signal from the uncommitted-change signal workspace_021 already covers"
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        match &result {
+            Ok(PostMergeSyncOutcome::LeftUntouched { reason }) => {
+                assert!(
+                    !reason.is_empty(),
+                    "a refusal must surface a non-empty note the caller can show the user"
+                );
+            }
+            other => panic!(
+                "PRD fork#544 M7: a local commit not yet on origin/main -- committed after the \
+                 merge's own content -- must also refuse the auto-switch, even though the tree \
+                 is fully clean; a clean-tree-only check would silently strand or discard this \
+                 commit, got {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before,
+            "a refused switch must leave the checked-out branch completely untouched"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_with_extra_commit,
+            "a refused switch must never discard or strand the extra local commit"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M7's Decisions table row, the "other live
+    /// workspaces" half — on an UNRELATED merge (this workspace's own
+    /// branch did not just merge), only a proactive, read-only `git fetch`
+    /// runs: the `origin/main` remote-tracking ref updates, but the
+    /// checked-out local branch and working tree are completely untouched.
+    /// Simulates a genuine unrelated merge by fast-forwarding `origin`'s own
+    /// main from a second, independent clone, then calls the new
+    /// `fetch_other_live_workspace` function against a THIRD, unrelated
+    /// clone standing in for another live orchestration's own workspace.
+    #[spec("orchestration/workspace/023")]
+    #[test]
+    fn workspace_023_other_live_workspace_gets_read_only_fetch_only() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        // A SEPARATE, unrelated live workspace -- an ordinary clone/checkout
+        // standing in for another orchestration's own workspace that is NOT
+        // the one whose branch just merged.
+        let other_clone = ws.path().join("workspace-023-other");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                other_clone.to_str().unwrap(),
+            ],
+        );
+        git(
+            &other_clone,
+            &["checkout", "--quiet", "-b", "unrelated-feature"],
+        );
+        let branch_before = git_output(&other_clone, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let head_before = head_sha(&other_clone);
+        let origin_tracking_ref_before = git_output(&other_clone, &["rev-parse", "origin/main"]);
+
+        // The UNRELATED merge: origin's own main genuinely advances while
+        // `other_clone` was untouched -- exactly the Decisions table's "on
+        // an unrelated merge" scenario. Landed the same way `020`-`022`
+        // simulate a merge: fetch a third clone's commit into `origin_repo`
+        // directly and fast-forward main onto it (never a `git push` into
+        // origin's own checked-out branch).
+        let other_committer = ws.path().join("other-committer");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                other_committer.to_str().unwrap(),
+            ],
+        );
+        git(
+            &other_committer,
+            &["config", "user.email", "test@example.com"],
+        );
+        git(&other_committer, &["config", "user.name", "Test"]);
+        git(&other_committer, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            other_committer.join("unrelated.txt"),
+            "someone else's merged PR\n",
+        )
+        .unwrap();
+        git(&other_committer, &["add", "unrelated.txt"]);
+        git(
+            &other_committer,
+            &["commit", "--quiet", "-m", "unrelated merge"],
+        );
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                other_committer.to_str().unwrap(),
+                "main:refs/heads/incoming-main",
+            ],
+        );
+        git(
+            &origin_repo,
+            &["merge", "--quiet", "--ff-only", "incoming-main"],
+        );
+        let advanced_origin_main = head_sha(&origin_repo);
+        assert_ne!(
+            advanced_origin_main, origin_tracking_ref_before,
+            "setup: origin's main must have genuinely advanced past what other_clone's stale \
+             origin/main remote-tracking ref still shows"
+        );
+
+        let result = fetch_other_live_workspace(&other_clone);
+
+        assert!(
+            result.is_ok(),
+            "PRD fork#544 M7: a proactive read-only fetch for another live workspace on an \
+             unrelated merge must succeed, got {result:?}"
+        );
+        assert_eq!(
+            git_output(&other_clone, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before,
+            "a proactive fetch must never touch the checked-out local branch"
+        );
+        assert_eq!(
+            head_sha(&other_clone),
+            head_before,
+            "a proactive fetch must never touch the working tree/local HEAD"
+        );
+        assert!(
+            !other_clone.join("unrelated.txt").exists(),
+            "a proactive fetch must never merge/checkout the advanced content into the working \
+             tree"
+        );
+        assert_eq!(
+            git_output(&other_clone, &["rev-parse", "origin/main"]),
+            advanced_origin_main,
+            "the read-only fetch must bring the origin/main remote-tracking ref itself up to \
+             date -- this is the one thing it IS supposed to do"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M9's own coverage list, "creation-time
+    /// freshness against origin" — the Decisions table's "Should a fresh
+    /// clone start from up-to-date main? ... needs verification ... whether
+    /// today's creation path already fetches from origin at clone time or
+    /// inherits the root checkout's own staleness." `source_dir` stands in
+    /// for the user's already-open root checkout: a real clone of a
+    /// separately-advanceable "true origin" repository, whose OWN knowledge
+    /// of `origin/main` goes stale the moment `origin_repo` advances again
+    /// behind `source_dir`'s back — exactly what happens when a teammate
+    /// pushes to `main` while the user's checkout sits unfetched. Asserts
+    /// the freshly created workspace's own `origin/main` remote-tracking
+    /// ref reflects that TRUE, current advance — not merely a copy of
+    /// `source_dir`'s own stale knowledge, and not merely the clone-time
+    /// snapshot of `source_dir`'s local `main` branch (which a plain `git
+    /// clone` alone would produce) — proving creation genuinely fetches
+    /// from the real origin URL rather than inheriting whatever staleness
+    /// the root checkout happened to be carrying. Uses a REAL,
+    /// independently-fetchable local repository as `origin`, the same
+    /// technique `020`-`023` use, so this test genuinely proves a fetch
+    /// happened rather than merely a URL string being copied (unlike
+    /// `provision_isolated_clone_sync_sets_origin_and_branch_when_source_
+    /// has_origin`'s unreachable `.invalid` URL, which no fetch could ever
+    /// reach).
+    #[spec("orchestration/workspace/024")]
+    #[test]
+    fn workspace_024_fresh_creation_fetches_true_origin_not_source_staleness() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        // `source_dir` stands in for the user's already-open root checkout:
+        // a real clone of `origin_repo`, so it has a genuine `origin` URL
+        // pointing at it. Its own `origin/main` remote-tracking ref is
+        // frozen at clone time and never refreshed again below.
+        let source_dir = ws.path().join("source");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                source_dir.to_str().unwrap(),
+            ],
+        );
+        let stale_origin_main = git_output(&source_dir, &["rev-parse", "origin/main"]);
+
+        // Advance the TRUE origin directly -- entirely behind `source_dir`'s
+        // back, exactly like a teammate pushing to `main` while the user's
+        // root checkout sits unfetched. `source_dir` never re-fetches below,
+        // so its own `origin/main` ref stays at `stale_origin_main` for the
+        // rest of this test.
+        std::fs::write(origin_repo.join("advanced.txt"), "true origin moved on\n").unwrap();
+        git(&origin_repo, &["add", "advanced.txt"]);
+        git(
+            &origin_repo,
+            &["commit", "--quiet", "-m", "advance past source_dir"],
+        );
+        let advanced_origin_head = head_sha(&origin_repo);
+        assert_ne!(
+            advanced_origin_head, stale_origin_main,
+            "setup: true origin must have genuinely advanced past what source_dir's own \
+             origin/main remote-tracking ref still shows"
+        );
+        assert_eq!(
+            git_output(&source_dir, &["rev-parse", "origin/main"]),
+            stale_origin_main,
+            "setup: source_dir must never itself re-fetch -- its origin/main ref must remain \
+             frozen at the stale commit throughout"
+        );
+
+        let clone_dir = ws.path().join("workspace-024");
+        let result =
+            provision_isolated_clone_sync(&source_dir, &clone_dir, "my-feature-024", "tester");
+        assert!(
+            matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "isolated clone must succeed, got {result:?}"
+        );
+
+        assert_eq!(
+            git_output(&clone_dir, &["remote", "get-url", "origin"]),
+            origin_repo.to_str().unwrap(),
+            "the new workspace's origin must be the TRUE origin URL, read from source_dir's own \
+             origin remote"
+        );
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "origin/main"]),
+            advanced_origin_head,
+            "PRD fork#544 M2 Decisions table: a freshly created workspace must fetch from the \
+             real origin at creation time, so its own origin/main remote-tracking ref reflects \
+             origin's TRUE current state -- not merely inherit source_dir's own stale \
+             origin/main knowledge (still at {stale_origin_main}), and not merely the \
+             clone-time snapshot of source_dir's local main branch either"
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer B1 /
+    /// auditor A1, both independently reproduced this). Creates a workspace
+    /// exactly as `orchestration/workspace/001` does, then advances
+    /// `source_dir` itself with a real new commit — the ordinary steady
+    /// state of a root checkout that keeps being worked in after a
+    /// workspace was cloned from it, e.g. a later `git pull` or a direct
+    /// commit — so the workspace's own clone (a snapshot frozen at clone
+    /// time) has never seen and does not carry that new commit in its
+    /// object database. A second `provision_isolated_clone_sync` call then
+    /// attempts to resume the same workspace. Pins the CORRECT behavior
+    /// (resume must not be misreported as a wrong/foreign repository) —
+    /// not merely today's wrong one — per this test's own doc comment on
+    /// `isolated_clone_ancestry_matches_source` below for why today's check
+    /// gets this backwards.
+    #[spec("orchestration/workspace/025")]
+    #[test]
+    fn workspace_025_resume_survives_source_dir_advancing_past_the_clones_object_db() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-my-feature");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone from source must succeed, got {created:?}"
+        );
+        let clone_head_before = head_sha(&clone_dir);
+
+        // The ordinary steady state PRD fork#544 exists to support: the
+        // root checkout (source_dir) keeps advancing after the workspace
+        // was created next to it. A real new commit made directly in
+        // source_dir is a commit the clone's own object database has never
+        // fetched or received -- it did not exist yet at clone time, and
+        // nothing has re-fetched it into the clone since.
+        std::fs::write(source.join("advanced.txt"), "source moved on after clone\n").unwrap();
+        git(&source, &["add", "advanced.txt"]);
+        git(
+            &source,
+            &["commit", "--quiet", "-m", "source advances past the clone"],
+        );
+        let source_head_after = head_sha(&source);
+        assert_ne!(
+            source_head_after, clone_head_before,
+            "setup: source_dir must have genuinely advanced past the commit the clone was made \
+             from"
+        );
+
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+
+        assert!(
+            !matches!(
+                result,
+                Ok(IsolatedCloneOutcome::Rejected(
+                    ResumeRejection::AncestryMismatch
+                ))
+            ),
+            "reviewer B1 / auditor A1 (both independently reproduced this): \
+             `isolated_clone_ancestry_matches_source` runs `git merge-base --is-ancestor \
+             <source_dir's CURRENT HEAD> HEAD` INSIDE the clone -- this asks whether \
+             source_dir's HEAD AT RESUME TIME is contained in the clone's own history, which is \
+             true only in the instant right after cloning (when a plain `git clone` hardlinks \
+             source_dir's object store). The moment source_dir advances -- an ordinary `git \
+             pull` or a new commit in the root checkout, the everyday steady state this PRD \
+             exists to support, not an edge case -- source_dir's new HEAD is a commit the \
+             clone's object database has never seen, so this probe fails and a perfectly \
+             healthy, genuinely-derived, resumable workspace is wrongly refused as \
+             AncestryMismatch. `resume_existing_isolated_clone`'s caller then tells the user to \
+             'remove it manually' -- pointed squarely at destroying the exact uncommitted work \
+             this PRD exists to protect. Got {result:?}"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            clone_head_before,
+            "sanity: whatever the outcome (resumed or refused), an attempt at resuming must \
+             never itself mutate the workspace's checked-out HEAD"
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer B2's own
+    /// sibling issue, verified in the same finding). `'my feature'`,
+    /// `'feat:544'`, `'wip~1'` and `'cache*'` all survive
+    /// `sanitize_workspace_segment` completely UNCHANGED -- it only
+    /// replaces path separators and strips NUL/`".."`/a leading `-`/`.`,
+    /// none of which any of these four trigger -- yet every one of them is
+    /// rejected deep inside `git check-ref-format` the moment
+    /// `provision_isolated_clone_sync` tries to `git checkout -b` it
+    /// (verified empirically: `git branch -- 'my feature'` and the other
+    /// three all fail with `fatal: '<name>' is not a valid branch name`).
+    /// Directly exercises `provision_isolated_clone_sync` with each raw
+    /// Name (skipping `sanitize_workspace_segment` itself, which is private
+    /// to `src/ui.rs` and a no-op for every one of these four anyway).
+    /// Pins that the checkout failure is a CLEAN, typed refusal -- never a
+    /// silently-succeeding `Created`, and never a half-provisioned
+    /// directory left wedged at the derived path for the next attempt at
+    /// the same Name to trip over.
+    #[spec("orchestration/workspace/027")]
+    #[test]
+    fn workspace_027_invalid_git_ref_name_rejected_cleanly_not_left_dangling() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        for invalid_name in ["my feature", "feat:544", "wip~1", "cache*"] {
+            let safe_suffix: String = invalid_name
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect();
+            let clone_dir = ws.path().join(format!("workspace-027-{safe_suffix}"));
+
+            let result = provision_isolated_clone_sync(&source, &clone_dir, invalid_name, "tester");
+
+            assert!(
+                !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+                "an invalid git ref name must never report Created, got {result:?} for Name \
+                 {invalid_name:?}"
+            );
+            assert!(
+                !clone_dir.exists(),
+                "reviewer B2 sibling issue: an invalid git ref name's checkout failure must \
+                 leave NO half-provisioned directory behind at {} for Name {invalid_name:?}, so \
+                 a later attempt at the same Name is not wedged by this attempt's own \
+                 leftovers, got {result:?}",
+                clone_dir.display()
+            );
+        }
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (auditor A5).
+    /// `sync_merged_workspace_to_main`'s own checkout call
+    /// (`.args(["checkout", "--quiet", default_branch])`) has no `--`
+    /// end-of-options separator before `default_branch`, unlike its `merge`
+    /// call 18 lines later which does have one. A real git branch can never
+    /// literally be named e.g. `"--detach"` (`git branch -- --detach` is
+    /// itself refused by `git check-ref-format`, verified empirically), so
+    /// this test plants the adversarial-looking remote-tracking ref
+    /// directly with `git update-ref` -- the closest a real repository can
+    /// get to reproducing what the missing separator actually does: lets an
+    /// option-shaped `default_branch` value be consumed as a FLAG rather
+    /// than the branch to check out.
+    #[spec("orchestration/workspace/028")]
+    #[test]
+    fn workspace_028_checkout_missing_separator_detaches_head_on_adversarial_branch_name() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-028");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+
+        // Plant `refs/remotes/origin/--detach` directly -- `git branch` (and
+        // therefore `git fetch`, which mirrors the source's own branches)
+        // refuses to ever create a real ref component starting with '-',
+        // so `update-ref` is the only way to construct this fixture at all.
+        // Points at the clone's own current HEAD, so the ancestry
+        // precondition below trivially holds without needing a separate
+        // "merge landed" simulation.
+        let head = head_sha(&clone_dir);
+        git(
+            &clone_dir,
+            &["update-ref", "refs/remotes/origin/--detach", &head],
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "--detach");
+
+        assert!(
+            matches!(result, Ok(PostMergeSyncOutcome::SwitchedToMain)),
+            "setup: both preconditions (clean tree; HEAD already equals origin/--detach) must \
+             hold so this genuinely reaches the checkout step, got {result:?}"
+        );
+        assert_ne!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "HEAD",
+            "auditor A5: `git checkout --quiet {{default_branch}}` with no `--` separator lets \
+             an option-shaped `default_branch` value (here '--detach') be consumed as an OPTION \
+             rather than the branch to check out -- the checkout silently DETACHES HEAD instead \
+             of actually landing the workspace on the named branch. `git rev-parse --abbrev-ref \
+             HEAD` reports the literal string \"HEAD\" only when detached, which is what it \
+             reports today"
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (auditor A3).
+    /// `provision_isolated_clone_sync` writes the M4b provenance artifact
+    /// (`write_isolated_clone_provenance`, outside `clone_dir` under
+    /// `state_dir()`) BEFORE the branch checkout. When the checkout fails
+    /// (here, forced with an invalid git ref Name, the same fixture
+    /// `workspace_027` above uses), `attempt_isolated_clone_cleanup` removes
+    /// `clone_dir` itself but the cleanup function never touches the
+    /// provenance artifact, which lives in a completely separate location.
+    /// A later attempt at the same canonical path would then find
+    /// "evidence" for a directory that no longer exists -- and M3's
+    /// Stranger gate (`resume_existing_isolated_clone`) uses evidence
+    /// PRESENCE as its entire test, so this stale evidence would wrongly
+    /// vouch for whatever gets created there next.
+    #[spec("orchestration/workspace/029")]
+    #[test]
+    fn workspace_029_checkout_failure_leaves_no_orphaned_provenance_artifact() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-029");
+        // "my feature" survives `sanitize_workspace_segment` unchanged
+        // (verified in `workspace_027` above) but is rejected deep inside
+        // `git check-ref-format` at the checkout step -- forcing the exact
+        // checkout-failure path this test needs, after the provenance
+        // artifact has already been written.
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my feature", "tester");
+
+        assert!(
+            !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: an invalid git ref Name must fail the checkout step, not succeed, got \
+             {result:?}"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "setup: checkout failure must clean up the half-provisioned clone directory itself \
+             before this test's real assertion (the provenance artifact) is meaningful, got \
+             {result:?}"
+        );
+
+        let provenance_path = isolated_clone_provenance_path(&clone_dir);
+        assert!(
+            !provenance_path.exists(),
+            "auditor A3: the M4b provenance artifact must not survive a checkout failure that \
+             already removed the clone directory itself -- a later attempt at this same \
+             canonical path would find 'evidence' for a directory that no longer exists, and \
+             M3's Stranger gate (resume_existing_isolated_clone) uses evidence PRESENCE as its \
+             entire test, so this stale evidence would wrongly vouch for whatever gets created \
+             there next. Found orphaned at {}",
+            provenance_path.display()
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer S3).
+    /// `sync_merged_workspace_to_main`'s preconditions are checked against
+    /// `HEAD` (the workspace's own just-merged feature branch), but the
+    /// MUTATION (`checkout` then `merge --ff-only`) targets `default_branch`
+    /// instead. Sets up a workspace whose HEAD (a feature branch) passes
+    /// both preconditions against the just-advanced `origin/main`, while
+    /// LOCAL `main` has separately diverged from `origin/main` (an extra
+    /// local commit on `main` that was never pushed) -- so the checkout
+    /// onto local `main` succeeds, but the subsequent `merge --ff-only`
+    /// fails, and the function returns `Err` having already left the
+    /// workspace switched onto diverged `main` instead of back where it
+    /// started. Pins the property that actually matters (per the task):
+    /// no `Err` result may ever leave the workspace anywhere other than
+    /// where it started -- not a specific mechanism (precondition
+    /// detection vs. restore-on-failure).
+    #[spec("orchestration/workspace/030")]
+    #[test]
+    fn workspace_030_failed_sync_never_leaves_workspace_switched_away_from_start() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-030");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+
+        // Diverge LOCAL main from origin/main: an extra local commit on
+        // main that is never pushed anywhere -- exactly the shape a real
+        // orchestration's root-checkout main can pick up independently of
+        // any one workspace (e.g. a maintainer commits directly to their
+        // own local main).
+        git(&clone_dir, &["checkout", "--quiet", "main"]);
+        std::fs::write(clone_dir.join("local-only.txt"), "never pushed\n").unwrap();
+        git(&clone_dir, &["add", "local-only.txt"]);
+        git(
+            &clone_dir,
+            &["commit", "--quiet", "-m", "diverged local main"],
+        );
+        let diverged_local_main = head_sha(&clone_dir);
+
+        // The feature branch this workspace is actually on: forked BEFORE
+        // the divergence above (from the original seed commit), so it
+        // shares no history with the diverged local main beyond that seed.
+        git(
+            &clone_dir,
+            &["checkout", "--quiet", "-b", "feat-030", "main~1"],
+        );
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-030 work"]);
+        let feature_head = head_sha(&clone_dir);
+
+        // Simulate the merge landing on origin's real main: fetch the
+        // feature branch's own commit into origin_repo directly and
+        // fast-forward origin's main onto it (the same technique
+        // `workspace_020` uses) -- origin/main becomes the feature commit,
+        // completely independent of clone_dir's own diverged LOCAL main.
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-030:refs/heads/feat-030",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-030"]);
+        let advanced_origin_main = head_sha(&origin_repo);
+        assert_eq!(
+            advanced_origin_main, feature_head,
+            "setup: origin's main must now BE the feature commit (a real fast-forward merge)"
+        );
+
+        let branch_before = git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let head_before = head_sha(&clone_dir);
+        assert_eq!(
+            branch_before, "feat-030",
+            "setup: the workspace must still be on its own feature branch before calling sync"
+        );
+        assert_eq!(
+            head_before, feature_head,
+            "setup: the workspace's HEAD must still be the feature commit before calling sync"
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        assert!(
+            result.is_err(),
+            "setup: local main ({diverged_local_main}) must have genuinely diverged from the \
+             just-advanced origin/main ({advanced_origin_main}), so the ff-only merge fails and \
+             this call returns Err, got {result:?}"
+        );
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before,
+            "reviewer S3: preconditions are checked against HEAD (the feature branch, which \
+             passes both), but the mutation targets `default_branch` (\"main\") instead -- the \
+             checkout onto local main succeeds (no precondition guards it), then `merge \
+             --ff-only` fails because local main independently diverged from origin/main. The \
+             function returns Err having already left the workspace switched onto diverged main \
+             instead of restoring it to the feature branch it started on. No Err result may \
+             ever leave the workspace anywhere other than where it started"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_before,
+            "reviewer S3: a failed sync must never leave the workspace's checked-out commit \
+             anywhere other than where it started, got {result:?}"
+        );
     }
 
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B), extended by
