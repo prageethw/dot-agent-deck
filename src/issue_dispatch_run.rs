@@ -78,6 +78,7 @@ use crate::issue_dispatch::{
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnKind, SpawnRequest, spawn};
+use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_terminal_display};
 
 // ---------------------------------------------------------------------------
 // M2.4 — daemon-side worktree registry (close → cleanup plumbing)
@@ -2784,6 +2785,92 @@ fn write_isolated_clone_provenance(
         let _ = std::fs::remove_file(&tmp_path);
         format!("failed to finalize isolated-clone provenance artifact: {e}")
     })
+}
+
+/// PRD fork#544 M5: the only deliberate way a named workspace is ever
+/// cleared — modeled on this codebase's existing `issue claim --takeover
+/// --confirm-stopped` pattern (refuse by default, require an explicit
+/// confirming flag) rather than on
+/// [`crate::worktree_reclaim::remove_isolated_clone_dir`]. That function's
+/// checks (branch re-resolution, a clean tree, an empty stash list, and —
+/// the one that actually rules it out — the clone's HEAD matching a
+/// **merged PR's** `headRefOid`) all encode "this was already reclaimed
+/// after its PR merged"; a persistent workspace being explicitly forgotten
+/// has no such PR, may be mid-work, and may carry uncommitted changes the
+/// caller has every right to discard on purpose. Requiring those
+/// preconditions here would make `forget` refuse in exactly the cases a
+/// caller asked it to handle. It is also private (`fn`, not `pub(crate)`)
+/// to `worktree_reclaim.rs`. So this reimplements only the directory
+/// removal, not the reclaim-specific revalidation.
+///
+/// Ownership is proven the same way [`resume_existing_isolated_clone`]
+/// already proves it for resume: presence of the M4b provenance artifact
+/// at [`isolated_clone_provenance_path`]. A confirming flag alone only
+/// proves the caller wants to remove *a* workspace of its own — not that
+/// `clone_dir` *is* one, which is exactly the stranger-directory hazard
+/// `ResumeRejection::Stranger` already guards against on the resume side.
+///
+/// `#[allow(dead_code)]`: PRD fork#544 M5 deliberately ships no CLI wiring
+/// yet (that is a later milestone) — this function is exercised directly
+/// by `orchestration/workspace/014`-`017` and nothing else calls it today,
+/// the same honest state [`create_worktree_sync`]'s own `#[allow(dead_code)]`
+/// documents rather than papering over with a synthetic caller.
+#[allow(dead_code)]
+pub(crate) fn forget_isolated_workspace(
+    clone_dir: &Path,
+    confirmed: bool,
+    remover: &str,
+) -> Result<(), String> {
+    if !confirmed {
+        return Err(
+            "refusing to forget: pass an explicit confirming flag to acknowledge that this \
+             permanently removes the workspace directory and its provenance record -- nothing \
+             was touched"
+                .to_string(),
+        );
+    }
+
+    let marker_path = isolated_clone_provenance_path(clone_dir);
+    if !marker_path.is_file() {
+        return Err(format!(
+            "refusing to forget {}: no M4b ownership evidence found for this workspace \
+             (expected a provenance artifact at {}) -- it may never have been created by this \
+             deck, or may already have been forgotten",
+            clone_dir.display(),
+            marker_path.display()
+        ));
+    }
+
+    // Tolerate the directory already being gone (fork#325/M4b's own
+    // `remove_isolated_clone_dir` precedent): the provenance artifact is
+    // the durable ownership record, so a caller retrying a forget whose
+    // directory removal previously succeeded but whose artifact removal
+    // then failed must still be able to finish the job.
+    if let Err(e) = std::fs::remove_dir_all(clone_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!(
+            "failed to remove workspace directory {} (requested by {remover}): {e}",
+            clone_dir.display()
+        ));
+    }
+    std::fs::remove_file(&marker_path).map_err(|e| {
+        format!(
+            "failed to remove provenance artifact {} (requested by {remover}): {e}",
+            marker_path.display()
+        )
+    })?;
+
+    // Issue #325 / reviewer B1 / auditor F2 precedent, carried to this
+    // removal path too: the ONLY durable trace of a confirmed removal.
+    // `remover` is an unauthenticated, caller-supplied string, sanitized
+    // here exactly as `remove_isolated_clone_dir` sanitizes its own.
+    tracing::info!(
+        path = %sanitize_path_for_terminal_display(clone_dir),
+        remover = %sanitize_for_terminal_display(remover),
+        "isolated workspace forgotten"
+    );
+    Ok(())
 }
 
 /// PRD fork#544 M3: distinguishable refusal reasons for
