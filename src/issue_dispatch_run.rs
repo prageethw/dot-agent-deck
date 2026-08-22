@@ -2774,7 +2774,19 @@ fn isolated_clone_provenance_field(content: &str, key: &str) -> Option<String> {
 /// [`crate::worktree_reclaim::sanitize_marker_creator`] (reused rather than
 /// inventing a second sanitizer) before being interpolated into the raw
 /// `key=value` content below, so a `name`/`creator` containing an embedded
-/// `\n` can't forge additional records into the artifact.
+/// `\n` can't forge additional records into the artifact. `path`, by
+/// contrast, is NOT sanitized -- it is the canonicalized `clone_dir` itself,
+/// not free text -- so PRD fork#544 review-findings fix round 3 (N3) writes
+/// `creator=` (and `name=`) BEFORE `path=` in the content below, not after:
+/// [`isolated_clone_provenance_field`]'s read side returns the FIRST line
+/// matching a given key, so an unsanitized `path` value that somehow
+/// embedded its own `\ncreator=...` line could otherwise inject a forged
+/// `creator=` record ahead of the real one. With `creator=` written first,
+/// any such embedded line would land on a LATER line instead and never be
+/// the one returned. Same-uid, self-directed severity either way (a
+/// malformed `path` would already have failed the checkout that produces
+/// `clone_dir` in the first place), but this ordering costs nothing to get
+/// right.
 ///
 /// Atomic write-then-rename, mirroring [`mark_worktree_owned`]'s own
 /// pattern in `worktree_reclaim.rs` for the identical reason: on ENOSPC or
@@ -2826,7 +2838,7 @@ fn write_isolated_clone_provenance(
     let safe_name = crate::worktree_reclaim::sanitize_marker_creator(name);
     let safe_creator = crate::worktree_reclaim::sanitize_marker_creator(creator);
     let content = format!(
-        "schema=2\nroot-hash={root_hash:016x}\nname={safe_name}\npath={}\ncreator={safe_creator}\n",
+        "schema=2\nroot-hash={root_hash:016x}\nname={safe_name}\ncreator={safe_creator}\npath={}\n",
         canonical_clone_dir.display()
     );
 
@@ -3074,6 +3086,37 @@ pub(crate) fn sync_merged_workspace_to_main(
     clone_dir: &Path,
     default_branch: &str,
 ) -> Result<PostMergeSyncOutcome, String> {
+    // Reviewer S4 / auditor F3 (PRD fork#544 review-findings fix round 3):
+    // a `default_branch` git itself refuses to CREATE as a real branch is
+    // never a valid input to this function. The `update-ref` route further
+    // down was chosen specifically BECAUSE it sidesteps `check-ref-format`'s
+    // branch-CREATION validation (see that call's own doc comment) -- which
+    // means an adversarial-looking `default_branch` (`--detach`; `HEAD`
+    // itself, which `git check-ref-format --branch` genuinely also rejects,
+    // verified empirically) would otherwise get written as a literal ref
+    // via `update-ref` rather than refused, and every later git invocation
+    // against this workspace then inherits that as a live hazard --
+    // `refs/heads/HEAD` in particular permanently breaks `rev-parse
+    // --abbrev-ref HEAD`, this function's own dependency further down.
+    // Validate up front, before touching the workspace at all, and refuse
+    // outright rather than proceeding to manufacture an illegal ref.
+    if run_status_sync(
+        "git",
+        &[
+            "check-ref-format".to_string(),
+            "--branch".to_string(),
+            default_branch.to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .is_err()
+    {
+        return Err(format!(
+            "refusing to sync {}: {default_branch:?} is not a valid git branch name",
+            clone_dir.display()
+        ));
+    }
+
     let clone_dir_str = clone_dir.to_string_lossy().into_owned();
 
     let status_stdout = run_capture_sync(
@@ -3261,6 +3304,43 @@ pub(crate) fn sync_merged_workspace_to_main(
                 clone_dir.display()
             ));
         }
+
+        // Reviewer S3 (PRD fork#544 review-findings fix round 3): `update-ref`
+        // above writes only the ref itself -- no tracking configuration at
+        // all, unlike ordinary DWIM branch creation -- which directly
+        // contradicts this whole mechanism's own stated purpose ("so
+        // ahead/behind info stays accurate," which needs an upstream to even
+        // compute). `git branch --set-upstream-to` is not subject to
+        // `check-ref-format`'s branch-CREATION validation the way `git
+        // branch`/`git switch`'s own DWIM is -- only ref CREATION is what
+        // `update-ref` was chosen to sidestep, and this sets tracking on a
+        // ref that already exists -- so this doesn't reopen the hazard
+        // `update-ref` exists to avoid. A hard error, not a best-effort
+        // warning: `remote_ref` was just used to create `local_branch_ref`
+        // above, so it is already known to resolve, and silently swallowing
+        // a failure here would silently reproduce the exact bug this fixes.
+        let set_upstream_status = run_status_sync(
+            "git",
+            &[
+                "-C".to_string(),
+                clone_dir_str.clone(),
+                "branch".to_string(),
+                format!("--set-upstream-to={remote_ref}"),
+                "--".to_string(),
+                default_branch.to_string(),
+            ],
+            WORKTREE_GIT_TIMEOUT,
+        );
+        if let Err(e) = set_upstream_status {
+            let msg = match e {
+                AddError::TimedOut(m) | AddError::Failed(m) => m,
+            };
+            return Err(format!(
+                "failed to set upstream tracking for the newly created {default_branch} to \
+                 {remote_ref} in {}: {msg}",
+                clone_dir.display()
+            ));
+        }
     }
 
     let switch_status = run_status_sync(
@@ -3368,10 +3448,23 @@ pub(crate) enum ResumeRejection {
     /// directory this deck never created (or wrote evidence for) at this
     /// exact location.
     Stranger,
-    /// M4b evidence is present, but `clone_dir`'s origin/shared history
-    /// does not match `source_dir` — the same Name typed against a
-    /// different underlying project (Problem Statement #4).
+    /// M4b evidence is present, but `clone_dir`'s origin/shared history is
+    /// PROVEN not to match `source_dir` — the same Name typed against a
+    /// different underlying project (Problem Statement #4): either the two
+    /// sides' `origin` URLs genuinely disagree, or `git merge-base` ran to
+    /// completion and reported no common ancestor (exit 1).
     AncestryMismatch,
+    /// PRD fork#544 review-findings fix round 3 (reviewer S1): the ancestry
+    /// probe could not reach a verdict either way — `git merge-base` never
+    /// got to run a conclusive comparison (its own best-effort fetch to
+    /// pull in a missing object failed, or the probe itself failed to
+    /// spawn), so there is no positive evidence the two sides share history
+    /// AND no proof they don't. Refused the same as [`Self::AncestryMismatch`]
+    /// (no positive evidence of shared history means no resume), but kept
+    /// distinguishable from it: unlike a proven mismatch, this is not
+    /// evidence the directory belongs to a different project, so
+    /// [`Self::describe`]'s "remove it manually" advice does not apply here.
+    AncestryUnverifiable,
     /// The directory's git state could not be read (`git rev-parse HEAD`
     /// failed) — refused only, never auto-deleted or auto-repaired.
     Unhealthy,
@@ -3408,6 +3501,11 @@ impl ResumeRejection {
                 "the existing directory's history does not match this project (wrong repo, or \
                  stale) — remove it manually, or pick a different Name"
             }
+            Self::AncestryUnverifiable => {
+                "the existing directory's history could not be compared against this project \
+                 right now (a network or permission problem, not a proven mismatch) — try \
+                 again"
+            }
             Self::Unhealthy => {
                 "the existing directory's git state could not be read (it may be corrupt or \
                  mid-delete) — it was left untouched; repair or remove it manually"
@@ -3416,8 +3514,8 @@ impl ResumeRejection {
             Self::NameCollision => {
                 "a different orchestration Name already opened the workspace at this location \
                  (its provenance record names a different creator) — the two Names sanitize to \
-                 the same directory; pick a different Name, or remove the existing directory \
-                 manually"
+                 the same directory; pick a different Name instead of this one. It may still be \
+                 in use by the orchestration that opened it — do not remove it"
             }
         }
     }
@@ -3518,10 +3616,18 @@ fn resume_existing_isolated_clone(
     if !isolated_clone_git_state_readable(clone_dir) {
         return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Unhealthy));
     }
-    if !isolated_clone_ancestry_matches_source(source_dir, clone_dir) {
-        return Ok(IsolatedCloneOutcome::Rejected(
-            ResumeRejection::AncestryMismatch,
-        ));
+    match isolated_clone_ancestry_matches_source(source_dir, clone_dir) {
+        AncestryProbe::Matches => {}
+        AncestryProbe::ProvenMismatch => {
+            return Ok(IsolatedCloneOutcome::Rejected(
+                ResumeRejection::AncestryMismatch,
+            ));
+        }
+        AncestryProbe::Unverifiable => {
+            return Ok(IsolatedCloneOutcome::Rejected(
+                ResumeRejection::AncestryUnverifiable,
+            ));
+        }
     }
 
     let canonical = canonicalize_best_effort(clone_dir);
@@ -3603,6 +3709,27 @@ fn resume_existing_isolated_clone(
     Ok(IsolatedCloneOutcome::Resumed { fetch_warning })
 }
 
+/// [`isolated_clone_ancestry_matches_source`]'s three-way verdict — kept
+/// distinct from a plain `bool` (PRD fork#544 review-findings fix round 3,
+/// reviewer S1) so its caller can refuse a PROVEN mismatch
+/// ([`Self::ProvenMismatch`]) differently from a probe that simply could
+/// not reach a verdict ([`Self::Unverifiable`]) — see
+/// [`ResumeRejection::AncestryUnverifiable`]'s own doc comment for why that
+/// distinction matters to a caller.
+enum AncestryProbe {
+    /// Positive evidence of shared history (or both sides genuinely have no
+    /// `origin` configured, the expected shape for that case).
+    Matches,
+    /// Positive evidence the two sides do NOT share history: the `origin`
+    /// URLs disagree, or `git merge-base` ran to completion and reported no
+    /// common ancestor (exit 1) between two commits it could actually
+    /// resolve.
+    ProvenMismatch,
+    /// The probe never reached a conclusive comparison — no positive
+    /// evidence either way.
+    Unverifiable,
+}
+
 /// PRD fork#544 M3 check (c): does `clone_dir`'s history genuinely derive
 /// from `source_dir`, rather than an unrelated repository that merely
 /// landed on the same canonical path? Two signals, both must hold when
@@ -3626,68 +3753,125 @@ fn resume_existing_isolated_clone(
 ///   past it (the everyday steady state this PRD exists to support). A
 ///   plain merge-base, with neither side pinned to "must contain the
 ///   other," is symmetric: it passes whichever side has since moved on.
-///   Preceded by a best-effort `git fetch` directly from `source_dir`'s own
-///   path (not `origin`, which may not exist at all when `source_dir` has
-///   none configured — see [`remove_isolated_clone_origin_default`]) so
-///   `source_dir`'s new commits, unreachable from anything `clone_dir`
-///   already had, become real objects in `clone_dir`'s own database before
-///   the probe runs.
-fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -> bool {
+///
+/// PRD fork#544 review-findings fix round 3 (auditor F1, reviewer S1/S2):
+/// the merge-base probe now runs FIRST, against whatever `clone_dir`'s
+/// object database already has, with NO fetch beforehand — the fetch used
+/// to run unconditionally, which (a) is exactly the untrusted-`clone_dir`
+/// code-execution exposure `spawn_git_status_child`'s new `-c
+/// core.fsmonitor=` hardening (above) closes the fsmonitor half of, so
+/// skipping the fetch whenever it isn't needed reduces exposure to that
+/// residual further still; and (b) meant a colliding-Name `NameCollision`
+/// resume (checked further down in `resume_existing_isolated_clone`, AFTER
+/// this probe) or a wrong-repo `AncestryMismatch` refusal
+/// (`orchestration/workspace/007`) both wrote `git fetch` traffic into a
+/// directory this call has no business touching before ever discovering
+/// that. The common steady-state case — a workspace resumed more than
+/// once, where a prior resume's own fetch already pulled `source_dir`'s
+/// then-current HEAD in — now resolves via this first probe alone, no
+/// fetch at all. Only when this first attempt fails with exit 128
+/// (`source_head`'s object is genuinely missing from `clone_dir`'s
+/// database — not exit 1, a proven mismatch, which is conclusive on its
+/// own) does this fall back to a best-effort `git fetch` directly from
+/// `source_dir`'s own path (not `origin`, which may not exist at all when
+/// `source_dir` has none configured — see
+/// [`remove_isolated_clone_origin_default`]) followed by a retry of the
+/// same probe. A failure at any other point (spawn failure, or the fetch
+/// itself failing, or the object still missing after the fetch) resolves to
+/// [`AncestryProbe::Unverifiable`], never silently reused as
+/// [`AncestryProbe::ProvenMismatch`] (that describe()'s "remove it
+/// manually" advice does not apply to a probe that was simply unable to
+/// run, e.g. a permission error reading the source's own new commit
+/// object — `orchestration/workspace/031`).
+fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -> AncestryProbe {
     if let (Some(source_url), Some(clone_url)) = (
         read_source_origin_url(source_dir),
         read_source_origin_url(clone_dir),
     ) && source_url != clone_url
     {
-        return false;
+        return AncestryProbe::ProvenMismatch;
     }
 
     let Some(source_head) = isolated_clone_head_sha(source_dir) else {
-        return false;
+        return AncestryProbe::Unverifiable;
     };
 
     let clone_dir_str = clone_dir.to_string_lossy().into_owned();
-    // Best-effort: bring source_dir's own objects (including anything it
-    // has committed since clone_dir was created) directly into clone_dir's
-    // database. A failure here isn't fatal -- the probe below just runs
-    // against whatever clone_dir's database already has, same as before
-    // this fetch existed.
-    let _ = run_status_sync(
-        "git",
-        &[
-            "-C".to_string(),
-            clone_dir_str.clone(),
-            "fetch".to_string(),
-            "--quiet".to_string(),
-            "--".to_string(),
-            source_dir.to_string_lossy().into_owned(),
-        ],
-        WORKTREE_GIT_TIMEOUT,
-    );
 
+    if let MergeBaseAttempt::MissingObject = merge_base_attempt(&clone_dir_str, &source_head) {
+        // Exit 128 only -- source_head's object isn't in clone_dir's
+        // database yet. Best-effort: bring source_dir's own objects
+        // (including anything it has committed since clone_dir was
+        // created) directly into clone_dir's database, then retry once. A
+        // failure here isn't fatal on its own -- the retry below just runs
+        // against whatever clone_dir's database already has, same as if
+        // the fetch had never existed.
+        let _ = run_status_sync(
+            "git",
+            &[
+                "-C".to_string(),
+                clone_dir_str.clone(),
+                "fetch".to_string(),
+                "--quiet".to_string(),
+                "--".to_string(),
+                source_dir.to_string_lossy().into_owned(),
+            ],
+            WORKTREE_GIT_TIMEOUT,
+        );
+        return match merge_base_attempt(&clone_dir_str, &source_head) {
+            MergeBaseAttempt::Matches => AncestryProbe::Matches,
+            MergeBaseAttempt::ProvenMismatch => AncestryProbe::ProvenMismatch,
+            MergeBaseAttempt::MissingObject | MergeBaseAttempt::Failed => {
+                AncestryProbe::Unverifiable
+            }
+        };
+    }
+
+    match merge_base_attempt(&clone_dir_str, &source_head) {
+        MergeBaseAttempt::Matches => AncestryProbe::Matches,
+        MergeBaseAttempt::ProvenMismatch => AncestryProbe::ProvenMismatch,
+        MergeBaseAttempt::MissingObject | MergeBaseAttempt::Failed => AncestryProbe::Unverifiable,
+    }
+}
+
+/// The four distinguishable outcomes of a single `git merge-base
+/// <source_head> HEAD` attempt inside `clone_dir`, as run by
+/// [`isolated_clone_ancestry_matches_source`] both before and (when this
+/// first came back [`Self::MissingObject`]) after its best-effort fetch.
+/// Kept as its own enum, rather than folding into [`AncestryProbe`]
+/// directly, so that caller can retry ONLY on the specific exit-128 case
+/// the fetch might actually resolve -- any other failure (a spawn error,
+/// or any exit code other than 0/1/128) is not something a fetch from
+/// `source_dir` could plausibly fix, so it resolves straight to
+/// [`AncestryProbe::Unverifiable`] without a second, pointless attempt.
+enum MergeBaseAttempt {
+    /// Exit 0: a merge base was found -- source_dir's HEAD and clone_dir's
+    /// own current HEAD share history, regardless of which side has since
+    /// advanced past the other.
+    Matches,
+    /// Exit 1: git ran fine and found no common ancestor between two
+    /// resolvable commits -- a genuine, conclusive ancestry mismatch
+    /// (`orchestration/workspace/007`'s unrelated second source).
+    ProvenMismatch,
+    /// Exit 128: `source_head`'s object is not yet in `clone_dir`'s
+    /// database -- inconclusive, and specifically the one case a fetch
+    /// from `source_dir` might resolve.
+    MissingObject,
+    /// Any other exit code, or the probe failing to spawn at all --
+    /// inconclusive, and not something retrying after a fetch would help.
+    Failed,
+}
+
+fn merge_base_attempt(clone_dir_str: &str, source_head: &str) -> MergeBaseAttempt {
     match spawn_and_wait_sync(
         "git",
-        &["-C", &clone_dir_str, "merge-base", &source_head, "HEAD"],
+        &["-C", clone_dir_str, "merge-base", source_head, "HEAD"],
         WORKTREE_GIT_TIMEOUT,
     ) {
-        // A merge base was found: source_dir's HEAD and clone_dir's own
-        // current HEAD share history, regardless of which side has since
-        // advanced past the other.
-        Ok(out) if out.status.success() => true,
-        // Exit 1: git ran fine and found no common ancestor between two
-        // resolvable commits -- a genuine ancestry mismatch
-        // (`orchestration/workspace/007`'s unrelated second source, whose
-        // own HEAD the fetch above DOES bring in, since it's a real,
-        // reachable repository -- it simply shares no history with
-        // clone_dir).
-        //
-        // Anything else (exit 128 -- source_head's object still isn't in
-        // clone_dir's database even after the fetch above, e.g. a
-        // dangling commit unreachable from any ref in source_dir -- or the
-        // probe failing to spawn at all) is inconclusive rather than a
-        // proven mismatch, but there is no positive evidence of shared
-        // history either, so this refuses the same as a genuine mismatch
-        // rather than silently vouching for it.
-        _ => false,
+        Ok(out) if out.status.success() => MergeBaseAttempt::Matches,
+        Ok(out) if out.status.code() == Some(1) => MergeBaseAttempt::ProvenMismatch,
+        Ok(out) if out.status.code() == Some(128) => MergeBaseAttempt::MissingObject,
+        _ => MergeBaseAttempt::Failed,
     }
 }
 
@@ -4573,9 +4757,34 @@ fn spawn_git_status_child(
     std::process::Child,
     crate::platform::proc::AgentProcessGroup,
 )> {
+    // PRD fork#544 review-findings fix round 3 (auditor F1/F2): every call
+    // through this shared core now also carries `-c core.fsmonitor=`, the
+    // same override `crate::worktree_reclaim::git_in_untrusted_dir` applies
+    // for exactly the same reason -- several of this module's callers (the
+    // resume arm's ancestry/fetch probes chief among them) run `git` inside
+    // a `clone_dir` this process did not just create and cannot vouch for,
+    // and a forged `core.fsmonitor` in that directory's own `.git/config` is
+    // a same-uid code-execution vector through a plain `git
+    // status`/`git fetch`. Applied here, in the one shared spawn core,
+    // rather than at each of this module's own call sites individually -- a
+    // caller genuinely operating in a directory it just created (e.g. the
+    // initial `git clone` itself) pays a harmless no-op, the same tradeoff
+    // `check_cleanliness`'s doc comment in `worktree_reclaim.rs` already
+    // accepts for its own always-hardened calls. This blocks the fsmonitor
+    // vector specifically; it does NOT close every same-uid config-driven
+    // vector reachable through an untrusted `.git/config`
+    // (`remote.<name>.uploadpack` on `fetch`, `filter.<driver>.clean`,
+    // `core.hooksPath`, `diff.external` chief among the residuals) -- see
+    // `isolated_clone_ancestry_matches_source`'s own doc comment for the one
+    // still open and why.
+    let mut hardened_args: Vec<&str> = Vec::with_capacity(args.len() + 2);
+    hardened_args.push("-c");
+    hardened_args.push("core.fsmonitor=");
+    hardened_args.extend_from_slice(args);
+
     let mut command = std::process::Command::new(program);
     command
-        .args(args)
+        .args(&hardened_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4625,6 +4834,36 @@ fn spawn_and_wait_sync(
     let (mut child, group) = spawn_git_status_child(program, args)
         .map_err(|e| AddError::Failed(format!("failed to run `{program}`: {e}")))?;
 
+    // PRD fork#544 review-findings fix round 3 (auditor F4): drain stdout
+    // and stderr on their own reader threads CONCURRENTLY with waiting for
+    // the child below, rather than sequentially after `try_wait` reports
+    // exit. A command whose own output exceeds the OS pipe buffer (e.g.
+    // `git status --porcelain` on a busy workspace, comfortably over the
+    // usual ~64KiB) blocks the CHILD writing to a full pipe while nothing
+    // is reading it -- and since this whole function runs on the TUI's
+    // synchronous render/event loop (fork issue #136's own doc comment
+    // below), that block reaches all the way up to the UI, stalling it for
+    // up to the full `timeout` before this call fails closed. Taking the
+    // pipes now, before the wait loop, and handing each to its own thread
+    // means the child is never blocked on a full pipe regardless of how
+    // long `try_wait` takes to report exit.
+    let stdout_reader = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -4637,14 +4876,12 @@ fn spawn_and_wait_sync(
                     // `post-checkout`) running past this bound. `child` leads
                     // its own group on Unix (see `spawn_git_status_child` /
                     // `spawn_in_new_process_group`), so `killpg` here reaches
-                    // it and everything it forked.
-                    //
-                    // Fork issue #136: the detached-reap variant, not the
-                    // synchronous one — this call runs on the TUI's
-                    // synchronous render/event loop (this function's only
-                    // caller path from `dispatch_action`), so the final
-                    // reap must not block here. See that function's doc
-                    // comment for why.
+                    // it and everything it forked. The reader threads above
+                    // are left to finish on their own -- killing the child
+                    // closes its end of each pipe, so each thread's
+                    // `read_to_end` returns on its own; this call already
+                    // discards their output on the timeout path below, so
+                    // there is nothing to join.
                     let boxed: Box<dyn portable_pty::Child + Send + Sync> =
                         Box::new(crate::platform::proc::test_child::StdChild(child));
                     crate::platform::proc::terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
@@ -4667,16 +4904,15 @@ fn spawn_and_wait_sync(
         }
     };
 
-    let mut stdout = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        use std::io::Read;
-        let _ = out.read_to_end(&mut stdout);
-    }
-    let mut stderr = Vec::new();
-    if let Some(mut err) = child.stderr.take() {
-        use std::io::Read;
-        let _ = err.read_to_end(&mut stderr);
-    }
+    // The child has exited, so each pipe's write end is closed and its
+    // reader thread's `read_to_end` has already returned or is about to --
+    // `join` here is bounded by that, not by anything still running.
+    let stdout = stdout_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
     Ok(SyncGitOutput {
         status,
         stdout,
@@ -8600,21 +8836,32 @@ exit 0
         }
     }
 
-    /// Scenario: PRD fork#544 review-findings fix round (auditor A5).
-    /// `sync_merged_workspace_to_main`'s own checkout call
-    /// (`.args(["checkout", "--quiet", default_branch])`) has no `--`
-    /// end-of-options separator before `default_branch`, unlike its `merge`
-    /// call 18 lines later which does have one. A real git branch can never
-    /// literally be named e.g. `"--detach"` (`git branch -- --detach` is
-    /// itself refused by `git check-ref-format`, verified empirically), so
-    /// this test plants the adversarial-looking remote-tracking ref
-    /// directly with `git update-ref` -- the closest a real repository can
-    /// get to reproducing what the missing separator actually does: lets an
-    /// option-shaped `default_branch` value be consumed as a FLAG rather
-    /// than the branch to check out.
+    /// Scenario: PRD fork#544 review-findings fix round (auditor A5),
+    /// RE-SCOPED in fix round 3 (auditor F3 / reviewer S4). The original
+    /// form of this test pinned auditor A5's fix -- a missing `--`
+    /// end-of-options separator on the checkout call let an option-shaped
+    /// `default_branch` (`--detach`) silently detach HEAD instead of
+    /// landing on the named branch. Round 3 goes further: rather than only
+    /// making the checkout/switch call SAFE for an adversarial name, it
+    /// validates `default_branch` via `git check-ref-format --branch`
+    /// before touching the workspace at all, and refuses outright -- `git
+    /// check-ref-format --branch -- --detach` itself rejects `--detach` as
+    /// not a valid branch name, verified empirically, so this function no
+    /// longer needs to be safe AGAINST that name; it never manufactures a
+    /// real local branch literally named `--detach` via `update-ref` in the
+    /// first place (auditor F3: exactly that unvalidated `update-ref` was
+    /// the other place `--detach` could still land as a real ref, unrelated
+    /// to A5's checkout/switch fix). `git branch` (and therefore `git
+    /// fetch`, which mirrors the source's own branches) still refuses to
+    /// ever create a real ref component starting with '-', so this test
+    /// still plants the adversarial-looking remote-tracking ref directly
+    /// with `git update-ref` to reproduce the same starting shape the
+    /// original test did -- not because the validation needs it (it runs
+    /// before this ref is ever consulted), but so this stays the same
+    /// fixture rather than a weaker one.
     #[spec("orchestration/workspace/028")]
     #[test]
-    fn workspace_028_checkout_missing_separator_detaches_head_on_adversarial_branch_name() {
+    fn workspace_028_adversarial_branch_name_refused_before_touching_workspace() {
         let ws = tempfile::tempdir().unwrap();
 
         let origin_repo = ws.path().join("origin");
@@ -8635,31 +8882,34 @@ exit 0
         // therefore `git fetch`, which mirrors the source's own branches)
         // refuses to ever create a real ref component starting with '-',
         // so `update-ref` is the only way to construct this fixture at all.
-        // Points at the clone's own current HEAD, so the ancestry
-        // precondition below trivially holds without needing a separate
-        // "merge landed" simulation.
+        // Points at the clone's own current HEAD, so (if validation did not
+        // refuse first) the ancestry precondition would trivially hold too.
         let head = head_sha(&clone_dir);
         git(
             &clone_dir,
             &["update-ref", "refs/remotes/origin/--detach", &head],
         );
+        let starting_branch = git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
 
         let result = sync_merged_workspace_to_main(&clone_dir, "--detach");
 
         assert!(
-            matches!(result, Ok(PostMergeSyncOutcome::SwitchedToMain)),
-            "setup: both preconditions (clean tree; HEAD already equals origin/--detach) must \
-             hold so this genuinely reaches the checkout step, got {result:?}"
+            matches!(result, Err(ref msg) if msg.contains("--detach")),
+            "reviewer S4 / auditor F3: a `default_branch` git itself refuses to CREATE as a \
+             real branch (here '--detach', which `git check-ref-format --branch` itself \
+             rejects) must be refused up front as a clean `Err` naming the offending value, \
+             never proceed to manufacture an illegal ref via `update-ref` -- got {result:?}"
         );
-        assert_ne!(
+        assert_eq!(
             git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "HEAD",
-            "auditor A5: `git checkout --quiet {{default_branch}}` with no `--` separator lets \
-             an option-shaped `default_branch` value (here '--detach') be consumed as an OPTION \
-             rather than the branch to check out -- the checkout silently DETACHES HEAD instead \
-             of actually landing the workspace on the named branch. `git rev-parse --abbrev-ref \
-             HEAD` reports the literal string \"HEAD\" only when detached, which is what it \
-             reports today"
+            starting_branch,
+            "an up-front refusal must leave the workspace completely untouched -- still on \
+             whatever branch it started on, not detached and not switched onto anything"
+        );
+        assert!(
+            !clone_dir.join(".git/refs/heads/--detach").exists(),
+            "an up-front refusal must never reach the `update-ref` call that would otherwise \
+             create a real local branch literally named '--detach'"
         );
     }
 
