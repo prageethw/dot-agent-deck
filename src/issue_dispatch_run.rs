@@ -3203,8 +3203,66 @@ pub(crate) fn sync_merged_workspace_to_main(
     // `<branch>` as a pathspec, and `checkout <branch> --` still consumes
     // an option-shaped `<branch>` as a flag) -- `git switch`'s `--`
     // genuinely does separate options from the target ref, so this uses
-    // `switch` instead. Same DWIM as `checkout` for a branch that exists
-    // on `origin` only as a remote-tracking ref.
+    // `switch` instead.
+    //
+    // `switch`'s (and `checkout`'s) own DWIM -- creating a local tracking
+    // branch when `default_branch` exists on `origin` only as a
+    // remote-tracking ref -- goes through the SAME `check-ref-format`
+    // branch-name validation `git branch` itself applies, which refuses to
+    // CREATE any ref component starting with `-` (verified empirically:
+    // `git branch --track -- --detach origin/--detach` fails with `fatal:
+    // '--detach' is not a valid branch name`, independent of any `--`
+    // separator anywhere in the invoking argv) -- so DWIM alone can never
+    // land on an adversarial-looking name like `--detach`, regardless of
+    // how the outer command's argv is escaped. `git update-ref`, a
+    // low-level ref write, is NOT subject to that same branch-name
+    // validation, so it is used here to create the local tracking branch
+    // directly when one doesn't already exist -- after which `switch`
+    // above needs no DWIM at all, just a lookup of a ref that's already
+    // there. Only ever creates, never overwrites: an existing local
+    // `default_branch` (the ordinary case, and Fix 5's own diverged-local-
+    // branch scenario) is left exactly as it is, since overwriting it here
+    // would erase the very divergence Fix 5's own restore-on-failure path
+    // depends on being able to see.
+    let local_branch_ref = format!("refs/heads/{default_branch}");
+    let local_branch_exists = spawn_and_wait_sync(
+        "git",
+        &[
+            "-C",
+            &clone_dir_str,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &local_branch_ref,
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .is_ok_and(|out| out.status.success());
+    if !local_branch_exists {
+        let create_local_branch_status = run_status_sync(
+            "git",
+            &[
+                "-C".to_string(),
+                clone_dir_str.clone(),
+                "update-ref".to_string(),
+                "--".to_string(),
+                local_branch_ref,
+                remote_ref.clone(),
+            ],
+            WORKTREE_GIT_TIMEOUT,
+        );
+        if let Err(e) = create_local_branch_status {
+            let msg = match e {
+                AddError::TimedOut(m) | AddError::Failed(m) => m,
+            };
+            return Err(format!(
+                "failed to create a local tracking branch for {default_branch} from \
+                 {remote_ref} in {}: {msg}",
+                clone_dir.display()
+            ));
+        }
+    }
+
     let switch_status = run_status_sync(
         "git",
         &[
@@ -6930,6 +6988,19 @@ exit 0
     /// winner/loser shape applied to a pre-existing (rather than
     /// just-created) directory.
     ///
+    /// PRD fork#544 review-findings fix round (reviewer B2): both racers
+    /// now share the SAME creator string, not two distinct ones. Reviewer
+    /// B2's own fix (`orchestration/workspace/026`) makes a resume refuse
+    /// when the provenance artifact's `creator=` names someone else — the
+    /// correct behavior for two genuinely DIFFERENT orchestration Names
+    /// colliding after sanitization, but wrong for THIS test's own
+    /// scenario: two callers racing to open the SAME Name (hence, in real
+    /// production, the SAME derived `orchestration:<name>` creator) via two
+    /// panes/attempts. Distinct `"racer-a"`/`"racer-b"` strings were never
+    /// a realistic stand-in for that — they simulated a same-Name race
+    /// using two DIFFERENT identities, which is precisely the shape
+    /// `026`'s fix now (correctly) refuses.
+    ///
     /// `#[cfg(unix)]` matches `worktree/create/001`'s own precedent — many
     /// trials of real `git` subprocesses (here, full clones, heavier than
     /// that test's `worktree add`) starved `build-windows`'s shared CI
@@ -6975,11 +7046,11 @@ exit 0
                 let clone_dir_b = clone_dir.clone();
                 let h_a = s.spawn(move || {
                     barrier.wait();
-                    provision_isolated_clone_sync(source, &clone_dir_a, "race", "racer-a")
+                    provision_isolated_clone_sync(source, &clone_dir_a, "race", "racer")
                 });
                 let h_b = s.spawn(move || {
                     barrier.wait();
-                    provision_isolated_clone_sync(source, &clone_dir_b, "race", "racer-b")
+                    provision_isolated_clone_sync(source, &clone_dir_b, "race", "racer")
                 });
                 handles.push((h_a, h_b));
             }
