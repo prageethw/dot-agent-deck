@@ -984,3 +984,416 @@ fn workspace_002_naming_is_deterministic_from_name_alone_across_separate_runs() 
          `orchestrator-N`"
     );
 }
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture, open its one
+/// orchestration under a fixed Name, write an uncommitted change and make a
+/// local-only commit directly in the resulting workspace, close the whole
+/// tab (Ctrl+D -> Ctrl+W -> confirm), then reopen the SAME orchestration
+/// under the IDENTICAL Name a second time. PRD fork#544 M3: the second open
+/// must RESUME the existing workspace directory rather than refuse it — the
+/// exact directory, with the uncommitted file and the local-only commit
+/// both still present, byte-identical, never a fresh clone and never the
+/// blanket "already exists" refusal today's pre-M3 code reports for every
+/// present-directory case.
+#[spec("orchestration/workspace/003")]
+#[test]
+fn workspace_003_reopening_same_name_resumes_existing_workspace_preserving_local_state() {
+    const NAME: &str = "workspace003fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+
+    // --- First open: creates the workspace. ---
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let owner = format!("orchestration:{NAME}");
+    let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
+    });
+    assert_eq!(
+        pwd, expected_path,
+        "sanity: the first open must land at the derived workspace path, matching workspace_001"
+    );
+
+    // Write an uncommitted change AND make a local-only commit directly in
+    // the workspace — the exact state a resumed session must never lose
+    // (the PRD's own biggest-hazard mitigation: zero destructive git
+    // mutation on resume).
+    let uncommitted_path = pwd.join("uncommitted-003.txt");
+    let uncommitted_content = "uncommitted change made before closing\n";
+    std::fs::write(&uncommitted_path, uncommitted_content)
+        .expect("write uncommitted file into the workspace");
+
+    let local_only_path = pwd.join("local-only-003.txt");
+    std::fs::write(&local_only_path, "local-only commit content\n")
+        .expect("write local-only file into the workspace");
+    run_git(&pwd, &["add", "local-only-003.txt"]);
+    run_git(
+        &pwd,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "local-only commit before close",
+        ],
+    );
+    let head_before_close = head_sha(&pwd);
+
+    // --- Close the whole tab. ---
+    deck.send_keys(b"\x04"); // Ctrl+D -> command mode
+    deck.send_keys(b"\x17"); // Ctrl+W -> arm close confirmation
+    deck.wait_for_string("Close this tab and all its panes?");
+    deck.send_keys(b"\x1b[B"); // Down -> select Close
+    deck.send_keys(b"\r"); // Enter -> confirm
+    deck.wait_for_string("No active sessions"); // back to an empty Dashboard
+
+    // The workspace directory itself must never be removed by closing its
+    // tab (PRD fork#544 M6/M4c: persistence is a decision, not an absence).
+    assert!(
+        pwd.is_dir(),
+        "the workspace directory at {} must still exist on disk after closing its tab",
+        pwd.display()
+    );
+
+    // --- Second open: same fixture, same directory-picker target, same
+    // typed Name — PRD fork#544 M3's resume arm. ---
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    common::wait_for_file_lines(&log_path, 2, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the resumed role pane must have appended a second owner+pwd line to {log_path:?}: \
+             {e}\n=== rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    let contents_after =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    // Last-line-wins by owner (matching `worktree_014`/`016`'s own idiom):
+    // the SAME owner string is written by both opens, so the FIRST match
+    // alone (`pwd_for_owner`) would silently keep proving the first open's
+    // path even if resume actually landed somewhere else.
+    let mut pwd_by_owner: HashMap<String, PathBuf> = HashMap::new();
+    for line in contents_after.lines() {
+        if let Some((o, p)) = line.split_once(' ') {
+            pwd_by_owner.insert(o.to_string(), PathBuf::from(p));
+        }
+    }
+    let pwd_after = pwd_by_owner.get(&owner).unwrap_or_else(|| {
+        panic!(
+            "no line in {log_path:?} for owner {owner:?} after reopening; got: {contents_after:?}"
+        )
+    });
+
+    assert_eq!(
+        pwd_after, &pwd,
+        "PRD fork#544 M3: reopening under the IDENTICAL Name must RESUME the exact SAME \
+         workspace directory, never a different/freshly-numbered one"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&uncommitted_path).unwrap_or_else(|e| panic!(
+            "read back uncommitted file {uncommitted_path:?} after reopening: {e}"
+        )),
+        uncommitted_content,
+        "the uncommitted change made before closing must still be present, byte-identical, \
+         after resuming — resume must perform ZERO destructive git mutation"
+    );
+
+    assert_eq!(
+        head_sha(&pwd),
+        head_before_close,
+        "the local-only commit made before closing must still be the workspace's HEAD after \
+         resuming — resume must never rebase, merge, or otherwise move the checked-out branch"
+    );
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture with the
+/// launch directory's `origin` pointed at a REAL, separately-advanceable
+/// local repository, open its one orchestration under a fixed Name, close
+/// the whole tab, advance that real "upstream" repository with extra
+/// commits while the workspace is closed, then reopen under the IDENTICAL
+/// Name. PRD fork#544 M3: resume must perform EXACTLY one read-only `git
+/// fetch` (updating only the `origin/<default-branch>` remote-tracking ref)
+/// and ZERO other git mutation — the checked-out branch's own HEAD commit
+/// must be byte-identical before and after, even though `origin` has
+/// genuinely moved ahead in the meantime.
+#[spec("orchestration/workspace/004")]
+#[test]
+fn workspace_004_resume_fetches_read_only_and_leaves_checked_out_branch_untouched() {
+    const NAME: &str = "workspace004fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+    let default_branch = current_branch(&work);
+
+    // A REAL, separately-advanceable local repository as `origin` — unlike
+    // the other tests in this family, this one is a genuine local clone the
+    // resumed workspace's own `git fetch origin` can actually reach, not an
+    // unreachable `https://example.invalid/...` placeholder.
+    let upstream_root = common::race_safe_tempdir();
+    let upstream = upstream_root.path().join("upstream");
+    run_git(
+        upstream_root.path(),
+        &[
+            "clone",
+            "-q",
+            work.to_str().expect("work path must be valid UTF-8"),
+            upstream
+                .to_str()
+                .expect("upstream path must be valid UTF-8"),
+        ],
+    );
+    run_git(
+        &work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            upstream
+                .to_str()
+                .expect("upstream path must be valid UTF-8"),
+        ],
+    );
+
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let owner = format!("orchestration:{NAME}");
+    let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
+    });
+
+    assert_eq!(
+        remote_origin_url(&pwd).as_deref(),
+        Some(
+            upstream
+                .to_str()
+                .expect("upstream path must be valid UTF-8")
+        ),
+        "sanity: the isolated clone's origin must be the source's own real origin URL"
+    );
+
+    let head_before_close = head_sha(&pwd);
+
+    // --- Close the whole tab. ---
+    deck.send_keys(b"\x04");
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close this tab and all its panes?");
+    deck.send_keys(b"\x1b[B");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("No active sessions");
+
+    // Advance the real upstream repository while the workspace is closed —
+    // extra commits the resumed workspace's own checked-out branch (its own
+    // NAME branch, forked off the ORIGINAL source HEAD) must never pick up
+    // automatically, but the `origin/<default-branch>` remote-tracking ref
+    // SHOULD reflect once resumed.
+    for msg in ["extra-upstream-1", "extra-upstream-2"] {
+        run_git(
+            &upstream,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                msg,
+            ],
+        );
+    }
+    let upstream_head_after_advance = head_sha(&upstream);
+
+    // --- Reopen under the IDENTICAL Name — PRD fork#544 M3's resume arm. ---
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    common::wait_for_file_lines(&log_path, 2, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the resumed role pane must have appended a second owner+pwd line to {log_path:?}: \
+             {e}\n=== rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    let contents_after =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let mut pwd_by_owner: HashMap<String, PathBuf> = HashMap::new();
+    for line in contents_after.lines() {
+        if let Some((o, p)) = line.split_once(' ') {
+            pwd_by_owner.insert(o.to_string(), PathBuf::from(p));
+        }
+    }
+    let pwd_after = pwd_by_owner.get(&owner).unwrap_or_else(|| {
+        panic!(
+            "no line in {log_path:?} for owner {owner:?} after reopening; got: {contents_after:?}"
+        )
+    });
+    assert_eq!(
+        pwd_after, &pwd,
+        "reopening under the IDENTICAL Name must resume the same workspace directory"
+    );
+
+    assert_eq!(
+        head_sha(&pwd),
+        head_before_close,
+        "PRD fork#544 M3: resume must perform ZERO mutation of the checked-out branch — its \
+         HEAD commit must be byte-identical to before closing, even though origin has genuinely \
+         moved ahead in the meantime"
+    );
+
+    let remote_tracking_ref = format!("refs/remotes/origin/{default_branch}");
+    let remote_tracking_head = std::process::Command::new("git")
+        .current_dir(&pwd)
+        .args(["rev-parse", &remote_tracking_ref])
+        .output()
+        .expect("git rev-parse must spawn");
+    assert!(
+        remote_tracking_head.status.success(),
+        "PRD fork#544 M3: resume must run a read-only `git fetch origin`, populating \
+         {remote_tracking_ref} — it does not resolve at all, meaning no fetch ran: {}",
+        String::from_utf8_lossy(&remote_tracking_head.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&remote_tracking_head.stdout).trim(),
+        upstream_head_after_advance,
+        "PRD fork#544 M3: resume's read-only fetch must bring {remote_tracking_ref} up to date \
+         with the real upstream's CURRENT (advanced) HEAD, proving a genuine `git fetch origin` \
+         ran on resume rather than none at all"
+    );
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
+/// one orchestration under a fixed Name — WITHOUT closing it — then attempt
+/// to open a SECOND orchestration under the IDENTICAL Name while the first
+/// is still live. PRD fork#544 M3's own eligibility check (a) reuses the
+/// EXISTING fork#192 live-name query as the FIRST gate, ahead of the new
+/// resume logic — this test exercises that ordering directly: the second
+/// attempt must be refused as "name in use" (the New Pane form stays open,
+/// no second tab opens), and critically it must NEVER silently fall back to
+/// a numeric-suffixed sibling path the way a naive "directory exists, so
+/// pick another slug" implementation could.
+#[spec("orchestration/workspace/005")]
+#[test]
+fn workspace_005_reopening_name_held_by_live_orchestration_refuses_without_suffix_fallback() {
+    const NAME: &str = "workspace005fixed";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+
+    // First open — creates and stays live for the rest of this test.
+    open_orchestration_with_name(&deck, NAME);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the role pane must have appended its owner+pwd line to {log_path:?}: {e}\n\
+             === rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+
+    // Back to Dashboard WITHOUT closing the first orchestration — it stays
+    // live throughout this test.
+    deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode
+    deck.send_keys(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    // Attempt a second open under the IDENTICAL Name while the first is
+    // still live.
+    open_orchestration_with_name(&deck, NAME);
+
+    // The refusal must be visible on screen — the new-pane form stays open,
+    // never silently closing into a second, differently-pathed tab.
+    deck.wait_until_grid(
+        "New Agent form remains open after a live-name collision, no second tab opened",
+        |g| g.contains("New Agent"),
+    );
+
+    // No numeric-suffix fallback directory (`<basename>-{NAME}-2` or any
+    // similarly auto-renumbered sibling path) may exist on disk — the ONLY
+    // directory this Name may ever resolve to is `expected_path`, still
+    // owned by the still-live first orchestration.
+    let suffixed_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}-2"));
+    assert!(
+        !suffixed_path.exists(),
+        "PRD fork#544 M3/fork#192: a Name collision with a LIVE orchestration must never fall \
+         back to a numeric-suffixed sibling path such as {} — it must refuse outright",
+        suffixed_path.display()
+    );
+
+    // Only ONE role pane must ever have appended to the shared log — the
+    // refused second attempt must never have provisioned or spawned
+    // anything at all.
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    assert_eq!(
+        contents.lines().count(),
+        1,
+        "the refused second attempt must never have spawned a role pane at all — expected \
+         exactly 1 line in {log_path:?}, got: {contents:?}"
+    );
+
+    // The first orchestration's own workspace must be completely
+    // undisturbed by the refused second attempt.
+    assert!(
+        expected_path.is_dir(),
+        "the first (still-live) orchestration's workspace at {} must remain intact",
+        expected_path.display()
+    );
+}

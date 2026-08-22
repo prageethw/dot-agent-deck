@@ -6016,6 +6016,321 @@ exit 0
         }
     }
 
+    /// Read `dir`'s HEAD commit SHA via `git rev-parse HEAD` — shared by the
+    /// PRD fork#544 M3 resume-eligibility tests below, mirroring the
+    /// identically-named helper in `tests/e2e_orchestration_worktree.rs`.
+    fn head_sha(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse HEAD must spawn");
+        assert!(
+            out.status.success(),
+            "git rev-parse HEAD failed in {dir:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `git init` + inline-identity-configure + one commit, shared setup for
+    /// the PRD fork#544 M3 resume-eligibility tests below — the same
+    /// sequence `provision_isolated_clone_sync_sets_origin_and_branch_when_source_has_origin`
+    /// and its siblings above already inline per-test; hoisted here since
+    /// four more tests need the identical seed.
+    fn seed_source_repo(dir: &Path, seed_content: &str) {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("README.md"), seed_content).unwrap();
+        git(dir, &["add", "README.md"]);
+        git(dir, &["commit", "--quiet", "-m", "seed"]);
+    }
+
+    /// Scenario: PRD fork#544 M3. `provision_isolated_clone_sync` is called
+    /// against a `clone_dir` that already exists on disk but was never
+    /// created by this deck — no M4b provenance artifact exists for it (a
+    /// directory a human happened to create at the same derived path, with
+    /// its own unrelated git history). Asserts the outcome refuses to
+    /// silently attach and, once PRD fork#544 M3's eligibility check exists,
+    /// names the refusal distinguishably as a stranger directory rather than
+    /// folding it into the generic `AlreadyClaimed` outcome every
+    /// present-directory case reports pre-M3. `DOT_AGENT_DECK_STATE_DIR` is
+    /// pinned so the M4b evidence lookup this test's assertion depends on
+    /// resolves deterministically regardless of what else runs in this
+    /// process.
+    #[spec("orchestration/workspace/006")]
+    #[test]
+    fn workspace_006_stranger_directory_refused_with_no_evidence() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-my-feature");
+        // A stranger directory: present on disk with its own unrelated git
+        // history, but never created by `provision_isolated_clone_sync` —
+        // no M4b provenance artifact was ever written for this canonical
+        // path.
+        seed_source_repo(&clone_dir, "not the deck's\n");
+        let stranger_head_before = head_sha(&clone_dir);
+
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        let debug = format!("{result:?}");
+
+        assert!(
+            !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "a stranger directory with no ownership evidence must never be silently (re)created \
+             over, got {debug}"
+        );
+        assert!(
+            debug.to_lowercase().contains("stranger"),
+            "PRD fork#544 M3: a directory with NO matching M4b ownership evidence must be \
+             refused with a distinguishable 'stranger directory' reason (per the PRD's own \
+             compatibility table) — pre-M3 code reports the generic AlreadyClaimed outcome for \
+             every present-directory case with no such distinction, got {debug}"
+        );
+
+        assert_eq!(
+            head_sha(&clone_dir),
+            stranger_head_before,
+            "a refused stranger directory's git state must be completely untouched"
+        );
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "a refused stranger directory's working tree must be completely untouched"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M3. A `clone_dir` that DOES carry genuine M4b
+    /// ownership evidence — because it was actually created by a real prior
+    /// `provision_isolated_clone_sync` call — is reopened against a SECOND,
+    /// entirely unrelated source repository at the same derived path (the
+    /// same Name typed against a different underlying project — Problem
+    /// Statement #4's exact hazard: content-free evidence alone can't prove
+    /// WHICH repository a directory belongs to). Asserts the mismatched
+    /// ancestry refuses the resume distinguishably, never silently
+    /// attaching the new source's session onto foreign history.
+    #[spec("orchestration/workspace/007")]
+    #[test]
+    fn workspace_007_ancestry_mismatch_refused_as_wrong_repo() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source_a = ws.path().join("source-a");
+        seed_source_repo(&source_a, "seed-a\n");
+
+        let clone_dir = ws.path().join("workspace-my-feature");
+        let created = provision_isolated_clone_sync(&source_a, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone from source A must succeed, got {created:?}"
+        );
+        let clone_head_before = head_sha(&clone_dir);
+
+        // A SECOND, entirely unrelated source repository — no shared
+        // history, no shared origin — happening to want the SAME clone_dir.
+        let source_b = ws.path().join("source-b");
+        seed_source_repo(&source_b, "seed-b-unrelated-history\n");
+
+        let result = provision_isolated_clone_sync(&source_b, &clone_dir, "my-feature", "tester");
+        let debug = format!("{result:?}");
+
+        assert!(
+            !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "a directory with REAL M4b evidence but UNRELATED ancestry to the newly-opened \
+             source must never be silently created/attached over, got {debug}"
+        );
+        assert!(
+            debug.to_lowercase().contains("ancestry")
+                || debug.to_lowercase().contains("wrong repo")
+                || debug.to_lowercase().contains("stale")
+                || debug.to_lowercase().contains("unrelated"),
+            "PRD fork#544 M3: a directory whose origin/ancestry does not match the source being \
+             opened must be refused with a distinguishable wrong/stale-repo reason (per the \
+             PRD's own compatibility table) — pre-M3 code reports the generic AlreadyClaimed \
+             outcome for every present-directory case with no such distinction, got {debug}"
+        );
+
+        assert_eq!(
+            head_sha(&clone_dir),
+            clone_head_before,
+            "the existing clone's git state (unrelated to source B) must be untouched by the \
+             refused attempt"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M3. A `clone_dir` that carries genuine M4b
+    /// evidence AND matching ancestry (both would pass) is corrupted —
+    /// its `.git` directory is removed entirely, simulating a directory
+    /// mid-delete or otherwise unhealthy — before a second
+    /// `provision_isolated_clone_sync` call against the SAME source.
+    /// Asserts the health probe's failure refuses distinguishably, and
+    /// critically that the refusal never auto-deletes or silently replaces
+    /// the unhealthy directory (the PRD's own explicit "never auto-delete"
+    /// decision).
+    #[spec("orchestration/workspace/008")]
+    #[test]
+    fn workspace_008_unhealthy_directory_refused_without_deleting() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-my-feature");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        // Corrupt the clone's git state — remove `.git` entirely, simulating
+        // a directory mid-delete or otherwise unhealthy, while leaving the
+        // working-tree files (and the M4b evidence, which lives OUTSIDE the
+        // directory under state_dir()) untouched.
+        std::fs::remove_dir_all(clone_dir.join(".git")).expect("corrupt clone's .git");
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "sanity: working-tree files survive the corruption, only .git is gone"
+        );
+
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        let debug = format!("{result:?}");
+
+        assert!(
+            !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "an unhealthy directory (evidence + ancestry would otherwise match) must never be \
+             silently treated as fresh/created-over, got {debug}"
+        );
+        assert!(
+            debug.to_lowercase().contains("unhealthy")
+                || debug.to_lowercase().contains("corrupt")
+                || debug.to_lowercase().contains("health"),
+            "PRD fork#544 M3: a directory that fails the health probe (e.g. `git rev-parse \
+             HEAD` no longer succeeding) must be refused with a distinguishable 'unhealthy' \
+             reason — pre-M3 code reports the generic AlreadyClaimed outcome for every \
+             present-directory case with no such distinction, got {debug}"
+        );
+
+        // Never auto-deleted, and never silently repaired/replaced either.
+        assert!(
+            clone_dir.is_dir(),
+            "the unhealthy directory must never be auto-deleted on refusal"
+        );
+        assert!(
+            !clone_dir.join(".git").exists(),
+            "the directory must still be missing its .git — confirms the refusal did not \
+             silently repair or replace it"
+        );
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "working-tree files must remain untouched by the refusal"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M3's attach-lock reuse for the resume race.
+    /// Mirrors `provision_isolated_clone_sync_concurrent_calls_never_both_create`'s
+    /// own barrier-synchronized two-thread pattern, but races a RESUME
+    /// (the directory already exists and is genuinely resume-eligible —
+    /// created once via a real prior call, so it carries matching M4b
+    /// evidence and ancestry) rather than a fresh CREATE. Asserts the two
+    /// racers' outcomes are DISTINGUISHABLE — one attaches/resumes, the
+    /// other refuses because it lost the race — never both reporting the
+    /// identical outcome, which is exactly what pre-M3 code does today
+    /// (both simply see the directory present and report the generic
+    /// `AlreadyClaimed`, with no winner/loser distinction at all, since
+    /// resume doesn't exist yet).
+    ///
+    /// `#[cfg(unix)]` matches the precedent this mirrors — many trials of
+    /// real `git` subprocesses on a shared CI runner.
+    #[cfg(unix)]
+    #[spec("orchestration/workspace/009")]
+    #[test]
+    fn workspace_009_concurrent_resume_attempts_report_distinguishable_outcomes() {
+        const TRIALS: usize = 10;
+
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let barriers: Vec<std::sync::Barrier> =
+            (0..TRIALS).map(|_| std::sync::Barrier::new(2)).collect();
+
+        let results: Vec<[Result<IsolatedCloneOutcome, String>; 2]> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(TRIALS);
+            for (i, barrier) in barriers.iter().enumerate() {
+                let source = &source;
+                let clone_dir = ws.path().join(format!("source-resume-race-{i}"));
+                // Pre-create the resume-eligible directory ONCE, before the
+                // race: a real prior clone, carrying genuine M4b evidence
+                // and matching ancestry — the race is over RESUMING it, not
+                // creating it.
+                let setup = provision_isolated_clone_sync(source, &clone_dir, "race", "setup");
+                assert!(
+                    matches!(setup, Ok(IsolatedCloneOutcome::Created { .. })),
+                    "trial {i} setup: the initial clone must succeed, got {setup:?}"
+                );
+
+                let clone_dir_a = clone_dir.clone();
+                let clone_dir_b = clone_dir.clone();
+                let h_a = s.spawn(move || {
+                    barrier.wait();
+                    provision_isolated_clone_sync(source, &clone_dir_a, "race", "racer-a")
+                });
+                let h_b = s.spawn(move || {
+                    barrier.wait();
+                    provision_isolated_clone_sync(source, &clone_dir_b, "race", "racer-b")
+                });
+                handles.push((h_a, h_b));
+            }
+            handles
+                .into_iter()
+                .map(|(a, b)| [a.join().unwrap(), b.join().unwrap()])
+                .collect()
+        });
+
+        for (i, pair) in results.iter().enumerate() {
+            let [a, b] = pair;
+            let debug_a = format!("{a:?}");
+            let debug_b = format!("{b:?}");
+            assert_ne!(
+                debug_a, debug_b,
+                "trial {i}: PRD fork#544 M3 — two near-simultaneous resume attempts against the \
+                 SAME already-eligible directory must serialize on the reused attach lock into \
+                 DISTINGUISHABLE outcomes (one resumes/attaches, the other refuses because it \
+                 lost the race), never the identical outcome for both — pre-M3 code reports the \
+                 identical generic AlreadyClaimed for both racers here, with no winner at all, \
+                 got {debug_a} / {debug_b}"
+            );
+        }
+    }
+
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B), extended by
     /// round 3 (reviewer C1/C2, auditor C1/C2). Unit tests
     /// `handle_isolated_clone_add_error` directly rather than inducing a
