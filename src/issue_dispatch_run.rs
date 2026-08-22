@@ -2873,6 +2873,187 @@ pub(crate) fn forget_isolated_workspace(
     Ok(())
 }
 
+/// Read-only `git fetch origin` in `clone_dir` — updates only the
+/// `origin/*` remote-tracking refs, never the checked-out local branch or
+/// working tree. Shared by [`sync_merged_workspace_to_main`] (which needs an
+/// up-to-date `origin/<default_branch>` before it can check ancestry) and
+/// [`fetch_other_live_workspace`] (for which this fetch IS the entire
+/// operation).
+fn fetch_origin(clone_dir: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["fetch", "--quiet", "origin"])
+        .output()
+        .map_err(|e| format!("failed to fetch origin in {}: {e}", clone_dir.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git fetch origin failed in {}: {}",
+            clone_dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// PRD fork#544 M7 (Design step 7 / Decisions table row "What happens to
+/// other live workspaces, and to this one, when a merge lands?"). Outcome of
+/// [`sync_merged_workspace_to_main`] — its own `Debug` output is what
+/// `orchestration/workspace/020`-`022` match against.
+///
+/// `#[allow(dead_code)]`: the `reason` field is only ever constructed by
+/// [`sync_merged_workspace_to_main`], which carries its own
+/// `#[allow(dead_code)]` for the same "no caller yet" reason — without this,
+/// dead-code analysis treats the field as unread because nothing reachable
+/// from the crate root ever constructs it outside tests.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum PostMergeSyncOutcome {
+    /// Both preconditions held: local `<default_branch>` now sits exactly
+    /// at `origin/<default_branch>`'s SHA, and the workspace is checked out
+    /// on it.
+    SwitchedToMain,
+    /// At least one precondition failed — nothing was touched (no checkout,
+    /// no merge, no mutation of any kind). `reason` names which one, for a
+    /// caller to show the user.
+    LeftUntouched { reason: String },
+}
+
+/// PRD fork#544 M7: auto-switch a just-merged workspace onto
+/// `default_branch` — but only when it is safe to do so without discarding
+/// or stranding anything the merge itself did not capture. Two independent
+/// preconditions, both checked (per the Risks section: a tree-cleanliness-
+/// only check would wrongly pass `orchestration/workspace/022`'s extra-
+/// local-commit case, and an ancestry-only check would wrongly pass
+/// `021`'s uncommitted-edit case):
+///
+/// 1. No uncommitted changes (`git status --porcelain` is empty — this one
+///    check already covers staged, unstaged, and untracked files).
+/// 2. No local commits beyond the merge: after fetching `origin`, `HEAD` is
+///    fully contained in `origin/<default_branch>`'s history
+///    (`git merge-base --is-ancestor HEAD origin/<default_branch>`).
+///
+/// If both hold, checks out `default_branch` — git's DWIM creates a local
+/// tracking branch from `origin/<default_branch>` when none exists yet, the
+/// same mechanism `provision_isolated_clone_sync_attaches_branch_that_
+/// exists_only_as_remote_tracking_ref` already relies on elsewhere in this
+/// module — and then fast-forwards it with `git merge --ff-only
+/// origin/<default_branch>`. `--ff-only`, deliberately never `reset --hard`:
+/// an incorrect ancestry check then fails loudly instead of silently
+/// discarding anything, and the explicit merge step is what actually lands
+/// local `default_branch` exactly on `origin/<default_branch>`'s SHA in the
+/// (typical) case where a local branch of that name already exists from the
+/// clone's own initial checkout, stale, rather than only being created fresh
+/// by the DWIM.
+///
+/// `#[allow(dead_code)]`: PRD fork#544 M7 ships no CLI/caller wiring yet,
+/// the same honest state [`forget_isolated_workspace`]'s own
+/// `#[allow(dead_code)]` documents — this function is exercised directly by
+/// `orchestration/workspace/020`-`022` and nothing else calls it today.
+#[allow(dead_code)]
+pub(crate) fn sync_merged_workspace_to_main(
+    clone_dir: &Path,
+    default_branch: &str,
+) -> Result<PostMergeSyncOutcome, String> {
+    let status_out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to check {} for uncommitted changes: {e}",
+                clone_dir.display()
+            )
+        })?;
+    if !status_out.status.success() {
+        return Err(format!(
+            "git status --porcelain failed in {}: {}",
+            clone_dir.display(),
+            String::from_utf8_lossy(&status_out.stderr).trim()
+        ));
+    }
+    if !status_out.stdout.is_empty() {
+        return Ok(PostMergeSyncOutcome::LeftUntouched {
+            reason: "the workspace has uncommitted changes -- refusing to switch and \
+                     potentially discard unprotected work"
+                .to_string(),
+        });
+    }
+
+    fetch_origin(clone_dir)?;
+
+    let remote_ref = format!("origin/{default_branch}");
+    let ancestor_out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["merge-base", "--is-ancestor", "HEAD", &remote_ref])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to check whether HEAD is an ancestor of {remote_ref} in {}: {e}",
+                clone_dir.display()
+            )
+        })?;
+    if !ancestor_out.status.success() {
+        return Ok(PostMergeSyncOutcome::LeftUntouched {
+            reason: format!(
+                "the workspace's HEAD is not fully contained in {remote_ref} -- it carries a \
+                 local commit the merge never captured, refusing to switch and potentially \
+                 strand or discard it"
+            ),
+        });
+    }
+
+    let checkout_out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["checkout", "--quiet", default_branch])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to check out {default_branch} in {}: {e}",
+                clone_dir.display()
+            )
+        })?;
+    if !checkout_out.status.success() {
+        return Err(format!(
+            "git checkout {default_branch} failed in {}: {}",
+            clone_dir.display(),
+            String::from_utf8_lossy(&checkout_out.stderr).trim()
+        ));
+    }
+
+    let merge_out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["merge", "--quiet", "--ff-only", "--", &remote_ref])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to fast-forward {default_branch} to {remote_ref} in {}: {e}",
+                clone_dir.display()
+            )
+        })?;
+    if !merge_out.status.success() {
+        return Err(format!(
+            "git merge --ff-only {remote_ref} failed in {}: {}",
+            clone_dir.display(),
+            String::from_utf8_lossy(&merge_out.stderr).trim()
+        ));
+    }
+
+    Ok(PostMergeSyncOutcome::SwitchedToMain)
+}
+
+/// PRD fork#544 M7 (Decisions table row, "other live workspaces" half): on
+/// an UNRELATED merge (this workspace's own branch did not just merge),
+/// only a proactive, read-only fetch runs — see [`fetch_origin`] for what
+/// that does and does not touch.
+///
+/// `#[allow(dead_code)]`: same honest state as
+/// [`sync_merged_workspace_to_main`] above — exercised directly by
+/// `orchestration/workspace/023` and nothing else calls it today.
+#[allow(dead_code)]
+pub(crate) fn fetch_other_live_workspace(clone_dir: &Path) -> Result<(), String> {
+    fetch_origin(clone_dir)
+}
+
 /// PRD fork#544 M3: distinguishable refusal reasons for
 /// [`resume_existing_isolated_clone`] — this enum's own `Debug` output is
 /// the interface `orchestration/workspace/006`-`008` assert substrings
