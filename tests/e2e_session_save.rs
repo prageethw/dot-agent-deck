@@ -24,7 +24,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use spec::spec;
 
 /// Create a plain dashboard pane (no mode) running `command` via the new-pane
@@ -164,6 +164,9 @@ fn save_002_detach_path_writes_snapshot() {
 /// orchestration HIDES the Command field, so a second Enter submits the form.
 /// Mirrors `e2e_dashboard_selection`'s `open_orchestration`.
 fn open_orchestration(deck: &TuiDeck) {
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm current dir → new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"

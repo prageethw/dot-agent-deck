@@ -80,6 +80,7 @@ fn start_agent_request(client_pane_id: &str) -> AttachRequest {
         tab_membership: None,
         agent_type: None,
         seed: None,
+        isolated_clone_origin: None,
     }
 }
 

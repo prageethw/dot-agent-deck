@@ -1016,6 +1016,10 @@ impl EmbeddedPaneController {
         // environment as DOT_AGENT_DECK_WORKTREE_OWNER. `None` for a pane
         // outside a worktree-owning orchestration.
         owner: Option<String>,
+        // PRD fork#544 M6: forwarded as
+        // `StartAgentOptions.isolated_clone_origin`. `None` for a pane
+        // outside a client-side-provisioned isolated clone.
+        isolated_clone_origin: Option<String>,
     ) -> Result<String, PaneError> {
         // PRD #365 M2: the daemon mints `pane_id` now and returns it on
         // `AttachResponse::pane_id` (see `start_agent_with_pane_id` below)
@@ -1054,6 +1058,7 @@ impl EmbeddedPaneController {
             tab_membership,
             agent_type,
             seed,
+            isolated_clone_origin,
         };
 
         // Start-agent + attach happen on the daemon's runtime; we
@@ -3584,6 +3589,7 @@ impl PaneController for EmbeddedPaneController {
             opts.cols,
             opts.seed,
             opts.owner,
+            opts.isolated_clone_origin,
         );
         result.map(|id| (id, resolved))
     }
