@@ -3100,9 +3100,20 @@ pub(crate) fn sync_merged_workspace_to_main(
     // --abbrev-ref HEAD`, this function's own dependency further down.
     // Validate up front, before touching the workspace at all, and refuse
     // outright rather than proceeding to manufacture an illegal ref.
+    let clone_dir_str = clone_dir.to_string_lossy().into_owned();
+
+    // Final cleanup round (reviewer): `-C <clone_dir_str>` pins this gate's
+    // cwd, so a cwd-dependent input like `@{-1}` is resolved against the
+    // workspace being validated rather than against wherever this deck
+    // process itself happens to be running from -- not independently
+    // exploitable (the `update-ref` route further down still refuses a
+    // literal `@{-1}` component the same way it refuses `--detach`), but a
+    // determinism gap worth closing on a gate this security-relevant.
     if run_status_sync(
         "git",
         &[
+            "-C".to_string(),
+            clone_dir_str.clone(),
             "check-ref-format".to_string(),
             "--branch".to_string(),
             default_branch.to_string(),
@@ -3116,8 +3127,6 @@ pub(crate) fn sync_merged_workspace_to_main(
             clone_dir.display()
         ));
     }
-
-    let clone_dir_str = clone_dir.to_string_lossy().into_owned();
 
     let status_stdout = run_capture_sync(
         "git",
@@ -3681,13 +3690,18 @@ fn resume_existing_isolated_clone(
     // clone with no `origin` remote at all after creation (see
     // `remove_isolated_clone_origin_default`) — `git fetch origin` then
     // fails loudly with "No such remote", which is fine here, not a
-    // provisioning failure.
+    // provisioning failure. `--upload-pack=git-upload-pack` (final cleanup
+    // round) closes the `remote.origin.uploadpack` code-execution vector a
+    // forged value of that setting in this untrusted `clone_dir`'s own
+    // `.git/config` would otherwise open, at zero cost against the real
+    // `origin` this fetches from.
     let fetch_warning = match run_status_sync(
         "git",
         &[
             "-C".to_string(),
             clone_dir.to_string_lossy().into_owned(),
             "fetch".to_string(),
+            "--upload-pack=git-upload-pack".to_string(),
             "origin".to_string(),
         ],
         WORKTREE_GIT_TIMEOUT,
@@ -3783,6 +3797,16 @@ enum AncestryProbe {
 /// manually" advice does not apply to a probe that was simply unable to
 /// run, e.g. a permission error reading the source's own new commit
 /// object — `orchestration/workspace/031`).
+///
+/// Final cleanup round: this fallback fetch, run against a `clone_dir` this
+/// process did not create and cannot vouch for, also now carries
+/// `--upload-pack=git-upload-pack` — closing the `remote.<name>.uploadpack`
+/// code-execution vector a forged value of that setting in the untrusted
+/// directory's own `.git/config` would otherwise open, at zero cost: the
+/// flag is a no-op for this call's actual local-path fetch and needs no
+/// `origin` remote to exist. `spawn_git_status_child`'s own doc comment
+/// (above) tracks which residuals from that untrusted-`.git/config` class
+/// remain open; this one no longer is.
 fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -> AncestryProbe {
     if let (Some(source_url), Some(clone_url)) = (
         read_source_origin_url(source_dir),
@@ -3798,7 +3822,8 @@ fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -
 
     let clone_dir_str = clone_dir.to_string_lossy().into_owned();
 
-    if let MergeBaseAttempt::MissingObject = merge_base_attempt(&clone_dir_str, &source_head) {
+    let first_attempt = merge_base_attempt(&clone_dir_str, &source_head);
+    if let MergeBaseAttempt::MissingObject = first_attempt {
         // Exit 128 only -- source_head's object isn't in clone_dir's
         // database yet. Best-effort: bring source_dir's own objects
         // (including anything it has committed since clone_dir was
@@ -3813,6 +3838,7 @@ fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -
                 clone_dir_str.clone(),
                 "fetch".to_string(),
                 "--quiet".to_string(),
+                "--upload-pack=git-upload-pack".to_string(),
                 "--".to_string(),
                 source_dir.to_string_lossy().into_owned(),
             ],
@@ -3827,7 +3853,7 @@ fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -
         };
     }
 
-    match merge_base_attempt(&clone_dir_str, &source_head) {
+    match first_attempt {
         MergeBaseAttempt::Matches => AncestryProbe::Matches,
         MergeBaseAttempt::ProvenMismatch => AncestryProbe::ProvenMismatch,
         MergeBaseAttempt::MissingObject | MergeBaseAttempt::Failed => AncestryProbe::Unverifiable,
@@ -4773,10 +4799,11 @@ fn spawn_git_status_child(
     // accepts for its own always-hardened calls. This blocks the fsmonitor
     // vector specifically; it does NOT close every same-uid config-driven
     // vector reachable through an untrusted `.git/config`
-    // (`remote.<name>.uploadpack` on `fetch`, `filter.<driver>.clean`,
-    // `core.hooksPath`, `diff.external` chief among the residuals) -- see
-    // `isolated_clone_ancestry_matches_source`'s own doc comment for the one
-    // still open and why.
+    // (`filter.<driver>.clean`, `core.hooksPath`, `diff.external` chief
+    // among the residuals). `remote.<name>.uploadpack` on `fetch` was in
+    // this list too until PRD fork#544's final cleanup round closed it —
+    // see `isolated_clone_ancestry_matches_source`'s own doc comment for how
+    // and why.
     let mut hardened_args: Vec<&str> = Vec::with_capacity(args.len() + 2);
     hardened_args.push("-c");
     hardened_args.push("core.fsmonitor=");
@@ -4877,11 +4904,16 @@ fn spawn_and_wait_sync(
                     // its own group on Unix (see `spawn_git_status_child` /
                     // `spawn_in_new_process_group`), so `killpg` here reaches
                     // it and everything it forked. The reader threads above
-                    // are left to finish on their own -- killing the child
-                    // closes its end of each pipe, so each thread's
-                    // `read_to_end` returns on its own; this call already
-                    // discards their output on the timeout path below, so
-                    // there is nothing to join.
+                    // are left to finish on their own -- killing the direct
+                    // `git` child alone would not be enough to unblock them: a
+                    // hook grandchild (e.g. `post-checkout`) inherits its own
+                    // copy of each pipe's write end, so `read_to_end` would
+                    // still see it open even after `git` itself exits. It's
+                    // the `killpg` call above, reaching that grandchild too
+                    // and closing every inherited copy of each fd, that
+                    // actually bounds how long the reader threads can block;
+                    // this call already discards their output on the timeout
+                    // path below, so there is nothing to join.
                     let boxed: Box<dyn portable_pty::Child + Send + Sync> =
                         Box::new(crate::platform::proc::test_child::StdChild(child));
                     crate::platform::proc::terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
@@ -5017,14 +5049,25 @@ async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String
 /// [`run_status`] is (stdin closed, no credential-prompt env) since — unlike
 /// `run_capture_args`'s other direct `git` use (`remote get-url origin`
 /// against a clone we just provisioned) — this runs against a worktree
-/// outside our control. A timeout is treated exactly like any other probe
+/// outside our control. Final cleanup round: also carries `-c
+/// core.fsmonitor=`, the same override [`spawn_git_status_child`] applies for
+/// exactly the same reason — a forged `core.fsmonitor` in this worktree's own
+/// (untrusted) `.git/config` is the same same-uid code-execution vector on a
+/// plain `git status`. A timeout is treated exactly like any other probe
 /// failure: the caller's `Err` arm already keeps the tree fail-safe and
 /// reports [`crate::event::KeptReason::ProbeError`].
 async fn probe_worktree_dirty(worktree: &str) -> Result<String, String> {
     let output = tokio::time::timeout(
         WORKTREE_CLEANUP_TIMEOUT,
         tokio::process::Command::new("git")
-            .args(["-C", worktree, "status", "--porcelain"])
+            .args([
+                "-c",
+                "core.fsmonitor=",
+                "-C",
+                worktree,
+                "status",
+                "--porcelain",
+            ])
             .stdin(Stdio::null())
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
@@ -7586,8 +7629,8 @@ exit 0
         );
     }
 
-    /// Scenario: PRD fork#544 M3's attach-lock reuse for the resume race.
-    /// Mirrors `provision_isolated_clone_sync_concurrent_calls_never_both_create`'s
+    /// Scenario: PRD fork#544 M3's resume-race winner/loser split. Mirrors
+    /// `provision_isolated_clone_sync_concurrent_calls_never_both_create`'s
     /// own barrier-synchronized two-thread pattern, but races a RESUME
     /// (the directory already exists and is genuinely resume-eligible —
     /// created once via a real prior call, so it carries matching M4b
@@ -7602,14 +7645,20 @@ exit 0
     /// even the race's WINNER mismatch the stored `"setup"` creator, so it
     /// is refused as `NameCollision` too — nothing ever resumes. The
     /// surviving `assert_ne!` on the two outcomes' `Debug` strings still
-    /// passed, but for a reason unrelated to the attach lock: the
-    /// process-global registry mutex alone hands one racer `NameCollision`
-    /// and the other `Contested`, so the test would stay green even with
-    /// the attach lock removed entirely. One shared creator string removes
-    /// `NameCollision` from the reachable outcomes here and restores the
-    /// race-specific property directly: across all trials, exactly one of
-    /// the two racers resumes and exactly one is refused as `Contested` —
-    /// never both, never neither, never anything else.
+    /// passed, but for a reason unrelated to what this test is meant to
+    /// prove: the process-global registry mutex (`resumed_isolated_clones()`)
+    /// alone hands one racer `NameCollision` and the other `Contested`, so
+    /// the test would stay green even with the (separate, cross-process)
+    /// attach lock removed entirely — that mutex is atomic on its own and
+    /// fully accounts for the observable split. One shared creator string
+    /// removes `NameCollision` from the reachable outcomes here and
+    /// restores the race-specific property directly: across all trials,
+    /// M3's resume arm yields exactly one `Resumed` winner and exactly one
+    /// `Contested` loser, where pre-M3 code yields two identical
+    /// `AlreadyClaimed` outcomes with no winner at all — never both, never
+    /// neither, never anything else. This test does not, and cannot,
+    /// distinguish the registry mutex's contribution from the attach
+    /// lock's; see "Does not assert" in `tests/CATALOG.md`.
     ///
     /// `#[cfg(unix)]` matches the precedent this mirrors — many trials of
     /// real `git` subprocesses on a shared CI runner.
@@ -7682,9 +7731,9 @@ exit 0
                 resumed_count, 1,
                 "trial {i}: PRD fork#544 M3 — two near-simultaneous resume attempts against the \
                  SAME already-eligible directory, opened under the IDENTICAL creator string, \
-                 must serialize on the reused attach lock so exactly one of them resumes — \
-                 pre-M3 code reports the identical generic AlreadyClaimed for both racers here, \
-                 with no winner at all, got {a:?} / {b:?}"
+                 must yield exactly one Resumed winner — pre-M3 code reports the identical \
+                 generic AlreadyClaimed for both racers here, with no winner at all, \
+                 got {a:?} / {b:?}"
             );
             assert_eq!(
                 contested_count, 1,
@@ -8844,21 +8893,29 @@ exit 0
     /// landing on the named branch. Round 3 goes further: rather than only
     /// making the checkout/switch call SAFE for an adversarial name, it
     /// validates `default_branch` via `git check-ref-format --branch`
-    /// before touching the workspace at all, and refuses outright -- `git
-    /// check-ref-format --branch -- --detach` itself rejects `--detach` as
-    /// not a valid branch name, verified empirically, so this function no
-    /// longer needs to be safe AGAINST that name; it never manufactures a
-    /// real local branch literally named `--detach` via `update-ref` in the
-    /// first place (auditor F3: exactly that unvalidated `update-ref` was
-    /// the other place `--detach` could still land as a real ref, unrelated
-    /// to A5's checkout/switch fix). `git branch` (and therefore `git
-    /// fetch`, which mirrors the source's own branches) still refuses to
-    /// ever create a real ref component starting with '-', so this test
-    /// still plants the adversarial-looking remote-tracking ref directly
-    /// with `git update-ref` to reproduce the same starting shape the
-    /// original test did -- not because the validation needs it (it runs
-    /// before this ref is ever consulted), but so this stays the same
-    /// fixture rather than a weaker one.
+    /// before touching the workspace at all, and refuses outright -- the
+    /// production code runs `git check-ref-format --branch --detach` (no
+    /// `--` separator: `check-ref-format` does not accept one at all, and
+    /// passing one there exits 129 as a usage error, not a ref-name
+    /// rejection -- measured directly), which genuinely rejects `--detach`
+    /// with exit 128, so this function no longer needs to be safe AGAINST
+    /// that name; it never manufactures a real local branch literally named
+    /// `--detach` via `update-ref` in the first place (auditor F3: exactly
+    /// that unvalidated `update-ref` was the other place `--detach` could
+    /// still land as a real ref, unrelated to A5's checkout/switch fix).
+    /// `git branch` (and therefore `git fetch`, which mirrors the source's
+    /// own branches) still refuses to ever create a real ref component
+    /// starting with '-', so this test still plants the adversarial-looking
+    /// remote-tracking ref directly with `git update-ref` to reproduce the
+    /// same starting shape the original test did -- not because the
+    /// validation needs it (it runs before this ref is ever consulted), but
+    /// so this stays the same fixture rather than a weaker one.
+    ///
+    /// Does not assert: the checkout/switch call's own `--`
+    /// end-of-options separator (A5's original finding) -- the up-front
+    /// `check-ref-format` validation above makes that code path
+    /// unreachable for an adversarial `default_branch` like `--detach`, so
+    /// nothing in this test's assertions exercises it any longer.
     #[spec("orchestration/workspace/028")]
     #[test]
     fn workspace_028_adversarial_branch_name_refused_before_touching_workspace() {
@@ -9300,6 +9357,16 @@ exit 0
              for the branch this call just switched to and created must resolve cleanly, not \
              error. stderr: {}",
             String::from_utf8_lossy(&upstream_check.stderr)
+        );
+        // Final cleanup round (nit 3): tighten past "resolves cleanly" to the
+        // exact value, so an upstream pointed at the wrong ref (e.g. a stray
+        // `origin/feat-032` left over from setup) is also caught, not just an
+        // outright-unset one.
+        assert_eq!(
+            String::from_utf8_lossy(&upstream_check.stdout).trim(),
+            "origin/main",
+            "the newly-created `main`'s upstream must be `origin/main` specifically, not merely \
+             present"
         );
     }
 
