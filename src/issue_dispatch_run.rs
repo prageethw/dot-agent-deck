@@ -1489,7 +1489,7 @@ pub(crate) fn provision_isolated_clone_sync(
     // failure here does not fail the whole provisioning call, since the
     // clone itself is already fully usable — it only means this clone will
     // never report `owned: true` from `worktree list`.
-    if let Err(e) = write_isolated_clone_provenance(clone_dir) {
+    if let Err(e) = write_isolated_clone_provenance(source_dir, clone_dir, branch) {
         tracing::warn!(
             clone = %clone_dir.display(),
             error = %e,
@@ -2713,6 +2713,18 @@ pub(crate) fn isolated_clone_provenance_path(clone_dir: &Path) -> PathBuf {
 /// succeeded, so this genuinely vouches for a clone this call itself just
 /// created.
 ///
+/// PRD fork#544 M4: the artifact is no longer the content-free `b"deck\n"`
+/// bytes — it now carries plain `key=value` lines: a `schema=` tag for a
+/// future consumer to branch on, a `root-hash=` of `source_dir`'s own
+/// canonical path (hashed with the same [`crate::platform::lock::fnv1a64`]
+/// keying scheme [`isolated_clone_provenance_path`] already uses for the
+/// clone path, rather than inventing a second hash), the orchestration
+/// `name` typed for this workspace, and the clone's own canonical `path`.
+/// This is additive evidence for future tooling, not a new requirement:
+/// [`resume_existing_isolated_clone`]'s eligibility check (b) below still
+/// only tests file presence, so a pre-M4 `b"deck\n"` artifact keeps
+/// resuming exactly as before (`orchestration/workspace/012`).
+///
 /// Atomic write-then-rename, mirroring [`mark_worktree_owned`]'s own
 /// pattern in `worktree_reclaim.rs` for the identical reason: on ENOSPC or
 /// a process kill mid-write, a plain `std::fs::write` could leave a
@@ -2732,7 +2744,11 @@ pub(crate) fn isolated_clone_provenance_path(clone_dir: &Path) -> PathBuf {
 /// every mechanism here shares with [`crate::worktree_reclaim::owned_git_dir`]).
 ///
 /// [`mark_worktree_owned`]: crate::worktree_reclaim::mark_worktree_owned
-fn write_isolated_clone_provenance(clone_dir: &Path) -> Result<(), String> {
+fn write_isolated_clone_provenance(
+    source_dir: &Path,
+    clone_dir: &Path,
+    name: &str,
+) -> Result<(), String> {
     let marker_path = isolated_clone_provenance_path(clone_dir);
     let parent = marker_path.parent().expect(
         "isolated_clone_provenance_path always nests under state_dir(), which has a parent",
@@ -2749,7 +2765,18 @@ fn write_isolated_clone_provenance(clone_dir: &Path) -> Result<(), String> {
         .unwrap_or("provenance");
     let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
 
-    std::fs::write(&tmp_path, b"deck\n").map_err(|e| {
+    let root_hash = crate::platform::lock::fnv1a64(
+        canonicalize_best_effort(source_dir)
+            .to_string_lossy()
+            .as_bytes(),
+    );
+    let canonical_clone_dir = canonicalize_best_effort(clone_dir);
+    let content = format!(
+        "schema=2\nroot-hash={root_hash:016x}\nname={name}\npath={}\n",
+        canonical_clone_dir.display()
+    );
+
+    std::fs::write(&tmp_path, content.as_bytes()).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
         format!("failed to write isolated-clone provenance artifact: {e}")
     })?;
