@@ -11,7 +11,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, find_pane_box_left_edge};
+use common::{TuiDeck, commit_fixture, find_pane_box_left_edge};
 use spec::spec;
 
 /// Scenario: Extends the Ctrl+l split-toggle to Dashboard tabs — launch with
@@ -35,6 +35,10 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
         .with_pty_size(100, 40)
         .with_continue_session(DASH_PANE, "cat")
         .launch_with_fixture("orch-deck");
+    // The Orchestration tab opened below needs isolated-clone provisioning,
+    // which needs a ref to branch from — an unborn HEAD (the harness's own
+    // bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode
     deck.wait_for_string(DASH_PANE);
 

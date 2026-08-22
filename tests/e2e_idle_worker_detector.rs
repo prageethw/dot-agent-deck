@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use dot_agent_deck::config;
 use dot_agent_deck::daemon_protocol::TabMembership;
 use dot_agent_deck::event::{DaemonMessage, DelegateSignal};
@@ -320,6 +320,10 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "1500")
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
+    // The orchestration opened below needs isolated-clone provisioning,
+    // which needs a ref to branch from — an unborn HEAD (the harness's own
+    // bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     open_orchestration(&deck);
     deck.wait_for_string("worker");
 

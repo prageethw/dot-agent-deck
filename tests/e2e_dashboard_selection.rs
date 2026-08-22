@@ -26,7 +26,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use spec::spec;
 
 /// Write a fixture "agent" for the Mode tab: it self-posts a `SessionStart`
@@ -186,6 +186,11 @@ fn selection_019_enter_paints_highlight_on_orchestration_real_binary() {
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
+
+    // The Orchestration tab opened below needs isolated-clone provisioning,
+    // which needs a ref to branch from — an unborn HEAD (the harness's own
+    // bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
 
     // Open the orchestration tab (Dashboard + Orchestration = the ≥2 tabs the
     // round-trip needs). Its two `cat` role panes render as deck cards.
