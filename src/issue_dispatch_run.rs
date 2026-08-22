@@ -7355,13 +7355,25 @@ exit 0
     /// own barrier-synchronized two-thread pattern, but races a RESUME
     /// (the directory already exists and is genuinely resume-eligible —
     /// created once via a real prior call, so it carries matching M4b
-    /// evidence and ancestry) rather than a fresh CREATE. Asserts the two
-    /// racers' outcomes are DISTINGUISHABLE — one attaches/resumes, the
-    /// other refuses because it lost the race — never both reporting the
-    /// identical outcome, which is exactly what pre-M3 code does today
-    /// (both simply see the directory present and report the generic
-    /// `AlreadyClaimed`, with no winner/loser distinction at all, since
-    /// resume doesn't exist yet).
+    /// evidence and ancestry) rather than a fresh CREATE. The setup call
+    /// and both racers all share ONE creator string (`"racer"`, matching
+    /// that same sibling test's own precedent) rather than three distinct
+    /// ones.
+    ///
+    /// Round-3 review-findings fix (reviewer, "`workspace_009` drift"):
+    /// with the original mismatched creators (`"setup"`/`"racer-a"`/
+    /// `"racer-b"`), the B2 fix round's new `NameCollision` check makes
+    /// even the race's WINNER mismatch the stored `"setup"` creator, so it
+    /// is refused as `NameCollision` too — nothing ever resumes. The
+    /// surviving `assert_ne!` on the two outcomes' `Debug` strings still
+    /// passed, but for a reason unrelated to the attach lock: the
+    /// process-global registry mutex alone hands one racer `NameCollision`
+    /// and the other `Contested`, so the test would stay green even with
+    /// the attach lock removed entirely. One shared creator string removes
+    /// `NameCollision` from the reachable outcomes here and restores the
+    /// race-specific property directly: across all trials, exactly one of
+    /// the two racers resumes and exactly one is refused as `Contested` —
+    /// never both, never neither, never anything else.
     ///
     /// `#[cfg(unix)]` matches the precedent this mirrors — many trials of
     /// real `git` subprocesses on a shared CI runner.
@@ -7391,7 +7403,7 @@ exit 0
                 // race: a real prior clone, carrying genuine M4b evidence
                 // and matching ancestry — the race is over RESUMING it, not
                 // creating it.
-                let setup = provision_isolated_clone_sync(source, &clone_dir, "race", "setup");
+                let setup = provision_isolated_clone_sync(source, &clone_dir, "race", "racer");
                 assert!(
                     matches!(setup, Ok(IsolatedCloneOutcome::Created { .. })),
                     "trial {i} setup: the initial clone must succeed, got {setup:?}"
@@ -7401,11 +7413,11 @@ exit 0
                 let clone_dir_b = clone_dir.clone();
                 let h_a = s.spawn(move || {
                     barrier.wait();
-                    provision_isolated_clone_sync(source, &clone_dir_a, "race", "racer-a")
+                    provision_isolated_clone_sync(source, &clone_dir_a, "race", "racer")
                 });
                 let h_b = s.spawn(move || {
                     barrier.wait();
-                    provision_isolated_clone_sync(source, &clone_dir_b, "race", "racer-b")
+                    provision_isolated_clone_sync(source, &clone_dir_b, "race", "racer")
                 });
                 handles.push((h_a, h_b));
             }
@@ -7417,16 +7429,31 @@ exit 0
 
         for (i, pair) in results.iter().enumerate() {
             let [a, b] = pair;
-            let debug_a = format!("{a:?}");
-            let debug_b = format!("{b:?}");
-            assert_ne!(
-                debug_a, debug_b,
+            let resumed_count = [a, b]
+                .iter()
+                .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::Resumed { .. })))
+                .count();
+            let contested_count = [a, b]
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r,
+                        Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Contested))
+                    )
+                })
+                .count();
+            assert_eq!(
+                resumed_count, 1,
                 "trial {i}: PRD fork#544 M3 — two near-simultaneous resume attempts against the \
-                 SAME already-eligible directory must serialize on the reused attach lock into \
-                 DISTINGUISHABLE outcomes (one resumes/attaches, the other refuses because it \
-                 lost the race), never the identical outcome for both — pre-M3 code reports the \
-                 identical generic AlreadyClaimed for both racers here, with no winner at all, \
-                 got {debug_a} / {debug_b}"
+                 SAME already-eligible directory, opened under the IDENTICAL creator string, \
+                 must serialize on the reused attach lock so exactly one of them resumes — \
+                 pre-M3 code reports the identical generic AlreadyClaimed for both racers here, \
+                 with no winner at all, got {a:?} / {b:?}"
+            );
+            assert_eq!(
+                contested_count, 1,
+                "trial {i}: PRD fork#544 M3 — the loser of that same race must be refused as \
+                 Contested exactly once, got {a:?} / {b:?}"
             );
         }
     }
@@ -8494,14 +8521,9 @@ exit 0
         let result = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
 
         assert!(
-            !matches!(
-                result,
-                Ok(IsolatedCloneOutcome::Rejected(
-                    ResumeRejection::AncestryMismatch
-                ))
-            ),
-            "reviewer B1 / auditor A1 (both independently reproduced this): \
-             `isolated_clone_ancestry_matches_source` runs `git merge-base --is-ancestor \
+            matches!(result, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "reviewer N4 (round-3 tightening) / B1 / auditor A1 (both independently reproduced \
+             this): `isolated_clone_ancestry_matches_source` runs `git merge-base --is-ancestor \
              <source_dir's CURRENT HEAD> HEAD` INSIDE the clone -- this asks whether \
              source_dir's HEAD AT RESUME TIME is contained in the clone's own history, which is \
              true only in the instant right after cloning (when a plain `git clone` hardlinks \
@@ -8512,7 +8534,10 @@ exit 0
              healthy, genuinely-derived, resumable workspace is wrongly refused as \
              AncestryMismatch. `resume_existing_isolated_clone`'s caller then tells the user to \
              'remove it manually' -- pointed squarely at destroying the exact uncommitted work \
-             this PRD exists to protect. Got {result:?}"
+             this PRD exists to protect. A bare `!matches!(.., AncestryMismatch)` would also \
+             pass on Stranger/Unhealthy/Err, which is not what this test claims to pin -- both \
+             calls here share creator \"tester\", so the resume genuinely succeeds and this \
+             asserts the actual intended outcome. Got {result:?}"
         );
         assert_eq!(
             head_sha(&clone_dir),
@@ -8814,6 +8839,217 @@ exit 0
             head_before,
             "reviewer S3: a failed sync must never leave the workspace's checked-out commit \
              anywhere other than where it started, got {result:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer S1).
+    /// `isolated_clone_ancestry_matches_source`'s own code comment already
+    /// distinguishes "exit 1 = proven mismatch" from "exit 128 =
+    /// inconclusive" for the `merge-base` probe, but the `match` collapses
+    /// both into the identical `false` -> `Rejected(AncestryMismatch)`,
+    /// whose user-facing text tells the user to remove the directory
+    /// manually. This forces the inconclusive branch specifically: after a
+    /// real clone, `source_dir` advances with a genuine new commit (the
+    /// same ordinary steady state `workspace_025` exercises), then the
+    /// commit's own loose object file has its read permission stripped
+    /// (`#[cfg(unix)]` — verified directly with the real `git` binary
+    /// before writing this test that `git rev-parse HEAD` in `source_dir`,
+    /// which only resolves a ref to a SHA, does not need to open that
+    /// object and still succeeds, while the best-effort `git fetch -- \
+    /// source_dir` DOES need to transmit that exact object and fails with
+    /// a permission error, leaving the follow-up `merge-base` unable to
+    /// find the object either — exit 128, never exit 1). Asserts the
+    /// result is NOT the same rejection as a genuine wrong-repo/stranger
+    /// mismatch, whatever coder ends up naming the distinguishable variant
+    /// — pinning the property, not a specific enum variant.
+    #[cfg(unix)]
+    #[spec("orchestration/workspace/031")]
+    #[test]
+    fn workspace_031_ancestry_probe_distinguishes_unverifiable_fetch_failure_from_proven_mismatch()
+    {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-my-feature");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone from source must succeed, got {created:?}"
+        );
+        let clone_head_before = head_sha(&clone_dir);
+
+        // Source advances past the clone -- the ordinary steady state
+        // `workspace_025` exercises -- so the resume's ancestry probe
+        // genuinely needs its best-effort fetch to succeed to find shared
+        // history.
+        std::fs::write(source.join("advanced.txt"), "source moved on after clone\n").unwrap();
+        git(&source, &["add", "advanced.txt"]);
+        git(
+            &source,
+            &["commit", "--quiet", "-m", "source advances past the clone"],
+        );
+        let source_head = head_sha(&source);
+
+        // Strip read permission from the new commit's own loose object
+        // file -- forces the best-effort fetch (which must open and
+        // transmit that exact object) to fail, while leaving `git
+        // rev-parse HEAD` in `source_dir` (a plain ref resolution, run
+        // earlier in the same probe) unaffected.
+        let obj_path = source
+            .join(".git/objects")
+            .join(&source_head[0..2])
+            .join(&source_head[2..]);
+        assert!(
+            obj_path.is_file(),
+            "setup: the new commit's own loose object file must exist at {obj_path:?}"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&obj_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&obj_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        assert!(
+            !matches!(
+                result,
+                Ok(IsolatedCloneOutcome::Rejected(
+                    ResumeRejection::AncestryMismatch
+                ))
+            ),
+            "reviewer S1: a best-effort fetch failing for a reason that has NOTHING to do with \
+             the two repositories being unrelated (here, a permission error reading the \
+             source's own new commit object) must not be reported the identical way as a \
+             genuine wrong-repo/stranger mismatch. Today's code collapses every non-zero \
+             merge-base exit code -- both the proven exit-1 mismatch AND an inconclusive exit-128 \
+             ('object not found' because the fetch that would have supplied it just failed) -- \
+             into the same `false` -> AncestryMismatch, whose describe() text tells the user to \
+             'remove it manually' -- destructive advice for a workspace that is provably \
+             genuinely derived from source, just transiently unable to prove it right now. Got \
+             {result:?}"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            clone_head_before,
+            "sanity: whatever the outcome, an attempt at resuming must never itself mutate the \
+             workspace's checked-out HEAD"
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer S3).
+    /// `sync_merged_workspace_to_main` creates a missing local
+    /// `default_branch` via a bare `git update-ref -- refs/heads/<b> \
+    /// origin/<b>` (Fix 3's own chosen route, specifically BECAUSE it
+    /// sidesteps `check-ref-format`'s DWIM-creation validation -- see
+    /// `workspace_028`). Unlike ordinary DWIM checkout (which sets
+    /// `branch.<b>.remote`/`branch.<b>.merge` automatically when creating a
+    /// new local branch from a remote-tracking ref), a bare `update-ref`
+    /// writes only the ref itself -- no tracking configuration at all.
+    /// Mirrors `workspace_020`'s three-repo real-fast-forward-merge
+    /// fixture, but additionally deletes the local `main` branch the clone
+    /// starts with (`git branch -D main`, while checked out on the feature
+    /// branch) so `local_branch_exists` is genuinely false going into the
+    /// sync call -- per the reviewer, the same precondition
+    /// `remove_stray_default_branch` normally produces at creation time in
+    /// real use, not an edge case.
+    #[spec("orchestration/workspace/032")]
+    #[test]
+    fn workspace_032_update_ref_created_default_branch_still_tracks_its_remote() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-032");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["checkout", "--quiet", "-b", "feat-032"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-032 work"]);
+        let feature_head = head_sha(&clone_dir);
+
+        // Delete the local `main` the clone started with -- the same
+        // `local_branch_exists == false` precondition `remove_stray_
+        // default_branch` produces at creation time in real use (reviewer
+        // S3: "this is NOT an edge case ... local_branch_exists is
+        // normally false").
+        git(&clone_dir, &["branch", "-D", "main"]);
+        let local_branch_check = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/main"])
+            .output()
+            .expect("git rev-parse --verify --quiet refs/heads/main must spawn");
+        assert!(
+            !local_branch_check.status.success(),
+            "setup: local main must genuinely be gone before calling sync"
+        );
+
+        // Simulate the merge landing on origin's own main, exactly as
+        // `workspace_020`.
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-032:refs/heads/feat-032",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-032"]);
+        let merged_main_head = head_sha(&origin_repo);
+        assert_eq!(
+            merged_main_head, feature_head,
+            "setup: origin's main must now BE the feature commit (a real fast-forward merge)"
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        assert!(
+            matches!(result, Ok(PostMergeSyncOutcome::SwitchedToMain)),
+            "setup: a clean workspace whose HEAD is now fully contained in the just-advanced \
+             origin/main must auto-switch -- this test's real assertion only means something \
+             once this reaches SwitchedToMain via the update-ref-created-branch path, got \
+             {result:?}"
+        );
+
+        let upstream_check = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
+            .output()
+            .expect("git rev-parse --abbrev-ref @{upstream} must spawn");
+        assert!(
+            upstream_check.status.success(),
+            "reviewer S3: `sync_merged_workspace_to_main` creates the missing local `main` via \
+             a bare `git update-ref -- refs/heads/main origin/main`, which -- unlike ordinary \
+             DWIM checkout -- writes no tracking configuration at all, so `main` ends up with no \
+             upstream (`git config --get branch.main.remote` unset). That directly contradicts \
+             the PRD's own Decisions table, whose stated reason for the read-only fetch this \
+             whole mechanism depends on is 'so ahead/behind info stays accurate' -- info that \
+             requires an upstream to even compute. `git rev-parse --abbrev-ref @{{upstream}}` \
+             for the branch this call just switched to and created must resolve cleanly, not \
+             error. stderr: {}",
+            String::from_utf8_lossy(&upstream_check.stderr)
         );
     }
 

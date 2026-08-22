@@ -35737,6 +35737,16 @@ mod tests {
     /// collision rather than silently resolving to `Resumed` — pinning the
     /// refusal as a PROPERTY, not a specific error string, since the fix's
     /// exact mechanism is left to coder.
+    ///
+    /// Round-3 review-findings tightening (reviewer N1): the two creator
+    /// strings are derived from the real `orchestration_creator_string`
+    /// (the actual production function both real call sites use), not
+    /// hand-written literals that merely happen to differ today — B2's
+    /// entire fix rests on "distinct Names ⇒ distinct creators", so
+    /// deriving them here means a future change that collapsed
+    /// `orchestration_creator_string`'s output for these two Names would
+    /// be caught by this test, rather than silently regressing to the
+    /// exact bug B2 fixes while this test kept passing on stale literals.
     #[spec("orchestration/workspace/026")]
     #[test]
     fn workspace_026_distinct_names_colliding_after_sanitization_refuse_second_open() {
@@ -35760,11 +35770,17 @@ mod tests {
              workspace path"
         );
 
+        let creator_a = orchestration_creator_string("fix/544");
+        let creator_b = orchestration_creator_string("fix-544");
+        assert_ne!(
+            creator_a, creator_b,
+            "setup: sanity -- B2's whole mechanism rests on distinct Names deriving distinct \
+             creators even though they collide on the path/segment; if this ever failed, this \
+             test would no longer be exercising B2 at all"
+        );
+
         let first = crate::issue_dispatch_run::provision_isolated_clone_sync(
-            &repo,
-            &path_a,
-            &segment_a,
-            "orchestration:fix-544-a",
+            &repo, &path_a, &segment_a, &creator_a,
         );
         assert!(
             matches!(
@@ -35776,10 +35792,7 @@ mod tests {
         );
 
         let second = crate::issue_dispatch_run::provision_isolated_clone_sync(
-            &repo,
-            &path_b,
-            &segment_b,
-            "orchestration:fix-544-b",
+            &repo, &path_b, &segment_b, &creator_b,
         );
 
         assert!(
