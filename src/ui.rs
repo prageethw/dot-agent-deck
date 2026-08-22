@@ -5533,7 +5533,27 @@ fn process_pending_kept_worktrees(state: &SharedState, ui: &mut UiState) {
                 None => "removing it failed".to_string(),
             },
         };
-        let message = format!("Worktree kept at {}: {reason}", notice.path);
+        // PRD fork#544 M6 fix round: REASON first, path last — not
+        // `"Worktree kept at {path}: {reason}"`. The status bar renders this
+        // into a single-row `Paragraph` with no `.wrap()` (see the render
+        // site, ~line 18117), so ratatui clips at `area.width` (120 cols in
+        // the e2e harness). `notice.path` is an absolute path under the
+        // harness's own per-test tempdir (`/var/tmp/dad-e2e-<uid>/dad-tests-
+        // <pid>-<rand>/<fixture>-<name>/`), routinely 70-90+ characters on
+        // its own — long enough that the OLD path-first ordering could push
+        // a `reason` variant's text past column 120 and off screen entirely,
+        // not merely close to the edge. Found while chasing
+        // `orchestration/workspace/018`'s RED persisting unchanged after
+        // this milestone's registration fix landed: if the notice *is* now
+        // broadcast correctly, this ordering is what would have hidden it
+        // regardless — a clipped-but-sent notice and a never-sent one both
+        // fail `wait_for_string` identically, so this reorder closes that
+        // ambiguity even though it wasn't possible to directly observe which
+        // of the two was occurring. Reason-first means the actionable half
+        // survives a clip; only the path (present mainly for a developer to
+        // `cd`/`rm -rf` into, not required to understand what happened) is
+        // now the part that can be truncated.
+        let message = format!("{reason} (worktree kept at {})", notice.path);
         // PRD 236 review (item 3): visibility is the entire justification for
         // keeping instead of force-removing — the ONLY prior reader of
         // `session_warnings` is an `eprintln!` loop after `ratatui::restore()`
