@@ -203,8 +203,28 @@ while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; do
     );
 
     // Isolated-clone provisioning needs a ref to branch from — an unborn
-    // HEAD (the harness's own bare `git init`) does not provide one.
+    // HEAD (the harness's own bare `git init`) does not provide one. `git
+    // clone` only carries COMMITTED content into the isolated clone, so the
+    // orchestrator's `./orchestrator-send-result.sh` role command (just
+    // written above) must be committed too, or its spawn fails inside the
+    // clone with the script missing.
     commit_fixture(deck.workdir());
+    common::run_git(deck.workdir(), &["add", "orchestrator-send-result.sh"]);
+    common::run_git(
+        deck.workdir(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "send-result script",
+        ],
+    );
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");

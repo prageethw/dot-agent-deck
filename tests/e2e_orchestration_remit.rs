@@ -247,8 +247,28 @@ fn open_and_confirm_initial_delivery(
     );
 
     // Isolated-clone provisioning needs a ref to branch from — an unborn
-    // HEAD (the harness's own bare `git init`) does not provide one.
+    // HEAD (the harness's own bare `git init`) does not provide one. `git
+    // clone` only carries COMMITTED content into the isolated clone, so the
+    // orchestrator's `./orchestrator-remit.sh` role command (just written
+    // above) must be committed too, or its spawn fails inside the clone
+    // with the script missing.
     commit_fixture(deck.workdir());
+    common::run_git(deck.workdir(), &["add", "orchestrator-remit.sh"]);
+    common::run_git(
+        deck.workdir(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "remit script",
+        ],
+    );
     open_orchestration(deck);
     deck.wait_for_absence("New Agent");
 

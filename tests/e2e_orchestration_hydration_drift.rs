@@ -35,6 +35,47 @@ const DRIFT_WARNING_NEEDLE: &str = "orchestration 'demo-orch' not found in local
 /// coincidentally matching some unrelated error string.
 const PARSE_WARNING_NEEDLE: &str = "local .dot-agent-deck.toml could not be parsed";
 
+/// PRD fork#544 M2b: isolation is now unconditional, so the orchestration
+/// opened by the tests below does not run in `deck.workdir()` itself — it
+/// runs in a freshly `git clone`d SIBLING directory
+/// (`<workdir-basename>-<segment>`, `resolve_workspace_path` in
+/// `src/ui.rs`). The daemon's hydration/drift check reads
+/// `.dot-agent-deck.toml` from THAT role pane's own cwd, not from
+/// `deck.workdir()` — so a test simulating config drift by rewriting the
+/// file must rewrite the isolated clone's copy, not the source fixture's.
+/// Rather than reimplement the exact sanitize/name-suggestion logic here,
+/// find the one new sibling directory `open_orchestration`'s clone created:
+/// `deck.workdir()`'s parent holds only per-test tempdirs, each with a
+/// high-entropy random suffix, so a `<basename>-` prefix match is safe from
+/// collision with a concurrently-running test's own directory.
+fn find_isolated_clone_dir(deck: &TuiDeck) -> std::path::PathBuf {
+    let workdir = deck.workdir();
+    let basename = workdir
+        .file_name()
+        .expect("workdir has a basename")
+        .to_string_lossy()
+        .into_owned();
+    let parent = workdir.parent().expect("workdir has a parent");
+    let prefix = format!("{basename}-");
+    std::fs::read_dir(parent)
+        .expect("read workdir's parent directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path != workdir
+                && path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().starts_with(prefix.as_str()))
+                    .unwrap_or(false)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no isolated-clone sibling of {workdir:?} found under {parent:?} \
+                 (prefix {prefix:?}) -- did the orchestration actually open?"
+            )
+        })
+}
+
 /// Scenario: Open a live Orchestration tab against the `orch-deck` fixture's
 /// `demo-orch` orchestration in one TUI client, then rewrite that project's
 /// `.dot-agent-deck.toml` on disk to rename the orchestration — the file
@@ -70,11 +111,13 @@ fn hydration_001_renamed_orchestration_warns_on_reattach() {
     let attach_socket = deck.attach_socket_path().to_string_lossy().into_owned();
     let hook_socket = deck.hook_socket_path().to_string_lossy().into_owned();
 
-    // Rewrite the fixture's config on disk while the daemon still has a
-    // live pane recorded under the old orchestration name — the drift
-    // condition. The file still parses (`cfg.is_some()`), it simply no
-    // longer lists `demo-orch`, which is what distinguishes this from the
-    // legitimate `cfg.is_none()` remote-reconnect case (PRD #111).
+    // Rewrite the config on disk while the daemon still has a live pane
+    // recorded under the old orchestration name — the drift condition. The
+    // file still parses (`cfg.is_some()`), it simply no longer lists
+    // `demo-orch`, which is what distinguishes this from the legitimate
+    // `cfg.is_none()` remote-reconnect case (PRD #111). This must land in
+    // the ISOLATED CLONE the orchestration actually runs in, not
+    // `deck.workdir()` — see `find_isolated_clone_dir`'s doc comment.
     let renamed_toml = r#"# Rewritten by orchestration/hydration/001 to rename the orchestration out
 # from under the still-live daemon pane -- the drift condition under test.
 [[orchestrations]]
@@ -89,7 +132,8 @@ start = true
 name = "worker"
 command = "cat"
 "#;
-    std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), renamed_toml)
+    let orchestration_dir = find_isolated_clone_dir(&deck);
+    std::fs::write(orchestration_dir.join(".dot-agent-deck.toml"), renamed_toml)
         .expect("rewrite .dot-agent-deck.toml to rename the orchestration");
 
     // Reattach a FRESH TUI client to the SAME daemon -- the still-running
@@ -170,8 +214,14 @@ name = "orchestrator"
 command = "cat"
 start = true
 "#;
-    std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), corrupted_toml)
-        .expect("corrupt .dot-agent-deck.toml with a syntax error");
+    // Must land in the ISOLATED CLONE the orchestration actually runs in,
+    // not `deck.workdir()` — see `find_isolated_clone_dir`'s doc comment.
+    let orchestration_dir = find_isolated_clone_dir(&deck);
+    std::fs::write(
+        orchestration_dir.join(".dot-agent-deck.toml"),
+        corrupted_toml,
+    )
+    .expect("corrupt .dot-agent-deck.toml with a syntax error");
 
     // Reattach a FRESH TUI client to the SAME daemon, exactly as
     // `hydration_001` does.

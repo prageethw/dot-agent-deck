@@ -167,8 +167,29 @@ fn focus_007_lock_governed_focus_contract_on_real_binary() {
 
     // The orchestration opened below needs isolated-clone provisioning,
     // which needs a ref to branch from — an unborn HEAD (the harness's own
-    // bare `git init`) does not provide one.
+    // bare `git init`) does not provide one. `git clone` only carries
+    // COMMITTED content into the isolated clone, so `beta`'s
+    // `./beta-agent.sh` role command — a fixture file that ships alongside
+    // `.dot-agent-deck.toml` but isn't itself committed by `commit_fixture`
+    // — must be committed too, or `beta`'s spawn (and everything after it)
+    // fails inside the clone with the script missing.
     commit_fixture(deck.workdir());
+    common::run_git(deck.workdir(), &["add", "beta-agent.sh"]);
+    common::run_git(
+        deck.workdir(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "beta script",
+        ],
+    );
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
 

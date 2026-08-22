@@ -499,8 +499,28 @@ fn write_beta_agent(deck: &TuiDeck) {
 /// field, so a second Enter submits the form.
 fn open_focus_lifecycle_orchestration(deck: &TuiDeck) {
     // Isolated-clone provisioning needs a ref to branch from — an unborn
-    // HEAD (the harness's own bare `git init`) does not provide one.
+    // HEAD (the harness's own bare `git init`) does not provide one. `git
+    // clone` only carries COMMITTED content into the isolated clone, so
+    // `beta`'s `./beta-agent.sh` role command (written by `write_beta_agent`
+    // before this call) must be committed too, or its spawn fails inside
+    // the clone with the script missing.
     commit_fixture(deck.workdir());
+    common::run_git(deck.workdir(), &["add", "beta-agent.sh"]);
+    common::run_git(
+        deck.workdir(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "beta script",
+        ],
+    );
     deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode");
