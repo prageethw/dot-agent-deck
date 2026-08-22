@@ -4266,6 +4266,34 @@ without depending on the config struct API.
 - **Does not assert:** behavior against a second, older schema value (none exists yet); the hash/Name/path fields (`011` covers those).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/workspace/014 — Calling the new explicit "forget this workspace" action (`forget_isolated_workspace`) against a real, live isolated-clone workspace with `confirmed: false` refuses rather than silently no-opping, and leaves BOTH the workspace directory and its M4b provenance artifact completely untouched — content, not just presence (PRD fork#544 M5's Design step 5: modeled on this codebase's own `issue claim --takeover --confirm-stopped` pattern, refuse by default).
+- **Layer:** L1 (in-process — direct calls to `provision_isolated_clone_sync` and the new `forget_isolated_workspace`; real `git` subprocess and filesystem, no PTY, no daemon, no real agent).
+- **Agent:** none.
+- **Asserts:** a real isolated-clone workspace, created via `provision_isolated_clone_sync`, is not removed or modified by an unconfirmed forget call: the returned `Result` is `Err`, naming the missing confirmation; the workspace directory still exists as a directory; its working-tree file and HEAD commit are byte-identical to before the call; the M4b provenance artifact still exists and its content is byte-identical to before the call. `DOT_AGENT_DECK_STATE_DIR` pinned per-test, as `006`-`013`. `forget_isolated_workspace` does not exist in production code yet — this is a compile-time RED (the milestone's own expected RED shape, per the tester's `work-done` report), not a runtime one.
+- **Does not assert:** the confirmed-removal path (`015`); the nonexistent-workspace case (`016`); the stranger-directory case (`017`); the exact CLI surface (`worker-agent-deck worktree forget <name>` or otherwise) — only the internal function's observable contract.
+- **Platform coverage:** mac+linux+windows (no `cfg` gate — a plain `std::process::Command` git subprocess, same as its sibling tests in this file).
+
+##### orchestration/workspace/015 — Calling `forget_isolated_workspace` with `confirmed: true` against a real, live isolated-clone workspace atomically removes BOTH the workspace directory and its M4b provenance artifact — never one without the other — the milestone's headline behavior and the only way a named workspace is ever cleared (PRD fork#544 M5's Design step 5 / M9's own listed coverage: "atomic removal with confirmation").
+- **Layer:** L1 (in-process — direct calls to `provision_isolated_clone_sync` and the new `forget_isolated_workspace`; real `git` subprocess and filesystem, no PTY, no daemon, no real agent).
+- **Agent:** none.
+- **Asserts:** a real isolated-clone workspace, created via `provision_isolated_clone_sync`, is fully removed by a confirmed forget call: the returned `Result` is `Ok`; the workspace directory no longer exists at all; the M4b provenance artifact no longer exists at all — both checked independently, never inferring one from the other. `DOT_AGENT_DECK_STATE_DIR` pinned per-test, as `006`-`014`. RED today: `forget_isolated_workspace` does not exist in production code (compile-time RED, matching `014`).
+- **Does not assert:** the refusal path (`014`); the nonexistent-workspace and stranger-directory edge cases (`016`/`017`); whether the two removals happen in any particular order, or via any particular filesystem primitive — only that both are gone afterward.
+- **Platform coverage:** mac+linux+windows, matching `014`.
+
+##### orchestration/workspace/016 — Calling `forget_isolated_workspace` with `confirmed: true` against a `clone_dir` that has never existed at all — no directory, no provenance artifact, nothing the deck or anyone else ever created there — does not panic and does not falsely report success; there is nothing there to forget (PRD fork#544 M5's own "consider" coverage).
+- **Layer:** L1 (in-process — a direct call to `forget_isolated_workspace` against a never-created path; filesystem only, no `git` subprocess needed, no PTY, no daemon, no real agent).
+- **Agent:** none.
+- **Asserts:** the returned `Result` is `Err`, never `Ok` — a confirmed forget against a workspace that was never created must not be misreported as a successful removal; the target path still does not exist afterward (the call creates nothing either). `DOT_AGENT_DECK_STATE_DIR` pinned per-test, as `006`-`015`. RED today: `forget_isolated_workspace` does not exist in production code (compile-time RED, matching `014`).
+- **Does not assert:** the stranger-directory case, where something DOES exist on disk but carries no provenance (`017`); the confirmed/unconfirmed refusal paths against a real workspace (`014`/`015`).
+- **Platform coverage:** mac+linux+windows, matching `014`.
+
+##### orchestration/workspace/017 — Calling `forget_isolated_workspace` with `confirmed: true` against a directory that sits at the derived `clone_dir` path with its own real, independent git history — but was never created by `provision_isolated_clone_sync`, so it carries no M4b provenance artifact — refuses rather than deleting someone else's real content, even though the caller explicitly confirmed (PRD fork#544 M5's own "consider" coverage, and the codebase's general never-delete-unowned-content safety property already applied by `resume_existing_isolated_clone`'s own stranger-directory refusal).
+- **Layer:** L1 (in-process — direct calls to `forget_isolated_workspace` against a directory seeded with its own independent git history via the existing `seed_source_repo` helper; real `git` subprocess and filesystem, no PTY, no daemon, no real agent).
+- **Agent:** none.
+- **Asserts:** the returned `Result` is `Err` — a confirming flag proves the caller wants to remove ITS workspace, not that this directory IS one; the stranger directory is never deleted (still a directory afterward); its working-tree file and HEAD commit remain byte-identical to before the call. `DOT_AGENT_DECK_STATE_DIR` pinned per-test, as `006`-`016`. RED today: `forget_isolated_workspace` does not exist in production code (compile-time RED, matching `014`).
+- **Does not assert:** the nonexistent-workspace case, where nothing exists on disk at all (`016`); the confirmed-removal path against a genuine deck-owned workspace (`015`).
+- **Platform coverage:** mac+linux+windows, matching `014`.
+
 #### orchestration/remit
 
 ##### orchestration/remit/001 — A `Compacting` event on the orchestrator start-role pane re-delivers the remit pointer a second time (upstream issue #423).

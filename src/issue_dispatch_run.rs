@@ -6899,6 +6899,206 @@ exit 0
         );
     }
 
+    /// Scenario: PRD fork#544 M5. `forget_isolated_workspace` is the new
+    /// explicit "forget this workspace" action, modeled on this codebase's
+    /// existing `issue claim --takeover --confirm-stopped` pattern: calling
+    /// it against a real, live isolated-clone workspace with `confirmed:
+    /// false` must refuse rather than silently no-op, and must leave BOTH
+    /// the directory and its M4b provenance artifact completely untouched.
+    /// `forget_isolated_workspace` does not exist yet (M5 has not
+    /// implemented it), so this is a compile-time RED — the expected RED
+    /// reason for this milestone, matching this task's own framing ("the
+    /// action doesn't exist yet").
+    #[spec("orchestration/workspace/014")]
+    #[test]
+    fn workspace_014_refusal_without_confirmation_leaves_everything_untouched() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-forget-me-not");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "forget-me-not", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        let marker_before = std::fs::read_to_string(&marker_path)
+            .unwrap_or_else(|e| panic!("setup: provenance artifact must be readable: {e}"));
+        let head_before = head_sha(&clone_dir);
+
+        let result = forget_isolated_workspace(&clone_dir, false, "tester");
+
+        assert!(
+            result.is_err(),
+            "PRD fork#544 M5: forgetting without an explicit confirming flag must refuse, never \
+             silently no-op and never report success, got {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("confirm"),
+            "the refusal reason must name the missing confirmation (mirroring this codebase's \
+             `--confirm-stopped` precedent), got {err:?}"
+        );
+
+        assert!(
+            clone_dir.is_dir(),
+            "an unconfirmed forget attempt must never remove the workspace directory"
+        );
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "an unconfirmed forget attempt must never touch the workspace's working tree"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_before,
+            "an unconfirmed forget attempt must never touch the workspace's git state"
+        );
+        assert!(
+            marker_path.is_file(),
+            "an unconfirmed forget attempt must never remove the M4b provenance artifact"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).unwrap(),
+            marker_before,
+            "an unconfirmed forget attempt must never modify the M4b provenance artifact's \
+             content"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M5. Calling `forget_isolated_workspace` with
+    /// `confirmed: true` against a real, live isolated-clone workspace must
+    /// remove BOTH the workspace directory and its M4b provenance artifact
+    /// — never one without the other. This is the milestone's headline
+    /// behavior: the only way a named workspace is ever cleared.
+    #[spec("orchestration/workspace/015")]
+    #[test]
+    fn workspace_015_confirmed_forget_atomically_removes_directory_and_provenance() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-forget-me");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "forget-me", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        assert!(
+            marker_path.is_file(),
+            "setup: the provenance artifact must exist before the forget call"
+        );
+
+        let result = forget_isolated_workspace(&clone_dir, true, "tester");
+        assert!(
+            result.is_ok(),
+            "PRD fork#544 M5: a confirmed forget against a real, existing workspace must \
+             succeed, got {result:?}"
+        );
+
+        assert!(
+            !clone_dir.exists(),
+            "a confirmed forget must remove the workspace directory — don't just check the \
+             provenance artifact and assume the directory followed"
+        );
+        assert!(
+            !marker_path.exists(),
+            "a confirmed forget must remove the M4b provenance artifact — don't just check the \
+             directory and assume the artifact followed"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M5's own "consider" coverage. Calling
+    /// `forget_isolated_workspace` with `confirmed: true` against a
+    /// `clone_dir` that has never existed at all — no directory, no
+    /// provenance artifact — must not panic and must not falsely report
+    /// success; there is nothing there to forget.
+    #[spec("orchestration/workspace/016")]
+    #[test]
+    fn workspace_016_forgetting_a_nonexistent_workspace_does_not_falsely_succeed() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let clone_dir = ws.path().join("source-never-existed");
+        assert!(
+            !clone_dir.exists(),
+            "sanity: this path must genuinely never have been created"
+        );
+
+        let result = forget_isolated_workspace(&clone_dir, true, "tester");
+
+        assert!(
+            result.is_err(),
+            "PRD fork#544 M5: forgetting a workspace that was never created must not falsely \
+             report success — there is nothing there to forget, got {result:?}"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "a forget attempt against a nonexistent workspace must not create anything either"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M5's own "consider" coverage, and the
+    /// codebase's general never-auto-delete-unowned-content safety property
+    /// (the same reasoning `resume_existing_isolated_clone`'s stranger-
+    /// directory refusal already applies). A directory sitting at the
+    /// derived `clone_dir` path with its own real, independent git history
+    /// — but never created by `provision_isolated_clone_sync`, so it
+    /// carries no M4b provenance artifact — must be refused, not deleted,
+    /// even with `confirmed: true`: a confirming flag proves the CALLER
+    /// wants to remove ITS workspace, not that this directory IS one.
+    #[spec("orchestration/workspace/017")]
+    #[test]
+    fn workspace_017_stranger_directory_with_no_provenance_is_refused_not_deleted() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let clone_dir = ws.path().join("source-not-ours");
+        // A stranger directory: present on disk with its own unrelated git
+        // history, but never created by `provision_isolated_clone_sync` —
+        // no M4b provenance artifact was ever written for this canonical
+        // path.
+        seed_source_repo(&clone_dir, "not the deck's\n");
+        let head_before = head_sha(&clone_dir);
+
+        let result = forget_isolated_workspace(&clone_dir, true, "tester");
+
+        assert!(
+            result.is_err(),
+            "PRD fork#544 M5: a confirmed forget against a directory with NO matching M4b \
+             ownership evidence must refuse rather than deleting someone else's real content, \
+             got {result:?}"
+        );
+        assert!(
+            clone_dir.is_dir(),
+            "a stranger directory must never be deleted by forget, confirmed or not"
+        );
+        assert!(
+            clone_dir.join("README.md").exists(),
+            "a stranger directory's working tree must remain untouched"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_before,
+            "a stranger directory's git state must remain untouched"
+        );
+    }
+
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B), extended by
     /// round 3 (reviewer C1/C2, auditor C1/C2). Unit tests
     /// `handle_isolated_clone_add_error` directly rather than inducing a
