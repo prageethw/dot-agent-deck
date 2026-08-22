@@ -6698,6 +6698,180 @@ exit 0
         );
     }
 
+    /// Scenario: PRD fork#544 M4. After a real `provision_isolated_clone_sync`
+    /// call creates a fresh isolated clone (and, as a side effect, writes the
+    /// M4b provenance artifact), the artifact's raw file content is read
+    /// directly off disk and must contain a hash of the root checkout's
+    /// (`source_dir`'s) own canonical path, the orchestration Name typed for
+    /// this workspace, and the clone's own canonical path — all as real,
+    /// extractable data, not merely a content-free presence marker. Today the
+    /// artifact is still the literal bytes `b"deck\n"`, so this fails on the
+    /// very first assertion.
+    #[spec("orchestration/workspace/011")]
+    #[test]
+    fn workspace_011_provenance_artifact_round_trips_schema_hash_name_and_path() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-my-feature");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        let content = std::fs::read_to_string(&marker_path).unwrap_or_else(|e| {
+            panic!("provenance artifact must be readable at {marker_path:?}: {e}")
+        });
+
+        let expected_root_hash = format!(
+            "{:016x}",
+            crate::platform::lock::fnv1a64(
+                canonicalize_best_effort(&source)
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        );
+        let expected_path = canonicalize_best_effort(&clone_dir)
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(
+            content.trim() != "deck",
+            "PRD fork#544 M4: the provenance artifact must carry structured data (schema tag, \
+             root-checkout-path hash, orchestration Name, canonical workspace path) — today it \
+             is still the content-free M4b bytes `b\"deck\\n\"`, got {content:?}"
+        );
+        assert!(
+            content.contains(&expected_root_hash),
+            "PRD fork#544 M4: the artifact must record a hash of the root checkout's \
+             (source_dir's) canonical path at write time, keyed the same way \
+             `isolated_clone_provenance_path` already keys the clone path itself — expected to \
+             find {expected_root_hash} somewhere in {content:?}"
+        );
+        assert!(
+            content.contains("my-feature"),
+            "PRD fork#544 M4: the artifact must record the orchestration Name as explicit \
+             structured data — expected to find the Name \"my-feature\" somewhere in {content:?}"
+        );
+        assert!(
+            content.contains(&expected_path),
+            "PRD fork#544 M4: the artifact must record the canonical workspace path as explicit \
+             structured data — expected to find {expected_path:?} somewhere in {content:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M4. A pre-M4 provenance artifact — the literal
+    /// bytes `b"deck\n"` written directly to disk, bypassing the writer
+    /// entirely, simulating a workspace created by a build that predates the
+    /// M4 fields — must still be treated as valid M4b ownership evidence:
+    /// reopening the same Name against the same source must still resume
+    /// rather than being refused as a stranger directory. This exercises
+    /// EXISTING M3 behavior (`resume_existing_isolated_clone`'s eligibility
+    /// check (b) only ever tested file presence via `is_file()`, never
+    /// content), so unlike `011` this may already be green — reported
+    /// honestly either way, not forced.
+    #[spec("orchestration/workspace/012")]
+    #[test]
+    fn workspace_012_old_format_content_free_evidence_still_valid_for_resume() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-legacy-workspace");
+        let created =
+            provision_isolated_clone_sync(&source, &clone_dir, "legacy-workspace", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        // Simulate a pre-M4 artifact: overwrite whatever the writer just
+        // produced with the OLD content-free bytes, bypassing the writer
+        // entirely — this is deliberately NOT calling any writer function,
+        // to prove the READ path tolerates a genuinely pre-M4 file rather
+        // than merely tolerating today's writer's own output.
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        std::fs::write(&marker_path, b"deck\n").expect("overwrite with pre-M4 format");
+
+        // Release the prior registration so this resume attempt isn't
+        // refused as Contested for a reason unrelated to what this test
+        // checks.
+        release_resumed_isolated_clone_registration(&clone_dir);
+
+        let result =
+            provision_isolated_clone_sync(&source, &clone_dir, "legacy-workspace", "opener");
+        assert!(
+            matches!(result, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "PRD fork#544 M4: an old-format (pre-M4) `b\"deck\\n\"` provenance artifact must \
+             still be treated as valid ownership evidence — M3's eligibility check (b) must keep \
+             passing for it, not reject it as a stranger directory just because it predates the \
+             M4 fields, got {result:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#544 M4. After a real `provision_isolated_clone_sync`
+    /// call writes today's provenance artifact, the artifact's schema tag
+    /// must round-trip as real, readable data — a `schema=<CURRENT>` marker
+    /// a future consumer could branch on — not merely be present-but-unread.
+    /// No second, genuinely pre-M4 schema value exists yet to compare
+    /// against (M4 is the first schema tag this artifact has ever carried),
+    /// so this only proves TODAY's tag is real extractable data, per the
+    /// PRD's own explicit carve-out ("you don't need a second real 'old
+    /// naming scheme' to compare against").
+    #[spec("orchestration/workspace/013")]
+    #[test]
+    fn workspace_013_schema_tag_is_real_readable_data_not_merely_present() {
+        // Tester's proposed encoding for the M4 artifact, since none is
+        // specified beyond "content-minimal, no untrusted payload": plain
+        // `key=value` lines, one per field. `CURRENT_SCHEMA` is this test's
+        // own stand-in for whatever tag value the real implementation picks
+        // for "today's schema" — see this test's `work-done` report for the
+        // full recommendation.
+        const CURRENT_SCHEMA: &str = "2";
+
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-schema-check");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "schema-check", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        let content = std::fs::read_to_string(&marker_path).unwrap_or_else(|e| {
+            panic!("provenance artifact must be readable at {marker_path:?}: {e}")
+        });
+
+        let schema_tag = content
+            .lines()
+            .find_map(|line| line.strip_prefix("schema=").map(str::trim));
+        assert_eq!(
+            schema_tag,
+            Some(CURRENT_SCHEMA),
+            "PRD fork#544 M4: reading the artifact back must report today's schema tag as real, \
+             extractable data a future consumer could branch on to distinguish it from an older \
+             naming-scheme's evidence — expected a `schema={CURRENT_SCHEMA}` line, got {content:?}"
+        );
+    }
+
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B), extended by
     /// round 3 (reviewer C1/C2, auditor C1/C2). Unit tests
     /// `handle_isolated_clone_add_error` directly rather than inducing a
