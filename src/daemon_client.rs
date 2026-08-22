@@ -105,6 +105,13 @@ pub struct StartAgentOptions {
     /// payload so older daemons keep accepting the request (and, receiving no
     /// seed, drive the unchanged PTY-injection path).
     pub seed: Option<String>,
+    /// PRD fork#544 M6: forwarded as
+    /// `AttachRequest::StartAgent.isolated_clone_origin` — see that
+    /// field's doc for the full contract. `None` omits the field from the
+    /// wire payload so older daemons keep accepting the request (and,
+    /// receiving no origin, never register the workspace — today's
+    /// pre-M6 behavior).
+    pub isolated_clone_origin: Option<String>,
 }
 
 impl Default for StartAgentOptions {
@@ -119,6 +126,7 @@ impl Default for StartAgentOptions {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         }
     }
 }
@@ -433,6 +441,7 @@ impl DaemonClient {
             tab_membership: opts.tab_membership,
             agent_type: opts.agent_type,
             seed: opts.seed,
+            isolated_clone_origin: opts.isolated_clone_origin,
         };
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
         if !resp.ok {

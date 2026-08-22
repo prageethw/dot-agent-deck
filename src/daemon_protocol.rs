@@ -515,6 +515,19 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 // Message types
 // ---------------------------------------------------------------------------
 
+// PRD fork#544 M6: `StartAgent`'s size is dominated by `tab_membership:
+// Option<TabMembership>` (an enum whose `Orchestration` variant carries
+// several `String`/`Option<String>` fields), not by any single field added
+// here. Boxing it would fix the lint, but `tab_membership` is constructed
+// and destructured by name at every `StartAgent` call/match site across
+// `src/` and `tests/` (`AgentSpawnOptions`, `StartAgentOptions`, and every
+// literal/pattern of the wire enum itself) — a ripple this milestone's
+// scope doesn't warrant for a lint that was already this close to firing
+// before `isolated_clone_origin` tipped it over. Wire correctness is
+// unaffected either way: this enum's fields all still (de)serialize
+// through `serde_json`, which sizes each request independently on
+// encode/decode rather than by the enum's in-memory `size_of`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum AttachRequest {
@@ -579,6 +592,25 @@ pub enum AttachRequest {
         /// unchanged PTY-injection path (the fallback still delivers).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<String>,
+        /// PRD fork#544 M6: the root checkout this pane's `cwd` was
+        /// isolated-cloned FROM, when the TUI's client-side
+        /// `provision_isolated_clone_sync` (Model A's own provisioning —
+        /// see `src/ui.rs`'s `provision_isolated_clone_or_status`) created
+        /// or resumed it. `Some` only on an orchestration role pane whose
+        /// workspace is such a clone; `None` for every other spawn
+        /// (dashboard/mode panes, and Model B/C dispatch, which already
+        /// register daemon-side via `record_worktree` at dispatch time —
+        /// see `src/dispatch.rs`/`src/issue_dispatch_run.rs`). The handler
+        /// below uses it to register the workspace in the daemon's own
+        /// `WorktreeRegistry` under `RemovalPolicy::IsolatedClone`, so a
+        /// later tab-close finds an entry to report `Kept` against instead
+        /// of finding nothing (Model A previously never registered at
+        /// all). Same `skip_serializing_if` pattern as the other additive
+        /// fields above, so this needs no `PROTOCOL_VERSION` bump — an
+        /// older daemon simply ignores the field and never registers the
+        /// workspace, which is exactly today's (pre-M6) behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolated_clone_origin: Option<String>,
     },
     StopAgent {
         id: String,
@@ -1674,6 +1706,7 @@ async fn handle_connection(
             tab_membership,
             agent_type,
             seed,
+            isolated_clone_origin,
         } => {
             // PRD #92 F1 followup hardening: refuse to start a new agent
             // while the registry's `shutting_down` latch is set. The
@@ -1931,6 +1964,31 @@ async fn handle_connection(
                         let orch_cwd = orchestration_cwd
                             .or_else(|| cwd_for_state.clone())
                             .unwrap_or_default();
+                        // PRD fork#544 M6: Model A's own client-side
+                        // provisioning (`src/ui.rs`'s
+                        // `provision_isolated_clone_or_status`) has no
+                        // access to this daemon's `WorktreeRegistry` — it
+                        // runs in the TUI process, not here — so unlike
+                        // Model B/C (which call `record_worktree` at
+                        // dispatch time, daemon-side) nothing ever
+                        // registered this workspace for tab-close cleanup.
+                        // Register it now, keyed by the SAME `orch_cwd`
+                        // `take_worktree`/`worktree_still_in_use` look up
+                        // at close time — never `cwd_for_state`, which is
+                        // this one pane's own cwd and can diverge from the
+                        // shared orchestration cwd (round-9 #2). Idempotent
+                        // (`record_worktree`'s doc comment): every role
+                        // pane of this tab carries the same
+                        // `isolated_clone_origin`, so re-registering on
+                        // each one just refreshes the identical entry.
+                        if let Some(origin) = isolated_clone_origin.as_deref() {
+                            crate::issue_dispatch_run::record_worktree(
+                                &worktree_registry,
+                                Path::new(&orch_cwd),
+                                Path::new(origin),
+                                crate::issue_dispatch_run::RemovalPolicy::IsolatedClone,
+                            );
+                        }
                         // PRD #140 M2.0: prefer the per-tab instance token
                         // when the client stamped one. Two tabs of the same
                         // orchestration in the same directory produce
@@ -4214,6 +4272,7 @@ mod tests {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
@@ -4249,6 +4308,7 @@ mod tests {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -4289,6 +4349,7 @@ mod tests {
             }),
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4329,6 +4390,7 @@ mod tests {
             }),
             agent_type: None,
             seed: None,
+            isolated_clone_origin: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4941,7 +5003,7 @@ mod tests {
         // `ConfirmOrchestrationClaim` for the post-spawn rebind onto the
         // real pane id. `AgentPtyRegistry::claim_orchestration_name`'s own
         // exclusivity contract is covered directly by
-        // `identity_012`/`identity_013`/`identity_014`/`identity_015` in
+        // `identity_021`/`identity_022`/`identity_023`/`identity_024` in
         // `src/agent_pty.rs`; this pins the REQUEST's wire shape, the part
         // those registry-level tests can't see.
         let req = AttachRequest::ClaimOrchestrationName {
