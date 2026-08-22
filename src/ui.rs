@@ -10650,17 +10650,31 @@ fn dispatch_action(
                     // apart from the other two warnings for the same reason
                     // they're kept apart from each other (see that
                     // function's doc comment).
+                    let provision_result = provision_isolated_clone_or_status(
+                        &req.dir,
+                        &worktree_path,
+                        &segment,
+                        &creator,
+                    );
+                    // PRD fork#544 M3 fix round: release this process-local
+                    // resume registration the moment provisioning returns,
+                    // on every outcome — the `ClaimOrchestrationName` call
+                    // above already durably established liveness for this
+                    // Name before provisioning even ran, so the registry's
+                    // brief defense-in-depth job is done here regardless of
+                    // whether provisioning resumed, created, or refused.
+                    // See `resumed_isolated_clones`'s doc comment
+                    // (`src/issue_dispatch_run.rs`) for why this is correct
+                    // rather than a weakening of the race protection.
+                    crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
+                        &worktree_path,
+                    );
                     let (
                         dir_str,
                         worktree_marker_warning,
                         worktree_origin_warning,
                         worktree_resume_fetch_warning,
-                    ) = match provision_isolated_clone_or_status(
-                        &req.dir,
-                        &worktree_path,
-                        &segment,
-                        &creator,
-                    ) {
+                    ) = match provision_result {
                         Ok((resolved_dir_str, marker_warning, origin_warning, fetch_warning)) => (
                             resolved_dir_str,
                             marker_warning,

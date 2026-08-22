@@ -2813,29 +2813,55 @@ impl ResumeRejection {
 /// PRD fork#544 M3: process-local record of which isolated-clone canonical
 /// paths have already been resumed once. Deliberately IN-PROCESS rather
 /// than a persistent on-disk artifact next to the M4b evidence file it sits
-/// beside in this source file: the only real caller today
-/// (`Action::SpawnPane`'s dispatch in `src/ui.rs`) is already fully
-/// arbitrated by fork#192's `ClaimOrchestrationName` daemon registry before
+/// beside in this source file: both real callers today
+/// (`Action::SpawnPane`'s dispatch in `src/ui.rs`, arbitrated by fork#192's
+/// `ClaimOrchestrationName` daemon registry; `src/dispatch.rs`'s ad hoc
+/// `dispatch <name>` CLI path, arbitrated by its own has-live-sibling
+/// daemon query) already run their OWN liveness check/claim before
 /// [`provision_isolated_clone_sync`] is ever reached, so a genuine
 /// same-Name concurrent resume never reaches this function in production —
-/// this registry exists as THIS function's own defense-in-depth for a
-/// caller that bypasses that gate (a scheduled-dispatch caller, or a direct
-/// test such as `orchestration/workspace/009`), and it resets for free on
-/// every process restart rather than needing its own release-on-close
-/// plumbing.
+/// this registry exists as THIS function's own defense-in-depth for the
+/// brief window between that check and this in-process registration (a
+/// window a direct test such as `orchestration/workspace/009` can exercise
+/// with no daemon involved at all), and it resets for free on every process
+/// restart.
 ///
-/// Known scope limit, not exercised by any current test: within ONE
-/// process's lifetime a given canonical path can only ever win this
-/// registration once, so a THIRD open of the same Name in the same
-/// still-running process (open, close, reopen — the one legitimate resume
-/// every current test exercises — close, reopen again) would incorrectly
-/// see [`ResumeRejection::Contested`] on that second reopen. Nothing in
-/// this round releases an entry on tab close; flagged here rather than
-/// silently accepted.
+/// PRD fork#544 M3 fix round: an entry now gets released by
+/// [`release_resumed_isolated_clone_registration`], called by both real
+/// callers immediately after `provision_isolated_clone_sync` returns —
+/// NOT tied to tab close. That is deliberately early rather than late: by
+/// the time either caller reaches this function at all, its own liveness
+/// check/claim has already durably established that this orchestration is
+/// the sole live user of the path, so this registry's job is done the
+/// moment provisioning returns to it. Previously nothing released an entry
+/// at all, so within one process a given canonical path could only ever
+/// win this registration once — a THIRD open of the same Name in the same
+/// still-running process (open, close, reopen [1st resume, works], close,
+/// reopen again [2nd resume]) incorrectly saw
+/// [`ResumeRejection::Contested`] on that second reopen; see
+/// `orchestration/workspace/009`'s extension for the regression test.
 fn resumed_isolated_clones() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
     static REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// PRD fork#544 M3 fix round: releases `clone_dir`'s entry (if any) from
+/// [`resumed_isolated_clones`]. Called by both real `provision_isolated_clone_sync`
+/// callers (`src/ui.rs`, `src/dispatch.rs`) immediately after provisioning
+/// returns, on every outcome — `Resumed`, `Created`, a `Rejected` refusal,
+/// or an `Err` — so a caller need not match on the outcome to know whether
+/// to call it: idempotent (a no-op `HashSet::remove` when no entry was ever
+/// inserted, which is every outcome except `Resumed`). Deliberately NOT
+/// hooked to tab close or any other teardown path — see
+/// [`resumed_isolated_clones`]'s doc comment for why releasing this early
+/// is correct rather than a weakening of the race protection.
+pub(crate) fn release_resumed_isolated_clone_registration(clone_dir: &Path) {
+    let canonical = canonicalize_best_effort(clone_dir);
+    resumed_isolated_clones()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&canonical);
 }
 
 /// PRD fork#544 M3: `provision_isolated_clone_sync`'s resume arm, called in
@@ -6596,6 +6622,80 @@ exit 0
                  got {debug_a} / {debug_b}"
             );
         }
+    }
+
+    /// Scenario: PRD fork#544 M3 fix round. Resumes the SAME already-eligible
+    /// directory TWICE in a row, in one still-running process, releasing
+    /// `resumed_isolated_clones()`'s registration in between each resume —
+    /// exactly what both real callers (`src/ui.rs`, `src/dispatch.rs`) now do
+    /// immediately after `provision_isolated_clone_sync` returns. Before the
+    /// fix, nothing ever released an entry, so the SECOND resume in this
+    /// sequence incorrectly saw `Rejected(Contested)`; this pins that it now
+    /// resumes successfully, matching the PRD's own stated purpose (a named
+    /// workspace resumable repeatedly, not once). A trailing THIRD attempt
+    /// made WITHOUT releasing in between still correctly loses to
+    /// `Contested`, proving the fix didn't accidentally stop the registry
+    /// from protecting the still-open race window at all.
+    #[spec("orchestration/workspace/010")]
+    #[test]
+    fn workspace_010_repeated_resume_in_same_process_succeeds_after_registration_release() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-repeat-resume");
+
+        // Open #1: a real CREATE, establishing M4b evidence and ancestry.
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "repeat", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        // Reopen #1 (1st resume): the one legitimate resume every pre-fix
+        // test already exercised — must succeed.
+        let resume_1 = provision_isolated_clone_sync(&source, &clone_dir, "repeat", "opener");
+        assert!(
+            matches!(resume_1, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "the 1st resume must succeed, got {resume_1:?}"
+        );
+
+        // Mirrors what `src/ui.rs`/`src/dispatch.rs` now do immediately
+        // after `provision_isolated_clone_sync` returns, on every outcome —
+        // their own liveness check/claim (fork#192's `ClaimOrchestrationName`
+        // for the former, the has-live-sibling daemon query for the latter)
+        // already ran BEFORE provisioning, so releasing here is safe.
+        release_resumed_isolated_clone_registration(&clone_dir);
+
+        // Reopen #2 (2nd resume, the PRD fork#544's own stated purpose — a
+        // named workspace resumable repeatedly, not once): before the fix
+        // this incorrectly saw `Rejected(Contested)`, since nothing ever
+        // released the 1st resume's registration.
+        let resume_2 = provision_isolated_clone_sync(&source, &clone_dir, "repeat", "opener");
+        assert!(
+            matches!(resume_2, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "the 2nd resume, after the 1st resume's registration was released, must succeed — \
+             not Rejected(Contested) — got {resume_2:?}"
+        );
+
+        // Reopen #3, attempted WITHOUT releasing `resume_2`'s registration
+        // first: `009`'s own race-distinguishing property must still hold —
+        // the registry must still refuse a resume that finds an
+        // unreleased entry already there.
+        let resume_3 = provision_isolated_clone_sync(&source, &clone_dir, "repeat", "opener");
+        assert!(
+            matches!(
+                resume_3,
+                Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Contested))
+            ),
+            "a resume attempted before the prior resume's registration is released must still \
+             be refused as Contested — the registry's own race protection must survive the fix, \
+             got {resume_3:?}"
+        );
     }
 
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B), extended by

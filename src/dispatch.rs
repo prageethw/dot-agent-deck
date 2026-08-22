@@ -432,6 +432,16 @@ pub async fn handle_dispatch(
             provision_isolated_clone_sync(&source_dir, &clone_target, &branch, &creator_for_clone)
         })
         .await;
+        // PRD fork#544 M3 fix round: release this process-local resume
+        // registration the moment provisioning returns, on every outcome —
+        // the has-live-sibling daemon query above already durably
+        // established liveness for this path before provisioning even ran,
+        // so the registry's brief defense-in-depth job is done here
+        // regardless of whether provisioning resumed, created, or refused.
+        // See `resumed_isolated_clones`'s doc comment
+        // (`src/issue_dispatch_run.rs`) for why this is correct rather than
+        // a weakening of the race protection.
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&paths.worktree_dir);
         match outcome {
             // Issue #164: a marker-write warning is not surfaced on this ad
             // hoc `dispatch` CLI path, matching the shared-checkout arm's
