@@ -1871,6 +1871,19 @@ mod tests {
     /// `handle_isolated_clone_add_error` takes its ordinary
     /// leaves-a-half-created-directory `Failed` path rather than the
     /// `!clone_dir.exists()` early `Err` branch.
+    ///
+    /// PRD fork#544 review-findings fix round 3: detects `clone` as ANY
+    /// argument, not `$1` positionally -- `spawn_git_status_child`'s new
+    /// `-c core.fsmonitor=` hardening now prepends two global-option args
+    /// ahead of the subcommand on every call through that shared core
+    /// (`provision_isolated_clone_sync`'s own `git clone` included), so
+    /// `$1` is `-c`, not `clone`, on the invocation this test actually
+    /// drives. A positional check silently fell through to `exec
+    /// {real_git}`, which then genuinely cloned `repo` (a valid
+    /// repository) instead of simulating a failure -- this stub's job is
+    /// to recognize an invocation AS a clone regardless of what global
+    /// options precede the subcommand, the same way real `git` itself
+    /// does.
     #[cfg(unix)]
     fn with_git_clone_failing_with_hostile_stderr(scratch: &Path) -> FakeGitOnPathGuard {
         use std::os::unix::fs::PermissionsExt;
@@ -1883,7 +1896,11 @@ mod tests {
             &stub,
             format!(
                 "#!/bin/sh\n\
-                 if [ \"$1\" = clone ]; then\n\
+                 is_clone=0\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$a\" = clone ]; then is_clone=1; fi\n\
+                 done\n\
+                 if [ \"$is_clone\" = 1 ]; then\n\
                  \x20\x20dest=\"\"\n\
                  \x20\x20for a in \"$@\"; do dest=\"$a\"; done\n\
                  \x20\x20mkdir -p \"$dest/.git\"\n\
