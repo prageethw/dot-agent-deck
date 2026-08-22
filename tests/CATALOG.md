@@ -4343,6 +4343,48 @@ without depending on the config struct API.
 - **Does not assert:** whether the NEWLY CHECKED-OUT branch's own content is rebased onto the fresh `origin/main` (it is not — the PRD's own design only fetches remote-tracking refs at creation time, exactly as `004`'s resume-time fetch does; a fresh branch is still cut from `source_dir`'s local snapshot at clone time); the origin-URL-pointing behavior itself (`provision_isolated_clone_sync_sets_origin_and_branch_when_source_has_origin`'s own point); the no-origin-on-source case (`provision_isolated_clone_sync_removes_origin_when_source_has_none`).
 - **Platform coverage:** mac+linux+windows, matching `006`.
 
+##### orchestration/workspace/025 — A workspace resumed after `source_dir` (the root checkout) has genuinely advanced with a new commit the workspace's own clone has never fetched must not be misreported as a wrong/foreign repository — the ordinary steady state of a root checkout that keeps being worked in after a workspace was cloned from it (PRD fork#544 review-findings fix round, reviewer B1 / auditor A1: `isolated_clone_ancestry_matches_source` tests the WRONG direction, `git merge-base --is-ancestor <source_dir's CURRENT HEAD> HEAD`, which is only true in the instant right after cloning).
+- **Layer:** L1 (in-process — real `git` subprocesses, mirroring `006`-`009`'s own real-clone technique).
+- **Agent:** none.
+- **Asserts:** a workspace created via `provision_isolated_clone_sync` and then resumed AFTER `source_dir` advances with a real new commit the clone's own object database has never received must not resolve as `Rejected(AncestryMismatch)` — pinning the CORRECT direction as a property (resume succeeds, or at minimum is not misreported as a wrong repo), not today's wrong behavior; a resume attempt (successful or refused) must never itself mutate the workspace's checked-out HEAD. Today this is RED: current code returns `Rejected(AncestryMismatch)`, per both reviewer and auditor's empirical reproduction.
+- **Does not assert:** the wrong-repo case where ancestry genuinely never held (`007`, unaffected by this fix); the stranger/unhealthy cases (`006`, `008`).
+- **Platform coverage:** mac+linux+windows, matching `006`.
+
+##### orchestration/workspace/026 — Two distinct, real orchestration Names (`'fix/544'` and `'fix-544'`) that collide onto the identical sanitized segment/derived path must refuse the second open as a collision rather than silently resolving it to `Resumed`, since fork#192's live-orchestration uniqueness gate compares the raw typed Name, not the derived path, and therefore lets both through (PRD fork#544 review-findings fix round, reviewer B2).
+- **Layer:** L1 (in-process — real `git` subprocesses via `provision_isolated_clone_sync`, called directly with the segments a real `sanitize_workspace_segment`/`resolve_workspace_path` pair derives from the two Names).
+- **Agent:** none.
+- **Asserts:** `sanitize_workspace_segment("fix/544")` and `sanitize_workspace_segment("fix-544")` are identical (sanity: this genuinely is a collision), and the derived workspace paths are identical too; opening the first orchestration under the shared segment succeeds as `Created`; opening the second orchestration under the identical segment (standing in for the colliding Name) must not resolve as `Ok(Resumed { .. })` — pinning the refusal as a property, not a specific error string. Today this is RED: current code silently resumes.
+- **Does not assert:** the exact refusal mechanism (Name-vs-recorded-evidence comparison, widened path derivation, or something else — left to coder); the fork#192 live-name uniqueness gate itself, which this test deliberately does not exercise (it compares raw Names, and the two Names here differ, so it lets both through by design — the bug is downstream of it).
+- **Platform coverage:** mac+linux+windows, matching `006`.
+
+##### orchestration/workspace/027 — An orchestration Name that survives `sanitize_workspace_segment` unchanged (`'my feature'`, `'feat:544'`, `'wip~1'`, `'cache*'`) but is not a valid git ref must be rejected cleanly by `provision_isolated_clone_sync` — never reported as `Created`, and never left as a half-provisioned directory wedged at the derived path for a later attempt to trip over (PRD fork#544 review-findings fix round, reviewer B2's sibling issue).
+- **Layer:** L1 (in-process — real `git` subprocesses; the checkout failure is a real `git check-ref-format` refusal, not simulated).
+- **Agent:** none.
+- **Asserts:** for each of the four invalid-ref Names, `provision_isolated_clone_sync` never reports `Created`, and the clone directory does not exist on disk afterward (checkout failure's cleanup path must remove it completely).
+- **Does not assert:** whether the M4b provenance artifact (which lives outside the clone directory) is also cleaned up on this same failure path — that is `029`'s own, separate assertion; the exact wording of the returned error.
+- **Platform coverage:** mac+linux+windows, matching `006`.
+
+##### orchestration/workspace/028 — `sync_merged_workspace_to_main`'s checkout call has no `--` end-of-options separator before `default_branch`, so an option-shaped `default_branch` value is consumed as a flag rather than the branch to check out — silently detaching HEAD instead of landing the workspace on the named branch (PRD fork#544 review-findings fix round, auditor A5).
+- **Layer:** L1 (in-process — real `git` subprocesses; the adversarial remote-tracking ref is planted directly with `git update-ref` since `git branch`/`git fetch` refuse to ever create a real ref component starting with `-`).
+- **Agent:** none.
+- **Asserts:** with `refs/remotes/origin/--detach` planted at the clone's own current HEAD (so both of `sync_merged_workspace_to_main`'s preconditions trivially hold) and `default_branch = "--detach"`, the call reaches the checkout step and reports `SwitchedToMain`, but `git rev-parse --abbrev-ref HEAD` reports the literal string `"HEAD"` afterward — proving the workspace ended up in DETACHED HEAD state rather than actually checked out on a named branch, because the missing `--` separator let `"--detach"` be consumed as the `git checkout` option of the same name.
+- **Does not assert:** the ordinary (non-adversarial) `SwitchedToMain` path, already covered by `020`; the sibling `merge` call's own separator (already present, not under test here).
+- **Platform coverage:** mac+linux, matching `020`-`023` (real `git update-ref` construction, no Windows-specific concern).
+
+##### orchestration/workspace/029 — The M4b provenance artifact `provision_isolated_clone_sync` writes before the branch checkout must not survive a checkout failure that already removed the clone directory itself — a later attempt at the same canonical path must not find orphaned "evidence" for a directory that no longer exists (PRD fork#544 review-findings fix round, auditor A3).
+- **Layer:** L1 (in-process — real `git` subprocesses; forces the checkout-failure path with the same invalid-ref-Name fixture `027` uses).
+- **Agent:** none.
+- **Asserts:** after `provision_isolated_clone_sync` fails at the checkout step for an invalid-ref Name (`"my feature"`) and the clone directory has been confirmed cleaned up, `isolated_clone_provenance_path(&clone_dir)` must not exist. Today this is RED: the artifact lives outside `clone_dir` under `state_dir()`, and `attempt_isolated_clone_cleanup` only removes `clone_dir` itself.
+- **Does not assert:** the clone-directory-level cleanup itself, already covered by `027`; the M3 Stranger gate's own behavior when it encounters such orphaned evidence (a consequence of this bug, not this test's own fixture).
+- **Platform coverage:** mac+linux+windows, matching `006`.
+
+##### orchestration/workspace/030 — `sync_merged_workspace_to_main`'s preconditions are checked against `HEAD` (the workspace's own just-merged feature branch) but its mutation (`checkout` then `merge --ff-only`) targets `default_branch` instead — if local `default_branch` has separately diverged from `origin/default_branch`, a failed sync must never leave the workspace switched away from where it started (PRD fork#544 review-findings fix round, reviewer S3).
+- **Layer:** L1 (in-process — real `git` subprocesses, mirroring `020`'s own real-fast-forward-merge simulation technique).
+- **Agent:** none.
+- **Asserts:** a workspace whose checked-out feature branch HEAD passes both of `sync_merged_workspace_to_main`'s preconditions against the just-advanced `origin/main`, while LOCAL `main` has separately diverged (an extra local commit never pushed), causes the call to return `Err` (the `--ff-only` merge genuinely cannot fast-forward) — and afterward the workspace's checked-out branch name and HEAD commit are byte-identical to what they were immediately before the call. Today this is RED: the checkout onto local `main` succeeds before the merge fails, leaving the workspace switched onto diverged `main` instead of restored to the feature branch it started on.
+- **Does not assert:** the exact fix mechanism (precondition detection before mutating vs. restore-on-failure after) — only the property that no `Err` result may ever leave the workspace anywhere other than where it started; the clean-success path, already covered by `020`.
+- **Platform coverage:** mac+linux+windows, matching `006`.
+
 #### orchestration/remit
 
 ##### orchestration/remit/001 — A `Compacting` event on the orchestrator start-role pane re-delivers the remit pointer a second time (upstream issue #423).

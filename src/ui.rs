@@ -35722,6 +35722,81 @@ mod tests {
         );
     }
 
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer B2).
+    /// `sanitize_workspace_segment`/`resolve_workspace_path` are not
+    /// injective: `'fix/544'` and `'fix-544'` are two distinct, real
+    /// orchestration Names that both sanitize to the identical segment
+    /// `'fix-544'` (the slash becomes a dash), and therefore resolve to the
+    /// identical on-disk workspace path. Since fork#192's live-orchestration
+    /// uniqueness gate compares the RAW typed Name (not the derived path or
+    /// segment), two orchestrations opened under these two distinct Names
+    /// both pass that gate — the collision is invisible at the Name layer
+    /// and only bites once both calls reach provisioning. Opens the first
+    /// under `'fix/544'`, then attempts to open the second under the
+    /// colliding `'fix-544'`, and asserts the second is refused as a
+    /// collision rather than silently resolving to `Resumed` — pinning the
+    /// refusal as a PROPERTY, not a specific error string, since the fix's
+    /// exact mechanism is left to coder.
+    #[test]
+    fn workspace_026_distinct_names_colliding_after_sanitization_refuse_second_open() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+
+        let segment_a = sanitize_workspace_segment("fix/544");
+        let segment_b = sanitize_workspace_segment("fix-544");
+        assert_eq!(
+            segment_a, segment_b,
+            "setup: sanity -- these two distinct Names must genuinely collide under \
+             sanitize_workspace_segment, or this test isn't exercising reviewer B2 at all"
+        );
+
+        let path_a = resolve_workspace_path(&repo, &segment_a);
+        let path_b = resolve_workspace_path(&repo, &segment_b);
+        assert_eq!(
+            path_a, path_b,
+            "setup: sanity -- colliding segments must resolve to the identical derived \
+             workspace path"
+        );
+
+        let first = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &path_a,
+            &segment_a,
+            "orchestration:fix-544-a",
+        );
+        assert!(
+            matches!(
+                first,
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created { .. })
+            ),
+            "setup: the first orchestration's open (typed Name 'fix/544') must succeed, got \
+             {first:?}"
+        );
+
+        let second = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &path_b,
+            &segment_b,
+            "orchestration:fix-544-b",
+        );
+
+        assert!(
+            !matches!(
+                second,
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { .. })
+            ),
+            "reviewer B2: distinct orchestration Names 'fix/544' and 'fix-544' both sanitize to \
+             the identical path/segment 'fix-544'. Since fork#192's uniqueness gate is on the \
+             raw Name, not the derived path, BOTH claims succeed at that layer -- the second \
+             orchestration then finds the first orchestration's directory already present, \
+             passes M3's eligibility check (evidence and ancestry both trivially match, since \
+             it IS the same directory, just opened under a different colliding Name), and gets \
+             silently `Resumed` -- two live orchestrations then attach to the same \
+             directory/branch concurrently. Got {second:?}"
+        );
+    }
+
     /// Fork #122: a real `.dot-agent-deck.toml` at `dir` defining one
     /// orchestration with the same `coder`/`reviewer` role shape
     /// `make_orchestration` builds in memory — used by both

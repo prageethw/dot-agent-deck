@@ -7961,6 +7961,453 @@ exit 0
         );
     }
 
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer B1 /
+    /// auditor A1, both independently reproduced this). Creates a workspace
+    /// exactly as `orchestration/workspace/001` does, then advances
+    /// `source_dir` itself with a real new commit — the ordinary steady
+    /// state of a root checkout that keeps being worked in after a
+    /// workspace was cloned from it, e.g. a later `git pull` or a direct
+    /// commit — so the workspace's own clone (a snapshot frozen at clone
+    /// time) has never seen and does not carry that new commit in its
+    /// object database. A second `provision_isolated_clone_sync` call then
+    /// attempts to resume the same workspace. Pins the CORRECT behavior
+    /// (resume must not be misreported as a wrong/foreign repository) —
+    /// not merely today's wrong one — per this test's own doc comment on
+    /// `isolated_clone_ancestry_matches_source` below for why today's check
+    /// gets this backwards.
+    #[spec("orchestration/workspace/025")]
+    #[test]
+    fn workspace_025_resume_survives_source_dir_advancing_past_the_clones_object_db() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-my-feature");
+        let created = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone from source must succeed, got {created:?}"
+        );
+        let clone_head_before = head_sha(&clone_dir);
+
+        // The ordinary steady state PRD fork#544 exists to support: the
+        // root checkout (source_dir) keeps advancing after the workspace
+        // was created next to it. A real new commit made directly in
+        // source_dir is a commit the clone's own object database has never
+        // fetched or received -- it did not exist yet at clone time, and
+        // nothing has re-fetched it into the clone since.
+        std::fs::write(source.join("advanced.txt"), "source moved on after clone\n").unwrap();
+        git(&source, &["add", "advanced.txt"]);
+        git(
+            &source,
+            &["commit", "--quiet", "-m", "source advances past the clone"],
+        );
+        let source_head_after = head_sha(&source);
+        assert_ne!(
+            source_head_after, clone_head_before,
+            "setup: source_dir must have genuinely advanced past the commit the clone was made \
+             from"
+        );
+
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my-feature", "tester");
+
+        assert!(
+            !matches!(
+                result,
+                Ok(IsolatedCloneOutcome::Rejected(
+                    ResumeRejection::AncestryMismatch
+                ))
+            ),
+            "reviewer B1 / auditor A1 (both independently reproduced this): \
+             `isolated_clone_ancestry_matches_source` runs `git merge-base --is-ancestor \
+             <source_dir's CURRENT HEAD> HEAD` INSIDE the clone -- this asks whether \
+             source_dir's HEAD AT RESUME TIME is contained in the clone's own history, which is \
+             true only in the instant right after cloning (when a plain `git clone` hardlinks \
+             source_dir's object store). The moment source_dir advances -- an ordinary `git \
+             pull` or a new commit in the root checkout, the everyday steady state this PRD \
+             exists to support, not an edge case -- source_dir's new HEAD is a commit the \
+             clone's object database has never seen, so this probe fails and a perfectly \
+             healthy, genuinely-derived, resumable workspace is wrongly refused as \
+             AncestryMismatch. `resume_existing_isolated_clone`'s caller then tells the user to \
+             'remove it manually' -- pointed squarely at destroying the exact uncommitted work \
+             this PRD exists to protect. Got {result:?}"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            clone_head_before,
+            "sanity: whatever the outcome (resumed or refused), an attempt at resuming must \
+             never itself mutate the workspace's checked-out HEAD"
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer's second,
+    /// more severe blocker, B2). `'fix/544'` and `'fix-544'` are two
+    /// distinct, real orchestration Names — but `sanitize_workspace_segment`
+    /// (`src/ui.rs`) maps BOTH to the identical sanitized segment
+    /// `'fix-544'` (the slash becomes a dash), and `resolve_workspace_path`
+    /// then derives the identical on-disk path from that segment for both.
+    /// Since fork#192's live-orchestration uniqueness gate compares the RAW
+    /// typed Name (not the derived path/segment), two orchestrations opened
+    /// under these two distinct Names both pass that gate — nothing at the
+    /// Name layer ever notices they collide. This test skips straight to
+    /// the layer where the reviewer's finding actually bites:
+    /// `provision_isolated_clone_sync` itself, called twice with the two
+    /// colliding segments/paths a real `sanitize_workspace_segment` +
+    /// `resolve_workspace_path` pair would derive from those two Names
+    /// (verified inline below rather than re-implemented, since those
+    /// functions are private to `src/ui.rs` — this module cannot call them
+    /// directly). Pins the refusal as a PROPERTY (a genuine collision must
+    /// never silently resolve to `Resumed`), not a specific error string —
+    /// the fix's exact mechanism (comparing the recorded vs. requested
+    /// Name, widening the path-derivation input, or something else) is
+    /// left to coder.
+    #[spec("orchestration/workspace/026")]
+    #[test]
+    fn workspace_026_distinct_names_colliding_onto_one_path_refuse_rather_than_resume() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        // `sanitize_workspace_segment("fix/544")` == `sanitize_workspace_segment("fix-544")`
+        // == "fix-544": `sanitize_clone_segment` replaces '/' with '-', and
+        // `sanitize_workspace_segment`'s own further leading-dash/dot strip
+        // does not touch either (neither starts with '-' or '.'). Both
+        // orchestrations therefore derive the identical on-disk path.
+        let segment = "fix-544";
+        let clone_dir = ws.path().join(format!("source-{segment}"));
+
+        // Orchestration A, typed Name "fix/544" (sanitizes to the shared
+        // segment above).
+        let first = provision_isolated_clone_sync(&source, &clone_dir, segment, "orchestration:a");
+        assert!(
+            matches!(first, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the first orchestration's open (typed Name 'fix/544') must succeed, got \
+             {first:?}"
+        );
+
+        // Orchestration B, typed Name "fix-544" -- a DIFFERENT typed Name
+        // that fork#192's live-name uniqueness gate (which this test
+        // deliberately does not exercise, since it compares raw Names and
+        // 'fix/544' != 'fix-544') would have let through, but which derives
+        // the SAME segment/path as orchestration A above.
+        let second = provision_isolated_clone_sync(&source, &clone_dir, segment, "orchestration:b");
+
+        assert!(
+            !matches!(second, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "reviewer B2: distinct orchestration Names 'fix/544' and 'fix-544' both sanitize to \
+             the identical path/segment 'fix-544'. Since fork#192's uniqueness gate is on the \
+             raw Name, not the derived path, BOTH claims succeed at that layer -- the second \
+             orchestration then finds orchestration A's directory already present, passes M3's \
+             eligibility check (the evidence and ancestry both trivially match, since it IS the \
+             same directory, just opened under a different colliding Name), and gets silently \
+             `Resumed` -- two live orchestrations then attach to the same directory/branch \
+             concurrently. Got {second:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer B2's own
+    /// sibling issue, verified in the same finding). `'my feature'`,
+    /// `'feat:544'`, `'wip~1'` and `'cache*'` all survive
+    /// `sanitize_workspace_segment` completely UNCHANGED -- it only
+    /// replaces path separators and strips NUL/`".."`/a leading `-`/`.`,
+    /// none of which any of these four trigger -- yet every one of them is
+    /// rejected deep inside `git check-ref-format` the moment
+    /// `provision_isolated_clone_sync` tries to `git checkout -b` it
+    /// (verified empirically: `git branch -- 'my feature'` and the other
+    /// three all fail with `fatal: '<name>' is not a valid branch name`).
+    /// Directly exercises `provision_isolated_clone_sync` with each raw
+    /// Name (skipping `sanitize_workspace_segment` itself, which is private
+    /// to `src/ui.rs` and a no-op for every one of these four anyway).
+    /// Pins that the checkout failure is a CLEAN, typed refusal -- never a
+    /// silently-succeeding `Created`, and never a half-provisioned
+    /// directory left wedged at the derived path for the next attempt at
+    /// the same Name to trip over.
+    #[spec("orchestration/workspace/027")]
+    #[test]
+    fn workspace_027_invalid_git_ref_name_rejected_cleanly_not_left_dangling() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        for invalid_name in ["my feature", "feat:544", "wip~1", "cache*"] {
+            let safe_suffix: String = invalid_name
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect();
+            let clone_dir = ws.path().join(format!("workspace-027-{safe_suffix}"));
+
+            let result = provision_isolated_clone_sync(&source, &clone_dir, invalid_name, "tester");
+
+            assert!(
+                !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+                "an invalid git ref name must never report Created, got {result:?} for Name \
+                 {invalid_name:?}"
+            );
+            assert!(
+                !clone_dir.exists(),
+                "reviewer B2 sibling issue: an invalid git ref name's checkout failure must \
+                 leave NO half-provisioned directory behind at {} for Name {invalid_name:?}, so \
+                 a later attempt at the same Name is not wedged by this attempt's own \
+                 leftovers, got {result:?}",
+                clone_dir.display()
+            );
+        }
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (auditor A5).
+    /// `sync_merged_workspace_to_main`'s own checkout call
+    /// (`.args(["checkout", "--quiet", default_branch])`) has no `--`
+    /// end-of-options separator before `default_branch`, unlike its `merge`
+    /// call 18 lines later which does have one. A real git branch can never
+    /// literally be named e.g. `"--detach"` (`git branch -- --detach` is
+    /// itself refused by `git check-ref-format`, verified empirically), so
+    /// this test plants the adversarial-looking remote-tracking ref
+    /// directly with `git update-ref` -- the closest a real repository can
+    /// get to reproducing what the missing separator actually does: lets an
+    /// option-shaped `default_branch` value be consumed as a FLAG rather
+    /// than the branch to check out.
+    #[spec("orchestration/workspace/028")]
+    #[test]
+    fn workspace_028_checkout_missing_separator_detaches_head_on_adversarial_branch_name() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-028");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+
+        // Plant `refs/remotes/origin/--detach` directly -- `git branch` (and
+        // therefore `git fetch`, which mirrors the source's own branches)
+        // refuses to ever create a real ref component starting with '-',
+        // so `update-ref` is the only way to construct this fixture at all.
+        // Points at the clone's own current HEAD, so the ancestry
+        // precondition below trivially holds without needing a separate
+        // "merge landed" simulation.
+        let head = head_sha(&clone_dir);
+        git(
+            &clone_dir,
+            &["update-ref", "refs/remotes/origin/--detach", &head],
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "--detach");
+
+        assert!(
+            matches!(result, Ok(PostMergeSyncOutcome::SwitchedToMain)),
+            "setup: both preconditions (clean tree; HEAD already equals origin/--detach) must \
+             hold so this genuinely reaches the checkout step, got {result:?}"
+        );
+        assert_ne!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "HEAD",
+            "auditor A5: `git checkout --quiet {{default_branch}}` with no `--` separator lets \
+             an option-shaped `default_branch` value (here '--detach') be consumed as an OPTION \
+             rather than the branch to check out -- the checkout silently DETACHES HEAD instead \
+             of actually landing the workspace on the named branch. `git rev-parse --abbrev-ref \
+             HEAD` reports the literal string \"HEAD\" only when detached, which is what it \
+             reports today"
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (auditor A3).
+    /// `provision_isolated_clone_sync` writes the M4b provenance artifact
+    /// (`write_isolated_clone_provenance`, outside `clone_dir` under
+    /// `state_dir()`) BEFORE the branch checkout. When the checkout fails
+    /// (here, forced with an invalid git ref Name, the same fixture
+    /// `workspace_027` above uses), `attempt_isolated_clone_cleanup` removes
+    /// `clone_dir` itself but the cleanup function never touches the
+    /// provenance artifact, which lives in a completely separate location.
+    /// A later attempt at the same canonical path would then find
+    /// "evidence" for a directory that no longer exists -- and M3's
+    /// Stranger gate (`resume_existing_isolated_clone`) uses evidence
+    /// PRESENCE as its entire test, so this stale evidence would wrongly
+    /// vouch for whatever gets created there next.
+    #[spec("orchestration/workspace/029")]
+    #[test]
+    fn workspace_029_checkout_failure_leaves_no_orphaned_provenance_artifact() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-029");
+        // "my feature" survives `sanitize_workspace_segment` unchanged
+        // (verified in `workspace_027` above) but is rejected deep inside
+        // `git check-ref-format` at the checkout step -- forcing the exact
+        // checkout-failure path this test needs, after the provenance
+        // artifact has already been written.
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "my feature", "tester");
+
+        assert!(
+            !matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: an invalid git ref Name must fail the checkout step, not succeed, got \
+             {result:?}"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "setup: checkout failure must clean up the half-provisioned clone directory itself \
+             before this test's real assertion (the provenance artifact) is meaningful, got \
+             {result:?}"
+        );
+
+        let provenance_path = isolated_clone_provenance_path(&clone_dir);
+        assert!(
+            !provenance_path.exists(),
+            "auditor A3: the M4b provenance artifact must not survive a checkout failure that \
+             already removed the clone directory itself -- a later attempt at this same \
+             canonical path would find 'evidence' for a directory that no longer exists, and \
+             M3's Stranger gate (resume_existing_isolated_clone) uses evidence PRESENCE as its \
+             entire test, so this stale evidence would wrongly vouch for whatever gets created \
+             there next. Found orphaned at {}",
+            provenance_path.display()
+        );
+    }
+
+    /// Scenario: PRD fork#544 review-findings fix round (reviewer S3).
+    /// `sync_merged_workspace_to_main`'s preconditions are checked against
+    /// `HEAD` (the workspace's own just-merged feature branch), but the
+    /// MUTATION (`checkout` then `merge --ff-only`) targets `default_branch`
+    /// instead. Sets up a workspace whose HEAD (a feature branch) passes
+    /// both preconditions against the just-advanced `origin/main`, while
+    /// LOCAL `main` has separately diverged from `origin/main` (an extra
+    /// local commit on `main` that was never pushed) -- so the checkout
+    /// onto local `main` succeeds, but the subsequent `merge --ff-only`
+    /// fails, and the function returns `Err` having already left the
+    /// workspace switched onto diverged `main` instead of back where it
+    /// started. Pins the property that actually matters (per the task):
+    /// no `Err` result may ever leave the workspace anywhere other than
+    /// where it started -- not a specific mechanism (precondition
+    /// detection vs. restore-on-failure).
+    #[spec("orchestration/workspace/030")]
+    #[test]
+    fn workspace_030_failed_sync_never_leaves_workspace_switched_away_from_start() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        let clone_dir = ws.path().join("workspace-030");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+
+        // Diverge LOCAL main from origin/main: an extra local commit on
+        // main that is never pushed anywhere -- exactly the shape a real
+        // orchestration's root-checkout main can pick up independently of
+        // any one workspace (e.g. a maintainer commits directly to their
+        // own local main).
+        git(&clone_dir, &["checkout", "--quiet", "main"]);
+        std::fs::write(clone_dir.join("local-only.txt"), "never pushed\n").unwrap();
+        git(&clone_dir, &["add", "local-only.txt"]);
+        git(
+            &clone_dir,
+            &["commit", "--quiet", "-m", "diverged local main"],
+        );
+        let diverged_local_main = head_sha(&clone_dir);
+
+        // The feature branch this workspace is actually on: forked BEFORE
+        // the divergence above (from the original seed commit), so it
+        // shares no history with the diverged local main beyond that seed.
+        git(
+            &clone_dir,
+            &["checkout", "--quiet", "-b", "feat-030", "main~1"],
+        );
+        std::fs::write(clone_dir.join("feature.txt"), "the PR's own content\n").unwrap();
+        git(&clone_dir, &["add", "feature.txt"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "feat-030 work"]);
+        let feature_head = head_sha(&clone_dir);
+
+        // Simulate the merge landing on origin's real main: fetch the
+        // feature branch's own commit into origin_repo directly and
+        // fast-forward origin's main onto it (the same technique
+        // `workspace_020` uses) -- origin/main becomes the feature commit,
+        // completely independent of clone_dir's own diverged LOCAL main.
+        git(
+            &origin_repo,
+            &[
+                "fetch",
+                "--quiet",
+                clone_dir.to_str().unwrap(),
+                "feat-030:refs/heads/feat-030",
+            ],
+        );
+        git(&origin_repo, &["merge", "--quiet", "--ff-only", "feat-030"]);
+        let advanced_origin_main = head_sha(&origin_repo);
+        assert_eq!(
+            advanced_origin_main, feature_head,
+            "setup: origin's main must now BE the feature commit (a real fast-forward merge)"
+        );
+
+        let branch_before = git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let head_before = head_sha(&clone_dir);
+        assert_eq!(
+            branch_before, "feat-030",
+            "setup: the workspace must still be on its own feature branch before calling sync"
+        );
+        assert_eq!(
+            head_before, feature_head,
+            "setup: the workspace's HEAD must still be the feature commit before calling sync"
+        );
+
+        let result = sync_merged_workspace_to_main(&clone_dir, "main");
+
+        assert!(
+            result.is_err(),
+            "setup: local main ({diverged_local_main}) must have genuinely diverged from the \
+             just-advanced origin/main ({advanced_origin_main}), so the ff-only merge fails and \
+             this call returns Err, got {result:?}"
+        );
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before,
+            "reviewer S3: preconditions are checked against HEAD (the feature branch, which \
+             passes both), but the mutation targets `default_branch` (\"main\") instead -- the \
+             checkout onto local main succeeds (no precondition guards it), then `merge \
+             --ff-only` fails because local main independently diverged from origin/main. The \
+             function returns Err having already left the workspace switched onto diverged main \
+             instead of restoring it to the feature branch it started on. No Err result may \
+             ever leave the workspace anywhere other than where it started"
+        );
+        assert_eq!(
+            head_sha(&clone_dir),
+            head_before,
+            "reviewer S3: a failed sync must never leave the workspace's checked-out commit \
+             anywhere other than where it started, got {result:?}"
+        );
+    }
+
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B), extended by
     /// round 3 (reviewer C1/C2, auditor C1/C2). Unit tests
     /// `handle_isolated_clone_add_error` directly rather than inducing a
