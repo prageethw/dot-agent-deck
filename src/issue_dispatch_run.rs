@@ -7865,6 +7865,102 @@ exit 0
         );
     }
 
+    /// Scenario: PRD fork#544 M9's own coverage list, "creation-time
+    /// freshness against origin" — the Decisions table's "Should a fresh
+    /// clone start from up-to-date main? ... needs verification ... whether
+    /// today's creation path already fetches from origin at clone time or
+    /// inherits the root checkout's own staleness." `source_dir` stands in
+    /// for the user's already-open root checkout: a real clone of a
+    /// separately-advanceable "true origin" repository, whose OWN knowledge
+    /// of `origin/main` goes stale the moment `origin_repo` advances again
+    /// behind `source_dir`'s back — exactly what happens when a teammate
+    /// pushes to `main` while the user's checkout sits unfetched. Asserts
+    /// the freshly created workspace's own `origin/main` remote-tracking
+    /// ref reflects that TRUE, current advance — not merely a copy of
+    /// `source_dir`'s own stale knowledge, and not merely the clone-time
+    /// snapshot of `source_dir`'s local `main` branch (which a plain `git
+    /// clone` alone would produce) — proving creation genuinely fetches
+    /// from the real origin URL rather than inheriting whatever staleness
+    /// the root checkout happened to be carrying. Uses a REAL,
+    /// independently-fetchable local repository as `origin`, the same
+    /// technique `020`-`023` use, so this test genuinely proves a fetch
+    /// happened rather than merely a URL string being copied (unlike
+    /// `provision_isolated_clone_sync_sets_origin_and_branch_when_source_
+    /// has_origin`'s unreachable `.invalid` URL, which no fetch could ever
+    /// reach).
+    #[spec("orchestration/workspace/024")]
+    #[test]
+    fn workspace_024_fresh_creation_fetches_true_origin_not_source_staleness() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let origin_repo = ws.path().join("origin");
+        seed_source_repo(&origin_repo, "seed\n");
+
+        // `source_dir` stands in for the user's already-open root checkout:
+        // a real clone of `origin_repo`, so it has a genuine `origin` URL
+        // pointing at it. Its own `origin/main` remote-tracking ref is
+        // frozen at clone time and never refreshed again below.
+        let source_dir = ws.path().join("source");
+        git(
+            ws.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin_repo.to_str().unwrap(),
+                source_dir.to_str().unwrap(),
+            ],
+        );
+        let stale_origin_main = git_output(&source_dir, &["rev-parse", "origin/main"]);
+
+        // Advance the TRUE origin directly -- entirely behind `source_dir`'s
+        // back, exactly like a teammate pushing to `main` while the user's
+        // root checkout sits unfetched. `source_dir` never re-fetches below,
+        // so its own `origin/main` ref stays at `stale_origin_main` for the
+        // rest of this test.
+        std::fs::write(origin_repo.join("advanced.txt"), "true origin moved on\n").unwrap();
+        git(&origin_repo, &["add", "advanced.txt"]);
+        git(
+            &origin_repo,
+            &["commit", "--quiet", "-m", "advance past source_dir"],
+        );
+        let advanced_origin_head = head_sha(&origin_repo);
+        assert_ne!(
+            advanced_origin_head, stale_origin_main,
+            "setup: true origin must have genuinely advanced past what source_dir's own \
+             origin/main remote-tracking ref still shows"
+        );
+        assert_eq!(
+            git_output(&source_dir, &["rev-parse", "origin/main"]),
+            stale_origin_main,
+            "setup: source_dir must never itself re-fetch -- its origin/main ref must remain \
+             frozen at the stale commit throughout"
+        );
+
+        let clone_dir = ws.path().join("workspace-024");
+        let result =
+            provision_isolated_clone_sync(&source_dir, &clone_dir, "my-feature-024", "tester");
+        assert!(
+            matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "isolated clone must succeed, got {result:?}"
+        );
+
+        assert_eq!(
+            git_output(&clone_dir, &["remote", "get-url", "origin"]),
+            origin_repo.to_str().unwrap(),
+            "the new workspace's origin must be the TRUE origin URL, read from source_dir's own \
+             origin remote"
+        );
+        assert_eq!(
+            git_output(&clone_dir, &["rev-parse", "origin/main"]),
+            advanced_origin_head,
+            "PRD fork#544 M2 Decisions table: a freshly created workspace must fetch from the \
+             real origin at creation time, so its own origin/main remote-tracking ref reflects \
+             origin's TRUE current state -- not merely inherit source_dir's own stale \
+             origin/main knowledge (still at {stale_origin_main}), and not merely the \
+             clone-time snapshot of source_dir's local main branch either"
+        );
+    }
+
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B), extended by
     /// round 3 (reviewer C1/C2, auditor C1/C2). Unit tests
     /// `handle_isolated_clone_add_error` directly rather than inducing a
