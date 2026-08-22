@@ -1490,7 +1490,7 @@ pub(crate) fn provision_isolated_clone_sync(
     // failure here does not fail the whole provisioning call, since the
     // clone itself is already fully usable — it only means this clone will
     // never report `owned: true` from `worktree list`.
-    if let Err(e) = write_isolated_clone_provenance(source_dir, clone_dir, branch) {
+    if let Err(e) = write_isolated_clone_provenance(source_dir, clone_dir, branch, creator) {
         tracing::warn!(
             clone = %clone_dir.display(),
             error = %e,
@@ -1543,9 +1543,12 @@ pub(crate) fn provision_isolated_clone_sync(
     //
     // `git remote get-url`/`set-url`/`remove` are cheap local metadata reads
     // with no network I/O — the same class of call `git_common_dir` already
-    // runs unbounded on this synchronous path (fork issue #388) — so this
-    // deliberately does not add its own `WORKTREE_GIT_TIMEOUT`-bounded
-    // subprocess plumbing for a one-line `Command::output()`.
+    // runs unbounded on this synchronous path (fork issue #388). PRD
+    // fork#544 review-findings fix round: `read_source_origin_url` is now
+    // routed through `run_capture_sync` (the same hardened helper every
+    // other git subprocess in this module uses) rather than a raw
+    // `std::process::Command`, so it does carry `WORKTREE_GIT_TIMEOUT` now
+    // — cheap enough not to matter, and no longer a bare, unbounded spawn.
     let source_origin = read_source_origin_url(source_dir);
     let mut origin_warning = match source_origin.as_deref() {
         Some(url) => point_isolated_clone_origin(clone_dir, url),
@@ -1820,14 +1823,20 @@ fn clone_destination_predates_attempt(error_text: &str) -> bool {
 /// [`provision_isolated_clone_sync`] treats identically: nothing better to
 /// point the clone's `origin` at.
 fn read_source_origin_url(source_dir: &Path) -> Option<String> {
-    std::process::Command::new("git")
-        .current_dir(source_dir)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|url| !url.is_empty())
+    run_capture_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            source_dir.to_string_lossy().into_owned(),
+            "remote".to_string(),
+            "get-url".to_string(),
+            "origin".to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|url| !url.is_empty())
 }
 
 /// Unpushable placeholder [`point_isolated_clone_origin`] points a fresh
@@ -2051,6 +2060,19 @@ pub(crate) fn attempt_isolated_clone_cleanup(clone_dir: &Path, remover: &str) ->
         return None;
     }
     let removed = std::fs::remove_dir_all(clone_dir).is_ok();
+    // Auditor A3 (PRD fork#544 review-findings fix round): the M4b
+    // provenance artifact lives OUTSIDE `clone_dir` entirely (under
+    // `state_dir()`, keyed by `clone_dir`'s canonical path), so removing
+    // `clone_dir` above never touches it -- a checkout failure here left it
+    // orphaned, "evidence" for a directory that no longer exists, which
+    // `resume_existing_isolated_clone`'s Stranger gate (evidence PRESENCE
+    // alone) would then wrongly vouch for on a later attempt at this same
+    // canonical path. Best-effort, same as the directory removal above: a
+    // failure here doesn't change whether this cleanup is reported as
+    // successful, since the directory itself (the thing a caller actually
+    // interacts with) is what `remover`'s presence in the return value
+    // promises was removed.
+    let _ = std::fs::remove_file(isolated_clone_provenance_path(clone_dir));
     if removed && !clone_dir.exists() {
         Some(remover.to_string())
     } else {
@@ -2707,6 +2729,26 @@ pub(crate) fn isolated_clone_provenance_path(clone_dir: &Path) -> PathBuf {
         .join(format!("{basename}-{hash:016x}"))
 }
 
+/// Read one `key=value` field out of a provenance artifact's raw `content`,
+/// but only when the artifact carries a recognized `schema=2` tag — a
+/// pre-M4 `b"deck\n"` artifact (or anything else that doesn't parse as
+/// today's format) has no such fields to trust, and every caller of this
+/// function must treat that as "no evidence to contradict," never as a
+/// literal empty string (PRD fork#544 review-findings fix round; shared by
+/// [`resume_existing_isolated_clone`]'s creator check and
+/// [`forget_isolated_workspace`]'s `path=` verification rather than each
+/// growing its own parser).
+fn isolated_clone_provenance_field(content: &str, key: &str) -> Option<String> {
+    if !content.lines().any(|line| line.trim() == "schema=2") {
+        return None;
+    }
+    let prefix = format!("{key}=");
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::to_string)
+}
+
 /// Write fork#325 M4b's isolated-clone-specific provenance artifact at
 /// [`isolated_clone_provenance_path`]'s resolved location. Called only from
 /// [`provision_isolated_clone_sync`], only once its own `clone_dir.exists()`
@@ -2720,11 +2762,19 @@ pub(crate) fn isolated_clone_provenance_path(clone_dir: &Path) -> PathBuf {
 /// canonical path (hashed with the same [`crate::platform::lock::fnv1a64`]
 /// keying scheme [`isolated_clone_provenance_path`] already uses for the
 /// clone path, rather than inventing a second hash), the orchestration
-/// `name` typed for this workspace, and the clone's own canonical `path`.
-/// This is additive evidence for future tooling, not a new requirement:
-/// [`resume_existing_isolated_clone`]'s eligibility check (b) below still
-/// only tests file presence, so a pre-M4 `b"deck\n"` artifact keeps
-/// resuming exactly as before (`orchestration/workspace/012`).
+/// `name` typed for this workspace, the clone's own canonical `path`, and
+/// (review-findings fix round, reviewer B2) the `creator` identity that
+/// opened it. This is additive evidence for future tooling, not a new
+/// requirement: [`resume_existing_isolated_clone`]'s eligibility check (b)
+/// below still only tests file presence, so a pre-M4 `b"deck\n"` artifact
+/// keeps resuming exactly as before (`orchestration/workspace/012`).
+///
+/// Both `name` and `creator` are caller-supplied strings, not values this
+/// module controls the shape of — sanitized via
+/// [`crate::worktree_reclaim::sanitize_marker_creator`] (reused rather than
+/// inventing a second sanitizer) before being interpolated into the raw
+/// `key=value` content below, so a `name`/`creator` containing an embedded
+/// `\n` can't forge additional records into the artifact.
 ///
 /// Atomic write-then-rename, mirroring [`mark_worktree_owned`]'s own
 /// pattern in `worktree_reclaim.rs` for the identical reason: on ENOSPC or
@@ -2749,6 +2799,7 @@ fn write_isolated_clone_provenance(
     source_dir: &Path,
     clone_dir: &Path,
     name: &str,
+    creator: &str,
 ) -> Result<(), String> {
     let marker_path = isolated_clone_provenance_path(clone_dir);
     let parent = marker_path.parent().expect(
@@ -2772,8 +2823,10 @@ fn write_isolated_clone_provenance(
             .as_bytes(),
     );
     let canonical_clone_dir = canonicalize_best_effort(clone_dir);
+    let safe_name = crate::worktree_reclaim::sanitize_marker_creator(name);
+    let safe_creator = crate::worktree_reclaim::sanitize_marker_creator(creator);
     let content = format!(
-        "schema=2\nroot-hash={root_hash:016x}\nname={name}\npath={}\n",
+        "schema=2\nroot-hash={root_hash:016x}\nname={safe_name}\npath={}\ncreator={safe_creator}\n",
         canonical_clone_dir.display()
     );
 
@@ -2841,6 +2894,49 @@ pub(crate) fn forget_isolated_workspace(
         ));
     }
 
+    // Bundled hardening (PRD fork#544 review-findings fix round):
+    // `attempt_isolated_clone_cleanup` guards its own `remove_dir_all` with
+    // `clone_dir.join(".git").is_dir()`, making that destructive,
+    // unconditional removal self-evidently safe to a future reader --
+    // this function performed the same unconditional removal with no
+    // equivalent guard. Skipped when `clone_dir` doesn't exist at all (the
+    // "already gone, tolerated" case immediately below): there is nothing
+    // to protect there, and `remove_dir_all`'s own `NotFound` tolerance
+    // already covers it.
+    if clone_dir.exists() && !clone_dir.join(".git").is_dir() {
+        return Err(format!(
+            "refusing to forget {}: no .git directory found there -- not something this \
+             deck's forget could safely remove",
+            clone_dir.display()
+        ));
+    }
+
+    // Bundled hardening (PRD fork#544 review-findings fix round): today
+    // the sole authority for removal is `marker_path.is_file()` above --
+    // presence alone, never checking what the artifact actually NAMES. M4
+    // writes `path=<canonical clone dir>` into it; read it back (when the
+    // artifact carries the `schema=2` tag `isolated_clone_provenance_field`
+    // requires -- a pre-M4 `b"deck\n"` artifact has no `path=` to check,
+    // and is tolerated exactly as `resume_existing_isolated_clone`'s own
+    // evidence-presence check tolerates it) and confirm it names THIS
+    // directory before trusting it. Closes the gap where a stale artifact
+    // -- one a checkout failure predating this fix round's Fix 4 never
+    // cleaned up, or one surviving some other path -- could authorise
+    // deleting the wrong directory.
+    if let Ok(content) = std::fs::read_to_string(&marker_path)
+        && let Some(stored_path) = isolated_clone_provenance_field(&content, "path")
+    {
+        let canonical_clone_dir = canonicalize_best_effort(clone_dir);
+        if stored_path != canonical_clone_dir.to_string_lossy() {
+            return Err(format!(
+                "refusing to forget {}: the provenance artifact at {} names a different \
+                 directory ({stored_path}) -- stale evidence, not trusted",
+                clone_dir.display(),
+                marker_path.display()
+            ));
+        }
+    }
+
     // Tolerate the directory already being gone (fork#325/M4b's own
     // `remove_isolated_clone_dir` precedent): the provenance artifact is
     // the durable ownership record, so a caller retrying a forget whose
@@ -2880,19 +2976,23 @@ pub(crate) fn forget_isolated_workspace(
 /// [`fetch_other_live_workspace`] (for which this fetch IS the entire
 /// operation).
 fn fetch_origin(clone_dir: &Path) -> Result<(), String> {
-    let out = std::process::Command::new("git")
-        .current_dir(clone_dir)
-        .args(["fetch", "--quiet", "origin"])
-        .output()
-        .map_err(|e| format!("failed to fetch origin in {}: {e}", clone_dir.display()))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git fetch origin failed in {}: {}",
-            clone_dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(())
+    run_status_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir.to_string_lossy().into_owned(),
+            "fetch".to_string(),
+            "--quiet".to_string(),
+            "origin".to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .map_err(|e| {
+        let msg = match e {
+            AddError::TimedOut(m) | AddError::Failed(m) => m,
+        };
+        format!("git fetch origin failed in {}: {msg}", clone_dir.display())
+    })
 }
 
 /// PRD fork#544 M7 (Design step 7 / Decisions table row "What happens to
@@ -2932,9 +3032,18 @@ pub(crate) enum PostMergeSyncOutcome {
 ///    fully contained in `origin/<default_branch>`'s history
 ///    (`git merge-base --is-ancestor HEAD origin/<default_branch>`).
 ///
-/// If both hold, checks out `default_branch` — git's DWIM creates a local
-/// tracking branch from `origin/<default_branch>` when none exists yet, the
-/// same mechanism `provision_isolated_clone_sync_attaches_branch_that_
+/// If both hold, a THIRD check (reviewer S3, review-findings fix round)
+/// covers a gap neither precondition above catches: LOCAL `default_branch`
+/// itself may have separately diverged from `origin/<default_branch>` (a
+/// maintainer committing directly to their own local main, say) — the two
+/// preconditions above are both checked against HEAD (this workspace's own
+/// just-merged feature branch), not against `default_branch`, so neither
+/// sees this coming. The starting ref is captured before anything below
+/// moves HEAD, so a merge failure further down can restore it.
+///
+/// Switches onto `default_branch` — git's DWIM creates a local tracking
+/// branch from `origin/<default_branch>` when none exists yet, the same
+/// mechanism `provision_isolated_clone_sync_attaches_branch_that_
 /// exists_only_as_remote_tracking_ref` already relies on elsewhere in this
 /// module — and then fast-forwards it with `git merge --ff-only
 /// origin/<default_branch>`. `--ff-only`, deliberately never `reset --hard`:
@@ -2943,7 +3052,18 @@ pub(crate) enum PostMergeSyncOutcome {
 /// local `default_branch` exactly on `origin/<default_branch>`'s SHA in the
 /// (typical) case where a local branch of that name already exists from the
 /// clone's own initial checkout, stale, rather than only being created fresh
-/// by the DWIM.
+/// by the DWIM. `git switch`, not `git checkout` (auditor A5, review-
+/// findings fix round): `checkout`'s own `--` separator doesn't protect an
+/// option-shaped `default_branch` value the way it looks like it should
+/// (verified empirically — see the inline comment at the call site), so an
+/// adversarial-looking branch name silently detached HEAD instead of
+/// landing on it; `switch`'s `--` genuinely separates options from the
+/// target ref.
+///
+/// If the merge fails after a successful switch, the workspace is restored
+/// to its starting ref before the error is returned (reviewer S3) — no
+/// `Err` result may ever leave the workspace anywhere other than where it
+/// started.
 ///
 /// `#[allow(dead_code)]`: PRD fork#544 M7 ships no CLI/caller wiring yet,
 /// the same honest state [`forget_isolated_workspace`]'s own
@@ -2954,24 +3074,28 @@ pub(crate) fn sync_merged_workspace_to_main(
     clone_dir: &Path,
     default_branch: &str,
 ) -> Result<PostMergeSyncOutcome, String> {
-    let status_out = std::process::Command::new("git")
-        .current_dir(clone_dir)
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| {
-            format!(
-                "failed to check {} for uncommitted changes: {e}",
-                clone_dir.display()
-            )
-        })?;
-    if !status_out.status.success() {
-        return Err(format!(
-            "git status --porcelain failed in {}: {}",
-            clone_dir.display(),
-            String::from_utf8_lossy(&status_out.stderr).trim()
-        ));
-    }
-    if !status_out.stdout.is_empty() {
+    let clone_dir_str = clone_dir.to_string_lossy().into_owned();
+
+    let status_stdout = run_capture_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir_str.clone(),
+            "status".to_string(),
+            "--porcelain".to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .map_err(|e| {
+        let msg = match e {
+            AddError::TimedOut(m) | AddError::Failed(m) => m,
+        };
+        format!(
+            "failed to check {} for uncommitted changes: {msg}",
+            clone_dir.display()
+        )
+    })?;
+    if !status_stdout.is_empty() {
         return Ok(PostMergeSyncOutcome::LeftUntouched {
             reason: "the workspace has uncommitted changes -- refusing to switch and \
                      potentially discard unprotected work"
@@ -2982,17 +3106,19 @@ pub(crate) fn sync_merged_workspace_to_main(
     fetch_origin(clone_dir)?;
 
     let remote_ref = format!("origin/{default_branch}");
-    let ancestor_out = std::process::Command::new("git")
-        .current_dir(clone_dir)
-        .args(["merge-base", "--is-ancestor", "HEAD", &remote_ref])
-        .output()
-        .map_err(|e| {
-            format!(
-                "failed to check whether HEAD is an ancestor of {remote_ref} in {}: {e}",
-                clone_dir.display()
-            )
-        })?;
-    if !ancestor_out.status.success() {
+    let ancestor_status = run_status_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir_str.clone(),
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            "HEAD".to_string(),
+            remote_ref.clone(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    );
+    if ancestor_status.is_err() {
         return Ok(PostMergeSyncOutcome::LeftUntouched {
             reason: format!(
                 "the workspace's HEAD is not fully contained in {remote_ref} -- it carries a \
@@ -3002,39 +3128,157 @@ pub(crate) fn sync_merged_workspace_to_main(
         });
     }
 
-    let checkout_out = std::process::Command::new("git")
-        .current_dir(clone_dir)
-        .args(["checkout", "--quiet", default_branch])
-        .output()
+    // Reviewer S3 (PRD fork#544 review-findings fix round): the two
+    // preconditions above are both checked against HEAD (this workspace's
+    // own just-merged feature branch), but the mutation below targets
+    // `default_branch` instead -- a LOCAL `default_branch` that has
+    // separately diverged from `origin/<default_branch>` (e.g. a
+    // maintainer committing directly to their own local main) is caught by
+    // NEITHER precondition, so the switch below can succeed while the
+    // follow-up `merge --ff-only` fails. Capture the starting ref NOW,
+    // before the switch ever moves HEAD, so a merge failure below can
+    // restore it -- the property that actually matters is "no `Err` result
+    // ever leaves the workspace anywhere but where it started," not
+    // catching the divergence as an earlier precondition failure.
+    // `--abbrev-ref` reports the literal string "HEAD" when detached (this
+    // function's own preconditions above make that unreachable in
+    // practice, since a detached HEAD's "branch" can't itself be resumed
+    // as a named workspace, but the fallback keeps this correct rather
+    // than merely untested for that case): restore via the exact SHA
+    // instead of treating "HEAD" as a branch name.
+    let starting_ref_name = run_capture_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir_str.clone(),
+            "rev-parse".to_string(),
+            "--abbrev-ref".to_string(),
+            "HEAD".to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .map(|s| s.trim().to_string())
+    .map_err(|e| {
+        let msg = match e {
+            AddError::TimedOut(m) | AddError::Failed(m) => m,
+        };
+        format!(
+            "failed to resolve the workspace's own starting branch in {}: {msg}",
+            clone_dir.display()
+        )
+    })?;
+    let starting_head_sha = if starting_ref_name == "HEAD" {
+        run_capture_sync(
+            "git",
+            &[
+                "-C".to_string(),
+                clone_dir_str.clone(),
+                "rev-parse".to_string(),
+                "HEAD".to_string(),
+            ],
+            WORKTREE_GIT_TIMEOUT,
+        )
+        .map(|s| s.trim().to_string())
         .map_err(|e| {
+            let msg = match e {
+                AddError::TimedOut(m) | AddError::Failed(m) => m,
+            };
             format!(
-                "failed to check out {default_branch} in {}: {e}",
+                "failed to resolve the workspace's own starting commit in {}: {msg}",
                 clone_dir.display()
             )
-        })?;
-    if !checkout_out.status.success() {
+        })?
+    } else {
+        String::new()
+    };
+
+    // Auditor A5 (PRD fork#544 review-findings fix round): `git checkout
+    // --quiet {default_branch}` had no `--` end-of-options separator,
+    // unlike the `merge` call below -- an option-shaped `default_branch`
+    // value (e.g. `--detach`) is then consumed as a FLAG rather than the
+    // branch to check out, silently detaching HEAD instead of landing on
+    // the named branch. Verified empirically that `checkout`'s own `--`
+    // does NOT fix this (its `--` separates a tree-ish from PATHSPECS, not
+    // options from the branch itself -- `checkout -- <branch>` treats
+    // `<branch>` as a pathspec, and `checkout <branch> --` still consumes
+    // an option-shaped `<branch>` as a flag) -- `git switch`'s `--`
+    // genuinely does separate options from the target ref, so this uses
+    // `switch` instead. Same DWIM as `checkout` for a branch that exists
+    // on `origin` only as a remote-tracking ref.
+    let switch_status = run_status_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir_str.clone(),
+            "switch".to_string(),
+            "--quiet".to_string(),
+            "--".to_string(),
+            default_branch.to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    );
+    if let Err(e) = switch_status {
+        let msg = match e {
+            AddError::TimedOut(m) | AddError::Failed(m) => m,
+        };
         return Err(format!(
-            "git checkout {default_branch} failed in {}: {}",
-            clone_dir.display(),
-            String::from_utf8_lossy(&checkout_out.stderr).trim()
+            "git switch {default_branch} failed in {}: {msg}",
+            clone_dir.display()
         ));
     }
 
-    let merge_out = std::process::Command::new("git")
-        .current_dir(clone_dir)
-        .args(["merge", "--quiet", "--ff-only", "--", &remote_ref])
-        .output()
-        .map_err(|e| {
-            format!(
-                "failed to fast-forward {default_branch} to {remote_ref} in {}: {e}",
-                clone_dir.display()
-            )
-        })?;
-    if !merge_out.status.success() {
+    let merge_status = run_status_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir_str.clone(),
+            "merge".to_string(),
+            "--quiet".to_string(),
+            "--ff-only".to_string(),
+            "--".to_string(),
+            remote_ref.clone(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    );
+    if let Err(e) = merge_status {
+        let msg = match e {
+            AddError::TimedOut(m) | AddError::Failed(m) => m,
+        };
+        // Reviewer S3: restore the workspace to exactly where it started
+        // before the switch above moved it -- best-effort, since the merge
+        // failure is already the error that matters to the caller; a
+        // restore failure is logged, not layered into the returned text.
+        // The ordinary case restores onto the SAME NAMED BRANCH it started
+        // on (never detached, matching `--abbrev-ref HEAD`'s original
+        // report); only a genuinely detached starting HEAD restores via
+        // `--detach <sha>`, since there is no branch name to give back.
+        let mut restore_args = vec![
+            "-C".to_string(),
+            clone_dir_str.clone(),
+            "switch".to_string(),
+            "--quiet".to_string(),
+        ];
+        let restore_target = if starting_ref_name == "HEAD" {
+            restore_args.push("--detach".to_string());
+            &starting_head_sha
+        } else {
+            &starting_ref_name
+        };
+        restore_args.push("--".to_string());
+        restore_args.push(restore_target.clone());
+        if let Err(restore_err) = run_status_sync("git", &restore_args, WORKTREE_GIT_TIMEOUT) {
+            tracing::warn!(
+                clone = %clone_dir.display(),
+                restore_target = %restore_target,
+                error = ?restore_err,
+                "issue-dispatch: failed to restore the workspace to its starting ref after a \
+                 failed post-merge sync; the workspace may be left switched onto \
+                 {default_branch} instead of its original branch"
+            );
+        }
         return Err(format!(
-            "git merge --ff-only {remote_ref} failed in {}: {}",
-            clone_dir.display(),
-            String::from_utf8_lossy(&merge_out.stderr).trim()
+            "git merge --ff-only {remote_ref} failed in {}: {msg}",
+            clone_dir.display()
         ));
     }
 
@@ -3078,6 +3322,16 @@ pub(crate) enum ResumeRejection {
     /// window this call also went through — the loser of the race the
     /// PRD's own Design step 3 names.
     Contested,
+    /// Evidence, ancestry and health all passed, and this call won the
+    /// Contested race, but the provenance artifact's own `creator=` field
+    /// (when present) names a DIFFERENT identity than the one making this
+    /// call (PRD fork#544 review-findings fix round, reviewer B2):
+    /// `sanitize_workspace_segment`/`resolve_workspace_path` aren't
+    /// injective, so two distinct orchestration Names (`fix/544` and
+    /// `fix-544`, say) can sanitize to the identical derived path — the
+    /// SECOND Name's open must not silently attach to the FIRST Name's
+    /// directory as though it were the same workspace.
+    NameCollision,
 }
 
 impl ResumeRejection {
@@ -3101,6 +3355,12 @@ impl ResumeRejection {
                  mid-delete) — it was left untouched; repair or remove it manually"
             }
             Self::Contested => "another request just resumed it first — try again",
+            Self::NameCollision => {
+                "a different orchestration Name already opened the workspace at this location \
+                 (its provenance record names a different creator) — the two Names sanitize to \
+                 the same directory; pick a different Name, or remove the existing directory \
+                 manually"
+            }
         }
     }
 }
@@ -3147,7 +3407,12 @@ fn resumed_isolated_clones() -> &'static std::sync::Mutex<std::collections::Hash
 /// returns, on every outcome — `Resumed`, `Created`, a `Rejected` refusal,
 /// or an `Err` — so a caller need not match on the outcome to know whether
 /// to call it: idempotent (a no-op `HashSet::remove` when no entry was ever
-/// inserted, which is every outcome except `Resumed`). Deliberately NOT
+/// inserted, which is every outcome except `Resumed` and, since PRD
+/// fork#544's review-findings fix round, `Rejected(NameCollision)` — the
+/// latter is refused only AFTER winning this same claim, and deliberately
+/// leaves it claimed rather than releasing it itself; see
+/// `resume_existing_isolated_clone`'s own doc comment on that check for
+/// why). Deliberately NOT
 /// hooked to tab close or any other teardown path — see
 /// [`resumed_isolated_clones`]'s doc comment for why releasing this early
 /// is correct rather than a weakening of the race protection.
@@ -3210,6 +3475,35 @@ fn resume_existing_isolated_clone(
         return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Contested));
     }
 
+    // Reviewer B2 (PRD fork#544 review-findings fix round): won the
+    // Contested race, but that only proves no OTHER call is resuming this
+    // exact path RIGHT NOW — it says nothing about whether THIS call's own
+    // Name is the one that created it. `sanitize_workspace_segment`/
+    // `resolve_workspace_path` aren't injective, so a distinct, colliding
+    // Name can reach this point never having raced anyone. The provenance
+    // artifact's own `creator=` field (when present -- a pre-M4 `b"deck\n"`
+    // artifact has none, and this deliberately tolerates that the same way
+    // the eligibility checks above do) is the source of truth for who
+    // opened it; a mismatch here means a second, distinct Name resolved to
+    // the same on-disk directory as a first, unrelated one. Deliberately
+    // does NOT release this call's own claim above on refusal — real
+    // callers release unconditionally on every outcome regardless (see
+    // `release_resumed_isolated_clone_registration`'s doc comment), and
+    // leaving it claimed is what keeps two near-simultaneous mismatched
+    // resumes distinguishable from each other (one gets refused here as
+    // NameCollision for having won the race in the first place; the other
+    // never even reaches this check, refused instead as Contested) rather
+    // than both racing to the identical outcome.
+    if let Some(stored_creator) = std::fs::read_to_string(isolated_clone_provenance_path(clone_dir))
+        .ok()
+        .and_then(|content| isolated_clone_provenance_field(&content, "creator"))
+        && stored_creator != crate::worktree_reclaim::sanitize_marker_creator(creator)
+    {
+        return Ok(IsolatedCloneOutcome::Rejected(
+            ResumeRejection::NameCollision,
+        ));
+    }
+
     tracing::info!(
         clone = %clone_dir.display(),
         creator = %creator,
@@ -3263,14 +3557,23 @@ fn resume_existing_isolated_clone(
 ///   fixup with NO `origin` remote at all (see
 ///   [`remove_isolated_clone_origin_default`]), so "both absent" is the
 ///   expected shape for that case, not evidence of anything.
-/// - **Shared history**, via `git merge-base --is-ancestor <source HEAD>
-///   HEAD` run inside `clone_dir` — a plain local `git clone` hardlinks
-///   `source_dir`'s object store, so `source_dir`'s HEAD at clone time is
-///   always a real object inside `clone_dir`'s own database; an unrelated
-///   repository's HEAD never is. This is the decisive signal for the
-///   `orchestration/workspace/007` fixture specifically, where neither
-///   repository has an `origin` configured at all, so the URL signal above
-///   can't distinguish them.
+/// - **Shared history**, via a plain `git merge-base <source HEAD> HEAD`
+///   run inside `clone_dir` (PRD fork#544 review-findings fix round,
+///   reviewer B1 / auditor A1, pinned by `orchestration/workspace/025`):
+///   the ORIGINAL form ran `--is-ancestor`, asking whether `source_dir`'s
+///   HEAD AT RESUME TIME is contained in `clone_dir`'s history — true only
+///   in the instant right after cloning, when a plain `git clone`
+///   hardlinks `source_dir`'s object store, and wrongly refusing a
+///   healthy, genuinely-derived workspace the moment `source_dir` advances
+///   past it (the everyday steady state this PRD exists to support). A
+///   plain merge-base, with neither side pinned to "must contain the
+///   other," is symmetric: it passes whichever side has since moved on.
+///   Preceded by a best-effort `git fetch` directly from `source_dir`'s own
+///   path (not `origin`, which may not exist at all when `source_dir` has
+///   none configured — see [`remove_isolated_clone_origin_default`]) so
+///   `source_dir`'s new commits, unreachable from anything `clone_dir`
+///   already had, become real objects in `clone_dir`'s own database before
+///   the probe runs.
 fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -> bool {
     if let (Some(source_url), Some(clone_url)) = (
         read_source_origin_url(source_dir),
@@ -3283,27 +3586,70 @@ fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -
     let Some(source_head) = isolated_clone_head_sha(source_dir) else {
         return false;
     };
-    std::process::Command::new("git")
-        .current_dir(clone_dir)
-        .args(["merge-base", "--is-ancestor", &source_head, "HEAD"])
-        .output()
-        .is_ok_and(|out| out.status.success())
+
+    let clone_dir_str = clone_dir.to_string_lossy().into_owned();
+    // Best-effort: bring source_dir's own objects (including anything it
+    // has committed since clone_dir was created) directly into clone_dir's
+    // database. A failure here isn't fatal -- the probe below just runs
+    // against whatever clone_dir's database already has, same as before
+    // this fetch existed.
+    let _ = run_status_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir_str.clone(),
+            "fetch".to_string(),
+            "--quiet".to_string(),
+            "--".to_string(),
+            source_dir.to_string_lossy().into_owned(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    );
+
+    match spawn_and_wait_sync(
+        "git",
+        &["-C", &clone_dir_str, "merge-base", &source_head, "HEAD"],
+        WORKTREE_GIT_TIMEOUT,
+    ) {
+        // A merge base was found: source_dir's HEAD and clone_dir's own
+        // current HEAD share history, regardless of which side has since
+        // advanced past the other.
+        Ok(out) if out.status.success() => true,
+        // Exit 1: git ran fine and found no common ancestor between two
+        // resolvable commits -- a genuine ancestry mismatch
+        // (`orchestration/workspace/007`'s unrelated second source, whose
+        // own HEAD the fetch above DOES bring in, since it's a real,
+        // reachable repository -- it simply shares no history with
+        // clone_dir).
+        //
+        // Anything else (exit 128 -- source_head's object still isn't in
+        // clone_dir's database even after the fetch above, e.g. a
+        // dangling commit unreachable from any ref in source_dir -- or the
+        // probe failing to spawn at all) is inconclusive rather than a
+        // proven mismatch, but there is no positive evidence of shared
+        // history either, so this refuses the same as a genuine mismatch
+        // rather than silently vouching for it.
+        _ => false,
+    }
 }
 
 /// `git rev-parse HEAD` in `dir`, `None` on any spawn/exit failure — shared
 /// by [`isolated_clone_ancestry_matches_source`] and
 /// [`isolated_clone_git_state_readable`].
 fn isolated_clone_head_sha(dir: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if sha.is_empty() { None } else { Some(sha) }
+    run_capture_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "rev-parse".to_string(),
+            "HEAD".to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
 }
 
 /// PRD fork#544 M3 health probe: is `clone_dir`'s git state usable at all?
@@ -4194,24 +4540,31 @@ fn spawn_git_status_child(
     }
 }
 
-/// Blocking twin of [`run_status_args`] for [`create_worktree_sync`] and
-/// [`attempt_worktree_cleanup`], which run on the TUI's synchronous
-/// `SpawnPane` dispatch path and cannot `.await`.
-///
-/// Fork #122/#123 audit (P2), two layers: stdin closed and a
-/// non-interactive git environment applied — same three env vars as
-/// [`run_status`] above — so a credential prompt fails fast instead of
-/// waiting on input nothing will ever supply; and `Command::output()` —
-/// which waits for termination with no bound — is replaced with `spawn()`
-/// plus `try_wait()` polling against the caller-supplied `timeout`, killing
-/// the child and returning [`AddError::TimedOut`] on expiry, rather than
-/// leaving the render/event loop unable to repaint, show an error, or
-/// accept input. `timeout` is a parameter (fork #122/#123 re-audit, P2)
-/// rather than the fixed [`WORKTREE_GIT_TIMEOUT`] so [`attempt_worktree_cleanup`]
-/// can give its own cleanup call a shorter, independent bound.
-fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<(), AddError> {
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (mut child, group) = spawn_git_status_child(program, &refs)
+/// The raw result of [`spawn_and_wait_sync`] — exit status plus fully
+/// drained stdout/stderr, so a caller that needs the exit CODE (not just
+/// success/failure) or the captured OUTPUT (not just whether there was any)
+/// can get at both without a second subprocess spawn.
+struct SyncGitOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Shared spawn/poll/timeout/drain core for [`run_status_sync`] and
+/// [`run_capture_sync`] — both are thin wrappers that differ only in which
+/// half of this result they surface to their own caller. Extracted (PRD
+/// fork#544 review-findings fix round, bundled hardening) so a synchronous
+/// caller that needs captured stdout (`read_source_origin_url`, the
+/// ancestry probe) can get [`spawn_git_status_child`]'s same hardening
+/// — stdin closed, non-interactive git env, `LC_ALL=C`, a bounded
+/// process-group timeout — without a second, unhardened
+/// `std::process::Command` of its own.
+fn spawn_and_wait_sync(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<SyncGitOutput, AddError> {
+    let (mut child, group) = spawn_git_status_child(program, args)
         .map_err(|e| AddError::Failed(format!("failed to run `{program}`: {e}")))?;
 
     let deadline = Instant::now() + timeout;
@@ -4243,7 +4596,7 @@ fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<
                     );
                     return Err(AddError::TimedOut(format!(
                         "`{program} {}` timed out after {timeout:?} without exiting",
-                        refs.join(" "),
+                        args.join(" "),
                     )));
                 }
                 std::thread::sleep(WORKTREE_GIT_POLL_INTERVAL);
@@ -4256,19 +4609,73 @@ fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<
         }
     };
 
-    if status.success() {
+    let mut stdout = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_end(&mut stdout);
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut err) = child.stderr.take() {
+        use std::io::Read;
+        let _ = err.read_to_end(&mut stderr);
+    }
+    Ok(SyncGitOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Blocking twin of [`run_status_args`] for [`create_worktree_sync`] and
+/// [`attempt_worktree_cleanup`], which run on the TUI's synchronous
+/// `SpawnPane` dispatch path and cannot `.await`.
+///
+/// Fork #122/#123 audit (P2), two layers: stdin closed and a
+/// non-interactive git environment applied — same three env vars as
+/// [`run_status`] above — so a credential prompt fails fast instead of
+/// waiting on input nothing will ever supply; and `Command::output()` —
+/// which waits for termination with no bound — is replaced with `spawn()`
+/// plus `try_wait()` polling against the caller-supplied `timeout`, killing
+/// the child and returning [`AddError::TimedOut`] on expiry, rather than
+/// leaving the render/event loop unable to repaint, show an error, or
+/// accept input. `timeout` is a parameter (fork #122/#123 re-audit, P2)
+/// rather than the fixed [`WORKTREE_GIT_TIMEOUT`] so [`attempt_worktree_cleanup`]
+/// can give its own cleanup call a shorter, independent bound.
+fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<(), AddError> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = spawn_and_wait_sync(program, &refs, timeout)?;
+    if out.status.success() {
         return Ok(());
     }
-    let mut stderr_buf = Vec::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        use std::io::Read;
-        let _ = stderr.read_to_end(&mut stderr_buf);
-    }
-    let stderr = String::from_utf8_lossy(&stderr_buf);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     Err(AddError::Failed(format!(
         "`{program} {}` failed ({}): {}",
         refs.join(" "),
-        status,
+        out.status,
+        stderr.trim()
+    )))
+}
+
+/// Blocking, hardened twin of [`run_capture_args`] for synchronous callers
+/// that need the child's actual STDOUT, not just success/failure —
+/// [`read_source_origin_url`], `sync_merged_workspace_to_main`'s `git
+/// status --porcelain` check, and the resume-arm's ancestry/fetch probes
+/// (PRD fork#544 review-findings fix round, bundled hardening): all four
+/// used to run a raw, unhardened `std::process::Command` of their own
+/// rather than [`spawn_git_status_child`]'s stdin-closed/non-interactive/
+/// bounded-timeout environment. Shares [`spawn_and_wait_sync`] with
+/// [`run_status_sync`] rather than duplicating the spawn/poll/timeout loop.
+fn run_capture_sync(program: &str, args: &[String], timeout: Duration) -> Result<String, AddError> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = spawn_and_wait_sync(program, &refs, timeout)?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(AddError::Failed(format!(
+        "`{program} {}` failed ({}): {}",
+        refs.join(" "),
+        out.status,
         stderr.trim()
     )))
 }
