@@ -239,19 +239,37 @@ while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; do
         Duration::from_secs(5),
     );
     let marked_working = deck.snapshot_grid().contains("Working");
-    std::fs::write(deck.workdir().join("allow-live-target"), "")
+
+    // PRD fork#544 M2b: isolation is unconditional, so the orchestrator
+    // role's script (and everything it writes — the live-target sentinel,
+    // its prompt log, its generated context file) runs inside its own
+    // isolated clone, not `deck.workdir()`. Read the daemon's own record of
+    // the role pane's cwd rather than assuming it's the fixture's source
+    // dir.
+    let role_cwd = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find_map(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(dot_agent_deck::agent_pty::TabMembership::Orchestration { role_name, .. })
+                    if role_name == "orchestrator"
+            )
+            .then_some(r.cwd)
+            .flatten()
+        })
+        .map(std::path::PathBuf::from)
+        .expect("orchestrator role pane must be registered with a recorded cwd");
+
+    std::fs::write(role_cwd.join("allow-live-target"), "")
         .expect("allow synthetic role to become live");
     let delivered = common::wait_for_file_substr_count(
-        &deck.workdir().join("orchestrator-prompt.log"),
+        &role_cwd.join("orchestrator-prompt.log"),
         DELIVERED_POINTER,
         1,
         Duration::from_secs(10),
     );
-    let context = std::fs::read_to_string(
-        deck.workdir()
-            .join(".dot-agent-deck/orchestrator-context.md"),
-    )
-    .expect("read generated orchestrator context");
+    let context = std::fs::read_to_string(role_cwd.join(".dot-agent-deck/orchestrator-context.md"))
+        .expect("read generated orchestrator context");
     let grid = deck.snapshot_grid();
 
     assert!(

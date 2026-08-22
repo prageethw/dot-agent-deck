@@ -280,7 +280,15 @@ fn open_and_confirm_initial_delivery(
         .expect("orchestrator role pane must have a DOT_AGENT_DECK_PANE_ID recorded");
     let agent_id = record.id.clone();
 
-    let log = deck.workdir().join("orchestrator-prompt.log");
+    // PRD fork#544 M2b: isolation is unconditional, so the orchestrator
+    // role's script runs (and writes this log) inside its own isolated
+    // clone, not `deck.workdir()` — read the daemon's own record of the
+    // role pane's cwd rather than assuming it's the fixture's source dir.
+    let role_cwd = record
+        .cwd
+        .clone()
+        .expect("orchestrator role pane must have a recorded cwd");
+    let log = std::path::PathBuf::from(role_cwd).join("orchestrator-prompt.log");
     let initial_delivered =
         common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 1, Duration::from_secs(10));
     assert!(
