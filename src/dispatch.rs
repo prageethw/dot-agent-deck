@@ -462,6 +462,23 @@ pub async fn handle_dispatch(
                     ),
                 };
             }
+            // PRD fork#544 M3: resuming an existing, eligible isolated clone
+            // is a success just like `Created` above — this ad hoc
+            // `dispatch` CLI path does not surface a warning on `Created`
+            // either (`marker_warning: _` above), so `fetch_warning` is
+            // dropped here for the same reason.
+            Ok(Ok(IsolatedCloneOutcome::Resumed { fetch_warning: _ })) => {}
+            Ok(Ok(IsolatedCloneOutcome::Rejected(reason))) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: cannot use the isolated clone at {} — {}",
+                        paths.worktree_dir.display(),
+                        reason.describe(),
+                    ),
+                };
+            }
             Ok(Ok(IsolatedCloneOutcome::TimedOut { cleaned_up_by })) => {
                 return isolated_clone_failure_result(
                     &paths.worktree_dir,

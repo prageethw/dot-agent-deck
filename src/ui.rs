@@ -9621,15 +9621,27 @@ fn commit_rename(
 /// path — every orchestration isolates, so there is no longer a separate
 /// shared-checkout arm for this to be one of two callers of. Wraps
 /// [`crate::issue_dispatch_run::provision_isolated_clone_sync`] and turns
-/// every non-`Created` outcome into a status-message string — this function
-/// has no access to `ui`, so the caller is responsible for setting
+/// every non-`Created`/`Resumed` outcome into a status-message string — this
+/// function has no access to `ui`, so the caller is responsible for setting
 /// `ui.status_message` from the `Err` string and returning `Flow::Continue`.
+///
+/// PRD fork#544 M3: the fourth tuple element is the resume-time read-only
+/// fetch's own best-effort warning — kept separate from `marker_warning`/
+/// `origin_warning` (both `Created`-only, and never set on a `Resumed`
+/// outcome) for the same reason those two are already kept apart from each
+/// other (fix round 3, reviewer C0/auditor P2-3): each names a different
+/// hazard, and the call site renders each with its own accurate wording.
+///
+/// Fields, in order: the resolved workspace directory; the ownership-marker
+/// warning; the origin-fixup warning; the resume-fetch warning.
+type ProvisionedWorkspace = (String, Option<String>, Option<String>, Option<String>);
+
 fn provision_isolated_clone_or_status(
     root_dir: &Path,
     worktree_path: &Path,
     branch: &str,
     creator: &str,
-) -> Result<(String, Option<String>, Option<String>), String> {
+) -> Result<ProvisionedWorkspace, String> {
     match crate::issue_dispatch_run::provision_isolated_clone_sync(
         root_dir,
         worktree_path,
@@ -9643,9 +9655,36 @@ fn provision_isolated_clone_or_status(
             worktree_path.display().to_string(),
             marker_warning,
             origin_warning,
+            None,
+        )),
+        // PRD fork#544 M3: a resumed workspace proceeds exactly like a
+        // freshly `Created` one from this function's perspective — the
+        // caller (`Action::SpawnPane`) spawns the role pane(s) into
+        // `worktree_path` identically either way, just skipping the `git
+        // clone` step that already happened (or never needed to, this
+        // time).
+        Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { fetch_warning }) => Ok((
+            worktree_path.display().to_string(),
+            None,
+            None,
+            fetch_warning,
+        )),
+        // PRD fork#544 M3: `clone_dir` existed but failed the three-part
+        // eligibility check plus health probe — name which of the four
+        // distinguishable reasons via the shared `ResumeRejection::describe`
+        // wording (also used by `src/dispatch.rs`'s ad hoc `dispatch <name>`
+        // CLI path, so the two can't drift apart).
+        Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Rejected(reason)) => Err(format!(
+            "Orchestration failed: cannot use the workspace at {} — {}",
+            worktree_path.display(),
+            reason.describe()
         )),
         // Issue #325 reviewer P3-1: say "clone", not "worktree" — `git
-        // worktree remove` does not apply to this path at all.
+        // worktree remove` does not apply to this path at all. PRD
+        // fork#544 M3: this arm is now reached only via
+        // `handle_isolated_clone_add_error`'s narrow TOCTOU case (a human
+        // `git worktree add` into this exact path mid-clone) — the ordinary
+        // present-directory case goes through `Resumed`/`Rejected` above.
         Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::AlreadyClaimed) => Err(format!(
             "Orchestration failed: clone already exists at {}",
             worktree_path.display()
@@ -10604,22 +10643,36 @@ fn dispatch_action(
                     // a fixed template built for the ownership-marker
                     // failure, which would misdescribe an origin-fixup
                     // failure entirely.
-                    let (dir_str, worktree_marker_warning, worktree_origin_warning) =
-                        match provision_isolated_clone_or_status(
-                            &req.dir,
-                            &worktree_path,
-                            &segment,
-                            &creator,
-                        ) {
-                            Ok((resolved_dir_str, marker_warning, origin_warning)) => {
-                                (resolved_dir_str, marker_warning, origin_warning)
-                            }
-                            Err(message) => {
-                                release_orchestration_claim_token(&orchestration_claim_token);
-                                ui.status_message = Some((message, std::time::Instant::now()));
-                                return Flow::Continue;
-                            }
-                        };
+                    // PRD fork#544 M3: `worktree_resume_fetch_warning` is
+                    // `Some` only when `provision_isolated_clone_or_status`
+                    // below resumed an existing workspace and its own
+                    // best-effort read-only `git fetch origin` failed — kept
+                    // apart from the other two warnings for the same reason
+                    // they're kept apart from each other (see that
+                    // function's doc comment).
+                    let (
+                        dir_str,
+                        worktree_marker_warning,
+                        worktree_origin_warning,
+                        worktree_resume_fetch_warning,
+                    ) = match provision_isolated_clone_or_status(
+                        &req.dir,
+                        &worktree_path,
+                        &segment,
+                        &creator,
+                    ) {
+                        Ok((resolved_dir_str, marker_warning, origin_warning, fetch_warning)) => (
+                            resolved_dir_str,
+                            marker_warning,
+                            origin_warning,
+                            fetch_warning,
+                        ),
+                        Err(message) => {
+                            release_orchestration_claim_token(&orchestration_claim_token);
+                            ui.status_message = Some((message, std::time::Instant::now()));
+                            return Flow::Continue;
+                        }
+                    };
                     // PRD #107 regression fix: do NOT overwrite
                     // `orch_config.name` with the form name. That override
                     // corrupted the orchestration IDENTITY — the canonical
@@ -10902,6 +10955,18 @@ fn dispatch_action(
                                                 &dir_str, error,
                                             ),
                                         );
+                                    }
+                                    // PRD fork#544 M3: a resumed workspace's
+                                    // own best-effort read-only `git fetch
+                                    // origin` failing — never fatal to the
+                                    // resume itself, just possibly-stale
+                                    // ahead/behind info.
+                                    if let Some(error) = &worktree_resume_fetch_warning {
+                                        warnings.push(format!(
+                                            "this workspace's read-only `git fetch origin` on \
+                                             resume failed ({error}) — ahead/behind info may be \
+                                             stale until the next successful fetch"
+                                        ));
                                     }
                                     if warnings.is_empty() {
                                         title

@@ -1265,6 +1265,21 @@ pub(crate) enum IsolatedCloneOutcome {
         error: String,
         cleaned_up_by: Option<String>,
     },
+    /// PRD fork#544 M3: `clone_dir` existed, and
+    /// [`resume_existing_isolated_clone`]'s three-part eligibility check
+    /// plus health probe all passed — reattached with a read-only `git
+    /// fetch origin` (never a fast-forward/rebase/merge/checkout of a
+    /// different ref) and otherwise zero git mutation. `fetch_warning` is
+    /// `Some` only when that best-effort fetch itself failed (e.g. no
+    /// `origin` configured); it never fails resumption itself.
+    Resumed {
+        fetch_warning: Option<String>,
+    },
+    /// PRD fork#544 M3: `clone_dir` existed but failed
+    /// [`resume_existing_isolated_clone`]'s eligibility check — see
+    /// [`ResumeRejection`] for which of the four distinguishable reasons.
+    /// Never auto-deletes or auto-repairs the directory; refuses only.
+    Rejected(ResumeRejection),
 }
 
 /// PRD fork#325 M3 sync twin, structurally mirroring [`provision_repo`]'s
@@ -1416,7 +1431,13 @@ pub(crate) fn provision_isolated_clone_sync(
             })?;
 
     if clone_dir.exists() {
-        return Ok(IsolatedCloneOutcome::AlreadyClaimed);
+        // PRD fork#544 M3: a present directory is no longer an unconditional
+        // refusal — `resume_existing_isolated_clone` runs the three-part
+        // eligibility check plus health probe and either resumes it or
+        // reports a distinguishable rejection reason. This REPLACES the
+        // flat `AlreadyClaimed` this branch used to return; it does not run
+        // alongside it.
+        return resume_existing_isolated_clone(source_dir, clone_dir, creator);
     }
 
     // Issue #325 auditor A2: `--` end-of-options separator before both
@@ -2736,6 +2757,240 @@ fn write_isolated_clone_provenance(clone_dir: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp_path);
         format!("failed to finalize isolated-clone provenance artifact: {e}")
     })
+}
+
+/// PRD fork#544 M3: distinguishable refusal reasons for
+/// [`resume_existing_isolated_clone`] — this enum's own `Debug` output is
+/// the interface `orchestration/workspace/006`-`008` assert substrings
+/// against (`"stranger"`, `"ancestry"`, `"unhealthy"`), so the variant
+/// names are chosen to read naturally in that form rather than for any
+/// other convention.
+#[derive(Debug)]
+pub(crate) enum ResumeRejection {
+    /// No M4b ownership evidence for this canonical path at all — a
+    /// directory this deck never created (or wrote evidence for) at this
+    /// exact location.
+    Stranger,
+    /// M4b evidence is present, but `clone_dir`'s origin/shared history
+    /// does not match `source_dir` — the same Name typed against a
+    /// different underlying project (Problem Statement #4).
+    AncestryMismatch,
+    /// The directory's git state could not be read (`git rev-parse HEAD`
+    /// failed) — refused only, never auto-deleted or auto-repaired.
+    Unhealthy,
+    /// Evidence, ancestry and health all passed, but another call already
+    /// resumed this exact canonical path first, inside the very attach-lock
+    /// window this call also went through — the loser of the race the
+    /// PRD's own Design step 3 names.
+    Contested,
+}
+
+impl ResumeRejection {
+    /// A single, shared human-readable description of the refusal — reused
+    /// by both real callers of [`IsolatedCloneOutcome::Rejected`]
+    /// (`src/ui.rs`'s `Action::SpawnPane` dispatch and `src/dispatch.rs`'s
+    /// ad hoc `dispatch <name>` CLI path) so the wording can't drift
+    /// between them.
+    pub(crate) fn describe(&self) -> &'static str {
+        match self {
+            Self::Stranger => {
+                "a directory already exists there but was not created by this deck (no \
+                 ownership evidence found) — remove it manually, or pick a different Name"
+            }
+            Self::AncestryMismatch => {
+                "the existing directory's history does not match this project (wrong repo, or \
+                 stale) — remove it manually, or pick a different Name"
+            }
+            Self::Unhealthy => {
+                "the existing directory's git state could not be read (it may be corrupt or \
+                 mid-delete) — it was left untouched; repair or remove it manually"
+            }
+            Self::Contested => "another request just resumed it first — try again",
+        }
+    }
+}
+
+/// PRD fork#544 M3: process-local record of which isolated-clone canonical
+/// paths have already been resumed once. Deliberately IN-PROCESS rather
+/// than a persistent on-disk artifact next to the M4b evidence file it sits
+/// beside in this source file: the only real caller today
+/// (`Action::SpawnPane`'s dispatch in `src/ui.rs`) is already fully
+/// arbitrated by fork#192's `ClaimOrchestrationName` daemon registry before
+/// [`provision_isolated_clone_sync`] is ever reached, so a genuine
+/// same-Name concurrent resume never reaches this function in production —
+/// this registry exists as THIS function's own defense-in-depth for a
+/// caller that bypasses that gate (a scheduled-dispatch caller, or a direct
+/// test such as `orchestration/workspace/009`), and it resets for free on
+/// every process restart rather than needing its own release-on-close
+/// plumbing.
+///
+/// Known scope limit, not exercised by any current test: within ONE
+/// process's lifetime a given canonical path can only ever win this
+/// registration once, so a THIRD open of the same Name in the same
+/// still-running process (open, close, reopen — the one legitimate resume
+/// every current test exercises — close, reopen again) would incorrectly
+/// see [`ResumeRejection::Contested`] on that second reopen. Nothing in
+/// this round releases an entry on tab close; flagged here rather than
+/// silently accepted.
+fn resumed_isolated_clones() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// PRD fork#544 M3: `provision_isolated_clone_sync`'s resume arm, called in
+/// place of the flat `AlreadyClaimed` return the directory-exists branch
+/// used to give unconditionally — from INSIDE the same
+/// `worktree_attach_lock_path` attach lock that call already holds for its
+/// whole duration, so this whole check-then-register sequence is itself
+/// serialized against any other racing call for the identical `clone_dir`
+/// (PRD's own Design step 3; see `orchestration/workspace/009`).
+///
+/// Three-part eligibility, checked in an order that keeps a corrupt
+/// directory from being misdiagnosed as an ancestry mismatch: (b) M4b
+/// ownership evidence for this canonical path; a health probe (`git
+/// rev-parse HEAD`) BEFORE the ancestry probe below, since a directory with
+/// no `.git` at all would otherwise fail the ancestry probe's own git
+/// invocations for the wrong reason; then (c) ancestry — does `clone_dir`'s
+/// history genuinely derive from `source_dir`, via
+/// [`isolated_clone_ancestry_matches_source`]. Check (a), name-liveness,
+/// already ran ahead of this call entirely — see [`IsolatedCloneOutcome`]'s
+/// own doc comment; this function never duplicates it.
+///
+/// A full pass registers this exact canonical path in
+/// [`resumed_isolated_clones`] — the FIRST caller to do so (inside the
+/// attach lock, so no two callers can race the registration itself) wins
+/// and resumes; a caller that finds the path already registered lost the
+/// race and is refused as [`ResumeRejection::Contested`] without touching
+/// git again.
+fn resume_existing_isolated_clone(
+    source_dir: &Path,
+    clone_dir: &Path,
+    creator: &str,
+) -> Result<IsolatedCloneOutcome, String> {
+    if !isolated_clone_provenance_path(clone_dir).is_file() {
+        return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Stranger));
+    }
+    if !isolated_clone_git_state_readable(clone_dir) {
+        return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Unhealthy));
+    }
+    if !isolated_clone_ancestry_matches_source(source_dir, clone_dir) {
+        return Ok(IsolatedCloneOutcome::Rejected(
+            ResumeRejection::AncestryMismatch,
+        ));
+    }
+
+    let canonical = canonicalize_best_effort(clone_dir);
+    let first_to_claim = resumed_isolated_clones()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(canonical);
+    if !first_to_claim {
+        return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Contested));
+    }
+
+    tracing::info!(
+        clone = %clone_dir.display(),
+        creator = %creator,
+        "issue-dispatch: resuming existing isolated clone"
+    );
+
+    // PRD fork#544 M3 Decisions table: read-only fetch only — updates
+    // `origin/<default-branch>`'s remote-tracking ref, touches no local
+    // branch and no working tree. Best-effort: a source with no `origin`
+    // configured (the `orch-clone-gate` fixture's own shape) leaves this
+    // clone with no `origin` remote at all after creation (see
+    // `remove_isolated_clone_origin_default`) — `git fetch origin` then
+    // fails loudly with "No such remote", which is fine here, not a
+    // provisioning failure.
+    let fetch_warning = match run_status_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            clone_dir.to_string_lossy().into_owned(),
+            "fetch".to_string(),
+            "origin".to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    ) {
+        Ok(()) => None,
+        Err(err) => {
+            let e = match err {
+                AddError::TimedOut(e) | AddError::Failed(e) => e,
+            };
+            tracing::warn!(
+                clone = %clone_dir.display(),
+                error = %e,
+                "issue-dispatch: could not fetch origin on resume; ahead/behind info may be stale"
+            );
+            Some(e)
+        }
+    };
+
+    Ok(IsolatedCloneOutcome::Resumed { fetch_warning })
+}
+
+/// PRD fork#544 M3 check (c): does `clone_dir`'s history genuinely derive
+/// from `source_dir`, rather than an unrelated repository that merely
+/// landed on the same canonical path? Two signals, both must hold when
+/// applicable:
+///
+/// - **Origin URL**, when BOTH sides have one configured — reusing
+///   [`read_source_origin_url`] rather than inventing a second way to read
+///   it. Deliberately not required when either side has none: a plain
+///   local `git clone` of a no-origin source ends this call's own `origin`
+///   fixup with NO `origin` remote at all (see
+///   [`remove_isolated_clone_origin_default`]), so "both absent" is the
+///   expected shape for that case, not evidence of anything.
+/// - **Shared history**, via `git merge-base --is-ancestor <source HEAD>
+///   HEAD` run inside `clone_dir` — a plain local `git clone` hardlinks
+///   `source_dir`'s object store, so `source_dir`'s HEAD at clone time is
+///   always a real object inside `clone_dir`'s own database; an unrelated
+///   repository's HEAD never is. This is the decisive signal for the
+///   `orchestration/workspace/007` fixture specifically, where neither
+///   repository has an `origin` configured at all, so the URL signal above
+///   can't distinguish them.
+fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -> bool {
+    if let (Some(source_url), Some(clone_url)) = (
+        read_source_origin_url(source_dir),
+        read_source_origin_url(clone_dir),
+    ) && source_url != clone_url
+    {
+        return false;
+    }
+
+    let Some(source_head) = isolated_clone_head_sha(source_dir) else {
+        return false;
+    };
+    std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["merge-base", "--is-ancestor", &source_head, "HEAD"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// `git rev-parse HEAD` in `dir`, `None` on any spawn/exit failure — shared
+/// by [`isolated_clone_ancestry_matches_source`] and
+/// [`isolated_clone_git_state_readable`].
+fn isolated_clone_head_sha(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// PRD fork#544 M3 health probe: is `clone_dir`'s git state usable at all?
+/// `git rev-parse HEAD` failing (no `.git`, corrupt, mid-delete) is refused
+/// distinguishably as [`ResumeRejection::Unhealthy`] — the directory is
+/// never auto-deleted or auto-repaired on this path, only refused.
+fn isolated_clone_git_state_readable(clone_dir: &Path) -> bool {
+    isolated_clone_head_sha(clone_dir).is_some()
 }
 
 /// Issue #164: surface a [`WorktreeCreation::Created`] marker-write warning
@@ -5933,9 +6188,19 @@ exit 0
     /// `provision_isolated_clone_sync` for the SAME `source_dir`/`clone_dir`
     /// pair concurrently — the new attach lock (auditor A3) exists
     /// specifically to serialize this. Asserts exactly one thread reports
-    /// `Created` and the other reports `AlreadyClaimed`, across many
-    /// trials, mirroring `worktree/create/001`'s own reasoning for why a
-    /// single trial proves nothing.
+    /// `Created` and the other reports a second, distinguishable success,
+    /// across many trials, mirroring `worktree/create/001`'s own reasoning
+    /// for why a single trial proves nothing.
+    ///
+    /// PRD fork#544 M3: the loser used to report `AlreadyClaimed`
+    /// (round 2's original assertion) — that outcome no longer exists for
+    /// this scenario. Once the winner's `git clone` makes `clone_dir`
+    /// genuinely present, it is ALSO fully resume-eligible (real M4b
+    /// evidence, matching ancestry, healthy), so the loser now correctly
+    /// resumes it instead of being refused — this is M3's whole point, not
+    /// a regression: see `orchestration/workspace/009` for the same
+    /// winner/loser shape applied to a pre-existing (rather than
+    /// just-created) directory.
     ///
     /// `#[cfg(unix)]` matches `worktree/create/001`'s own precedent — many
     /// trials of real `git` subprocesses (here, full clones, heavier than
@@ -6001,17 +6266,19 @@ exit 0
                 .iter()
                 .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::Created { .. })))
                 .count();
-            let claimed_count = pair
+            let resumed_count = pair
                 .iter()
-                .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::AlreadyClaimed)))
+                .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::Resumed { .. })))
                 .count();
             assert_eq!(
                 created_count, 1,
                 "trial {i}: exactly one caller must report Created, got {pair:?}"
             );
             assert_eq!(
-                claimed_count, 1,
-                "trial {i}: exactly one caller must report AlreadyClaimed, got {pair:?}"
+                resumed_count, 1,
+                "trial {i}: PRD fork#544 M3 — the loser must now resume the winner's freshly \
+                 created (and therefore fully resume-eligible) clone rather than being refused, \
+                 got {pair:?}"
             );
         }
     }
