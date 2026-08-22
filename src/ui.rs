@@ -8805,9 +8805,21 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
 /// which explicitly rejected a leading dash outright. Strips any leading
 /// dashes and falls back to the same `"issues"` sentinel
 /// `sanitize_clone_segment` itself falls back to when nothing else survives.
+///
+/// Also strips a leading `.`: `git check-ref-format` refuses any ref
+/// component starting with a dot (`fatal: '<name>' is not a valid branch
+/// name`), and the auto-suggested orchestration Name
+/// (`suggest_orchestration_name`) is built from the directory's own
+/// basename — which, for every harness-driven e2e fixture, is a
+/// `tempfile`-generated `.tmpXXXXXX` dir. Left unstripped, accepting that
+/// suggested default (as a user who never retypes the Name field does) sent
+/// a dot-prefixed string straight into `git checkout -b`, which failed
+/// every isolated-clone provision silently (`Err` -> status message, zero
+/// panes spawned) — the actual cause behind a wide swath of PRD fork#544's
+/// e2e regressions, not the unborn-HEAD fallback-removal fix alone.
 fn sanitize_workspace_segment(name: &str) -> String {
     let segment = crate::issue_dispatch::sanitize_clone_segment(name);
-    let stripped = segment.trim_start_matches('-');
+    let stripped = segment.trim_start_matches(['-', '.']);
     if stripped.is_empty() {
         "issues".to_string()
     } else {
@@ -35565,6 +35577,34 @@ mod tests {
             resolve_workspace_path(&dir, &sanitize_workspace_segment("my-feature")),
             PathBuf::from("/tmp/dot-agent-deck-my-feature"),
             "a valid name must still resolve exactly as orchestration/workspace/001 expects"
+        );
+    }
+
+    /// `git check-ref-format` refuses any ref component starting with a
+    /// dot, and `suggest_orchestration_name`'s auto-suggested default is
+    /// built from the directory's own basename — a `tempfile`-generated
+    /// `.tmpXXXXXX` dir for every harness-driven e2e fixture. A dot-prefixed
+    /// segment sent unstripped into `git checkout -b` fails outright
+    /// (`fatal: '<name>' is not a valid branch name`), which silently
+    /// failed isolated-clone provisioning for any orchestration opened with
+    /// its suggested (never retyped) default name.
+    #[test]
+    fn sanitize_workspace_segment_strips_leading_dot() {
+        assert_eq!(
+            sanitize_workspace_segment(".tmpAbC123-orchestrator-1"),
+            "tmpAbC123-orchestrator-1",
+            "a leading dot must be stripped, not passed through to `git checkout -b`"
+        );
+        assert_eq!(
+            sanitize_workspace_segment("..."),
+            "issues",
+            "an all-dot segment must fall back to the same sentinel \
+             sanitize_clone_segment itself falls back to"
+        );
+        assert_eq!(
+            sanitize_workspace_segment("-.-.oops"),
+            "oops",
+            "interleaved leading dashes and dots must all be stripped"
         );
     }
 

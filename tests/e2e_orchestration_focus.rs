@@ -33,7 +33,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use spec::spec;
 
@@ -165,6 +165,10 @@ fn focus_007_lock_governed_focus_contract_on_real_binary() {
         .launch_with_fixture("orch-focus-lifecycle");
     deck.wait_for_string("No active sessions");
 
+    // The orchestration opened below needs isolated-clone provisioning,
+    // which needs a ref to branch from — an unborn HEAD (the harness's own
+    // bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
 

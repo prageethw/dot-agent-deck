@@ -6,7 +6,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use serde_json::json;
 use spec::spec;
@@ -202,6 +202,9 @@ while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; do
 "#,
     );
 
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");

@@ -16,7 +16,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture};
 use spec::spec;
 
 /// Substring the drift warning must carry once the fix lands: names the
@@ -48,6 +48,11 @@ const PARSE_WARNING_NEEDLE: &str = "local .dot-agent-deck.toml could not be pars
 fn hydration_001_renamed_orchestration_warns_on_reattach() {
     let deck = TuiDeck::builder().launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
+
+    // The orchestration opened below needs isolated-clone provisioning,
+    // which needs a ref to branch from — an unborn HEAD (the harness's own
+    // bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
 
     // Open the fixture's single orchestration live (mirrors
     // `e2e_orchestration_focus.rs::open_orchestration` / `dashboard_002`):
@@ -128,6 +133,11 @@ command = "cat"
 fn hydration_002_unparseable_config_warns_on_reattach() {
     let deck = TuiDeck::builder().launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
+
+    // The orchestration opened below needs isolated-clone provisioning,
+    // which needs a ref to branch from — an unborn HEAD (the harness's own
+    // bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
 
     // Open the fixture's single orchestration live -- identical setup to
     // `hydration_001`.

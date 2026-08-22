@@ -35,7 +35,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, open_orchestration, write_executable};
+use common::{TuiDeck, commit_fixture, open_orchestration, write_executable};
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use spec::spec;
 
@@ -246,6 +246,9 @@ fn open_and_confirm_initial_delivery(
         ORCHESTRATOR_REMIT_SCRIPT,
     );
 
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     open_orchestration(deck);
     deck.wait_for_absence("New Agent");
 

@@ -311,6 +311,9 @@ fn orchestration_024_ctrl_l_forwards_to_pty_on_focused_orchestration_role_pane()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-bash-role");
     deck.wait_for_string("No active sessions");
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up, orchestrator focused
@@ -358,6 +361,9 @@ fn orchestration_015_active_tab_bold_status_color_no_underline() {
     let active_label = format!("{launch_dir_basename}-orchestrator-1");
 
     deck.wait_for_string("No active sessions");
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab is up
     deck.wait_for_string(&format!(" {active_label} ")); // tab strip renders the active tab's label
@@ -492,6 +498,9 @@ fn write_beta_agent(deck: &TuiDeck) {
 /// selects the orchestration; selecting an orchestration hides the Command
 /// field, so a second Enter submits the form.
 fn open_focus_lifecycle_orchestration(deck: &TuiDeck) {
+    // Isolated-clone provisioning needs a ref to branch from — an unborn
+    // HEAD (the harness's own bare `git init`) does not provide one.
+    commit_fixture(deck.workdir());
     deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode");
