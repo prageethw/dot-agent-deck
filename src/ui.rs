@@ -1154,13 +1154,17 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// into the narrow case).
 ///
 /// PRD fork#325 fix round (issue #489 fix round, reviewer BLOCKER 2): the
-/// per-record loop below is additionally scoped by [`SiblingScope`] — the
-/// blank-slug caller (no typed Worktree slug to isolate into, so its only
-/// remedy is refusal) asks a narrower question than the typed-slug caller
+/// per-record loop below is additionally scoped by [`SiblingScope`] — a
+/// blank-slug caller with no typed Worktree slug to isolate into (its only
+/// remedy was refusal) asked a narrower question than a typed-slug caller
 /// (which isolates into its own clone): does a live orchestration's cwd
 /// literally EQUAL `target_dir`, not merely share its `--git-common-dir`.
-/// See [`SiblingScope`]'s own doc comment for why the two callers need
-/// different answers to what looks like the same question.
+/// PRD fork#544 M2b retired Model A's own two call sites to this function
+/// entirely (isolation is now unconditional, so it never needs to ask
+/// either question) — [`SiblingScope::AnySharedCommonDir`] remains
+/// load-bearing for Model B's (`dispatch.rs`) own, still-conditional gate;
+/// [`SiblingScope::ExactCwdOnly`] has no live caller left, kept rather than
+/// deleted per this function's own doc comment below.
 ///
 /// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1; widened fix round
 /// 4, auditor D2), not yet fixed, tracked as issue #496: the fail-closed
@@ -1309,41 +1313,38 @@ pub(crate) fn root_checkout_has_live_sibling(
 }
 
 /// Issue #489 fix round (reviewer BLOCKER 2): [`root_checkout_has_live_sibling`]
-/// answers two different questions depending on which caller asks it, and
-/// conflating them was the defect — the blank-slug arm's remedy is an
-/// outright refusal, so it must only refuse on the narrow collision it can't
-/// route around (a live orchestration whose cwd literally IS `target_dir`);
-/// the typed-slug arm's remedy is an isolated clone, so it can safely treat
-/// the broader "shares a `--git-common-dir`" signal as a collision, because
-/// isolating into a clone is always a safe response to that signal.
+/// used to answer two different questions depending on which Model A caller
+/// asked it, and conflating them was the defect — the blank-slug arm's
+/// remedy was an outright refusal, so it had to refuse only on the narrow
+/// collision it couldn't route around (a live orchestration whose cwd
+/// literally IS `target_dir`); the typed-slug arm's remedy was an isolated
+/// clone, so it could safely treat the broader "shares a `--git-common-dir`"
+/// signal as a collision, because isolating into a clone is always a safe
+/// response to that signal. PRD fork#544 M2b retired both Model A call
+/// sites (isolation is unconditional now, so Model A never asks either
+/// question), leaving [`ExactCwdOnly`](SiblingScope::ExactCwdOnly) with no
+/// live caller — kept rather than deleted, since Model B (`dispatch.rs`)
+/// still depends on this type and its sibling
+/// [`AnySharedCommonDir`](SiblingScope::AnySharedCommonDir) variant for its
+/// own, still-conditional Nth-concurrent gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SiblingScope {
-    /// The blank-slug (`None`) arm: only a live orchestration whose own cwd
-    /// equals `target_dir` counts. A live orchestration in a linked worktree
-    /// of `target_dir` (CLAUDE.md rule 1's every-fix-gets-its-own-worktree
+    /// Formerly Model A's blank-slug (`None`) arm, now unused in
+    /// production: only a live orchestration whose own cwd equals
+    /// `target_dir` counts. A live orchestration in a linked worktree of
+    /// `target_dir` (CLAUDE.md rule 1's every-fix-gets-its-own-worktree
     /// model) does NOT — refusing on that shape blocked a brand-new,
     /// unrelated blank-slug orchestration in the root checkout for as long
     /// as any worker orchestration held a worktree, a real regression
     /// (`orchestration_dispatch_001`'s e2e failure).
     ExactCwdOnly,
-    /// The typed-slug (`Some(worktree_path)`) arm: today's pre-#489
-    /// behavior, unchanged — any live orchestration sharing `target_dir`'s
-    /// `--git-common-dir`, whether its own cwd IS `target_dir` or a
-    /// worktree carved off it, counts, so the slug is provisioned as an
-    /// isolated clone rather than a `git worktree add` sibling that would
-    /// race the shared object store (issue #325's original incident shape).
+    /// Model B's (`dispatch.rs`) own Nth-concurrent gate: any live
+    /// orchestration sharing `target_dir`'s `--git-common-dir`, whether its
+    /// own cwd IS `target_dir` or a worktree carved off it, counts, so the
+    /// slug is provisioned as an isolated clone rather than a `git worktree
+    /// add` sibling that would race the shared object store (issue #325's
+    /// original incident shape).
     AnySharedCommonDir,
-}
-
-/// Shared wording for both `root_checkout_has_live_sibling` call sites'
-/// `Err` arm (the `Some(worktree_path)` and `None`-slug branches) — they
-/// previously duplicated this string verbatim.
-fn live_sibling_check_failed_message(target_dir: &Path, reason: &str) -> String {
-    format!(
-        "Orchestration failed: could not confirm no other live orchestration \
-         already shares {} — {reason}",
-        target_dir.display()
-    )
 }
 
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
@@ -1359,10 +1360,6 @@ pub enum FormField {
     Agent,
     Name,
     Command,
-    /// Fork #122: the typed slug for the orchestration's own worktree. Only
-    /// reachable (Tab cycle) and rendered when an orchestration is selected
-    /// — see [`NewPaneFormState::worktree_slug_visible`].
-    WorktreeSlug,
 }
 
 /// PRD #170 (unify): why the directory picker is open — which form to build
@@ -1472,10 +1469,6 @@ struct NewPaneFormState {
     /// typed, since it is what lands in the tab title and the worktree
     /// ownership marker.
     name_is_suggestion: bool,
-    /// Fork #122: the typed slug for the orchestration's own worktree. Empty
-    /// (the `new` default) means no worktree — panes spawn in `dir`, today's
-    /// exact behavior. Only meaningful when an orchestration is selected.
-    worktree_slug: String,
 }
 
 impl NewPaneFormState {
@@ -1552,8 +1545,6 @@ impl NewPaneFormState {
             // value (the bare basename pre-fill) is fair game to overwrite
             // with the first suggestion.
             name_is_suggestion: true,
-            // Fork #122: no worktree by default — preserves today's behavior.
-            worktree_slug: String::new(),
         }
     }
 
@@ -1690,20 +1681,6 @@ impl NewPaneFormState {
             .is_some_and(|t| self.live_orchestration_names.iter().any(|l| l == t.trim()))
     }
 
-    /// Fork #122 test-only seam: attach a typed worktree slug without
-    /// threading it through the interactive keyboard-typing path (production
-    /// fills `worktree_slug` character-by-character via
-    /// `handle_new_pane_form_key`, never through a consuming builder).
-    /// Mirrors [`Self::with_live_orchestration_cwds`]'s shape but, unlike
-    /// that one, has no production call site — `#[cfg(test)]` keeps it out
-    /// of the production API surface entirely (same pattern as
-    /// `AgentPtyRegistry::agent_writer`, `src/agent_pty.rs`).
-    #[cfg(test)]
-    fn with_worktree_slug(mut self, slug: String) -> Self {
-        self.worktree_slug = slug;
-        self
-    }
-
     /// PRD #140 M4.0: whether the form should render
     /// [`SAME_CWD_ORCHESTRATION_WARNING`] — an orchestration is selected AND its
     /// directory already hosts a live one. Selecting "No mode", a plain mode, or
@@ -1779,9 +1756,6 @@ impl NewPaneFormState {
             // schedule form (no orchestration to select), but the value
             // must still be set.
             name_is_suggestion: true,
-            // Fork #122: the locked schedule form can't select an
-            // orchestration, so there is never a worktree slug to type.
-            worktree_slug: String::new(),
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
         // modes/orchestrations) so the existing schedule spawn branch fires.
@@ -1938,14 +1912,6 @@ impl NewPaneFormState {
         self.selected_orchestration().is_none()
     }
 
-    /// Fork #122: the worktree-slug field is the mirror image of
-    /// `command_visible` — shown only when an orchestration IS selected (a
-    /// worktree slug is meaningless for a plain mode/card, which has no
-    /// `.dot-agent-deck.toml` role config to root in a worktree).
-    fn worktree_slug_visible(&self) -> bool {
-        self.selected_orchestration().is_some()
-    }
-
     /// PRD #20 finding #8: the label shown in the Agent chip — the selected
     /// registry entry's label, or `auto` when no agent is picked (Command comes
     /// from the global default / typed text).
@@ -2009,10 +1975,6 @@ impl NewPaneFormState {
             FormField::Name => {
                 if cmd_visible {
                     FormField::Command
-                } else if self.worktree_slug_visible() {
-                    // Fork #122: orchestration selected — offer the
-                    // worktree-slug field before cycling back to Mode.
-                    FormField::WorktreeSlug
                 } else if self.has_mode_field {
                     FormField::Mode
                 } else {
@@ -2020,15 +1982,6 @@ impl NewPaneFormState {
                 }
             }
             FormField::Command => {
-                if self.has_mode_field {
-                    FormField::Mode
-                } else {
-                    FormField::Name
-                }
-            }
-            // Fork #122: last field in the orchestration branch of the
-            // cycle — back to Mode (or Name, mirroring Command above).
-            FormField::WorktreeSlug => {
                 if self.has_mode_field {
                     FormField::Mode
                 } else {
@@ -2047,11 +2000,7 @@ impl NewPaneFormState {
         let cmd_visible = self.command_visible();
         match self.focused {
             FormField::Mode => {
-                if self.worktree_slug_visible() {
-                    // Fork #122: symmetric to `next_field`'s Name ->
-                    // WorktreeSlug -> Mode chain.
-                    FormField::WorktreeSlug
-                } else if cmd_visible {
+                if cmd_visible {
                     FormField::Command
                 } else {
                     FormField::Name
@@ -2070,8 +2019,6 @@ impl NewPaneFormState {
                 }
             }
             FormField::Command => FormField::Name,
-            // Fork #122: symmetric to Command's prev.
-            FormField::WorktreeSlug => FormField::Name,
         }
     }
 }
@@ -5869,28 +5816,6 @@ pub struct NewPaneRequest {
     /// here keeps the authoring session a dashboard card while still delivering
     /// the authoring prompt.
     seed_prompt: Option<String>,
-    /// Fork #122: when set, the orchestration's role panes root themselves
-    /// in this worktree instead of `dir`. `None` preserves today's exact
-    /// behavior (panes spawn in `dir`).
-    orchestration_worktree_path: Option<PathBuf>,
-    /// Fork #122 audit (P1): the validated raw slug that produced
-    /// `orchestration_worktree_path` — `Some` exactly when that field is
-    /// `Some`. `Action::SpawnPane`'s orchestration branch uses this
-    /// directly as the worktree's branch name, instead of recovering it by
-    /// stripping the `<dir-basename>-` prefix back off the resolved path
-    /// (the fragile inverse the #122/#123 audit and review both flagged —
-    /// deleted along with this field's introduction).
-    orchestration_worktree_slug: Option<String>,
-    /// Fork #122 audit (P1): set instead of `orchestration_worktree_path`
-    /// when the form's worktree slug was non-blank but failed validation
-    /// (path separators, `.`/`..`, a leading `-`, control characters, or
-    /// anything else outside the allowlist — see
-    /// `validate_orchestration_worktree_slug`). `Action::SpawnPane` checks
-    /// this BEFORE attempting worktree creation and refuses the tab through
-    /// the same fail-loud path a creation failure uses — never a silent
-    /// fallback to the deck's shared cwd, which is the exact collision this
-    /// feature exists to prevent.
-    orchestration_worktree_error: Option<String>,
 }
 
 /// PRD #80: the single action layer. Every keyboard-only command and (from
@@ -8783,13 +8708,6 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             mode_config: None,
             orchestration_config: None,
             seed_prompt: build_dispatcher_mode(&form.dir).seed_prompt,
-            // Fork #122: the dispatcher option is a single-agent card, never
-            // an orchestration -- no worktree slug field exists for it to
-            // resolve, so this preserves today's exact behavior (panes spawn
-            // in `dir`), same as every other non-orchestration branch here.
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
     }
     // fork #166 reviewer F1: trimmed once here, at the single place every
@@ -8823,9 +8741,6 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             mode_config: None,
             orchestration_config: None,
             seed_prompt: Some(build_issue_dispatch_authoring_seed(&form.dir)),
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
     }
     // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
@@ -8868,13 +8783,8 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             orchestration_config: None,
             seed_prompt: build_schedule_authoring_mode(form.schedule_existing.as_ref(), &form.dir)
                 .seed_prompt,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
     }
-    let (orchestration_worktree_path, orchestration_worktree_slug, orchestration_worktree_error) =
-        resolve_orchestration_worktree_request(&form.dir, &form.worktree_slug);
     NewPaneRequest {
         dir: form.dir.clone(),
         name: name.clone(),
@@ -8882,130 +8792,43 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
         seed_prompt: None,
-        orchestration_worktree_path,
-        orchestration_worktree_slug,
-        orchestration_worktree_error,
     }
 }
 
-/// Fork #122 audit (P1): validate a worktree slug BEFORE any path arithmetic
-/// touches it. `resolve_orchestration_worktree_path` used to splice the raw
-/// slug straight into the final path component with no checks at all — a
-/// slug like `x/../../../tmp/owned` against repo `/safe/repo` resolved to a
-/// path entirely outside `/safe`, and every role pane was then started with
-/// that escaped directory as its cwd.
-///
-/// A narrow allowlist (letters, digits, `-`, `_`) is used instead of a
-/// blocklist of "bad characters" — a blocklist is the pattern that keeps
-/// missing one. The allowlist alone already rejects everything the audit
-/// named: `/` and `\` (path separators — `\` is also a separator on
-/// Windows), `.` (so a slug can never BE `.` or `..`), NUL and other control
-/// bytes, and anything that isn't a valid git branch name. A leading `-` is
-/// rejected by a separate check below, because `git` can read a
-/// leading-dash ref/branch name as a flag rather than a name.
-fn validate_orchestration_worktree_slug(slug: &str) -> Result<(), String> {
-    let trimmed = slug.trim();
-    if trimmed.is_empty() {
-        return Err("worktree name cannot be blank".to_string());
+/// PRD fork#544 M2: guard a [`crate::issue_dispatch::sanitize_clone_segment`]
+/// result against being consumed as a bare `git` argv token later —
+/// [`crate::issue_dispatch::isolated_clone_checkout_argv`]'s `Local` branch
+/// passes the branch name with no leading `--`, so a leading `-` could be
+/// misread as a flag rather than a ref name. `sanitize_clone_segment` strips
+/// path separators/`..`/NUL but was never designed for this argv-safety
+/// property — unlike the retired `validate_orchestration_worktree_slug`,
+/// which explicitly rejected a leading dash outright. Strips any leading
+/// dashes and falls back to the same `"issues"` sentinel
+/// `sanitize_clone_segment` itself falls back to when nothing else survives.
+fn sanitize_workspace_segment(name: &str) -> String {
+    let segment = crate::issue_dispatch::sanitize_clone_segment(name);
+    let stripped = segment.trim_start_matches('-');
+    if stripped.is_empty() {
+        "issues".to_string()
+    } else {
+        stripped.to_string()
     }
-    let starts_ok = trimmed
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-    if !starts_ok {
-        return Err(format!(
-            "worktree name {trimmed:?} must start with a letter, digit, or underscore"
-        ));
-    }
-    if let Some(bad) = trimmed
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
-    {
-        return Err(format!(
-            "worktree name {trimmed:?} may only contain letters, digits, '-', and '_' \
-             (found {bad:?})"
-        ));
-    }
-    Ok(())
 }
 
-/// Fork #122: resolve the sibling worktree path for an orchestration's own
-/// worktree — `<dir>-<slug>`, next to `dir` (e.g. `/tmp/dot-agent-deck` +
-/// `my-feature` → `/tmp/dot-agent-deck-my-feature`). Pure path arithmetic, no
-/// I/O; the actual `git worktree add` happens in [`Action::SpawnPane`]'s
-/// orchestration branch.
-///
-/// Two independent layers, per the #122/#123 audit (P1): (1)
-/// [`validate_orchestration_worktree_slug`] rejects anything that isn't a
-/// plain alphanumeric/`-`/`_` token before it touches path arithmetic at
-/// all; (2) belt and braces, the candidate built from the validated slug is
-/// re-decomposed and checked to still be the exact, immediate
-/// `<dir-parent>/<dir-basename>-<slug>` sibling intended — catching
-/// anything layer (1) missed, in case the allowlist above is ever weakened
-/// by a future edit.
-///
-/// Layer (2) is a pure, lexical component check — deliberately NOT
-/// `fs::canonicalize` — for two reasons: `dir` need not exist on disk yet
-/// when this runs (this function stays I/O-free, as documented above; the
-/// real filesystem check happens later, when `git worktree add` itself
-/// runs), and canonicalizing would be actively wrong here — on the macOS CI
-/// runner `/tmp` is a symlink to `/private/tmp`, so canonicalizing a `/tmp`-
-/// rooted `dir` would silently rewrite an already-correct literal path and
-/// reject input that `orchestration/worktree/001` pins byte-for-byte on
-/// that runner. Since the allowlist already forbids every character that
-/// could shift a path component (no `/`, `\`, or `.`), `Path::with_file_name`
-/// cannot algebraically escape `dir`'s parent — this check is a structural
-/// assertion of that guarantee, not a mechanism that changes behavior for
-/// any valid input.
-fn resolve_orchestration_worktree_path(dir: &Path, slug: &str) -> Result<PathBuf, String> {
-    validate_orchestration_worktree_slug(slug)?;
-    let trimmed = slug.trim();
-
+/// PRD fork#544 M2: the sibling workspace path for an orchestration Name —
+/// `<dir-basename>-<sanitize_workspace_segment(name)>`, replacing the
+/// retired manually-typed Worktree-slug field
+/// (`resolve_orchestration_worktree_path`/`validate_orchestration_worktree_slug`).
+/// Name is now the sole input to the path; there is no longer a separate
+/// validate-and-reject step — an un-sanitizable name resolves to the same
+/// fixed fallback segment `sanitize_clone_segment` itself falls back to,
+/// rather than refusing.
+fn resolve_workspace_path(dir: &Path, segment: &str) -> PathBuf {
     let dir_name = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut sibling_name = dir_name;
-    sibling_name.push('-');
-    sibling_name.push_str(trimmed);
-
-    let candidate = dir.with_file_name(&sibling_name);
-
-    if candidate.parent() != dir.parent()
-        || candidate.file_name().and_then(|n| n.to_str()) != Some(sibling_name.as_str())
-    {
-        return Err(format!(
-            "worktree path {} is not a direct sibling of {}",
-            candidate.display(),
-            dir.display()
-        ));
-    }
-
-    Ok(candidate)
-}
-
-/// Fork #122 audit (P1): resolve the `(path, slug, error)` triple
-/// [`NewPaneRequest`] carries for its worktree fields, from the form's raw
-/// (untrimmed, unvalidated) slug text. A blank slug preserves today's exact
-/// behavior — `(None, None, None)`, panes spawn in `dir`. A non-blank slug
-/// that validates carries BOTH the resolved path and the validated raw slug
-/// (used directly as the branch name by `Action::SpawnPane`, replacing the
-/// prefix-stripping recovery that used to derive it back out of the path). A
-/// non-blank slug that fails validation carries the rejection reason instead
-/// — `Action::SpawnPane` checks that field first and refuses the tab through
-/// the same fail-loud path a creation failure uses.
-fn resolve_orchestration_worktree_request(
-    dir: &Path,
-    slug: &str,
-) -> (Option<PathBuf>, Option<String>, Option<String>) {
-    let trimmed = slug.trim();
-    if trimmed.is_empty() {
-        return (None, None, None);
-    }
-    match resolve_orchestration_worktree_path(dir, trimmed) {
-        Ok(path) => (Some(path), Some(trimmed.to_string()), None),
-        Err(reason) => (None, None, Some(reason)),
-    }
+    dir.with_file_name(format!("{dir_name}-{segment}"))
 }
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -9065,12 +8888,8 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 form.focused = FormField::Command;
             }
             // PRD #106: when the Command field is hidden (orchestration
-            // selected), pressing Enter on Name submits directly. Fork #122's
-            // worktree-slug field stays out of this chain deliberately — it's
-            // opt-in and rarely used, so it isn't worth taxing every
-            // orchestration launch's Enter-to-submit muscle memory. The field
-            // is still reachable via Tab, and Enter submits from there too.
-            FormField::Name | FormField::Command | FormField::WorktreeSlug => {
+            // selected), pressing Enter on Name submits directly.
+            FormField::Name | FormField::Command => {
                 // fork#192 M1.0: a name a live orchestration already holds is
                 // REFUSED at submit — no SpawnPane, form stays open. Checked
                 // before building the request so a stale/resubmitted taken
@@ -9093,12 +8912,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 return Action::SpawnPane(Box::new(req));
             }
         },
-        KeyCode::Backspace
-            if matches!(
-                form.focused,
-                FormField::Name | FormField::Command | FormField::WorktreeSlug
-            ) =>
-        {
+        KeyCode::Backspace if matches!(form.focused, FormField::Name | FormField::Command) => {
             // fork#192 review F4 / audit F7: any direct edit to Name marks
             // it user-typed, so a later selection landing won't overwrite it.
             if form.focused == FormField::Name {
@@ -9107,17 +8921,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
-                FormField::WorktreeSlug => &mut form.worktree_slug,
                 FormField::Mode | FormField::Agent => unreachable!(),
             };
             field.pop();
         }
-        KeyCode::Char(c)
-            if matches!(
-                form.focused,
-                FormField::Name | FormField::Command | FormField::WorktreeSlug
-            ) =>
-        {
+        KeyCode::Char(c) if matches!(form.focused, FormField::Name | FormField::Command) => {
             // fork#192 review F1: cap Name at the daemon's own
             // `DISPLAY_NAME_MAX_LEN` so a paste can never produce a value
             // `is_valid_display_name` rejects — an over-long name was
@@ -9137,7 +8945,6 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
-                FormField::WorktreeSlug => &mut form.worktree_slug,
                 FormField::Mode | FormField::Agent => unreachable!(),
             };
             field.push(c);
@@ -9797,14 +9604,12 @@ fn commit_rename(
     }
 }
 
-/// Issue #521: shared isolate-and-provision logic for `Action::SpawnPane`'s
-/// live-sibling `Ok(true)` branch — used by BOTH the typed-slug
-/// (`Some(worktree_path)`) arm and the blank-slug (`None`, once
-/// auto-generated by [`auto_generate_worktree_slug`]) arm, so the two paths
-/// can't drift apart on wording or behavior the way the pre-#521 blank-slug
-/// refusal did. Wraps [`crate::issue_dispatch_run::provision_isolated_clone_sync`]
-/// and turns every non-`Created` outcome into the exact status message text
-/// the (former, typed-slug-only) inline match already used — this function
+/// Issue #521 / PRD fork#544 M2b: shared isolate-and-provision logic for
+/// `Action::SpawnPane`'s orchestration branch, now the SOLE provisioning
+/// path — every orchestration isolates, so there is no longer a separate
+/// shared-checkout arm for this to be one of two callers of. Wraps
+/// [`crate::issue_dispatch_run::provision_isolated_clone_sync`] and turns
+/// every non-`Created` outcome into a status-message string — this function
 /// has no access to `ui`, so the caller is responsible for setting
 /// `ui.status_message` from the `Err` string and returning `Flow::Continue`.
 fn provision_isolated_clone_or_status(
@@ -9885,35 +9690,6 @@ fn provision_isolated_clone_or_status(
         }
         Err(e) => Err(format!("Orchestration failed: {e}")),
     }
-}
-
-/// Issue #521: auto-generate a worktree slug for the blank-slug (`None`)
-/// `Action::SpawnPane` arm when a live sibling orchestration is detected —
-/// mirroring fork#192 M1.0's `<foldername>-orchestrator-N` naming pattern
-/// ([`NewPaneFormState::suggest_orchestration_name`]) rather than inventing a
-/// new scheme. [`resolve_orchestration_worktree_path`] already prefixes the
-/// resolved sibling path with `dir`'s own basename, so a bare
-/// `orchestrator-N` slug here resolves to the exact same
-/// `<dir-basename>-orchestrator-N` sibling name that field suggests for the
-/// Name field. Skips any `N` whose resolved sibling path already exists on
-/// disk, so a previous auto-isolated clone (or a same-named manual worktree)
-/// is never collided with. Bounded the same way
-/// `suggest_orchestration_name` is (a fixed cap rather than an open loop) so
-/// a pathological filesystem state can't hang the spawn; the fallback below
-/// is unreachable in practice.
-fn auto_generate_worktree_slug(dir: &Path) -> String {
-    for n in 1..=1000u32 {
-        let candidate = format!("orchestrator-{n}");
-        if let Ok(path) = resolve_orchestration_worktree_path(dir, &candidate)
-            && !path.exists()
-        {
-            return candidate;
-        }
-    }
-    // Unreachable in practice — 1000 same-second collisions on one root
-    // checkout — but a process-id suffix keeps this total rather than
-    // panicking if it ever somehow happens.
-    format!("orchestrator-{}", std::process::id())
 }
 
 /// Shared by both `open_orchestration_tab` call sites (live-open and
@@ -10674,20 +10450,6 @@ fn dispatch_action(
                     // branch rather than relying on the doors re-setting it
                     // before the next dispatch.
                     ui.pending_last_command = None;
-                    // Fork #122 audit (P1): a non-blank slug that failed
-                    // validation carries its reason here instead of a
-                    // resolved path — refuse through the same fail-loud path
-                    // a creation failure below uses, before any tab/pane
-                    // state exists, rather than silently falling back to the
-                    // shared cwd (the exact collision this feature exists to
-                    // prevent).
-                    if let Some(reason) = req.orchestration_worktree_error.as_ref() {
-                        ui.status_message = Some((
-                            format!("Orchestration failed: {reason}"),
-                            std::time::Instant::now(),
-                        ));
-                        return Flow::Continue;
-                    }
                     // Fork issue #201 redesign (reviewer P1-1/P1-2, auditor
                     // A1): claim the orchestration's name BEFORE any
                     // worktree/clone provisioning happens and before any role
@@ -10745,328 +10507,107 @@ fn dispatch_action(
                         ));
                         return Flow::Continue;
                     }
-                    // Fork #122: when the form resolved a worktree path,
-                    // create it now — before any tab/pane state exists — so a
-                    // failure never leaves a half-open orchestration behind.
-                    // Fail-loud: no tab, no panes, no pane_cwd_map writes.
-                    // Silently falling back to the shared cwd here would
-                    // reintroduce the multi-orchestration collision CLAUDE.md
-                    // rule 1 / fork #74 exists to prevent, while looking like
-                    // it worked.
-                    // Fork #166 M2.4: hoisted out of the `match` arm below so
-                    // it survives to the `open_orchestration_tab` call after
-                    // the match — every role pane needs the SAME computed
-                    // string that gets written into the worktree marker,
-                    // never a second derivation of it. `None` when this
-                    // orchestration creates no worktree (the `None` arm
-                    // below, e.g. an unnamed orchestration reopened directly
-                    // in `main`).
-                    let mut creator: Option<String> = None;
-                    // Issue #164: `Some(raw error)` when `create_worktree_sync`
-                    // below created the worktree but its ownership marker
-                    // write failed. Hoisted the same way `creator` is, above,
-                    // so it survives past the `match` arm into the final
-                    // status message set after `open_orchestration_tab`.
-                    let mut worktree_marker_warning: Option<String> = None;
+                    // PRD fork#544 M2b: isolation is now UNCONDITIONAL —
+                    // every orchestration, including the very first against
+                    // a root checkout, provisions its own isolated, named
+                    // workspace; no orchestration ever works directly in the
+                    // root checkout. Create it now, before any tab/pane
+                    // state exists, so a failure never leaves a half-open
+                    // orchestration behind. Fail-loud: no tab, no panes, no
+                    // pane_cwd_map writes. Silently falling back to the
+                    // shared cwd here would reintroduce the multi-
+                    // orchestration collision CLAUDE.md rule 1 / fork #74
+                    // exists to prevent, while looking like it worked.
+                    //
+                    // `root_checkout_has_live_sibling`'s Nth-concurrent
+                    // liveness gate is retired from THIS call site — the
+                    // answer is now always "isolate" — but the function
+                    // itself, `SiblingScope`, and its own two dedicated
+                    // fail-closed unit tests stay: Model B (`dispatch.rs`)
+                    // still depends on it for its own, out-of-scope
+                    // Nth-concurrent gate.
+                    //
+                    // fork #166 / fork #184: `typed_name` (`req.name`, the
+                    // same value that becomes `display_title` below,
+                    // trimmed once in `build_new_pane_request` so both
+                    // consumers test blankness and read content from the
+                    // identical value; reviewer F1) is the Name the user
+                    // typed or accepted into this specific pane/tab.
+                    // fork#192's M1.0 pre-fills it with a suggested
+                    // `<foldername>-orchestrator-N` and refuses a submit
+                    // colliding with a live orchestration, so a non-empty,
+                    // DISTINCT typed name is what a user submits in the
+                    // common case — this is a deliberate choice, not an
+                    // accident it happens to fall into: the marker records
+                    // WHICH tab owns the worktree, and the pane's own
+                    // identity answers that better than `orch_config.name`,
+                    // a value shared by every tab of the same orchestration
+                    // config (#184).
+                    //
+                    // PRD fork#544 M2: the resolved sibling path and the
+                    // branch name are now BOTH derived from the SAME
+                    // sanitized segment of `typed_name` (`sanitize_workspace_segment`,
+                    // `resolve_workspace_path`) — Name is the sole input to
+                    // the path; the separate, manually-typed Worktree-slug
+                    // field is retired.
+                    //
+                    // PR #215 fixup (reviewer F5 M2 / auditor M2): there
+                    // used to be a fallback to the canonical config name
+                    // when the field was cleared to empty. That fallback is
+                    // gone — `orchestration_creator_string` now maps an
+                    // empty typed name straight to the
+                    // `orchestration:unknown` sentinel `--mine` refuses,
+                    // rather than to `orchestration:<config_name>`, an
+                    // identity every unnamed orchestration on the same
+                    // config shared with no refusal. The blankness test
+                    // inside `orchestration_creator_string` is on an
+                    // already-trimmed value (fork issue #174: a
+                    // whitespace-only name must fall back too, not become
+                    // the identity) rather than the bare `is_empty()` #174
+                    // flags elsewhere.
+                    let typed_name = req.name.as_str();
+                    // Fork #166 M2.4: the exact string passed to
+                    // `provision_isolated_clone_or_status` below is the one
+                    // every role pane's env var carries too.
+                    // `orchestration_creator_string` is the single shared
+                    // computation the restore path also calls, so the two
+                    // can't drift apart. Every isolate path now needs a
+                    // creator identity for the ownership marker (tester
+                    // finding for PRD fork#544: previously only computed
+                    // inside the Nth-concurrent branch — the 1st-orchestration
+                    // branch fell through to `dir_str` without ever
+                    // assigning one).
+                    let creator = orchestration_creator_string(typed_name);
+                    let segment = sanitize_workspace_segment(typed_name);
+                    let worktree_path = resolve_workspace_path(&req.dir, &segment);
+                    // Issue #164: `Some(raw error)` when
+                    // `provision_isolated_clone_or_status` below created the
+                    // worktree but its ownership marker write failed.
+                    //
                     // PRD fork#325 fix round 3 (reviewer C0 / auditor P2-3):
-                    // only ever set by the isolated-clone arm below — the
-                    // shared-checkout arm has no origin-fixup step at all.
-                    // Kept separate from `worktree_marker_warning` rather
-                    // than folded into it: the final status message below
-                    // renders `worktree_marker_warning` via
-                    // `format_marker_warning`, a fixed template built for the
-                    // ownership-marker failure, which would misdescribe an
-                    // origin-fixup failure entirely.
-                    let mut worktree_origin_warning: Option<String> = None;
-                    let dir_str = match req.orchestration_worktree_path.as_ref() {
-                        Some(worktree_path) => {
-                            // Fork #122 audit (P1): use the validated raw
-                            // slug the request carries directly as the
-                            // branch name — no more recovering it by
-                            // stripping the `<dir-basename>-` prefix back
-                            // off the resolved path (the fragile inverse
-                            // both reviews flagged). The basename fallback
-                            // below only fires for a request built directly
-                            // (bypassing `build_new_pane_request`, e.g. in
-                            // tests) without a slug.
-                            let branch =
-                                req.orchestration_worktree_slug.clone().unwrap_or_else(|| {
-                                    worktree_path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().into_owned())
-                                        .unwrap_or_default()
-                                });
-                            // fork #166 / fork #184: `typed_name` (`req.name`,
-                            // the same value that becomes `display_title`
-                            // below, trimmed once in
-                            // `build_new_pane_request` so both consumers
-                            // test blankness and read content from the
-                            // identical value; reviewer F1) is the Name the
-                            // user typed or accepted into this specific
-                            // pane/tab. fork#192's M1.0 pre-fills it with a
-                            // suggested `<foldername>-orchestrator-N` and
-                            // refuses a submit colliding with a live
-                            // orchestration, so a non-empty, DISTINCT typed
-                            // name is what a user submits in the common
-                            // case — this is a deliberate choice, not an
-                            // accident it happens to fall into: the marker
-                            // records WHICH tab owns the worktree, and the
-                            // pane's own identity answers that better than
-                            // `orch_config.name`, a value shared by every
-                            // tab of the same orchestration config (#184).
-                            //
-                            // PR #215 fixup (reviewer F5 M2 / auditor M2):
-                            // there used to be a fallback to the canonical
-                            // config name when the field was cleared to
-                            // empty. That fallback is gone —
-                            // `orchestration_creator_string` now maps an
-                            // empty typed name straight to the
-                            // `orchestration:unknown` sentinel `--mine`
-                            // refuses, rather than to
-                            // `orchestration:<config_name>`, an identity
-                            // every unnamed orchestration on the same config
-                            // shared with no refusal. The blankness test
-                            // inside `orchestration_creator_string` is on an
-                            // already-trimmed value (fork issue #174: a
-                            // whitespace-only name must fall back too, not
-                            // become the identity) rather than the bare
-                            // `is_empty()` #174 flags elsewhere.
-                            let typed_name = req.name.as_str();
-                            // Fork #166 M2.4: assigns the OUTER `creator`
-                            // hoisted above the match — the exact string
-                            // passed to `create_worktree_sync` below is the
-                            // one every role pane's env var carries too.
-                            // `orchestration_creator_string` is the single
-                            // shared computation the restore path also calls,
-                            // so the two can't drift apart.
-                            creator = Some(orchestration_creator_string(typed_name));
-                            // PRD fork#325 M3: decide SHARED vs ISOLATED
-                            // before touching disk. See
-                            // `root_checkout_has_live_sibling`'s doc comment
-                            // for the collision signal (a shared
-                            // `--git-common-dir`, not raw cwd equality) and
-                            // the fail-closed decision on a daemon query
-                            // failure this branches on.
-                            match root_checkout_has_live_sibling(
-                                &req.dir,
-                                SiblingScope::AnySharedCommonDir,
-                            ) {
-                                Err(reason) => {
-                                    release_orchestration_claim_token(&orchestration_claim_token);
-                                    ui.status_message = Some((
-                                        live_sibling_check_failed_message(&req.dir, &reason),
-                                        std::time::Instant::now(),
-                                    ));
-                                    return Flow::Continue;
-                                }
-                                // 1st orchestration against this root
-                                // checkout — unaffected, exactly today's
-                                // `git worktree add` sibling path.
-                                Ok(false) => match crate::issue_dispatch_run::create_worktree_sync(
-                                    &req.dir,
-                                    worktree_path,
-                                    &branch,
-                                    creator.as_deref().expect("just assigned above"),
-                                ) {
-                                    Ok(crate::issue_dispatch_run::WorktreeCreation::Created {
-                                        marker_warning,
-                                    }) => {
-                                        worktree_marker_warning = marker_warning;
-                                        worktree_path.display().to_string()
-                                    }
-                                    Ok(
-                                        crate::issue_dispatch_run::WorktreeCreation::AlreadyClaimed,
-                                    ) => {
-                                        release_orchestration_claim_token(
-                                            &orchestration_claim_token,
-                                        );
-                                        ui.status_message = Some((
-                                            format!(
-                                                "Orchestration failed: worktree already exists at {}",
-                                                worktree_path.display()
-                                            ),
-                                            std::time::Instant::now(),
-                                        ));
-                                        return Flow::Continue;
-                                    }
-                                    // Fork #122/#123 re-audit (P2): distinct from
-                                    // `AlreadyClaimed` above — `git worktree add`
-                                    // was killed for taking too long, not beaten
-                                    // by another actor, and it may have left a
-                                    // half-created directory behind that
-                                    // permanently wedges this slug unless
-                                    // cleared. Name the exact path and exact
-                                    // command rather than falling back to the
-                                    // deck's cwd.
-                                    Ok(crate::issue_dispatch_run::WorktreeCreation::TimedOut {
-                                        cleaned_up_by,
-                                    }) => {
-                                        let detail = if let Some(remover) = cleaned_up_by.as_deref()
-                                        {
-                                            // Issue #325 reviewer P2-2: the identity
-                                            // is always the same `creator` this
-                                            // request just supplied, so it carries
-                                            // no NEW information for the status
-                                            // line -- but it is still worth a log
-                                            // line for a post-incident reader
-                                            // grepping DOT_AGENT_DECK_LOG, and it
-                                            // was previously discarded entirely.
-                                            tracing::info!(
-                                                path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
-                                                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                                                "worktree add timed out; half-created directory removed automatically"
-                                            );
-                                            "the half-created directory was removed automatically — try again".to_string()
-                                        } else {
-                                            format!(
-                                                "run `git -C {} worktree remove --force {}` to clear it, then try again",
-                                                req.dir.display(),
-                                                worktree_path.display()
-                                            )
-                                        };
-                                        release_orchestration_claim_token(
-                                            &orchestration_claim_token,
-                                        );
-                                        ui.status_message = Some((
-                                            format!(
-                                                "Orchestration failed: worktree add timed out at {} — {detail}",
-                                                worktree_path.display()
-                                            ),
-                                            std::time::Instant::now(),
-                                        ));
-                                        return Flow::Continue;
-                                    }
-                                    // `create_worktree_sync` always attaches an
-                                    // existing branch rather than refusing it, so
-                                    // this variant is structurally unreachable
-                                    // from this call site — kept only because the
-                                    // match must stay exhaustive against the
-                                    // shared `WorktreeCreation` enum.
-                                    Ok(
-                                        crate::issue_dispatch_run::WorktreeCreation::BranchExists,
-                                    ) => {
-                                        release_orchestration_claim_token(
-                                            &orchestration_claim_token,
-                                        );
-                                        ui.status_message = Some((
-                                            format!(
-                                                "Orchestration failed: branch already exists for {}",
-                                                worktree_path.display()
-                                            ),
-                                            std::time::Instant::now(),
-                                        ));
-                                        return Flow::Continue;
-                                    }
-                                    Err(e) => {
-                                        release_orchestration_claim_token(
-                                            &orchestration_claim_token,
-                                        );
-                                        ui.status_message = Some((
-                                            format!("Orchestration failed: {e}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                        return Flow::Continue;
-                                    }
-                                },
-                                // Nth-concurrent orchestration against a root
-                                // checkout a live sibling already shares —
-                                // isolate via its own clone instead of a
-                                // `git worktree add` sibling of the shared
-                                // checkout. Same resolved sibling PATH
-                                // (`worktree_path`) as the shared case above
-                                // — only the provisioning mechanism differs.
-                                Ok(true) => match provision_isolated_clone_or_status(
-                                    &req.dir,
-                                    worktree_path,
-                                    &branch,
-                                    creator.as_deref().expect("just assigned above"),
-                                ) {
-                                    Ok((resolved_dir_str, marker_warning, origin_warning)) => {
-                                        worktree_marker_warning = marker_warning;
-                                        worktree_origin_warning = origin_warning;
-                                        resolved_dir_str
-                                    }
-                                    Err(message) => {
-                                        release_orchestration_claim_token(
-                                            &orchestration_claim_token,
-                                        );
-                                        ui.status_message =
-                                            Some((message, std::time::Instant::now()));
-                                        return Flow::Continue;
-                                    }
-                                },
-                            }
-                        }
-                        // Issue #489/#521: a blank Worktree slug used to skip
-                        // the live-sibling gate entirely and fall straight
-                        // through to `req.dir` — the exact collision this
-                        // gate exists to prevent, just reached via the
-                        // default (unnamed-slug) path instead of a typed
-                        // one. Consult the same
-                        // `root_checkout_has_live_sibling` check the
-                        // `Some(worktree_path)` arm above already runs.
-                        // Issue #521 (fix direction agreed 2026-08-21):
-                        // rather than refuse and ask the user to type a
-                        // slug (issue #489's original remedy, pinned by the
-                        // now-superseded `worktree_017`), auto-generate one
-                        // and isolate automatically — matching the
-                        // typed-slug arm's existing auto-isolate behavior
-                        // above, so opening any Nth orchestration "just
-                        // works" with zero manual steps either way.
-                        None => match root_checkout_has_live_sibling(
+                    // `worktree_origin_warning` kept separate from
+                    // `worktree_marker_warning` rather than folded into it:
+                    // the final status message below renders
+                    // `worktree_marker_warning` via `format_marker_warning`,
+                    // a fixed template built for the ownership-marker
+                    // failure, which would misdescribe an origin-fixup
+                    // failure entirely.
+                    let (dir_str, worktree_marker_warning, worktree_origin_warning) =
+                        match provision_isolated_clone_or_status(
                             &req.dir,
-                            SiblingScope::ExactCwdOnly,
+                            &worktree_path,
+                            &segment,
+                            &creator,
                         ) {
-                            Err(reason) => {
+                            Ok((resolved_dir_str, marker_warning, origin_warning)) => {
+                                (resolved_dir_str, marker_warning, origin_warning)
+                            }
+                            Err(message) => {
                                 release_orchestration_claim_token(&orchestration_claim_token);
-                                ui.status_message = Some((
-                                    live_sibling_check_failed_message(&req.dir, &reason),
-                                    std::time::Instant::now(),
-                                ));
+                                ui.status_message = Some((message, std::time::Instant::now()));
                                 return Flow::Continue;
                             }
-                            Ok(true) => {
-                                let slug = auto_generate_worktree_slug(&req.dir);
-                                let worktree_path =
-                                    match resolve_orchestration_worktree_path(&req.dir, &slug) {
-                                        Ok(path) => path,
-                                        Err(reason) => {
-                                            release_orchestration_claim_token(
-                                                &orchestration_claim_token,
-                                            );
-                                            ui.status_message = Some((
-                                                format!("Orchestration failed: {reason}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                            return Flow::Continue;
-                                        }
-                                    };
-                                let typed_name = req.name.as_str();
-                                creator = Some(orchestration_creator_string(typed_name));
-                                match provision_isolated_clone_or_status(
-                                    &req.dir,
-                                    &worktree_path,
-                                    &slug,
-                                    creator.as_deref().expect("just assigned above"),
-                                ) {
-                                    Ok((resolved_dir_str, marker_warning, origin_warning)) => {
-                                        worktree_marker_warning = marker_warning;
-                                        worktree_origin_warning = origin_warning;
-                                        resolved_dir_str
-                                    }
-                                    Err(message) => {
-                                        release_orchestration_claim_token(
-                                            &orchestration_claim_token,
-                                        );
-                                        ui.status_message =
-                                            Some((message, std::time::Instant::now()));
-                                        return Flow::Continue;
-                                    }
-                                }
-                            }
-                            Ok(false) => dir_str,
-                        },
-                    };
+                        };
                     // PRD #107 regression fix: do NOT overwrite
                     // `orch_config.name` with the form name. That override
                     // corrupted the orchestration IDENTITY — the canonical
@@ -11127,7 +10668,7 @@ fn dispatch_action(
                         &dir_str,
                         prompt,
                         display_title.as_deref(),
-                        creator.as_deref(),
+                        Some(creator.as_str()),
                         spawn_dims,
                     ) {
                         Ok((_tab_idx, role_pane_ids)) => {
@@ -11269,7 +10810,7 @@ fn dispatch_action(
                                         // above — not a re-derivation — so
                                         // restore can pass it through rather
                                         // than fabricate or drop it.
-                                        owner: creator.clone(),
+                                        owner: Some(creator.clone()),
                                     }),
                                 },
                             );
@@ -19931,11 +19472,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
     let cmd_rows: u16 = if cmd_visible { 2 } else { 0 };
-    // Fork #122: the worktree-slug field takes the same two rows (label +
-    // spacer) when an orchestration is selected — mutually exclusive with
-    // `cmd_rows` since `worktree_slug_visible` is `command_visible`'s mirror.
-    let worktree_slug_visible = form.worktree_slug_visible();
-    let worktree_slug_rows: u16 = if worktree_slug_visible { 2 } else { 0 };
     // PRD #127 M3.2 / PRD #120: either authoring option ("schedule" or
     // "schedule: issues") adds one separator/label row marking it as a throwaway
     // authoring session (only in the unlocked Mode cycler — the locked schedule
@@ -19981,14 +19517,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // than the chip row (`warning_w` is 0 when no warning shows, so the width is
     // unchanged in every other state).
     let desired_w = chip_row_w.max(warning_w).saturating_add(4).max(56);
-    let desired_h = 9
-        + name_rows
-        + agent_rows
-        + mode_extra
-        + cmd_rows
-        + worktree_slug_rows
-        + schedule_rows
-        + warning_rows;
+    let desired_h =
+        9 + name_rows + agent_rows + mode_extra + cmd_rows + schedule_rows + warning_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -20016,12 +19546,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     } else {
         unfocused_label
     };
-    let worktree_slug_style = if form.focused == FormField::WorktreeSlug {
-        focused_label
-    } else {
-        unfocused_label
-    };
-
     let dir_display = form.dir.display().to_string();
     let mut lines = vec![
         Line::styled(
@@ -20124,28 +19648,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                     width = inner_width.saturating_sub(11)
                 ),
                 if form.focused == FormField::Command {
-                    text_primary()
-                } else {
-                    unfocused_label
-                },
-            ),
-        ]));
-    }
-    // Fork #122: the worktree-slug field — shown only when an orchestration
-    // is selected (mutually exclusive with the Command block above).
-    let mut worktree_slug_line_idx: Option<usize> = None;
-    if worktree_slug_visible {
-        lines.push(Line::from(""));
-        worktree_slug_line_idx = Some(lines.len());
-        lines.push(Line::from(vec![
-            Span::styled("  Worktree:", worktree_slug_style),
-            Span::styled(
-                format!(
-                    "{:<width$}",
-                    form.worktree_slug,
-                    width = inner_width.saturating_sub(11)
-                ),
-                if form.focused == FormField::WorktreeSlug {
                     text_primary()
                 } else {
                     unfocused_label
@@ -20256,17 +19758,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
             },
         ));
     }
-    if let Some(wi) = worktree_slug_line_idx {
-        field_rects.push((
-            FormField::WorktreeSlug,
-            Rect {
-                x: row_x,
-                y: line_y(wi),
-                width: row_width,
-                height: 1,
-            },
-        ));
-    }
 
     // Mode chip row: render `  Mode: ` then one `[name]` chip per option, the
     // selected one highlighted. PRD #144: the chips sit on a SINGLE row —
@@ -20370,12 +19861,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     {
         let cursor_x = popup_area.x + 12 + form.command.len() as u16;
         frame.set_cursor_position(Position::new(cursor_x, line_y(ci)));
-    } else if form.focused == FormField::WorktreeSlug
-        && let Some(wi) = worktree_slug_line_idx
-        && line_y(wi) < popup_bottom
-    {
-        let cursor_x = popup_area.x + 12 + form.worktree_slug.len() as u16;
-        frame.set_cursor_position(Position::new(cursor_x, line_y(wi)));
     }
 
     (field_rects, chip_rects, button_rects)
@@ -29650,9 +29135,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("tab-a")),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req_a)),
@@ -29704,9 +29186,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("tab-b")),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req_b)),
@@ -29983,9 +29462,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("shared-orch")),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -32780,16 +32256,12 @@ mod tests {
         f.focused = f.next_field();
         assert_eq!(f.focused, FormField::Name);
 
-        // Fork #122: Name now visits the worktree-slug field (not hidden —
-        // shown exactly when Command is hidden) before wrapping to Mode.
-        f.focused = f.next_field();
-        assert_eq!(f.focused, FormField::WorktreeSlug);
+        // PRD fork#544 M2: the Worktree-slug field is retired — Name wraps
+        // straight to Mode when Command is hidden (orchestration selected).
         f.focused = f.next_field();
         assert_eq!(f.focused, FormField::Mode);
 
-        // Shift+Tab from Mode should land on WorktreeSlug (skip Command).
-        f.focused = f.prev_field();
-        assert_eq!(f.focused, FormField::WorktreeSlug);
+        // Shift+Tab from Mode should land straight back on Name.
         f.focused = f.prev_field();
         assert_eq!(f.focused, FormField::Name);
 
@@ -32894,16 +32366,11 @@ mod tests {
                 .is_some()
         );
 
-        // Now Tab forward: Mode → Name → WorktreeSlug → Mode (skipping
-        // hidden Command; fork #122 inserts WorktreeSlug where Command
-        // would otherwise have been).
+        // Now Tab forward: Mode → Name → Mode (skipping hidden Command; PRD
+        // fork#544 M2 retires the Worktree-slug field that used to sit
+        // between them).
         handle_new_pane_form_key(tab, &mut ui);
         assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
-        handle_new_pane_form_key(tab, &mut ui);
-        assert_eq!(
-            ui.new_pane_form.as_ref().unwrap().focused,
-            FormField::WorktreeSlug
-        );
         handle_new_pane_form_key(tab, &mut ui);
         assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Mode);
     }
@@ -33503,9 +32970,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -34289,55 +33753,9 @@ mod tests {
         );
     }
 
-    /// Scenario: Build the new-pane form for an orchestration with a
-    /// worktree slug typed in, then submit it. The resulting request must
-    /// carry the resolved sibling worktree path (`<dir>-<slug>`, next to the
-    /// picked directory). The identical form with a BLANK slug must carry
-    /// `None`, preserving today's exact behavior — panes spawn in the deck's
-    /// own cwd (fork #122 reopened: this issue's shape, deliberately not
-    /// PRD #220's).
-    #[spec("orchestration/worktree/001")]
-    #[test]
-    fn worktree_001_slug_resolves_path_blank_yields_none() {
-        let dir = PathBuf::from("/tmp/dot-agent-deck");
-
-        // A typed slug resolves to a sibling worktree dir named <repo>-<slug>.
-        let mut with_slug = NewPaneFormState::new(
-            dir.clone(),
-            String::new(),
-            String::new(),
-            vec![],
-            vec![make_orchestration("review")],
-        )
-        .with_worktree_slug("my-feature".to_string());
-        with_slug.selection_index = 1; // the only orchestration
-        let req = build_new_pane_request(&with_slug, "claude");
-        assert_eq!(
-            req.orchestration_worktree_path,
-            Some(PathBuf::from("/tmp/dot-agent-deck-my-feature")),
-            "a typed slug must resolve to a sibling worktree dir named <repo>-<slug>"
-        );
-
-        // A blank slug is today's behavior exactly: no worktree path, so the
-        // SpawnPane handler falls back to the deck's own cwd.
-        let mut blank = NewPaneFormState::new(
-            dir,
-            String::new(),
-            String::new(),
-            vec![],
-            vec![make_orchestration("review")],
-        );
-        blank.selection_index = 1;
-        let req = build_new_pane_request(&blank, "claude");
-        assert_eq!(
-            req.orchestration_worktree_path, None,
-            "a blank slug must preserve today's behavior: no worktree, panes spawn in the deck's cwd"
-        );
-    }
-
-    /// Scenario: Submit an orchestration form whose worktree slug resolves
-    /// against a `dir` that is deliberately NOT a git repository, so the
-    /// real worktree-creation step fails when `Action::SpawnPane` is
+    /// Scenario: Submit an orchestration form with a typed Name against a
+    /// `dir` that is deliberately NOT a git repository, so the real
+    /// isolated-clone provisioning step fails when `Action::SpawnPane` is
     /// dispatched. The fail-loud contract (fork #122) requires the
     /// orchestration tab is never opened and the error surfaces to the user
     /// — never a silent fallback to the shared cwd, which would reintroduce
@@ -34347,25 +33765,20 @@ mod tests {
     #[test]
     fn worktree_002_creation_failure_refuses_tab_and_surfaces_error() {
         let tmp = tempdir().expect("tempdir");
-        // Deliberately not a git repository: `git worktree add` must fail.
+        // Deliberately not a git repository: the isolated clone must fail.
         let dir = tmp.path().join("not-a-repo");
         std::fs::create_dir_all(&dir).expect("create dir");
 
         let mut form = NewPaneFormState::new(
             dir.clone(),
-            String::new(),
+            "my-feature".to_string(),
             String::new(),
             vec![],
             vec![make_orchestration("review")],
-        )
-        .with_worktree_slug("my-feature".to_string());
+        );
         form.selection_index = 1;
 
         let req = build_new_pane_request(&form, "claude");
-        assert!(
-            req.orchestration_worktree_path.is_some(),
-            "precondition: the form must resolve a worktree path to attempt creating"
-        );
 
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone());
@@ -34408,19 +33821,20 @@ mod tests {
         );
     }
 
-    /// Scenario: Submit an orchestration form with a typed worktree slug
-    /// against a directory that IS a genuine, valid git repository (unlike
+    /// Scenario: Submit an orchestration form with a typed Name against a
+    /// directory that IS a genuine, valid git repository (unlike
     /// `worktree_002`'s deliberately-broken one — the only thing standing
     /// between this spawn and success is the gate itself), but with the
     /// daemon's attach socket redirected to a path nothing is listening on —
     /// a stand-in for a down/wedged daemon. Dispatch the real
-    /// `Action::SpawnPane`. PRD fork#325 M3's Nth-concurrent-orchestration
-    /// gate must FAIL CLOSED: refuse the spawn through the same status-
-    /// message-driven refusal path `worktree_002` exercises for a plain
-    /// `git worktree add` failure, never silently proceed as if no live
-    /// sibling orchestration exists — which would reintroduce #325's exact
-    /// race under exactly the ambiguous state (daemon down/unreachable) the
-    /// PRD's own Design step 4 flags as the danger of failing open here.
+    /// `Action::SpawnPane`. PRD fork#544 M2b retired Model A's own call
+    /// sites to the Nth-concurrent liveness gate (isolation is now
+    /// unconditional), so what this test actually pins now is the
+    /// pre-provisioning `ClaimOrchestrationName` daemon round trip: it must
+    /// FAIL CLOSED when the daemon is unreachable, refusing the spawn
+    /// through the same status-message-driven refusal path `worktree_002`
+    /// exercises for a plain clone failure, before any git operation ever
+    /// touches disk.
     #[spec("orchestration/worktree/015")]
     #[test]
     fn worktree_015_daemon_unreachable_refuses_spawn_fail_closed() {
@@ -34455,23 +33869,15 @@ mod tests {
 
         let mut form = NewPaneFormState::new(
             dir.clone(),
-            String::new(),
+            "my-feature".to_string(),
             String::new(),
             vec![],
             vec![make_orchestration("review")],
-        )
-        .with_worktree_slug("my-feature".to_string());
+        );
         form.selection_index = 1;
 
         let req = build_new_pane_request(&form, "claude");
-        assert!(
-            req.orchestration_worktree_path.is_some(),
-            "precondition: the form must resolve a worktree path to attempt creating"
-        );
-        let worktree_path = req
-            .orchestration_worktree_path
-            .clone()
-            .expect("just asserted Some above");
+        let worktree_path = resolve_workspace_path(&dir, &sanitize_workspace_segment("my-feature"));
 
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone());
@@ -34503,12 +33909,12 @@ mod tests {
         assert!(
             matches!(tm.active_tab(), Tab::Dashboard { .. }),
             "a down/unreachable daemon must refuse the spawn (fail closed), never silently \
-             open the orchestration tab as if no live sibling orchestration exists"
+             open the orchestration tab as if the name claim had succeeded"
         );
         // ...no role pane was spawned...
         assert!(
             pc.recorded_orchestration_names().is_empty(),
-            "no role pane should be spawned when the gate can't confirm no live sibling exists"
+            "no role pane should be spawned when the name claim can't be confirmed"
         );
         // ...the error surfaces to the user...
         let message = ui
@@ -34520,184 +33926,13 @@ mod tests {
             !message.is_empty(),
             "the fail-closed refusal must surface a status message, not fail silently"
         );
-        // ...and nothing was created on disk — the gate must refuse BEFORE
-        // any git operation (shared or isolated) runs against the target.
+        // ...and nothing was created on disk — the claim must refuse BEFORE
+        // any git operation runs against the target.
         assert!(
             !worktree_path.exists(),
             "the fail-closed refusal must happen before any provisioning attempt touches disk, \
              found {} unexpectedly present",
             worktree_path.display()
-        );
-    }
-
-    /// Scenario: Issue #521 — the fix direction agreed for issue #489's
-    /// blank-slug refusal, formerly pinned by `worktree_017` (removed by this
-    /// fix — its refusal assertions are the exact opposite of the intended
-    /// behavior below, so it could not coexist with this test against the
-    /// identical scenario; see this fix's commit for the removal): a
-    /// blank-slug `Action::SpawnPane` against a root checkout with a live
-    /// sibling orchestration must auto-generate a slug and provision an
-    /// isolated clone — mirroring the typed-slug arm's existing auto-isolate
-    /// behavior (`orchestration/worktree/014`) — instead of refusing and
-    /// asking the user to type one. Dispatches a blank-slug
-    /// `Action::SpawnPane` against a real git repo (with one commit, so
-    /// `provision_isolated_clone_sync`'s checkout step has a ref to attach
-    /// to) while a stubbed daemon reports a live sibling orchestration whose
-    /// `orchestration_cwd` is that same repo, and asserts an orchestration
-    /// tab opens with its role panes rooted in a freshly created, distinct
-    /// clone directory — the opposite of the refusal `worktree_017` used to
-    /// pin for this exact scenario.
-    #[spec("orchestration/worktree/018")]
-    #[test]
-    fn worktree_018_blank_slug_auto_isolates_when_root_checkout_has_live_sibling() {
-        let tmp = tempdir().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        init_git_repo(&repo);
-        // A commit is required — `provision_isolated_clone_sync`'s checkout
-        // step (`git checkout -b <branch>` when the branch is `Absent`)
-        // needs a ref to branch from, matching `worktree_004`'s precedent.
-        let run_git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .current_dir(&repo)
-                .args(args)
-                .status()
-                .expect("run git");
-            assert!(status.success(), "git {args:?} failed in {repo:?}");
-        };
-        std::fs::write(repo.join("README.md"), "worktree_018 fixture\n").expect("write README");
-        run_git(&["add", "-A"]);
-        run_git(&[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "init",
-        ]);
-
-        let sibling_record = crate::agent_pty::AgentRecord {
-            id: "sibling-agent".to_string(),
-            pane_id_env: None,
-            display_name: None,
-            cwd: None,
-            tab_membership: Some(TabMembership::Orchestration {
-                name: "other-orchestration".to_string(),
-                role_index: 0,
-                role_name: "orchestrator".to_string(),
-                is_start_role: true,
-                orchestration_cwd: Some(repo.display().to_string()),
-                display_title: None,
-                orchestration_id: None,
-            }),
-            agent_type: None,
-            rows: 24,
-            cols: 80,
-            live: None,
-            daemon_boot_id: None,
-            registration_generation: None,
-        };
-        let _daemon = with_crafted_response_daemon(
-            tmp.path(),
-            crate::daemon_protocol::AttachResponse::agent_records(vec![sibling_record]),
-        );
-
-        let config = make_orchestration("review");
-        let req = NewPaneRequest {
-            dir: repo.clone(),
-            name: String::new(),
-            command: String::new(),
-            mode_config: None,
-            orchestration_config: Some(config.clone()),
-            seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
-        };
-
-        let pc = Arc::new(CapturingPaneController::new());
-        let mut tm = TabManager::new(pc.clone());
-        let mut ui = default_ui();
-        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-        let snapshot = AppState::default();
-
-        let _ = dispatch_action(
-            Action::SpawnPane(Box::new(req)),
-            &mut ui,
-            pc.as_ref(),
-            &state,
-            &mut tm,
-            &snapshot,
-            &[],
-            None,
-            Rect::new(0, 0, 200, 50),
-        );
-
-        // The refusal `worktree_017` used to pin must NOT happen here: an
-        // orchestration tab must open instead of leaving the Dashboard
-        // active.
-        assert!(
-            !matches!(tm.active_tab(), Tab::Dashboard { .. }),
-            "a blank-slug spawn against a root checkout with a live sibling orchestration must \
-             auto-isolate (fix direction agreed for issue #521), not refuse and leave the \
-             Dashboard tab active the way it does today"
-        );
-        // ...with its role panes actually spawned...
-        let names = pc.recorded_orchestration_names();
-        assert_eq!(
-            names.len(),
-            config.roles.len(),
-            "every role pane must be spawned once auto-isolation succeeds, not refused before \
-             any pane is created"
-        );
-
-        // ...rooted in a FRESH, DISTINCT clone directory — not `repo`
-        // itself, the collision this whole gate exists to prevent.
-        let cwds = pc.recorded_cwds();
-        assert_eq!(cwds.len(), config.roles.len());
-        let repo_str = repo.display().to_string();
-        for cwd in &cwds {
-            let cwd = cwd.as_deref().expect("every role pane must carry a cwd");
-            assert_ne!(
-                cwd, repo_str,
-                "an auto-isolated clone must root role panes in its OWN directory, not the \
-                 shared root checkout — spawning into `repo` here would be exactly the \
-                 collision this gate exists to prevent"
-            );
-            let clone_dir = std::path::PathBuf::from(cwd);
-            assert!(
-                clone_dir.is_dir(),
-                "the auto-isolated clone directory must actually exist on disk at {cwd}"
-            );
-            // A genuine isolated CLONE has its own real `.git` directory
-            // (from `git clone`) — unlike a linked `git worktree add`
-            // sibling, whose `.git` is a one-line file pointing back at the
-            // shared checkout's object store. This is what distinguishes
-            // "auto-isolated clone" (what `014`'s typed-slug arm already
-            // does, and what this fix must match) from merely resolving a
-            // sibling path without isolating it.
-            assert!(
-                clone_dir.join(".git").is_dir(),
-                "the auto-isolated directory at {cwd} must be a real, independent git clone \
-                 (a directory `.git`), not a linked worktree sharing the root checkout's \
-                 object store"
-            );
-        }
-
-        // ...and the manual-slug refusal wording `worktree_017` used to pin
-        // must not appear in the status message.
-        let message = ui
-            .status_message
-            .as_ref()
-            .map(|(m, _)| m.clone())
-            .unwrap_or_default();
-        assert!(
-            !message.contains("type a Worktree slug to isolate this one"),
-            "auto-isolation succeeding (silently, or with a warning of its own) must not \
-             surface the manual-slug refusal wording; got {message:?}"
         );
     }
 
@@ -34756,9 +33991,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -35451,9 +34683,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -35534,9 +34763,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -35601,9 +34827,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -35684,9 +34907,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -35803,16 +35023,15 @@ mod tests {
         );
     }
 
-    /// Scenario: Build a `NewPaneRequest` whose `dir` is a real git repository
-    /// and whose `orchestration_worktree_path` is `Some(<sibling path>)` —
-    /// the shape `001` proves the form produces, `002` proves fails loud, and
-    /// `003` characterizes only the pre-existing `req.dir` → pane-cwd
-    /// threading with `orchestration_worktree_path: None`. Dispatch the real
-    /// `Action::SpawnPane` against that request. Unlike `003`, `req.dir` and
-    /// the worktree path are deliberately DIFFERENT directories, so this
-    /// exercises the actual fork #122 behavior: the worktree must exist on
-    /// disk afterward, and every role pane's cwd — `recorded_cwds()` and
-    /// every `pane_cwd_map` value — must be the worktree path, not `req.dir`.
+    /// Scenario: Build a `NewPaneRequest` for a real git repository with a
+    /// typed Name (PRD fork#544 M2: Name is the sole input to the resolved
+    /// workspace path — `003` characterizes only the pre-existing `req.dir`
+    /// → pane-cwd threading). Dispatch the real `Action::SpawnPane` against
+    /// that request. `req.dir` and the derived workspace path are
+    /// deliberately DIFFERENT directories, so this exercises the actual
+    /// fork #122 behavior: the workspace must exist on disk afterward, and
+    /// every role pane's cwd — `recorded_cwds()` and every `pane_cwd_map`
+    /// value — must be the workspace path, not `req.dir`.
     #[spec("orchestration/worktree/004")]
     #[test]
     fn worktree_004_worktree_path_creates_and_roots_role_panes() {
@@ -35849,9 +35068,10 @@ mod tests {
             "init",
         ]);
 
-        // Sibling of `repo`, matching `resolve_orchestration_worktree_path`'s
-        // `<dir-basename>-<slug>` convention, but deliberately NOT equal to
-        // `req.dir` — that inequality is the whole point of this test.
+        // Sibling of `repo`, matching `resolve_workspace_path`'s
+        // `<dir-basename>-<sanitized name>` convention, but deliberately NOT
+        // equal to `req.dir` — that inequality is the whole point of this
+        // test.
         let worktree = tmp.path().join("repo-my-feature");
         assert_ne!(
             repo, worktree,
@@ -35863,18 +35083,11 @@ mod tests {
         let config = make_orchestration("review");
         let req = NewPaneRequest {
             dir: repo.clone(),
-            name: String::new(),
+            name: "my-feature".to_string(),
             command: String::new(),
             mode_config: None,
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
-            orchestration_worktree_path: Some(worktree.clone()),
-            // No slug: exercises the defensive fallback branch-name path
-            // (worktree basename) rather than `001`'s slug-carrying shape —
-            // deliberate, per `orchestration/worktree/004`'s own scope note
-            // above ("does not assert ... branch naming").
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -35945,13 +35158,12 @@ mod tests {
     #[test]
     fn worktree_reclaim_022_two_orchestrations_of_the_same_config_type_with_distinct_names_record_distinct_owners()
      {
-        fn spawn_and_read_owner(
-            tmp: &std::path::Path,
-            repo: &std::path::Path,
-            suffix: &str,
-            name: &str,
-        ) -> Option<String> {
-            let worktree = tmp.join(format!("repo-{suffix}"));
+        fn spawn_and_read_owner(repo: &std::path::Path, name: &str) -> Option<String> {
+            // PRD fork#544 M2: the resolved workspace path is now a pure
+            // function of `(repo, name)` — compute it via the SAME
+            // production function `Action::SpawnPane` uses, rather than a
+            // hand-built path that could drift from it.
+            let worktree = resolve_workspace_path(repo, &sanitize_workspace_segment(name));
             let config = make_orchestration("review");
             let req = NewPaneRequest {
                 dir: repo.to_path_buf(),
@@ -35960,9 +35172,6 @@ mod tests {
                 mode_config: None,
                 orchestration_config: Some(config.clone()),
                 seed_prompt: None,
-                orchestration_worktree_path: Some(worktree.clone()),
-                orchestration_worktree_slug: None,
-                orchestration_worktree_error: None,
             };
 
             let pc = Arc::new(CapturingPaneController::new());
@@ -36022,10 +35231,8 @@ mod tests {
         ]);
 
         let _daemon = with_empty_agents_daemon(tmp.path());
-        let owner_a =
-            spawn_and_read_owner(tmp.path(), &repo, "instance-a", "review-orchestrator-1");
-        let owner_b =
-            spawn_and_read_owner(tmp.path(), &repo, "instance-b", "review-orchestrator-2");
+        let owner_a = spawn_and_read_owner(&repo, "review-orchestrator-1");
+        let owner_b = spawn_and_read_owner(&repo, "review-orchestrator-2");
 
         assert_ne!(
             owner_a, owner_b,
@@ -36137,19 +35344,21 @@ mod tests {
             "init",
         ]);
 
-        let worktree = tmp.path().join("repo-identity-008");
+        // PRD fork#544 M2: the resolved workspace path is now a pure
+        // function of `(repo, name)` — compute it via the SAME production
+        // function `Action::SpawnPane` uses, rather than a hand-built path
+        // that could drift from it.
+        let name = "identity-008-orchestrator";
+        let worktree = resolve_workspace_path(&repo, &sanitize_workspace_segment(name));
         let _daemon = with_empty_agents_daemon(tmp.path());
         let config = make_orchestration("review");
         let req = NewPaneRequest {
             dir: repo.clone(),
-            name: "identity-008-orchestrator".to_string(),
+            name: name.to_string(),
             command: String::new(),
             mode_config: None,
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
-            orchestration_worktree_path: Some(worktree.clone()),
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -36200,51 +35409,42 @@ mod tests {
         }
     }
 
-    /// Scenario: Call `resolve_orchestration_worktree_path` with four slugs,
-    /// each violating exactly one rule of the #122/#123 audit's P1 fix — a
-    /// path separator, the literal `..`, a leading dash, and a NUL control
-    /// character — and confirm every one comes back `Err` rather than
-    /// resolving to a path (the original bug let a slug like
-    /// `x/../../../tmp/owned` against repo `/safe/repo` escape `/safe`
-    /// entirely, and every role pane was then started with that escaped
-    /// directory as its cwd). A final case proves the validation added here
-    /// does not regress the working path: a plain alphanumeric-and-dash slug
-    /// still resolves exactly as `orchestration/worktree/001` expects.
-    #[spec("orchestration/worktree/006")]
+    /// PRD fork#544 M2: `resolve_workspace_path`/`sanitize_workspace_segment`
+    /// replace `resolve_orchestration_worktree_path`/
+    /// `validate_orchestration_worktree_slug` (retired along with
+    /// `orchestration/worktree/006`, which pinned the old reject-based
+    /// validation directly). The escape properties `006` proved — no path
+    /// separator, no `..`, no NUL — are inherited for free from
+    /// `sanitize_clone_segment` (already unit-tested in
+    /// `issue_dispatch.rs`), which this wraps; this test's own job is the
+    /// ONE property that sanitizer does not already provide: a leading dash
+    /// stripped rather than passed through, since a leading-dash segment is
+    /// later consumed as a bare `git` argv token
+    /// (`isolated_clone_checkout_argv`'s `Local` branch).
     #[test]
-    fn worktree_006_slug_validation_rejects_escapes() {
-        let dir = PathBuf::from("/tmp/dot-agent-deck");
-
-        let separator = resolve_orchestration_worktree_path(&dir, "x/owned");
-        assert!(
-            separator.is_err(),
-            "a slug containing a path separator must be rejected: {separator:?}"
-        );
-
-        let dot_dot = resolve_orchestration_worktree_path(&dir, "..");
-        assert!(
-            dot_dot.is_err(),
-            "a slug that is exactly '..' must be rejected: {dot_dot:?}"
-        );
-
-        let leading_dash = resolve_orchestration_worktree_path(&dir, "-oops");
-        assert!(
-            leading_dash.is_err(),
-            "a slug with a leading dash must be rejected: {leading_dash:?}"
-        );
-
-        let control_char = resolve_orchestration_worktree_path(&dir, "bad\u{0}name");
-        assert!(
-            control_char.is_err(),
-            "a slug containing a NUL control character must be rejected: {control_char:?}"
-        );
-
-        let valid = resolve_orchestration_worktree_path(&dir, "my-feature")
-            .expect("a plain alphanumeric-and-dash slug must still validate");
+    fn sanitize_workspace_segment_strips_leading_dash() {
         assert_eq!(
-            valid,
+            sanitize_workspace_segment("-oops"),
+            "oops",
+            "a leading dash must be stripped, not passed through to a bare git argv token"
+        );
+        assert_eq!(
+            sanitize_workspace_segment("---"),
+            "issues",
+            "an all-dash segment must fall back to the same sentinel \
+             sanitize_clone_segment itself falls back to"
+        );
+        assert_eq!(
+            sanitize_workspace_segment("my-feature"),
+            "my-feature",
+            "an ordinary alphanumeric-and-dash name must pass through unchanged"
+        );
+
+        let dir = PathBuf::from("/tmp/dot-agent-deck");
+        assert_eq!(
+            resolve_workspace_path(&dir, &sanitize_workspace_segment("my-feature")),
             PathBuf::from("/tmp/dot-agent-deck-my-feature"),
-            "a valid slug must still resolve exactly as orchestration/worktree/001 expects"
+            "a valid name must still resolve exactly as orchestration/workspace/001 expects"
         );
     }
 
@@ -36506,9 +35706,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
         let controller = Arc::new(CapturingPaneController::new());
         let mut tab_manager = TabManager::new(controller.clone());
@@ -36570,9 +35767,6 @@ mod tests {
             mode_config: None,
             orchestration_config: None,
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         }
     }
 
@@ -36859,9 +36053,6 @@ mod tests {
             mode_config: Some(mode),
             orchestration_config: None,
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         }
     }
 
@@ -40446,9 +39637,6 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(lock_test_orch_config(name)),
             seed_prompt: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),

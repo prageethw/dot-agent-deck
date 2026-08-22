@@ -64,9 +64,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{
-    TuiDeck, commit_fixture, open_orchestration, open_orchestration_with_slug, write_executable,
-};
+use common::{TuiDeck, commit_fixture, open_orchestration, write_executable};
 use dot_agent_deck::event::Writable;
 use spec::spec;
 
@@ -323,21 +321,20 @@ exec cat
 }
 
 /// Scenario: issue #521, second-concurrent-orchestration hypothesis. Open a
-/// FIRST orchestration with a blank Worktree slug in the `orch-deck` fixture,
-/// return to the Dashboard, then open a SECOND orchestration against the SAME
-/// directory with a TYPED Worktree slug — routing the spawn through
+/// FIRST orchestration in the `orch-deck` fixture, return to the Dashboard,
+/// then open a SECOND orchestration against the SAME directory —
+/// `provision_isolated_clone_sync` provisions both now (PRD fork#544 M2b:
+/// isolation is unconditional, so this no longer depends on
 /// `root_checkout_has_live_sibling`'s `AnySharedCommonDir` scope, which
-/// `774526ed`/`cb1df96d` (PRD fork#325 M3, both already ancestors of this
-/// branch's HEAD) resolve to the isolated-clone provisioning arm
-/// (`provision_isolated_clone_sync`) because the FIRST orchestration is
-/// already live in `req.dir`. This is the one Nth-concurrent-orchestration
-/// code path none of `001`-`004` exercised — they all open exactly one
-/// orchestration tab. With the SECOND orchestration's own orchestrator pane
-/// focused, press `Ctrl+n` and confirm the directory picker opens. Then
-/// switch back to the FIRST orchestration's tab and press `Ctrl+n` there too
-/// — `UiState` (`src/ui.rs`) is a single struct shared by every tab, so if
-/// whatever the second open leaves behind is deck-global rather than scoped
-/// to the second tab, the first tab would be silently blocked as well.
+/// Model A's `Action::SpawnPane` call sites to it no longer exist). This is
+/// the one Nth-concurrent-orchestration code path none of `001`-`004`
+/// exercised — they all open exactly one orchestration tab. With the SECOND
+/// orchestration's own orchestrator pane focused, press `Ctrl+n` and confirm
+/// the directory picker opens. Then switch back to the FIRST orchestration's
+/// tab and press `Ctrl+n` there too — `UiState` (`src/ui.rs`) is a single
+/// struct shared by every tab, so if whatever the second open leaves behind
+/// is deck-global rather than scoped to the second tab, the first tab would
+/// be silently blocked as well.
 #[spec("orchestration/newpane/005")]
 #[test]
 fn newpane_005_ctrl_n_after_second_concurrent_orchestration_opened() {
@@ -346,9 +343,8 @@ fn newpane_005_ctrl_n_after_second_concurrent_orchestration_opened() {
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     let work = deck.workdir().to_path_buf();
-    // Issue #489: the second `open_orchestration_with_slug` call below needs
-    // a ref to branch from — `git worktree add`/the isolated-clone arm it
-    // goes through both fail against an unborn HEAD (the harness's own bare
+    // The second open's isolated-clone provisioning needs a ref to branch
+    // from — it fails against an unborn HEAD (the harness's own bare
     // `git init`). Same reason `identity_009` commits the fixture first.
     commit_fixture(&work);
     deck.wait_for_string("No active sessions");
@@ -362,10 +358,9 @@ fn newpane_005_ctrl_n_after_second_concurrent_orchestration_opened() {
     deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
     deck.wait_for_string("session(s)");
 
-    // Second orchestration, same directory, typed slug — goes through the
-    // Nth-concurrent-orchestration isolated-clone arm since the first
-    // orchestration is still live in `work`.
-    open_orchestration_with_slug(&deck, "newpane521");
+    // Second orchestration, same directory — every orchestration isolates
+    // now, unconditionally.
+    open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> second tab up, orchestrator focused
     deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, orchestrator focused
 

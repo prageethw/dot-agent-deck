@@ -1617,6 +1617,39 @@ pub(crate) fn provision_isolated_clone_sync(
         // comment above for why this is deferred rather than run
         // immediately after the clone).
         origin_warning = remove_isolated_clone_origin_default(clone_dir);
+    } else {
+        // PRD fork#544 M2 Decisions table: a plain local `git clone` only
+        // ever contains whatever `source_dir`'s own refs happened to hold
+        // at clone time — it is not, on its own, guaranteed fresh against
+        // the real `origin/main`. Now that `origin` is pointed at the
+        // source's real URL (the `if` branch above only fires when there
+        // was none to point at), fetch it once, updating only this NEW
+        // clone's own `origin/*` remote-tracking refs — the source/root
+        // checkout is never touched. Best-effort and read-only: a failure
+        // here (offline, auth) does not fail provisioning, since the clone
+        // is already fully usable from its local-clone snapshot; it only
+        // means this workspace starts from whatever `main` looked like at
+        // clone time instead of the true HEAD.
+        if let Err(err) = run_status_sync(
+            "git",
+            &[
+                "-C".to_string(),
+                clone_dir.to_string_lossy().into_owned(),
+                "fetch".to_string(),
+                "origin".to_string(),
+            ],
+            WORKTREE_GIT_TIMEOUT,
+        ) {
+            let e = match err {
+                AddError::TimedOut(e) | AddError::Failed(e) => e,
+            };
+            tracing::warn!(
+                clone = %clone_dir.display(),
+                error = %e,
+                "issue-dispatch: could not fetch origin for freshness after isolated clone; \
+                 workspace starts from the clone-time snapshot instead of the true HEAD"
+            );
+        }
     }
 
     let marker_warning = mark_worktree_owned_best_effort(clone_dir, creator);
@@ -3113,6 +3146,17 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 /// prevent, ahead of the bounded calls it protects. On expiry the acquisition
 /// refuses with an error rather than proceeding unlocked — this function
 /// never reaches `git worktree add` without holding the lock.
+///
+/// PRD fork#544 M2b: Model A's own call site (the TUI's `Action::SpawnPane`,
+/// `src/ui.rs`) is retired — isolation is now unconditional, so the shared-
+/// checkout `git worktree add` sibling this function provisions is no
+/// longer reachable from the interactive spawn path at all. Kept rather
+/// than deleted (a deliberate scope decision, not an oversight) since it
+/// remains exercised directly by this module's and `worktree_reclaim.rs`'s
+/// own tests, and nothing about the mechanism itself is wrong — only its
+/// one caller went away. `#[allow(dead_code)]` reflects that production-code
+/// state honestly rather than papering over it with a synthetic caller.
+#[allow(dead_code)]
 pub(crate) fn create_worktree_sync(
     clone_dir: &Path,
     worktree_dir: &Path,
