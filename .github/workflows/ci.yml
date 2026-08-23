@@ -219,7 +219,7 @@ jobs:
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-linux-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -408,7 +408,7 @@ jobs:
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-windows-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -494,7 +494,7 @@ jobs:
       # the test step has no results and must not fail on that.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-macos-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
