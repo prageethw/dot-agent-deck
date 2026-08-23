@@ -2199,7 +2199,7 @@ async fn run_hook_loop(
                                         .write_and_submit_guarded(
                                             &signal.pane_id,
                                             &result.message,
-                                            Some(expected_agent_id.as_str()),
+                                            expected_agent_id.as_str(),
                                             || async { true },
                                         )
                                         .await;
