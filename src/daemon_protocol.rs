@@ -3211,18 +3211,27 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let pane_id = "dashboard-pane-454";
-        let agent_id = DaemonClient::new(sock.clone())
-            .start_agent(StartAgentOptions {
+        // PRD fork#365 M2: the daemon, not the client, is authoritative for
+        // `pane_id` — whatever this test proposes under `DOT_AGENT_DECK_PANE_ID`
+        // is stripped and replaced with a freshly-minted one, so the test must
+        // read back the daemon's actual minted id via `start_agent_with_pane_id`
+        // rather than assume its own proposed value survives.
+        let (agent_id, pane_id) = DaemonClient::new(sock.clone())
+            .start_agent_with_pane_id(StartAgentOptions {
                 command: Some("cat".to_string()),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "dashboard-pane-454".to_string(),
+                )],
                 // Deliberately no `tab_membership`: this is a plain dashboard
                 // pane, the case the old code registered nowhere.
                 ..StartAgentOptions::default()
             })
             .await
             .expect("spawn an ordinary pane through the attach socket");
+        let pane_id = pane_id.expect("PRD fork#365 daemon always mints and returns a pane_id");
+        let pane_id = pane_id.as_str();
 
         // The registry owns the pane — that is the fact the admission check now
         // consults. Nothing was copied into `AppState` to make it true.
@@ -3352,13 +3361,19 @@ mod tests {
         // A role pane, so the role-map cleanup `StopAgent` owes is observable
         // too — that is the half `agent_records()`' exited filter silently
         // skipped.
-        let pane_id = "dead-pane-454";
+        //
+        // PRD fork#365 M2: the daemon mints and owns `pane_id`, so this test
+        // reads back the actual minted value via `start_agent_with_pane_id`
+        // rather than assume its proposed `DOT_AGENT_DECK_PANE_ID` survives.
         let client = DaemonClient::new(sock.clone());
-        let agent_id = client
-            .start_agent(StartAgentOptions {
+        let (agent_id, pane_id) = client
+            .start_agent_with_pane_id(StartAgentOptions {
                 command: Some("/usr/bin/true".to_string()),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "dead-pane-454".to_string(),
+                )],
                 tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
                     name: "dead-orch-454".to_string(),
                     role_index: 0,
@@ -3372,6 +3387,8 @@ mod tests {
             })
             .await
             .expect("spawn a short-lived role pane through the attach socket");
+        let pane_id = pane_id.expect("PRD fork#365 daemon always mints and returns a pane_id");
+        let pane_id = pane_id.as_str();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while registry.live_count() != 0 {
@@ -3456,7 +3473,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn stopping_a_retired_agent_leaves_its_panes_new_occupant_alone() {
-        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+        use crate::daemon_client::DaemonClient;
 
         let dir = tempfile::tempdir().expect("tempdir for the attach socket");
         let sock = dir.path().join("attach.sock");
@@ -3490,32 +3507,61 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        // PRD fork#365 M2: `AttachRequest::StartAgent` always mints a fresh,
+        // unique `pane_id` and refuses to let a caller land two spawns on the
+        // same one — so this test's premise (generation B taking over
+        // generation A's IDENTICAL pane_id) is driven straight through the
+        // registry's own `spawn_agent`, bypassing the daemon's minting, which
+        // is exactly how a real same-pane_id handover (a `clear = true`
+        // respawn aside) is only ever reachable in this registry's own
+        // contract, not through `StartAgent`. `AppState` registration is
+        // mirrored explicitly right after, via the same
+        // `confirm_orchestration_role` the real `StartAgent` handler calls,
+        // since bypassing the handler also bypasses that.
         let pane_id = "handover-pane-454";
         let client = DaemonClient::new(sock.clone());
-        let role_spawn = |command: &str, role: &str| {
-            let dir_path = dir.path().to_string_lossy().into_owned();
-            StartAgentOptions {
-                command: Some(command.to_string()),
-                cwd: Some(dir_path.clone()),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
-                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
-                    name: "handover-orch-454".to_string(),
-                    role_index: 0,
-                    role_name: role.to_string(),
-                    is_start_role: false,
-                    orchestration_cwd: Some(dir_path),
-                    display_title: None,
-                    orchestration_id: Some("orch-handover-454".to_string()),
-                }),
-                ..StartAgentOptions::default()
+        let dir_path = dir.path().to_string_lossy().into_owned();
+        let role_spawn = |command: &'static str, role: &str| crate::agent_pty::SpawnOptions {
+            command: Some(command),
+            cwd: Some(&dir_path),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+            tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                name: "handover-orch-454".to_string(),
+                role_index: 0,
+                role_name: role.to_string(),
+                is_start_role: false,
+                orchestration_cwd: Some(dir_path.clone()),
+                display_title: None,
+                orchestration_id: Some("orch-handover-454".to_string()),
+            }),
+            ..crate::agent_pty::SpawnOptions::default()
+        };
+        let confirm_role = |role: &str| {
+            let dir_path = dir_path.clone();
+            let state = state.clone();
+            let role = role.to_string();
+            async move {
+                let mut guard = state.write().await;
+                let generation = guard.reserve_registration_generation(pane_id);
+                guard.confirm_orchestration_role(
+                    pane_id,
+                    &role,
+                    false,
+                    crate::state::OrchestrationIdentity::Instance {
+                        id: "orch-handover-454".to_string(),
+                        name: "handover-orch-454".to_string(),
+                    },
+                    Some(&dir_path),
+                    generation,
+                );
             }
         };
 
         // Generation A takes the pane and immediately dies.
-        let old_id = client
-            .start_agent(role_spawn("/usr/bin/true", "worker-a"))
-            .await
+        let old_id = registry
+            .spawn_agent(role_spawn("/usr/bin/true", "worker-a"))
             .expect("spawn the first role pane");
+        confirm_role("worker-a").await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while registry.live_count() != 0 {
             assert!(
@@ -3527,10 +3573,10 @@ mod tests {
 
         // Generation B takes the pane over — which the registry allows and the
         // daemon re-registers under B's own role.
-        let new_id = client
-            .start_agent(role_spawn("/bin/sh", "worker-b"))
-            .await
+        let new_id = registry
+            .spawn_agent(role_spawn("/bin/sh", "worker-b"))
             .expect("the pane must be reusable once its child is gone");
+        confirm_role("worker-b").await;
         assert_eq!(
             registry.pane_current_agent_id(pane_id).as_deref(),
             Some(new_id.as_str()),
@@ -3662,14 +3708,19 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let pane_id = "reserved-handover-pane-454";
+        // PRD fork#365 M2: the daemon mints and owns `pane_id`, so this test
+        // reads back the actual minted value via `start_agent_with_pane_id`
+        // rather than assume its proposed `DOT_AGENT_DECK_PANE_ID` survives.
         let client = DaemonClient::new(sock.clone());
         let dir_path = dir.path().to_string_lossy().into_owned();
-        let old_id = client
-            .start_agent(StartAgentOptions {
+        let (old_id, pane_id) = client
+            .start_agent_with_pane_id(StartAgentOptions {
                 command: Some("/usr/bin/true".to_string()),
                 cwd: Some(dir_path.clone()),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "reserved-handover-pane-454".to_string(),
+                )],
                 tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
                     name: "reserved-orch-454".to_string(),
                     role_index: 0,
@@ -3683,6 +3734,8 @@ mod tests {
             })
             .await
             .expect("spawn the first role pane");
+        let pane_id = pane_id.expect("PRD fork#365 daemon always mints and returns a pane_id");
+        let pane_id = pane_id.as_str();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while registry.live_count() != 0 {
             assert!(

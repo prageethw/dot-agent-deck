@@ -13910,11 +13910,15 @@ mod spawn_tests {
     ///
     /// Scenario: three registries, each seeded with real short-lived OS
     /// processes spawned as their own process-group leader. `solo-exits-promptly`
-    /// wraps `true`, which exits almost immediately — under today's shipped
-    /// fix phase 2 reaps it via `try_wait` and phase 3 skips it entirely
-    /// (no `wait`); under the reworked contract phase 2 must observe the
-    /// exit without reaping so phase 3 still signals and reaps it (`wait`
-    /// present, `try_wait` absent). `solo-never-exits` wraps `sh -c "trap ''
+    /// wraps `true`, which exits almost immediately — phase 2 must observe
+    /// the exit without reaping (a raw `waitid` peek, invisible to this log)
+    /// so phase 3 still signals and reaps it unconditionally. Fork issue
+    /// #597 changed phase 3's own reap mechanism from a single blocking
+    /// `wait()` per agent to `force_kill_and_reap_all`'s split
+    /// signal-then-poll (a shared, non-reaping-until-exited `try_wait` loop,
+    /// so one wedged agent's blocking reap cannot starve its siblings'
+    /// SIGKILL) — so the log this test reads shows exactly one `try_wait`
+    /// call, not `wait`, for every agent phase 3 reaps. `solo-never-exits` wraps `sh -c "trap ''
     /// TERM; exec sleep 300"`, which ignores SIGTERM and can only be killed
     /// by phase 3's SIGKILL — the control that already works today and
     /// must keep working (its own process death is confirmed for real via
@@ -14093,10 +14097,12 @@ mod spawn_tests {
             let calls = log.lock().unwrap().clone();
             assert_eq!(
                 calls,
-                vec!["wait"],
-                "phase 2 must observe this agent's exit via a non-reaping peek (never the \
-                 reaping `try_wait`), and phase 3 must still signal and reap it via exactly one \
-                 `wait` rather than skipping it — calls were: {calls:?}"
+                vec!["try_wait"],
+                "phase 2 must observe this agent's exit via a non-reaping raw `waitid` peek \
+                 (invisible to this log), never the reaping `Child::try_wait`, and phase 3 must \
+                 still signal and reap it — fork issue #597 reaps via `force_kill_and_reap_all`'s \
+                 polling `try_wait`, not a blocking `wait`, so exactly one `try_wait` call is what \
+                 phase 3's reap leaves in this log — calls were: {calls:?}"
             );
             assert!(
                 elapsed < Duration::from_millis(500),
@@ -14133,13 +14139,15 @@ mod spawn_tests {
             let elapsed = started.elapsed();
 
             let calls = log.lock().unwrap().clone();
-            assert_eq!(
-                calls,
-                vec!["wait"],
+            assert!(
+                !calls.is_empty() && calls.iter().all(|c| *c == "try_wait"),
                 "an agent phase 2 never observes exiting must still be signalled (SIGTERM, then \
                  phase 3's SIGKILL — both real killpg calls, invisible to this log once \
-                 process_id() is Some) and reaped via exactly one `wait`, never via the reaping \
-                 `try_wait`; calls were: {calls:?}"
+                 process_id() is Some) and reaped — fork issue #597's `force_kill_and_reap_all` \
+                 reaps via polling `try_wait`, not a blocking `wait`, so every call this log \
+                 shows must be `try_wait`; the poll may take more than one round here (unlike \
+                 the promptly-exiting sibling above) since the real SIGKILL still has to be \
+                 delivered and processed before a poll can observe it; calls were: {calls:?}"
             );
             // Auditor F2: pins the `Ok(false)` half of the peek's contract,
             // which nothing else here does — every other assertion in this
@@ -14199,17 +14207,18 @@ mod spawn_tests {
             let calls_b = log_b.lock().unwrap().clone();
             assert_eq!(
                 calls_a,
-                vec!["wait"],
+                vec!["try_wait"],
                 "the promptly-exiting agent in a shared two-agent registry must still be \
                  reaped in phase 3, regardless of HashMap iteration order; calls were: \
                  {calls_a:?}"
             );
-            assert_eq!(
-                calls_b,
-                vec!["wait"],
+            assert!(
+                !calls_b.is_empty() && calls_b.iter().all(|c| *c == "try_wait"),
                 "the SIGTERM-ignoring agent in a shared two-agent registry must still be \
-                 signalled and reaped in phase 3, regardless of HashMap iteration order; calls \
-                 were: {calls_b:?}"
+                 signalled and reaped in phase 3 via polling `try_wait` (fork issue #597), \
+                 regardless of HashMap iteration order — the poll may take more than one round \
+                 since the real SIGKILL still has to be delivered and processed; calls were: \
+                 {calls_b:?}"
             );
             assert!(
                 !alive(pid_a) && !alive(pid_b),

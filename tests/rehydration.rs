@@ -2930,8 +2930,12 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
     let daemon = start_agent_event_daemon().await;
     let cwd = test_temp::tempdir().expect("allocate real-agent-event pane cwd");
     let client = DaemonClient::new(daemon.attach_path.clone());
-    let agent_id = client
-        .start_agent(StartAgentOptions {
+    // PRD fork#365 M2: the daemon mints and owns `pane_id`, so this reads
+    // back the actual minted value via `start_agent_with_pane_id` rather
+    // than assume `CLI_REHYDRATION_PANE` (its proposed
+    // `DOT_AGENT_DECK_PANE_ID`) survives.
+    let (agent_id, pane_id) = client
+        .start_agent_with_pane_id(StartAgentOptions {
             command: Some("cat".to_string()),
             cwd: Some(cwd.path().to_string_lossy().into_owned()),
             env: vec![(
@@ -2943,9 +2947,11 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
         })
         .await
         .expect("spawn the pane through the TUI's StartAgent attach path");
-    let observed = run_real_agent_event(&daemon, CLI_REHYDRATION_PANE, &agent_id, cwd.path()).await;
+    let pane_id = pane_id.expect("PRD fork#365 daemon always mints and returns a pane_id");
+    let pane_id = pane_id.as_str();
+    let observed = run_real_agent_event(&daemon, pane_id, &agent_id, cwd.path()).await;
     assert_eq!(observed.event_type, EventType::Thinking);
-    assert_eq!(observed.pane_id.as_deref(), Some(CLI_REHYDRATION_PANE));
+    assert_eq!(observed.pane_id.as_deref(), Some(pane_id));
     assert_eq!(observed.agent_id.as_deref(), Some(agent_id.as_str()));
 
     let controller = Arc::new(EmbeddedPaneController::new(
@@ -2979,7 +2985,7 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
     let rebuilt = fresh_tui_state
         .sessions
         .values()
-        .find(|session| session.pane_id.as_deref() == Some(CLI_REHYDRATION_PANE))
+        .find(|session| session.pane_id.as_deref() == Some(pane_id))
         .expect("fresh TUI must rebuild one card for the CLI-driven pane");
     assert_eq!(
         rebuilt.status,
