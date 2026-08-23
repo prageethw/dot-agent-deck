@@ -6749,6 +6749,13 @@ impl AgentPtyRegistry {
         // write to the pane's entry-time owner. `expected_agent_id` is a `&str`,
         // so that case no longer exists to be skipped.
         if !is_paneless && expected_agent_id != target.agent_id {
+            tracing::warn!(
+                pane_id = %pane_id,
+                expected_agent_id = %expected_agent_id,
+                actual_agent_id = %target.agent_id,
+                "guarded write refused: expected agent id does not match the pane's \
+                 current occupant"
+            );
             return Ok(GuardedSendDetail::Outcome(GuardedSend::WrongSession));
         }
         // Encode before locking so a bad payload doesn't pin the writer.

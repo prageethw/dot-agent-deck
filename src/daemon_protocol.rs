@@ -2103,8 +2103,24 @@ async fn compute_write_and_submit_outcome(
     // guarded call passes a concrete id instead of an `Option` that merely
     // happens never to be `None`.
     let is_paneless = pane_id == "<no-pane>";
-    let writable = match extras.expected_agent_id.as_deref() {
-        None => Writable::None,
+    // The sending side (`embedded_pane.rs`'s `write_and_submit_to_pane`)
+    // normalizes an empty id to `None` before it ever reaches the wire; mirror
+    // that here so the two ends agree on what "unnamed" means rather than
+    // treating a wire-level `Some("")` as a named identity.
+    let expected_agent_id = extras
+        .expected_agent_id
+        .as_deref()
+        .filter(|id| !id.is_empty());
+    let writable = match expected_agent_id {
+        None => {
+            tracing::warn!(
+                pane_id = %pane_id,
+                is_paneless,
+                "write-and-submit refused: no expected agent id was named, so the request \
+                 cannot be routed to a verified target"
+            );
+            Writable::None
+        }
         Some(agent_id) => {
             let guard = state.read().await;
             if is_paneless {
@@ -5600,24 +5616,24 @@ mod tests {
         reg.shutdown_all();
     }
 
-    /// Issue #494: `compute_write_and_submit_outcome`'s **paned** branch forwards
-    /// `extras.expected_agent_id.as_deref()` straight into
-    /// `write_and_submit_guarded` with no gate of its own — when it is `None`,
-    /// `write_and_submit_guarded`'s pre-lock identity check
-    /// (`if let Some(expected) = expected_agent_id && expected != target.agent_id`)
-    /// is skipped entirely, and the paned re-resolution afterwards only compares
-    /// the pane's CURRENT agent against ITSELF (there is no separate "did the
-    /// caller name an agent at all" gate), so the write proceeds keyed by
-    /// `pane_id` alone. Contrast the **paneless** branch a few lines earlier in
-    /// the same function: `Writable::Live` there is reachable ONLY when
-    /// `extras.expected_agent_id` is `Some` (`None => Writable::None` at the
-    /// `pane_writable`/`agent_writable` match), so an absent agent id fails
-    /// closed before the guarded send is ever reached. The paned branch has no
-    /// equivalent upstream gate. This pins the gap: a live pane with a
-    /// registered agent, written to with `expected_agent_id: None`, must be
-    /// REFUSED (never `SendResult::Applied`) — mirroring the `let Some(...) else
-    /// { return ... }` shape PR #477 established for issue #465's identical bug
-    /// class at a different call site.
+    /// Issue #494: `compute_write_and_submit_outcome`'s **paned** branch used to
+    /// forward `extras.expected_agent_id.as_deref()` straight into
+    /// `write_and_submit_guarded` with no gate of its own — when it was `None`,
+    /// `write_guarded`'s pre-lock identity check was skipped entirely, and the
+    /// paned re-resolution afterwards only compared the pane's CURRENT agent
+    /// against ITSELF (there was no separate "did the caller name an agent at
+    /// all" gate), so the write proceeded keyed by `pane_id` alone. Issue
+    /// #608/#617 closed that at the primitive: `write_guarded`'s
+    /// `expected_agent_id` is no longer `Option<&str>` but a plain `&str`
+    /// compared directly against `target.agent_id` (`agent_pty.rs`), so a
+    /// missing identity can no longer even reach it. `Option` legitimately
+    /// survives at THIS wire-level layer (`WriteAndSubmitExtras`, PR #477's
+    /// paned `let Some(...) else { return NoLiveTarget }` gate for issue #465's
+    /// identical bug class), so this test still matters here: it pins that a
+    /// wire request naming no agent id is refused before ever reaching the
+    /// now-non-optional primitive. A live pane with a registered agent, written
+    /// to with `expected_agent_id: None`, must be REFUSED (never
+    /// `SendResult::Applied`).
     #[cfg(unix)]
     #[tokio::test]
     async fn paned_write_refuses_missing_expected_agent_id() {

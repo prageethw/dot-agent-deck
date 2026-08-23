@@ -6117,6 +6117,13 @@ async fn dispatch_one_owned(
     // still caught by the post-lock re-validation), defeating the exact
     // guarantee PRD #249 finding B1 built this call to enforce. Treat an
     // unresolved identity as "no verified target" and never attempt the write.
+    // Issue #530: `write_and_submit_guarded_detailed`'s `expected_agent_id` is
+    // no longer `Option<&str>` — the fail-open path this comment describes
+    // above is now rejected at compile time, not merely by this call site
+    // remembering to guard it by hand. The `if let Some(...)` below still
+    // exists because `expected_worker_agent_id` may itself be unresolved
+    // (genuine pane-id reuse, see above); that case has nothing to pass as an
+    // identity and is refused as "no verified target" in the `else` arm.
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
         registry
             .write_and_submit_guarded_detailed(
@@ -12071,15 +12078,14 @@ clear = false
     }
 
     /// Issue #465 auditor confirmation, finding M1: pin `dispatch_one_owned`'s
-    /// OWN refusal — the fix itself, at `src/state.rs:3348-3377` — not merely the
-    /// primitive's permissive-on-`None` default pinned from the other side by
-    /// `guarded_send_with_no_expected_identity_writes_to_the_live_pane` in
+    /// OWN refusal — the fix itself, at `src/state.rs:4195-4225` — not merely
+    /// the primitive's own mismatch refusal pinned from the other side by
+    /// `guarded_send_with_mismatched_expected_identity_is_refused` in
     /// `agent_pty.rs`. When the worker identity cannot be resolved (no live
     /// agent owns the pane, and no `clear = true` respawn ran to mint one),
     /// `dispatch_one_owned` must take the `else` arm and synthesize
     /// `GuardedSend::NoLiveTarget` itself — WITHOUT ever calling
-    /// `AgentPtyRegistry::write_and_submit_guarded_detailed` and handing the
-    /// permissive primitive a bare `None`.
+    /// `AgentPtyRegistry::write_and_submit_guarded_detailed` at all.
     ///
     /// A regression that "simplified" the `if let Some(worker_agent_id) = ...
     /// else { .. }` guard back to calling the primitive with
