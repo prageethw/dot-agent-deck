@@ -42533,6 +42533,13 @@ mod tests {
             _expected_session_id: Option<&str>,
             _delivery_id: Option<&str>,
         ) -> Result<crate::event::SendResult, PaneError> {
+            // This test double's `pane_agent_id` (below) always resolves to
+            // `Some`, so its only caller (`process_pending_seed_prompts`) never
+            // reaches this method with `None` — see
+            // `pane_input_032_user_input_disarms_submit_only_probe`, the sole
+            // test that exercises this controller.
+            let expected_agent_id = expected_agent_id
+                .expect("RegistryBackedPaneController's pane_agent_id always resolves to Some");
             let outcome = self
                 .runtime
                 .block_on(self.registry.write_and_submit_guarded(

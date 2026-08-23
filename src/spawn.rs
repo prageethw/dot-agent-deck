@@ -1616,12 +1616,10 @@ async fn guarded_submit(
     let closing = Arc::clone(registry);
     // Issue #424 H5: the DETAILED form, because this is the path that owes the
     // user a terminal report and cannot produce one from a flattened `Stale`.
-    let send = registry.write_and_submit_guarded_detailed(
-        pane_id,
-        prompt,
-        Some(agent_id),
-        || async move { !closing.is_pane_closing(pane_id) },
-    );
+    let send =
+        registry.write_and_submit_guarded_detailed(pane_id, prompt, agent_id, || async move {
+            !closing.is_pane_closing(pane_id)
+        });
     match tokio::time::timeout(remaining_before(deadline), send).await {
         Err(_) => GuardedOutcome::Refused("deadline elapsed while writing"),
         Ok(Err(e)) => GuardedOutcome::Failed(e),
@@ -2965,12 +2963,9 @@ async fn deliver_on_idle(
     // pattern before that lands.
     registry.note_payload_settled(pane_id, prompt);
     let outcome = registry
-        .write_and_submit_guarded(
-            pane_id,
-            prompt,
-            Some(expected_agent_id.as_str()),
-            || async { true },
-        )
+        .write_and_submit_guarded(pane_id, prompt, expected_agent_id.as_str(), || async {
+            true
+        })
         .await;
     // Same reasoning in the other direction: release the record THIS write
     // just left, so a later fire of the same recurring prompt isn't refused
@@ -3493,7 +3488,7 @@ mod tests {
         let agent_id = spawn_byte_target(&registry, pane_id);
         assert_eq!(
             registry
-                .write_and_submit_guarded(pane_id, prompt, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(pane_id, prompt, &agent_id, || async { true })
                 .await
                 .expect("delivery before user newline control"),
             GuardedSend::Applied
@@ -3511,7 +3506,7 @@ mod tests {
             String::from_utf8_lossy(&before)
         );
         let outcome = registry
-            .write_and_submit_guarded(pane_id, prompt, Some(&agent_id), || async { true })
+            .write_and_submit_guarded(pane_id, prompt, &agent_id, || async { true })
             .await
             .expect("replacement after user newline control");
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -3894,7 +3889,7 @@ mod tests {
         let agent_id = spawn_byte_target(&registry, PANE_ID);
         assert_eq!(
             registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
                 .await
                 .expect("initial detached delivery"),
             GuardedSend::Applied
@@ -4535,7 +4530,7 @@ mod tests {
         // without a real attempt-1 write standing in for the caller, `PROMPT`
         // never physically reaches the pane and the precondition below panics.
         let initial = registry
-            .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+            .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
             .await
             .expect("attempt 1 guarded delivery");
         assert_eq!(
@@ -4611,7 +4606,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
                 .await
                 .expect("guarded payload write"),
             GuardedSend::Applied
@@ -4659,7 +4654,7 @@ mod tests {
         let agent_id = spawn_byte_target(&registry, PANE_ID);
         assert_eq!(
             registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
                 .await
                 .expect("initial guarded delivery"),
             GuardedSend::Applied
@@ -4673,7 +4668,7 @@ mod tests {
         let retry_agent = agent_id.clone();
         let retry = tokio::spawn(async move {
             retry_registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&retry_agent), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &retry_agent, || async { true })
                 .await
                 .expect("queued guarded replacement")
         });
@@ -4735,9 +4730,7 @@ mod tests {
         let same_agent = spawn_byte_target(&same_registry, SAME_PANE);
         assert_eq!(
             same_registry
-                .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, Some(&same_agent), || async {
-                    true
-                })
+                .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, &same_agent, || async { true })
                 .await
                 .expect("delivery A"),
             GuardedSend::Applied
@@ -4753,7 +4746,7 @@ mod tests {
             .snapshot(&same_agent)
             .expect("before delivery B snapshot");
         let delivery_b = same_registry
-            .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, Some(&same_agent), || async { true })
+            .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, &same_agent, || async { true })
             .await
             .expect("delivery B first attempt");
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -4768,12 +4761,9 @@ mod tests {
         let replaced_agent = spawn_byte_target(&replaced_registry, REPLACED_PANE);
         assert_eq!(
             replaced_registry
-                .write_and_submit_guarded(
-                    REPLACED_PANE,
-                    DELIVERY_A,
-                    Some(&replaced_agent),
-                    || async { true },
-                )
+                .write_and_submit_guarded(REPLACED_PANE, DELIVERY_A, &replaced_agent, || async {
+                    true
+                },)
                 .await
                 .expect("delivery A first attempt"),
             GuardedSend::Applied
@@ -4787,12 +4777,9 @@ mod tests {
         .await;
         assert_eq!(
             replaced_registry
-                .write_and_submit_guarded(
-                    REPLACED_PANE,
-                    DELIVERY_B,
-                    Some(&replaced_agent),
-                    || async { true },
-                )
+                .write_and_submit_guarded(REPLACED_PANE, DELIVERY_B, &replaced_agent, || async {
+                    true
+                },)
                 .await
                 .expect("independent delivery B"),
             GuardedSend::Applied,
@@ -4803,7 +4790,7 @@ mod tests {
             .snapshot(&replaced_agent)
             .expect("before delivery A retry snapshot");
         let delivery_a_retry = replaced_registry
-            .write_and_submit_guarded(REPLACED_PANE, DELIVERY_A, Some(&replaced_agent), || async {
+            .write_and_submit_guarded(REPLACED_PANE, DELIVERY_A, &replaced_agent, || async {
                 true
             })
             .await
@@ -4821,7 +4808,7 @@ mod tests {
         let paste_agent = spawn_byte_target(&paste_registry, PASTE_PANE);
         assert_eq!(
             paste_registry
-                .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, Some(&paste_agent), || async {
+                .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, &paste_agent, || async {
                     true
                 },)
                 .await
@@ -4843,9 +4830,7 @@ mod tests {
             String::from_utf8_lossy(&before_paste_retry)
         );
         let paste_retry = paste_registry
-            .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, Some(&paste_agent), || async {
-                true
-            })
+            .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, &paste_agent, || async { true })
             .await
             .expect("replacement after bracketed paste");
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -4907,12 +4892,9 @@ mod tests {
         let overlap_agent = spawn_byte_target(&overlap_registry, OVERLAP_PANE);
         assert_eq!(
             overlap_registry
-                .write_and_submit_guarded(
-                    OVERLAP_PANE,
-                    OVERLAP_PROMPT,
-                    Some(&overlap_agent),
-                    || async { true },
-                )
+                .write_and_submit_guarded(OVERLAP_PANE, OVERLAP_PROMPT, &overlap_agent, || async {
+                    true
+                },)
                 .await
                 .expect("overlapping delivery A first write"),
             GuardedSend::Applied
@@ -4924,12 +4906,9 @@ mod tests {
         };
         assert_eq!(
             overlap_registry
-                .write_and_submit_guarded(
-                    OVERLAP_PANE,
-                    OVERLAP_PROMPT,
-                    Some(&overlap_agent),
-                    || async { true },
-                )
+                .write_and_submit_guarded(OVERLAP_PANE, OVERLAP_PROMPT, &overlap_agent, || async {
+                    true
+                },)
                 .await
                 .expect("overlapping delivery B first write"),
             GuardedSend::Applied
@@ -4954,12 +4933,9 @@ mod tests {
             .snapshot(&overlap_agent)
             .expect("before surviving delivery retry snapshot");
         let overlap_retry = overlap_registry
-            .write_and_submit_guarded(
-                OVERLAP_PANE,
-                OVERLAP_PROMPT,
-                Some(&overlap_agent),
-                || async { true },
-            )
+            .write_and_submit_guarded(OVERLAP_PANE, OVERLAP_PROMPT, &overlap_agent, || async {
+                true
+            })
             .await
             .expect("surviving delivery B replacement");
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -5013,7 +4989,7 @@ mod tests {
         let agent_id = spawn_byte_target(&registry, PANE_ID);
         assert_eq!(
             registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
                 .await
                 .expect("initial detached delivery"),
             GuardedSend::Applied
