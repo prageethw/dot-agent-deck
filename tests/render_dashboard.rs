@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
@@ -1690,6 +1690,82 @@ fn agent_badge_006_model_with_format_chars_is_sanitized() {
         text.contains(&sanitized),
         "the model must be routed through the repo's terminal sanitizer \
          (src/terminal_sanitize.rs) before rendering:\n{text}"
+    );
+}
+
+/// Scenario: issue #410 — apply a `SessionStart` `AgentEvent` whose
+/// `display_name` metadata (`DISPLAY_NAME_METADATA_KEY`) embeds a
+/// Unicode `Cf` format character (U+202E RIGHT-TO-LEFT OVERRIDE) and is
+/// far longer than a reasonable display length, through the real
+/// `AppState::apply_event` seam, then check `SessionState.display_name`
+/// directly — no render involved, since the defect is inside
+/// `apply_event` itself: it sanitizes and length-clamps `event.model` on
+/// ingest (`dashboard/agent-badge/005`, `dashboard/agent-badge/006`) but
+/// does nothing of the kind for `display_name`, which arrives on the
+/// same wire and is stored with only an `is_empty()` filter. Mirrors
+/// `agent-badge/006`'s Cf-sanitization property and `agent-badge/005`'s
+/// length-clamp property, both applied to the sibling field.
+#[spec("dashboard/agent-badge/007")]
+#[test]
+fn agent_badge_007_display_name_is_sanitized_and_clamped() {
+    let mut state = AppState::default();
+    state.register_pane("pane-badge-name".to_string());
+    let started = chrono::Utc::now();
+
+    let hostile_display_name = format!("Sonnet\u{202e}-evil-{}TAIL-MARKER-ZZZZ", "日".repeat(100));
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        DISPLAY_NAME_METADATA_KEY.to_string(),
+        hostile_display_name.clone(),
+    );
+    state.apply_event(AgentEvent {
+        session_id: "name-id-01".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata,
+        pane_id: Some("pane-badge-name".to_string()),
+        agent_id: Some("agent-badge-name".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
+    let session = state
+        .sessions
+        .get("name-id-01")
+        .expect("the session exists after SessionStart");
+
+    let display_name = session
+        .display_name
+        .as_deref()
+        .expect("non-empty display_name metadata must be stored on the session");
+
+    assert!(
+        !display_name.contains('\u{202e}'),
+        "a Cf format char (U+202E RIGHT-TO-LEFT OVERRIDE) in display_name \
+         metadata must not reach session.display_name unsanitized:\n{display_name}"
+    );
+    assert!(
+        !display_name.contains("TAIL-MARKER-ZZZZ"),
+        "an unbounded display_name must be length-clamped to a sane display \
+         cap — the raw tail of a ~340-char display_name must not survive into \
+         session.display_name:\n{display_name}"
+    );
+
+    let sanitized_full =
+        dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display(&hostile_display_name);
+    assert!(
+        sanitized_full.starts_with(display_name) && display_name.len() < sanitized_full.len(),
+        "session.display_name must be a truncated prefix of the display_name \
+         run through the repo's terminal sanitizer (src/terminal_sanitize.rs) \
+         — sanitize-then-clamp, mirroring how `model` is handled at the top \
+         of AppState::apply_event:\ndisplay_name:\n{display_name}\n\
+         sanitized_full:\n{sanitized_full}"
     );
 }
 
