@@ -159,14 +159,17 @@ async fn wait_for_attach_socket(attach_socket: &Path, timeout: Duration) {
 /// injects `DOT_AGENT_DECK_AGENT_ID`; the returned id is then replayed into the
 /// real `agent-event` subprocess exactly as it is inside the managed pane.
 #[cfg(unix)]
+// PRD fork#365 M2: the daemon mints and owns `pane_id`, so this returns the
+// actual minted value alongside the agent id rather than assume the
+// caller-proposed `pane_id` (via `DOT_AGENT_DECK_PANE_ID`) survives.
 async fn start_tui_managed_agent(
     daemon: &common::InProcDaemon,
     pane_id: &str,
     cwd: &str,
-) -> String {
+) -> (String, String) {
     wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
-    DaemonClient::new(daemon.attach_path.clone())
-        .start_agent(StartAgentOptions {
+    let (agent_id, minted_pane_id) = DaemonClient::new(daemon.attach_path.clone())
+        .start_agent_with_pane_id(StartAgentOptions {
             command: Some("cat".to_string()),
             cwd: Some(cwd.to_string()),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
@@ -174,7 +177,11 @@ async fn start_tui_managed_agent(
             ..StartAgentOptions::default()
         })
         .await
-        .expect("spawn TUI-managed agent through the daemon attach socket")
+        .expect("spawn TUI-managed agent through the daemon attach socket");
+    (
+        agent_id,
+        minted_pane_id.expect("PRD fork#365 daemon always mints and returns a pane_id"),
+    )
 }
 
 /// Invoke the REAL `agent-event` CLI and wait until the in-process daemon has
@@ -374,8 +381,12 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
     wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
-    let agent_id = DaemonClient::new(daemon.attach_path.clone())
-        .start_agent(StartAgentOptions {
+    // PRD fork#365 M2: the daemon mints and owns `pane_id`, so this test
+    // reads back the actual minted value via `start_agent_with_pane_id`
+    // rather than assume `JSON_PANE` (its proposed `DOT_AGENT_DECK_PANE_ID`)
+    // survives.
+    let (agent_id, pane_id) = DaemonClient::new(daemon.attach_path.clone())
+        .start_agent_with_pane_id(StartAgentOptions {
             command: Some("cat".to_string()),
             cwd: Some(cwd_str.clone()),
             display_name: Some(JSON_LABEL.to_string()),
@@ -388,12 +399,14 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
         })
         .await
         .expect("spawn fully described pane through the TUI's StartAgent attach path");
-    let observed = run_agent_event_cli(&daemon, JSON_PANE, &agent_id, cwd.path()).await;
-    assert_eq!(observed.pane_id.as_deref(), Some(JSON_PANE));
+    let pane_id = pane_id.expect("PRD fork#365 daemon always mints and returns a pane_id");
+    let pane_id = pane_id.as_str();
+    let observed = run_agent_event_cli(&daemon, pane_id, &agent_id, cwd.path()).await;
+    assert_eq!(observed.pane_id.as_deref(), Some(pane_id));
     assert_eq!(observed.agent_id.as_deref(), Some(agent_id.as_str()));
 
-    let mut tool_event = thinking_event(JSON_PANE, &agent_id, None);
-    tool_event.session_id = format!("{JSON_PANE}-session");
+    let mut tool_event = thinking_event(pane_id, &agent_id, None);
+    tool_event.session_id = format!("{pane_id}-session");
     tool_event.event_type = EventType::ToolStart;
     tool_event.tool_name = Some(JSON_TOOL.to_string());
     common::write_hook_line(
@@ -407,7 +420,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             let state = daemon.state.read().await;
             state.sessions.values().any(|session| {
                 session.agent_id.as_deref() == Some(agent_id.as_str())
-                    && session.pane_id.as_deref() == Some(JSON_PANE)
+                    && session.pane_id.as_deref() == Some(pane_id)
                     && session.status == SessionStatus::Working
                     && session
                         .active_tool
@@ -465,8 +478,8 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
         .unwrap_or_else(|| panic!("the pinned `agents` field must be an array; got {parsed:?}"));
     let agent = agents
         .iter()
-        .find(|entry| entry.get("pane_id").and_then(serde_json::Value::as_str) == Some(JSON_PANE))
-        .unwrap_or_else(|| panic!("no JSON agent entry named pane {JSON_PANE:?}; got {parsed:?}"));
+        .find(|entry| entry.get("pane_id").and_then(serde_json::Value::as_str) == Some(pane_id))
+        .unwrap_or_else(|| panic!("no JSON agent entry named pane {pane_id:?}; got {parsed:?}"));
     let agent_fields: std::collections::BTreeSet<&str> = agent
         .as_object()
         .expect("each `agents` entry must be an object")
@@ -482,6 +495,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "label",
             "pane_id",
             "role",
+            "shell_synthetic_working",
             "status",
         ]),
         "the current schema version must pin every public field name on a fully populated agent row; got agent={agent:?}"
@@ -493,8 +507,9 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "agent_id": agent_id,
             "cwd": cwd_str,
             "label": JSON_LABEL,
-            "pane_id": JSON_PANE,
+            "pane_id": pane_id,
             "role": format!("mode:{JSON_MODE}"),
+            "shell_synthetic_working": false,
             "status": "Working",
         }),
         "the representative row must pin the value and shape of every public field"
@@ -711,11 +726,14 @@ async fn daemon_status_005_real_agent_event_cli_joins_live_state_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
-    let driven_agent_id = start_tui_managed_agent(&daemon, CLI_DRIVEN_PANE, &cwd_str).await;
-    let control_agent_id = start_tui_managed_agent(&daemon, CLI_CONTROL_PANE, &cwd_str).await;
+    let (driven_agent_id, driven_pane_id) =
+        start_tui_managed_agent(&daemon, CLI_DRIVEN_PANE, &cwd_str).await;
+    let (control_agent_id, control_pane_id) =
+        start_tui_managed_agent(&daemon, CLI_CONTROL_PANE, &cwd_str).await;
+    let driven_pane_id = driven_pane_id.as_str();
+    let control_pane_id = control_pane_id.as_str();
 
-    let observed =
-        run_agent_event_cli(&daemon, CLI_DRIVEN_PANE, &driven_agent_id, cwd.path()).await;
+    let observed = run_agent_event_cli(&daemon, driven_pane_id, &driven_agent_id, cwd.path()).await;
 
     let human = run_daemon_status_cli(&daemon.attach_path, false).await;
     assert!(
@@ -728,12 +746,12 @@ async fn daemon_status_005_real_agent_event_cli_joins_live_state_inner() {
     let driven_lines: Vec<&str> = human
         .stdout
         .lines()
-        .filter(|line| line.contains(CLI_DRIVEN_PANE))
+        .filter(|line| line.contains(driven_pane_id))
         .collect();
     let control_lines: Vec<&str> = human
         .stdout
         .lines()
-        .filter(|line| line.contains(CLI_CONTROL_PANE))
+        .filter(|line| line.contains(control_pane_id))
         .collect();
     assert!(
         !driven_lines.is_empty() && !control_lines.is_empty(),
@@ -748,9 +766,9 @@ async fn daemon_status_005_real_agent_event_cli_joins_live_state_inner() {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let driven_text = normalize_identity_fields(&driven_lines, CLI_DRIVEN_PANE, &driven_agent_id);
+    let driven_text = normalize_identity_fields(&driven_lines, driven_pane_id, &driven_agent_id);
     let control_text =
-        normalize_identity_fields(&control_lines, CLI_CONTROL_PANE, &control_agent_id);
+        normalize_identity_fields(&control_lines, control_pane_id, &control_agent_id);
     let human_has_live_status = driven_text != control_text;
 
     let json = run_daemon_status_cli(&daemon.attach_path, true).await;
@@ -773,7 +791,7 @@ async fn daemon_status_005_real_agent_event_cli_joins_live_state_inner() {
         .and_then(serde_json::Value::as_array)
         .and_then(|agents| {
             agents.iter().find(|agent| {
-                agent.get("pane_id").and_then(serde_json::Value::as_str) == Some(CLI_DRIVEN_PANE)
+                agent.get("pane_id").and_then(serde_json::Value::as_str) == Some(driven_pane_id)
             })
         });
     let json_has_live_status = driven_json.and_then(|agent| agent.get("status")).is_some();

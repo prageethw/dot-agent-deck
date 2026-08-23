@@ -41,6 +41,13 @@ fn write_fixture(root: &Path, catalog_body: &str) {
          fn dupcat_001_pins_duplicate_heading() {}\n",
     )
     .expect("write dup_test.rs");
+    // Rule 9 (issue #474) unconditionally reads `src/test_temp.rs` — this
+    // fixture predates that rule, so it needs a trivial, violation-free
+    // stand-in for the check to find.
+    let src_dir = root.join("src");
+    fs::create_dir_all(&src_dir).expect("mkdir src/");
+    fs::write(src_dir.join("test_temp.rs"), "// fixture stand-in\n")
+        .expect("write src/test_temp.rs");
 }
 
 #[test]
