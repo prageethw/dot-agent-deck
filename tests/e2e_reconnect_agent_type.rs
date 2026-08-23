@@ -334,28 +334,24 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // Fork-only removed the agent-type badge from card titles (b33cec2), so
+    // "Pi" never renders on any card here; the status word alone (on the
+    // card's border line) is what identifies the live state, matching the
+    // idiom `live_006` above already uses for the same reason.
     first_tui.wait_until_grid("live card shows Thinking from agent-event", |grid| {
-        grid.contains(LABEL)
-            && grid
-                .lines()
-                .any(|line| line.contains("Pi") && line.contains("Thinking"))
+        grid.contains(LABEL) && grid.contains("Thinking")
     });
     drop(first_tui);
 
     let reconnected_tui = launch_tui_against(&daemon);
     reconnected_tui.wait_until_grid(
         "reconnected card restores agent-event Thinking instead of Idle",
-        |grid| {
-            grid.contains(LABEL)
-                && grid
-                    .lines()
-                    .any(|line| line.contains("Pi") && line.contains("Thinking"))
-        },
+        |grid| grid.contains(LABEL) && grid.contains("Thinking"),
     );
     let grid = reconnected_tui.snapshot_grid();
     let header = grid
         .lines()
-        .find(|line| line.contains("Pi") && line.contains("Thinking"))
+        .find(|line| line.contains("Thinking"))
         .unwrap_or_else(|| panic!("reconnected grid lost the managed card {LABEL:?}:\n{grid}"));
     assert!(
         !header.contains("Idle"),
