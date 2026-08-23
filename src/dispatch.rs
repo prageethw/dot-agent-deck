@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    IsolatedCloneOutcome, RemovalPolicy, WorktreeCreation, WorktreeRegistry,
+    IsolatedCloneOutcome, RemovalPolicy, RemoveOutcome, WorktreeCreation, WorktreeRegistry,
     attempt_isolated_clone_cleanup, create_worktree, provision_isolated_clone_sync,
     record_worktree, remove_worktree, run_status, worktree_still_in_use,
 };
@@ -778,6 +778,14 @@ pub async fn handle_dispatch(
             // with no error surfaced, since the delete itself succeeds
             // against the wrong repository (auditor A1, verified
             // empirically).
+            // issue #473: `should_drop_registry` tracks whether the
+            // worktree was actually removed from disk -- the isolated-clone
+            // arm's cleanup is unconditional (see its own comment below), but
+            // the shared-checkout arm's `remove_worktree` can genuinely fail
+            // (e.g. a locked worktree), and dropping the registry entry in
+            // that case would lose the only record that the worktree is
+            // still on disk.
+            let mut should_drop_registry = true;
             let cleanup_failed = if has_live_sibling {
                 // The clone directory IS `paths.worktree_dir` -- remove it
                 // with the same helper `provision_isolated_clone_sync`'s own
@@ -808,18 +816,32 @@ pub async fn handle_dispatch(
                         .flatten();
                 cleaned_up_by.is_none()
             } else {
-                let _ = remove_worktree(
+                // Match the outcome instead of discarding it (`let _ = ...`)
+                // -- `RemoveOutcome` is `#[must_use]` for exactly this
+                // reason (PRD 236 review). Mirrors the tab-close precedent
+                // in `daemon_protocol.rs` that already matches on
+                // `Kept`/`RemoveFailed`/`Removed`.
+                let remove_outcome = remove_worktree(
                     &paths.worktree_dir,
                     &clone_dir,
                     RemovalPolicy::Force,
                     &creator,
                 )
                 .await;
+                // issue #473: removal genuinely not happening (failed, or --
+                // though `RemovalPolicy::Force` never produces it -- kept)
+                // must not drop the registry entry, since that entry is the
+                // only record that the worktree is still on disk.
+                let remove_failed = match remove_outcome {
+                    RemoveOutcome::Removed(_) => false,
+                    RemoveOutcome::Kept(_) | RemoveOutcome::RemoveFailed(_) => true,
+                };
+                should_drop_registry = !remove_failed;
                 // Also delete the branch: `git worktree remove` never
                 // deletes it. Same multi-role caveat as above — a still-live
                 // sibling role may hold committed work whose only record is
                 // this branch.
-                run_status(
+                let branch_delete_failed = run_status(
                     "git",
                     &[
                         "-C",
@@ -830,7 +852,8 @@ pub async fn handle_dispatch(
                     ],
                 )
                 .await
-                .is_err()
+                .is_err();
+                remove_failed || branch_delete_failed
             };
 
             if cleanup_failed {
@@ -842,7 +865,7 @@ pub async fn handle_dispatch(
                 );
             }
 
-            {
+            if should_drop_registry {
                 let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
                 wts.remove(&paths.worktree_dir);
             }
