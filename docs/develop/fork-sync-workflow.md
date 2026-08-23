@@ -121,6 +121,18 @@ gh run list --repo prageethw/dot-agent-deck --branch <branch> --json workflowNam
 
 This is CLAUDE.md rule 5's push-and-wait loop failing open: the rule routes all test runs to CI, and here the thing being waited for is never created.
 
+**Once both runs exist, wait for them with one sustained foreground command — CLAUDE.md rule 28 — not by re-running the `gh run list` check above at intervals.** A sync is exactly the case rule 28 exists for: the orchestrator's own pane has nothing else to do but wait on these CI results, and a gapped re-check reads as `Idle` on the dashboard the whole time CI is genuinely running (fork issue #499's originating incident was this exact sequence). `ci.yml` and `e2e.yml` are separate workflows with separate run ids — watch both, filtered to this exact head SHA so a stale prior run for the branch can't be mistaken for the new one — then still read the `e2e:` job's log rather than trusting the watch exit status (rule 8):
+
+```bash
+SHA=$(git rev-parse HEAD)
+for WF in ci.yml e2e.yml; do
+  RUN_ID=$(gh run list --repo prageethw/dot-agent-deck --branch <branch> --workflow="$WF" \
+    --limit 20 --json databaseId,headSha --jq "[.[] | select(.headSha==\"$SHA\")][0].databaseId")
+  [ -n "$RUN_ID" ] || { echo "no $WF run for $SHA yet — dispatch it first"; exit 1; }
+  gh run watch "$RUN_ID" --repo prageethw/dot-agent-deck --interval 30 --compact
+done
+```
+
 **This rewrites history on both branches, intentionally.** The rebase gives `fork-only`'s commits new SHAs, and `main` is force-pushed to match. That is expected for this workflow, not an accident. Anyone holding a stale local clone of either branch must **hard-reset to the new history** after a sync (`git fetch && git reset --hard origin/<branch>`) — a plain `git pull` will produce a tangled merge, not the intended state.
 
 ## The current `fork-only` stack
