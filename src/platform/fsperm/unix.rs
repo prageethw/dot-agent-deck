@@ -135,3 +135,50 @@ pub fn verify_endpoint_trusted(path: &Path) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use super::*;
+
+    /// Scenario: plants a real "attacker" directory at a permissive mode
+    /// (0o755), puts a symlink at the path the caller asks
+    /// `ensure_owner_only_dir` to secure, and points that symlink at the
+    /// attacker directory. The call must refuse (return `Err`) rather than
+    /// silently succeed, and the attacker directory's mode must stay
+    /// unchanged — proving the function does not follow the symlink and
+    /// chmod whatever real directory it happens to point at (issue #491).
+    #[test]
+    fn ensure_owner_only_dir_refuses_a_symlink_at_the_target_path() {
+        let tmp = crate::test_temp::tempdir().expect("scratch tempdir");
+
+        let attacker_target = tmp.path().join("attacker_target");
+        fs::create_dir(&attacker_target).expect("create attacker target dir");
+        fs::set_permissions(&attacker_target, fs::Permissions::from_mode(0o755))
+            .expect("set attacker target dir to a permissive starting mode");
+
+        let victim_dir = tmp.path().join("victim_dir");
+        symlink(&attacker_target, &victim_dir).expect("plant symlink at the victim path");
+
+        let result = ensure_owner_only_dir(&victim_dir);
+
+        assert!(
+            result.is_err(),
+            "ensure_owner_only_dir must refuse a symlink at the target path, not silently \
+             return Ok"
+        );
+
+        let attacker_mode = fs::metadata(&attacker_target)
+            .expect("stat attacker target dir by its real path")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            attacker_mode, 0o755,
+            "attacker_target's mode must be left unchanged, not tightened to 0o700 through the \
+             symlink"
+        );
+    }
+}
