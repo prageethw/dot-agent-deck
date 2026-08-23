@@ -832,8 +832,14 @@ pub async fn handle_dispatch(
                 // though `RemovalPolicy::Force` never produces it -- kept)
                 // must not drop the registry entry, since that entry is the
                 // only record that the worktree is still on disk.
+                // auditor A4: don't trust git's reported exit status alone --
+                // mirror the `removed && !dir.exists()` second signal
+                // `attempt_worktree_cleanup`/`attempt_worktree_cleanup_async`
+                // already require elsewhere in this repo
+                // (`issue_dispatch_run.rs`) before treating a removal as
+                // confirmed.
                 let remove_failed = match remove_outcome {
-                    RemoveOutcome::Removed(_) => false,
+                    RemoveOutcome::Removed(_) => paths.worktree_dir.exists(),
                     RemoveOutcome::Kept(_) | RemoveOutcome::RemoveFailed(_) => true,
                 };
                 should_drop_registry = !remove_failed;
@@ -880,7 +886,23 @@ pub async fn handle_dispatch(
                     )
                 )
             } else {
-                " (cleanup failed: branch may still exist — name may be wedged)".to_string()
+                // issue #473 review round (reviewer P2-1 / auditor A2): this
+                // message is the actual recovery path a human will read --
+                // retaining the registry entry buys no automatic recovery,
+                // since its only production consumer (tab-close) needs a
+                // live agent rooted here. Name both things that can still be
+                // on disk (the branch delete and the worktree removal are
+                // separate calls, either of which can fail independently)
+                // and give the same actionable hint the `has_live_sibling`
+                // arm above already gives.
+                format!(
+                    " (cleanup failed: branch and/or worktree directory may still exist — \
+                     check `{}`; if it's still there, run `rm -rf` on it and delete the \
+                     branch manually, then try again)",
+                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                        &paths.worktree_dir
+                    )
+                )
             };
 
             DispatchResult {
@@ -1784,12 +1806,12 @@ mod tests {
     /// worktree is locked the instant `git worktree add` creates it, via a
     /// `PATH`-shimmed `git`), then asserts the CORRECT post-rollback
     /// behavior: the registry entry for the worktree must still be present,
-    /// since removal did not actually succeed. Currently FAILS: `dispatch.rs`
-    /// discards `remove_worktree`'s `RemoveOutcome` (`let _ = remove_worktree(...)`)
-    /// and drops the registry entry unconditionally a few lines later,
-    /// regardless of whether removal actually happened -- reintroducing, in
-    /// this caller, exactly the defect `RemoveOutcome::RemoveFailed` was
-    /// added to prevent (see its own doc comment, PRD 236 review).
+    /// since removal did not actually succeed. `dispatch.rs` now matches on
+    /// `remove_worktree`'s `RemoveOutcome` instead of discarding it
+    /// (`let _ = remove_worktree(...)`) and only drops the registry entry
+    /// when removal actually succeeded, restoring the guarantee
+    /// `RemoveOutcome::RemoveFailed` exists to provide (see its own doc
+    /// comment, PRD 236 review).
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_rollback_retains_registry_entry_when_force_removal_fails() {
@@ -1854,6 +1876,16 @@ mod tests {
              genuinely failed (locked worktree), so dropping the entry anyway loses the \
              only record that this worktree is still on disk: {}",
             paths.worktree_dir.display(),
+            result.message
+        );
+        assert!(
+            result.message.contains("cleanup failed"),
+            "reviewer P2-3: every other assertion here is a positive that the earlier \
+             `worktree_still_in_use` early-return would also satisfy, so this is the one \
+             assertion that proves the rollback arm was genuinely reached (not the early \
+             return) AND pins the second half of the behavior change -- that \
+             `cleanup_failed` is actually set to true here, not just that the registry \
+             retains the entry: {}",
             result.message
         );
 
@@ -2240,6 +2272,134 @@ mod tests {
             std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
         }
         FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Prepend a fake `git` to `PATH` that fails ONLY `git branch -D`
+    /// invocations -- the shared-checkout rollback arm's separate
+    /// branch-deletion call -- and passes every other invocation, including
+    /// its own `git worktree remove --force`, straight through to the real
+    /// `git`. Lets a test force the worktree removal to genuinely succeed
+    /// while the branch delete alone fails (issue #473 sibling gap, auditor
+    /// A3).
+    ///
+    /// Word-scanned rather than positional (matches `branch` immediately
+    /// followed by `-D` anywhere in argv), the same reasoning
+    /// `with_git_worktree_add_locking_the_new_worktree` documents: the
+    /// rollback's `branch -D` call goes through `run_status`, a raw
+    /// `tokio::process::Command` with no global-option prefix today, but a
+    /// positional match would silently stop matching if that ever changed.
+    #[cfg(unix)]
+    fn with_git_branch_delete_failing(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-branch-delete-fail-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 prev=\"\"\n\
+                 is_branch_delete=0\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$prev\" = \"branch\" ] && [ \"$a\" = \"-D\" ]; then\n\
+                 \x20\x20\x20\x20is_branch_delete=1\n\
+                 \x20\x20fi\n\
+                 \x20\x20prev=\"$a\"\n\
+                 done\n\
+                 if [ \"$is_branch_delete\" = \"1\" ]; then\n\
+                 \x20\x20echo 'stub: simulated git branch -D failure' >&2\n\
+                 \x20\x20exit 1\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Scenario: issue #473 sibling gap (auditor A3). Forces the
+    /// shared-checkout rollback arm's worktree removal to succeed for real
+    /// while the SEPARATE `git branch -D` call fails, via
+    /// `with_git_branch_delete_failing`. Guards against
+    /// `should_drop_registry = !cleanup_failed` -- a plausible-looking but
+    /// wrong simplification the auditor reproduced directly: it would
+    /// compile, pass every other rollback test, and silently reintroduce
+    /// phantom registry retention for a worktree that is actually gone. The
+    /// worktree here IS gone (only the branch delete failed), so the
+    /// registry entry -- the only record of a still-on-disk worktree -- must
+    /// still be dropped, even though `cleanup_failed` is separately true.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_rollback_drops_registry_entry_when_only_branch_delete_fails() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "branchfail-unit");
+
+        // Same daemon-gate bypass every sibling rollback test in this file
+        // uses -- without it, issue #490's live-sibling gate fails closed
+        // before the rollback arm this test targets is ever reached.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+        let _git_stub = with_git_branch_delete_failing(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-473b".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "branchfail-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached: {}",
+            result.message
+        );
+        assert!(
+            !paths.worktree_dir.exists(),
+            "worktree removal itself must have genuinely succeeded (only the branch \
+             delete was stubbed to fail): {}",
+            result.message
+        );
+        assert!(
+            branch_exists(&repo, &paths.branch),
+            "the branch delete must have genuinely failed, or this test proves nothing \
+             about the sibling gap it targets"
+        );
+        assert!(
+            !ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "issue #473 sibling gap: the worktree itself is gone, so the registry entry \
+             must still be dropped even though the branch delete failed -- dropping the \
+             registry must track whether the WORKTREE was removed, not whether cleanup as \
+             a whole (including the branch delete) succeeded: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("cleanup failed"),
+            "cleanup_failed must still be true, separately from should_drop_registry, \
+             since the branch delete genuinely failed: {}",
+            result.message
+        );
     }
 
     /// Scenario: issue #490, case 1 -- regression guard. No live orchestration
