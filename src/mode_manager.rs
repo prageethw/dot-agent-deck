@@ -6,10 +6,10 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError};
-#[cfg(unix)]
-use crate::platform::shell::quote_shell_arg;
 #[cfg(windows)]
 use crate::platform::shell::{escape_cmd_exe_program, quote_cmd_exe_arg};
+#[cfg(unix)]
+use crate::platform::shell::{quote_shell_arg, sanitize_shell_control_chars};
 use crate::project_config::ModeConfig;
 
 /// Build the outer-shell command line for `dot-agent-deck watch --interval N
@@ -23,6 +23,13 @@ use crate::project_config::ModeConfig;
 /// token, which `{:?}` Debug-escaping does not guarantee (POSIX shells
 /// still expand `$` and backticks inside double quotes, and Rust's escapes
 /// are not a faithful encoding for every character, e.g. a real newline).
+/// Before quoting, `command` is also run through
+/// `sanitize_shell_control_chars` (fork issue #429) — quoting alone is not
+/// enough, because the emitted line is typed keystroke-by-keystroke into a
+/// live PTY on the persistent-watch-pane delivery path, and the tty line
+/// discipline consumes several control characters as editing/signal input
+/// *below* the shell's own grammar, before `sh` ever sees the quotes at
+/// all; see that function's doc comment for which bytes and why.
 ///
 /// **Windows**: position-aware `cmd.exe` quoting (fork issue #283) —
 /// `exe` and `command` sit in two different grammatical positions of a
@@ -47,7 +54,7 @@ fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
         "{} watch --interval {} {}",
         quote_shell_arg(&exe.display().to_string()),
         interval_secs,
-        quote_shell_arg(command)
+        quote_shell_arg(&sanitize_shell_control_chars(command))
     )
 }
 
