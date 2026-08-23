@@ -36735,6 +36735,163 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #496 reviewer F2 (fix round two-pass restructure) —
+    /// the property this rule exists to pin is order-INDEPENDENCE, not just
+    /// the `Ok(true)` outcome. Point the gate at a well-formed response
+    /// carrying TWO `AgentRecord`s: one cwd-less `Orchestration` record (the
+    /// ambiguous shape from the tests above) and one genuine `Orchestration`
+    /// record whose `orchestration_cwd` IS `dir` itself — a real,
+    /// determinable collision. The cwd-less record sorts FIRST in the `Vec`
+    /// passed to `AttachResponse::agent_records`. Before this fix round, the
+    /// per-record `let Some(cwd) = orchestration_cwd else { return
+    /// Err(...) }` was an immediate early return (not the deferred
+    /// `saw_unresolvable_cwd` flag it was replaced with), so it would have
+    /// returned `Err` here without the loop ever reaching the second,
+    /// colliding record — a definite `Ok(true)` collision hidden behind an
+    /// earlier "can't tell" refusal purely because of `Vec` order. Assert
+    /// `Ok(true)`: the consumer (`dispatch.rs`) routes `true` into an
+    /// isolated clone, which is always safe regardless of what else is in
+    /// the record list.
+    #[test]
+    fn root_checkout_has_live_sibling_ok_true_wins_when_cwdless_record_sorts_first() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let cwdless_record = crate::agent_pty::AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "some-older-orchestration".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+        let colliding_record = crate::agent_pty::AgentRecord {
+            id: "2".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "live-sibling".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: Some(dir.to_string_lossy().into_owned()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![
+                cwdless_record,
+                colliding_record,
+            ]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
+        assert_eq!(
+            result,
+            Ok(true),
+            "a determinable Ok(true) collision must win over an earlier cwd-less \
+             record's ambiguity, regardless of Vec order; got {result:?}"
+        );
+    }
+
+    /// Scenario: the same property as the test above, with the two records'
+    /// `Vec` order reversed — the colliding record sorts FIRST, the cwd-less
+    /// record sorts LAST. On the pre-fix immediate-`return Err` code this
+    /// order already happened to pass, since the loop's short-circuit
+    /// `return Ok(true)` on the first (colliding) record ran before the
+    /// second (cwd-less) record was ever examined; this test exists so the
+    /// pair together pin order-independence rather than one lucky order, per
+    /// reviewer's own suggestion. Assert `Ok(true)`.
+    #[test]
+    fn root_checkout_has_live_sibling_ok_true_wins_when_cwdless_record_sorts_last() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let cwdless_record = crate::agent_pty::AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "some-older-orchestration".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+        let colliding_record = crate::agent_pty::AgentRecord {
+            id: "2".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "live-sibling".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: Some(dir.to_string_lossy().into_owned()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![
+                colliding_record,
+                cwdless_record,
+            ]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
+        assert_eq!(
+            result,
+            Ok(true),
+            "a determinable Ok(true) collision must win regardless of Vec order; \
+             got {result:?}"
+        );
+    }
+
     /// Scenario: Build a `NewPaneRequest` for a real git repository with a
     /// typed Name (PRD fork#544 M2: Name is the sole input to the resolved
     /// workspace path — `003` characterizes only the pre-existing `req.dir`
