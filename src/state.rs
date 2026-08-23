@@ -2000,7 +2000,7 @@ fn arm_idle_worker_watch(
             .write_and_submit_guarded(
                 &orchestrator_pane_id,
                 &prompt,
-                Some(&delegation.orchestrator_agent_id),
+                &delegation.orchestrator_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -2534,7 +2534,7 @@ fn arm_delegate_silence_watch(
             .write_notice_guarded(
                 &orchestrator_pane_id,
                 &notice,
-                Some(&expected_agent_id),
+                &expected_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -3837,13 +3837,22 @@ async fn dispatch_one_owned(
                     let notice_registry = Arc::clone(&registry);
                     let notice_pane = orchestrator_pane_id.clone();
                     let notice_orchestration = orchestration.clone();
+                    // Resolved immediately before the call; a `None` here means
+                    // no live agent currently owns the orchestrator pane, in
+                    // which case `writer_target_for_pane` inside the guarded
+                    // write independently observes the same absence and refuses
+                    // with `NoLiveTarget` before this identity is ever compared
+                    // — so the empty-string placeholder is unreachable except as
+                    // a (safely refused) mismatch in the narrow TOCTOU window
+                    // where an agent attaches between this read and the write.
+                    let current_orchestrator_agent_id = registry
+                        .pane_current_agent_id(&orchestrator_pane_id)
+                        .unwrap_or_default();
                     match registry
                         .write_notice_guarded(
                             &orchestrator_pane_id,
                             &notice,
-                            registry
-                                .pane_current_agent_id(&orchestrator_pane_id)
-                                .as_deref(),
+                            &current_orchestrator_agent_id,
                             || async move {
                                 if notice_registry.is_pane_closing(&notice_pane) {
                                     return false;
@@ -4169,12 +4178,19 @@ async fn dispatch_one_owned(
     // still caught by the post-lock re-validation), defeating the exact
     // guarantee PRD #249 finding B1 built this call to enforce. Treat an
     // unresolved identity as "no verified target" and never attempt the write.
+    // Issue #530: `write_and_submit_guarded_detailed`'s `expected_agent_id` is
+    // no longer `Option<&str>` — the fail-open path this comment describes
+    // above is now rejected at compile time, not merely by this call site
+    // remembering to guard it by hand. The `if let Some(...)` below still
+    // exists because `expected_worker_agent_id` may itself be unresolved
+    // (genuine pane-id reuse, see above); that case has nothing to pass as an
+    // identity and is refused as "no verified target" in the `else` arm.
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
         registry
             .write_and_submit_guarded_detailed(
                 &pane_id,
                 &one_liner,
-                Some(worker_agent_id),
+                worker_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -5930,7 +5946,7 @@ impl AppState {
             .write_and_submit_guarded(
                 &orch_pane_id,
                 &feedback,
-                Some(expected_agent_id.as_str()),
+                expected_agent_id.as_str(),
                 || async { true },
             )
             .await;
@@ -10081,7 +10097,7 @@ clear = false
                 .write_and_submit_guarded(
                     ORCHESTRATOR_PANE,
                     PROMPT,
-                    Some(&orchestrator_agent),
+                    &orchestrator_agent,
                     || async { true },
                 )
                 .await
@@ -10139,7 +10155,7 @@ clear = false
         );
 
         let probe = registry
-            .write_and_submit_guarded(ORCHESTRATOR_PANE, "", Some(&orchestrator_agent), || async {
+            .write_and_submit_guarded(ORCHESTRATOR_PANE, "", &orchestrator_agent, || async {
                 true
             })
             .await

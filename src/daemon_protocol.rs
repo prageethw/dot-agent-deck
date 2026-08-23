@@ -1278,7 +1278,15 @@ async fn compute_write_and_submit_outcome(
     // happens never to be `None`.
     let is_paneless = pane_id == "<no-pane>";
     let writable = match extras.expected_agent_id.as_deref() {
-        None => Writable::None,
+        None => {
+            tracing::warn!(
+                pane_id = %pane_id,
+                is_paneless,
+                "write-and-submit refused: no expected agent id was named, so the request \
+                 cannot be routed to a verified target"
+            );
+            Writable::None
+        }
         Some(agent_id) => {
             let guard = state.read().await;
             if is_paneless {
@@ -1312,7 +1320,7 @@ async fn compute_write_and_submit_outcome(
                 // target.
                 let agent_for_check = agent_id.clone();
                 registry
-                    .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
+                    .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
                         st.read().await.agent_writable(&agent_for_check) == Writable::Live
                     })
                     .await
@@ -1326,6 +1334,13 @@ async fn compute_write_and_submit_outcome(
                 // verified target rather than falling through to an unguarded write
                 // keyed by pane_id alone.
                 let Some(expected_agent_id) = extras.expected_agent_id.as_deref() else {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        "write-and-submit refused: a paned target reached `Writable::Live` with \
+                         no expected agent id named, so the write is treated as no verified \
+                         target rather than falling through to an unguarded write keyed by \
+                         pane_id alone"
+                    );
                     return Ok(SendResult::NoLiveTarget);
                 };
                 let pane_for_check = pane_id.to_string();
@@ -1334,7 +1349,7 @@ async fn compute_write_and_submit_outcome(
                     .write_and_submit_guarded(
                         pane_id,
                         text,
-                        Some(expected_agent_id),
+                        expected_agent_id,
                         move || async move {
                             // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
                             // stale-pre-lock-snapshot CLASS close: this closure is

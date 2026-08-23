@@ -228,7 +228,7 @@ pub fn arm_seed_fallback(
                     .write_and_submit_guarded(
                         &pane_id,
                         &seed,
-                        Some(expected_agent_id.as_str()),
+                        expected_agent_id.as_str(),
                         || async { true },
                     )
                     .await;
@@ -4676,7 +4676,7 @@ impl AgentPtyRegistry {
             .write_notice_guarded(
                 &orchestrator_pane_id,
                 &notice,
-                Some(&expected_agent_id),
+                &expected_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -5827,7 +5827,7 @@ impl AgentPtyRegistry {
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSend, AgentPtyError>
     where
@@ -5850,7 +5850,7 @@ impl AgentPtyRegistry {
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSendDetail, AgentPtyError>
     where
@@ -5883,7 +5883,7 @@ impl AgentPtyRegistry {
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSend, AgentPtyError>
     where
@@ -5911,7 +5911,7 @@ impl AgentPtyRegistry {
         pane_id: &str,
         text: &str,
         mode: SubmitMode,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSendDetail, AgentPtyError>
     where
@@ -5919,8 +5919,8 @@ impl AgentPtyRegistry {
     {
         let is_paneless = pane_id == "<no-pane>";
         let target = if is_paneless {
-            // Resolve BY agent identity; no identity → nothing to route to.
-            match expected_agent_id.and_then(|id| self.writer_target_for_agent(id)) {
+            // Resolve BY agent identity.
+            match self.writer_target_for_agent(expected_agent_id) {
                 Some(target) => target,
                 None => return Ok(GuardedSendDetail::Outcome(GuardedSend::NoLiveTarget)),
             }
@@ -5933,11 +5933,17 @@ impl AgentPtyRegistry {
         // Pre-lock identity gate: refuse a prompt queued for a different agent
         // than the one that now owns the pane (respawn/rebind before delivery).
         // A paneless target was resolved BY `expected_agent_id`, so it can never
-        // mismatch here — skip the gate.
-        if !is_paneless
-            && let Some(expected) = expected_agent_id
-            && expected != target.agent_id
-        {
+        // mismatch here — skip the gate. Issue #530: `expected_agent_id` is no
+        // longer optional, so this check can no longer fail open on a missing
+        // identity — every paned call now names an agent to match against.
+        if !is_paneless && expected_agent_id != target.agent_id {
+            tracing::warn!(
+                pane_id = %pane_id,
+                expected_agent_id = %expected_agent_id,
+                actual_agent_id = %target.agent_id,
+                "guarded write refused: expected agent id does not match the pane's \
+                 current occupant"
+            );
             return Ok(GuardedSendDetail::Outcome(GuardedSend::WrongSession));
         }
         // Encode before locking so a bad payload doesn't pin the writer.
@@ -12167,12 +12173,13 @@ mod spawn_tests {
         let guard = target.writer.lock().await;
 
         let reg_for_task = reg.clone();
+        let id_for_task = id.clone();
         let mut task = tokio::spawn(async move {
             reg_for_task
                 .write_and_submit_guarded(
                     "pane-removal-barrier",
                     "printf 'REMOVED-AFTER-AUTH'",
-                    None,
+                    &id_for_task,
                     // Liveness always "ok" — the ONLY thing that must reject is
                     // the removal re-resolution under the held writer.
                     || async { true },
@@ -12204,22 +12211,19 @@ mod spawn_tests {
         reg.shutdown_all();
     }
 
-    /// Pin the PRIMITIVE's documented-permissive `None`
-    /// behavior as an asserted fact, not merely a reader's inference from the
-    /// source. `write_guarded`'s pre-lock identity gate (`if !is_paneless &&
-    /// let Some(expected) = expected_agent_id && ...`) only compares
-    /// identities when `expected_agent_id` is `Some` — passing `None` skips
-    /// the gate entirely, and the call proceeds as an UNGUARDED write to
-    /// whoever currently owns the pane. That is correct at THIS layer: the
-    /// primitive is generic, and it is every caller's job never to pass
-    /// `None` when it needs verified delivery — `dispatch_one_owned`'s own
-    /// refusal (`dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved`
-    /// in `state.rs`) is exactly that caller-side responsibility. Without
-    /// this test, a future reader would have to re-derive the permissive
-    /// semantics from the gate's `if let` shape rather than finding them
-    /// asserted.
+    /// Issue #530: `expected_agent_id` is no longer `Option<&str>`, so the
+    /// fail-open `None` path this test used to pin (a `None` identity skipped
+    /// `write_guarded`'s pre-lock identity gate entirely and proceeded as an
+    /// UNGUARDED write to whoever currently owned the pane) can no longer even
+    /// be expressed — it is rejected at compile time rather than relying on
+    /// every caller remembering never to pass `None`. This test now pins the
+    /// property that actually matters at this layer: a caller that names the
+    /// WRONG agent is always refused, never silently allowed through by
+    /// omitting an identity. Without this test, a future reader would have to
+    /// re-derive the mismatch-refusal semantics from the gate's comparison
+    /// rather than finding them asserted.
     #[tokio::test]
-    async fn guarded_send_with_no_expected_identity_writes_to_the_live_pane() {
+    async fn guarded_send_with_mismatched_expected_identity_is_refused() {
         let reg = Arc::new(AgentPtyRegistry::new());
         // `spawn_agent` returns the REGISTRY's own agent id — a UUID, not the
         // `pane_id_env` string — and `AgentPtyRegistry::snapshot` reads
@@ -12230,7 +12234,7 @@ mod spawn_tests {
                 command: Some("/bin/sh"),
                 env: vec![(
                     DOT_AGENT_DECK_PANE_ID.to_string(),
-                    "pane-no-expected-identity".to_string(),
+                    "pane-mismatched-expected-identity".to_string(),
                 )],
                 ..SpawnOptions::default()
             })
@@ -12238,39 +12242,29 @@ mod spawn_tests {
 
         let outcome = reg
             .write_and_submit_guarded_detailed(
-                "pane-no-expected-identity",
-                "echo none-identity-permissive-marker",
-                None,
+                "pane-mismatched-expected-identity",
+                "echo mismatched-identity-should-not-appear",
+                "some-other-agent-id-entirely",
                 || async { true },
             )
             .await
             .expect("guarded send result");
         assert_eq!(
             outcome,
-            GuardedSendDetail::Outcome(GuardedSend::Applied),
-            "a None expected identity must not be refused by the primitive — it is the caller's \
-             job to withhold None when it wants verification"
+            GuardedSendDetail::Outcome(GuardedSend::WrongSession),
+            "an expected identity that does not match the pane's live occupant must always be \
+             refused, never silently allowed through"
         );
 
-        // Confirm bytes actually reached the live pane, not merely that the
-        // outcome claims `Applied`.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut found = false;
-        while tokio::time::Instant::now() < deadline {
-            let snap = reg.snapshot(&agent_id).unwrap_or_default();
-            if snap
-                .windows(b"none-identity-permissive-marker".len())
-                .any(|w| w == b"none-identity-permissive-marker")
-            {
-                found = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
+        // Confirm NO bytes reached the live pane — the refusal above claims
+        // nothing was written, and this is the check that it actually wasn't.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let snap = reg.snapshot(&agent_id).unwrap_or_default();
         assert!(
-            found,
-            "the guarded primitive must have written the payload into the live pane when \
-             expected_agent_id was None"
+            !snap
+                .windows(b"mismatched-identity-should-not-appear".len())
+                .any(|w| w == b"mismatched-identity-should-not-appear"),
+            "a refused guarded send must not have written any bytes into the live pane"
         );
 
         reg.shutdown_all();
