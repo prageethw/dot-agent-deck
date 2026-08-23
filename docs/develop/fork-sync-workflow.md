@@ -121,6 +121,13 @@ gh run list --repo prageethw/dot-agent-deck --branch <branch> --json workflowNam
 
 This is CLAUDE.md rule 5's push-and-wait loop failing open: the rule routes all test runs to CI, and here the thing being waited for is never created.
 
+**Once a run exists, wait for it with one sustained foreground command — CLAUDE.md rule 28 — not by re-running the `gh run list` check above at intervals.** A sync is exactly the case rule 28 exists for: the orchestrator's own pane has nothing else to do but wait on this CI result, and a gapped re-check reads as `Idle` on the dashboard the whole time CI is genuinely running (fork issue #499's originating incident was this exact sequence). Watch the run to completion, then still read the `e2e:` job's log rather than trusting the watch exit status (rule 8):
+
+```bash
+RUN_ID=$(gh run list --repo prageethw/dot-agent-deck --branch <branch> --workflow=ci.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run watch "$RUN_ID" --repo prageethw/dot-agent-deck
+```
+
 **This rewrites history on both branches, intentionally.** The rebase gives `fork-only`'s commits new SHAs, and `main` is force-pushed to match. That is expected for this workflow, not an accident. Anyone holding a stale local clone of either branch must **hard-reset to the new history** after a sync (`git fetch && git reset --hard origin/<branch>`) — a plain `git pull` will produce a tangled merge, not the intended state.
 
 ## The current `fork-only` stack
