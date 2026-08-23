@@ -1756,6 +1756,100 @@ mod tests {
         );
     }
 
+    /// Scenario: issue #473 regression guard. Forces the shared-checkout
+    /// rollback arm's `git worktree remove --force` to genuinely fail (the
+    /// worktree is locked the instant `git worktree add` creates it, via a
+    /// `PATH`-shimmed `git`), then asserts the CORRECT post-rollback
+    /// behavior: the registry entry for the worktree must still be present,
+    /// since removal did not actually succeed. Currently FAILS: `dispatch.rs`
+    /// discards `remove_worktree`'s `RemoveOutcome` (`let _ = remove_worktree(...)`)
+    /// and drops the registry entry unconditionally a few lines later,
+    /// regardless of whether removal actually happened -- reintroducing, in
+    /// this caller, exactly the defect `RemoveOutcome::RemoveFailed` was
+    /// added to prevent (see its own doc comment, PRD 236 review).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_rollback_retains_registry_entry_when_force_removal_fails() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "lockfail-unit");
+
+        // Same daemon-gate bypass as the sibling test above -- without it,
+        // issue #490's live-sibling gate fails closed before the rollback
+        // arm this test targets is ever reached.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
+        // Force the rollback's eventual `git worktree remove --force` to
+        // genuinely fail: a `PATH`-shimmed `git` locks the worktree the
+        // moment `git worktree add` creates it -- synchronously, inside the
+        // same subprocess call `create_worktree` awaits, so there is no
+        // timing race against `handle_dispatch`'s later spawn-then-rollback
+        // steps. `git worktree remove --force` refuses a locked worktree
+        // even with a single `--force` (`remove_worktree_argv` only ever
+        // pushes one) -- verified directly against git 2.55.0, matching
+        // `RemoveOutcome::RemoveFailed`'s own doc comment on how PRD 236
+        // originally reproduced this.
+        let _git_stub = with_git_worktree_add_locking_the_new_worktree(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-473".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "lockfail-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached -- every other assertion \
+             here is a negative that a fail-closed early return (creating nothing) would \
+             also satisfy, so this is the one assertion that distinguishes a genuine \
+             rollback attempt from the gate refusing before it ever got there: {}",
+            result.message
+        );
+        assert!(
+            paths.worktree_dir.exists(),
+            "removal was forced to fail (the worktree is locked) -- the directory must \
+             still be on disk: {}",
+            result.message
+        );
+        assert!(
+            ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "issue #473: the registry entry for {} must still be present -- removal \
+             genuinely failed (locked worktree), so dropping the entry anyway loses the \
+             only record that this worktree is still on disk: {}",
+            paths.worktree_dir.display(),
+            result.message
+        );
+
+        // Best-effort cleanup: `tmp`'s own Drop removes everything under it
+        // regardless, but unlock first so a leftover admin lock file cannot
+        // confuse anything that inspects `repo/.git/worktrees/` before then.
+        let _ = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "worktree",
+                "unlock",
+                "--",
+                &paths.worktree_dir.to_string_lossy(),
+            ])
+            .output();
+        let _ = std::fs::remove_dir_all(&paths.worktree_dir);
+    }
+
     // --- issue #490 (PRD fork#325 M3, Model B): the live-sibling clone gate ---
     //
     // Model A's equivalent (`src/ui.rs`'s `Action::SpawnPane` handler) consults
@@ -2043,6 +2137,73 @@ mod tests {
                  \x20\x20mkdir -p \"$dest/.git\"\n\
                  \x20\x20printf 'fatal: simulated clone failure \\033[31mhostile\\033[0m\\n' >&2\n\
                  \x20\x20exit 128\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Prepend a fake `git` to `PATH` that LOCKS a worktree the instant `git
+    /// worktree add` creates it -- synchronously, inside the same subprocess
+    /// call `create_worktree`'s `run_status_killable_args` awaits, so there
+    /// is no timing race against anything `handle_dispatch` does afterward
+    /// (recording the worktree, attempting the spawn, or -- issue #473's
+    /// target -- the rollback's own `git worktree remove --force`). Every
+    /// other invocation, including that eventual removal attempt, passes
+    /// straight through to the real `git`.
+    ///
+    /// Word-scanned rather than positional, mirroring
+    /// `with_git_clone_failing_with_hostile_stderr`'s own reasoning: matches
+    /// wherever `worktree` is immediately followed by `add`, and reads
+    /// `clone_dir`/`worktree_dir` off the values immediately following
+    /// `-C`/`add` respectively -- so the `-c core.fsmonitor=` hardening
+    /// `spawn_git_status_child` prepends to every call through this shared
+    /// core cannot shift the match off a fixed `$N` the way it did to an
+    /// earlier, positional version of that sibling stub.
+    #[cfg(unix)]
+    fn with_git_worktree_add_locking_the_new_worktree(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-worktree-add-lock-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 is_add=0\n\
+                 clone_dir=\"\"\n\
+                 worktree_dir=\"\"\n\
+                 prev=\"\"\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$prev\" = \"-C\" ]; then\n\
+                 \x20\x20\x20\x20clone_dir=\"$a\"\n\
+                 \x20\x20fi\n\
+                 \x20\x20if [ \"$prev\" = \"worktree\" ] && [ \"$a\" = \"add\" ]; then\n\
+                 \x20\x20\x20\x20is_add=1\n\
+                 \x20\x20fi\n\
+                 \x20\x20if [ \"$prev\" = \"add\" ]; then\n\
+                 \x20\x20\x20\x20worktree_dir=\"$a\"\n\
+                 \x20\x20fi\n\
+                 \x20\x20prev=\"$a\"\n\
+                 done\n\
+                 if [ \"$is_add\" = \"1\" ] && [ -n \"$worktree_dir\" ]; then\n\
+                 \x20\x20{real_git} \"$@\"\n\
+                 \x20\x20status=$?\n\
+                 \x20\x20if [ \"$status\" -eq 0 ]; then\n\
+                 \x20\x20\x20\x20{real_git} -C \"$clone_dir\" worktree lock -- \"$worktree_dir\" 1>&2\n\
+                 \x20\x20fi\n\
+                 \x20\x20exit \"$status\"\n\
                  fi\n\
                  exec {real_git} \"$@\"\n"
             ),
