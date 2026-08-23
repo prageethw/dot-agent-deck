@@ -36575,6 +36575,58 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #496 — point the gate at a well-formed response
+    /// carrying one `AgentRecord` whose `tab_membership` is
+    /// `Some(TabMembership::Orchestration { orchestration_cwd: None, .. })`,
+    /// the shape an older client (pre-`orchestration_cwd` field, which is
+    /// `#[serde(default)]` on the wire) sends. The per-record loop's
+    /// `let Some(TabMembership::Orchestration { orchestration_cwd: Some(cwd), .. }) = r.tab_membership else { continue; }`
+    /// treats this as "not a live sibling here" and silently skips the
+    /// record instead of refusing to answer, unlike the two sibling tests
+    /// above which correctly fail closed on an unreachable daemon or a
+    /// legacy `agents`-only response. Assert `Err`.
+    #[test]
+    fn root_checkout_has_live_sibling_fails_closed_on_orchestration_record_with_no_cwd() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let record = crate::agent_pty::AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "some-orchestration".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![record]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
+        assert!(
+            result.is_err(),
+            "an orchestration record with orchestration_cwd: None (an older client's \
+             shape) must fail the gate closed, not be silently skipped as 'not a live \
+             sibling here'; got {result:?}"
+        );
+    }
+
     /// Scenario: Build a `NewPaneRequest` for a real git repository with a
     /// typed Name (PRD fork#544 M2: Name is the sole input to the resolved
     /// workspace path — `003` characterizes only the pre-existing `req.dir`
