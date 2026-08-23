@@ -1311,7 +1311,7 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// above used NOT to extend to a live orchestration whose record reaches
 /// this loop with `tab_membership: None` or with a `tab_membership` that IS
 /// `Orchestration` but carries `orchestration_cwd: None`. Two distinct
-/// routes could produce a cwd-less orchestration record:
+/// routes could hide a live orchestration from this loop:
 ///
 /// 1. An OLDER CLIENT whose record omits `orchestration_cwd` altogether
 ///    (`TabMembership::Orchestration`'s field is `#[serde(default)]`, so a
@@ -1330,13 +1330,29 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 ///    boundary crossing (a same-uid peer already has arbitrary code
 ///    execution in this model), which is why this is tracked rather than
 ///    treated as a blocker. **Still open, deliberately out of scope for
-///    issue #496**: this route clamps `tab_membership` itself to `None`
-///    before it ever reaches this function, so there is nothing left here
-///    to distinguish an `Orchestration` record from — fixing it needs
-///    `sanitize_record_tab_membership` to preserve more information (e.g.
-///    a tombstone shape saying "this WAS an orchestration record, just an
-///    invalid one") rather than collapsing it to `None`, which is a
-///    separate design question left for a fresh follow-up issue.
+///    issue #496 — and unreachable from THIS function specifically, for two
+///    independent reasons** (issue #496 fix round, auditor A1; corrects an
+///    earlier claim that this function itself sits downstream of the
+///    sanitizer): first, this function bypasses
+///    `sanitize_record_tab_membership` entirely — it calls
+///    `send_daemon_request_blocking`, a raw synchronous socket round trip
+///    that never goes through the async `DaemonClient::list_agents`
+///    hydration path the sanitizer is wired into, so a clamped-to-`None`
+///    membership produced by that mechanism never reaches this loop.
+///    Second, the daemon-side producer never creates the clamped shape
+///    either: `spawn_agent` (`src/agent_pty.rs`) rejects the whole
+///    `StartAgent` outright when `validate_tab_membership` fails, rather
+///    than storing a nulled membership, so no record is ever created for
+///    `ListAgents` to echo. The remaining, purely theoretical shape — a
+///    buggy-or-hostile same-uid daemon emitting `tab_membership: None` on
+///    the wire directly — is indistinguishable from an ordinary
+///    non-orchestration pane and so cannot be failed closed on without
+///    `sanitize_record_tab_membership` growing a tombstone shape (e.g.
+///    "this WAS an orchestration record, just an invalid one") rather than
+///    collapsing it to `None` — a separate design question left for a
+///    fresh follow-up issue, whose fix would have to land on this raw path
+///    (or move this gate onto `DaemonClient::list_agents`), not on the
+///    sanitizer alone.
 ///
 /// So this doc comment's fail-closed claim now holds for route 1; route 2
 /// remains a real, tracked gap, not a claim that the whole function fails
@@ -1425,7 +1441,19 @@ pub(crate) fn root_checkout_has_live_sibling(
     let target_dir_canon =
         std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
 
+    // Issue #496 fix round (reviewer F2): a cwd-less record's `Err` is
+    // deferred rather than returned immediately, so the collision scan below
+    // always runs to completion (or to a definite `Ok(true)`) first. Without
+    // this, whether the function refuses or safely isolates depended on
+    // `agent_records`' numeric-id sort order — a cwd-less record sorting
+    // ahead of a record that would have matched `target_dir` short-circuited
+    // the loop before the genuine, already-safely-handled collision was ever
+    // seen. A determinable `Ok(true)` collision now always wins over a mere
+    // "can't tell" refusal, regardless of which record the daemon lists
+    // first; the fail-closed guarantee is unchanged, since no path below
+    // reaches `Ok(false)` while a cwd-less record was seen.
     let mut seen_cwds: HashSet<String> = HashSet::new();
+    let mut saw_unresolvable_cwd = false;
     for r in agent_records {
         let Some(TabMembership::Orchestration {
             orchestration_cwd, ..
@@ -1434,11 +1462,8 @@ pub(crate) fn root_checkout_has_live_sibling(
             continue;
         };
         let Some(cwd) = orchestration_cwd else {
-            return Err(
-                "a live orchestration record has no resolvable cwd — cannot determine \
-                 whether it collides with this checkout"
-                    .to_string(),
-            );
+            saw_unresolvable_cwd = true;
+            continue;
         };
         if !seen_cwds.insert(cwd.clone()) {
             continue;
@@ -1464,6 +1489,15 @@ pub(crate) fn root_checkout_has_live_sibling(
         if live_common == target_common {
             return Ok(true);
         }
+    }
+    if saw_unresolvable_cwd {
+        return Err(
+            "a live orchestration record has no resolvable cwd — cannot determine \
+             whether it collides with this checkout; close the older client's \
+             orchestration, or restart it under this build, before opening a \
+             second orchestration here"
+                .to_string(),
+        );
     }
     Ok(false)
 }
@@ -36635,11 +36669,69 @@ mod tests {
         );
 
         let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
-        assert!(
-            result.is_err(),
+        // Reviewer F3: assert the error's content, not just `is_err()` — every
+        // failure mode of this function returns `Err`, so a bare `is_err()`
+        // check would still pass green if this specific arm regressed (e.g.
+        // `with_crafted_response_daemon` failing to bind, or the daemon
+        // round trip erroring for an unrelated reason). "no resolvable cwd"
+        // is unique to this arm's message and distinguishes it from this
+        // function's other `Err` producers ("too old to report" and "could
+        // not reach the daemon").
+        let err = result.expect_err(
             "an orchestration record with orchestration_cwd: None (an older client's \
              shape) must fail the gate closed, not be silently skipped as 'not a live \
-             sibling here'; got {result:?}"
+             sibling here'",
+        );
+        assert!(
+            err.contains("no resolvable cwd"),
+            "expected the cwd-less-orchestration arm's message, got: {err}"
+        );
+    }
+
+    /// Scenario: Issue #496 reviewer F4 — the negative-side counterweight to
+    /// the test above. Point the gate at a well-formed response carrying one
+    /// `AgentRecord` whose `tab_membership` is `Some(TabMembership::Mode {
+    /// .. })` — a genuinely non-`Orchestration` member, the shape every
+    /// ordinary (non-orchestration) pane has. The per-record loop's
+    /// `let Some(TabMembership::Orchestration { .. }) = r.tab_membership else { continue; }`
+    /// must still treat this as "not a live sibling here" and `continue`,
+    /// not be swept into the new cwd-less-`Orchestration` `Err` arm above —
+    /// nothing else in `agent_records` matches, so the function must reach
+    /// its "no live sibling" success case, `Ok(false)`.
+    #[test]
+    fn root_checkout_has_live_sibling_ignores_non_orchestration_record() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let record = crate::agent_pty::AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Mode {
+                name: "some-mode".into(),
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![record]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
+        assert_eq!(
+            result,
+            Ok(false),
+            "a non-Orchestration tab_membership record (Mode) must still be \
+             skipped as 'not a live sibling here', not trigger the cwd-less-\
+             Orchestration Err arm; got {result:?}"
         );
     }
 
