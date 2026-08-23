@@ -1142,3 +1142,73 @@ fn hook_rule_identification_024_symlinked_settings_are_refused_not_replaced() {
          found — the deck must not write outside the directory it was pointed at"
     );
 }
+
+/// Fork issue #426: `shell_quote_if_needed`'s Windows arm (`src/hooks_manage.rs`)
+/// wraps a path needing quoting in `"..."` and escapes an embedded `"` to
+/// `\"` — but `\` is not a `cmd.exe` quote-escape, so the escaped `"` still
+/// counts as a real quote character toward `cmd.exe`'s own `/C` quote-parity
+/// check (`cmd /?`: unless the command line has exactly two quote characters
+/// naming an existing executable, `cmd.exe` strips the leading quote and the
+/// LAST quote character anywhere on the line, then parses what remains with
+/// its normal quote-toggling grammar). Two embedded quotes placed adjacent to
+/// each other, both ahead of an injected payload, survive that strip as a
+/// self-closing empty quoted region — so the `&` immediately after them is
+/// left unquoted and reaches `cmd.exe` as a live command separator. This was
+/// flagged twice in PR #423's review and never fixed; #423 patched the
+/// `watch_invocation` and `codex_hooks_manage::build_command` call sites, not
+/// this one.
+///
+/// Scenario: Install deck hooks under a binary path containing two adjacent
+/// embedded `"` characters immediately ahead of a `& type nul > … &`
+/// injection probe. The installed rule's `command` string is run through a
+/// REAL `cmd.exe /C`, mirroring `mode_manager`'s
+/// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe` — a
+/// benign marker-file write stands in for a real payload so a passing
+/// "nothing was injected" assertion needs no GUI process. RED today: the
+/// marker file IS created, proving the injected `type nul > injected.marker`
+/// ran as its own, unquoted `cmd.exe` command.
+#[cfg(windows)]
+#[test]
+fn hook_rule_identification_025_windows_embedded_quote_in_binary_path_does_not_permit_command_injection()
+ {
+    use std::os::windows::process::CommandExt;
+
+    let scratch = test_temp::tempdir().expect("create scratch tempdir");
+    let marker = scratch.path().join("injected.marker");
+
+    // Two adjacent embedded `"` characters ahead of the payload: after
+    // `shell_quote_if_needed` escapes each to `\"` and wraps the whole path
+    // in `"..."`, the command line carries 4 quote characters total, which
+    // triggers cmd.exe's destructive strip (not exactly two quotes naming an
+    // executable). Stripping the leading quote and the LAST quote on the
+    // line leaves these two embedded quotes to close an empty quoted region
+    // against each other, which un-quotes the `&` that follows.
+    let binary_path = r#"C:\deck\dot-agent-deck.exe"" & type nul > injected.marker & rem"#;
+
+    let (_dir, path) = settings_path();
+    install_to(&path, binary_path).expect("install");
+
+    let commands = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        commands.len(),
+        1,
+        "expected exactly one PreToolUse rule; got {commands:?}"
+    );
+    let line = &commands[0];
+
+    let output = std::process::Command::new("cmd.exe")
+        .raw_arg("/C")
+        .raw_arg(line)
+        .current_dir(scratch.path())
+        .output()
+        .expect("cmd.exe should run");
+
+    assert!(
+        !marker.exists(),
+        "an embedded '\"' in the binary path escaped shell_quote_if_needed's \
+         quoting and let `& type nul > injected.marker &` run as a separate \
+         cmd.exe command.\nline: {line}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
