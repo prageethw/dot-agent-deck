@@ -113,8 +113,9 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
     },
     PermissionSite {
         function: "ensure_owner_only_dir",
-        unix: "DirBuilder::mode(0o700) plus an unconditional set_permissions(0o700) that repairs \
-               a pre-existing loose directory",
+        unix: "symlink_metadata(2) refuses a symlink planted at the target path (issue #491) \
+               before DirBuilder::mode(0o700) plus an unconditional set_permissions(0o700) \
+               repairs a pre-existing loose directory",
         windows: WindowsCounterpart::Enforced(
             "create_dir_all plus an unconditional SetNamedSecurityInfoW protected \
              current-user-only DACL — the same repair-an-existing-dir semantics",
