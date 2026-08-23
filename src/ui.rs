@@ -1307,18 +1307,20 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// deleted per this function's own doc comment below.
 ///
 /// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1; widened fix round
-/// 4, auditor D2), not yet fixed, tracked as issue #496: the fail-closed
-/// guarantee above does NOT extend to a live orchestration whose record
-/// reaches this loop with `tab_membership: None`. Two distinct routes
-/// produce that shape, both silently falling through the per-record loop's
-/// `else { continue; }` arm below — invisible to this gate, treated exactly
-/// like "no live sibling" for that entry, even though a genuine live
-/// orchestration sits behind it:
+/// 4, auditor D2; narrowed by issue #496's fix): the fail-closed guarantee
+/// above used NOT to extend to a live orchestration whose record reaches
+/// this loop with `tab_membership: None` or with a `tab_membership` that IS
+/// `Orchestration` but carries `orchestration_cwd: None`. Two distinct
+/// routes could produce a cwd-less orchestration record:
 ///
 /// 1. An OLDER CLIENT whose record omits `orchestration_cwd` altogether
 ///    (`TabMembership::Orchestration`'s field is `#[serde(default)]`, so a
 ///    pre-#325 client's record deserializes with it as `None` rather than
-///    failing to parse at all).
+///    failing to parse at all). **Fixed by issue #496**: the per-record loop
+///    now distinguishes "this record IS an `Orchestration` member but we
+///    can't tell its cwd" from "this record isn't an `Orchestration` member
+///    at all" — the former now returns `Err` (fails closed) instead of
+///    silently `continue`-ing.
 /// 2. `sanitize_record_tab_membership` (`src/daemon_client.rs`) clamping the
 ///    WHOLE `tab_membership` to `None` when
 ///    [`crate::agent_pty::validate_tab_membership`] rejects it — which it
@@ -1327,11 +1329,19 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 ///    control-byte-bearing `orchestration_cwd` in `StartAgent`; not a
 ///    boundary crossing (a same-uid peer already has arbitrary code
 ///    execution in this model), which is why this is tracked rather than
-///    treated as a blocker.
+///    treated as a blocker. **Still open, deliberately out of scope for
+///    issue #496**: this route clamps `tab_membership` itself to `None`
+///    before it ever reaches this function, so there is nothing left here
+///    to distinguish an `Orchestration` record from — fixing it needs
+///    `sanitize_record_tab_membership` to preserve more information (e.g.
+///    a tombstone shape saying "this WAS an orchestration record, just an
+///    invalid one") rather than collapsing it to `None`, which is a
+///    separate design question left for a fresh follow-up issue.
 ///
-/// This is a real, tracked gap on these two axes, not a claim that the whole
-/// function fails open; every other failure mode this doc comment describes
-/// still fails closed as stated.
+/// So this doc comment's fail-closed claim now holds for route 1; route 2
+/// remains a real, tracked gap, not a claim that the whole function fails
+/// open — every other failure mode this doc comment describes still fails
+/// closed as stated.
 ///
 /// A single LIVE entry whose own `git-common-dir` fails to resolve (e.g. its
 /// worktree was removed after the daemon's record went stale) is skipped
@@ -1418,11 +1428,17 @@ pub(crate) fn root_checkout_has_live_sibling(
     let mut seen_cwds: HashSet<String> = HashSet::new();
     for r in agent_records {
         let Some(TabMembership::Orchestration {
-            orchestration_cwd: Some(cwd),
-            ..
+            orchestration_cwd, ..
         }) = r.tab_membership
         else {
             continue;
+        };
+        let Some(cwd) = orchestration_cwd else {
+            return Err(
+                "a live orchestration record has no resolvable cwd — cannot determine \
+                 whether it collides with this checkout"
+                    .to_string(),
+            );
         };
         if !seen_cwds.insert(cwd.clone()) {
             continue;
