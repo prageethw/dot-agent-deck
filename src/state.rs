@@ -3837,17 +3837,24 @@ async fn dispatch_one_owned(
                     let notice_registry = Arc::clone(&registry);
                     let notice_pane = orchestrator_pane_id.clone();
                     let notice_orchestration = orchestration.clone();
-                    // Resolved immediately before the call; a `None` here means
-                    // no live agent currently owns the orchestrator pane, in
-                    // which case `writer_target_for_pane` inside the guarded
-                    // write independently observes the same absence and refuses
-                    // with `NoLiveTarget` before this identity is ever compared
-                    // — so the empty-string placeholder is unreachable except as
-                    // a (safely refused) mismatch in the narrow TOCTOU window
-                    // where an agent attaches between this read and the write.
-                    let current_orchestrator_agent_id = registry
-                        .pane_current_agent_id(&orchestrator_pane_id)
-                        .unwrap_or_default();
+                    let Some(current_orchestrator_agent_id) =
+                        registry.pane_current_agent_id(&orchestrator_pane_id)
+                    else {
+                        warn!(
+                            pane_id = %orchestrator_pane_id,
+                            role = %target_role,
+                            "delegate: dead-replacement notice not armed: no live agent owns the \
+                             orchestrator pane, so the notice could not be bound to a verifiable \
+                             delivery target"
+                        );
+                        release_undelivered_commission(
+                            &registry,
+                            &pane_id,
+                            &target_role,
+                            "the clear=true replacement worker never became live",
+                        );
+                        return;
+                    };
                     match registry
                         .write_notice_guarded(
                             &orchestrator_pane_id,
@@ -8717,15 +8724,14 @@ clear = false
     }
 
     /// Issue #465 auditor confirmation, finding M1: pin `dispatch_one_owned`'s
-    /// OWN refusal — the fix itself, at `src/state.rs:3348-3377` — not merely the
-    /// primitive's permissive-on-`None` default pinned from the other side by
-    /// `guarded_send_with_no_expected_identity_writes_to_the_live_pane` in
+    /// OWN refusal — the fix itself, at `src/state.rs:4195-4225` — not merely
+    /// the primitive's own mismatch refusal pinned from the other side by
+    /// `guarded_send_with_mismatched_expected_identity_is_refused` in
     /// `agent_pty.rs`. When the worker identity cannot be resolved (no live
     /// agent owns the pane, and no `clear = true` respawn ran to mint one),
     /// `dispatch_one_owned` must take the `else` arm and synthesize
     /// `GuardedSend::NoLiveTarget` itself — WITHOUT ever calling
-    /// `AgentPtyRegistry::write_and_submit_guarded_detailed` and handing the
-    /// permissive primitive a bare `None`.
+    /// `AgentPtyRegistry::write_and_submit_guarded_detailed` at all.
     ///
     /// A regression that "simplified" the `if let Some(worker_agent_id) = ...
     /// else { .. }` guard back to calling the primitive with

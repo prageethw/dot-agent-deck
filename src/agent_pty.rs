@@ -12225,10 +12225,10 @@ mod spawn_tests {
     #[tokio::test]
     async fn guarded_send_with_mismatched_expected_identity_is_refused() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        // `spawn_agent` returns the REGISTRY's own agent id — a UUID, not the
-        // `pane_id_env` string — and `AgentPtyRegistry::snapshot` reads
-        // scrollback by that agent id, so it has to be captured here rather
-        // than discarded.
+        // `spawn_agent` returns the REGISTRY's own agent id — a decimal
+        // integer (`inner.next_id.to_string()`), not the `pane_id_env` string
+        // — and `AgentPtyRegistry::snapshot` reads scrollback by that agent
+        // id, so it has to be captured here rather than discarded.
         let agent_id = reg
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
