@@ -43,6 +43,32 @@ pub(crate) const MAX_FIRST_PROMPTS: usize = 3;
 /// model could push the identity off the title entirely.
 const MODEL_MAX_LEN: usize = 40;
 
+/// Issue #410: the display cap for `SessionState.display_name` ingested
+/// from `DISPLAY_NAME_METADATA_KEY`. Bound to
+/// [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`] — the cap
+/// [`crate::agent_pty::is_valid_display_name`] already enforces on the
+/// rename path — rather than a separate literal, so ingest and rename
+/// can't drift apart into two different rules for the same field.
+const DISPLAY_NAME_MAX_LEN: usize = crate::agent_pty::DISPLAY_NAME_MAX_LEN;
+
+/// Truncate `s` to at most `max_bytes`, snapping back to the nearest char
+/// boundary so a multi-byte UTF-8 sequence is never split. Unlike
+/// [`crate::prompt_delivery::truncate_on_char_boundary`], appends no
+/// ellipsis: `display_name` is a stored identity value compared/rendered
+/// elsewhere as-is, so the clamped result stays a literal prefix of its
+/// (sanitized) input rather than gaining a trailing marker. Mirrors
+/// `daemon_client::clamp_bytes`'s identical shape at the wire-echo seam.
+fn clamp_display_name_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 /// PRD #92 F9 followup-6: how long the post-respawn dispatch task
 /// waits for the freshly-spawned agent to emit a `SessionStart` hook
 /// event before falling back to writing the prompt anyway.
@@ -6763,12 +6789,20 @@ impl AppState {
         // metadata refreshes it (the synthetic live-surface `SessionStart`
         // sets it; ordinary hooks omit the key and leave it untouched). This
         // takes precedence over any name inherited from a superseded session.
-        if let Some(name) = event
-            .metadata
-            .get(DISPLAY_NAME_METADATA_KEY)
-            .filter(|n| !n.is_empty())
-        {
-            session.display_name = Some(name.clone());
+        //
+        // Issue #410: sanitize (`Cf` format chars, per the `model` handling
+        // above) BEFORE truncating, so the length bound applies to what will
+        // actually render, then check emptiness on the sanitized-and-clamped
+        // result. Uses a plain byte clamp with no appended ellipsis (unlike
+        // `truncate_on_char_boundary`) — this is a stored identity value, not
+        // a rendered label with its own width budget, so the truncated value
+        // stays a literal prefix of the sanitized string.
+        if let Some(name) = event.metadata.get(DISPLAY_NAME_METADATA_KEY) {
+            let sanitized = crate::terminal_sanitize::sanitize_for_terminal_display(name);
+            let clamped = clamp_display_name_bytes(&sanitized, DISPLAY_NAME_MAX_LEN);
+            if !clamped.is_empty() {
+                session.display_name = Some(clamped);
+            }
         }
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
