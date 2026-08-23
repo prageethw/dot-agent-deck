@@ -1610,7 +1610,14 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                         Some(SendResult::Applied),
                         true,
                     )
-                && unattached_session_guard_observation == (Some(SendResult::Stale), false)
+                // PRD #20 R20-003 finding #4 (see `compute_write_and_submit_outcome`'s
+                // doc comment in `src/daemon_protocol.rs`): the strict "reject a
+                // None-named session" rule is scoped to a LIVE INTERACTIVE
+                // (attached) pane, deliberately — an unattached/headless delivery
+                // whose agent identity is confirmed proceeds regardless of whether
+                // a current session is recorded, since finding #4's threat is a
+                // stale prompt surfacing in a conversation someone is watching.
+                && unattached_session_guard_observation == (Some(SendResult::Applied), true)
                 && sessionless_observation == (Some(SendResult::Applied), true),
             "guarded paned delivery must fail closed on absent identity without weakening valid sends; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target}), missing_agent={missing_agent_observation:?}, session_guard={session_guard_observation:?}, unattached_session_guard={unattached_session_guard_observation:?}, sessionless={sessionless_observation:?}",
             same_agent_result,
