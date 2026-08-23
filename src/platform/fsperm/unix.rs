@@ -49,6 +49,25 @@ pub fn with_socket_umask<T>(f: impl FnOnce() -> T) -> T {
 /// first-time callers don't fight; real I/O errors still surface.
 pub fn ensure_owner_only_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    // `symlink_metadata` (lstat semantics) does not follow the final
+    // component, unlike `metadata`/`Path::is_dir` — so this is the one stat
+    // that can see a symlink planted at `dir` itself rather than the real
+    // directory it points at. A `NotFound` error here is the ordinary
+    // first-time-creation case and must fall through to `builder.create`
+    // below, not be treated as a refusal (issue #491).
+    if let Ok(meta) = std::fs::symlink_metadata(dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to secure {}: it is a symlink, not a real directory",
+                dir.display()
+            ),
+        ));
+    }
+
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder.create(dir)?;
