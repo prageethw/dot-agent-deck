@@ -653,6 +653,76 @@ mod tests {
         );
     }
 
+    /// Fork issue #429: the identical vulnerability shape fork issue #423
+    /// already closed for the Windows arm
+    /// (`watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
+    /// above), but on the Unix delivery path and with a different set of
+    /// dangerous bytes. `watch_invocation`'s output isn't read by `sh`
+    /// through its own grammar first — it's typed into a mode pane's PTY
+    /// keystroke-by-keystroke (`write_to_pane`), and the tty line
+    /// discipline consumes several control characters *below* the shell's
+    /// own grammar before the shell ever sees them: `ETX`/`\x03` (SIGINT),
+    /// `NAK`/`\x15` and `ETB`/`\x17` (kill-line / word-erase under many
+    /// `stty` configurations), and `EOT`/`\x04` (end-of-input). A `command`
+    /// value containing one of these discards everything the terminal
+    /// driver ate — including the deck's own program token and the
+    /// `export … && printf … &&` prefix `write_to_pane` types ahead of this
+    /// line — landing the remainder at a fresh prompt where the trailing
+    /// newline submits it as an attacker-chosen command.
+    ///
+    /// Deliberately not a copy of the Windows fix: a real newline is
+    /// genuinely safe here today
+    /// (`watch_invocation_preserves_real_newline_posix` above), so whatever
+    /// closes this off must target these specific control characters
+    /// without breaking that.
+    ///
+    /// **Honesty caveat, same as the Windows sibling's**: `sh` here is
+    /// driven via `-c <line>` as a single process argument — not the
+    /// interactive-PTY line discipline a real watch pane types into — so
+    /// this proves the emitted line contains no raw control character and
+    /// behaves safely once handed to a real `sh` that way, but it cannot
+    /// reproduce, and does not prove, the PTY-level consumption itself;
+    /// that remains reasoned rather than executed.
+    #[cfg(unix)]
+    #[test]
+    fn watch_invocation_neutralizes_control_characters_through_real_shell_posix() {
+        for command in [
+            "npm run dev\x03touch injected.marker",
+            "npm run dev\x15touch injected.marker",
+            "npm run dev\x17touch injected.marker",
+            "npm run dev\x04touch injected.marker",
+        ] {
+            let scratch = tempfile::tempdir().expect("scratch tempdir");
+            let marker = scratch.path().join("injected.marker");
+
+            let exe = scratch.path().join("dot-agent-deck");
+            let line = watch_invocation(&exe, 5, command);
+
+            assert!(
+                !line.chars().any(|c| c.is_control() && c != '\n'),
+                "watch_invocation must never emit a raw control character \
+                 (other than a legitimate real newline) into the shell \
+                 command line\ncommand: {command:?}\nline: {line:?}"
+            );
+
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&line)
+                .current_dir(scratch.path())
+                .output()
+                .expect("sh -c should run");
+
+            assert!(
+                !marker.exists(),
+                "a control character in `command` was not neutralized and \
+                 `touch injected.marker` ran as its own command.\n\
+                 command: {command:?}\nline: {line}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     /// Runs `quote_shell_arg(value)` through a real `sh -c` invocation via a
     /// sentinel-prefixed `printf` and returns what the shell recovered.
     ///
