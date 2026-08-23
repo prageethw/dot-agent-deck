@@ -283,17 +283,22 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
 #[spec("session/live/012")]
 #[test]
 fn live_012_agent_event_status_survives_real_tui_reconnect() {
-    const PANE_ID: &str = "pane-agent-event-reconnect";
     const LABEL: &str = "agent-event-reconnect-42";
 
     let daemon = spawn_daemon_serve(None, "0");
+    // PRD fork#365 M2: the daemon mints and owns `pane_id`, so this reads
+    // back the actual minted value via `AttachResponse::pane_id` rather
+    // than assume its proposed `DOT_AGENT_DECK_PANE_ID` survives.
     let response = daemon
         .send_attach_request(&AttachRequest::StartAgent {
             command: Some("sh -c 'sleep 600'".into()),
             cwd: None,
             rows: 24,
             cols: 80,
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE_ID.into())],
+            env: vec![(
+                "DOT_AGENT_DECK_PANE_ID".into(),
+                "pane-agent-event-reconnect".into(),
+            )],
             display_name: Some(LABEL.into()),
             tab_membership: None,
             agent_type: Some(AgentType::Pi),
@@ -306,6 +311,11 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
         "StartAgent should succeed, got error: {:?}",
         response.error
     );
+    let pane_id = response
+        .pane_id
+        .clone()
+        .expect("PRD fork#365 daemon always mints and returns a pane_id");
+    let pane_id = pane_id.as_str();
     let records = daemon.wait_for_agent_count(1, Duration::from_secs(5));
     let agent_id = records
         .first()
@@ -316,7 +326,7 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
     let first_tui = launch_tui_against(&daemon);
     first_tui.wait_for_string(LABEL);
 
-    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), "running");
+    let output = daemon.run_agent_event(pane_id, Some(&agent_id), "running");
     assert!(
         output.status.success(),
         "the real non-SessionStart `agent-event --type running` CLI failed: status={:?} stdout={:?} stderr={:?}",
