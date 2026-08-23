@@ -306,10 +306,11 @@ fn hook_rule_identification_007_old_flat_format_rule_is_recognised() {
 /// its quoted form, and must be fully removable by uninstall — mirroring
 /// `devin_hooks_manage`'s `install_quotes_a_binary_path_with_spaces` precedent
 /// (`src/devin_hooks_manage.rs:726-738`). The expected quoting form is
-/// platform-specific — POSIX single quotes on Unix, `cmd.exe` double quotes on
-/// Windows, per `shell_quote_if_needed`'s two `#[cfg]` arms
-/// (`src/hooks_manage.rs:147-184`) — so this pins the actual mechanism per
-/// platform rather than only the fact that quoting happened.
+/// platform-specific — POSIX single quotes on Unix, `cmd.exe` caret-escaping
+/// (never a leading quote — fork issue #426) on Windows via
+/// [`crate::platform::shell::escape_cmd_exe_program`], per
+/// `shell_quote_if_needed`'s two `#[cfg]` arms — so this pins the actual
+/// mechanism per platform rather than only the fact that quoting happened.
 #[test]
 fn hook_rule_identification_008_spaced_binary_path_round_trips() {
     let (_dir, path) = settings_path();
@@ -317,7 +318,7 @@ fn hook_rule_identification_008_spaced_binary_path_round_trips() {
     #[cfg(unix)]
     let expected_command = "'/Applications/My Deck/dot-agent-deck' hook --agent claude-code";
     #[cfg(windows)]
-    let expected_command = "\"/Applications/My Deck/dot-agent-deck\" hook --agent claude-code";
+    let expected_command = "/Applications/My^ Deck/dot-agent-deck hook --agent claude-code";
 
     install_to(&path, binary).expect("install");
     let after_one = rule_commands(&read_settings(&path), "PreToolUse");
@@ -578,29 +579,32 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
 }
 
 /// Scenario: A binary path containing `%` or `!` — both `cmd.exe`-special for
-/// variable expansion — must be double-quoted on Windows even though neither
+/// variable expansion — must be caret-escaped on Windows even though neither
 /// character trips the POSIX safe-set check and `~` (also present here, but
-/// NOT `cmd.exe`-special) does not force quoting on its own. Closes a gap:
-/// nothing exercised this arm of `shell_quote_if_needed`'s Windows safe set
-/// before now, and `cargo clippy` on a Unix box cannot even compile the
+/// NOT `cmd.exe`-special) does not force escaping on its own. Escaping here is
+/// [`crate::platform::shell::escape_cmd_exe_program`]'s caret-per-character
+/// scheme (fork issue #426), never a `"..."` wrap — closes a gap: nothing
+/// exercised this arm of `shell_quote_if_needed`'s Windows safe set before
+/// now, and `cargo clippy` on a Unix box cannot even compile the
 /// `#[cfg(windows)]` arm — CI's `build-windows` job is the only thing that
 /// sees it.
 #[cfg(windows)]
 #[test]
-fn hook_rule_identification_015_windows_percent_and_bang_are_quoted() {
+fn hook_rule_identification_015_windows_percent_and_bang_are_caret_escaped() {
     let (_dir, path) = settings_path();
     let binary = r"C:\Tools\RUNNER~1\100%!\dot-agent-deck.exe";
-    let expected_command = format!("\"{binary}\" hook --agent claude-code");
+    let escaped_binary = r"C:\Tools\RUNNER~1\100^%^!\dot-agent-deck.exe";
+    let expected_command = format!("{escaped_binary} hook --agent claude-code");
 
     install_to(&path, binary).expect("install");
     let after_install = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_install,
         vec![expected_command.clone()],
-        "a path containing '%' or '!' must be double-quoted on Windows because both \
-         fall outside the safe set, even though '~' alone would not force quoting \
-         — the quoting itself does not neutralise cmd.exe's expansion of '%VAR%' \
-         or (under delayed expansion) '!VAR!', which the quotes do not prevent; \
+        "a path containing '%' or '!' must be caret-escaped on Windows because both \
+         fall outside the safe set, even though '~' alone would not force escaping \
+         — the escaping itself does not neutralise cmd.exe's expansion of '%VAR%' \
+         or (under delayed expansion) '!VAR!', which the carets do not prevent; \
          got {after_install:?}"
     );
 
@@ -608,7 +612,7 @@ fn hook_rule_identification_015_windows_percent_and_bang_are_quoted() {
     let remaining = total_rule_count(&read_settings(&path));
     assert_eq!(
         remaining, 0,
-        "a Windows-quoted path containing '%'/'!' must still be fully removable \
+        "a Windows-escaped path containing '%'/'!' must still be fully removable \
          by uninstall; {remaining} remained"
     );
 }

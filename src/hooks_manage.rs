@@ -296,42 +296,38 @@ fn shell_quote_if_needed(path: &str) -> String {
     }
 }
 
-/// Double-quote `path` for `cmd.exe` only when it contains a character outside
-/// a conservative safe set; otherwise return it unchanged. `~` is NOT special
-/// to `cmd.exe` (unlike POSIX, where it triggers home-directory expansion), so
-/// it is in the safe set here — a real Windows temp path such as
-/// `C:\Users\RUNNER~1\...\dot-agent-deck` needs no quoting at all.
-///
-/// `%` and `!` are excluded from the safe set, but excluding them does NOT
-/// resolve them — the same species of over-claiming comment corrected as H3
-/// on [`read_settings_lenient`] above. `cmd.exe` expands `%VAR%` even *inside*
-/// double quotes, and `!VAR!` under delayed expansion; wrapping the path in
-/// quotes here changes neither. What quoting actually buys is limited to
-/// spaces and the other characters outside the safe set — a path containing a
-/// literal `%` or `!` is written through with that character unresolved,
-/// quoted or not.
+/// Escape `path` for the leading-program-token position of a `cmd.exe`
+/// command line. Delegates to
+/// [`crate::platform::shell::escape_cmd_exe_program`] rather than this
+/// function's former bespoke `"..."`-wrap-with-backslash-escaping scheme,
+/// which was unsafe against `cmd.exe`'s own quote-parity fallback: a
+/// backslash-escaped embedded `"` still counts toward the total quote count
+/// `cmd.exe` tallies on the whole line, so a `binary_path` containing two
+/// adjacent quotes ahead of injected shell syntax could push that count past
+/// 2 and trigger `cmd.exe`'s destructive leading/trailing-quote strip,
+/// unquoting (and thereby executing) the injected payload (fork issue #426).
+/// `escape_cmd_exe_program` closes this class by construction — it never
+/// emits a leading quote at all, caret-escaping whitespace and
+/// metacharacters instead — the same function `mode_manager::watch_invocation`
+/// already uses for the analogous leading-program-token position.
 #[cfg(windows)]
 fn shell_quote_if_needed(path: &str) -> String {
-    fn is_safe(b: u8) -> bool {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'\\' | b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b',' | b'~'
-            )
-    }
-    if !path.is_empty() && path.bytes().all(is_safe) {
-        path.to_string()
-    } else {
-        format!("\"{}\"", path.replace('"', "\\\""))
-    }
+    crate::platform::shell::escape_cmd_exe_program(path)
 }
 
 /// Undo [`shell_quote_if_needed`]: strip a single- or double-quoted wrapper
-/// and unescape it back to the raw path, or return `exe` unchanged if it was
-/// never quoted. Tries BOTH quoting forms regardless of platform — not just
-/// the one this platform's writer produces — so a settings file written on
-/// one platform and read on another is not stranded, mirroring `_009`'s
-/// "a historical unquoted rule must still be recognised" principle.
+/// and unescape it back to the raw path, undo `cmd.exe` caret-escaping
+/// ([`crate::platform::shell::escape_cmd_exe_program`], the current Windows
+/// writer — fork issue #426), or return `exe` unchanged if it was never
+/// quoted or escaped. Tries every form regardless of platform — not just the
+/// one this platform's writer currently produces — so a settings file written
+/// on one platform (or by a pre-#426 Windows build, which still emitted the
+/// `"..."` wrap) and read on another is not stranded, mirroring `_009`'s
+/// "a historical unquoted rule must still be recognised" principle. This
+/// recovery is used only for identifying an already-installed rule's binary
+/// (dedup, coexistence, staleness) — never for anything that reaches a real
+/// shell — so a caret in a POSIX-written path being misread as escaping is a
+/// (very unlikely) identification miss, not a security concern.
 fn unquote_if_needed(exe: &str) -> std::borrow::Cow<'_, str> {
     if let Some(inner) = exe.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
         return std::borrow::Cow::Owned(inner.replace(r"'\''", "'"));
@@ -339,7 +335,36 @@ fn unquote_if_needed(exe: &str) -> std::borrow::Cow<'_, str> {
     if let Some(inner) = exe.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         return std::borrow::Cow::Owned(inner.replace("\\\"", "\""));
     }
+    if exe.contains('^') {
+        return std::borrow::Cow::Owned(unescape_cmd_exe_carets(exe));
+    }
     std::borrow::Cow::Borrowed(exe)
+}
+
+/// Undo [`crate::platform::shell::escape_cmd_exe_program`]'s caret-escaping:
+/// a `^` immediately followed by one of the chars that function escapes is
+/// the escape sequence for that literal char; any other `^` (there should be
+/// none, since a literal `^` is itself always escaped to `^^`) passes
+/// through unchanged, which keeps this a safe no-op on input that was never
+/// caret-escaped at all.
+fn unescape_cmd_exe_carets(s: &str) -> String {
+    const ESCAPED: [char; 14] = [
+        ' ', '"', '^', '&', '|', '<', '>', '(', ')', ',', ';', '=', '%', '!',
+    ];
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '^'
+            && let Some(&next) = chars.peek()
+            && ESCAPED.contains(&next)
+        {
+            out.push(next);
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Ensure `settings["hooks"]` is an object and return a mutable reference to it.
