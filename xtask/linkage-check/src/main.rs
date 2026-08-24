@@ -5,10 +5,11 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the nine checks
-//!   listed in Decision 7 + Decision 30 (+ issue #322 + fork #148):
+//!   (issue #557; see [`repo_state`]), then performs the eleven checks
+//!   listed in Decision 7 + Decision 30 (+ issue #322 + fork #148 + issue
+//!   #259):
 //!
-//!   The preflight is deliberately not one of the ten numbered checks: it answers
+//!   The preflight is deliberately not one of the eleven numbered checks: it answers
 //!   "is this repository sane to reason about", a different question from
 //!   "does the catalog match the tests", and it runs first so a repository
 //!   in a state that would misdiagnose the checks below is caught before
@@ -111,6 +112,16 @@ use regex::Regex;
 const CATALOG_PATH: &str = "tests/CATALOG.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
+
+/// Total numbered checks this tool performs (the repository-state preflight
+/// is deliberately not one of them — see the module doc). One literal for
+/// one fact, rather than the three that used to drift independently: the
+/// module doc's prose said "nine" and "ten" while the success line below
+/// printed "9 rules", and issue #259 added an eleventh check without
+/// touching any of them. The same shape as `work_type`'s own (private,
+/// unrelated, five-rule) `RULE_COUNT`, which exists for the identical
+/// reason one module over.
+const CHECK_COUNT: usize = 11;
 
 /// Check 8 (issue #322): why a bare `tempfile` constructor is forbidden under
 /// `tests/`, spelled out here because the violation is invisible at the call
@@ -665,22 +676,44 @@ fn main() -> ExitCode {
     // the compiler). The broader "why does this branch touch this file"
     // heuristic issue #259 also raises stays explicit future work, not
     // attempted here.
-    match work_type::resolve_base(None, &root) {
-        Ok(base_sha) => failures.extend(
-            work_type::check_resurrected_fragments(&root, &base_sha)
-                .into_iter()
-                .map(|v| format!("[11] {v}")),
-        ),
-        Err(e) => failures.push(format!(
-            "[11] could not resolve the merge base against {} to check for resurrected \
-             changelog fragments: {e}",
-            work_type::DEFAULT_BASE
-        )),
-    }
+    // B1 (issue #259 fix round): an unresolvable base (no `origin/main`, not
+    // a git repository at all, …) is a SKIP, not a failure — matching
+    // `repo_state`'s preflight five lines above `main()`, not the "fail
+    // unconditionally" shape `duplicate_catalog_id.rs`'s
+    // `linkage_check_passes_once_the_duplicate_heading_is_resolved` control
+    // test exists specifically to forbid. The skip is still printed to
+    // stderr, attributably, so it cannot decay into the silent-success shape
+    // `work_type`'s own module doc warns `resolve_base` callers against.
+    let check_11_fragments_checked: Option<usize> = match work_type::resolve_base(None, &root) {
+        Ok(base_sha) => {
+            let fragment_count = work_type::collect_added_fragments(&root, &base_sha)
+                .map(|f| f.len())
+                .unwrap_or(0);
+            failures.extend(
+                work_type::check_resurrected_fragments(&root, &base_sha)
+                    .into_iter()
+                    .map(|v| format!("[11] {v}")),
+            );
+            Some(fragment_count)
+        }
+        Err(e) => {
+            eprintln!(
+                "linkage-check: [11] skipped (could not resolve base {:?} to check for \
+                 resurrected changelog fragments): {e}",
+                work_type::DEFAULT_BASE
+            );
+            None
+        }
+    };
 
     if failures.is_empty() {
+        let check_11_note = match check_11_fragments_checked {
+            Some(n) => format!(", {n} added changelog fragment(s) checked against CHANGELOG.md"),
+            None => ", check 11 skipped (no resolvable base)".to_string(),
+        };
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 9 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, {CHECK_COUNT} \
+             rules{check_11_note})",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
