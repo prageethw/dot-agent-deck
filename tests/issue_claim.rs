@@ -2129,3 +2129,218 @@ fn issue_claim_028_comment_naming_a_non_assignee_removes_nobody() {
         fx.gh_calls_raw()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #286 (RED half) — `issue claim-check <n> [--repo <owner/name>]`, a
+// NEW, READ-ONLY subcommand that reuses `issue claim`'s own
+// `resolve_caller_identity` + `read_current_claim` + `decide_claim` to report
+// the SAME lock decision without ever writing a comment, a label, or an
+// assignee. This is the mechanical check a Claude Code `PreToolUse` hook will
+// shell out to (issue #286) so the hook's identity logic can never drift from
+// the deck's own — it must never itself become a second, independent
+// implementation of "who holds this issue?" (the exact "two guards out of
+// sync" failure mode fork #174 already warns about). The subcommand does not
+// exist yet: `clap` currently rejects `issue claim-check ...` as an
+// unrecognized subcommand, so these four tests are RED on a parse failure
+// today and must fail on their actual read-only/exit-code assertions once
+// the coder wires it up — not on argument parsing.
+// ---------------------------------------------------------------------------
+
+/// Scenario: An unlabelled issue (no `in-progress` label, no claim comment)
+/// is checked with `issue claim-check <n> --repo <repo>` from a linked
+/// worktree. Assert the check exits 0 (nobody holds it, so this identity may
+/// proceed — `ClaimDecision::Claim`) and that every `gh` call it made is
+/// read-only: no `gh issue comment`, no `--add-label`, no
+/// `--add-assignee`/`--remove-assignee` — unlike the mutating `issue claim`,
+/// which would have written a comment, a label, and an assignee here.
+#[spec("issue/claim/029")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_029_claim_check_on_unlabelled_issue_reports_ok_and_writes_nothing() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    // Deliberately no seeding at all: a fresh, unlabelled issue.
+
+    let wt = fx.add_worktree("wt-029", "claim-029-branch");
+    fx.mark_owned(&wt, "orchestration:orch-029");
+    fx.set_login("dana");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "claim-check", "29", "--repo", repo],
+        Some("pane-029"),
+    );
+    assert!(
+        out.status.success(),
+        "claim-check on an unlabelled issue must report success — nobody holds it, so this \
+         identity may proceed (`ClaimDecision::Claim`); out={}",
+        combined(&out)
+    );
+
+    let calls = fx.gh_calls();
+    assert!(
+        !any_claim_write(&calls),
+        "claim-check must be read-only: no --add-label, no `gh issue comment`, no \
+         --add-assignee/--remove-assignee call — observed gh calls: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|l| l.starts_with("issue view ") || l.starts_with("api user")),
+        "claim-check must issue ONLY read-shaped gh calls (`gh issue view ...`, `gh api user \
+         ...`) — the mutating `issue claim` would also post a comment, add a label, and set an \
+         assignee here, none of which claim-check may do; observed gh calls: {calls:?}"
+    );
+}
+
+/// Scenario: Agent pane A claims issue 30 from its own worktree via the
+/// mutating `issue claim`. A different agent pane B then runs `issue
+/// claim-check 30` from ITS OWN worktree. Assert B's check exits non-zero,
+/// its output names A's worktree path and branch (the same holder-naming
+/// shape `issue claim`'s own `RefuseHeldByOther` refusal uses), and B's run
+/// wrote nothing.
+#[spec("issue/claim/030")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_030_claim_check_refuses_when_held_by_a_different_identity_and_writes_nothing() {
+    let (fx, repo, wt_a, wt_b) = two_orchestrations("orch-A", "orch-B");
+
+    fx.set_login("alice");
+    let claim_a = fx.run(
+        &wt_a,
+        &["issue", "claim", "30", "--repo", repo],
+        Some("pane-a"),
+    );
+    assert!(
+        claim_a.status.success(),
+        "A's own initial claim must succeed (sanity precondition); out={}",
+        combined(&claim_a)
+    );
+
+    let calls_before_check = fx.gh_calls().len();
+    fx.set_login("bob");
+    let check_b = fx.run(
+        &wt_b,
+        &["issue", "claim-check", "30", "--repo", repo],
+        Some("pane-b"),
+    );
+
+    assert!(
+        !check_b.status.success(),
+        "claim-check must exit non-zero when the issue is held by a DIFFERENT identity; out={}",
+        combined(&check_b)
+    );
+    let text = combined(&check_b);
+    let wt_a_str = wt_a.to_string_lossy().into_owned();
+    assert!(
+        text.contains(&wt_a_str) && text.contains(BRANCH_A),
+        "claim-check's refusal must name the current holder — A's worktree absolute path \
+         {wt_a_str:?} and branch {BRANCH_A:?}, the same holder-naming shape `issue claim`'s own \
+         `RefuseHeldByOther` message uses; got:\n{text}"
+    );
+    assert!(
+        text.contains("held by"),
+        "claim-check's refusal should read like `issue claim`'s own `RefuseHeldByOther` \
+         message (`... is held by \\`<holder>\\` ...`), not an unrelated wording; got:\n{text}"
+    );
+
+    let new_calls: Vec<String> = fx.gh_calls().into_iter().skip(calls_before_check).collect();
+    assert!(
+        !any_claim_write(&new_calls),
+        "a refused claim-check must write nothing; new gh calls during B's check: {new_calls:?}"
+    );
+}
+
+/// Scenario: An agent pane claims issue 31 via the mutating `issue claim`,
+/// then runs `issue claim-check 31` from the SAME worktree/identity. Assert
+/// the check exits 0 (`decide_claim`'s idempotent-refresh case — `held.
+/// identity == caller_identity` → `Claim`) but, unlike a real `issue claim`
+/// re-run (which would refresh the comment/label/assignee), writes nothing
+/// at all — the case that most needs the "writes nothing" assertion.
+#[spec("issue/claim/031")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_031_claim_check_on_own_claim_is_idempotent_and_writes_nothing() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+
+    let wt = fx.add_worktree("wt-031", "claim-031-branch");
+    fx.mark_owned(&wt, "orchestration:orch-031");
+    fx.set_login("erin");
+
+    let claim = fx.run(
+        &wt,
+        &["issue", "claim", "31", "--repo", repo],
+        Some("pane-031"),
+    );
+    assert!(
+        claim.status.success(),
+        "the initial claim must succeed (sanity precondition); out={}",
+        combined(&claim)
+    );
+
+    let calls_before_check = fx.gh_calls().len();
+    let check = fx.run(
+        &wt,
+        &["issue", "claim-check", "31", "--repo", repo],
+        Some("pane-031"),
+    );
+    assert!(
+        check.status.success(),
+        "claim-check on an issue already held by the SAME identity must succeed — \
+         `decide_claim`'s idempotent-refresh case (`held.identity == caller_identity` → \
+         `Claim`); out={}",
+        combined(&check)
+    );
+
+    let new_calls: Vec<String> = fx.gh_calls().into_iter().skip(calls_before_check).collect();
+    assert!(
+        !any_claim_write(&new_calls),
+        "claim-check must write NOTHING even for the caller's own claim — this is the case that \
+         most needs the assertion, since the mutating `issue claim` WOULD write here (a \
+         comment/label/assignee refresh); new gh calls during the check: {new_calls:?}"
+    );
+}
+
+/// Scenario: An issue is labelled `in-progress` with NO discoverable claim
+/// comment at all (identity unknown — a hand-typed claim applied outside any
+/// deck flow). `issue claim-check` is run against it. Assert the check exits
+/// non-zero, its output says the holder's identity is unknown (the same
+/// wording `issue claim`'s own `RefuseNoIdentity` refusal uses), and it
+/// wrote nothing.
+#[spec("issue/claim/032")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_032_claim_check_refuses_when_labelled_with_no_claim_comment() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    fx.seed_label_only(repo, 32, "in-progress");
+
+    let wt = fx.add_worktree("wt-032", "claim-032-branch");
+    fx.mark_owned(&wt, "orchestration:orch-032");
+    fx.set_login("frank");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "claim-check", "32", "--repo", repo],
+        Some("pane-032"),
+    );
+    assert!(
+        !out.status.success(),
+        "claim-check on an issue labelled `in-progress` with no discoverable claim comment must \
+         refuse — the holder's identity is unknown; out={}",
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("identity unknown"),
+        "claim-check's refusal should carry the same wording `issue claim`'s own \
+         `RefuseNoIdentity` refusal uses (`... refusing (identity unknown); ...`); got:\n{text}"
+    );
+
+    let calls = fx.gh_calls();
+    assert!(
+        !any_claim_write(&calls),
+        "a refusal must write nothing; observed gh calls: {calls:?}"
+    );
+}
