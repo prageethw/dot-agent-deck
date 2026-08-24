@@ -2319,12 +2319,14 @@ let y = 2;"###;
     /// that module needs a `file://` URL specifically so `--depth=1` is
     /// honoured (a plain-path clone ignores `--depth`), and a `file://` URL
     /// built from a Windows path is what breaks there. This module's clones
-    /// never pass `--depth`, so there is no reason to prefer the URL form,
-    /// and cloning from the plain canonicalised path is valid on every
-    /// platform (fix round B1/A3 — the original `format!("file://{}", …)`
-    /// form broke on Windows for two compounding reasons: the URL syntax
-    /// itself, and `TempDir::path().canonicalize()`'s `\\?\`-prefixed
-    /// extended-length form not surviving that formatting either way).
+    /// never pass `--depth`, so there is no reason to prefer the URL form.
+    /// Getting Windows genuinely green took two rounds (fix round B1/A3):
+    /// dropping the `file://` wrapper alone was not enough, because
+    /// `Sandbox::new`'s `TempDir::path().canonicalize()` still produced a
+    /// `\\?\`-prefixed extended-length path, and git's clone URL heuristic
+    /// misparses a bare `\\?\C:\…` as scp-style `host:path` syntax
+    /// (confirmed red on `build-windows` with "hostname contains invalid
+    /// characters") — so `Sandbox::new` now canonicalises only on Unix.
     ///
     /// [`check_cross_branch_catalog_collisions`] itself is deliberately
     /// *not* given that sandboxed environment — it is called exactly the
@@ -2345,6 +2347,22 @@ let y = 2;"###;
         impl Sandbox {
             fn new() -> Sandbox {
                 let dir = TempDir::new().expect("tempdir");
+                // Windows' `canonicalize()` returns a `\\?\`-prefixed
+                // extended-length path. Dropping the `file://` wrapper (the
+                // fix round's first attempt) was not enough on its own:
+                // git's clone URL heuristic still misparses a bare
+                // `\\?\C:\…` path as scp-style `host:path` syntax — the
+                // `\\?\C` before the colon reads as an invalid hostname —
+                // confirmed red on `build-windows` in this fix round with
+                // exactly that error ("hostname contains invalid
+                // characters"). Canonicalizing only on Unix keeps macOS's
+                // `/var` -> `/private/var` symlink resolution (needed if
+                // anything here ever compares against git's own
+                // `--show-toplevel`, matching `repo_state.rs`'s sibling
+                // `Sandbox`) without reintroducing the Windows breakage.
+                #[cfg(windows)]
+                let root = dir.path().to_path_buf();
+                #[cfg(not(windows))]
                 let root = dir.path().canonicalize().expect("canonicalize tempdir");
                 fs::create_dir_all(root.join("home")).expect("mkdir home");
                 fs::create_dir_all(root.join("empty-template")).expect("mkdir template");
