@@ -2394,6 +2394,25 @@ pub struct AgentRecord {
     /// no live session/registry access is available (dummy-state test path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_generation: Option<u64>,
+    /// Issue #586 M1/M2: whether PRD #126's idle-worker watch is currently
+    /// armed for this pane, joined in by the `ListAgents` handler from
+    /// [`AgentPtyRegistry::delegation_watch_snapshot`] the same way `live` /
+    /// `daemon_boot_id` above are. `None` when the detector isn't armed for
+    /// this pane (no outstanding delegation, the detector is disabled, or no
+    /// registry access is available). `skip_serializing_if` keeps the wire
+    /// shape backwards-compatible with daemons predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outstanding_delegation: Option<WatchSnapshot>,
+    /// Issue #586 M1/M2: whether PRD #249's delegate silent-worker watch is
+    /// currently armed for this pane. See `outstanding_delegation` above for
+    /// the join and backwards-compatibility rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence_watch: Option<WatchSnapshot>,
+    /// Issue #586 M1/M2: issue #448's commission ledger entry for this pane,
+    /// if any delegation is still unanswered. See `outstanding_delegation`
+    /// above for the join and backwards-compatibility rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_commission: Option<CommissionSnapshot>,
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -3051,6 +3070,41 @@ pub struct AgentPtyRegistry {
     orchestration_name_claims: Mutex<HashMap<String, String>>,
 }
 
+/// Issue #586 M1/M2: a point-in-time snapshot of all delegation-watch state
+/// armed for one worker pane, for exposure via `daemon status --json`
+/// ([`crate::daemon_status`]) and the `ListAgents` attach response
+/// ([`crate::daemon_protocol`]). Each field is `None` when that particular
+/// watch isn't armed for the pane — three independent detectors (PRD #126,
+/// PRD #249, issue #448), so all three states are reported rather than
+/// collapsed into one.
+///
+/// Rides over the wire inside [`AgentRecord`], so its derives mirror that
+/// struct's.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DelegationWatchSnapshot {
+    pub outstanding_delegation: Option<WatchSnapshot>,
+    pub silence_watch: Option<WatchSnapshot>,
+    pub delegation_commission: Option<CommissionSnapshot>,
+}
+
+/// Issue #586 M1/M2: the wire-safe shape of an armed [`OutstandingDelegation`]
+/// or [`SilenceWatchRecord`] — plain `u64` seconds rather than `Duration` or
+/// `Instant`, neither of which can be serialized, mirroring how the rest of
+/// this file already keeps raw internal types off the wire.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WatchSnapshot {
+    pub armed_secs_ago: u64,
+    pub orchestrator_pane_id: String,
+}
+
+/// Issue #586 M1/M2: the wire-safe shape of an armed [`DelegationCommission`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommissionSnapshot {
+    pub outstanding: u32,
+    pub oldest_armed_secs_ago: u64,
+    pub orchestrator_pane_id: String,
+}
+
 /// PRD #126: the outstanding-delegation side state — records plus the
 /// mid-close pane set. See [`AgentPtyRegistry::delegations`].
 #[derive(Default)]
@@ -3138,6 +3192,10 @@ struct SilenceWatchRecord {
     /// watch's own conditional take). Mirrors
     /// [`OutstandingDelegation::_watch_cancel`].
     _cancel: oneshot::Sender<()>,
+    /// Issue #586 M1/M2: when this watch was armed, for exposure via
+    /// [`AgentPtyRegistry::delegation_watch_snapshot`]. Mirrors
+    /// [`OutstandingDelegation::armed_at`].
+    armed_at: Instant,
 }
 
 /// Issue #448: the commission ledger's per-worker-pane entry — how many
@@ -3159,6 +3217,15 @@ struct DelegationCommission {
     /// specific orchestrator, and a pane id freed by a close can be inherited by
     /// an unrelated agent that commissioned nothing.
     orchestrator_pane_id: String,
+    /// Issue #586 M2/B: when the FIRST still-unanswered delegation to this
+    /// worker pane was commissioned — set once, on the initial insert, and never
+    /// touched by later re-arms (see [`AgentPtyRegistry::arm_delegation_commission`]).
+    /// Represents the age of the oldest unretired commission, which
+    /// [`AgentPtyRegistry::retire_delegation_commission`] checks against
+    /// `worker_response_timeout_minutes` to close upstream #590 (a commission
+    /// that never expired, so a much-later genuine `work-done` could be
+    /// wrongly credited against stale debt).
+    armed_at: Instant,
 }
 
 /// Issue #448: did the orchestrator actually commission the work a `work-done`
@@ -3958,6 +4025,7 @@ impl AgentPtyRegistry {
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
                 worker_agent_id: worker_agent_id.map(str::to_string),
                 _cancel: cancel_tx,
+                armed_at: Instant::now(),
             },
         );
         Some(ArmedSilenceWatch {
@@ -4008,6 +4076,11 @@ impl AgentPtyRegistry {
             .or_insert_with(|| DelegationCommission {
                 outstanding: 0,
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
+                // Issue #586 M2/B: pinned to the FIRST arm only — never
+                // touched below — so it represents the age of the OLDEST
+                // unretired commission for [`AgentPtyRegistry::retire_delegation_commission`]'s
+                // expiry check.
+                armed_at: Instant::now(),
             });
         entry.outstanding = entry.outstanding.saturating_add(1);
         // Last delegate wins: a pane id that has changed hands (orchestrator
@@ -4017,6 +4090,34 @@ impl AgentPtyRegistry {
         true
     }
 
+    /// Issue #586 M1/M2: a point-in-time snapshot of the delegation-watch state
+    /// armed for `worker_pane_id`, for exposure via `daemon status --json`.
+    /// One lock acquisition; each field is `None` when that watch isn't armed.
+    pub fn delegation_watch_snapshot(&self, worker_pane_id: &str) -> DelegationWatchSnapshot {
+        let tracker = self.delegations.lock().unwrap();
+        let now = Instant::now();
+        DelegationWatchSnapshot {
+            outstanding_delegation: tracker.records.get(worker_pane_id).map(|r| WatchSnapshot {
+                armed_secs_ago: now.duration_since(r.armed_at).as_secs(),
+                orchestrator_pane_id: r.orchestrator_pane_id.clone(),
+            }),
+            silence_watch: tracker
+                .silence_watches
+                .get(worker_pane_id)
+                .map(|r| WatchSnapshot {
+                    armed_secs_ago: now.duration_since(r.armed_at).as_secs(),
+                    orchestrator_pane_id: r.orchestrator_pane_id.clone(),
+                }),
+            delegation_commission: tracker.commissions.get(worker_pane_id).map(|c| {
+                CommissionSnapshot {
+                    outstanding: c.outstanding,
+                    oldest_armed_secs_ago: now.duration_since(c.armed_at).as_secs(),
+                    orchestrator_pane_id: c.orchestrator_pane_id.clone(),
+                }
+            }),
+        }
+    }
+
     /// Issue #448: credit a `work-done` from `worker_pane_id` against the
     /// commission ledger, and report whether the orchestrator had actually asked
     /// for anything — see [`WorkDoneProvenance`].
@@ -4024,15 +4125,34 @@ impl AgentPtyRegistry {
     /// The last commission for a pane removes its entry rather than leaving a
     /// zero behind, so the map tracks live debt instead of every worker pane that
     /// has ever been delegated to.
-    pub fn retire_delegation_commission(&self, worker_pane_id: &str) -> WorkDoneProvenance {
+    ///
+    /// Issue #586 M2/B, closing upstream #590: `timeout` is the caller's
+    /// already-resolved `worker_response_timeout_minutes` (PRD #126's own
+    /// knob — no new config surface), `None` meaning the detector is
+    /// disabled the same way [`crate::state::worker_response_timeout`]
+    /// already represents "disabled" for its own callers. When the
+    /// commission's oldest unanswered delegation ([`DelegationCommission::armed_at`])
+    /// is older than `timeout`, it is treated as stale: the whole entry is
+    /// dropped and this reports `Unsolicited` rather than crediting a much-later
+    /// genuine `work-done` against debt nobody would still recognize as owed.
+    /// A disabled detector (`timeout: None`) never expires a commission, mirroring
+    /// every other consumer of this knob.
+    pub fn retire_delegation_commission(
+        &self,
+        worker_pane_id: &str,
+        timeout: Option<Duration>,
+    ) -> WorkDoneProvenance {
         let mut tracker = self.delegations.lock().unwrap();
-        let Some(outstanding) = tracker
-            .commissions
-            .get(worker_pane_id)
-            .map(|entry| entry.outstanding)
-        else {
+        let Some(commission) = tracker.commissions.get(worker_pane_id) else {
             return WorkDoneProvenance::Unsolicited;
         };
+        if let Some(timeout) = timeout
+            && Instant::now().duration_since(commission.armed_at) > timeout
+        {
+            tracker.commissions.remove(worker_pane_id);
+            return WorkDoneProvenance::Unsolicited;
+        }
+        let outstanding = commission.outstanding;
         if outstanding <= 1 {
             tracker.commissions.remove(worker_pane_id);
             // A `0` entry cannot normally exist — this branch removes an entry as
@@ -6820,6 +6940,9 @@ impl AgentPtyRegistry {
             // `AppState` themselves.
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         })
     }
 
@@ -7117,6 +7240,9 @@ impl AgentPtyRegistry {
                 // both in from `AppState`.
                 daemon_boot_id: None,
                 registration_generation: None,
+                outstanding_delegation: None,
+                silence_watch: None,
+                delegation_commission: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -11707,6 +11833,9 @@ mod spawn_tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -11733,6 +11862,48 @@ mod spawn_tests {
             .expect("older daemon shape must decode via #[serde(default)] on rows/cols");
         assert_eq!(back.rows, 0);
         assert_eq!(back.cols, 0);
+    }
+
+    /// Issue #586 M1/M2: with the three new watch fields all `None`, the
+    /// `skip_serializing_if` contract must hold — none of the three keys
+    /// appears on the wire, so an older client decoding this record sees the
+    /// same JSON shape it always has.
+    #[test]
+    fn agent_record_with_no_watches_armed_omits_the_new_keys() {
+        let rec = AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in [
+            "outstanding_delegation",
+            "silence_watch",
+            "delegation_commission",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "{key} must be omitted from the wire payload when None, per \
+                 skip_serializing_if — an older client must see nothing new"
+            );
+        }
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert!(back.outstanding_delegation.is_none());
+        assert!(back.silence_watch.is_none());
+        assert!(back.delegation_commission.is_none());
     }
 
     #[test]
@@ -11970,6 +12141,9 @@ mod spawn_tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -12673,7 +12847,7 @@ mod spawn_tests {
     fn commission_ledger_credits_one_completion_per_delegation() {
         let reg = Arc::new(AgentPtyRegistry::new());
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a worker nobody delegated to owes nothing"
         );
@@ -12681,17 +12855,17 @@ mod spawn_tests {
         assert!(reg.arm_delegation_commission("worker", "orch"));
         assert!(reg.arm_delegation_commission("worker", "orch"));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Solicited { remaining: 1 },
             "the first completion answers one of two outstanding commissions"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Solicited { remaining: 0 },
             "the second answers the last one"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a third completion is answering nothing — the defect in #448"
         );
@@ -12714,7 +12888,7 @@ mod spawn_tests {
         assert!(reg.arm_delegation_commission("worker", "orch"));
         assert!(reg.release_delegation_commission("worker"));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a failed delegate must not leave a phantom commission for a later \
              uncommissioned work-done to spend — that is #448 through its own fix"
@@ -12725,13 +12899,13 @@ mod spawn_tests {
         assert!(reg.arm_delegation_commission("worker", "orch"));
         assert!(reg.release_delegation_commission("worker"));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Solicited { remaining: 0 },
             "releasing one failed delegate must not discard a sibling delegation's \
              genuine commission"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "and only the one that landed is credited"
         );
@@ -12751,12 +12925,12 @@ mod spawn_tests {
         // orchestration's commission survives.
         drop(reg.begin_pane_close("orch-1"));
         assert_eq!(
-            reg.retire_delegation_commission("worker-a"),
+            reg.retire_delegation_commission("worker-a", None),
             WorkDoneProvenance::Unsolicited,
             "a commission owed to a closed orchestrator must not survive it"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker-b"),
+            reg.retire_delegation_commission("worker-b", None),
             WorkDoneProvenance::Solicited { remaining: 0 },
             "another orchestration's commission must be untouched by the close"
         );
@@ -12776,9 +12950,142 @@ mod spawn_tests {
             "a closing worker must not accept new commissions"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker-a"),
+            reg.retire_delegation_commission("worker-a", None),
             WorkDoneProvenance::Unsolicited,
             "the worker's own close swept its ledger entry too"
+        );
+    }
+
+    /// Issue #586 M1/M2: `arm_silence_watch` must stamp the record with a real
+    /// time, so [`AgentPtyRegistry::delegation_watch_snapshot`] can report how
+    /// long ago the watch was armed.
+    #[test]
+    fn arm_silence_watch_stamps_armed_at() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        reg.arm_silence_watch("worker", "orch", None)
+            .expect("arm succeeds for two open panes");
+        let armed_at = {
+            let tracker = reg.delegations.lock().unwrap();
+            tracker
+                .silence_watches
+                .get("worker")
+                .expect("just armed")
+                .armed_at
+        };
+        assert!(
+            armed_at.elapsed() < Duration::from_secs(5),
+            "armed_at must reflect the moment of arming, not a default/zero value"
+        );
+    }
+
+    /// Issue #586 M2/B: `armed_at` on the commission ledger's entry must stay
+    /// pinned to the FIRST arm — it represents the age of the OLDEST unanswered
+    /// delegation, which [`AgentPtyRegistry::retire_delegation_commission`]'s
+    /// expiry check reads. A second arm for the same worker pane bumps
+    /// `outstanding` but must not reset the clock.
+    #[test]
+    fn delegation_commission_armed_at_pinned_to_first_arm() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+        let first_armed_at = {
+            let tracker = reg.delegations.lock().unwrap();
+            tracker
+                .commissions
+                .get("worker")
+                .expect("just armed")
+                .armed_at
+        };
+
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+        let (second_armed_at, outstanding) = {
+            let tracker = reg.delegations.lock().unwrap();
+            let entry = tracker.commissions.get("worker").expect("still armed");
+            (entry.armed_at, entry.outstanding)
+        };
+
+        assert_eq!(outstanding, 2, "the second arm must increment the count");
+        assert_eq!(
+            first_armed_at, second_armed_at,
+            "armed_at must stay pinned to the first arm across a re-arm"
+        );
+    }
+
+    /// Issue #586 M1/M2: `delegation_watch_snapshot` reports each of the three
+    /// independent detectors — absent (`None`) when unarmed, populated with a
+    /// sane elapsed time when armed.
+    #[test]
+    fn delegation_watch_snapshot_reports_each_armed_watch() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        let unarmed = reg.delegation_watch_snapshot("worker");
+        assert!(
+            unarmed.outstanding_delegation.is_none()
+                && unarmed.silence_watch.is_none()
+                && unarmed.delegation_commission.is_none(),
+            "an unarmed worker pane must report all-None"
+        );
+
+        reg.arm_outstanding_delegation("worker", "role", "orch", "orch-agent", None);
+        reg.arm_silence_watch("worker", "orch", None)
+            .expect("arm succeeds for two open panes");
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch"));
+
+        let snap = reg.delegation_watch_snapshot("worker");
+        let outstanding = snap
+            .outstanding_delegation
+            .expect("idle-worker watch is armed");
+        assert_eq!(outstanding.orchestrator_pane_id, "orch");
+        assert!(outstanding.armed_secs_ago < 5);
+
+        let silence = snap.silence_watch.expect("silent-worker watch is armed");
+        assert_eq!(silence.orchestrator_pane_id, "orch");
+        assert!(silence.armed_secs_ago < 5);
+
+        let commission = snap
+            .delegation_commission
+            .expect("commission ledger is armed");
+        assert_eq!(commission.orchestrator_pane_id, "orch");
+        assert_eq!(commission.outstanding, 2);
+        assert!(commission.oldest_armed_secs_ago < 5);
+    }
+
+    /// Issue #586 M2/B, closing upstream #590: a commission whose oldest arm
+    /// predates `worker_response_timeout_minutes` expires — the whole entry is
+    /// dropped and the completion is reported `Unsolicited` rather than
+    /// crediting stale debt. A fresh commission is unaffected (regression guard
+    /// for the common case).
+    #[test]
+    fn retire_delegation_commission_expires_a_stale_commission() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let timeout = Duration::from_secs(120 * 60);
+
+        // A fresh commission, armed moments ago, must still be credited.
+        assert!(reg.arm_delegation_commission("fresh", "orch"));
+        assert_eq!(
+            reg.retire_delegation_commission("fresh", Some(timeout)),
+            WorkDoneProvenance::Solicited { remaining: 0 },
+            "a commission within the timeout window is unaffected by the expiry check"
+        );
+
+        // A stale commission, backdated past the timeout, must expire.
+        assert!(reg.arm_delegation_commission("stale", "orch"));
+        {
+            let mut tracker = reg.delegations.lock().unwrap();
+            let entry = tracker.commissions.get_mut("stale").expect("just armed");
+            entry.armed_at = Instant::now() - (timeout + Duration::from_secs(60));
+        }
+        assert_eq!(
+            reg.retire_delegation_commission("stale", Some(timeout)),
+            WorkDoneProvenance::Unsolicited,
+            "upstream #590: a commission older than the configured timeout must not be \
+             credited to a much-later genuine work-done"
+        );
+        assert!(
+            reg.delegation_watch_snapshot("stale")
+                .delegation_commission
+                .is_none(),
+            "the expired entry must be removed from the ledger, not merely reported stale"
         );
     }
 

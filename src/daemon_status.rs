@@ -101,6 +101,18 @@ pub struct StatusAgent {
     pub shell_synthetic_working: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<StatusTool>,
+    /// Issue #586 M1/M2: PRD #126's idle-worker watch, if currently armed for
+    /// this pane. Purely additive — see [`SCHEMA_VERSION`]'s doc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
+    /// Issue #586 M1/M2: PRD #249's delegate silent-worker watch, if
+    /// currently armed for this pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silence_watch: Option<crate::agent_pty::WatchSnapshot>,
+    /// Issue #586 M1/M2: issue #448's commission ledger entry for this pane,
+    /// if any delegation is still unanswered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_commission: Option<crate::agent_pty::CommissionSnapshot>,
 }
 
 /// Top-level `--json` document: a [`SCHEMA_VERSION`] and the `agents` array,
@@ -176,6 +188,9 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                 active_tool: live
                     .and_then(|s| s.active_tool)
                     .map(|tool: ActiveTool| StatusTool { name: tool.name }),
+                outstanding_delegation: record.outstanding_delegation,
+                silence_watch: record.silence_watch,
+                delegation_commission: record.delegation_commission,
             }
         })
         .collect()
@@ -247,6 +262,9 @@ mod tests {
             live,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         }
     }
 
@@ -289,6 +307,84 @@ mod tests {
             .replace("control", "<pane>")
             .replace("agent-2", "<agent>");
         assert_ne!(driven_norm, control_norm);
+    }
+
+    /// Issue #586 M1/M2: `build_status_agents` must carry the three new
+    /// delegation-watch fields straight through from `AgentRecord` onto
+    /// `StatusAgent` when the registry has them populated, and leave them
+    /// absent (not `null`) on the wire when it doesn't.
+    #[test]
+    fn build_status_agents_carries_delegation_watch_fields() {
+        let armed = crate::agent_pty::AgentRecord {
+            outstanding_delegation: Some(crate::agent_pty::WatchSnapshot {
+                armed_secs_ago: 12,
+                orchestrator_pane_id: "orch".to_string(),
+            }),
+            silence_watch: Some(crate::agent_pty::WatchSnapshot {
+                armed_secs_ago: 3,
+                orchestrator_pane_id: "orch".to_string(),
+            }),
+            delegation_commission: Some(crate::agent_pty::CommissionSnapshot {
+                outstanding: 2,
+                oldest_armed_secs_ago: 45,
+                orchestrator_pane_id: "orch".to_string(),
+            }),
+            ..record("agent-1", "armed", None)
+        };
+        let unarmed = record("agent-2", "unarmed", None);
+
+        let agents = build_status_agents(vec![armed, unarmed]);
+        let armed_status = agents
+            .iter()
+            .find(|a| a.pane_id.as_deref() == Some("armed"))
+            .unwrap();
+        assert_eq!(
+            armed_status
+                .outstanding_delegation
+                .as_ref()
+                .unwrap()
+                .armed_secs_ago,
+            12
+        );
+        assert_eq!(
+            armed_status.silence_watch.as_ref().unwrap().armed_secs_ago,
+            3
+        );
+        assert_eq!(
+            armed_status
+                .delegation_commission
+                .as_ref()
+                .unwrap()
+                .outstanding,
+            2
+        );
+
+        let unarmed_status = agents
+            .iter()
+            .find(|a| a.pane_id.as_deref() == Some("unarmed"))
+            .unwrap();
+        assert!(unarmed_status.outstanding_delegation.is_none());
+        assert!(unarmed_status.silence_watch.is_none());
+        assert!(unarmed_status.delegation_commission.is_none());
+
+        let json = serde_json::to_string(&StatusDocument::new(agents)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let unarmed_json = v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["pane_id"] == "unarmed")
+            .unwrap();
+        for key in [
+            "outstanding_delegation",
+            "silence_watch",
+            "delegation_commission",
+        ] {
+            assert!(
+                unarmed_json.as_object().unwrap().get(key).is_none(),
+                "{key} must be absent, not null, when the watch isn't armed"
+            );
+        }
     }
 
     /// Scenario: a status row built from a live snapshot carrying a seeded
