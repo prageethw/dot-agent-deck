@@ -40,7 +40,7 @@ You don't need to reproduce these; they're just what "resolve the conflicts with
 `main` never talks to `upstream`. Only `fork-only` rebases onto upstream, then `main` is reset to it.
 
 ```bash
-cd /absolute/path/to/worktree   # every command below runs from here — the two force-pushes and the reset included
+cd /absolute/path/to/worktree || exit 1   # every command below runs from here — the two force-pushes and the reset included; a failed cd must not silently fall through to running them in the ambient cwd
 
 git fetch upstream
 git checkout fork-only
