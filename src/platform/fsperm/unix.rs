@@ -52,15 +52,22 @@ pub fn with_socket_umask<T>(f: impl FnOnce() -> T) -> T {
 /// it and chmod-ing whatever real directory it points at — a same-uid attacker
 /// could otherwise plant a symlink at `dir` ahead of us and have us tighten the
 /// permissions of an arbitrary directory of their choosing (issue #491).
+///
+/// This narrows the attack window rather than closing it: the check is an
+/// unanchored `lstat` → `mkdir -p` → `chmod` sequence, so a symlink planted
+/// at `dir` *after* the `lstat` but before the `chmod` still produces the
+/// original attacker-controlled outcome (issue #560).
 pub fn ensure_owner_only_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     // `symlink_metadata` (lstat semantics) does not follow the final
     // component, unlike `metadata`/`Path::is_dir` — so this is the one stat
     // that can see a symlink planted at `dir` itself rather than the real
-    // directory it points at. A `NotFound` error here is the ordinary
-    // first-time-creation case and must fall through to `builder.create`
-    // below, not be treated as a refusal (issue #491).
+    // directory it points at. Any `Err` here — `NotFound` (the ordinary
+    // first-time-creation case) as well as every other error kind, e.g.
+    // permission denied — falls through to `builder.create` below rather
+    // than being treated as a refusal; a hidden non-`NotFound` error also
+    // fails the subsequent create/chmod, so this isn't a bypass (issue #491).
     if let Ok(meta) = std::fs::symlink_metadata(dir)
         && meta.file_type().is_symlink()
     {
