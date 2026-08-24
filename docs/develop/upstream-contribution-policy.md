@@ -113,6 +113,10 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 | `9d72de96` | Position-aware `cmd.exe` quoting for the watch-pane and hook-shell invocations (fork #283, #238) — `src/mode_manager.rs`/`src/platform/shell.rs` are upstream's own files |
 | `4090985f` | Jointly fit column count and card density (`fit_grid`) instead of picking each axis independently, so a narrow-AND-short terminal no longer silently drops cards (fork #437, tracks upstream vfarcic/dot-agent-deck#588 explicitly) |
 | `444de809` | `init_logging_from_env`'s default log path resolves under `/tmp` instead of the resolved state dir (fork #467) |
+| `7f576c2a` | `write_guarded` family's `expected_agent_id` should be non-optional, not `Option<&str>` (fork #530) — verified identical on `upstream/main`'s `agent_pty.rs` |
+| `527c5c03` | `spawn_rollback`'s shared-checkout arm drops the worktree registry entry when force-removal fails (fork #473) — the isolated-clone arm has the same gap, tracked separately as fork #563 |
+| `d3920439` | `ensure_owner_only_dir` (Unix) must not follow a symlink at the target path (fork #491) — verified identical on `upstream/main`'s `src/platform/fsperm/unix.rs`, which has no symlink guard at all |
+| `1929d5e8` | `apply_event` ingests `display_name` with only an `is_empty()` filter — no sanitize, no length clamp (fork #410) — verified identical on `upstream/main`'s `state.rs` |
 
 ### Test and CI determinism
 
