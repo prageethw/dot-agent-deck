@@ -508,6 +508,24 @@ pub fn issue_edit_add_label_argv(repo: &str, issue: u64, label: &str) -> Vec<Str
     ]
 }
 
+/// Build the `gh issue edit --remove-label` argv (arguments after `gh`) that
+/// strips `label` from `issue` — issue #326's `issue release` uses this to
+/// remove [`IN_PROGRESS_LABEL`], the exact mirror of
+/// [`issue_edit_add_label_argv`] with the same `--` end-of-options placement
+/// (see that function's doc comment for why the placement matters).
+pub fn issue_edit_remove_label_argv(repo: &str, issue: u64, label: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--remove-label".to_string(),
+        label.to_string(),
+        "--".to_string(),
+        issue.to_string(),
+    ]
+}
+
 /// Build the `gh issue comment` argv (arguments after `gh`) that posts `body`
 /// as a new comment on `issue` — always APPENDED, never edited in place (PRD
 /// #421 M1.1: the only path that re-runs the dispatch-success flow for the
@@ -1152,6 +1170,62 @@ pub fn claim_comment_body(
     body
 }
 
+/// The literal prefix [`release_comment_body`] always renders — issue #326's
+/// counterpart to [`CLAIM_COMMENT_PREFIX`], recording that a claim was
+/// deliberately relinquished rather than merely never made.
+pub const RELEASE_COMMENT_PREFIX: &str = "Released by ";
+
+/// Render the release-comment body posted on `issue release` (issue #326) —
+/// the release-side mirror of [`claim_comment_body`], same fields and same
+/// backtick-wrapping discipline (round-3 audit A3's reasoning applies
+/// identically here: `path`/`branch` can carry an attacker-influenceable
+/// backtick with no forged comment involved). `forced_from` names the
+/// identity a `--force` release displaced — `None` for releasing one's own
+/// claim, or for a forced release of an issue whose holder identity was
+/// never known. `reason` is the caller's optional free-text `--reason`,
+/// sanitized the same way a claimant name is (control characters, backticks)
+/// before it reaches a public comment body.
+pub fn release_comment_body(
+    identity: &Identity,
+    timestamp: &str,
+    login: Option<&str>,
+    forced_from: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let mut body = match identity {
+        Identity::Worktree {
+            path,
+            branch,
+            host,
+            label,
+        } => {
+            let label = label.as_deref().unwrap_or("the orchestration");
+            let path_str = sanitize_claimant_name(&path.display().to_string());
+            let branch_str = sanitize_claimant_name(branch);
+            format!(
+                "{RELEASE_COMMENT_PREFIX}{label} working `{path_str}` on branch `{branch_str}` \
+                 on host {host} at {timestamp}"
+            )
+        }
+        Identity::Human { login, host } => {
+            format!("{RELEASE_COMMENT_PREFIX}@{login} working from `{host}` at {timestamp}")
+        }
+    };
+    if matches!(identity, Identity::Worktree { .. })
+        && let Some(login) = login
+    {
+        body.push_str(&format!(", for @{login}"));
+    }
+    if let Some(prev) = forced_from {
+        body.push_str(&format!(", forcibly released from `{prev}`"));
+    }
+    if let Some(reason) = reason {
+        body.push_str(&format!(", reason: {}", sanitize_claimant_name(reason)));
+    }
+    body.push('.');
+    body
+}
+
 // ---------------------------------------------------------------------------
 // PRD #421 M2.0/M2.1/M2.2 — triage label vocabulary + prompt instruction
 // ---------------------------------------------------------------------------
@@ -1747,6 +1821,23 @@ mod tests {
     }
 
     #[test]
+    fn issue_edit_remove_label_argv_shape() {
+        assert_eq!(
+            issue_edit_remove_label_argv("acme/widgets", 7, IN_PROGRESS_LABEL),
+            vec![
+                "issue",
+                "edit",
+                "--repo",
+                "acme/widgets",
+                "--remove-label",
+                "in-progress",
+                "--",
+                "7",
+            ]
+        );
+    }
+
+    #[test]
     fn issue_comment_argv_shape() {
         assert_eq!(
             issue_comment_argv(
@@ -1895,6 +1986,54 @@ mod tests {
         );
         // The takeover clause must never displace the load-bearing prefix.
         assert!(body.starts_with(CLAIM_COMMENT_PREFIX));
+    }
+
+    // --- issue #326: release_comment_body ---
+
+    #[test]
+    fn release_comment_body_names_releaser_and_reason() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = release_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            Some("bob"),
+            None,
+            Some("PR merged"),
+        );
+        assert!(body.starts_with(RELEASE_COMMENT_PREFIX), "got {body:?}");
+        assert!(body.contains(", for @bob"), "got {body:?}");
+        assert!(body.contains("PR merged"), "got {body:?}");
+        assert!(
+            !body.contains("forcibly released"),
+            "no forced_from was supplied, so the forced clause must be omitted, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn release_comment_body_names_who_it_was_forced_from() {
+        let holder =
+            Identity::orchestration("orch-A", Path::new("/work/wt-a"), "branch-a").to_string();
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body =
+            release_comment_body(&identity, "2026-08-09T00:00:00Z", None, Some(&holder), None);
+        assert!(
+            body.contains(&format!("forcibly released from `{holder}`")),
+            "must name who it was forcibly released from, backtick-wrapped, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn release_comment_body_sanitizes_reason() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = release_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            None,
+            None,
+            Some("done`\ninjected"),
+        );
+        assert!(!body.contains('\n'), "got {body:?}");
+        assert!(!body.contains("done`"), "got {body:?}");
     }
 
     #[test]

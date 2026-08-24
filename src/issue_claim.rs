@@ -32,7 +32,8 @@ use std::process::Command;
 use crate::issue_dispatch::{
     IN_PROGRESS_LABEL, Identity, ParsedClaim, claim_comment_body, gh_current_login_argv,
     issue_comment_argv, issue_edit_add_label_argv, issue_edit_assignee_argv,
-    issue_view_claim_state_argv, parse_claim_state, sanitize_claimant_name, validate_gh_login,
+    issue_edit_remove_label_argv, issue_view_claim_state_argv, parse_claim_state,
+    release_comment_body, sanitize_claimant_name, validate_gh_login,
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +122,64 @@ pub fn decide_claim(
         holder,
         takeover_requested: takeover,
     }
+}
+
+/// The pure release decision (issue #326) — the release-side mirror of
+/// [`ClaimDecision`]. `release` has only ONE override flag (`--force`), not
+/// `claim`'s two-step `--takeover --confirm-stopped` friction: a release is
+/// inherently less risky to get wrong than a takeover-while-claiming (it
+/// only ever narrows what is locked, never widens who holds it), so the
+/// tester's contract (issue #326) asks for `--force` alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseDecision {
+    /// Release. `forced_from` names the identity displaced by a `--force`
+    /// release of a DIFFERENT holder's claim — `None` for releasing one's
+    /// own claim, or for a forced release of an issue whose holder identity
+    /// was never known (nothing to name).
+    Release { forced_from: Option<String> },
+    /// No `in-progress` label at all — nothing to release. Catches a
+    /// typo'd issue number rather than silently succeeding.
+    RefuseNothingToRelease,
+    /// Labelled but no claim comment names a holder — same ambiguous state
+    /// [`ClaimDecision::RefuseNoIdentity`] refuses on. Escapable with
+    /// `--force`, same as a known-holder refusal.
+    RefuseNoIdentity,
+    /// Held by a different identity, no `--force`.
+    RefuseHeldByOther { holder: String },
+}
+
+/// The pure decision function backing [`ReleaseDecision`]'s doc table.
+pub fn decide_release(
+    label_present: bool,
+    held: Option<&ParsedClaim>,
+    caller_identity: &str,
+    force: bool,
+) -> ReleaseDecision {
+    if !label_present {
+        return ReleaseDecision::RefuseNothingToRelease;
+    }
+    let Some(held) = held else {
+        return if force {
+            ReleaseDecision::Release { forced_from: None }
+        } else {
+            ReleaseDecision::RefuseNoIdentity
+        };
+    };
+    if held.identity == caller_identity {
+        return ReleaseDecision::Release { forced_from: None };
+    }
+    // Same untrusted-comment-content reasoning as `decide_claim`'s own
+    // `holder` field (auditor F3): sanitize before it is echoed into a
+    // refusal message or a release comment's "forcibly released from …"
+    // tail. The comparison just above already happened against the raw
+    // value, so this cannot change the decision itself.
+    let holder = sanitize_claimant_name(&held.identity);
+    if force {
+        return ReleaseDecision::Release {
+            forced_from: Some(holder),
+        };
+    }
+    ReleaseDecision::RefuseHeldByOther { holder }
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +459,35 @@ fn do_claim(
     Ok(())
 }
 
+/// Post the release comment, then remove the `in-progress` label — the
+/// release-side mirror of [`do_claim`]'s comment-FIRST, label-SECOND order
+/// (same reasoning: a failed comment write, the first call, simply leaves
+/// the issue still labelled and still discoverably held — recoverable by
+/// retrying release — rather than the inverse, an unlabelled issue with no
+/// discoverable release record). No assignee write: `release` (issue #326)
+/// only ever removes the label and posts a comment, unlike `claim`, which
+/// also replaces the assignee.
+fn do_release(
+    repo: &str,
+    issue: u64,
+    identity: &Identity,
+    login: Option<&str>,
+    forced_from: Option<&str>,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let body = release_comment_body(identity, &timestamp, login, forced_from, reason);
+    run_gh_status(&issue_comment_argv(repo, issue, &body))?;
+
+    run_gh_status(&issue_edit_remove_label_argv(
+        repo,
+        issue,
+        IN_PROGRESS_LABEL,
+    ))?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -511,6 +599,76 @@ pub fn run_issue_claim(
                 .unwrap_or_default();
             Err(format!(
                 "issue #{issue} of {repo} is held by `{holder}`{since} — {instruction}{dispatch_note}"
+            ))
+        }
+    }
+}
+
+/// Run `issue release <issue>` against `repo` (or, when `None`, the
+/// `owner/name` derived from `cwd`'s `origin` remote) — issue #326's
+/// missing release half of [`run_issue_claim`]'s lock: a stale claim (an
+/// orchestration that stopped) previously locked the issue against re-entry
+/// until someone manually posted a comment and stripped the label by hand.
+/// `Ok(message)` is the success text for stdout (exit 0); `Err(message)`
+/// covers both a refusal and an operational failure (exit non-zero) — same
+/// exit-code-is-the-mechanism discipline as [`run_issue_claim`].
+pub fn run_issue_release(
+    cwd: &Path,
+    repo: Option<&str>,
+    issue: u64,
+    force: bool,
+    reason: Option<&str>,
+) -> Result<String, String> {
+    let repo = match repo {
+        Some(r) => r.to_string(),
+        None => crate::worktree_reclaim::derive_repo_slug(cwd).ok_or_else(|| {
+            format!(
+                "could not derive an `owner/name` repo slug from {}'s `origin` remote; pass \
+                 --repo explicitly",
+                cwd.display()
+            )
+        })?,
+    };
+
+    let identity = resolve_caller_identity(cwd)?;
+    let (label_present, held, _current_assignees) = read_current_claim(&repo, issue)?;
+
+    match decide_release(label_present, held.as_ref(), &identity.to_string(), force) {
+        ReleaseDecision::Release { forced_from } => {
+            let login = resolve_assignee_login(&identity);
+            do_release(
+                &repo,
+                issue,
+                &identity,
+                login.as_deref(),
+                forced_from.as_deref(),
+                reason,
+            )?;
+            Ok(format!(
+                "released issue #{issue} of {repo} as `{identity}`\n"
+            ))
+        }
+        ReleaseDecision::RefuseNothingToRelease => Err(format!(
+            "issue #{issue} of {repo} is not labelled `{IN_PROGRESS_LABEL}` — nothing to \
+             release"
+        )),
+        ReleaseDecision::RefuseNoIdentity => Err(format!(
+            "issue #{issue} of {repo} is labelled `{IN_PROGRESS_LABEL}` but no claim comment \
+             names a holder — refusing (identity unknown); pass `--force` once you have \
+             confirmed there is nobody left holding this issue"
+        )),
+        ReleaseDecision::RefuseHeldByOther { holder } => {
+            // Same sanitize-before-display discipline as `run_issue_claim`'s
+            // own `RefuseHeldByOther` arm — `holder` is already sanitized by
+            // `decide_release`, `timestamp` is a sibling field from the same
+            // untrusted comment and needs its own pass.
+            let since = held
+                .as_ref()
+                .map(|h| format!(" since {}", sanitize_claimant_name(&h.timestamp)))
+                .unwrap_or_default();
+            Err(format!(
+                "issue #{issue} of {repo} is held by `{holder}`{since} — pass `--force` once \
+                 you have confirmed that agent has stopped"
             ))
         }
     }
@@ -738,6 +896,82 @@ mod tests {
                 takeover_from: None
             }
         );
+    }
+
+    // --- issue #326: decide_release ---
+
+    #[test]
+    fn decide_release_unlabelled_refuses_nothing_to_release() {
+        assert_eq!(
+            decide_release(false, None, "orchestration:a@h:1", false),
+            ReleaseDecision::RefuseNothingToRelease
+        );
+        assert_eq!(
+            decide_release(false, None, "orchestration:a@h:1", true),
+            ReleaseDecision::RefuseNothingToRelease
+        );
+    }
+
+    #[test]
+    fn decide_release_own_claim_releases() {
+        let held = claim("orchestration:a@h:1", Some("alice"), "ts");
+        assert_eq!(
+            decide_release(true, Some(&held), "orchestration:a@h:1", false),
+            ReleaseDecision::Release { forced_from: None }
+        );
+    }
+
+    #[test]
+    fn decide_release_held_by_other_no_force_refuses() {
+        let held = claim("orchestration:a@h:1", Some("alice"), "ts");
+        assert_eq!(
+            decide_release(true, Some(&held), "orchestration:b@h:2", false),
+            ReleaseDecision::RefuseHeldByOther {
+                holder: "orchestration:a@h:1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn decide_release_held_by_other_with_force_releases_naming_who() {
+        let held = claim("orchestration:a@h:1", Some("alice"), "ts");
+        assert_eq!(
+            decide_release(true, Some(&held), "orchestration:b@h:2", true),
+            ReleaseDecision::Release {
+                forced_from: Some("orchestration:a@h:1".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn decide_release_no_identity_no_force_refuses() {
+        assert_eq!(
+            decide_release(true, None, "orchestration:a@h:1", false),
+            ReleaseDecision::RefuseNoIdentity
+        );
+    }
+
+    #[test]
+    fn decide_release_no_identity_with_force_releases() {
+        assert_eq!(
+            decide_release(true, None, "orchestration:a@h:1", true),
+            ReleaseDecision::Release { forced_from: None }
+        );
+    }
+
+    #[test]
+    fn decide_release_sanitizes_held_identity_before_displaying_it() {
+        let held = claim("worktree:/work/evil\ninjected@branch", Some("alice"), "ts");
+        match decide_release(true, Some(&held), "orchestration:b@h:2", false) {
+            ReleaseDecision::RefuseHeldByOther { holder } => {
+                assert!(
+                    !holder.contains('\n'),
+                    "a raw newline parsed out of a held claim comment must not survive into a \
+                     new refusal message/comment tail, got {holder:?}"
+                );
+            }
+            other => panic!("expected RefuseHeldByOther, got {other:?}"),
+        }
     }
 
     // --- auditor F3: a held identity's display is sanitized before reuse ---

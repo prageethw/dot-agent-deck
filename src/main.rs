@@ -512,6 +512,31 @@ enum IssueCmd {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Release issue `<n>`'s claim (issue #326) — the missing release half
+    /// of `claim`'s lock: removes the `in-progress` label and posts a
+    /// comment recording the release. Refuses on an unclaimed issue, and
+    /// refuses on an issue held by a DIFFERENT identity or one whose
+    /// holder identity is unknown unless `--force` is passed. See
+    /// `dot_agent_deck::issue_claim::decide_release`'s doc table for the
+    /// full decision table.
+    Release {
+        /// The GitHub issue number.
+        issue: u64,
+        /// `owner/name`; derived from the current directory's `origin`
+        /// remote when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Release even when held by a different identity, or when the
+        /// holder identity is unknown — only after confirming that other
+        /// agent has stopped. Unlike `claim`'s two-step `--takeover
+        /// --confirm-stopped`, release has just this one override flag.
+        #[arg(long)]
+        force: bool,
+        /// Optional free-text reason, included verbatim (after
+        /// sanitization) in the posted release comment.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -1753,6 +1778,12 @@ fn main() -> ExitCode {
                 confirm_stopped,
             } => run_issue_claim_cli(issue, repo, takeover, confirm_stopped),
             IssueCmd::ClaimCheck { issue, repo } => run_issue_claim_check_cli(issue, repo),
+            IssueCmd::Release {
+                issue,
+                repo,
+                force,
+                reason,
+            } => run_issue_release_cli(issue, repo, force, reason),
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
@@ -2574,6 +2605,41 @@ fn run_issue_claim_cli(
         }
         Err(e) => {
             eprintln!("issue claim: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Same shape as [`run_issue_claim_cli`] — a refusal and an operational
+/// failure both map to `ExitCode::FAILURE` here (distinguished only by the
+/// printed message); `dot_agent_deck::issue_claim::run_issue_release` is
+/// where the actual decision lives.
+fn run_issue_release_cli(
+    issue: u64,
+    repo: Option<String>,
+    force: bool,
+    reason: Option<String>,
+) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("issue release: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match dot_agent_deck::issue_claim::run_issue_release(
+        &cwd,
+        repo.as_deref(),
+        issue,
+        force,
+        reason.as_deref(),
+    ) {
+        Ok(message) => {
+            print!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("issue release: {e}");
             ExitCode::FAILURE
         }
     }
