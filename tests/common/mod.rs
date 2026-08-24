@@ -596,6 +596,34 @@ impl TuiDeck {
                     claude_trust_paths.push(canon);
                 }
             }
+            // Fork issue #373: an orchestration's role panes (including the
+            // orchestrator role itself) do NOT run in `work` — PRD fork#544 M2b
+            // made isolated-clone provisioning the sole spawn path for every
+            // orchestration, so the orchestrator's real cwd is a sibling
+            // directory `resolve_workspace_path` derives from `work` and the
+            // orchestration's Name (`src/ui.rs`). Every real-agent orchestration
+            // test in this suite opens exactly one, the FIRST, orchestration
+            // against a fresh deck and accepts the form's suggested default
+            // Name rather than typing one, so that Name is deterministically
+            // `"{work-basename}-orchestrator-1"` (`suggest_orchestration_name`'s
+            // `n=1` candidate, always free on a fresh deck with no other live
+            // orchestrations). Pre-trust that predicted sibling path (raw and
+            // canonicalized) the same way as `work` above — mirroring, not
+            // calling, `sanitize_workspace_segment`/`resolve_workspace_path`,
+            // since both are private to `src/ui.rs` and this harness cannot
+            // depend on that crate's internals. A test that types a different
+            // Name, or opens a second orchestration, needs its own
+            // `with_claude_project_trust(path)` call for that path — this only
+            // covers the common, default-name, first-orchestration case every
+            // caller in this suite actually uses.
+            let isolated_clone_path = isolated_clone_sibling_path(&work, 1);
+            claude_trust_paths.push(isolated_clone_path.to_string_lossy().into_owned());
+            if let Ok(canon) = std::fs::canonicalize(&isolated_clone_path) {
+                let canon = canon.to_string_lossy().into_owned();
+                if !claude_trust_paths.contains(&canon) {
+                    claude_trust_paths.push(canon);
+                }
+            }
         }
         if !claude_trust_paths.is_empty() {
             seed_claude_project_trust(&home, &claude_trust_paths).map_err(|e| e.to_string())?;
@@ -3533,6 +3561,43 @@ fn import_claude_plugins_enabled() -> bool {
         std::env::var("DAD_E2E_IMPORT_CLAUDE_PLUGINS").as_deref(),
         Ok("1" | "true" | "yes")
     )
+}
+
+/// Predict the isolated-clone sibling directory an orchestration's role panes
+/// (the orchestrator role included) actually launch in, mirroring — not
+/// calling, since both are private to `src/ui.rs` — three production
+/// functions in lockstep: `suggest_orchestration_name` (the form's default
+/// Name, `"{work-basename}-orchestrator-{orchestrator_index}"`, offered when
+/// no other orchestration under that Name is already live),
+/// `sanitize_workspace_segment` (strips a leading `-`/`.` — the workdir
+/// basename is always a `tempfile`-generated `.tmpXXXXXX` dir, so this always
+/// fires), and `resolve_workspace_path` (`work.with_file_name("{work-basename}-{segment}")`).
+/// Fork issue #373: PRD fork#544 M2b made isolated-clone provisioning the SOLE
+/// spawn path for every orchestration, so a real Claude/Codex process
+/// launched via the new-pane orchestration form runs here, not in `work`
+/// itself — verified byte-for-byte against a captured production path,
+/// `/var/tmp/dad-e2e-.../.tmpUxkQzS-tmpUxkQzS-orchestrator-1`, for
+/// `orchestrator_index = 1`.
+///
+/// `orchestrator_index` is the suggested Name's `-orchestrator-N` suffix —
+/// pass `1` for the common case this harness's callers all use today: a
+/// fresh deck's FIRST orchestration, opened with the form's default Name
+/// left untyped. A caller that types its own Name, or opens more than one
+/// orchestration in the same test, is not covered — trust that path
+/// separately with `with_claude_project_trust`.
+fn isolated_clone_sibling_path(work: &Path, orchestrator_index: usize) -> PathBuf {
+    let dir_name = work
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let typed_name = format!("{dir_name}-orchestrator-{orchestrator_index}");
+    let segment = typed_name.trim_start_matches(['-', '.']);
+    let segment = if segment.is_empty() {
+        "issues"
+    } else {
+        segment
+    };
+    work.with_file_name(format!("{dir_name}-{segment}"))
 }
 
 /// Seed the per-test HOME's `~/.claude.json` so a daemon-spawned interactive
