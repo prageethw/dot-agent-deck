@@ -1838,15 +1838,23 @@ fn git_in_untrusted_dir(dir: &Path) -> Command {
 ///   artifact and correctly reports `owned: false` rather than being
 ///   hidden — mirroring how `owned_git_dir` returning `None` yields
 ///   `owned: false`, never a dropped row.
-/// - **Stale entries.** The artifact is never removed when a clone is
-///   later deleted, so it would vouch for an unrelated directory recreated
-///   at the same path afterward, if that later directory canonicalizes to
-///   the identical clone-dir path the hash was computed from — in practice
-///   this requires reusing the exact same `clone_dir` path after a prior
-///   clone there was destroyed. Broader than a naive per-clone-tree
-///   artifact would be (this one outlives the clone's own deletion by
-///   design), but no broader than M4a's own shared-namespace staleness, and
-///   nothing else in the deck ever writes into this directory.
+/// - **Stale entries.** [`remove_isolated_clone_dir`] now clears the
+///   artifact (best-effort) immediately after removing the clone directory
+///   it names (fork issue #546 hazard 1), so the removal path this deck
+///   itself drives no longer leaves it behind. What remains is narrower
+///   than the original claim: a clone destroyed by some other means (a
+///   manual `rm -rf`, or a removal whose marker-clearing step itself fails
+///   — logged and tolerated, never a hard failure, per that function's own
+///   doc comment) still leaves the artifact in place, and it would then
+///   vouch for an unrelated directory recreated at the same path
+///   afterward, if that later directory canonicalizes to the identical
+///   clone-dir path the hash was computed from — in practice this requires
+///   reusing the exact same `clone_dir` path after a prior clone there was
+///   destroyed outside this deck's own removal path. Broader than a naive
+///   per-clone-tree artifact would be (this one outlives the clone's own
+///   deletion by design), but no broader than M4a's own shared-namespace
+///   staleness, and nothing else in the deck ever writes into this
+///   directory.
 /// - **Path-bound, same as M4a (reviewer R2, PR #515).** Because the key is
 ///   the clone's own canonical PATH rather than anything stored inside the
 ///   clone's tree, `cp -r`/`mv` of a genuine clone to a different sibling
@@ -2538,12 +2546,14 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// re-verification exists to catch. The attach-lock provenance artifact is
 /// nothing like that: it is written once, under `state_dir()`, at
 /// `provision_isolated_clone_sync` time, keyed by the clone's own canonical
-/// PATH rather than anything inside its tree, and — per
-/// [`candidate_has_attach_lock`]'s own documented "stale entries" limit — is
-/// never removed even once the clone it names has been deleted. Nothing a
-/// live orchestration does inside the clone touches it, so it cannot
-/// legitimately flip from present to absent in this window the way the other
-/// four can flip from safe to unsafe. And because the check is purely
+/// PATH rather than anything inside its tree, and this function's own
+/// marker-clearing step (fork issue #546 hazard 1, below) is the only thing
+/// that ever removes it — and that step runs only after `remove_dir_all`
+/// has already succeeded, later in this same function body. So during the
+/// examination-to-removal window this re-verification actually covers,
+/// nothing has touched the marker yet: it cannot legitimately flip from
+/// present to absent in that window the way the other four can flip from
+/// safe to unsafe. And because the check is purely
 /// path-keyed rather than clone-identity-keyed, re-deriving it here would
 /// answer the identical question [`isolated_clone_report`] already answered
 /// at examination time — it cannot even detect the one adjacent hazard that
@@ -2629,6 +2639,43 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
     std::fs::remove_dir_all(worktree_path).map_err(|e| {
         format!("failed to remove isolated clone directory (requested by {remover}): {e}")
     })?;
+
+    // Fork issue #546 hazard 1: the directory is gone, but the M4b
+    // provenance artifact lives entirely outside it (in `state_dir()`, by
+    // design) and survives unless explicitly cleared here -- otherwise a
+    // later, unrelated directory created at this same path would be
+    // silently vouched for by this stale evidence. Best-effort, not
+    // `?`-propagated like `forget_isolated_workspace`'s equivalent removal:
+    // this function is called from `run_reclaim`'s batch loop, which
+    // classifies a row as "removed" on `Ok` and "kept" (with a "removal
+    // failed" reason) on `Err`. By the time the marker removal is
+    // attempted the directory removal above has already succeeded, so a
+    // hard failure here would misreport an isolated clone that is
+    // genuinely gone from disk as one that is still there and needs
+    // attention -- `forget_isolated_workspace` has no such batch
+    // classification to corrupt, which is why it can afford to propagate.
+    // `attempt_isolated_clone_cleanup` (issue_dispatch_run.rs) is actually
+    // the closer precedent for this choice, not just an alternative to
+    // contrast against: it clears the same marker after the same
+    // `remove_dir_all`, best-effort, for the same reason -- there, too, the
+    // directory is already gone by the time the marker removal runs, so a
+    // hard failure would only misreport a cleanup that already succeeded.
+    let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(worktree_path);
+    let marker_cleared = match std::fs::remove_file(&marker_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(
+                path = %sanitize_path_for_terminal_display(&marker_path),
+                remover = %sanitize_for_terminal_display(remover),
+                error = %e,
+                "failed to remove isolated clone provenance artifact after directory removal \
+                 succeeded -- stale evidence may remain at this path"
+            );
+            false
+        }
+    };
+
     // Issue #325 / reviewer B1 / auditor F2 precedent, carried to the M4c
     // removal path: the ONLY durable trace of a confirmed removal. `remover`
     // is an unauthenticated, caller-supplied string (auditor F3) -- sanitize
@@ -2637,6 +2684,7 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
     tracing::info!(
         path = %sanitize_path_for_terminal_display(worktree_path),
         remover = %sanitize_for_terminal_display(remover),
+        marker_cleared,
         "isolated clone removed"
     );
     Ok(())
@@ -5442,10 +5490,17 @@ mod tests {
     /// Scenario: a deck-owned isolated clone that is CLEAN and whose branch
     /// has a MERGED PR -- the exact combination that makes an ordinary
     /// linked worktree `Verdict::Remove` -- must never be automatically
-    /// removed by `worktree reclaim`, with or without `--yes`. This is
-    /// M4a's deliberate, conservative stopping point: whether an isolated
-    /// clone ever becomes safely auto-reclaimable (and under what stricter
-    /// condition) is left to a documented follow-up, not implemented here.
+    /// removed by `worktree reclaim`, with or without `--yes`, when the
+    /// `gh` stub's merged-PR response carries no `headRefOid` field at all.
+    /// CORRECTED (fork issue #546): this does NOT pin a guarantee that
+    /// isolated clones are never auto-reclaimed -- `worktree/reclaim/062`
+    /// proves the opposite once `headRefOid` genuinely matches the clone's
+    /// own HEAD. This test only ever exercises the "head ref unresolvable"
+    /// (`None`) branch, because [`write_merged_gh_stub`] omits the field
+    /// entirely; it passes for that specific fixture shape, not because of
+    /// any stronger guarantee the codebase actually makes (see
+    /// `worktree/reclaim/072`, which names this same gap for the
+    /// present-but-mismatched case).
     #[spec("worktree/reclaim/052")]
     #[test]
     #[cfg(unix)]
@@ -7248,6 +7303,101 @@ mod tests {
         assert!(
             clone_dir.join("dirtied-after-examination.txt").exists(),
             "the refusal must not touch the directory's other contents"
+        );
+    }
+
+    /// Scenario: fork issue #546 hazard 1 -- `remove_isolated_clone_dir`
+    /// deletes an isolated clone's directory via `remove_dir_all` but never
+    /// clears the M4b provenance artifact
+    /// (`issue_dispatch_run::isolated_clone_provenance_path`) that vouches
+    /// for that path, even though the artifact lives entirely outside the
+    /// directory being deleted (in `state_dir()`, by design -- see that
+    /// function's own doc comment). A later, unrelated directory created at
+    /// the same path would then be silently vouched for by this stale
+    /// evidence -- exactly the hazard PRD #544's own Risks section names,
+    /// reachable here via the heuristic-reclaim path that PRD never
+    /// touched. A genuinely eligible isolated clone (owned, clean,
+    /// single-branch, no stash, HEAD equal to the merged PR's
+    /// `headRefOid`) removed via `worktree reclaim --yes` must leave no
+    /// provenance artifact behind.
+    #[spec("worktree/reclaim/074")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_074_removal_clears_the_provenance_artifact() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-provenance-cleared");
+        let creator = "issue-dispatch:provenance-cleared#2012";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "provenance-cleared-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let provenance_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
+        assert!(
+            provenance_path.is_file(),
+            "sanity: the real provisioner must have written a provenance artifact at {} before \
+             removal is exercised, or this test isn't exercising the clearing behavior at all",
+            provenance_path.display()
+        );
+
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "provenance-cleared-branch", &head_ref_oid);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let outcome = run_reclaim(&repo, true, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            outcome.removed.iter().any(|r| r.real_path == clone_dir),
+            "sanity: the clone must actually be removed for this test to prove anything about \
+             what removal leaves behind, got removed={:?} pending={:?} kept={:?}",
+            outcome
+                .removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>(),
+            outcome
+                .pending
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>(),
+            outcome
+                .kept
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !clone_dir.exists(),
+            "the isolated clone directory must be gone from disk after `worktree reclaim --yes`"
+        );
+
+        assert!(
+            !provenance_path.is_file(),
+            "the M4b provenance artifact at {} must be cleared when the isolated clone it \
+             vouches for is removed -- a later, unrelated directory created at the same path \
+             would otherwise be silently vouched for by this stale evidence (fork issue #546 \
+             hazard 1)",
+            provenance_path.display()
         );
     }
 }
