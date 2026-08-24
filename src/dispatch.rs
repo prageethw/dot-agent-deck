@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    IsolatedCloneOutcome, RemovalPolicy, WorktreeCreation, WorktreeRegistry,
+    IsolatedCloneOutcome, RemovalPolicy, RemoveOutcome, WorktreeCreation, WorktreeRegistry,
     attempt_isolated_clone_cleanup, create_worktree, provision_isolated_clone_sync,
     record_worktree, remove_worktree, run_status, worktree_still_in_use,
 };
@@ -827,6 +827,14 @@ pub async fn handle_dispatch(
             // with no error surfaced, since the delete itself succeeds
             // against the wrong repository (auditor A1, verified
             // empirically).
+            // issue #473: `should_drop_registry` tracks whether the
+            // worktree was actually removed from disk -- the isolated-clone
+            // arm's cleanup is unconditional (see its own comment below), but
+            // the shared-checkout arm's `remove_worktree` can genuinely fail
+            // (e.g. a locked worktree), and dropping the registry entry in
+            // that case would lose the only record that the worktree is
+            // still on disk.
+            let mut should_drop_registry = true;
             let cleanup_failed = if has_live_sibling {
                 // The clone directory IS `paths.worktree_dir` -- remove it
                 // with the same helper `provision_isolated_clone_sync`'s own
@@ -857,18 +865,38 @@ pub async fn handle_dispatch(
                         .flatten();
                 cleaned_up_by.is_none()
             } else {
-                let _ = remove_worktree(
+                // Match the outcome instead of discarding it (`let _ = ...`)
+                // -- `RemoveOutcome` is `#[must_use]` for exactly this
+                // reason (PRD 236 review). Mirrors the tab-close precedent
+                // in `daemon_protocol.rs` that already matches on
+                // `Kept`/`RemoveFailed`/`Removed`.
+                let remove_outcome = remove_worktree(
                     &paths.worktree_dir,
                     &clone_dir,
                     RemovalPolicy::Force,
                     &creator,
                 )
                 .await;
+                // issue #473: removal genuinely not happening (failed, or --
+                // though `RemovalPolicy::Force` never produces it -- kept)
+                // must not drop the registry entry, since that entry is the
+                // only record that the worktree is still on disk.
+                // auditor A4: don't trust git's reported exit status alone --
+                // mirror the `removed && !dir.exists()` second signal
+                // `attempt_worktree_cleanup`/`attempt_worktree_cleanup_async`
+                // already require elsewhere in this repo
+                // (`issue_dispatch_run.rs`) before treating a removal as
+                // confirmed.
+                let remove_failed = match remove_outcome {
+                    RemoveOutcome::Removed(_) => paths.worktree_dir.exists(),
+                    RemoveOutcome::Kept(_) | RemoveOutcome::RemoveFailed(_) => true,
+                };
+                should_drop_registry = !remove_failed;
                 // Also delete the branch: `git worktree remove` never
                 // deletes it. Same multi-role caveat as above — a still-live
                 // sibling role may hold committed work whose only record is
                 // this branch.
-                run_status(
+                let branch_delete_failed = run_status(
                     "git",
                     &[
                         "-C",
@@ -879,7 +907,8 @@ pub async fn handle_dispatch(
                     ],
                 )
                 .await
-                .is_err()
+                .is_err();
+                remove_failed || branch_delete_failed
             };
 
             if cleanup_failed {
@@ -891,7 +920,7 @@ pub async fn handle_dispatch(
                 );
             }
 
-            {
+            if should_drop_registry {
                 let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
                 wts.remove(&paths.worktree_dir);
             }
@@ -906,7 +935,23 @@ pub async fn handle_dispatch(
                     )
                 )
             } else {
-                " (cleanup failed: branch may still exist — name may be wedged)".to_string()
+                // issue #473 review round (reviewer P2-1 / auditor A2): this
+                // message is the actual recovery path a human will read --
+                // retaining the registry entry buys no automatic recovery,
+                // since its only production consumer (tab-close) needs a
+                // live agent rooted here. Name both things that can still be
+                // on disk (the branch delete and the worktree removal are
+                // separate calls, either of which can fail independently)
+                // and give the same actionable hint the `has_live_sibling`
+                // arm above already gives.
+                format!(
+                    " (cleanup failed: branch and/or worktree directory may still exist — \
+                     check `{}`; if it's still there, run `rm -rf` on it and delete the \
+                     branch manually, then try again)",
+                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                        &paths.worktree_dir
+                    )
+                )
             };
 
             DispatchResult {
@@ -1916,6 +1961,110 @@ mod tests {
         );
     }
 
+    /// Scenario: issue #473 regression guard. Forces the shared-checkout
+    /// rollback arm's `git worktree remove --force` to genuinely fail (the
+    /// worktree is locked the instant `git worktree add` creates it, via a
+    /// `PATH`-shimmed `git`), then asserts the CORRECT post-rollback
+    /// behavior: the registry entry for the worktree must still be present,
+    /// since removal did not actually succeed. `dispatch.rs` now matches on
+    /// `remove_worktree`'s `RemoveOutcome` instead of discarding it
+    /// (`let _ = remove_worktree(...)`) and only drops the registry entry
+    /// when removal actually succeeded, restoring the guarantee
+    /// `RemoveOutcome::RemoveFailed` exists to provide (see its own doc
+    /// comment, PRD 236 review).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_rollback_retains_registry_entry_when_force_removal_fails() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "lockfail-unit");
+
+        // Same daemon-gate bypass as the sibling test above -- without it,
+        // issue #490's live-sibling gate fails closed before the rollback
+        // arm this test targets is ever reached.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
+        // Force the rollback's eventual `git worktree remove --force` to
+        // genuinely fail: a `PATH`-shimmed `git` locks the worktree the
+        // moment `git worktree add` creates it -- synchronously, inside the
+        // same subprocess call `create_worktree` awaits, so there is no
+        // timing race against `handle_dispatch`'s later spawn-then-rollback
+        // steps. `git worktree remove --force` refuses a locked worktree
+        // even with a single `--force` (`remove_worktree_argv` only ever
+        // pushes one) -- verified directly against git 2.55.0, matching
+        // `RemoveOutcome::RemoveFailed`'s own doc comment on how PRD 236
+        // originally reproduced this.
+        let _git_stub = with_git_worktree_add_locking_the_new_worktree(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-473".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "lockfail-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached -- every other assertion \
+             here is a negative that a fail-closed early return (creating nothing) would \
+             also satisfy, so this is the one assertion that distinguishes a genuine \
+             rollback attempt from the gate refusing before it ever got there: {}",
+            result.message
+        );
+        assert!(
+            paths.worktree_dir.exists(),
+            "removal was forced to fail (the worktree is locked) -- the directory must \
+             still be on disk: {}",
+            result.message
+        );
+        assert!(
+            ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "issue #473: the registry entry for {} must still be present -- removal \
+             genuinely failed (locked worktree), so dropping the entry anyway loses the \
+             only record that this worktree is still on disk: {}",
+            paths.worktree_dir.display(),
+            result.message
+        );
+        assert!(
+            result.message.contains("cleanup failed"),
+            "reviewer P2-3: every other assertion here is a positive that the earlier \
+             `worktree_still_in_use` early-return would also satisfy, so this is the one \
+             assertion that proves the rollback arm was genuinely reached (not the early \
+             return) AND pins the second half of the behavior change -- that \
+             `cleanup_failed` is actually set to true here, not just that the registry \
+             retains the entry: {}",
+            result.message
+        );
+
+        // Best-effort cleanup: `tmp`'s own Drop removes everything under it
+        // regardless, but unlock first so a leftover admin lock file cannot
+        // confuse anything that inspects `repo/.git/worktrees/` before then.
+        let _ = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "worktree",
+                "unlock",
+                "--",
+                &paths.worktree_dir.to_string_lossy(),
+            ])
+            .output();
+        let _ = std::fs::remove_dir_all(&paths.worktree_dir);
+    }
+
     // --- issue #490 (PRD fork#325 M3, Model B): the live-sibling clone gate ---
     //
     // Model A's equivalent (`src/ui.rs`'s `Action::SpawnPane` handler) consults
@@ -2216,6 +2365,201 @@ mod tests {
             std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
         }
         FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Prepend a fake `git` to `PATH` that LOCKS a worktree the instant `git
+    /// worktree add` creates it -- synchronously, inside the same subprocess
+    /// call `create_worktree`'s `run_status_killable_args` awaits, so there
+    /// is no timing race against anything `handle_dispatch` does afterward
+    /// (recording the worktree, attempting the spawn, or -- issue #473's
+    /// target -- the rollback's own `git worktree remove --force`). Every
+    /// other invocation, including that eventual removal attempt, passes
+    /// straight through to the real `git`.
+    ///
+    /// Word-scanned rather than positional, mirroring
+    /// `with_git_clone_failing_with_hostile_stderr`'s own reasoning: matches
+    /// wherever `worktree` is immediately followed by `add`, and reads
+    /// `clone_dir`/`worktree_dir` off the values immediately following
+    /// `-C`/`add` respectively -- so the `-c core.fsmonitor=` hardening
+    /// `spawn_git_status_child` prepends to every call through this shared
+    /// core cannot shift the match off a fixed `$N` the way it did to an
+    /// earlier, positional version of that sibling stub.
+    #[cfg(unix)]
+    fn with_git_worktree_add_locking_the_new_worktree(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-worktree-add-lock-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 is_add=0\n\
+                 clone_dir=\"\"\n\
+                 worktree_dir=\"\"\n\
+                 prev=\"\"\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$prev\" = \"-C\" ]; then\n\
+                 \x20\x20\x20\x20clone_dir=\"$a\"\n\
+                 \x20\x20fi\n\
+                 \x20\x20if [ \"$prev\" = \"worktree\" ] && [ \"$a\" = \"add\" ]; then\n\
+                 \x20\x20\x20\x20is_add=1\n\
+                 \x20\x20fi\n\
+                 \x20\x20if [ \"$prev\" = \"add\" ]; then\n\
+                 \x20\x20\x20\x20worktree_dir=\"$a\"\n\
+                 \x20\x20fi\n\
+                 \x20\x20prev=\"$a\"\n\
+                 done\n\
+                 if [ \"$is_add\" = \"1\" ] && [ -n \"$worktree_dir\" ]; then\n\
+                 \x20\x20{real_git} \"$@\"\n\
+                 \x20\x20status=$?\n\
+                 \x20\x20if [ \"$status\" -eq 0 ]; then\n\
+                 \x20\x20\x20\x20{real_git} -C \"$clone_dir\" worktree lock -- \"$worktree_dir\" 1>&2\n\
+                 \x20\x20fi\n\
+                 \x20\x20exit \"$status\"\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Prepend a fake `git` to `PATH` that fails ONLY `git branch -D`
+    /// invocations -- the shared-checkout rollback arm's separate
+    /// branch-deletion call -- and passes every other invocation, including
+    /// its own `git worktree remove --force`, straight through to the real
+    /// `git`. Lets a test force the worktree removal to genuinely succeed
+    /// while the branch delete alone fails (issue #473 sibling gap, auditor
+    /// A3).
+    ///
+    /// Word-scanned rather than positional (matches `branch` immediately
+    /// followed by `-D` anywhere in argv), the same reasoning
+    /// `with_git_worktree_add_locking_the_new_worktree` documents: the
+    /// rollback's `branch -D` call goes through `run_status`, a raw
+    /// `tokio::process::Command` with no global-option prefix today, but a
+    /// positional match would silently stop matching if that ever changed.
+    #[cfg(unix)]
+    fn with_git_branch_delete_failing(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-branch-delete-fail-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 prev=\"\"\n\
+                 is_branch_delete=0\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$prev\" = \"branch\" ] && [ \"$a\" = \"-D\" ]; then\n\
+                 \x20\x20\x20\x20is_branch_delete=1\n\
+                 \x20\x20fi\n\
+                 \x20\x20prev=\"$a\"\n\
+                 done\n\
+                 if [ \"$is_branch_delete\" = \"1\" ]; then\n\
+                 \x20\x20echo 'stub: simulated git branch -D failure' >&2\n\
+                 \x20\x20exit 1\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Scenario: issue #473 sibling gap (auditor A3). Forces the
+    /// shared-checkout rollback arm's worktree removal to succeed for real
+    /// while the SEPARATE `git branch -D` call fails, via
+    /// `with_git_branch_delete_failing`. Guards against
+    /// `should_drop_registry = !cleanup_failed` -- a plausible-looking but
+    /// wrong simplification the auditor reproduced directly: it would
+    /// compile, pass every other rollback test, and silently reintroduce
+    /// phantom registry retention for a worktree that is actually gone. The
+    /// worktree here IS gone (only the branch delete failed), so the
+    /// registry entry -- the only record of a still-on-disk worktree -- must
+    /// still be dropped, even though `cleanup_failed` is separately true.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_rollback_drops_registry_entry_when_only_branch_delete_fails() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "branchfail-unit");
+
+        // Same daemon-gate bypass every sibling rollback test in this file
+        // uses -- without it, issue #490's live-sibling gate fails closed
+        // before the rollback arm this test targets is ever reached.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+        let _git_stub = with_git_branch_delete_failing(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-473b".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "branchfail-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached: {}",
+            result.message
+        );
+        assert!(
+            !paths.worktree_dir.exists(),
+            "worktree removal itself must have genuinely succeeded (only the branch \
+             delete was stubbed to fail): {}",
+            result.message
+        );
+        assert!(
+            branch_exists(&repo, &paths.branch),
+            "the branch delete must have genuinely failed, or this test proves nothing \
+             about the sibling gap it targets"
+        );
+        assert!(
+            !ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "issue #473 sibling gap: the worktree itself is gone, so the registry entry \
+             must still be dropped even though the branch delete failed -- dropping the \
+             registry must track whether the WORKTREE was removed, not whether cleanup as \
+             a whole (including the branch delete) succeeded: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("cleanup failed"),
+            "cleanup_failed must still be true, separately from should_drop_registry, \
+             since the branch delete genuinely failed: {}",
+            result.message
+        );
     }
 
     /// Scenario: issue #490, case 1 -- regression guard. No live orchestration
