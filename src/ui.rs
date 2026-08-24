@@ -1310,18 +1310,20 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// deleted per this function's own doc comment below.
 ///
 /// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1; widened fix round
-/// 4, auditor D2), not yet fixed, tracked as issue #496: the fail-closed
-/// guarantee above does NOT extend to a live orchestration whose record
-/// reaches this loop with `tab_membership: None`. Two distinct routes
-/// produce that shape, both silently falling through the per-record loop's
-/// `else { continue; }` arm below — invisible to this gate, treated exactly
-/// like "no live sibling" for that entry, even though a genuine live
-/// orchestration sits behind it:
+/// 4, auditor D2; narrowed by issue #496's fix): the fail-closed guarantee
+/// above used NOT to extend to a live orchestration whose record reaches
+/// this loop with `tab_membership: None` or with a `tab_membership` that IS
+/// `Orchestration` but carries `orchestration_cwd: None`. Two distinct
+/// routes could hide a live orchestration from this loop:
 ///
 /// 1. An OLDER CLIENT whose record omits `orchestration_cwd` altogether
 ///    (`TabMembership::Orchestration`'s field is `#[serde(default)]`, so a
 ///    pre-#325 client's record deserializes with it as `None` rather than
-///    failing to parse at all).
+///    failing to parse at all). **Fixed by issue #496**: the per-record loop
+///    now distinguishes "this record IS an `Orchestration` member but we
+///    can't tell its cwd" from "this record isn't an `Orchestration` member
+///    at all" — the former now returns `Err` (fails closed) instead of
+///    silently `continue`-ing.
 /// 2. `sanitize_record_tab_membership` (`src/daemon_client.rs`) clamping the
 ///    WHOLE `tab_membership` to `None` when
 ///    [`crate::agent_pty::validate_tab_membership`] rejects it — which it
@@ -1330,11 +1332,35 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 ///    control-byte-bearing `orchestration_cwd` in `StartAgent`; not a
 ///    boundary crossing (a same-uid peer already has arbitrary code
 ///    execution in this model), which is why this is tracked rather than
-///    treated as a blocker.
+///    treated as a blocker. **Still open, deliberately out of scope for
+///    issue #496 — and unreachable from THIS function specifically, for two
+///    independent reasons** (issue #496 fix round, auditor A1; corrects an
+///    earlier claim that this function itself sits downstream of the
+///    sanitizer): first, this function bypasses
+///    `sanitize_record_tab_membership` entirely — it calls
+///    `send_daemon_request_blocking`, a raw synchronous socket round trip
+///    that never goes through the async `DaemonClient::list_agents`
+///    hydration path the sanitizer is wired into, so a clamped-to-`None`
+///    membership produced by that mechanism never reaches this loop.
+///    Second, the daemon-side producer never creates the clamped shape
+///    either: `spawn_agent` (`src/agent_pty.rs`) rejects the whole
+///    `StartAgent` outright when `validate_tab_membership` fails, rather
+///    than storing a nulled membership, so no record is ever created for
+///    `ListAgents` to echo. The remaining, purely theoretical shape — a
+///    buggy-or-hostile same-uid daemon emitting `tab_membership: None` on
+///    the wire directly — is indistinguishable from an ordinary
+///    non-orchestration pane and so cannot be failed closed on without
+///    `sanitize_record_tab_membership` growing a tombstone shape (e.g.
+///    "this WAS an orchestration record, just an invalid one") rather than
+///    collapsing it to `None` — a separate design question left for a
+///    fresh follow-up issue, whose fix would have to land on this raw path
+///    (or move this gate onto `DaemonClient::list_agents`), not on the
+///    sanitizer alone.
 ///
-/// This is a real, tracked gap on these two axes, not a claim that the whole
-/// function fails open; every other failure mode this doc comment describes
-/// still fails closed as stated.
+/// So this doc comment's fail-closed claim now holds for route 1; route 2
+/// remains a real, tracked gap, not a claim that the whole function fails
+/// open — every other failure mode this doc comment describes still fails
+/// closed as stated.
 ///
 /// A single LIVE entry whose own `git-common-dir` fails to resolve (e.g. its
 /// worktree was removed after the daemon's record went stale) is skipped
@@ -1418,13 +1444,28 @@ pub(crate) fn root_checkout_has_live_sibling(
     let target_dir_canon =
         std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
 
+    // Issue #496 fix round (reviewer F2): a cwd-less record's `Err` is
+    // deferred rather than returned immediately, so the collision scan below
+    // always runs to completion (or to a definite `Ok(true)`) first. Without
+    // this, whether the function refuses or safely isolates depended on
+    // `agent_records`' numeric-id sort order — a cwd-less record sorting
+    // ahead of a record that would have matched `target_dir` short-circuited
+    // the loop before the genuine, already-safely-handled collision was ever
+    // seen. A determinable `Ok(true)` collision now always wins over a mere
+    // "can't tell" refusal, regardless of which record the daemon lists
+    // first; the fail-closed guarantee is unchanged, since no path below
+    // reaches `Ok(false)` while a cwd-less record was seen.
     let mut seen_cwds: HashSet<String> = HashSet::new();
+    let mut saw_unresolvable_cwd = false;
     for r in agent_records {
         let Some(TabMembership::Orchestration {
-            orchestration_cwd: Some(cwd),
-            ..
+            orchestration_cwd, ..
         }) = r.tab_membership
         else {
+            continue;
+        };
+        let Some(cwd) = orchestration_cwd else {
+            saw_unresolvable_cwd = true;
             continue;
         };
         if !seen_cwds.insert(cwd.clone()) {
@@ -1451,6 +1492,15 @@ pub(crate) fn root_checkout_has_live_sibling(
         if live_common == target_common {
             return Ok(true);
         }
+    }
+    if saw_unresolvable_cwd {
+        return Err(
+            "a live orchestration record has no resolvable cwd — cannot determine \
+             whether it collides with this checkout; close the older client's \
+             orchestration, or restart it under this build, before opening a \
+             second orchestration here"
+                .to_string(),
+        );
     }
     Ok(false)
 }
@@ -37007,6 +37057,273 @@ mod tests {
             result.is_err(),
             "an older-daemon-shaped response (agent_records: None) must fail the \
              gate closed, not read as 'no live sibling'; got {result:?}"
+        );
+    }
+
+    /// Scenario: Issue #496 — point the gate at a well-formed response
+    /// carrying one `AgentRecord` whose `tab_membership` is
+    /// `Some(TabMembership::Orchestration { orchestration_cwd: None, .. })`,
+    /// the shape an older client (pre-`orchestration_cwd` field, which is
+    /// `#[serde(default)]` on the wire) sends. The per-record loop's
+    /// `let Some(TabMembership::Orchestration { orchestration_cwd: Some(cwd), .. }) = r.tab_membership else { continue; }`
+    /// treats this as "not a live sibling here" and silently skips the
+    /// record instead of refusing to answer, unlike the two sibling tests
+    /// above which correctly fail closed on an unreachable daemon or a
+    /// legacy `agents`-only response. Assert `Err`.
+    #[test]
+    fn root_checkout_has_live_sibling_fails_closed_on_orchestration_record_with_no_cwd() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let record = crate::agent_pty::AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "some-orchestration".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![record]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
+        // Reviewer F3: assert the error's content, not just `is_err()` — every
+        // failure mode of this function returns `Err`, so a bare `is_err()`
+        // check would still pass green if this specific arm regressed (e.g.
+        // `with_crafted_response_daemon` failing to bind, or the daemon
+        // round trip erroring for an unrelated reason). "no resolvable cwd"
+        // is unique to this arm's message and distinguishes it from this
+        // function's other `Err` producers ("too old to report" and "could
+        // not reach the daemon").
+        let err = result.expect_err(
+            "an orchestration record with orchestration_cwd: None (an older client's \
+             shape) must fail the gate closed, not be silently skipped as 'not a live \
+             sibling here'",
+        );
+        assert!(
+            err.contains("no resolvable cwd"),
+            "expected the cwd-less-orchestration arm's message, got: {err}"
+        );
+    }
+
+    /// Scenario: Issue #496 reviewer F4 — the negative-side counterweight to
+    /// the test above. Point the gate at a well-formed response carrying one
+    /// `AgentRecord` whose `tab_membership` is `Some(TabMembership::Mode {
+    /// .. })` — a genuinely non-`Orchestration` member, the shape every
+    /// ordinary (non-orchestration) pane has. The per-record loop's
+    /// `let Some(TabMembership::Orchestration { .. }) = r.tab_membership else { continue; }`
+    /// must still treat this as "not a live sibling here" and `continue`,
+    /// not be swept into the new cwd-less-`Orchestration` `Err` arm above —
+    /// nothing else in `agent_records` matches, so the function must reach
+    /// its "no live sibling" success case, `Ok(false)`.
+    #[test]
+    fn root_checkout_has_live_sibling_ignores_non_orchestration_record() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let record = crate::agent_pty::AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Mode {
+                name: "some-mode".into(),
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![record]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
+        assert_eq!(
+            result,
+            Ok(false),
+            "a non-Orchestration tab_membership record (Mode) must still be \
+             skipped as 'not a live sibling here', not trigger the cwd-less-\
+             Orchestration Err arm; got {result:?}"
+        );
+    }
+
+    /// Scenario: Issue #496 reviewer F2 (fix round two-pass restructure) —
+    /// the property this rule exists to pin is order-INDEPENDENCE, not just
+    /// the `Ok(true)` outcome. Point the gate at a well-formed response
+    /// carrying TWO `AgentRecord`s: one cwd-less `Orchestration` record (the
+    /// ambiguous shape from the tests above) and one genuine `Orchestration`
+    /// record whose `orchestration_cwd` IS `dir` itself — a real,
+    /// determinable collision. The cwd-less record sorts FIRST in the `Vec`
+    /// passed to `AttachResponse::agent_records`. Before this fix round, the
+    /// per-record `let Some(cwd) = orchestration_cwd else { return
+    /// Err(...) }` was an immediate early return (not the deferred
+    /// `saw_unresolvable_cwd` flag it was replaced with), so it would have
+    /// returned `Err` here without the loop ever reaching the second,
+    /// colliding record — a definite `Ok(true)` collision hidden behind an
+    /// earlier "can't tell" refusal purely because of `Vec` order. Assert
+    /// `Ok(true)`: the consumer (`dispatch.rs`) routes `true` into an
+    /// isolated clone, which is always safe regardless of what else is in
+    /// the record list.
+    #[test]
+    fn root_checkout_has_live_sibling_ok_true_wins_when_cwdless_record_sorts_first() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let cwdless_record = crate::agent_pty::AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "some-older-orchestration".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+        let colliding_record = crate::agent_pty::AgentRecord {
+            id: "2".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "live-sibling".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: Some(dir.to_string_lossy().into_owned()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![
+                cwdless_record,
+                colliding_record,
+            ]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
+        assert_eq!(
+            result,
+            Ok(true),
+            "a determinable Ok(true) collision must win over an earlier cwd-less \
+             record's ambiguity, regardless of Vec order; got {result:?}"
+        );
+    }
+
+    /// Scenario: the same property as the test above, with the two records'
+    /// `Vec` order reversed — the colliding record sorts FIRST, the cwd-less
+    /// record sorts LAST. On the pre-fix immediate-`return Err` code this
+    /// order already happened to pass, since the loop's short-circuit
+    /// `return Ok(true)` on the first (colliding) record ran before the
+    /// second (cwd-less) record was ever examined; this test exists so the
+    /// pair together pin order-independence rather than one lucky order, per
+    /// reviewer's own suggestion. Assert `Ok(true)`.
+    #[test]
+    fn root_checkout_has_live_sibling_ok_true_wins_when_cwdless_record_sorts_last() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let cwdless_record = crate::agent_pty::AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "some-older-orchestration".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+        let colliding_record = crate::agent_pty::AgentRecord {
+            id: "2".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "live-sibling".into(),
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                is_start_role: true,
+                orchestration_cwd: Some(dir.to_string_lossy().into_owned()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+        };
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![
+                colliding_record,
+                cwdless_record,
+            ]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
+        assert_eq!(
+            result,
+            Ok(true),
+            "a determinable Ok(true) collision must win regardless of Vec order; \
+             got {result:?}"
         );
     }
 
