@@ -242,9 +242,28 @@ fn render_compare_markdown(
         s.push('\n');
     }
 
-    s.push_str("## Modified (present at both, changed)\n\n");
+    s.push_str(&render_modified_table(
+        "## Modified (present at both, changed)\n\n",
+        modified,
+        false,
+    ));
+
+    s
+}
+
+/// Shared by `render_compare_markdown` and `render_markdown`: renders the
+/// "Modified" table section, identical in both reports apart from the
+/// heading text and whether a blank line trails the section (`render_markdown`
+/// has further sections after it; `render_compare_markdown`'s Modified
+/// section is the last thing printed).
+fn render_modified_table(heading: &str, modified: &[ModifiedRow], trailing_blank: bool) -> String {
+    let mut s = String::new();
+    s.push_str(heading);
     if modified.is_empty() {
         s.push_str("_(none)_\n");
+        if trailing_blank {
+            s.push('\n');
+        }
     } else {
         s.push_str("| Catalog ID | Function | File | What changed |\n");
         s.push_str("|---|---|---|---|\n");
@@ -264,8 +283,10 @@ fn render_compare_markdown(
                 what.join(", "),
             ));
         }
+        if trailing_blank {
+            s.push('\n');
+        }
     }
-
     s
 }
 
@@ -723,30 +744,11 @@ pub fn render_markdown(
         s.push('\n');
     }
 
-    s.push_str("## Modified in this branch\n\n");
-    if modified.is_empty() {
-        s.push_str("_(none)_\n\n");
-    } else {
-        s.push_str("| Catalog ID | Function | File | What changed |\n");
-        s.push_str("|---|---|---|---|\n");
-        for m in modified {
-            let mut what: Vec<&str> = Vec::new();
-            if m.scenario_changed {
-                what.push("Scenario");
-            }
-            if m.body_changed {
-                what.push("body");
-            }
-            s.push_str(&format!(
-                "| {} | `{}` | `{}` | {} |\n",
-                m.spec_id,
-                m.fn_name,
-                m.file,
-                what.join(", "),
-            ));
-        }
-        s.push('\n');
-    }
+    s.push_str(&render_modified_table(
+        "## Modified in this branch\n\n",
+        modified,
+        true,
+    ));
 
     s.push_str("## Catalog entries with prose changes\n\n");
     if catalog_delta.is_empty() {
@@ -815,7 +817,7 @@ fn git_merge_base(repo_dir: &Path) -> Result<String, String> {
     Ok(sha)
 }
 
-fn git_show(repo_dir: &Path, reference: &str, path: &str) -> Result<String, String> {
+pub(crate) fn git_show(repo_dir: &Path, reference: &str, path: &str) -> Result<String, String> {
     let out = Command::new("git")
         .args(["show", &format!("{reference}:{path}")])
         .current_dir(repo_dir)
@@ -848,7 +850,7 @@ fn git_ls_tree(repo_dir: &Path, reference: &str, path: &str) -> Result<Vec<Strin
         .collect())
 }
 
-fn collect_tests_at_ref(
+pub(crate) fn collect_tests_at_ref(
     repo_dir: &Path,
     reference: &str,
 ) -> Result<BTreeMap<String, TestEntry>, String> {
@@ -1448,7 +1450,16 @@ mod tests {
 /// shape (fixtures under a `tempfile::tempdir()`, ambient git
 /// configuration switched off, no network/sleep, nothing that can read or
 /// write the checkout these tests run inside).
-#[cfg(all(test, unix))]
+///
+/// **Not gated to `unix`, unlike `repo_state.rs`'s `mod real_git`.** That
+/// module's gate exists for two Unix-specific fixture constructs (a
+/// `file://` URL spelled from a POSIX path, and a directory name containing
+/// a literal newline Win32 rejects) that this module's fixtures do not use
+/// — `git init`, `fs::write`/`fs::remove_file`, and `Path`/`PathBuf` joins
+/// with forward slashes, all of which Windows accepts fine. Keeping these
+/// four tests running on `build-windows` is what CLAUDE.md rule 5 added
+/// `--workspace` for in the first place.
+#[cfg(test)]
 mod real_git {
     use super::*;
     use std::fs;
