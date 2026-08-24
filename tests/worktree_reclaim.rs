@@ -29,6 +29,14 @@ use spec::spec;
 #[path = "../src/test_temp.rs"]
 mod test_temp;
 
+// Issue #668: the wrapped-child lifetime bound for the one test below that
+// spawns through a bare `AgentPtyRegistry`, in a file that deliberately does
+// not link the full harness (see the `test_temp` comment above). Unix-gated
+// like its only caller, so the module is not dead code on Windows.
+#[cfg(unix)]
+#[path = "common/child_lifetime_bound.rs"]
+mod child_lifetime_bound;
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -2438,6 +2446,11 @@ exit 0
 #[tokio::test]
 #[cfg(unix)]
 async fn worktree_reclaim_045_issue_dispatch_producer_records_keep_if_dirty() {
+    // Issue #668: armed before the `AgentPtyRegistry` below spawns anything,
+    // so `cat` (the dispatched stand-in) carries the wrapped-child lifetime
+    // bound that lets `wrap` reap a stranded child.
+    child_lifetime_bound::arm();
+
     let scratch = test_temp::tempdir().expect("scratch tempdir");
     let workspace = scratch.path().to_path_buf();
     let task_name = "prd236-unit";

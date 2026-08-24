@@ -203,7 +203,13 @@ jobs:
       # merge-base HEAD origin/main`, and on a `pull_request` event a depth-1
       # checkout has no `origin/main` ref at all — `list-tests` never ran in
       # CI, so this has never mattered before. A full clone is what makes
-      # that ref resolvable.
+      # that ref resolvable. Issue #259: `cargo xtask linkage-check`'s check
+      # 11 (resurrected-changelog-fragment detection) is a second consumer
+      # of the same property — it also resolves `origin/main` via
+      # `work_type::resolve_base`, and fails closed with a printed skip
+      # rather than a hard failure when it cannot (B1), so removing this
+      # flag would make check 11 quietly stop running rather than break the
+      # build outright.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0

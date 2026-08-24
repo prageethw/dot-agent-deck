@@ -5,10 +5,11 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the eleven checks
-//!   listed in Decision 7 + Decision 30 (+ issue #322 + fork #148):
+//!   (issue #557; see [`repo_state`]), then performs the twelve checks
+//!   listed in Decision 7 + Decision 30 (+ issue #322 + fork #148 + issue
+//!   #259):
 //!
-//!   The preflight is deliberately not one of the ten numbered checks: it answers
+//!   The preflight is deliberately not one of the twelve numbered checks: it answers
 //!   "is this repository sane to reason about", a different question from
 //!   "does the catalog match the tests", and it runs first so a repository
 //!   in a state that would misdiagnose the checks below is caught before
@@ -54,6 +55,14 @@
 //!      rather than deduplicating into a set, so a repeat is
 //!      representable instead of silently collapsing to whichever
 //!      heading was parsed last.
+//!  12. No `changelog.d/*.md` fragment added by this branch has
+//!      content already present in `CHANGELOG.md` (issue #259, the
+//!      #258 shape) — a resurrected fragment, typically the result
+//!      of a rebase silently replaying a file a release rollup
+//!      already deleted and consumed. Reuses `work_type`'s
+//!      `resolve_base`/`collect_added_fragments` rather than
+//!      re-deriving the diff. See
+//!      [`work_type::check_resurrected_fragments`].
 //!
 //!   The numbers are stable identifiers in the failure output, so a
 //!   new rule takes the next one rather than renumbering the others.
@@ -144,6 +153,16 @@ use regex::Regex;
 const CATALOG_PATH: &str = "tests/CATALOG.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
+
+/// Total numbered checks this tool performs (the repository-state preflight
+/// is deliberately not one of them — see the module doc). One literal for
+/// one fact, rather than the three that used to drift independently: the
+/// module doc's prose said "nine" and "ten" while the success line below
+/// printed "9 rules", and issue #259 added a twelfth check without
+/// touching any of them. The same shape as `work_type`'s own (private,
+/// unrelated, five-rule) `RULE_COUNT`, which exists for the identical
+/// reason one module over.
+const CHECK_COUNT: usize = 12;
 
 /// Check 8 (issue #322): why a bare `tempfile` constructor is forbidden under
 /// `tests/`, spelled out here because the violation is invisible at the call
@@ -631,7 +650,7 @@ fn main() -> ExitCode {
     // single `cargo xtask` alias can drive both linkage-check and
     // docs. `cargo xtask docs --tests` → docs generator;
     // anything else (including no first arg or `linkage-check`) →
-    // the eleven Decision-7 / Decision-30 / issue #322 / fork #148 checks below.
+    // the twelve Decision-7 / Decision-30 / issue #322 / fork #148 / issue #259 checks below.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("docs")) {
         return run_docs(&args[1..]);
@@ -974,9 +993,58 @@ fn main() -> ExitCode {
         failures.push(format!("[7] {e}"));
     }
 
+    // Check 11 (issue #259 / #258): a changelog.d/*.md fragment ADDED by this
+    // diff whose content is already present in CHANGELOG.md is a resurrected
+    // fragment — `changelog.d/163.bugfix.md` shipped to `main` this way in PR
+    // #219's rebase across the 2026-08-12 upstream sync, caught only after
+    // merge (#258), because nothing compared an added fragment's content
+    // against what CHANGELOG.md already carries. See
+    // `work_type::check_resurrected_fragments` for the full reasoning and the
+    // whitespace-tolerant-but-still-exact comparison it uses. Scoped
+    // narrowly per issue #259's own table: this is the one artifact of the
+    // eight rebase artifacts that actually reached `main`; the other seven
+    // already have gates elsewhere (CI structure, this file's other checks,
+    // the compiler). The broader "why does this branch touch this file"
+    // heuristic issue #259 also raises stays explicit future work, not
+    // attempted here.
+    // B1 (issue #259 fix round): an unresolvable base (no `origin/main`, not
+    // a git repository at all, …) is a SKIP, not a failure — matching
+    // `repo_state`'s preflight five lines above `main()`, not the "fail
+    // unconditionally" shape `duplicate_catalog_id.rs`'s
+    // `linkage_check_passes_once_the_duplicate_heading_is_resolved` control
+    // test exists specifically to forbid. The skip is still printed to
+    // stderr, attributably, so it cannot decay into the silent-success shape
+    // `work_type`'s own module doc warns `resolve_base` callers against.
+    let check_12_fragments_checked: Option<usize> = match work_type::resolve_base(None, &root) {
+        Ok(base_sha) => {
+            let fragment_count = work_type::collect_added_fragments(&root, &base_sha)
+                .map(|f| f.len())
+                .unwrap_or(0);
+            failures.extend(
+                work_type::check_resurrected_fragments(&root, &base_sha)
+                    .into_iter()
+                    .map(|v| format!("[12] {v}")),
+            );
+            Some(fragment_count)
+        }
+        Err(e) => {
+            eprintln!(
+                "linkage-check: [12] skipped (could not resolve base {:?} to check for \
+                 resurrected changelog fragments): {e}",
+                work_type::DEFAULT_BASE
+            );
+            None
+        }
+    };
+
     if failures.is_empty() {
+        let check_12_note = match check_12_fragments_checked {
+            Some(n) => format!(", {n} added changelog fragment(s) checked against CHANGELOG.md"),
+            None => ", check 12 skipped (no resolvable base)".to_string(),
+        };
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 11 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, {CHECK_COUNT} \
+             rules{check_12_note})",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
