@@ -116,11 +116,14 @@ fn orchestration_seed_011_real_claude_orchestrator_reads_and_acts_on_remit() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .with_imported_claude_credentials()
-        // The orchestrator's cwd is the deck's own workdir (the copied
-        // `orch-seed-remit-real` fixture root); pre-trust it so the real
-        // claude's first-run onboarding/trust gates clear with no keystroke
-        // and the spawn-time seed pointer below isn't swallowed answering
-        // them.
+        // PRD fork#544 M2b made isolated-clone provisioning the sole spawn
+        // path for every orchestration, so the orchestrator's real cwd is
+        // NOT the deck's own workdir (the copied `orch-seed-remit-real`
+        // fixture root) — it's an isolated-clone sibling directory
+        // `with_claude_trust_workdir` also predicts and pre-trusts (fork
+        // issue #373). Pre-trust both so the real claude's first-run
+        // onboarding/trust gates clear with no keystroke and the spawn-time
+        // seed pointer below isn't swallowed answering them.
         .with_claude_trust_workdir()
         .launch_with_fixture("orch-seed-remit-real");
     deck.wait_for_string("No active sessions");
