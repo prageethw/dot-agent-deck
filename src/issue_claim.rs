@@ -516,6 +516,44 @@ pub fn run_issue_claim(
     }
 }
 
+/// The outcome of [`run_issue_claim_check`] — PR #573 review-round fix
+/// (reviewer B1/B2, auditor A5): a plain `Result<String, String>` collapses
+/// a confident lock refusal, a genuinely ambiguous state, and an
+/// operational failure (the checker binary missing, `gh` unauthenticated,
+/// or [`resolve_caller_identity`] refusing because the caller is an
+/// agent-shaped pane whose cwd is not a linked worktree — e.g. the
+/// orchestrator running in the root checkout, which is normal and common
+/// per CLAUDE.md rule 17) into the SAME `Err` arm. The CLI wrapper in
+/// `main.rs` maps each variant to a DISTINCT exit code so the calling hook
+/// script can tell them apart and react correctly to each:
+///
+/// | Variant | Exit code | Hook should |
+/// |---|---|---|
+/// | [`Clear`](ClaimCheckOutcome::Clear) | 0 | allow |
+/// | [`RefusedByLock`](ClaimCheckOutcome::RefusedByLock) | 1 | deny — confident violation |
+/// | [`Ambiguous`](ClaimCheckOutcome::Ambiguous) | 2 | ask (or deny if "ask" is unsupported) |
+/// | [`CouldNotDetermine`](ClaimCheckOutcome::CouldNotDetermine) | 3 | allow, but surface the reason |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimCheckOutcome {
+    /// `ClaimDecision::Claim` — nobody holds the issue, or the caller
+    /// already does. Safe to proceed.
+    Clear(String),
+    /// `ClaimDecision::RefuseHeldByOther` — a DIFFERENT identity holds the
+    /// issue. A confident violation; the caller should not proceed.
+    RefusedByLock(String),
+    /// `ClaimDecision::RefuseNoIdentity` — labelled but no claim comment
+    /// names a holder. Genuinely ambiguous, per CLAUDE.md rule 14's own
+    /// guidance to escalate rather than silently adopt.
+    Ambiguous(String),
+    /// Repo resolution, identity resolution, or the `gh` read failed —
+    /// nothing about the LOCK could be determined at all. This is the
+    /// operational-failure case [`run_issue_claim`]'s doc comment folds
+    /// into the same `Err` as a refusal; here it is kept distinct on
+    /// purpose, since a caller that could not even ask the question must
+    /// never be treated the same as one who asked and was refused.
+    CouldNotDetermine(String),
+}
+
 /// Run `issue claim-check <issue>` against `repo` — the READ-ONLY
 /// counterpart to [`run_issue_claim`] (issue #286), built specifically to
 /// back a Claude Code `PreToolUse` hook that gates `gh issue
@@ -525,25 +563,33 @@ pub fn run_issue_claim(
 /// `read_current_claim` → `decide_claim` sequence [`run_issue_claim`] does —
 /// with `takeover`/`confirm_stopped` always `false`, since this command
 /// accepts neither flag — but on `ClaimDecision::Claim` stops there: no
-/// `do_claim`, no comment/label/assignee write of any kind. `Ok(message)` is
-/// the success text for stdout (exit 0, safe to proceed); `Err(message)`
-/// covers a refusal only (exit non-zero) — there is no operational-failure
-/// case distinct from a refusal here beyond the same repo-resolution /
-/// identity / `gh` errors [`run_issue_claim`] can also return.
-pub fn run_issue_claim_check(cwd: &Path, repo: Option<&str>, issue: u64) -> Result<String, String> {
+/// `do_claim`, no comment/label/assignee write of any kind. See
+/// [`ClaimCheckOutcome`] for why this returns a 4-way enum rather than a
+/// `Result`: an operational failure must never be indistinguishable from a
+/// confident refusal to whatever calls this.
+pub fn run_issue_claim_check(cwd: &Path, repo: Option<&str>, issue: u64) -> ClaimCheckOutcome {
     let repo = match repo {
         Some(r) => r.to_string(),
-        None => crate::worktree_reclaim::derive_repo_slug(cwd).ok_or_else(|| {
-            format!(
-                "could not derive an `owner/name` repo slug from {}'s `origin` remote; pass \
-                 --repo explicitly",
-                cwd.display()
-            )
-        })?,
+        None => match crate::worktree_reclaim::derive_repo_slug(cwd) {
+            Some(r) => r,
+            None => {
+                return ClaimCheckOutcome::CouldNotDetermine(format!(
+                    "could not derive an `owner/name` repo slug from {}'s `origin` remote; pass \
+                     --repo explicitly",
+                    cwd.display()
+                ));
+            }
+        },
     };
 
-    let identity = resolve_caller_identity(cwd)?;
-    let (label_present, held, _current_assignees) = read_current_claim(&repo, issue)?;
+    let identity = match resolve_caller_identity(cwd) {
+        Ok(identity) => identity,
+        Err(e) => return ClaimCheckOutcome::CouldNotDetermine(e),
+    };
+    let (label_present, held, _current_assignees) = match read_current_claim(&repo, issue) {
+        Ok(v) => v,
+        Err(e) => return ClaimCheckOutcome::CouldNotDetermine(e),
+    };
 
     match decide_claim(
         label_present,
@@ -552,10 +598,10 @@ pub fn run_issue_claim_check(cwd: &Path, repo: Option<&str>, issue: u64) -> Resu
         false,
         false,
     ) {
-        ClaimDecision::Claim { .. } => Ok(format!(
+        ClaimDecision::Claim { .. } => ClaimCheckOutcome::Clear(format!(
             "ok to proceed on issue #{issue} of {repo} as `{identity}`\n"
         )),
-        ClaimDecision::RefuseNoIdentity => Err(format!(
+        ClaimDecision::RefuseNoIdentity => ClaimCheckOutcome::Ambiguous(format!(
             "issue #{issue} of {repo} is labelled `{IN_PROGRESS_LABEL}` but no claim comment \
              names a holder — refusing (identity unknown); this is likely a hand-typed claim \
              applied outside `dot-agent-deck issue claim`"
@@ -569,7 +615,7 @@ pub fn run_issue_claim_check(cwd: &Path, repo: Option<&str>, issue: u64) -> Resu
                 .as_ref()
                 .map(|h| format!(" since {}", sanitize_claimant_name(&h.timestamp)))
                 .unwrap_or_default();
-            Err(format!(
+            ClaimCheckOutcome::RefusedByLock(format!(
                 "issue #{issue} of {repo} is held by `{holder}`{since} — resolve via `issue \
                  claim --takeover --confirm-stopped` once you have confirmed the other agent \
                  has stopped, then retry"

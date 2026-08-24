@@ -2578,22 +2578,37 @@ fn run_issue_claim_cli(
     }
 }
 
+/// The exit code IS the mechanism here, more than usually: PR #573's
+/// fix-round hook (`.claude/hooks/check-issue-claim.sh`) reads exactly these
+/// four codes to tell a confident lock refusal apart from a merely
+/// ambiguous state and from an operational failure it cannot answer at all
+/// — see `dot_agent_deck::issue_claim::ClaimCheckOutcome`'s doc table for
+/// the full mapping. Do not renumber these without updating that hook.
 fn run_issue_claim_check_cli(issue: u64, repo: Option<String>) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("issue claim-check: failed to resolve current directory: {e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(3);
         }
     };
+    use dot_agent_deck::issue_claim::ClaimCheckOutcome;
     match dot_agent_deck::issue_claim::run_issue_claim_check(&cwd, repo.as_deref(), issue) {
-        Ok(message) => {
+        ClaimCheckOutcome::Clear(message) => {
             print!("{message}");
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("issue claim-check: {e}");
-            ExitCode::FAILURE
+        ClaimCheckOutcome::RefusedByLock(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(1)
+        }
+        ClaimCheckOutcome::Ambiguous(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(2)
+        }
+        ClaimCheckOutcome::CouldNotDetermine(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(3)
         }
     }
 }

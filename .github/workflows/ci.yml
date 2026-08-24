@@ -289,6 +289,17 @@ jobs:
       # folded into the branch-prefix exemption list.
       - run: cargo xtask work-type-check --self-test
       - run: cargo xtask work-type-check
+      # PR #573 fix round / issue #286 — `.claude/hooks/check-issue-claim.sh
+      # --self-test` was invoked NOWHERE: no CI, no shellcheck, no Rust/e2e
+      # test touches it (reviewer M4, auditor A4 — both independently flagged
+      # this as its own blocker). Same pattern as the two self-tests above:
+      # exercised on every push before anything trusts the script. Needs no
+      # toolchain and no network (~0.3s here); the script's own header names
+      # both of those as its model. There is no "real invocation" pairing to
+      # add alongside it (unlike check-symlinks.sh/work-type-check above) —
+      # this script is a live PreToolUse hook, not a checker with a real
+      # target to run against in CI.
+      - run: .claude/hooks/check-issue-claim.sh --self-test
 
   # Issue #368 — run the LOCAL Windows pre-PR gate in CI, for one reason only:
   # so that it cannot rot again. `scripts/windows-cross-check.sh` had been
