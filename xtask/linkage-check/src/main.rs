@@ -151,14 +151,6 @@ use regex::Regex;
 const CATALOG_PATH: &str = "tests/CATALOG.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 
-/// Total numbered checks this tool performs (the repository-state preflight
-/// is deliberately not one of them — see the module doc). One literal for
-/// one fact, rather than the three that used to drift independently: the
-/// module doc's prose said "nine" and "ten" while the success line printed
-/// a hardcoded `9 rules`, and fork #281 added an eleventh check without
-/// updating any of them (its own M1 finding, fix round). Same shape as
-/// `work_type`'s own (private, unrelated, five-rule) `RULE_COUNT`.
-const CHECK_COUNT: usize = 11;
 const TESTS_DIR: &str = "tests";
 
 /// Total numbered checks this tool performs (the repository-state preflight
