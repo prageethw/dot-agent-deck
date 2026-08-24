@@ -875,7 +875,7 @@ pub fn check_resurrected_fragments(repo_dir: &Path, base_sha: &str) -> Vec<Strin
         return Vec::new();
     }
 
-    let changelog = match git_show_in(repo_dir, base_sha, CHANGELOG_PATH) {
+    let changelog = match crate::list_tests::git_show(repo_dir, base_sha, CHANGELOG_PATH) {
         Ok(text) => text,
         Err(e) => {
             return vec![format!(
@@ -889,7 +889,7 @@ pub fn check_resurrected_fragments(repo_dir: &Path, base_sha: &str) -> Vec<Strin
     fragments
         .iter()
         .filter_map(|fragment| {
-            let body = match git_show_in(repo_dir, "HEAD", &fragment.path) {
+            let body = match crate::list_tests::git_show(repo_dir, "HEAD", &fragment.path) {
                 Ok(text) => text,
                 Err(e) => {
                     return Some(format!(
@@ -1841,8 +1841,10 @@ fn collect_chore_diff(repo_dir: &Path, base_sha: &str) -> Result<ChoreDiff, Stri
 /// than an error — the only realistic case is a scratch repo that never had
 /// the file, not a `git` failure worth propagating.
 fn command_variant_added(repo_dir: &Path, base_sha: &str) -> Result<bool, String> {
-    let base_source = git_show_in(repo_dir, base_sha, "src/main.rs").unwrap_or_default();
-    let head_source = git_show_in(repo_dir, "HEAD", "src/main.rs").unwrap_or_default();
+    let base_source =
+        crate::list_tests::git_show(repo_dir, base_sha, "src/main.rs").unwrap_or_default();
+    let head_source =
+        crate::list_tests::git_show(repo_dir, "HEAD", "src/main.rs").unwrap_or_default();
     let base_variants = extract_enum_variant_names(&base_source, "Commands");
     let head_variants = extract_enum_variant_names(&head_source, "Commands");
     Ok(head_variants.difference(&base_variants).next().is_some())
@@ -1895,8 +1897,8 @@ fn collect_bug_diff(
     base_sha: &str,
     fragments: &[AddedFragment],
 ) -> Result<BugDiff, String> {
-    let base_tests = collect_spec_sources_at(repo_dir, base_sha)?;
-    let head_tests = collect_spec_sources_at(repo_dir, "HEAD")?;
+    let base_tests = crate::list_tests::collect_tests_at_ref(repo_dir, base_sha)?;
+    let head_tests = crate::list_tests::collect_tests_at_ref(repo_dir, "HEAD")?;
     let delta = spec_test_delta(&base_tests, &head_tests);
 
     // N3: deliberately the working tree, not `git show HEAD:<path>` like
@@ -1947,72 +1949,6 @@ fn check_prd_fragments(repo_dir: &Path, fragments: &[AddedFragment]) -> Result<(
         check_r4_prd(&fragment.path, &stem, exists)?;
     }
     Ok(())
-}
-
-/// Repo-dir-parameterized sibling of `list_tests::collect_tests_at_ref` —
-/// duplicated rather than reused because that function (and the `git_show`/
-/// `git_ls_tree` it calls) always runs against the process's own cwd, with
-/// no `repo_dir` parameter to thread through; widening that private,
-/// well-tested function's signature was judged out of scope for glue this
-/// round's tests do not exercise. [`spec_test_delta`] itself — the part the
-/// PRD calls out by name — DOES reuse `list_tests::compute_created` /
-/// `compute_modified` rather than reimplementing the delta logic.
-fn collect_spec_sources_at(
-    repo_dir: &Path,
-    reference: &str,
-) -> Result<BTreeMap<String, TestEntry>, String> {
-    let mut sources: Vec<(String, String)> = Vec::new();
-    for f in git_ls_tree_in(repo_dir, reference, "tests")? {
-        if !f.ends_with(".rs") || f == "tests/common/mod.rs" {
-            continue;
-        }
-        let body = git_show_in(repo_dir, reference, &f)?;
-        sources.push((f, body));
-    }
-    for f in git_ls_tree_in(repo_dir, reference, "src")? {
-        if !f.ends_with(".rs") {
-            continue;
-        }
-        let body = git_show_in(repo_dir, reference, &f)?;
-        if !body.contains("#[spec(") {
-            continue;
-        }
-        sources.push((f, body));
-    }
-    crate::list_tests::collect_tests_from_sources(&sources)
-}
-
-fn git_ls_tree_in(repo_dir: &Path, reference: &str, path: &str) -> Result<Vec<String>, String> {
-    let out = Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", reference, path])
-        .current_dir(repo_dir)
-        .output()
-        .map_err(|e| format!("invoke git ls-tree {reference} {path}: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git ls-tree {reference} {path} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.to_string())
-        .collect())
-}
-
-fn git_show_in(repo_dir: &Path, reference: &str, path: &str) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(["show", &format!("{reference}:{path}")])
-        .current_dir(repo_dir)
-        .output()
-        .map_err(|e| format!("invoke git show {reference}:{path}: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git show {reference}:{path} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]

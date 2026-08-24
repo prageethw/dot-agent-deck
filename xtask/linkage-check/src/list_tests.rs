@@ -80,15 +80,15 @@ pub struct AllowlistRow {
 /// `workspace_root` is the repo root (where the workspace `Cargo.toml`
 /// lives). Returns the rendered Markdown.
 pub fn run(workspace_root: &Path) -> Result<String, String> {
-    let merge_base = git_merge_base()?;
+    let merge_base = git_merge_base(workspace_root)?;
 
-    let base_tests = collect_tests_at_ref(&merge_base)?;
+    let base_tests = collect_tests_at_ref(workspace_root, &merge_base)?;
     let head_tests = collect_tests_on_disk(workspace_root)?;
 
     let base_catalog = parse_catalog_at_ref(workspace_root, &merge_base)?;
     let head_catalog = parse_catalog_on_disk(workspace_root)?;
 
-    let base_allowlist = read_allowlist_at_ref(&merge_base)?;
+    let base_allowlist = read_allowlist_at_ref(workspace_root, &merge_base)?;
     let head_allowlist = read_allowlist_on_disk(workspace_root)?;
 
     let created = compute_created(&base_tests, &head_tests);
@@ -103,6 +103,190 @@ pub fn run(workspace_root: &Path) -> Result<String, String> {
         &allowlist_delta,
         &head_catalog,
     ))
+}
+
+/// Outcome of `cargo xtask list-tests --compare <ref-a> <ref-b>` (issue
+/// #344 item 3): the rendered Markdown plus whether any `#[spec]` test
+/// present at `ref_a` is missing at `ref_b`. A non-empty removal set is
+/// exactly the shape that let PRD fork#197's tests disappear silently
+/// when the commit carrying them was dropped as "superseded" during the
+/// 2026-08-15 sync — CI stayed green because the tier just got smaller.
+/// This makes that shape visible; it does not judge whether a given
+/// removal was justified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompareOutcome {
+    pub markdown: String,
+    pub has_removals: bool,
+}
+
+/// Compare the `#[spec]` test population between two arbitrary refs
+/// (issue #344 item 3). Unlike [`run`], which always diffs the working
+/// tree against `origin/main`'s merge-base for the current branch, this
+/// takes two explicit refs and is meant to be run BY HAND across a sync
+/// boundary (`docs/develop/fork-sync-workflow.md`'s own procedure) —
+/// deliberately NOT wired into the automatic per-PR `linkage-check`
+/// suite. On a real `pull_request` CI event `HEAD` is already a merge
+/// commit against `origin/main`'s tip, which makes a merge-base
+/// comparison structurally vacuous, and a `fork-only`/`sync/*` branch
+/// mid-rebase produces false positives because its merge-base briefly
+/// points at a stale pre-rebase commit (both failure classes hit by the
+/// sibling per-PR checks for issues #259/#281). A manual, explicit-refs
+/// comparison sidesteps both.
+///
+/// "Removed" means a catalog id backed by a `#[spec]` test at `ref_a`
+/// that has no backer of the same id at `ref_b` — computed by reusing
+/// [`compute_created`] with the two test populations swapped, since "new
+/// in head vs base" and "missing from head vs base" are the same set
+/// operation run in opposite directions. A same-id test that was merely
+/// edited or moved (a genuine rename, a reworded Scenario, a body tweak)
+/// is NOT a removal; it shows up in [`compute_modified`] instead, reusing
+/// that function's existing body/Scenario fingerprint comparison so a
+/// rename/edit is never confused with a drop.
+pub fn run_compare(repo_dir: &Path, ref_a: &str, ref_b: &str) -> Result<CompareOutcome, String> {
+    let sha_a = resolve_ref(repo_dir, ref_a)?;
+    let sha_b = resolve_ref(repo_dir, ref_b)?;
+
+    let tests_a = collect_tests_at_ref(repo_dir, &sha_a)?;
+    let tests_b = collect_tests_at_ref(repo_dir, &sha_b)?;
+
+    let added = compute_created(&tests_a, &tests_b);
+    let removed = compute_created(&tests_b, &tests_a);
+    let modified = compute_modified(&tests_a, &tests_b);
+
+    let has_removals = !removed.is_empty();
+    let markdown = render_compare_markdown(ref_a, ref_b, &added, &removed, &modified);
+    Ok(CompareOutcome {
+        markdown,
+        has_removals,
+    })
+}
+
+/// Resolve `reference` to a commit SHA in `repo_dir`, failing with a
+/// named error rather than letting an unresolvable ref silently produce
+/// an empty tree further down in [`collect_tests_at_ref`] (`git ls-tree`
+/// against a bad ref that happens to still parse as a pathspec would
+/// otherwise report "no tests" instead of "no such ref"). Mirrors
+/// `work_type::resolve_base`'s never-silent-success error handling
+/// without depending on its `WorkTypeError` type, which is specific to
+/// work-type derivation rather than this command.
+fn resolve_ref(repo_dir: &Path, reference: &str) -> Result<String, String> {
+    let out = git_command(repo_dir)
+        .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
+        .output()
+        .map_err(|e| format!("invoke git rev-parse --verify {reference}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ref {reference:?} does not resolve to a commit: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err(format!(
+            "git rev-parse --verify {reference} returned empty output"
+        ));
+    }
+    Ok(sha)
+}
+
+/// Render the `--compare` report. `ref_a`/`ref_b` are printed as given
+/// (the caller's original ref strings, not the resolved SHAs) so the
+/// report reads naturally when a human passed branch names or tags.
+fn render_compare_markdown(
+    ref_a: &str,
+    ref_b: &str,
+    added: &[TestEntry],
+    removed: &[TestEntry],
+    modified: &[ModifiedRow],
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "# Test-population comparison: `{ref_a}` -> `{ref_b}`\n\n"
+    ));
+
+    s.push_str("## Removed (present at ref-a, missing at ref-b)\n\n");
+    if removed.is_empty() {
+        s.push_str("_(none)_\n\n");
+    } else {
+        s.push_str(&format!(
+            "**{} removed.** Every one of these needs an explanation in the \
+             sync's own re-curation write-up (issue #344): either upstream's \
+             reimplementation genuinely covers the same contract, or this is \
+             a silent drop.\n\n",
+            removed.len()
+        ));
+        s.push_str("| Catalog ID | Function | File |\n");
+        s.push_str("|---|---|---|\n");
+        for t in removed {
+            s.push_str(&format!(
+                "| {} | `{}` | `{}` |\n",
+                t.spec_id, t.fn_name, t.file
+            ));
+        }
+        s.push('\n');
+    }
+
+    s.push_str("## Added (present at ref-b, missing at ref-a)\n\n");
+    if added.is_empty() {
+        s.push_str("_(none)_\n\n");
+    } else {
+        s.push_str("| Catalog ID | Function | File |\n");
+        s.push_str("|---|---|---|\n");
+        for t in added {
+            s.push_str(&format!(
+                "| {} | `{}` | `{}` |\n",
+                t.spec_id, t.fn_name, t.file
+            ));
+        }
+        s.push('\n');
+    }
+
+    s.push_str(&render_modified_table(
+        "## Modified (present at both, changed)\n\n",
+        modified,
+        false,
+    ));
+
+    s
+}
+
+/// Shared by `render_compare_markdown` and `render_markdown`: renders the
+/// "Modified" table section, identical in both reports apart from the
+/// heading text and whether a blank line trails the section (`render_markdown`
+/// has further sections after it; `render_compare_markdown`'s Modified
+/// section is the last thing printed).
+fn render_modified_table(heading: &str, modified: &[ModifiedRow], trailing_blank: bool) -> String {
+    let mut s = String::new();
+    s.push_str(heading);
+    if modified.is_empty() {
+        s.push_str("_(none)_\n");
+        if trailing_blank {
+            s.push('\n');
+        }
+    } else {
+        s.push_str("| Catalog ID | Function | File | What changed |\n");
+        s.push_str("|---|---|---|---|\n");
+        for m in modified {
+            let mut what: Vec<&str> = Vec::new();
+            if m.scenario_changed {
+                what.push("Scenario");
+            }
+            if m.body_changed {
+                what.push("body");
+            }
+            s.push_str(&format!(
+                "| {} | `{}` | `{}` | {} |\n",
+                m.spec_id,
+                m.fn_name,
+                m.file,
+                what.join(", "),
+            ));
+        }
+        if trailing_blank {
+            s.push('\n');
+        }
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -559,30 +743,11 @@ pub fn render_markdown(
         s.push('\n');
     }
 
-    s.push_str("## Modified in this branch\n\n");
-    if modified.is_empty() {
-        s.push_str("_(none)_\n\n");
-    } else {
-        s.push_str("| Catalog ID | Function | File | What changed |\n");
-        s.push_str("|---|---|---|---|\n");
-        for m in modified {
-            let mut what: Vec<&str> = Vec::new();
-            if m.scenario_changed {
-                what.push("Scenario");
-            }
-            if m.body_changed {
-                what.push("body");
-            }
-            s.push_str(&format!(
-                "| {} | `{}` | `{}` | {} |\n",
-                m.spec_id,
-                m.fn_name,
-                m.file,
-                what.join(", "),
-            ));
-        }
-        s.push('\n');
-    }
+    s.push_str(&render_modified_table(
+        "## Modified in this branch\n\n",
+        modified,
+        true,
+    ));
 
     s.push_str("## Catalog entries with prose changes\n\n");
     if catalog_delta.is_empty() {
@@ -632,8 +797,39 @@ fn escape_table_cell(value: &str) -> String {
 // I/O — git + filesystem
 // ---------------------------------------------------------------------------
 
-fn git_merge_base() -> Result<String, String> {
-    let out = Command::new("git")
+/// Git location environment variables that must never leak into a `git`
+/// invocation in this module (issue #344 auditor finding A2). An ambient
+/// `GIT_DIR` pointed at some other repository makes `git ls-tree` return
+/// empty output at exit 0 rather than erroring — read as "no tests" by
+/// every caller here instead of "wrong repository" — so `--compare`
+/// silently reports a confident all-clear while having read the wrong
+/// tree. Clearing all of them, not just `GIT_DIR`, closes the same door
+/// for its documented siblings (`git(1)` ENVIRONMENT VARIABLES).
+const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// Build a `git` [`Command`] rooted at `repo_dir` with every ambient git
+/// location variable cleared, so ambient environment can never redirect
+/// it to a different repository than the one named by `repo_dir`.
+fn git_command(repo_dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_dir);
+    for var in GIT_ENV_VARS_TO_CLEAR {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+fn git_merge_base(repo_dir: &Path) -> Result<String, String> {
+    let out = git_command(repo_dir)
         .args(["merge-base", "HEAD", "origin/main"])
         .output()
         .map_err(|e| format!("invoke git merge-base: {e}"))?;
@@ -650,8 +846,8 @@ fn git_merge_base() -> Result<String, String> {
     Ok(sha)
 }
 
-fn git_show(reference: &str, path: &str) -> Result<String, String> {
-    let out = Command::new("git")
+pub(crate) fn git_show(repo_dir: &Path, reference: &str, path: &str) -> Result<String, String> {
+    let out = git_command(repo_dir)
         .args(["show", &format!("{reference}:{path}")])
         .output()
         .map_err(|e| format!("invoke git show {reference}:{path}: {e}"))?;
@@ -664,8 +860,8 @@ fn git_show(reference: &str, path: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn git_ls_tree(reference: &str, path: &str) -> Result<Vec<String>, String> {
-    let out = Command::new("git")
+fn git_ls_tree(repo_dir: &Path, reference: &str, path: &str) -> Result<Vec<String>, String> {
+    let out = git_command(repo_dir)
         .args(["ls-tree", "-r", "--name-only", reference, path])
         .output()
         .map_err(|e| format!("invoke git ls-tree {reference} {path}: {e}"))?;
@@ -681,9 +877,12 @@ fn git_ls_tree(reference: &str, path: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn collect_tests_at_ref(reference: &str) -> Result<BTreeMap<String, TestEntry>, String> {
+pub(crate) fn collect_tests_at_ref(
+    repo_dir: &Path,
+    reference: &str,
+) -> Result<BTreeMap<String, TestEntry>, String> {
     let mut sources: Vec<(String, String)> = Vec::new();
-    for f in git_ls_tree(reference, "tests")? {
+    for f in git_ls_tree(repo_dir, reference, "tests")? {
         if !f.ends_with(".rs") {
             continue;
         }
@@ -692,7 +891,7 @@ fn collect_tests_at_ref(reference: &str) -> Result<BTreeMap<String, TestEntry>, 
         if f == "tests/common/mod.rs" {
             continue;
         }
-        let body = git_show(reference, &f)?;
+        let body = git_show(repo_dir, reference, &f)?;
         sources.push((f, body));
     }
     // src/ — PRD #83: the library crate can hold `#[spec]` tests too
@@ -701,11 +900,11 @@ fn collect_tests_at_ref(reference: &str) -> Result<BTreeMap<String, TestEntry>, 
     // docs-generator approach. (Scanning `src/` at BOTH refs keeps a
     // src-resident test that existed at merge-base out of the Created
     // section and into Modified, as expected.)
-    for f in git_ls_tree(reference, "src")? {
+    for f in git_ls_tree(repo_dir, reference, "src")? {
         if !f.ends_with(".rs") {
             continue;
         }
-        let body = git_show(reference, &f)?;
+        let body = git_show(repo_dir, reference, &f)?;
         if !body.contains("#[spec(") {
             continue;
         }
@@ -790,7 +989,7 @@ fn parse_catalog_at_ref(
     // treat that like an empty catalog (mirrors `read_allowlist_at_ref`) so
     // the diff just shows the entries as added rather than failing.
     let catalog_rel = "tests/CATALOG.md";
-    let body = match git_show(reference, catalog_rel) {
+    let body = match git_show(workspace_root, reference, catalog_rel) {
         Ok(s) => s,
         Err(_) => return Ok(BTreeMap::new()),
     };
@@ -821,12 +1020,12 @@ fn tempfile_for_catalog(workspace_root: &Path, body: &str) -> Result<PathBuf, St
     Ok(path)
 }
 
-fn read_allowlist_at_ref(reference: &str) -> Result<String, String> {
+fn read_allowlist_at_ref(repo_dir: &Path, reference: &str) -> Result<String, String> {
     let path = "xtask/linkage-check/m2.allowlist";
     // A branch where the allowlist was removed entirely would error
     // here, but the path is load-bearing so we treat the failure as
     // an empty allowlist rather than a fatal.
-    match git_show(reference, path) {
+    match git_show(repo_dir, reference, path) {
         Ok(s) => Ok(s),
         Err(_) => Ok(String::new()),
     }
@@ -1269,5 +1468,261 @@ mod tests {
         assert!(!layer_token_is_l1("L2 (re-sequenced from L1: ...)"));
         assert!(!layer_token_is_l1("L2 synthetic"));
         assert!(!layer_token_is_l1(""));
+    }
+
+    /// Issue #344 R1 (reviewer recheck of A2): pins `git_command`'s env
+    /// isolation directly, with no spawn — `Command::get_envs()` reports
+    /// each `env_remove`'d variable as `(key, None)`, so this asserts all
+    /// eight `GIT_ENV_VARS_TO_CLEAR` entries are explicitly removed on the
+    /// `Command` `git_command` builds, rather than only exercising it
+    /// indirectly via `real_git`'s decoy-env integration tests below.
+    #[test]
+    fn git_command_clears_all_git_location_env_vars() {
+        let cmd = git_command(Path::new("/tmp/git-command-env-test-repo"));
+        for var in GIT_ENV_VARS_TO_CLEAR {
+            let removed = cmd
+                .get_envs()
+                .any(|(k, v)| k == std::ffi::OsStr::new(var) && v.is_none());
+            assert!(
+                removed,
+                "expected {var} to be explicitly removed, got envs: {:?}",
+                cmd.get_envs().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// Issue #344 item 3: `run_compare` shells out to real `git` against two
+/// refs, so it needs a real repository history to exercise — the
+/// `mod real_git` exception CLAUDE.md rule 5 carves out for exactly this
+/// shape (fixtures under a `tempfile::tempdir()`, ambient git
+/// configuration switched off, no network/sleep, nothing that can read or
+/// write the checkout these tests run inside).
+///
+/// **Not gated to `unix`, unlike `repo_state.rs`'s `mod real_git`.** That
+/// module's gate exists for two Unix-specific fixture constructs (a
+/// `file://` URL spelled from a POSIX path, and a directory name containing
+/// a literal newline Win32 rejects) that this module's fixtures do not use
+/// — `git init`, `fs::write`/`fs::remove_file`, and `Path`/`PathBuf` joins
+/// with forward slashes, all of which Windows accepts fine. Keeping these
+/// four tests running on `build-windows` is what CLAUDE.md rule 5 added
+/// `--workspace` for in the first place.
+#[cfg(test)]
+mod real_git {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// A throwaway repository under a `tempfile::tempdir()`, isolated from
+    /// the developer's/CI runner's ambient git configuration the same way
+    /// `repo_state.rs`'s `mod real_git::Sandbox` is — see that module's
+    /// doc comment for the full reasoning; duplicated here rather than
+    /// shared because the two modules' fixture shapes (worktrees/clones
+    /// there, a single linear history of test-file commits here) don't
+    /// overlap enough to be worth a shared abstraction.
+    struct Sandbox {
+        _dir: TempDir,
+        root: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new() -> Sandbox {
+            let dir = TempDir::new().expect("tempdir");
+            let root = dir.path().canonicalize().expect("canonicalize tempdir");
+            fs::create_dir_all(root.join("home")).expect("mkdir home");
+            fs::create_dir_all(root.join("empty-template")).expect("mkdir template");
+            let sandbox = Sandbox { _dir: dir, root };
+            sandbox.git(&["init", "-q", "-b", "main"]);
+            sandbox
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&self.root)
+                .env("HOME", self.root.join("home"))
+                .env("XDG_CONFIG_HOME", self.root.join("home/.config"))
+                .env("GIT_CONFIG_GLOBAL", self.root.join("no-such-gitconfig"))
+                .env("GIT_CONFIG_SYSTEM", self.root.join("no-such-gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TEMPLATE_DIR", self.root.join("empty-template"))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "list-tests tests")
+                .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
+                .env("GIT_COMMITTER_NAME", "list-tests tests")
+                .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
+                .output()
+                .unwrap_or_else(|e| panic!("failed to invoke `git {}`: {e}", args.join(" ")));
+            assert!(
+                out.status.success(),
+                "fixture command `git {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Writes (or overwrites) a file relative to the sandbox root,
+        /// creating parent directories as needed.
+        fn write(&self, rel: &str, contents: &str) {
+            let path = self.root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("mkdir parent");
+            }
+            fs::write(&path, contents).expect("write fixture file");
+        }
+
+        /// Stages everything and commits, returning the new commit SHA.
+        fn commit(&self, message: &str) -> String {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", message]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+    }
+
+    /// Item 3's first required case: `ref-b` only ADDS a test relative to
+    /// `ref-a` — no removal should be reported.
+    #[test]
+    fn compare_reports_no_removal_when_ref_b_only_adds_a_test() {
+        let sandbox = Sandbox::new();
+        sandbox.write(
+            "tests/e2e_a.rs",
+            r#"
+                #[spec("hooks/delivery/001")]
+                #[test]
+                /// Scenario: original test, present at both refs.
+                fn delivery_001_x() { let _ = 1; }
+            "#,
+        );
+        let sha_a = sandbox.commit("first");
+
+        sandbox.write(
+            "tests/e2e_b.rs",
+            r#"
+                #[spec("dashboard/pane/005")]
+                #[test]
+                /// Scenario: a brand new test, only at ref-b.
+                fn pane_005_y() { let _ = 2; }
+            "#,
+        );
+        let sha_b = sandbox.commit("second");
+
+        let outcome = run_compare(&sandbox.root, &sha_a, &sha_b).expect("compare");
+        assert!(
+            !outcome.has_removals,
+            "adding a test must not read as a removal: {}",
+            outcome.markdown
+        );
+        assert!(outcome.markdown.contains("dashboard/pane/005"));
+        assert!(
+            outcome
+                .markdown
+                .contains("## Removed (present at ref-a, missing at ref-b)\n\n_(none)_")
+        );
+    }
+
+    /// Item 3's second required case: `ref-b` is missing a test `ref-a`
+    /// had — a removal must be reported, naming the dropped catalog id.
+    /// This is the exact shape fork issue #344 is about: PRD fork#197's
+    /// tests disappeared along with the implementation commit they were
+    /// bundled into when a sync dropped that commit as "superseded".
+    #[test]
+    fn compare_reports_removal_when_ref_b_drops_a_test() {
+        let sandbox = Sandbox::new();
+        sandbox.write(
+            "tests/e2e_a.rs",
+            r#"
+                #[spec("hooks/delivery/001")]
+                #[test]
+                /// Scenario: will be dropped at ref-b.
+                fn delivery_001_x() { let _ = 1; }
+            "#,
+        );
+        let sha_a = sandbox.commit("first");
+
+        fs::remove_file(sandbox.root.join("tests/e2e_a.rs")).expect("remove dropped test file");
+        sandbox.write(
+            "tests/e2e_c.rs",
+            r#"
+                #[spec("dashboard/pane/006")]
+                #[test]
+                /// Scenario: unrelated survivor, present at both refs really.
+                fn pane_006_z() { let _ = 3; }
+            "#,
+        );
+        let sha_b = sandbox.commit("second");
+
+        let outcome = run_compare(&sandbox.root, &sha_a, &sha_b).expect("compare");
+        assert!(
+            outcome.has_removals,
+            "dropping hooks/delivery/001 must be reported as a removal: {}",
+            outcome.markdown
+        );
+        assert!(outcome.markdown.contains("hooks/delivery/001"));
+        assert!(outcome.markdown.contains("delivery_001_x"));
+    }
+
+    /// Item 3's third required case: the SAME catalog id exists at both
+    /// refs but its Scenario/body changed — this must show up as
+    /// Modified, never as a false-positive Removed, by reusing
+    /// `compute_modified`'s existing fingerprint comparison exactly as
+    /// the module doc for `run_compare` states.
+    #[test]
+    fn compare_treats_a_same_id_edit_as_modified_not_removed() {
+        let sandbox = Sandbox::new();
+        sandbox.write(
+            "tests/e2e_a.rs",
+            r#"
+                #[spec("hooks/delivery/001")]
+                #[test]
+                /// Scenario: original wording.
+                fn delivery_001_x() { let x = 1; let _ = x; }
+            "#,
+        );
+        let sha_a = sandbox.commit("first");
+
+        sandbox.write(
+            "tests/e2e_a.rs",
+            r#"
+                #[spec("hooks/delivery/001")]
+                #[test]
+                /// Scenario: reworded, same contract, function renamed too.
+                fn delivery_001_x_renamed() { let x = 1; let _ = x; }
+            "#,
+        );
+        let sha_b = sandbox.commit("second");
+
+        let outcome = run_compare(&sandbox.root, &sha_a, &sha_b).expect("compare");
+        assert!(
+            !outcome.has_removals,
+            "a same-id edit must not read as a removal: {}",
+            outcome.markdown
+        );
+        assert!(outcome.markdown.contains("## Modified"));
+        assert!(outcome.markdown.contains("hooks/delivery/001"));
+        assert!(outcome.markdown.contains("delivery_001_x_renamed"));
+    }
+
+    /// `resolve_ref` must fail loudly on a ref that does not exist,
+    /// mirroring `work_type::resolve_base`'s never-silent-success
+    /// handling — a bad ref must never be silently treated as "no tests
+    /// there" by `git ls-tree` further down.
+    #[test]
+    fn compare_fails_clearly_on_an_unresolvable_ref() {
+        let sandbox = Sandbox::new();
+        sandbox.write(
+            "tests/e2e_a.rs",
+            r#"
+                #[spec("hooks/delivery/001")]
+                #[test]
+                /// Scenario: x.
+                fn delivery_001_x() { let _ = 1; }
+            "#,
+        );
+        let sha_a = sandbox.commit("first");
+
+        let err = run_compare(&sandbox.root, &sha_a, "not-a-real-ref")
+            .expect_err("an unresolvable ref must fail, not silently succeed");
+        assert!(err.contains("not-a-real-ref"), "{err}");
     }
 }
