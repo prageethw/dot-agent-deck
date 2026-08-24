@@ -40584,8 +40584,11 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            cli_name: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -40641,8 +40644,11 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            cli_name: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -40701,8 +40707,11 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            cli_name: None,
+            crashed: None,
         };
         let colliding_record = crate::agent_pty::AgentRecord {
             id: "2".into(),
@@ -40722,8 +40731,11 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            cli_name: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -40775,8 +40787,11 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            cli_name: None,
+            crashed: None,
         };
         let colliding_record = crate::agent_pty::AgentRecord {
             id: "2".into(),
@@ -40796,8 +40811,11 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            cli_name: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(

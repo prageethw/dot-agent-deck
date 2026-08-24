@@ -2643,6 +2643,7 @@ mod tests {
             worktrees: new_worktree_registry(),
             default_command: Some("/definitely-not-a-real-binary-xyz-473".to_string()),
             state: None,
+            caller: None,
         };
 
         let result = handle_dispatch(&ctx, "lockfail-unit", "task", None).await;
@@ -3160,6 +3161,7 @@ mod tests {
             worktrees: new_worktree_registry(),
             default_command: Some("/definitely-not-a-real-binary-xyz-473b".to_string()),
             state: None,
+            caller: None,
         };
 
         let result = handle_dispatch(&ctx, "branchfail-unit", "task", None).await;
