@@ -175,7 +175,13 @@ jobs:
       # merge-base HEAD origin/main`, and on a `pull_request` event a depth-1
       # checkout has no `origin/main` ref at all — `list-tests` never ran in
       # CI, so this has never mattered before. A full clone is what makes
-      # that ref resolvable.
+      # that ref resolvable. Issue #259: `cargo xtask linkage-check`'s check
+      # 11 (resurrected-changelog-fragment detection) is a second consumer
+      # of the same property — it also resolves `origin/main` via
+      # `work_type::resolve_base`, and fails closed with a printed skip
+      # rather than a hard failure when it cannot (B1), so removing this
+      # flag would make check 11 quietly stop running rather than break the
+      # build outright.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
@@ -289,6 +295,17 @@ jobs:
       # folded into the branch-prefix exemption list.
       - run: cargo xtask work-type-check --self-test
       - run: cargo xtask work-type-check
+      # PR #573 fix round / issue #286 — `.claude/hooks/check-issue-claim.sh
+      # --self-test` was invoked NOWHERE: no CI, no shellcheck, no Rust/e2e
+      # test touches it (reviewer M4, auditor A4 — both independently flagged
+      # this as its own blocker). Same pattern as the two self-tests above:
+      # exercised on every push before anything trusts the script. Needs no
+      # toolchain and no network (~0.3s here); the script's own header names
+      # both of those as its model. There is no "real invocation" pairing to
+      # add alongside it (unlike check-symlinks.sh/work-type-check above) —
+      # this script is a live PreToolUse hook, not a checker with a real
+      # target to run against in CI.
+      - run: .claude/hooks/check-issue-claim.sh --self-test
 
   # Issue #368 — run the LOCAL Windows pre-PR gate in CI, for one reason only:
   # so that it cannot rot again. `scripts/windows-cross-check.sh` had been
@@ -501,6 +518,17 @@ jobs:
           # RUST_BACKTRACE comment. Capture only happens on panic, so this
           # tier's passing runs pay nothing.
           RUST_BACKTRACE: "1"
+      # PR #573 fix round 4 / issue #286, reviewer N6: the Linux `build` job
+      # above already runs this self-test, but that only ever answered the
+      # bash-3.2/macOS portability question by inspection (round-2 L5,
+      # round-3 N6 — the script's own risky-looking `"${NOTES[@]}"`/
+      # `"${MATCHES[@]}"` expansions are guarded by a length check first, but
+      # nobody had actually run the self-test on a bash this old). macOS
+      # ships bash 3.2 by default and this runner is real macOS, so this
+      # settles the question empirically rather than leaving it a guess.
+      # Same reasoning as the Linux placement: needs no toolchain and no
+      # network, so it costs nothing extra on the already-required job.
+      - run: .claude/hooks/check-issue-claim.sh --self-test
       # Issue #564: preserve THIS attempt's test results, so a job-level re-run
       # cannot destroy the evidence from a failing one.
       #
