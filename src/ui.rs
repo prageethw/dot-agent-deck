@@ -39565,6 +39565,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
         };
@@ -39622,6 +39623,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
         };
@@ -39682,6 +39684,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
         };
@@ -39703,6 +39706,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
         };
@@ -39756,6 +39760,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
         };
@@ -39777,6 +39782,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
         };
