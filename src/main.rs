@@ -5,7 +5,10 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
+use dot_agent_deck::agent_pty::{
+    DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
+    DOT_AGENT_DECK_REGISTRATION_GENERATION,
+};
 use dot_agent_deck::bounded_read::read_task_input;
 use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path, state_dir};
@@ -755,6 +758,39 @@ fn resolve_work_done_candidate(path: &std::path::Path) -> (std::path::PathBuf, b
     (path.to_path_buf(), false)
 }
 
+/// Read the registration generation and daemon boot id THIS WORKER WAS
+/// SPAWNED UNDER from its own environment — injected at spawn time, sibling
+/// to `DOT_AGENT_DECK_PANE_ID` — rather than asking the live daemon what the
+/// pane's generation/boot currently are.
+///
+/// Fork #358 (M2 redesign, M4): asking the daemon at send time answers "what
+/// generation does this pane currently hold", which is the SAME question
+/// `handle_work_done` asks again microseconds later at delivery — a signal
+/// produced that way can never disagree with itself, so a worker that
+/// outlives its own orchestration's teardown (the actual #358 repro) would
+/// ask the *new* tenant's daemon state and get delivered into the *new*
+/// tenant's worktree unchanged. Reading it from the env instead means the
+/// value genuinely travels with the worker process from spawn, so a mismatch
+/// at delivery means what it's supposed to mean: the pane was re-registered
+/// since THIS worker began.
+///
+/// Missing or unparseable (an old CLI predating these variables, or a caller
+/// that didn't go through a dot-agent-deck-managed spawn) degrades to
+/// `(0, String::new())` — `0` never matches a real registration (those start
+/// at `1`), and `""` is never a real `daemon_boot_id` (see
+/// `DaemonBootId::default`) — so a report built from a defaulted context is
+/// refused at delivery rather than silently delivered unchecked. See
+/// `WorkDoneSignal::generation`'s doc for the cross-version cost of that
+/// choice.
+fn read_registration_context() -> (u64, String) {
+    let generation: u64 = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let daemon_boot_id: String = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).unwrap_or_default();
+    (generation, daemon_boot_id)
+}
+
 /// What `dot-agent-deck delegate` should print and exit with, for one daemon
 /// reply. See [`delegate_verdict`].
 #[derive(Debug, PartialEq, Eq)]
@@ -1391,45 +1427,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // Fork #358 (M2 redesign): read the registration generation THIS
-            // WORKER WAS SPAWNED UNDER from its own environment — injected
-            // at spawn time, sibling to `DOT_AGENT_DECK_PANE_ID` — rather
-            // than asking the live daemon what the pane's generation is
-            // right now. Asking the daemon at send time answers "what
-            // generation does this pane currently hold", which is the SAME
-            // question `handle_work_done` asks again microseconds later at
-            // delivery — a signal produced that way can never disagree with
-            // itself, so a worker that outlives its own orchestration's
-            // teardown (the actual #358 repro) would ask the *new* tenant's
-            // daemon state and get delivered into the *new* tenant's
-            // worktree unchanged. Reading it from the env instead means the
-            // value genuinely travels with the worker process from spawn,
-            // so a mismatch at delivery means what it's supposed to mean:
-            // the pane was re-registered since THIS worker began. Missing
-            // or unparseable (an old CLI predating this variable, or a
-            // caller that didn't go through a dot-agent-deck-managed spawn)
-            // degrades to `0`, which never matches a real registration
-            // (those start at `1`) — so this report is refused at delivery
-            // rather than silently delivered unchecked. See
-            // `WorkDoneSignal::generation`'s doc for the cross-version cost
-            // of that choice.
-            let generation: u64 =
-                std::env::var(dot_agent_deck::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION)
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-            // Fork #358 M4: sibling to `generation` above — read from its own
-            // env var, injected at spawn time alongside
-            // `DOT_AGENT_DECK_REGISTRATION_GENERATION`, for the same
-            // "travels with the worker process from spawn" reason. Missing
-            // (an old CLI predating this variable, or a non-managed caller)
-            // degrades to `""`, which no real `daemon_boot_id` is ever
-            // minted as (see `DaemonBootId::default`), so this report is
-            // refused at delivery exactly like a bare `generation: 0`
-            // already was.
-            let daemon_boot_id: String =
-                std::env::var(dot_agent_deck::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID)
-                    .unwrap_or_default();
+            // Fork #358 (M2 redesign, M4) / issue #461: see
+            // `read_registration_context`'s doc for why these are read from
+            // this process's own env rather than asked of the live daemon.
+            let (generation, daemon_boot_id) = read_registration_context();
             let signal = dot_agent_deck::event::WorkDoneSignal {
                 pane_id,
                 task,
@@ -3596,5 +3597,111 @@ mod tests {
             mode, 0o600,
             "expected the log file to be created owner-only (mode 0o600), got {mode:#o}"
         );
+    }
+
+    // --- issue #461: `read_registration_context`'s reader-seam extraction ---
+    //
+    // `std::env::set_var`/`remove_var` are process-global, and all three
+    // tests below mutate the same two vars, so they serialize against this
+    // module-level lock. As with `issue_claim.rs`'s `PANE_ID_ENV_LOCK`, real
+    // soundness rests on `cargo nextest`'s process-per-test isolation
+    // (CLAUDE.md rule 5's actual gate) — this mutex only protects this
+    // module's own tests from each other under a plain thread-per-test
+    // `cargo test` run.
+    static WORK_DONE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Scenario: set both `DOT_AGENT_DECK_REGISTRATION_GENERATION` and
+    /// `DOT_AGENT_DECK_DAEMON_BOOT_ID` to real values, call
+    /// `read_registration_context`, and confirm it returns exactly what was
+    /// set — the parsed generation and the boot id verbatim.
+    #[test]
+    fn read_registration_context_reads_both_vars_when_present() {
+        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
+        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
+
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, "3");
+            std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, "boot-abc123");
+        }
+
+        assert_eq!(read_registration_context(), (3, "boot-abc123".to_string()));
+
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
+            }
+            match prev_boot {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
+            }
+        }
+    }
+
+    /// Scenario: with both env vars unset, call `read_registration_context`
+    /// and confirm it falls back to `(0, String::new())` — the defaults an
+    /// old CLI predating these variables, or a caller that didn't go through
+    /// a dot-agent-deck-managed spawn, must degrade to so the report is
+    /// refused at delivery rather than silently accepted.
+    #[test]
+    fn read_registration_context_defaults_when_vars_are_unset() {
+        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
+        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
+
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION);
+            std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID);
+        }
+
+        assert_eq!(read_registration_context(), (0, String::new()));
+
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
+            }
+            match prev_boot {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
+            }
+        }
+    }
+
+    /// Scenario: set `DOT_AGENT_DECK_REGISTRATION_GENERATION` to a
+    /// non-numeric value with the boot id unset, and confirm
+    /// `read_registration_context` silently falls back to `0` rather than
+    /// panicking — matching `.and_then(|v| v.parse().ok())`'s existing
+    /// silent-fallback behavior for a malformed value.
+    #[test]
+    fn read_registration_context_falls_back_to_zero_on_unparseable_generation() {
+        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
+        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
+
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, "not-a-number");
+            std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID);
+        }
+
+        assert_eq!(read_registration_context(), (0, String::new()));
+
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
+            }
+            match prev_boot {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
+            }
+        }
     }
 }
