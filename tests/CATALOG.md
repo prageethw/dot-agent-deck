@@ -1634,7 +1634,7 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the exact refusal wording beyond its exit code and read-only property.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/034 — Issue #326: a NEW `issue release <n> --repo <owner/name> [--force] [--reason <text>]` subcommand (RED — does not exist yet, so `issue release ...` is rejected outright by clap). An agent claims issue 34 for real, then releases its OWN claim from the same worktree. Asserts the release exits 0, removes the `in-progress` label, and posts a NEW `gh issue comment` distinct from the claim comment already posted — validates the release path's happy case, not `claim`/`claim-check`.
+##### issue/claim/034 — Issue #326: a NEW `issue release <n> --repo <owner/name> [--force] [--confirm-stopped] [--reason <text>]` subcommand (RED — does not exist yet, so `issue release ...` is rejected outright by clap). An agent claims issue 34 for real, then releases its OWN claim from the same worktree. Asserts the release exits 0, removes the `in-progress` label, and posts a NEW `gh issue comment` distinct from the claim comment already posted — validates the release path's happy case, not `claim`/`claim-check`.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; a real `issue claim` seeds the held state, then the same worktree runs `issue release`).
 - **Agent:** none.
 - **Asserts:** the release exits zero; a `gh` call recorded after a call-count baseline taken just before the release began contains both `--remove-label` and `in-progress`; a call recorded after that same baseline is a genuine `gh issue comment` write (`is_issue_comment_call`), distinct from the earlier claim comment.
@@ -1648,11 +1648,11 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** a specific exit code (unlike `claim-check`'s tiered codes, `release`'s contract only distinguishes success/refusal); the exact full refusal string beyond naming the holder.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/036 — Issue #326: the SAME setup as `035` — A holds issue 36 for real, B is a different identity — but B runs `issue release 36 --force`. Asserts the release succeeds, the `in-progress` label is removed, and the posted release comment's own body names the identity it was force-released from (A's worktree absolute path and branch) — validates that a forced release genuinely records provenance, not merely that it succeeds.
+##### issue/claim/036 — Issue #326: the SAME setup as `035` — A holds issue 36 for real, B is a different identity — but B runs `issue release 36 --force --confirm-stopped`. Asserts the release succeeds, the `in-progress` label is removed, and the posted release comment's own body names the identity it was force-released from (A's worktree absolute path and branch) — validates that a forced release genuinely records provenance, not merely that it succeeds. Reviewer/auditor fix round (PR #582): `--force` alone is deliberately NOT enough — mirroring `claim`'s own `--takeover --confirm-stopped` friction (CLAUDE.md rule 23), so an agent can't satisfy the override in the same breath it discovers the conflict.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/035`).
 - **Agent:** none.
 - **Asserts:** the release exits zero; a `gh` call recorded after the pre-release baseline contains both `--remove-label` and `in-progress`; the specific `gh issue comment` call recorded after that same baseline contains A's worktree absolute path AND `BRANCH_A`.
-- **Does not assert:** the exact wording of the "force-released from" clause, only that the comment names the displaced identity.
+- **Does not assert:** the exact wording of the "force-released from" clause, only that the comment names the displaced identity; a `--force`-alone (no `--confirm-stopped`) invocation, which now refuses (production behavior only, not pinned by a new test this round).
 - **Platform coverage:** mac+linux.
 
 ##### issue/claim/037 — Issue #326: a fresh issue, NEVER claimed by anyone (no `in-progress` label, no claim comment). `issue release 37` is run against it (no `--force` needed — there is nothing to force through). Asserts the release refuses with a message indicating there is nothing to release (catching a typo'd issue number) and writes nothing — validates the NEW `release` subcommand's unclaimed-issue refusal, distinct from `RefuseHeldByOther`/`RefuseNoIdentity`.
@@ -1669,18 +1669,18 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the exact full refusal string beyond the `identity unknown` substring.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/039 — Issue #326: the SAME ambiguous identity-unknown seed as `038`, but `issue release 39 --force` is run. Asserts the release succeeds, removes the `in-progress` label, and posts a release comment — its body need not name a specific prior holder, since none was known — validating `--force` also escapes the no-identity state, not only a known different holder (`036`).
+##### issue/claim/039 — Issue #326: the SAME ambiguous identity-unknown seed as `038`, but `issue release 39 --force --confirm-stopped` is run. Asserts the release succeeds, removes the `in-progress` label, and posts a release comment — its body need not name a specific prior holder, since none was known — validating `--force --confirm-stopped` also escapes the no-identity state, not only a known different holder (`036`). Reviewer/auditor fix round (PR #582): `--force` alone is deliberately NOT enough here either, mirroring `decide_claim`'s own `RefuseNoIdentity` branch, which also requires both flags.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/038`).
 - **Agent:** none.
 - **Asserts:** the release exits zero; a recorded `gh` call contains both `--remove-label` and `in-progress`; a recorded `gh` call is a genuine `issue comment` write.
 - **Does not assert:** the release comment's body content — only that one was posted.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/040 — Issue #326: an agent claims issue 40 for real, then releases its own claim with `issue release 40 --reason "PR merged"`. Asserts the release succeeds and the posted release comment's body contains the exact reason text verbatim — validates the `--reason` flag's plumbing into the comment body, a surface none of `034`-`039` exercise.
+##### issue/claim/040 — Issue #326: an agent claims issue 40 for real, then releases its own claim with `issue release 40 --reason "PR merged"`. Asserts the release succeeds and the posted release comment's body contains the exact reason text verbatim, wrapped in its own code span — validates the `--reason` flag's plumbing into the comment body, a surface none of `034`-`039` exercise. Extended in the reviewer/auditor fix round (PR #582) to also claim and release a second issue (41) with a `--reason` carrying a live-looking `@mention`, asserting the posted comment never renders it as a LIVE mention (`raw_mention_present`) — `reason` was the ONLY untrusted value in this module rendered outside a code span before this fix.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/034`).
 - **Agent:** none.
-- **Asserts:** the release exits zero; the specific `gh issue comment` call recorded after a pre-release call-count baseline contains the literal text `PR merged`.
-- **Does not assert:** the comment's surrounding wording or structure beyond containing the reason text.
+- **Asserts:** the release exits zero; the specific `gh issue comment` call recorded after a pre-release call-count baseline contains the literal text `PR merged`, backtick-wrapped as `` reason: `PR merged` ``; a second release (issue 41, `--reason "ping @someone see #421"`) succeeds and its posted comment carries no LIVE `@someone` mention.
+- **Does not assert:** the comment's surrounding wording or structure beyond containing the reason text; that an EMPTY `--reason` omits the clause entirely (pinned instead by `release_comment_body_omits_empty_reason`, a `src/issue_dispatch.rs` unit test on the pure comment-body function).
 - **Platform coverage:** mac+linux.
 
 #### daemon/protocol

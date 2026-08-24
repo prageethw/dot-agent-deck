@@ -516,9 +516,10 @@ enum IssueCmd {
     /// of `claim`'s lock: removes the `in-progress` label and posts a
     /// comment recording the release. Refuses on an unclaimed issue, and
     /// refuses on an issue held by a DIFFERENT identity or one whose
-    /// holder identity is unknown unless `--force` is passed. See
-    /// `dot_agent_deck::issue_claim::decide_release`'s doc table for the
-    /// full decision table.
+    /// holder identity is unknown unless BOTH `--force` and
+    /// `--confirm-stopped` are passed. See
+    /// `dot_agent_deck::issue_claim`'s module doc for the full release
+    /// decision table.
     Release {
         /// The GitHub issue number.
         issue: u64,
@@ -526,14 +527,23 @@ enum IssueCmd {
         /// remote when omitted.
         #[arg(long)]
         repo: Option<String>,
-        /// Release even when held by a different identity, or when the
-        /// holder identity is unknown — only after confirming that other
-        /// agent has stopped. Unlike `claim`'s two-step `--takeover
-        /// --confirm-stopped`, release has just this one override flag.
+        /// Signal intent to release an issue held by a different identity,
+        /// or whose holder identity is unknown. Alone, this still refuses —
+        /// deliberate friction mirroring `claim`'s own
+        /// `--takeover`-alone-still-refuses behavior, so an agent can't
+        /// satisfy the override in the same breath it discovers the
+        /// conflict. Pass `--confirm-stopped` too, once you have confirmed
+        /// the other agent has stopped.
         #[arg(long)]
         force: bool,
+        /// Confirms the previous holder's agent has been stopped. Only
+        /// takes effect together with `--force`; nothing verifies the
+        /// assertion.
+        #[arg(long = "confirm-stopped")]
+        confirm_stopped: bool,
         /// Optional free-text reason, included verbatim (after
-        /// sanitization) in the posted release comment.
+        /// sanitization, wrapped in a code span) in the posted release
+        /// comment.
         #[arg(long)]
         reason: Option<String>,
     },
@@ -1782,8 +1792,9 @@ fn main() -> ExitCode {
                 issue,
                 repo,
                 force,
+                confirm_stopped,
                 reason,
-            } => run_issue_release_cli(issue, repo, force, reason),
+            } => run_issue_release_cli(issue, repo, force, confirm_stopped, reason),
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
@@ -2618,6 +2629,7 @@ fn run_issue_release_cli(
     issue: u64,
     repo: Option<String>,
     force: bool,
+    confirm_stopped: bool,
     reason: Option<String>,
 ) -> ExitCode {
     let cwd = match std::env::current_dir() {
@@ -2632,6 +2644,7 @@ fn run_issue_release_cli(
         repo.as_deref(),
         issue,
         force,
+        confirm_stopped,
         reason.as_deref(),
     ) {
         Ok(message) => {

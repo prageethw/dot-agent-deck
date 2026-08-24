@@ -21,10 +21,39 @@
 //! | Held by a different identity | `--takeover` | still refuses |
 //! | Held by a different identity | `--takeover --confirm-stopped` | claim, recording the takeover |
 //!
-//! The exit code is the mechanism — [`run_issue_claim`] returns `Err` for
-//! every refusal AND every operational failure alike, so the CLI wrapper in
-//! `main.rs` can map both uniformly to a non-zero exit; the two are
-//! distinguished only by the message text.
+//! `issue release` (issue #326) is the mirror-image write — see
+//! [`decide_release`] for the pure form:
+//!
+//! | State | Flags | Result |
+//! |---|---|---|
+//! | Unlabelled | — | refuse (nothing to release) |
+//! | Held by THIS identity | — | release |
+//! | Held by a DIFFERENT identity | — | refuse |
+//! | Labelled, no claim comment | — | refuse (identity unknown) |
+//! | Held by a different identity | `--force` | still refuses |
+//! | Held by a different identity | `--force --confirm-stopped` | release, recording who it was forced from |
+//! | Labelled, no claim comment | `--force` | still refuses |
+//! | Labelled, no claim comment | `--force --confirm-stopped` | release |
+//!
+//! `release` originally required only `--force` on its own (a single
+//! flag). Reviewer/auditor's fix round on PR #582 found that a bare
+//! `--force` alone unlocked an issue held by a different, known identity,
+//! after which an unflagged `issue claim` landed in exactly the end state
+//! `claim --takeover --confirm-stopped` reaches — routing around the
+//! deliberate two-flag friction that override requires (CLAUDE.md rule 23:
+//! "an agent can't satisfy the override in the same breath it discovers the
+//! conflict"), and the resulting claim comment recorded `takeover_from:
+//! None`, since it read as an ordinary claim on a now-unlabelled issue — the
+//! displacement fact survived only in the separate, earlier release
+//! comment. `release` now requires the SAME two flags together
+//! (`--force --confirm-stopped`) that `claim` does, mirroring its own
+//! precedent exactly.
+//!
+//! The exit code is the mechanism — [`run_issue_claim`] and
+//! [`run_issue_release`] both return `Err` for every refusal AND every
+//! operational failure alike, so the CLI wrapper in `main.rs` can map both
+//! uniformly to a non-zero exit; the two are distinguished only by the
+//! message text.
 
 use std::path::Path;
 use std::process::Command;
@@ -125,14 +154,16 @@ pub fn decide_claim(
 }
 
 /// The pure release decision (issue #326) — the release-side mirror of
-/// [`ClaimDecision`]. `release` has only ONE override flag (`--force`), not
-/// `claim`'s two-step `--takeover --confirm-stopped` friction: a release is
-/// inherently less risky to get wrong than a takeover-while-claiming (it
-/// only ever narrows what is locked, never widens who holds it), so the
-/// tester's contract (issue #326) asks for `--force` alone.
+/// [`ClaimDecision`]. `release` now requires the SAME two-step
+/// `--force --confirm-stopped` override [`decide_claim`]'s own
+/// `--takeover --confirm-stopped` requires, rather than `--force` alone
+/// (reviewer/auditor fix round, PR #582 — see this module's doc for the
+/// incident: a bare `--force` was a lower-friction route to the exact end
+/// state `claim --takeover --confirm-stopped` reaches, routing around the
+/// deliberate friction CLAUDE.md rule 23 requires of that override).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseDecision {
-    /// Release. `forced_from` names the identity displaced by a `--force`
+    /// Release. `forced_from` names the identity displaced by a forced
     /// release of a DIFFERENT holder's claim — `None` for releasing one's
     /// own claim, or for a forced release of an issue whose holder identity
     /// was never known (nothing to name).
@@ -142,24 +173,37 @@ pub enum ReleaseDecision {
     RefuseNothingToRelease,
     /// Labelled but no claim comment names a holder — same ambiguous state
     /// [`ClaimDecision::RefuseNoIdentity`] refuses on. Escapable with
-    /// `--force`, same as a known-holder refusal.
+    /// `--force --confirm-stopped`, same as a known-holder refusal.
     RefuseNoIdentity,
-    /// Held by a different identity, no `--force`.
-    RefuseHeldByOther { holder: String },
+    /// Held by a different identity. `force_requested` distinguishes the
+    /// two REFUSE rows that differ only in message — the release-side
+    /// mirror of [`ClaimDecision::RefuseHeldByOther`]'s own
+    /// `takeover_requested`: a bare refusal vs. `--force` alone (deliberate
+    /// friction — an agent must not be able to satisfy the override in the
+    /// same breath it discovers the conflict).
+    RefuseHeldByOther {
+        holder: String,
+        force_requested: bool,
+    },
 }
 
-/// The pure decision function backing [`ReleaseDecision`]'s doc table.
+/// The pure decision function backing [`ReleaseDecision`]'s doc table (see
+/// this module's own doc comment for the full release decision table).
 pub fn decide_release(
     label_present: bool,
     held: Option<&ParsedClaim>,
     caller_identity: &str,
     force: bool,
+    confirm_stopped: bool,
 ) -> ReleaseDecision {
     if !label_present {
         return ReleaseDecision::RefuseNothingToRelease;
     }
     let Some(held) = held else {
-        return if force {
+        // Escapable with the SAME two-step override as a known-holder
+        // refusal — see `RefuseNoIdentity`'s own doc, mirroring
+        // `decide_claim`'s identical `RefuseNoIdentity` branch.
+        return if force && confirm_stopped {
             ReleaseDecision::Release { forced_from: None }
         } else {
             ReleaseDecision::RefuseNoIdentity
@@ -174,12 +218,15 @@ pub fn decide_release(
     // tail. The comparison just above already happened against the raw
     // value, so this cannot change the decision itself.
     let holder = sanitize_claimant_name(&held.identity);
-    if force {
+    if force && confirm_stopped {
         return ReleaseDecision::Release {
             forced_from: Some(holder),
         };
     }
-    ReleaseDecision::RefuseHeldByOther { holder }
+    ReleaseDecision::RefuseHeldByOther {
+        holder,
+        force_requested: force,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +664,7 @@ pub fn run_issue_release(
     repo: Option<&str>,
     issue: u64,
     force: bool,
+    confirm_stopped: bool,
     reason: Option<&str>,
 ) -> Result<String, String> {
     let repo = match repo {
@@ -633,7 +681,13 @@ pub fn run_issue_release(
     let identity = resolve_caller_identity(cwd)?;
     let (label_present, held, _current_assignees) = read_current_claim(&repo, issue)?;
 
-    match decide_release(label_present, held.as_ref(), &identity.to_string(), force) {
+    match decide_release(
+        label_present,
+        held.as_ref(),
+        &identity.to_string(),
+        force,
+        confirm_stopped,
+    ) {
         ReleaseDecision::Release { forced_from } => {
             let login = resolve_assignee_login(&identity);
             do_release(
@@ -654,10 +708,13 @@ pub fn run_issue_release(
         )),
         ReleaseDecision::RefuseNoIdentity => Err(format!(
             "issue #{issue} of {repo} is labelled `{IN_PROGRESS_LABEL}` but no claim comment \
-             names a holder — refusing (identity unknown); pass `--force` once you have \
-             confirmed there is nobody left holding this issue"
+             names a holder — refusing (identity unknown); pass `--force --confirm-stopped` \
+             once you have confirmed there is nobody left holding this issue"
         )),
-        ReleaseDecision::RefuseHeldByOther { holder } => {
+        ReleaseDecision::RefuseHeldByOther {
+            holder,
+            force_requested,
+        } => {
             // Same sanitize-before-display discipline as `run_issue_claim`'s
             // own `RefuseHeldByOther` arm — `holder` is already sanitized by
             // `decide_release`, `timestamp` is a sibling field from the same
@@ -666,9 +723,18 @@ pub fn run_issue_release(
                 .as_ref()
                 .map(|h| format!(" since {}", sanitize_claimant_name(&h.timestamp)))
                 .unwrap_or_default();
+            let instruction = if force_requested {
+                "`--force` alone does not release it — this is deliberate friction, mirroring \
+                 `issue claim`'s own `--takeover`-alone-still-refuses behavior, so an agent \
+                 can't satisfy the override in the same breath it discovers the conflict; \
+                 re-run with `--force --confirm-stopped` once you have confirmed the other \
+                 agent has stopped"
+            } else {
+                "pass `--force --confirm-stopped` once you have confirmed that agent has \
+                 stopped"
+            };
             Err(format!(
-                "issue #{issue} of {repo} is held by `{holder}`{since} — pass `--force` once \
-                 you have confirmed that agent has stopped"
+                "issue #{issue} of {repo} is held by `{holder}`{since} — {instruction}"
             ))
         }
     }
@@ -903,11 +969,11 @@ mod tests {
     #[test]
     fn decide_release_unlabelled_refuses_nothing_to_release() {
         assert_eq!(
-            decide_release(false, None, "orchestration:a@h:1", false),
+            decide_release(false, None, "orchestration:a@h:1", false, false),
             ReleaseDecision::RefuseNothingToRelease
         );
         assert_eq!(
-            decide_release(false, None, "orchestration:a@h:1", true),
+            decide_release(false, None, "orchestration:a@h:1", true, true),
             ReleaseDecision::RefuseNothingToRelease
         );
     }
@@ -916,27 +982,44 @@ mod tests {
     fn decide_release_own_claim_releases() {
         let held = claim("orchestration:a@h:1", Some("alice"), "ts");
         assert_eq!(
-            decide_release(true, Some(&held), "orchestration:a@h:1", false),
+            decide_release(true, Some(&held), "orchestration:a@h:1", false, false),
             ReleaseDecision::Release { forced_from: None }
         );
     }
 
     #[test]
-    fn decide_release_held_by_other_no_force_refuses() {
+    fn decide_release_held_by_other_no_flags_refuses() {
         let held = claim("orchestration:a@h:1", Some("alice"), "ts");
         assert_eq!(
-            decide_release(true, Some(&held), "orchestration:b@h:2", false),
+            decide_release(true, Some(&held), "orchestration:b@h:2", false, false),
             ReleaseDecision::RefuseHeldByOther {
                 holder: "orchestration:a@h:1".to_string(),
+                force_requested: false,
+            }
+        );
+    }
+
+    // --- reviewer/auditor fix round, PR #582: `--force` alone must not be
+    // enough — it must not be a lower-friction route to the same end state
+    // `claim --takeover --confirm-stopped` reaches (CLAUDE.md rule 23).
+
+    #[test]
+    fn decide_release_force_alone_still_refuses() {
+        let held = claim("orchestration:a@h:1", Some("alice"), "ts");
+        assert_eq!(
+            decide_release(true, Some(&held), "orchestration:b@h:2", true, false),
+            ReleaseDecision::RefuseHeldByOther {
+                holder: "orchestration:a@h:1".to_string(),
+                force_requested: true,
             }
         );
     }
 
     #[test]
-    fn decide_release_held_by_other_with_force_releases_naming_who() {
+    fn decide_release_held_by_other_with_force_and_confirm_stopped_releases_naming_who() {
         let held = claim("orchestration:a@h:1", Some("alice"), "ts");
         assert_eq!(
-            decide_release(true, Some(&held), "orchestration:b@h:2", true),
+            decide_release(true, Some(&held), "orchestration:b@h:2", true, true),
             ReleaseDecision::Release {
                 forced_from: Some("orchestration:a@h:1".to_string())
             }
@@ -944,17 +1027,25 @@ mod tests {
     }
 
     #[test]
-    fn decide_release_no_identity_no_force_refuses() {
+    fn decide_release_no_identity_no_flags_refuses() {
         assert_eq!(
-            decide_release(true, None, "orchestration:a@h:1", false),
+            decide_release(true, None, "orchestration:a@h:1", false, false),
             ReleaseDecision::RefuseNoIdentity
         );
     }
 
     #[test]
-    fn decide_release_no_identity_with_force_releases() {
+    fn decide_release_no_identity_force_alone_still_refuses() {
         assert_eq!(
-            decide_release(true, None, "orchestration:a@h:1", true),
+            decide_release(true, None, "orchestration:a@h:1", true, false),
+            ReleaseDecision::RefuseNoIdentity
+        );
+    }
+
+    #[test]
+    fn decide_release_no_identity_escapes_with_force_and_confirm_stopped() {
+        assert_eq!(
+            decide_release(true, None, "orchestration:a@h:1", true, true),
             ReleaseDecision::Release { forced_from: None }
         );
     }
@@ -962,8 +1053,8 @@ mod tests {
     #[test]
     fn decide_release_sanitizes_held_identity_before_displaying_it() {
         let held = claim("worktree:/work/evil\ninjected@branch", Some("alice"), "ts");
-        match decide_release(true, Some(&held), "orchestration:b@h:2", false) {
-            ReleaseDecision::RefuseHeldByOther { holder } => {
+        match decide_release(true, Some(&held), "orchestration:b@h:2", false, false) {
+            ReleaseDecision::RefuseHeldByOther { holder, .. } => {
                 assert!(
                     !holder.contains('\n'),
                     "a raw newline parsed out of a held claim comment must not survive into a \

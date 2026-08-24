@@ -523,15 +523,19 @@ fn any_claim_write(calls: &[String]) -> bool {
 }
 
 /// Whether any of `calls` is a write `issue release` must never make on a
-/// refusal: a `--remove-label` call or an `issue comment` call. The
-/// `release`-specific sibling of [`any_claim_write`] — distinct because
-/// `release` (issue #326) only ever removes the `in-progress` label and
-/// posts a release comment; unlike `claim`, it never touches
-/// `--add-label`/`--add-assignee`/`--remove-assignee` at all.
+/// refusal — [`any_claim_write`]'s full set (`--add-label`, an `issue
+/// comment` call, `--add-assignee`, `--remove-assignee`) PLUS
+/// `--remove-label`, the one write `release` (unlike `claim`) legitimately
+/// makes on a SUCCESS. Widened from just `--remove-label`/`issue comment`
+/// (reviewer R9 / auditor A4, PR #582's fix round) so a refused release
+/// that accidentally wrote an assignee or added a label would actually be
+/// caught — before this widening, "release never touches assignees" was
+/// merely assumed, never verified. `release` never legitimately touches
+/// `--add-label`/`--add-assignee`/`--remove-assignee` at all, so checking
+/// for them costs nothing on the success paths and catches a real
+/// regression on the refusal paths.
 fn any_release_write(calls: &[String]) -> bool {
-    calls
-        .iter()
-        .any(|l| l.contains("--remove-label") || is_issue_comment_call(l))
+    any_claim_write(calls) || calls.iter().any(|l| l.contains("--remove-label"))
 }
 
 /// Whether `body` carries `@handle` as a LIVE mention — i.e. OUTSIDE any
@@ -2445,7 +2449,8 @@ fn issue_claim_033_claim_check_could_not_determine_when_caller_identity_is_unres
 
 // ---------------------------------------------------------------------------
 // `issue release` (issue #326) — RED round. `worker-agent-deck issue release
-// <n> --repo <owner/name> [--force] [--reason <text>]` does not exist yet:
+// <n> --repo <owner/name> [--force] [--confirm-stopped] [--reason <text>]`
+// does not exist yet:
 // clap rejects `issue release ...` outright as an unrecognized subcommand,
 // which is a genuine RED here, same as any brand-new subcommand (rather than
 // a behavioral mismatch, as the identity-anchor tests above are). Every
@@ -2573,10 +2578,13 @@ fn issue_claim_035_release_refuses_when_held_by_a_different_identity_and_writes_
 }
 
 /// Scenario: The SAME setup as `issue/claim/035` — A holds issue 36 for
-/// real, B is a different identity — but B runs `issue release 36 --force`.
-/// Assert the release succeeds, the `in-progress` label is removed, and
-/// the posted release comment's body names the identity it was
-/// force-released from (A's worktree absolute path and branch).
+/// real, B is a different identity — but B runs `issue release 36 --force
+/// --confirm-stopped`. Assert the release succeeds, the `in-progress`
+/// label is removed, and the posted release comment's body names the
+/// identity it was force-released from (A's worktree absolute path and
+/// branch). `--force` alone must not be enough (reviewer/auditor fix
+/// round, PR #582): mirroring `issue claim`'s own two-step
+/// `--takeover --confirm-stopped` friction is what this test now pins.
 #[spec("issue/claim/036")]
 #[test]
 #[cfg(unix)]
@@ -2599,12 +2607,21 @@ fn issue_claim_036_release_with_force_releases_a_different_identitys_claim() {
     fx.set_login("dave");
     let release_b = fx.run(
         &wt_b,
-        &["issue", "release", "36", "--repo", repo, "--force"],
+        &[
+            "issue",
+            "release",
+            "36",
+            "--repo",
+            repo,
+            "--force",
+            "--confirm-stopped",
+        ],
         Some("pane-b"),
     );
     assert!(
         release_b.status.success(),
-        "release --force must succeed even when held by a different identity; out={}",
+        "release --force --confirm-stopped must succeed even when held by a different \
+         identity; out={}",
         combined(&release_b)
     );
 
@@ -2714,9 +2731,12 @@ fn issue_claim_038_release_refuses_on_no_identity_state_without_force() {
 }
 
 /// Scenario: The SAME ambiguous identity-unknown seed as `issue/claim/038`,
-/// but `issue release 39 --force` is run. Assert the release succeeds and
-/// the `in-progress` label is removed and a release comment is posted —
-/// its body need not name a specific prior holder, since none was known.
+/// but `issue release 39 --force --confirm-stopped` is run. Assert the
+/// release succeeds and the `in-progress` label is removed and a release
+/// comment is posted — its body need not name a specific prior holder,
+/// since none was known. `--force` alone must not be enough here either
+/// (reviewer/auditor fix round, PR #582), mirroring `decide_claim`'s own
+/// `RefuseNoIdentity` branch, which also requires both flags.
 #[spec("issue/claim/039")]
 #[test]
 #[cfg(unix)]
@@ -2731,12 +2751,21 @@ fn issue_claim_039_release_with_force_handles_no_identity_state() {
 
     let out = fx.run(
         &wt,
-        &["issue", "release", "39", "--repo", repo, "--force"],
+        &[
+            "issue",
+            "release",
+            "39",
+            "--repo",
+            repo,
+            "--force",
+            "--confirm-stopped",
+        ],
         Some("pane-039"),
     );
     assert!(
         out.status.success(),
-        "release --force must succeed even when the holder's identity is unknown; out={}",
+        "release --force --confirm-stopped must succeed even when the holder's identity is \
+         unknown; out={}",
         combined(&out)
     );
 
@@ -2811,5 +2840,59 @@ fn issue_claim_040_release_with_reason_includes_it_in_the_comment() {
         comment_line.is_some_and(|l| l.contains("PR merged")),
         "the --reason text must appear verbatim in the posted release comment's body; new gh \
          calls: {new_calls:?}"
+    );
+    // Reviewer/auditor fix round (PR #582): `reason` was the ONLY untrusted
+    // value in this module rendered OUTSIDE a code span, so an unwrapped
+    // `--reason` let live markdown (a mention, a cross-reference) through.
+    // Mirror the `forcibly released from `{prev}`` clause immediately above
+    // it in the same function and confirm the reason is backtick-wrapped
+    // too.
+    assert!(
+        comment_line.is_some_and(|l| l.contains("reason: `PR merged`")),
+        "the reason must be wrapped in a code span so it cannot render as live markdown, got \
+         {new_calls:?}"
+    );
+
+    // Same property, adversarially: a --reason carrying a live-looking
+    // @mention must stay inert (inside its own code span) once posted.
+    let claim2 = fx.run(
+        &wt,
+        &["issue", "claim", "41", "--repo", repo],
+        Some("pane-040"),
+    );
+    assert!(
+        claim2.status.success(),
+        "the second claim must succeed (sanity precondition); out={}",
+        combined(&claim2)
+    );
+    let calls_before_release2 = fx.gh_calls().len();
+    let release2 = fx.run(
+        &wt,
+        &[
+            "issue",
+            "release",
+            "41",
+            "--repo",
+            repo,
+            "--reason",
+            "ping @someone see #421",
+        ],
+        Some("pane-040"),
+    );
+    assert!(
+        release2.status.success(),
+        "releasing with an @mention-carrying reason must still succeed; out={}",
+        combined(&release2)
+    );
+    let new_calls2: Vec<String> = fx
+        .gh_calls()
+        .into_iter()
+        .skip(calls_before_release2)
+        .collect();
+    let comment_line2 = new_calls2.iter().find(|l| is_issue_comment_call(l));
+    assert!(
+        comment_line2.is_some_and(|l| !raw_mention_present(l, "someone")),
+        "a --reason containing an @mention must never render as a LIVE mention once posted — \
+         it must stay inside the reason's own code span; new gh calls: {new_calls2:?}"
     );
 }

@@ -1197,8 +1197,15 @@ pub const RELEASE_COMMENT_PREFIX: &str = "Released by ";
 /// release displaced — `None` for releasing one's own claim, or for a forced
 /// release of an issue whose holder identity was never known. `reason` is
 /// the caller's optional free-text `--reason`, sanitized the same way a
-/// claimant name is (control characters, backticks) before it reaches a
-/// public comment body.
+/// claimant name is (control characters, backticks) and — mirroring the
+/// "forcibly released from" clause immediately above it — wrapped in its
+/// own code span before it reaches a public comment body: `reason` was the
+/// ONLY untrusted value in this module rendered OUTSIDE a code span, so
+/// `--reason "ping @someone"` used to post a live GitHub mention and
+/// `--reason "#421"` used to create a real cross-reference (reviewer/auditor
+/// fix round, PR #582). A `reason` that is empty, or entirely whitespace
+/// once sanitized, is treated as if `--reason` had never been passed at all
+/// — otherwise `--reason ""` would render as the meaningless ", reason: ".
 pub fn release_comment_body(
     identity: &Identity,
     timestamp: &str,
@@ -1216,7 +1223,11 @@ pub fn release_comment_body(
         body.push_str(&format!(", forcibly released from `{prev}`"));
     }
     if let Some(reason) = reason {
-        body.push_str(&format!(", reason: {}", sanitize_claimant_name(reason)));
+        let sanitized = sanitize_claimant_name(reason);
+        let trimmed = sanitized.trim();
+        if !trimmed.is_empty() {
+            body.push_str(&format!(", reason: `{trimmed}`"));
+        }
     }
     body.push('.');
     body
@@ -2030,6 +2041,60 @@ mod tests {
         );
         assert!(!body.contains('\n'), "got {body:?}");
         assert!(!body.contains("done`"), "got {body:?}");
+    }
+
+    // --- reviewer/auditor fix round, PR #582: reason wrapped in a code span ---
+
+    #[test]
+    fn release_comment_body_wraps_reason_in_a_code_span() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = release_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            None,
+            None,
+            Some("PR merged"),
+        );
+        assert!(
+            body.contains(", reason: `PR merged`"),
+            "the reason must be wrapped in its own code span, mirroring the `forcibly \
+             released from `{{prev}}`` clause immediately above it, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn release_comment_body_reason_mention_stays_inert_inside_its_code_span() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = release_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            None,
+            None,
+            Some("ping @someone see #421"),
+        );
+        // `reason` used to be the ONLY untrusted value in this module
+        // rendered outside a code span — an even count of backticks
+        // preceding the `@` means it sits OUTSIDE any open span (live).
+        let at_idx = body.find('@').expect("reason must be present");
+        let backticks_before = body[..at_idx].matches('`').count();
+        assert!(
+            !backticks_before.is_multiple_of(2),
+            "an @mention inside the reason must sit inside a code span (odd backtick count \
+             before it), got {body:?}"
+        );
+    }
+
+    #[test]
+    fn release_comment_body_omits_empty_reason() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        for reason in [Some(""), Some("   "), Some("```")] {
+            let body = release_comment_body(&identity, "2026-08-09T00:00:00Z", None, None, reason);
+            assert!(
+                !body.contains("reason:"),
+                "an empty (or all-whitespace, or all-backtick) --reason must be treated the \
+                 same as no --reason at all, got {body:?} for input {reason:?}"
+            );
+        }
     }
 
     #[test]
