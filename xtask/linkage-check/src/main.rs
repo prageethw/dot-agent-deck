@@ -69,6 +69,15 @@
 //!   `origin/main`, plus per-catalog-entry prose diffs and any
 //!   `m2.allowlist` changes. The orchestrator surfaces this to the
 //!   user before delegating release.
+//!   - `--compare <ref-a> <ref-b>` (issue #344 item 3): reports the
+//!     `#[spec]` test population delta between two explicit refs —
+//!     added, removed, modified — and exits non-zero when a test
+//!     present at `ref-a` is missing at `ref-b`. Meant to be run by
+//!     hand across a sync boundary (`docs/develop/fork-sync-workflow.md`),
+//!     deliberately NOT wired into the automatic per-PR checks below —
+//!     see [`list_tests::run_compare`]'s doc comment for why a
+//!     merge-base-vs-`origin/main` comparison would be structurally
+//!     vacuous or false-positive-prone on this suite's own triggers.
 //! - `work-type-check` — PRD fork#340 M3 R0: derives this diff's work type
 //!   (`bug | prd | doc | chore`) from the added `changelog.d` fragment
 //!   suffix, else the branch's work-type prefix, and fails if neither
@@ -701,24 +710,34 @@ fn run_docs(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `cargo xtask list-tests` dispatch (PRD #77 Decision 31). Emits a
-/// Markdown synthetic-test inventory between the current branch and
-/// `origin/main` on stdout. The orchestrator runs this before
-/// delegating release.
+/// `cargo xtask list-tests` dispatch (PRD #77 Decision 31, + issue #344
+/// item 3's `--compare` mode). Emits a Markdown synthetic-test inventory
+/// between the current branch and `origin/main` on stdout by default.
+/// The orchestrator runs this before delegating release.
 fn run_list_tests(args: &[String]) -> ExitCode {
     if let Some(first) = args.first() {
         match first.as_str() {
             "-h" | "--help" => {
-                println!("usage: cargo xtask list-tests");
+                println!("usage: cargo xtask list-tests [--compare <ref-a> <ref-b>]");
                 println!();
-                println!("Emits a Markdown report of every #[spec] test created or");
-                println!("modified in this branch versus origin/main, plus per-catalog");
-                println!("prose diffs and any xtask/linkage-check/m2.allowlist changes.");
+                println!("With no arguments, emits a Markdown report of every #[spec]");
+                println!("test created or modified in this branch versus origin/main,");
+                println!("plus per-catalog prose diffs and any");
+                println!("xtask/linkage-check/m2.allowlist changes.");
+                println!();
+                println!("--compare <ref-a> <ref-b> instead reports the #[spec] test");
+                println!("population delta between two arbitrary refs — added, removed,");
+                println!("modified — and exits non-zero if any test present at <ref-a>");
+                println!("is missing at <ref-b> (issue #344). Meant to be run by hand");
+                println!("across a sync boundary, not wired into the per-PR gate.");
                 return ExitCode::SUCCESS;
+            }
+            "--compare" => {
+                return run_list_tests_compare(&args[1..]);
             }
             other => {
                 eprintln!("xtask list-tests: unknown argument {other:?}");
-                eprintln!("usage: cargo xtask list-tests");
+                eprintln!("usage: cargo xtask list-tests [--compare <ref-a> <ref-b>]");
                 return ExitCode::from(2);
             }
         }
@@ -731,6 +750,40 @@ fn run_list_tests(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("xtask list-tests: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `cargo xtask list-tests --compare <ref-a> <ref-b>` dispatch (issue
+/// #344 item 3). Always prints the report — a removal is meant to be
+/// seen, not just detected — and exits non-zero exactly when the report
+/// found a removal, so a human (or a sync write-up step) can treat a
+/// non-zero exit as "read this before moving on."
+fn run_list_tests_compare(args: &[String]) -> ExitCode {
+    let (ref_a, ref_b) = match args {
+        [a, b] => (a.as_str(), b.as_str()),
+        _ => {
+            eprintln!(
+                "xtask list-tests --compare: expected exactly two refs, got {}",
+                args.len()
+            );
+            eprintln!("usage: cargo xtask list-tests --compare <ref-a> <ref-b>");
+            return ExitCode::from(2);
+        }
+    };
+    let root = repo_root();
+    match list_tests::run_compare(&root, ref_a, ref_b) {
+        Ok(outcome) => {
+            print!("{}", outcome.markdown);
+            if outcome.has_removals {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("xtask list-tests --compare: {e}");
             ExitCode::FAILURE
         }
     }
