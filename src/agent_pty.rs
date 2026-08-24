@@ -4109,14 +4109,12 @@ impl AgentPtyRegistry {
                     armed_secs_ago: now.duration_since(r.armed_at).as_secs(),
                     orchestrator_pane_id: r.orchestrator_pane_id.clone(),
                 }),
-            delegation_commission: tracker.commissions.get(worker_pane_id).map(|c| {
-                CommissionSnapshot {
+            delegation_commission: tracker.commissions.get(worker_pane_id).and_then(|c| {
+                c.arm_times.front().map(|&oldest| CommissionSnapshot {
                     outstanding: c.arm_times.len() as u32,
-                    oldest_armed_secs_ago: now
-                        .duration_since(*c.arm_times.front().expect("non-empty, entry exists"))
-                        .as_secs(),
+                    oldest_armed_secs_ago: now.duration_since(oldest).as_secs(),
                     orchestrator_pane_id: c.orchestrator_pane_id.clone(),
-                }
+                })
             }),
         }
     }
@@ -4183,18 +4181,19 @@ impl AgentPtyRegistry {
     /// may be outstanding to one worker and only one of them failed, so
     /// dropping the whole entry would discard a sibling delegation's genuine
     /// commission and mislabel ITS completion as unsolicited. Pops from the
-    /// front (oldest) for consistency with [`Self::retire_delegation_commission`]'s
-    /// oldest-first consumption — a delegate that never arrived has no real
-    /// "age" signal to prefer, so either end would be correct, but this keeps
-    /// the two methods' consumption order aligned. The entry is removed as it
-    /// empties so the map keeps tracking live debt rather than every pane
+    /// BACK (newest): the commission being released belongs to the delegate
+    /// that was just refused by the guarded send, which is always the most
+    /// recently armed entry for this worker pane, not the oldest. Popping the
+    /// front would remove a different, still-outstanding commission and leave
+    /// the failed delegate's phantom entry standing. The entry is removed as
+    /// it empties so the map keeps tracking live debt rather than every pane
     /// ever delegated to.
     pub fn release_delegation_commission(&self, worker_pane_id: &str) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
-        entry.arm_times.pop_front();
+        entry.arm_times.pop_back();
         if entry.arm_times.is_empty() {
             tracker.commissions.remove(worker_pane_id);
         }
@@ -13080,16 +13079,17 @@ mod spawn_tests {
         );
     }
 
-    /// Issue #586 M2/B round 2 (reviewer's B2 counterexample): two commissions
-    /// for the SAME worker pane, armed at different times, must be aged
-    /// INDEPENDENTLY. Under the old single-`armed_at`-plus-counter shape, a
-    /// far-older first arm's age was checked on behalf of a much-fresher
-    /// second delegation, and a legitimately in-flight completion could be
-    /// wrongly reported `Unsolicited` — discarding the worker's genuine report
-    /// (upstream #590's "expiring in the wrong direction is worse than not
-    /// expiring"). Repro: delegate, then delegate again ~100 minutes later
-    /// (well under `COMMISSION_MAX_AGE`, but far apart) — answering the first,
-    /// then the second, must credit both.
+    /// Issue #586 M2/B round 2: two commissions for the SAME worker pane,
+    /// armed at different times, must each be credited on completion and
+    /// consumed oldest-first — a correctness/plumbing check on independent
+    /// per-arm ages, not a discriminating regression guard. Its 100-minute
+    /// backdate only distinguished the old single-`armed_at`-plus-counter
+    /// shape from the redesign against the OLD 120-minute expiry window; against
+    /// the current 7-day `COMMISSION_MAX_AGE` both entries are "fresh" either
+    /// way, so this test alone would pass identically whether or not the
+    /// redesign had happened. [`retire_delegation_commission_purges_only_the_stale_sibling`]
+    /// below is the one that actually discriminates, since it backdates past
+    /// `COMMISSION_MAX_AGE` itself.
     #[test]
     fn retire_delegation_commission_ages_two_arms_independently() {
         let reg = Arc::new(AgentPtyRegistry::new());
@@ -13114,14 +13114,19 @@ mod spawn_tests {
             reg.retire_delegation_commission("worker"),
             WorkDoneProvenance::Solicited { remaining: 0 },
             "the second, genuinely fresh commission must not be caught by the first \
-             arm's age — this is reviewer's exact B2 counterexample"
+             arm's age"
         );
     }
 
     /// Issue #586 M2/B round 2 (finding B2's other half): one stale entry
     /// sharing a worker pane with fresh siblings must be purged on its own,
     /// without taking the fresh ones down with it — not `Unsolicited` just
-    /// because the stale entry happened to be at the front of the queue.
+    /// because the stale entry happened to be at the front of the queue. This
+    /// is the actually-discriminating regression guard for reviewer's B2
+    /// counterexample: it backdates one arm past `COMMISSION_MAX_AGE` itself,
+    /// so it is the test that would fail against the pre-fix single-`armed_at`
+    /// design, where the whole pane's age was governed by one shared field
+    /// rather than per-arm timestamps.
     #[test]
     fn retire_delegation_commission_purges_only_the_stale_sibling() {
         let reg = Arc::new(AgentPtyRegistry::new());
