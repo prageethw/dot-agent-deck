@@ -5803,23 +5803,13 @@ impl AppState {
         // [`crate::agent_pty::WorkDoneProvenance`] for why that arm cannot tell
         // "never delegated" from "delegated with the idle detector switched off".
         //
-        // Issue #586 M2/B, closing upstream #590: resolved the same way as
-        // every other consumer of this knob — [`worker_response_timeout`],
-        // orchestration cwd first, worker cwd as the PRD #120 clone fallback
-        // — so a commission that has sat unanswered longer than
-        // `worker_response_timeout_minutes` expires instead of being credited
-        // to whatever `work-done` happens to arrive next, however stale.
-        let commission_orchestration_cwd =
-            self.orchestrator_for_worker(&signal.pane_id)
-                .and_then(|orchestrator_pane_id| {
-                    self.orchestration_cwd_of(&orchestrator_pane_id, registry)
-                });
-        let commission_worker_cwd = self.pane_cwd_map.get(&signal.pane_id).cloned();
-        let commission_timeout = worker_response_timeout(
-            commission_orchestration_cwd.as_deref(),
-            commission_worker_cwd.as_deref(),
-        );
-        let provenance = registry.retire_delegation_commission(&signal.pane_id, commission_timeout);
+        // Issue #586 M2/B round 2, closing upstream #590: expiry is now a
+        // fixed, config-independent window (`COMMISSION_MAX_AGE` in
+        // `agent_pty.rs`), checked per-arm — deliberately NOT derived from
+        // `worker_response_timeout_minutes` or any other switchable detector,
+        // per upstream #590's explicit ask. There is no timeout to resolve
+        // here any more.
+        let provenance = registry.retire_delegation_commission(&signal.pane_id);
 
         // Fork #358 M1/M4: the compound generation/boot-id check now runs
         // BEFORE the retire calls above (see the comment there) — this is

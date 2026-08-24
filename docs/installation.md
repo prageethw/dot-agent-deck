@@ -229,6 +229,21 @@ dot-agent-deck daemon status --json
       "cwd": "/home/you/src/api",
       "status": "Working",
       "active_tool": { "name": "Bash" }
+    },
+    {
+      "agent_id": "3",
+      "pane_id": "3",
+      "label": "api",
+      "cwd": "/home/you/src/api",
+      "role": "coder",
+      "status": "Idle",
+      "outstanding_delegation": { "armed_secs_ago": 42, "orchestrator_pane_id": "1" },
+      "silence_watch": { "armed_secs_ago": 42, "orchestrator_pane_id": "1" },
+      "delegation_commission": {
+        "outstanding": 1,
+        "oldest_armed_secs_ago": 42,
+        "orchestrator_pane_id": "1"
+      }
     }
   ]
 }
@@ -236,7 +251,9 @@ dot-agent-deck daemon status --json
 
 `schema_version` is the contract. It is bumped when a field is **removed** or changes meaning; new fields can appear without a bump, so parse tolerantly and ignore keys you do not recognise. Version `2` removed `active_tool.detail`, which version `1` carried — a script written against v1 that read the tool's arguments gets nothing under v2 rather than something subtly different.
 
-Every field except `agent_id` is optional and is **omitted entirely** when the daemon has no value for it, which is what the table renders as `-`. In the document above, agent `2` has no `role` key and agent `1` has no `active_tool` key. Read them with a fallback rather than assuming they are present:
+`outstanding_delegation` and `silence_watch` report the two independent watches on a delegated worker pane — the idle-worker and silent-worker detectors — each as `{ "armed_secs_ago": <seconds>, "orchestrator_pane_id": <pane> }` when currently armed. `delegation_commission` reports the commission ledger: how many delegations to this pane still owe a `work-done`, as `{ "outstanding": <count>, "oldest_armed_secs_ago": <seconds>, "orchestrator_pane_id": <pane> }`. All three are per-pane, independent of each other, and independent of `worker_response_timeout_minutes` — the commission ledger ages out on its own fixed window, unrelated to that (or any other) switchable detector.
+
+Every field except `agent_id` is optional and is **omitted entirely** when the daemon has no value for it, which is what the table renders as `-`. In the document above, agent `2` has no `role` key, agent `1` has no `active_tool` key, and neither `1` nor `2` has any of the three delegation-watch keys. Read them with a fallback rather than assuming they are present:
 
 ```bash
 dot-agent-deck daemon status --json | jq --raw-output '.agents[] | "\(.pane_id)\t\(.status // "unknown")\t\(.active_tool.name // "-")"'
