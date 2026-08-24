@@ -1634,6 +1634,55 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the exact refusal wording beyond its exit code and read-only property.
 - **Platform coverage:** mac+linux.
 
+##### issue/claim/034 — Issue #326: a NEW `issue release <n> --repo <owner/name> [--force] [--reason <text>]` subcommand (RED — does not exist yet, so `issue release ...` is rejected outright by clap). An agent claims issue 34 for real, then releases its OWN claim from the same worktree. Asserts the release exits 0, removes the `in-progress` label, and posts a NEW `gh issue comment` distinct from the claim comment already posted — validates the release path's happy case, not `claim`/`claim-check`.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; a real `issue claim` seeds the held state, then the same worktree runs `issue release`).
+- **Agent:** none.
+- **Asserts:** the release exits zero; a `gh` call recorded after a call-count baseline taken just before the release began contains both `--remove-label` and `in-progress`; a call recorded after that same baseline is a genuine `gh issue comment` write (`is_issue_comment_call`), distinct from the earlier claim comment.
+- **Does not assert:** the exact release comment's wording beyond being a genuine `gh issue comment` call; the coder's chosen implementation shape (a new `decide_release` pure function, per the PRD/issue).
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/035 — Issue #326: agent A claims issue 35 for real; a DIFFERENT agent B then runs `issue release 35` WITHOUT `--force` from its own worktree. Asserts B's release refuses, its output names A's holder identity (worktree absolute path and branch, the same anchor `issue claim`'s own refusal names), and B's run writes nothing at all — validates the NEW `release` subcommand's held-by-another refusal, not `claim`/`claim-check`.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/030`; reuses the `two_orchestrations` two-worktree fixture, with A's hold established via a REAL `issue claim` run).
+- **Agent:** none.
+- **Asserts:** the release exits non-zero; combined stdout+stderr contains A's worktree absolute path AND `BRANCH_A`; no `gh` call recorded after a call-count baseline taken just before B's release began matches `any_release_write` (`--remove-label` or a genuine `issue comment` call).
+- **Does not assert:** a specific exit code (unlike `claim-check`'s tiered codes, `release`'s contract only distinguishes success/refusal); the exact full refusal string beyond naming the holder.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/036 — Issue #326: the SAME setup as `035` — A holds issue 36 for real, B is a different identity — but B runs `issue release 36 --force`. Asserts the release succeeds, the `in-progress` label is removed, and the posted release comment's own body names the identity it was force-released from (A's worktree absolute path and branch) — validates that a forced release genuinely records provenance, not merely that it succeeds.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/035`).
+- **Agent:** none.
+- **Asserts:** the release exits zero; a `gh` call recorded after the pre-release baseline contains both `--remove-label` and `in-progress`; the specific `gh issue comment` call recorded after that same baseline contains A's worktree absolute path AND `BRANCH_A`.
+- **Does not assert:** the exact wording of the "force-released from" clause, only that the comment names the displaced identity.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/037 — Issue #326: a fresh issue, NEVER claimed by anyone (no `in-progress` label, no claim comment). `issue release 37` is run against it (no `--force` needed — there is nothing to force through). Asserts the release refuses with a message indicating there is nothing to release (catching a typo'd issue number) and writes nothing — validates the NEW `release` subcommand's unclaimed-issue refusal, distinct from `RefuseHeldByOther`/`RefuseNoIdentity`.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/029`; no seeding at all — a fresh unlabelled, unclaimed issue).
+- **Agent:** none.
+- **Asserts:** the release exits non-zero; combined stdout+stderr contains `nothing to release`; no recorded `gh` call matches `any_release_write`.
+- **Does not assert:** the exact full refusal string beyond the `nothing to release` substring.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/038 — Issue #326: an issue is labelled `in-progress` with NO discoverable claim comment at all — the same ambiguous identity-unknown state `issue/claim/004`/`032` seed (`ClaimDecision`-analogue `RefuseNoIdentity`). `issue release 38` is run without `--force`. Asserts the release refuses with a message saying the identity is unknown, mirroring `issue claim`'s own `RefuseNoIdentity` wording, and writes nothing.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/032`; `Fixture::seed_label_only` seeds the label with no comment).
+- **Agent:** none.
+- **Asserts:** the release exits non-zero; combined stdout+stderr contains `identity unknown`; no recorded `gh` call matches `any_release_write`.
+- **Does not assert:** the exact full refusal string beyond the `identity unknown` substring.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/039 — Issue #326: the SAME ambiguous identity-unknown seed as `038`, but `issue release 39 --force` is run. Asserts the release succeeds, removes the `in-progress` label, and posts a release comment — its body need not name a specific prior holder, since none was known — validating `--force` also escapes the no-identity state, not only a known different holder (`036`).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/038`).
+- **Agent:** none.
+- **Asserts:** the release exits zero; a recorded `gh` call contains both `--remove-label` and `in-progress`; a recorded `gh` call is a genuine `issue comment` write.
+- **Does not assert:** the release comment's body content — only that one was posted.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/040 — Issue #326: an agent claims issue 40 for real, then releases its own claim with `issue release 40 --reason "PR merged"`. Asserts the release succeeds and the posted release comment's body contains the exact reason text verbatim — validates the `--reason` flag's plumbing into the comment body, a surface none of `034`-`039` exercise.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/034`).
+- **Agent:** none.
+- **Asserts:** the release exits zero; the specific `gh issue comment` call recorded after a pre-release call-count baseline contains the literal text `PR merged`.
+- **Does not assert:** the comment's surrounding wording or structure beyond containing the reason text.
+- **Platform coverage:** mac+linux.
+
 #### daemon/protocol
 
 ##### daemon/protocol/001 — A `SubscribeEvents` receiver that falls behind the broadcast capacity is torn down with `KIND_STREAM_END` carrying exactly the documented `"lagged"` reason (`handle_subscribe_events`'s doc comment, src/daemon_protocol.rs).

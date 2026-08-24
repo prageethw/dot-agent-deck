@@ -85,6 +85,10 @@ mod test_temp;
 ///     AUTHOR, only its body, so this field did not exist until now).
 ///   - `gh issue edit --repo R --add-label L -- N` → appends `L` to
 ///     `.../labels.txt` (idempotent).
+///   - `gh issue edit --repo R --remove-label L -- N` → removes `L` from
+///     `.../labels.txt` if present (idempotent) — added for issue #326's
+///     `issue release` (`issue/claim/034`-`040`), which removes
+///     `in-progress` rather than adding it.
 ///   - `gh issue edit --repo R --add-assignee A --remove-assignee B -- N` →
 ///     adds `A` THEN removes `B` (real-`gh`-ordering: whichever operation is
 ///     applied LAST wins when `A == B`, and a real `gh` applies the removal
@@ -128,6 +132,7 @@ repo=""
 issue=""
 body=""
 add_label=""
+remove_label=""
 add_assignee=""
 remove_assignee=""
 while [ "$#" -gt 0 ]; do
@@ -135,6 +140,7 @@ while [ "$#" -gt 0 ]; do
         --repo) shift; repo="$1" ;;
         --body) shift; body="$1" ;;
         --add-label) shift; add_label="$1" ;;
+        --remove-label) shift; remove_label="$1" ;;
         --add-assignee) shift; add_assignee="$1" ;;
         --remove-assignee) shift; remove_assignee="$1" ;;
         --json) shift ;;
@@ -174,6 +180,10 @@ if [ "$group" = "issue" ] && [ "$sub" = "edit" ]; then
     fi
     if [ -n "$add_label" ]; then
         grep -qxF "$add_label" "$issuedir/labels.txt" 2>/dev/null || printf '%s\n' "$add_label" >> "$issuedir/labels.txt"
+    fi
+    if [ -n "$remove_label" ] && [ -f "$issuedir/labels.txt" ]; then
+        grep -vxF "$remove_label" "$issuedir/labels.txt" > "$issuedir/labels.txt.tmp" 2>/dev/null
+        mv "$issuedir/labels.txt.tmp" "$issuedir/labels.txt" 2>/dev/null || true
     fi
     exit 0
 fi
@@ -510,6 +520,18 @@ fn any_claim_write(calls: &[String]) -> bool {
             || l.contains("--add-assignee")
             || l.contains("--remove-assignee")
     })
+}
+
+/// Whether any of `calls` is a write `issue release` must never make on a
+/// refusal: a `--remove-label` call or an `issue comment` call. The
+/// `release`-specific sibling of [`any_claim_write`] — distinct because
+/// `release` (issue #326) only ever removes the `in-progress` label and
+/// posts a release comment; unlike `claim`, it never touches
+/// `--add-label`/`--add-assignee`/`--remove-assignee` at all.
+fn any_release_write(calls: &[String]) -> bool {
+    calls
+        .iter()
+        .any(|l| l.contains("--remove-label") || is_issue_comment_call(l))
 }
 
 /// Whether `body` carries `@handle` as a LIVE mention — i.e. OUTSIDE any
@@ -2418,5 +2440,376 @@ fn issue_claim_033_claim_check_could_not_determine_when_caller_identity_is_unres
     assert!(
         !any_claim_write(&calls),
         "a could-not-determine outcome must write nothing; observed gh calls: {calls:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `issue release` (issue #326) — RED round. `worker-agent-deck issue release
+// <n> --repo <owner/name> [--force] [--reason <text>]` does not exist yet:
+// clap rejects `issue release ...` outright as an unrecognized subcommand,
+// which is a genuine RED here, same as any brand-new subcommand (rather than
+// a behavioral mismatch, as the identity-anchor tests above are). Every
+// assertion below checks something a bare clap usage error cannot already
+// satisfy (specific wording, a specific write, or a specific success exit),
+// so none of these seven can pass vacuously before the coder implements the
+// subcommand.
+// ---------------------------------------------------------------------------
+
+/// Scenario: An agent claims issue 34 for real from its own worktree, then
+/// runs `issue release 34` from that SAME worktree. Assert the release
+/// exits 0, the `in-progress` label is removed, and a NEW `gh issue
+/// comment` call — distinct from the claim comment already posted before
+/// this test's call-count baseline — genuinely goes out to record the
+/// release.
+#[spec("issue/claim/034")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_034_release_own_claim_removes_label_and_posts_comment() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+
+    let wt = fx.add_worktree("wt-034", "claim-034-branch");
+    fx.mark_owned(&wt, "orchestration:orch-034");
+    fx.set_login("hana");
+
+    let claim = fx.run(
+        &wt,
+        &["issue", "claim", "34", "--repo", repo],
+        Some("pane-034"),
+    );
+    assert!(
+        claim.status.success(),
+        "the initial claim must succeed (sanity precondition); out={}",
+        combined(&claim)
+    );
+
+    let calls_before_release = fx.gh_calls().len();
+    let release = fx.run(
+        &wt,
+        &["issue", "release", "34", "--repo", repo],
+        Some("pane-034"),
+    );
+    assert!(
+        release.status.success(),
+        "releasing one's own claim must succeed; out={}",
+        combined(&release)
+    );
+
+    let new_calls: Vec<String> = fx
+        .gh_calls()
+        .into_iter()
+        .skip(calls_before_release)
+        .collect();
+    assert!(
+        new_calls
+            .iter()
+            .any(|l| l.contains("--remove-label") && l.contains("in-progress")),
+        "release must remove the `in-progress` label; new gh calls: {new_calls:?}"
+    );
+    assert!(
+        new_calls.iter().any(|l| is_issue_comment_call(l)),
+        "release must post a NEW comment recording the release — distinct from the claim \
+         comment already posted before this baseline was captured; don't just check the label \
+         removal, confirm a release comment genuinely went out; new gh calls: {new_calls:?}"
+    );
+}
+
+/// Scenario: Agent A claims issue 35 for real from its own worktree
+/// (`wt-a`, branch [`BRANCH_A`]). A DIFFERENT agent B then runs `issue
+/// release 35` from ITS OWN worktree (`wt-b`, branch [`BRANCH_B`]) WITHOUT
+/// `--force`. Assert B's release exits non-zero, its output names A's
+/// worktree absolute path and branch as the current holder, and B's run
+/// wrote nothing at all (no label edit, no comment).
+#[spec("issue/claim/035")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_035_release_refuses_when_held_by_a_different_identity_and_writes_nothing() {
+    let (fx, repo, wt_a, wt_b) = two_orchestrations("orch-A", "orch-B");
+
+    fx.set_login("alice");
+    let claim_a = fx.run(
+        &wt_a,
+        &["issue", "claim", "35", "--repo", repo],
+        Some("pane-a"),
+    );
+    assert!(
+        claim_a.status.success(),
+        "A's own initial claim must succeed (sanity precondition); out={}",
+        combined(&claim_a)
+    );
+
+    let calls_before_release = fx.gh_calls().len();
+    fx.set_login("bob");
+    let release_b = fx.run(
+        &wt_b,
+        &["issue", "release", "35", "--repo", repo],
+        Some("pane-b"),
+    );
+
+    assert!(
+        !release_b.status.success(),
+        "release without --force must refuse when the issue is held by a DIFFERENT identity; \
+         out={}",
+        combined(&release_b)
+    );
+    let text = combined(&release_b);
+    let wt_a_str = wt_a.to_string_lossy().into_owned();
+    assert!(
+        text.contains(&wt_a_str) && text.contains(BRANCH_A),
+        "release's refusal must name the current holder — A's worktree absolute path \
+         {wt_a_str:?} and branch {BRANCH_A:?}; got:\n{text}"
+    );
+
+    let new_calls: Vec<String> = fx
+        .gh_calls()
+        .into_iter()
+        .skip(calls_before_release)
+        .collect();
+    assert!(
+        !any_release_write(&new_calls),
+        "a refused release must write nothing (no label edit, no comment); new gh calls during \
+         B's run: {new_calls:?}"
+    );
+}
+
+/// Scenario: The SAME setup as `issue/claim/035` — A holds issue 36 for
+/// real, B is a different identity — but B runs `issue release 36 --force`.
+/// Assert the release succeeds, the `in-progress` label is removed, and
+/// the posted release comment's body names the identity it was
+/// force-released from (A's worktree absolute path and branch).
+#[spec("issue/claim/036")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_036_release_with_force_releases_a_different_identitys_claim() {
+    let (fx, repo, wt_a, wt_b) = two_orchestrations("orch-A", "orch-B");
+
+    fx.set_login("carol");
+    let claim_a = fx.run(
+        &wt_a,
+        &["issue", "claim", "36", "--repo", repo],
+        Some("pane-a"),
+    );
+    assert!(
+        claim_a.status.success(),
+        "A's own initial claim must succeed (sanity precondition); out={}",
+        combined(&claim_a)
+    );
+
+    let calls_before_release = fx.gh_calls().len();
+    fx.set_login("dave");
+    let release_b = fx.run(
+        &wt_b,
+        &["issue", "release", "36", "--repo", repo, "--force"],
+        Some("pane-b"),
+    );
+    assert!(
+        release_b.status.success(),
+        "release --force must succeed even when held by a different identity; out={}",
+        combined(&release_b)
+    );
+
+    let new_calls: Vec<String> = fx
+        .gh_calls()
+        .into_iter()
+        .skip(calls_before_release)
+        .collect();
+    assert!(
+        new_calls
+            .iter()
+            .any(|l| l.contains("--remove-label") && l.contains("in-progress")),
+        "a forced release must remove the `in-progress` label; new gh calls: {new_calls:?}"
+    );
+    let wt_a_str = wt_a.to_string_lossy().into_owned();
+    let comment_line = new_calls.iter().find(|l| is_issue_comment_call(l));
+    assert!(
+        comment_line.is_some_and(|l| l.contains(&wt_a_str) && l.contains(BRANCH_A)),
+        "the posted release comment must record who it was force-released from — A's worktree \
+         absolute path {wt_a_str:?} and branch {BRANCH_A:?}; new gh calls: {new_calls:?}"
+    );
+}
+
+/// Scenario: A fresh issue, never claimed by anyone (no `in-progress`
+/// label, no claim comment). `issue release 37` is run against it (no
+/// `--force` needed — there is nothing to force through). Assert the
+/// release refuses, its message says there is nothing to release (catching
+/// a typo'd issue number), and it writes nothing.
+#[spec("issue/claim/037")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_037_release_refuses_on_an_unclaimed_issue() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    // Deliberately no seeding at all: a fresh, never-claimed issue.
+
+    let wt = fx.add_worktree("wt-037", "claim-037-branch");
+    fx.mark_owned(&wt, "orchestration:orch-037");
+    fx.set_login("kim");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "release", "37", "--repo", repo],
+        Some("pane-037"),
+    );
+    assert!(
+        !out.status.success(),
+        "release on a never-claimed issue must refuse — there is nothing to release; out={}",
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("nothing to release"),
+        "release's refusal on an unclaimed issue should say there is nothing to release, \
+         catching a typo'd issue number; got:\n{text}"
+    );
+
+    let calls = fx.gh_calls();
+    assert!(
+        !any_release_write(&calls),
+        "a refused release must write nothing (no label edit, no comment); observed gh calls: \
+         {calls:?}"
+    );
+}
+
+/// Scenario: An issue is labelled `in-progress` with NO discoverable claim
+/// comment at all — the same ambiguous identity-unknown state
+/// `issue/claim/004`/`032` seed via `Fixture::seed_label_only`. `issue
+/// release 38` is run without `--force`. Assert the release refuses, its
+/// message says the identity is unknown (mirroring `issue claim`'s own
+/// `RefuseNoIdentity` wording), and it writes nothing.
+#[spec("issue/claim/038")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_038_release_refuses_on_no_identity_state_without_force() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    fx.seed_label_only(repo, 38, "in-progress");
+
+    let wt = fx.add_worktree("wt-038", "claim-038-branch");
+    fx.mark_owned(&wt, "orchestration:orch-038");
+    fx.set_login("ivan");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "release", "38", "--repo", repo],
+        Some("pane-038"),
+    );
+    assert!(
+        !out.status.success(),
+        "release without --force must refuse when the holder's identity is unknown; out={}",
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("identity unknown"),
+        "release's refusal should carry the same wording `issue claim`'s own `RefuseNoIdentity` \
+         refusal uses (`... refusing (identity unknown); ...`); got:\n{text}"
+    );
+
+    let calls = fx.gh_calls();
+    assert!(
+        !any_release_write(&calls),
+        "a refused release must write nothing (no label edit, no comment); observed gh calls: \
+         {calls:?}"
+    );
+}
+
+/// Scenario: The SAME ambiguous identity-unknown seed as `issue/claim/038`,
+/// but `issue release 39 --force` is run. Assert the release succeeds and
+/// the `in-progress` label is removed and a release comment is posted —
+/// its body need not name a specific prior holder, since none was known.
+#[spec("issue/claim/039")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_039_release_with_force_handles_no_identity_state() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    fx.seed_label_only(repo, 39, "in-progress");
+
+    let wt = fx.add_worktree("wt-039", "claim-039-branch");
+    fx.mark_owned(&wt, "orchestration:orch-039");
+    fx.set_login("judy");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "release", "39", "--repo", repo, "--force"],
+        Some("pane-039"),
+    );
+    assert!(
+        out.status.success(),
+        "release --force must succeed even when the holder's identity is unknown; out={}",
+        combined(&out)
+    );
+
+    let calls = fx.gh_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|l| l.contains("--remove-label") && l.contains("in-progress")),
+        "a forced release must remove the `in-progress` label even when no prior holder \
+         identity was known; gh calls: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|l| is_issue_comment_call(l)),
+        "a forced release must post a release comment even when no prior holder identity was \
+         known; gh calls: {calls:?}"
+    );
+}
+
+/// Scenario: An agent claims issue 40 for real, then releases its own
+/// claim with `issue release 40 --reason "PR merged"`. Assert the release
+/// succeeds and the posted release comment's body contains the exact
+/// reason text.
+#[spec("issue/claim/040")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_040_release_with_reason_includes_it_in_the_comment() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+
+    let wt = fx.add_worktree("wt-040", "claim-040-branch");
+    fx.mark_owned(&wt, "orchestration:orch-040");
+    fx.set_login("liam");
+
+    let claim = fx.run(
+        &wt,
+        &["issue", "claim", "40", "--repo", repo],
+        Some("pane-040"),
+    );
+    assert!(
+        claim.status.success(),
+        "the initial claim must succeed (sanity precondition); out={}",
+        combined(&claim)
+    );
+
+    let calls_before_release = fx.gh_calls().len();
+    let release = fx.run(
+        &wt,
+        &[
+            "issue",
+            "release",
+            "40",
+            "--repo",
+            repo,
+            "--reason",
+            "PR merged",
+        ],
+        Some("pane-040"),
+    );
+    assert!(
+        release.status.success(),
+        "releasing one's own claim with a reason must succeed; out={}",
+        combined(&release)
+    );
+
+    let new_calls: Vec<String> = fx
+        .gh_calls()
+        .into_iter()
+        .skip(calls_before_release)
+        .collect();
+    let comment_line = new_calls.iter().find(|l| is_issue_comment_call(l));
+    assert!(
+        comment_line.is_some_and(|l| l.contains("PR merged")),
+        "the --reason text must appear verbatim in the posted release comment's body; new gh \
+         calls: {new_calls:?}"
     );
 }
