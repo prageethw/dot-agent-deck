@@ -5,11 +5,11 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the eleven checks
+//!   (issue #557; see [`repo_state`]), then performs the twelve checks
 //!   listed in Decision 7 + Decision 30 (+ issue #322 + fork #148 + issue
-//!   #259):
+//!   #259 + fork #281):
 //!
-//!   The preflight is deliberately not one of the eleven numbered checks: it answers
+//!   The preflight is deliberately not one of the twelve numbered checks: it answers
 //!   "is this repository sane to reason about", a different question from
 //!   "does the catalog match the tests", and it runs first so a repository
 //!   in a state that would misdiagnose the checks below is caught before
@@ -54,6 +54,17 @@
 //!       `resolve_base`/`collect_added_fragments` rather than
 //!       re-deriving the diff. See
 //!       [`work_type::check_resurrected_fragments`].
+//!   12. No catalog ID this branch adds is ALSO already present on
+//!       `origin/main`'s current tip, unless it was already there at
+//!       the merge-base (inherited, not newly added) — fork #281.
+//!       Two concurrent PRs each adding a test under the same catalog
+//!       ID pass this tool individually (each sees only its own
+//!       tree); the collision exists only once both merge, and
+//!       nothing catches it there either — not this tool (one tree at
+//!       a time), not git (the two entries land in different
+//!       files/locations, so the merge itself is clean). Best-effort:
+//!       skipped, not failed, whenever `origin/main` cannot be
+//!       resolved (local dev without the remote, a shallow/PR clone).
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -115,7 +126,7 @@ mod work_type;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use regex::Regex;
 
@@ -130,11 +141,11 @@ const TESTS_DIR: &str = "tests";
 /// is deliberately not one of them — see the module doc). One literal for
 /// one fact, rather than the three that used to drift independently: the
 /// module doc's prose said "nine" and "ten" while the success line below
-/// printed "9 rules", and issue #259 added an eleventh check without
-/// touching any of them. The same shape as `work_type`'s own (private,
-/// unrelated, five-rule) `RULE_COUNT`, which exists for the identical
-/// reason one module over.
-const CHECK_COUNT: usize = 11;
+/// printed "9 rules", issue #259 added an eleventh check without touching
+/// any of them, and fork #281 added a twelfth. The same shape as
+/// `work_type`'s own (private, unrelated, five-rule) `RULE_COUNT`, which
+/// exists for the identical reason one module over.
+const CHECK_COUNT: usize = 12;
 
 /// Check 8 (issue #322): why a bare `tempfile` constructor is forbidden under
 /// `tests/`, spelled out here because the violation is invisible at the call
@@ -367,7 +378,8 @@ fn main() -> ExitCode {
     // single `cargo xtask` alias can drive both linkage-check and
     // docs. `cargo xtask docs --tests` → docs generator;
     // anything else (including no first arg or `linkage-check`) →
-    // the nine Decision-7 / Decision-30 / issue #322 / fork #148 checks below.
+    // the twelve Decision-7 / Decision-30 / issue #322 / fork #148 / issue
+    // #259 / fork #281 checks below (CHECK_COUNT).
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("docs")) {
         return run_docs(&args[1..]);
@@ -440,6 +452,14 @@ fn main() -> ExitCode {
             ));
         }
     }
+
+    // Check 12 (fork #281): a catalog id this branch adds must not also
+    // already exist on origin/main's current tip. Best-effort — skips
+    // gracefully (logs to stderr, adds no failure) when origin/main is not
+    // resolvable at all, rather than newly failing linkage-check in an
+    // environment (local dev without the remote, a shallow/PR clone) where
+    // it previously passed.
+    failures.extend(check_cross_branch_catalog_collisions(&root, &catalog_ids));
 
     // Check 3: format regex on catalog IDs.
     let id_re = Regex::new(r"^[a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3}$")
@@ -993,6 +1013,14 @@ fn repo_root() -> PathBuf {
 /// representable, so check 9 below can catch it.
 fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeMap<String, u32>> {
     let text = std::fs::read_to_string(catalog_path)?;
+    Ok(parse_catalog_ids_from_text(&text))
+}
+
+/// The text-parsing core of [`parse_catalog_ids`], split out (fork #281) so
+/// check 11 can parse a `tests/CATALOG.md` blob read from another revision
+/// via `git show <rev>:<path>` — which has no filesystem path to hand
+/// `parse_catalog_ids` — without duplicating the heading grammar.
+fn parse_catalog_ids_from_text(text: &str) -> BTreeMap<String, u32> {
     let mut in_catalog = false;
     let header_re = Regex::new(r"^#####\s+([a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3})\b")
         .expect("catalog header regex compiles");
@@ -1010,7 +1038,112 @@ fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeMap<String, u3
                 .or_insert(0) += 1;
         }
     }
-    Ok(ids)
+    ids
+}
+
+/// `tests/CATALOG.md`'s catalog IDs as they existed at `revision`, read via
+/// `git show <revision>:<catalog_rel_path>` rather than the working tree.
+///
+/// Repo-relative `catalog_rel_path` (not joined onto `repo_dir`) because
+/// that is the form `git show <rev>:<path>` needs — a git revision spec has
+/// no concept of a filesystem-absolute path.
+fn catalog_ids_at_revision(
+    repo_dir: &Path,
+    revision: &str,
+    catalog_rel_path: &str,
+) -> Result<BTreeMap<String, u32>, String> {
+    let out = Command::new("git")
+        .args(["show", &format!("{revision}:{catalog_rel_path}")])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("invoke git show {revision}:{catalog_rel_path}: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(parse_catalog_ids_from_text(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
+/// Check 12 (fork #281): fail if this branch adds a catalog ID that is ALSO
+/// already present on `origin/main`'s current tip, unless that ID was
+/// already there at the merge-base — i.e. inherited from `origin/main`
+/// rather than newly claimed by this branch.
+///
+/// `catalog_ids` is the working tree's already-parsed catalog (the same
+/// value `main` uses for checks 1/3/9), so this only has to resolve the
+/// merge-base and `origin/main`'s tip, not re-parse the working tree.
+///
+/// Deliberately compares against `origin/main`'s CURRENT tip, not the
+/// merge-base: `origin/main` may have moved since this branch's
+/// merge-base, and a same-ID entry landing there after the branch forked is
+/// exactly the concurrent-PR collision fork #281 is about. Comparing only
+/// against the merge-base would miss it entirely.
+///
+/// Best-effort, not a hard requirement: skips (does not fail) whenever
+/// `origin/main` cannot be resolved at all — local dev without the remote,
+/// or a shallow/PR-only clone — matching how [`work_type::resolve_base`]'s
+/// other callers already treat that case (E1) rather than making this tool
+/// newly fail in an environment that previously worked.
+fn check_cross_branch_catalog_collisions(
+    root: &Path,
+    catalog_ids: &BTreeMap<String, u32>,
+) -> Vec<String> {
+    let merge_base = match work_type::resolve_base(None, root) {
+        Ok(sha) => sha,
+        Err(e) => {
+            eprintln!(
+                "linkage-check: [12] skipped (origin/main not resolvable — local dev without \
+                 the remote, or a shallow/PR clone): {e}"
+            );
+            return Vec::new();
+        }
+    };
+
+    let ids_at_merge_base = match catalog_ids_at_revision(root, &merge_base, CATALOG_PATH) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!(
+                "linkage-check: [12] skipped (could not read {CATALOG_PATH} at merge-base \
+                 {merge_base}: {e})"
+            );
+            return Vec::new();
+        }
+    };
+
+    // Deliberately `origin/main` the ref, not `merge_base` again: this is
+    // the branch's tip NOW, which may be ahead of the merge-base — see the
+    // function doc.
+    let ids_on_current_main =
+        match catalog_ids_at_revision(root, work_type::DEFAULT_BASE, CATALOG_PATH) {
+            Ok(ids) => ids,
+            Err(e) => {
+                eprintln!(
+                    "linkage-check: [12] skipped (could not read {CATALOG_PATH} at {}: {e})",
+                    work_type::DEFAULT_BASE
+                );
+                return Vec::new();
+            }
+        };
+
+    let mut failures = Vec::new();
+    for id in catalog_ids.keys() {
+        if ids_at_merge_base.contains_key(id) {
+            // Inherited from the merge-base — not newly added by this
+            // branch, so a collision here is just ordinary shared history,
+            // not two branches independently claiming the same ID.
+            continue;
+        }
+        if ids_on_current_main.contains_key(id) {
+            failures.push(format!(
+                "[12] catalog id `{id}` is newly added by this branch but already exists on \
+                 {}'s current tip in {CATALOG_PATH} — two branches independently claimed the \
+                 same catalog id; rename one (fork #281)",
+                work_type::DEFAULT_BASE
+            ));
+        }
+    }
+    failures
 }
 
 fn read_allowlist(path: &Path) -> std::io::Result<BTreeSet<String>> {
@@ -1892,5 +2025,244 @@ let y = 2;"###;
             removal_code, error_code,
             "a real removal and a tool failure must not share an exit code (A3)"
         );
+    }
+
+    /// Fork #281's cross-branch catalog-id collision check needs real `git`
+    /// history — a merge-base, a separately-advanced `origin/main` — that no
+    /// synthetic fixture can stand in for. Same shape as `repo_state.rs`'s
+    /// own `mod real_git` (CLAUDE.md rule 5's documented exception to "no
+    /// test shells out to git"): every fixture command runs with the
+    /// ambient git configuration switched off, inside a
+    /// `tempfile::tempdir()`, so nothing here can read or write the
+    /// checkout these tests are running inside.
+    ///
+    /// [`check_cross_branch_catalog_collisions`] itself is deliberately
+    /// *not* given that sandboxed environment — it is called exactly the
+    /// way `main` calls it, so what is under test is the production
+    /// invocation (relying on whatever git identity/config the process
+    /// already has) rather than a specially-configured one. Production
+    /// code never commits anything, so it needs no identity of its own.
+    mod real_git {
+        use super::*;
+        use std::fs;
+        use tempfile::TempDir;
+
+        struct Sandbox {
+            _dir: TempDir,
+            root: PathBuf,
+        }
+
+        impl Sandbox {
+            fn new() -> Sandbox {
+                let dir = TempDir::new().expect("tempdir");
+                let root = dir.path().canonicalize().expect("canonicalize tempdir");
+                fs::create_dir_all(root.join("home")).expect("mkdir home");
+                fs::create_dir_all(root.join("empty-template")).expect("mkdir template");
+                Sandbox { _dir: dir, root }
+            }
+
+            fn at(&self, rel: &str) -> PathBuf {
+                self.root.join(rel)
+            }
+
+            /// Runs a fixture git command, and fails the test with git's own
+            /// stderr if it does not succeed — a fixture that half-built
+            /// itself and then produced a green assertion is the same
+            /// fail-green in miniature this check exists to prevent.
+            fn git(&self, cwd: &Path, args: &[&str]) -> String {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .env("HOME", self.at("home"))
+                    .env("XDG_CONFIG_HOME", self.at("home/.config"))
+                    .env("GIT_CONFIG_GLOBAL", self.at("no-such-gitconfig"))
+                    .env("GIT_CONFIG_SYSTEM", self.at("no-such-gitconfig"))
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_TEMPLATE_DIR", self.at("empty-template"))
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .env("GIT_AUTHOR_NAME", "linkage-check tests")
+                    .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
+                    .env("GIT_COMMITTER_NAME", "linkage-check tests")
+                    .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
+                    .output()
+                    .unwrap_or_else(|e| panic!("failed to invoke `git {}`: {e}", args.join(" ")));
+                assert!(
+                    out.status.success(),
+                    "fixture command `git {}` failed in {}: {}",
+                    args.join(" "),
+                    cwd.display(),
+                    String::from_utf8_lossy(&out.stderr).trim(),
+                );
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+        }
+
+        /// Renders a synthetic `tests/CATALOG.md` body carrying exactly
+        /// `ids`, in the shape [`parse_catalog_ids_from_text`] expects: a
+        /// `## Test Case Catalog` section header, then one `##### <id>`
+        /// heading per id.
+        fn catalog_with(ids: &[&str]) -> String {
+            let mut text = String::from("## Test Case Catalog\n\n");
+            for id in ids {
+                text.push_str(&format!("##### {id}\n\nSomething.\n\n"));
+            }
+            text
+        }
+
+        fn write_catalog(repo: &Path, ids: &[&str]) {
+            fs::create_dir_all(repo.join("tests")).expect("mkdir tests");
+            fs::write(repo.join("tests/CATALOG.md"), catalog_with(ids)).expect("write catalog");
+        }
+
+        /// **The motivating case (fork #281).** This branch adds catalog id
+        /// `collision/id/001`; `origin/main` independently — on a sibling
+        /// commit sharing the SAME merge-base, which never saw the branch's
+        /// commit — adds the identical id. Neither tree contains the
+        /// other's copy, so each would pass linkage-check cleanly in
+        /// isolation (exactly the fork #281 incident: two concurrent PRs,
+        /// neither catches the other). Only comparing the branch's new ids
+        /// against `origin/main`'s CURRENT tip — not just the merge-base —
+        /// catches it.
+        #[test]
+        fn colliding_id_added_independently_on_origin_main_is_reported() {
+            let sb = Sandbox::new();
+            let origin = sb.at("origin");
+            fs::create_dir_all(&origin).expect("mkdir origin");
+            sb.git(&origin, &["init", "-q", "-b", "main"]);
+            write_catalog(&origin, &["shared/area/001"]);
+            sb.git(&origin, &["add", "-A"]);
+            sb.git(&origin, &["commit", "-q", "-m", "base"]);
+
+            let branch = sb.at("branch");
+            sb.git(
+                &sb.root,
+                &[
+                    "clone",
+                    "-q",
+                    &format!("file://{}", origin.display()),
+                    "branch",
+                ],
+            );
+            sb.git(&branch, &["checkout", "-q", "-b", "feature"]);
+            write_catalog(&branch, &["shared/area/001", "collision/id/001"]);
+            sb.git(&branch, &["add", "-A"]);
+            sb.git(
+                &branch,
+                &["commit", "-q", "-m", "branch adds collision/id/001"],
+            );
+
+            // Origin independently adds the SAME id, on a commit descended
+            // only from the shared base — it never saw the branch's commit.
+            write_catalog(&origin, &["shared/area/001", "collision/id/001"]);
+            sb.git(&origin, &["add", "-A"]);
+            sb.git(
+                &origin,
+                &["commit", "-q", "-m", "origin adds collision/id/001 too"],
+            );
+            sb.git(&branch, &["fetch", "-q", "origin", "main"]);
+
+            let catalog_ids = parse_catalog_ids(&branch.join("tests/CATALOG.md")).expect("parse");
+            let failures = check_cross_branch_catalog_collisions(&branch, &catalog_ids);
+
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert!(failures[0].contains("collision/id/001"), "{}", failures[0]);
+            assert!(!failures[0].contains("shared/area/001"), "{}", failures[0]);
+        }
+
+        /// **Negative control.** The branch adds an id `origin/main` never
+        /// gets at all — the ordinary, non-colliding case — and the check
+        /// must stay silent.
+        #[test]
+        fn id_not_present_on_origin_main_passes() {
+            let sb = Sandbox::new();
+            let origin = sb.at("origin");
+            fs::create_dir_all(&origin).expect("mkdir origin");
+            sb.git(&origin, &["init", "-q", "-b", "main"]);
+            write_catalog(&origin, &["shared/area/001"]);
+            sb.git(&origin, &["add", "-A"]);
+            sb.git(&origin, &["commit", "-q", "-m", "base"]);
+
+            let branch = sb.at("branch");
+            sb.git(
+                &sb.root,
+                &[
+                    "clone",
+                    "-q",
+                    &format!("file://{}", origin.display()),
+                    "branch",
+                ],
+            );
+            sb.git(&branch, &["checkout", "-q", "-b", "feature"]);
+            write_catalog(&branch, &["shared/area/001", "solo/id/001"]);
+            sb.git(&branch, &["add", "-A"]);
+            sb.git(&branch, &["commit", "-q", "-m", "branch adds solo/id/001"]);
+            sb.git(&branch, &["fetch", "-q", "origin", "main"]);
+
+            let catalog_ids = parse_catalog_ids(&branch.join("tests/CATALOG.md")).expect("parse");
+            let failures = check_cross_branch_catalog_collisions(&branch, &catalog_ids);
+            assert!(failures.is_empty(), "{failures:?}");
+        }
+
+        /// **Negative control — the "don't cry wolf on an ordinary rebase"
+        /// case.** `shared/area/001` was already on `origin/main` AT the
+        /// merge-base — the branch merely carries it forward unchanged, it
+        /// did not newly claim it. A naive implementation that only asked
+        /// "is this id in my tree AND in origin/main's tip" (without
+        /// subtracting the merge-base) would flag every such id on every
+        /// ordinary branch, making the check useless.
+        #[test]
+        fn id_inherited_from_merge_base_is_not_flagged() {
+            let sb = Sandbox::new();
+            let origin = sb.at("origin");
+            fs::create_dir_all(&origin).expect("mkdir origin");
+            sb.git(&origin, &["init", "-q", "-b", "main"]);
+            write_catalog(&origin, &["shared/area/001"]);
+            sb.git(&origin, &["add", "-A"]);
+            sb.git(&origin, &["commit", "-q", "-m", "base"]);
+
+            let branch = sb.at("branch");
+            sb.git(
+                &sb.root,
+                &[
+                    "clone",
+                    "-q",
+                    &format!("file://{}", origin.display()),
+                    "branch",
+                ],
+            );
+            sb.git(&branch, &["checkout", "-q", "-b", "feature"]);
+            // An unrelated commit that touches nothing in the catalog —
+            // `shared/area/001` carries forward exactly as inherited.
+            fs::write(branch.join("README-fixture.md"), "unrelated change\n")
+                .expect("write unrelated file");
+            sb.git(&branch, &["add", "-A"]);
+            sb.git(&branch, &["commit", "-q", "-m", "unrelated branch commit"]);
+            sb.git(&branch, &["fetch", "-q", "origin", "main"]);
+
+            let catalog_ids = parse_catalog_ids(&branch.join("tests/CATALOG.md")).expect("parse");
+            assert!(catalog_ids.contains_key("shared/area/001"));
+            let failures = check_cross_branch_catalog_collisions(&branch, &catalog_ids);
+            assert!(failures.is_empty(), "{failures:?}");
+        }
+
+        /// **Graceful skip.** No `origin` remote at all — local dev without
+        /// the remote configured, or a shallow/PR clone with no
+        /// `origin/main` ref — must not turn into a linkage-check failure;
+        /// this check is best-effort defense-in-depth, not a hard
+        /// requirement everywhere linkage-check runs.
+        #[test]
+        fn unresolvable_origin_main_skips_gracefully() {
+            let sb = Sandbox::new();
+            let solo = sb.at("solo");
+            fs::create_dir_all(&solo).expect("mkdir solo");
+            sb.git(&solo, &["init", "-q", "-b", "main"]);
+            write_catalog(&solo, &["solo/id/001"]);
+            sb.git(&solo, &["add", "-A"]);
+            sb.git(&solo, &["commit", "-q", "-m", "base"]);
+
+            let catalog_ids = parse_catalog_ids(&solo.join("tests/CATALOG.md")).expect("parse");
+            let failures = check_cross_branch_catalog_collisions(&solo, &catalog_ids);
+            assert!(failures.is_empty(), "{failures:?}");
+        }
     }
 }
