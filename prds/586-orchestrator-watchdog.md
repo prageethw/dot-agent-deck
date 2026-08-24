@@ -8,7 +8,7 @@
 
 ## Problem Statement
 
-The orchestrator has two structurally different ways a delegation can go wrong, and no reliable way to detect either one proactively — it depends entirely on the daemon's own fixed internal timers, or on the orchestrator noticing something is off while reading a report it already received.
+The orchestrator has (at least) three structurally different ways a delegation signal can go wrong, and no reliable way to detect any of them proactively — it depends entirely on the daemon's own fixed internal timers, or on the orchestrator noticing something is off while reading a signal it already received.
 
 ### Problem 1 — silent/stalled delegations (the issue as originally filed)
 
@@ -36,6 +36,16 @@ A structurally different failure that Problem 1's fix does not address at all, b
 
 **What this PRD does NOT claim:** a root cause. Unlike Problem 1 (where the exact code path is known and cited above) or PRD fork#465 (where `pump_reader`'s EOF handling was traced precisely), this session did not have the means to inspect the underlying agent harness's session-resumption/context behavior that produced this. It may not even be fixable from `dot-agent-deck`'s own codebase — if the cause lives in how the harness hands a new prompt to an already-used agent process, that's outside this daemon's control. What *is* in this daemon's control is **detecting** the mismatch before the orchestrator trusts it.
 
+### Problem 3 — misattributed notification delivery (independent corroboration, same day, a different orchestration session)
+
+A third, related-but-distinct symptom in the same family — not folded into Problem 2's wording, because the failure shape differs: Problem 2 is a *solicited* report arriving with fresh-looking but wrong content; Problem 3 is a notification arriving that does not belong to this orchestration's own delegation state at all, regardless of content.
+
+**Observed directly, 7 times, in a separate 2026-08-24 orchestration session** (the same day as Problem 2's observation, a different orchestration entirely — PR #573/#582 review work): a `coder`-role completion notification arrived **6 times** as a stale re-delivery of a report already read and acted on moments earlier — each one caught only because the harness itself flagged it: *"Worker coder reported completing a task, but you have no outstanding delegation to that worker."* A 7th instance was more serious in framing: a notification stating *"A delegated worker has not responded with work-done... delegated 2 hours ago"* for a `reviewer` role, which that orchestration had no outstanding delegation for at all — on its face indistinguishable from a genuine stall, the exact case Problem 1's fix is meant to help detect. It was cross-talk from a different orchestration's `reviewer` identity, not a real stall.
+
+**What this adds to the case for Problem 1's fix, specifically:** exposing `OutstandingDelegation`/`SilenceWatchRecord` state (Problem 1's fix, item A) only helps if the orchestrator can use it to **independently verify** an arriving signal rather than trusting the signal's own framing. All 7 instances here were correctly handled — but only because the orchestrator manually cross-checked "do I actually have this outstanding?" against its own conversational memory each time, which does not scale and does not survive compaction. A watchdog built on Problem 1's exposed state should treat it as the **source of truth to check an arriving notification against**, not an alternative notification channel to trust on its own.
+
+**Not claiming a root cause here either** — same posture as Problem 2. Whatever routes a daemon-level signal into a specific Claude Code session sits above `dot-agent-deck`'s own codebase (this daemon's `DelegationCommission` already carries an `orchestrator_pane_id` field internally, i.e. it *does* track ownership — so this may be a routing-layer bug entirely outside this repo, not a `dot-agent-deck` daemon defect). Recorded here as corroborating evidence for the PRD's general thesis, not as a fourth milestone of its own.
+
 ## Decisions
 
 | Question | Decision |
@@ -44,6 +54,7 @@ A structurally different failure that Problem 1's fix does not address at all, b
 | Does Problem 1's fix (exposing existing state) address Problem 2? | **No.** Problem 2's reports arrive with no silence and no timeout — none of `OutstandingDelegation`/`SilenceWatchRecord`/`DelegationCommission` would ever flag them. They need an independent mechanism. |
 | Should the daemon try to decide "this worker is stuck" and act automatically? | **No**, for either problem. Verifying a completion claim against real evidence (a CI result, a file, a PR, a subject match) requires actual tool use and judgement a Rust daemon can't perform. The daemon's job is to expose ground truth; deciding what to do with it stays the orchestrator's. |
 | Root-cause Problem 2 before shipping a detector? | **No** — out of scope for this PRD. Ship the detection/verification layer against the observed symptom; a root-cause fix (if one exists within this codebase) is separate follow-up work once the symptom is at least caught reliably. |
+| Does Problem 3 get its own fix milestone? | **No.** It's corroborating evidence, not a separate feature — it shapes how (A) should be *used* (as a verification source, not a trust source) rather than adding new scope. If a genuine `dot-agent-deck`-side routing defect is found later, file it as its own issue; this PRD does not claim to fix notification-layer attribution. |
 
 ## What we're building
 
@@ -75,7 +86,7 @@ Exact mechanism is a design-phase question, not decided here. Candidate shapes t
 
 ## Milestones
 
-- [ ] **M1** — Design the exact `StatusAgent` field additions for (A); confirm the privacy-scoping bar with a spot-check against the existing fields.
+- [ ] **M1** — Design the exact `StatusAgent` field additions for (A); confirm the privacy-scoping bar with a spot-check against the existing fields. Per Problem 3, design it as a **verification source** (something an orchestrator checks an arriving signal against) rather than an additional notification channel in its own right.
 - [ ] **M2** — Implement (A) + (B), tests, ship.
 - [ ] **M3** — Design phase for (C): evaluate the candidate mechanisms above against the observed session's actual failure shape (11ish fork#544 replays); pick one.
 - [ ] **M4** — Implement (C), tests, ship.
@@ -84,4 +95,4 @@ Exact mechanism is a design-phase question, not decided here. Candidate shapes t
 
 ## Provenance
 
-Problem 1 surfaced while designing an orchestrator-side watchdog workflow; re-scoped after a search turned up the existing detection infrastructure and the adjacent open upstream issue (#590). Problem 2 surfaced and was measured directly during a 2026-08-24 fix-bugs sweep orchestration session (fork issues #571/#259/#281/#344/#373), folded into this PRD by maintainer decision the same day rather than tracked as a separate, unrelated watchdog effort.
+Problem 1 surfaced while designing an orchestrator-side watchdog workflow; re-scoped after a search turned up the existing detection infrastructure and the adjacent open upstream issue (#590). Problem 2 surfaced and was measured directly during a 2026-08-24 fix-bugs sweep orchestration session (fork issues #571/#259/#281/#344/#373), folded into this PRD by maintainer decision the same day rather than tracked as a separate, unrelated watchdog effort. Problem 3 surfaced independently the same day in a *different* orchestration session (PR #573/#582 review work), corroborating the same general thesis — a delegation/notification signal cannot be trusted at face value — from a third angle; folded in as supporting evidence during reconciliation of this PRD with its own earlier, narrower draft (originally scoped to Problem 1 alone before this document existed).
