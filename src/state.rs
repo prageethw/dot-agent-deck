@@ -11996,7 +11996,7 @@ clear = false
                 .write_notice_guarded(
                     ORCHESTRATOR_PANE,
                     &notice,
-                    Some(&orchestrator_agent),
+                    &orchestrator_agent,
                     || async { true },
                 )
                 .await
@@ -12091,7 +12091,7 @@ clear = false
         ] {
             assert_eq!(
                 registry
-                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .write_and_submit_guarded(pane, &report, agent, || async { true })
                     .await
                     .expect("first silence report"),
                 crate::agent_pty::GuardedSend::Applied,
@@ -12108,13 +12108,13 @@ clear = false
         registry.note_user_input(UNSETTLED_PANE);
 
         let settled_repeat = registry
-            .write_and_submit_guarded(SETTLED_PANE, &report, Some(&settled_agent), || async {
+            .write_and_submit_guarded(SETTLED_PANE, &report, &settled_agent, || async {
                 true
             })
             .await
             .expect("second identical silence report after settling");
         let unsettled_repeat = registry
-            .write_and_submit_guarded(UNSETTLED_PANE, &report, Some(&unsettled_agent), || async {
+            .write_and_submit_guarded(UNSETTLED_PANE, &report, &unsettled_agent, || async {
                 true
             })
             .await
@@ -12193,7 +12193,7 @@ clear = false
         ] {
             assert_eq!(
                 registry
-                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .write_and_submit_guarded(pane, &report, agent, || async { true })
                     .await
                     .expect("first silence report"),
                 crate::agent_pty::GuardedSend::Applied,
@@ -12224,13 +12224,13 @@ clear = false
         registry.note_user_input(APPLIED_PANE);
 
         let ambiguous_repeat = registry
-            .write_and_submit_guarded(AMBIGUOUS_PANE, &report, Some(&ambiguous_agent), || async {
+            .write_and_submit_guarded(AMBIGUOUS_PANE, &report, &ambiguous_agent, || async {
                 true
             })
             .await
             .expect("second identical silence report after an ambiguous first");
         let applied_repeat = registry
-            .write_and_submit_guarded(APPLIED_PANE, &report, Some(&applied_agent), || async {
+            .write_and_submit_guarded(APPLIED_PANE, &report, &applied_agent, || async {
                 true
             })
             .await
