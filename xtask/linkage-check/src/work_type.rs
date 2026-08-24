@@ -875,7 +875,7 @@ pub fn check_resurrected_fragments(repo_dir: &Path, base_sha: &str) -> Vec<Strin
         return Vec::new();
     }
 
-    let changelog = match git_show_in(repo_dir, base_sha, CHANGELOG_PATH) {
+    let changelog = match crate::list_tests::git_show(repo_dir, base_sha, CHANGELOG_PATH) {
         Ok(text) => text,
         Err(e) => {
             return vec![format!(
@@ -889,7 +889,7 @@ pub fn check_resurrected_fragments(repo_dir: &Path, base_sha: &str) -> Vec<Strin
     fragments
         .iter()
         .filter_map(|fragment| {
-            let body = match git_show_in(repo_dir, "HEAD", &fragment.path) {
+            let body = match crate::list_tests::git_show(repo_dir, "HEAD", &fragment.path) {
                 Ok(text) => text,
                 Err(e) => {
                     return Some(format!(
