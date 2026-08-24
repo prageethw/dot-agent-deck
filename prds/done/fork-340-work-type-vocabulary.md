@@ -237,7 +237,7 @@ Fixtures follow `xtask/linkage-check/tests/duplicate_catalog_id.rs`, which alrea
 ## Risks
 
 - **E1 — the base ref cannot be resolved and the gate exits 0.** Highest-probability failure: `ci.yml:132` is depth-1 with no `origin/main`. Mitigated by `fetch-depth: 0`, explicit `--base`, non-zero exit, and a Tier-A test.
-- **E2 — the gate never runs on the PRs that matter.** `build` is skipped when `devbox_only`/`flake_only` (`ci.yml:128-129`) — those are Renovate's and exempt anyway, but keep the gate in `build` beside `linkage-check`, which has no path filter.
+- **E2 — the gate never runs on the PRs that matter.** `build` is skipped when `devbox_only`/`flake_only` (`ci.yml:128-129`) — those are Renovate's and exempt anyway, but keep the gate in `build` beside `linkage-check`, which has no path filter. PR #566 briefly also gated `build` on `docs_only`, which would have silenced this mitigation for exactly the population `work-type-check`'s `R2`/`R0` rules are meant to check (docs-only diffs); that fix round reverted it so `build` — and therefore `work-type-check` — stays unskipped on a docs-only PR too.
 - **E3 — R0 becomes unfailable** once every branch is prefixed, leaving derivation untested in production. This is why `--self-test` is not optional and why the success line must name the supplying tier.
 - **E4 — over-strict rules get bypassed rather than obeyed.** Both rejected rules would have fired on legitimate work weekly. Ship R0 alone (M3), watch, then add R1–R4 (M4).
 - **E5 — `--self-test` rots into a tautology.** Review it as production code.
