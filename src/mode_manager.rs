@@ -274,10 +274,10 @@ impl ModeManager {
                         // mechanism `watch_invocation` was fixed for, so it is
                         // not actually *proven* safe against a raw control
                         // byte either — this is one of the non-watch sites
-                        // fork issue #429's audit flagged (finding E) as a
-                        // separate, broader investigation, deliberately left
-                        // open by this fix, which is scoped to
-                        // `watch_invocation` alone.
+                        // fork issue #429's audit flagged (finding E) and is
+                        // tracked by fork issue #565, a separate, broader
+                        // investigation, deliberately left open by this fix,
+                        // which is scoped to `watch_invocation` alone.
                         pane_cfg.command.clone()
                     };
 
@@ -505,8 +505,8 @@ impl ModeManager {
             // function's own `export … && printf … &&` prefix — the exact
             // shape `watch_invocation` was fixed for), and is not proven
             // safe against the same control-character/termios-line-
-            // discipline risk. Tracked separately under fork issue #429
-            // audit finding E rather than closed here.
+            // discipline risk. Tracked by fork issue #565 (fork issue #429
+            // audit finding E) rather than closed here.
             command.to_string()
         };
 

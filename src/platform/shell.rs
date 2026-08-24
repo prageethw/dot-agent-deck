@@ -157,11 +157,11 @@ pub fn quote_shell_arg(arg: &str) -> String {
 /// command execution through this same `\n` exemption when `$SHELL` is
 /// `csh`/`tcsh`, whose quoting grammar handles an embedded newline
 /// differently; that gap is pre-existing (not a regression this fix
-/// introduces) and is tracked separately rather than closed here. Everything
-/// else in Unicode's control category (`char::is_control` — the C0 range
-/// `0x00-0x1F`, `DEL` `0x7F`, and the C1 range `U+0080..=U+009F`) is
-/// replaced, not only the four bytes fork issue #429 named
-/// (`\x03` ETX/SIGINT, `\x15` NAK, `\x17` ETB, `\x04` EOT, the ones a
+/// introduces) and is tracked by fork issue #564 rather than closed
+/// here. Everything else in Unicode's control category (`char::is_control`
+/// — the C0 range `0x00-0x1F`, `DEL` `0x7F`, and the C1 range
+/// `U+0080..=U+009F`) is replaced, not only the four bytes fork issue
+/// #429 named (`\x03` ETX/SIGINT, `\x15` NAK, `\x17` ETB, `\x04` EOT, the ones a
 /// *default* `stty` configuration binds to line-kill/word-erase/EOF): also,
 /// e.g., `\x1A` (SUSPEND/Ctrl-Z, `SIGTSTP`), `\x1C` (Ctrl-\\, `SIGQUIT`) and
 /// `\x08`/`\x7F` (erase). `stty` lets a user remap which byte triggers which
