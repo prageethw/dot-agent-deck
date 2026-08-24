@@ -1704,7 +1704,12 @@ fn agent_badge_006_model_with_format_chars_is_sanitized() {
 /// does nothing of the kind for `display_name`, which arrives on the
 /// same wire and is stored with only an `is_empty()` filter. Mirrors
 /// `agent-badge/006`'s Cf-sanitization property and `agent-badge/005`'s
-/// length-clamp property, both applied to the sibling field.
+/// length-clamp property, both applied to the sibling field. The fixture's
+/// prefix length is chosen (reviewer finding F2) so the 128-byte clamp
+/// lands mid-character rather than on a CJK char boundary, which is the
+/// only way this test can tell `clamp_display_name_bytes`'s boundary-
+/// snapping loop apart from a naive `&s[..128]` slice — see the exact
+/// snapped-length assertion below.
 #[spec("dashboard/agent-badge/007")]
 #[test]
 fn agent_badge_007_display_name_is_sanitized_and_clamped() {
@@ -1712,7 +1717,18 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
     state.register_pane("pane-badge-name".to_string());
     let started = chrono::Utc::now();
 
-    let hostile_display_name = format!("Sonnet\u{202e}-evil-{}TAIL-MARKER-ZZZZ", "日".repeat(100));
+    // Reviewer finding F2: the sanitized prefix ("Sonnet" + the 8-byte
+    // `\u{202e}` escape spelling + "-evil-!") is deliberately 21 bytes, not
+    // 20 — with a 20-byte prefix, 128 - 20 = 108 is an exact multiple of the
+    // CJK filler's 3-byte width, so the 128-byte clamp lands exactly on a
+    // char boundary and `clamp_display_name_bytes`'s boundary-snapping loop
+    // is never exercised (a naive `&s[..128]` would pass too). With this
+    // 21-byte prefix, 128 - 21 = 107 is NOT a multiple of 3: the clamp lands
+    // 2 bytes into the 36th CJK char (which spans sanitized bytes
+    // [126, 129)), so `&s[..128]` alone would panic ("byte index 128 is not
+    // a char boundary"), and the loop must snap back to 126 for this test to
+    // observe a valid, in-range result at all.
+    let hostile_display_name = format!("Sonnet\u{202e}-evil-!{}TAIL-MARKER-ZZZZ", "日".repeat(100));
     let mut metadata = HashMap::new();
     metadata.insert(
         DISPLAY_NAME_METADATA_KEY.to_string(),
@@ -1766,6 +1782,46 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
          — sanitize-then-clamp, mirroring how `model` is handled at the top \
          of AppState::apply_event:\ndisplay_name:\n{display_name}\n\
          sanitized_full:\n{sanitized_full}"
+    );
+
+    // Reviewer finding F2: prove the clamp is the boundary-snapping loop in
+    // `clamp_display_name_bytes`, not merely a length cap. `String` already
+    // guarantees valid UTF-8, so a naive `&s[..128]` slice at this fixture's
+    // (deliberately) non-boundary 128th byte would panic outright rather
+    // than produce a wrong-but-passing result — the fact this assertion
+    // runs at all, and lands on the hand-computed snap-back length, is the
+    // proof the loop ran.
+    assert!(
+        display_name.len() <= dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN,
+        "clamped display_name must never exceed the {}-byte cap, got {} bytes:\n{display_name}",
+        dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN,
+        display_name.len()
+    );
+    assert_eq!(
+        display_name.len(),
+        126,
+        "with this fixture's 21-byte sanitized prefix, the 128-byte clamp \
+         must snap back to 126 bytes (2 bytes short of the cap, since the \
+         char straddling the cut starts at sanitized byte 126) — a \
+         different length means the boundary-snapping loop did not run as \
+         reasoned above:\n{display_name}"
+    );
+    // NOTE: checking "the last byte isn't a UTF-8 continuation-byte pattern"
+    // is NOT a valid way to detect a mid-character cut here — the final byte
+    // of a *complete* multi-byte character (e.g. CJK's 0xA5 in 日's E6 97 A5
+    // encoding) legitimately matches the continuation-byte bit pattern
+    // 10xxxxxx too, so that check would fail on correct output whenever the
+    // clamp happens to end on a multi-byte char. The only sound proof that
+    // the cut landed on a real char boundary of the sanitized source (and
+    // not merely that the *output* is well-formed UTF-8, which any `String`
+    // guarantees trivially) is checking the boundary against the source
+    // string the offset was computed from:
+    assert!(
+        sanitized_full.is_char_boundary(display_name.len()),
+        "the clamp must land on a char boundary of the sanitized source, not \
+         merely produce a well-formed (but arbitrarily re-encoded) output — \
+         byte {} is not a char boundary of sanitized_full:\n{sanitized_full}",
+        display_name.len()
     );
 }
 
