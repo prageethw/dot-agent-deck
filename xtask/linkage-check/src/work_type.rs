@@ -791,6 +791,113 @@ fn parse_name_status_z(stdout: &[u8]) -> Vec<String> {
     paths
 }
 
+/// `CHANGELOG.md`'s repo-relative path — the comparison target for
+/// [`check_resurrected_fragments`].
+const CHANGELOG_PATH: &str = "CHANGELOG.md";
+
+/// Every `changelog.d/*.md` fragment [`collect_added_fragments`] reports as
+/// added by this diff, whose body content is already present in
+/// [`CHANGELOG_PATH`] at `HEAD` — issue #259, the #258 shape.
+///
+/// `changelog.d/163.bugfix.md` was already consumed into a released version
+/// (`656bac54`, v0.37.1) when PR #219's rebase across the 2026-08-12
+/// upstream sync resurrected it as a brand-new file; nothing caught it until
+/// after merge (`26801c4e`, issue #258), and left alone it would have
+/// printed that entry into the release notes a second time. This is the
+/// mechanical, judgement-free half of issue #259's suggested direction:
+/// content comparison, not filename deletion history, is the discriminator
+/// — `changelog.d/160.bugfix.md` was deleted by the exact same rollup
+/// commit and is legitimately back on a later branch, because its content
+/// covers a later, unrelated fix and is not in `CHANGELOG.md`. See
+/// [`normalize_prose`] for what "already present" means here — a fragment
+/// sharing only a few words or a similar topic with an old entry never
+/// matches.
+///
+/// Deliberately narrow: issue #259 also raises a broader "why does this
+/// branch touch this file" heuristic covering all eight rebase artifacts it
+/// found, not just this one. That is explicit future work, not attempted
+/// here — the other seven already have gates elsewhere (CI structure, this
+/// module's own R0/R1-R3 rules, the compiler), and this is the one that
+/// actually reached `main`.
+pub fn check_resurrected_fragments(repo_dir: &Path, base_sha: &str) -> Vec<String> {
+    let fragments = match collect_added_fragments(repo_dir, base_sha) {
+        Ok(fragments) => fragments,
+        Err(e) => {
+            return vec![format!(
+                "could not collect changelog.d fragments added since {base_sha}: {e}"
+            )];
+        }
+    };
+    if fragments.is_empty() {
+        return Vec::new();
+    }
+
+    let changelog = match git_show_in(repo_dir, "HEAD", CHANGELOG_PATH) {
+        Ok(text) => text,
+        Err(e) => {
+            return vec![format!(
+                "could not read {CHANGELOG_PATH} at HEAD to check for resurrected \
+                 fragments: {e}"
+            )];
+        }
+    };
+    let changelog_normalized = normalize_prose(&changelog);
+
+    fragments
+        .iter()
+        .filter_map(|fragment| {
+            let body = match git_show_in(repo_dir, "HEAD", &fragment.path) {
+                Ok(text) => text,
+                Err(e) => {
+                    return Some(format!(
+                        "could not read added fragment {} at HEAD: {e}",
+                        fragment.path
+                    ));
+                }
+            };
+            let body_normalized = normalize_prose(&body);
+            if body_normalized.is_empty() || !changelog_normalized.contains(&body_normalized) {
+                return None;
+            }
+            Some(format!(
+                "{} was added by this branch, but its content already appears in \
+                 {CHANGELOG_PATH} — a resurrected changelog fragment (issue #259, the #258 \
+                 shape): already consumed into a released version, reintroduced (typically \
+                 by a rebase replaying a deleted file). Left in place it would duplicate \
+                 this entry into the next release's notes. If this fragment covers \
+                 genuinely new content, its text must differ from what {CHANGELOG_PATH} \
+                 already carries; if it does not, delete {}.",
+                fragment.path, fragment.path
+            ))
+        })
+        .collect()
+}
+
+/// Whitespace-tolerant exact-text normalization for
+/// [`check_resurrected_fragments`]'s comparison: trims each line and drops
+/// blank ones, then joins what remains with a single space.
+///
+/// `CHANGELOG.md`'s release-rollup indents a fragment's paragraphs by two
+/// spaces and does not preserve the blank line a fragment source uses to
+/// separate paragraphs — verified against the #258 incident's own fragment
+/// (`changelog.d/163.bugfix.md`, deleted at v0.37.1 by `656bac54`,
+/// resurrected by PR #219's rebase, removed again by `26801c4e`): its two
+/// paragraphs sit on two consecutive, 2-space-indented lines in
+/// `CHANGELOG.md`'s `[Unreleased]` section, with no blank line between them
+/// and no blank line in the source fragment either once each paragraph's
+/// own single long line is accounted for. A byte-for-byte substring check
+/// against the raw text would silently miss that exact case. Still an EXACT
+/// match once normalized — no edit-distance, no stemming, no partial-line
+/// matching — so a fragment sharing only a few words with an old entry,
+/// rather than its full body, never matches.
+fn normalize_prose(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The gate's own success line — names the derived type, the tier that
 /// supplied it, and the base it derived against, so a green result is
 /// readable rather than bare (`empty-gates.md`'s thesis).
@@ -2625,6 +2732,185 @@ mod tests {
             "F2: a fragment introduced via git mv must be seen at its \
              destination path — --diff-filter=AR resolving R rows is what \
              makes this visible"
+        );
+    }
+
+    // -- check_resurrected_fragments (issue #259 / #258) --------------------
+
+    /// The scheduler-race body used across the resurrected-fragment tests —
+    /// two paragraphs, the shape a real `.bugfix.md` fragment takes.
+    const RESURRECTED_TEST_BODY: &str = "Fixed a widget race in the scheduler where two ticks \
+         could clobber the same slot.\n\nThe scheduler now takes a lock before writing the \
+         slot, closing the race.\n";
+
+    /// `CHANGELOG.md` as a release rollup actually leaves it: the fragment's
+    /// two paragraphs land on two consecutive 2-space-indented lines with no
+    /// blank line between them — mirroring the real #258 incident's
+    /// `changelog.d/163.bugfix.md` in `CHANGELOG.md`'s `[Unreleased]`
+    /// section, which is what [`normalize_prose`] exists to see past.
+    const RESURRECTED_TEST_CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n  \
+         Fixed a widget race in the scheduler where two ticks could clobber the same slot.\n  \
+         The scheduler now takes a lock before writing the slot, closing the race.\n";
+
+    /// Scenario: builds a scratch repo whose base commit already carries the
+    /// scheduler-race text in `CHANGELOG.md` (as if a rollup had consumed
+    /// it), then a second commit adds a changelog fragment whose body is
+    /// that exact same text — the #258 shape. Asserts
+    /// `check_resurrected_fragments` fails, naming the fragment.
+    #[test]
+    fn check_resurrected_fragments_flags_a_fragment_whose_body_already_shipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::create_dir_all(tmp.path().join("changelog.d")).expect("mkdir changelog.d");
+        std::fs::write(tmp.path().join("CHANGELOG.md"), RESURRECTED_TEST_CHANGELOG)
+            .expect("write CHANGELOG.md");
+        git(&["add", "CHANGELOG.md"], tmp.path());
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::write(
+            tmp.path().join("changelog.d/259.bugfix.md"),
+            RESURRECTED_TEST_BODY,
+        )
+        .expect("write fragment");
+        git(&["add", "changelog.d/259.bugfix.md"], tmp.path());
+        git(
+            &["commit", "-q", "-m", "add resurrected fragment"],
+            tmp.path(),
+        );
+
+        let failures = check_resurrected_fragments(tmp.path(), &base_sha);
+        assert_eq!(
+            failures.len(),
+            1,
+            "a fragment whose body already shipped in CHANGELOG.md must be flagged: {failures:?}"
+        );
+        assert!(
+            failures[0].contains("changelog.d/259.bugfix.md"),
+            "the failure must name the resurrected fragment's path: {:?}",
+            failures[0]
+        );
+        assert!(
+            failures[0].contains("CHANGELOG.md"),
+            "the failure must point at CHANGELOG.md as where it already appears: {:?}",
+            failures[0]
+        );
+    }
+
+    /// Scenario: same base commit (`CHANGELOG.md` already carries the
+    /// scheduler-race text), but the added fragment's body is genuinely
+    /// different content. Asserts `check_resurrected_fragments` passes —
+    /// an unrelated new fragment must never be flagged just because
+    /// *some* fragment was added.
+    #[test]
+    fn check_resurrected_fragments_passes_a_fragment_with_genuinely_new_content() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::create_dir_all(tmp.path().join("changelog.d")).expect("mkdir changelog.d");
+        std::fs::write(tmp.path().join("CHANGELOG.md"), RESURRECTED_TEST_CHANGELOG)
+            .expect("write CHANGELOG.md");
+        git(&["add", "CHANGELOG.md"], tmp.path());
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::write(
+            tmp.path().join("changelog.d/260.bugfix.md"),
+            "Fixed an unrelated memory leak in the daemon's PTY reader when a pane closes \
+             mid-write.\n",
+        )
+        .expect("write fragment");
+        git(&["add", "changelog.d/260.bugfix.md"], tmp.path());
+        git(&["commit", "-q", "-m", "add new fragment"], tmp.path());
+
+        let failures = check_resurrected_fragments(tmp.path(), &base_sha);
+        assert_eq!(
+            failures,
+            Vec::<String>::new(),
+            "a fragment with genuinely new content must not be flagged: {failures:?}"
+        );
+    }
+
+    /// Scenario: same base commit again, but the added fragment merely
+    /// shares a few words ("Fixed", "scheduler") with the old entry rather
+    /// than matching its content. Asserts `check_resurrected_fragments`
+    /// passes — proves the comparison is exact-text (after whitespace
+    /// normalization), not a fuzzy/keyword-overlap match.
+    #[test]
+    fn check_resurrected_fragments_does_not_false_positive_on_shared_words() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::create_dir_all(tmp.path().join("changelog.d")).expect("mkdir changelog.d");
+        std::fs::write(tmp.path().join("CHANGELOG.md"), RESURRECTED_TEST_CHANGELOG)
+            .expect("write CHANGELOG.md");
+        git(&["add", "CHANGELOG.md"], tmp.path());
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::write(
+            tmp.path().join("changelog.d/261.bugfix.md"),
+            "Fixed a scheduler flag typo in the CLI help text.\n",
+        )
+        .expect("write fragment");
+        git(&["add", "changelog.d/261.bugfix.md"], tmp.path());
+        git(
+            &["commit", "-q", "-m", "add unrelated fragment"],
+            tmp.path(),
+        );
+
+        let failures = check_resurrected_fragments(tmp.path(), &base_sha);
+        assert_eq!(
+            failures,
+            Vec::<String>::new(),
+            "a fragment sharing only a few words with an old entry must not be flagged \
+             (exact-text, not fuzzy, matching): {failures:?}"
+        );
+    }
+
+    /// Scenario: builds a scratch repo whose base commit already carries the
+    /// scheduler-race fragment (both the fragment file AND its content in
+    /// `CHANGELOG.md`), and the second commit changes nothing under
+    /// `changelog.d/`. Asserts `check_resurrected_fragments` passes — no
+    /// fragment was *added* by this diff, so there is nothing to check,
+    /// however much content `CHANGELOG.md` shares with an untouched fragment
+    /// sitting in the tree already.
+    #[test]
+    fn check_resurrected_fragments_ignores_a_pre_existing_fragment_nothing_added_this_diff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::create_dir_all(tmp.path().join("changelog.d")).expect("mkdir changelog.d");
+        std::fs::write(tmp.path().join("CHANGELOG.md"), RESURRECTED_TEST_CHANGELOG)
+            .expect("write CHANGELOG.md");
+        std::fs::write(
+            tmp.path().join("changelog.d/259.bugfix.md"),
+            RESURRECTED_TEST_BODY,
+        )
+        .expect("write fragment");
+        git(
+            &["add", "CHANGELOG.md", "changelog.d/259.bugfix.md"],
+            tmp.path(),
+        );
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::write(tmp.path().join("README.md"), "unrelated change\n")
+            .expect("write unrelated file");
+        git(&["add", "README.md"], tmp.path());
+        git(&["commit", "-q", "-m", "unrelated commit"], tmp.path());
+
+        let failures = check_resurrected_fragments(tmp.path(), &base_sha);
+        assert_eq!(
+            failures,
+            Vec::<String>::new(),
+            "a fragment already present at the base, untouched by this diff, must not be \
+             flagged: {failures:?}"
         );
     }
 

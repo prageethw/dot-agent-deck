@@ -45,6 +45,14 @@
 //!       rather than deduplicating into a set, so a repeat is
 //!       representable instead of silently collapsing to whichever
 //!       heading was parsed last.
+//!   11. No `changelog.d/*.md` fragment added by this branch has
+//!       content already present in `CHANGELOG.md` (issue #259, the
+//!       #258 shape) — a resurrected fragment, typically the result
+//!       of a rebase silently replaying a file a release rollup
+//!       already deleted and consumed. Reuses `work_type`'s
+//!       `resolve_base`/`collect_added_fragments` rather than
+//!       re-deriving the diff. See
+//!       [`work_type::check_resurrected_fragments`].
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -641,6 +649,33 @@ fn main() -> ExitCode {
     // gitignored, so on a fresh clone there is no `.md` to compare.
     if let Err(e) = xtask_docs::check_rule_7(&docs_config) {
         failures.push(format!("[7] {e}"));
+    }
+
+    // Check 11 (issue #259 / #258): a changelog.d/*.md fragment ADDED by this
+    // diff whose content is already present in CHANGELOG.md is a resurrected
+    // fragment — `changelog.d/163.bugfix.md` shipped to `main` this way in PR
+    // #219's rebase across the 2026-08-12 upstream sync, caught only after
+    // merge (#258), because nothing compared an added fragment's content
+    // against what CHANGELOG.md already carries. See
+    // `work_type::check_resurrected_fragments` for the full reasoning and the
+    // whitespace-tolerant-but-still-exact comparison it uses. Scoped
+    // narrowly per issue #259's own table: this is the one artifact of the
+    // eight rebase artifacts that actually reached `main`; the other seven
+    // already have gates elsewhere (CI structure, this file's other checks,
+    // the compiler). The broader "why does this branch touch this file"
+    // heuristic issue #259 also raises stays explicit future work, not
+    // attempted here.
+    match work_type::resolve_base(None, &root) {
+        Ok(base_sha) => failures.extend(
+            work_type::check_resurrected_fragments(&root, &base_sha)
+                .into_iter()
+                .map(|v| format!("[11] {v}")),
+        ),
+        Err(e) => failures.push(format!(
+            "[11] could not resolve the merge base against {} to check for resurrected \
+             changelog fragments: {e}",
+            work_type::DEFAULT_BASE
+        )),
     }
 
     if failures.is_empty() {
