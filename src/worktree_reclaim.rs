@@ -2622,6 +2622,37 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
     std::fs::remove_dir_all(worktree_path).map_err(|e| {
         format!("failed to remove isolated clone directory (requested by {remover}): {e}")
     })?;
+
+    // Fork issue #546 hazard 1: the directory is gone, but the M4b
+    // provenance artifact lives entirely outside it (in `state_dir()`, by
+    // design) and survives unless explicitly cleared here -- otherwise a
+    // later, unrelated directory created at this same path would be
+    // silently vouched for by this stale evidence. Best-effort, not
+    // `?`-propagated like `forget_isolated_workspace`'s equivalent removal:
+    // this function is called from `run_reclaim`'s batch loop, which
+    // classifies a row as "removed" on `Ok` and "kept" (with a "removal
+    // failed" reason) on `Err`. By the time the marker removal is
+    // attempted the directory removal above has already succeeded, so a
+    // hard failure here would misreport an isolated clone that is
+    // genuinely gone from disk as one that is still there and needs
+    // attention -- `forget_isolated_workspace` has no such batch
+    // classification to corrupt, which is why it can afford to propagate.
+    let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(worktree_path);
+    let marker_cleared = match std::fs::remove_file(&marker_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(
+                path = %sanitize_path_for_terminal_display(&marker_path),
+                remover = %sanitize_for_terminal_display(remover),
+                error = %e,
+                "failed to remove isolated clone provenance artifact after directory removal \
+                 succeeded -- stale evidence may remain at this path"
+            );
+            false
+        }
+    };
+
     // Issue #325 / reviewer B1 / auditor F2 precedent, carried to the M4c
     // removal path: the ONLY durable trace of a confirmed removal. `remover`
     // is an unauthenticated, caller-supplied string (auditor F3) -- sanitize
@@ -2630,6 +2661,7 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
     tracing::info!(
         path = %sanitize_path_for_terminal_display(worktree_path),
         remover = %sanitize_for_terminal_display(remover),
+        marker_cleared,
         "isolated clone removed"
     );
     Ok(())
