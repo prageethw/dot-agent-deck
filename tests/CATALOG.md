@@ -1656,6 +1656,41 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the coder's chosen implementation shape (as `022`/`027`). RED-first: under round-4 code this test genuinely FAILS — the self-authored gate opens and nothing yet checks whether `victim` is a real assignee, so `--remove-assignee victim` IS issued — making this test RED before the coder's round-5 fix and GREEN after, unlike `022`/`023`/`025`, which already pass under round-4 code for the (soon-superseded) author-gate reason.
 - **Platform coverage:** mac+linux.
 
+##### issue/claim/029 — Issue #286: the read-only `issue claim-check <n> --repo <repo>` subcommand on an UNLABELLED issue (no `in-progress` label, no claim comment) exits 0 (nobody holds it, so this identity may proceed — `ClaimDecision::Claim`) and issues ONLY read-shaped `gh` calls (`gh issue view ...`, `gh api user ...`) — no `gh issue comment`, no `--add-label`, no `--add-assignee`/`--remove-assignee`, unlike the mutating `issue claim`, which would write all three here. This is the test that actually proves "read-only", not merely the exit code.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the same `Fixture`/stub `gh`, no seeding at all — a fresh unlabelled issue).
+- **Agent:** none.
+- **Asserts:** the check exits zero, with exit CODE exactly `0` (`ClaimCheckOutcome::Clear`'s hook tier-0 code, PR #573 round-2 fix reviewer B6/auditor R5); every recorded `gh` call line starts with `issue view ` or `api user`; no call matches `any_claim_write` (`--add-label`, `gh issue comment`, `--add-assignee`/`--remove-assignee`).
+- **Does not assert:** the coder's chosen implementation shape for `claim-check`'s CLI wiring or its exact success message text; the PR #573 fix round's PreToolUse hook wrapper (`.claude/hooks/check-issue-claim.sh --self-test`, wired into CI separately) or the hook's own exit-code tiering (`ClaimCheckOutcome`) built on top of this subcommand.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/030 — Issue #286: agent pane A claims issue 30 via the mutating `issue claim`; a DIFFERENT agent pane B then runs `issue claim-check 30` from its own worktree. Asserts B's check exits non-zero WITH THE SPECIFIC exit code `1` (`ClaimCheckOutcome::RefusedByLock`'s hook tier-1/deny code, PR #573 round-2 fix reviewer B6/auditor R5 — previously only `!success()` was asserted, which cannot distinguish a confident refusal from an ambiguous or operational-failure exit), its combined output names A's holder identity (A's worktree absolute path and branch — the same anchor `issue claim`'s own `RefuseHeldByOther` refusal names, CLAUDE.md rule 23) and reads like that same refusal (`... is held by \`<holder>\` ...`), and B's run writes nothing at all.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; reuses the `two_orchestrations` two-worktree fixture, with A's hold established via a REAL `issue claim` run rather than a seeded comment).
+- **Agent:** none.
+- **Asserts:** the check exits non-zero with exit code exactly `1`; combined stdout+stderr contains A's worktree path AND `BRANCH_A` AND the substring `held by`; no `gh` call recorded after the check began (a call-count baseline taken just before it runs) matches `any_claim_write`.
+- **Does not assert:** the exact full refusal string (only that it names the holder and reads as a "held by" refusal, mirroring `issue claim`'s own `RefuseHeldByOther` message shape — `src/issue_claim.rs`'s `run_issue_claim`).
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/031 — Issue #286: an agent pane claims issue 31 via the mutating `issue claim`, then runs `issue claim-check 31` from the SAME worktree/identity — `decide_claim`'s idempotent-refresh case (`held.identity == caller_identity` → `Claim`). Asserts the check exits 0, WITH EXIT CODE exactly `0` (same `ClaimCheckOutcome::Clear` tier as `issue/claim/029`, PR #573 round-2 fix), but, unlike a real `issue claim` re-run (which would refresh the comment/label/assignee), writes nothing at all — the case that most needs the "writes nothing" assertion, since this is exactly the state where the mutating command WOULD write.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; a single worktree claims for real via `issue claim`, then re-runs as `claim-check` from the same `cwd`/identity).
+- **Agent:** none.
+- **Asserts:** the check exits zero with exit code exactly `0`; no `gh` call recorded after a call-count baseline taken just before the check began matches `any_claim_write`.
+- **Does not assert:** the coder's chosen implementation shape.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/032 — Issue #286: an issue is labelled `in-progress` with NO discoverable claim comment at all (identity unknown — a hand-typed claim applied outside any deck flow, `ClaimDecision::RefuseNoIdentity`). `issue claim-check` is run against it. Asserts the check exits non-zero WITH THE SPECIFIC exit code `4` (`ClaimCheckOutcome::Ambiguous`'s hook tier-4/ask code — renumbered off clap's own reserved exit code 2 in PR #573's round-2 fix, reviewer B5/auditor R3, since a pre-`claim-check` `worker-agent-deck` binary answers this subcommand with clap's usage-error exit 2), its combined output contains the substring `identity unknown` — the same wording `issue claim`'s own `RefuseNoIdentity` refusal uses (`src/issue_claim.rs`'s `run_issue_claim`) — and it writes nothing.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/004`; `Fixture::seed_label_only` seeds the label with no comment).
+- **Agent:** none.
+- **Asserts:** the check exits non-zero with exit code exactly `4`; combined stdout+stderr contains `identity unknown`; no recorded `gh` call matches `any_claim_write`.
+- **Does not assert:** the exact full refusal string beyond the `identity unknown` substring.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/033 — Issue #286 (PR #573 round-2 fix, reviewer B6/auditor R5): `issue claim-check` is run with `DOT_AGENT_DECK_PANE_ID` SET (an agent-shaped caller) from a directory that is NOT a linked worktree — the same fixture shape `issue/claim/006` uses to pin `resolve_caller_identity`'s refusal, and CLAUDE.md rule 17's normal orchestrator-in-the-root-checkout case. Before this test, `ClaimCheckOutcome::CouldNotDetermine` — the fix for the most severe round-1 finding — had no test at all on either side of the hook/binary contract. Asserts the check exits non-zero with the specific exit code `3` (tier-3/allow-with-note, distinct from both tier-1/deny and tier-4/ask) and writes nothing.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/006`; agent-shaped pane id set, `cwd` is the bare repo root rather than a linked worktree).
+- **Agent:** none.
+- **Asserts:** the check exits non-zero with exit code exactly `3`; no recorded `gh` call matches `any_claim_write`.
+- **Does not assert:** the exact refusal wording beyond its exit code and read-only property.
+- **Platform coverage:** mac+linux.
+
 #### daemon/protocol
 
 ##### daemon/protocol/001 — A `SubscribeEvents` receiver that falls behind the broadcast capacity is torn down with `KIND_STREAM_END` carrying exactly the documented `"lagged"` reason (`handle_subscribe_events`'s doc comment, src/daemon_protocol.rs).

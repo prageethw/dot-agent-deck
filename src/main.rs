@@ -505,6 +505,21 @@ enum IssueCmd {
         #[arg(long = "confirm-stopped")]
         confirm_stopped: bool,
     },
+    /// Report whether the caller is clear to act on issue `<n>`, WITHOUT
+    /// writing anything — the read-only counterpart to `claim`, built to
+    /// back a `PreToolUse` hook (issue #286) that gates `gh issue
+    /// comment`/`close`/`edit` and a closing `gh pr merge` on the same
+    /// identity lock `claim` enforces. No `--takeover`/`--confirm-stopped`:
+    /// this command never writes, so takeover is meaningless here — resolve
+    /// a refusal with `issue claim --takeover --confirm-stopped` instead.
+    ClaimCheck {
+        /// The GitHub issue number.
+        issue: u64,
+        /// `owner/name`; derived from the current directory's `origin`
+        /// remote when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -1752,6 +1767,7 @@ fn main() -> ExitCode {
                 takeover,
                 confirm_stopped,
             } => run_issue_claim_cli(issue, repo, takeover, confirm_stopped),
+            IssueCmd::ClaimCheck { issue, repo } => run_issue_claim_check_cli(issue, repo),
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
@@ -2638,6 +2654,49 @@ fn run_issue_claim_cli(
         Err(e) => {
             eprintln!("issue claim: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// The exit code IS the mechanism here, more than usually: PR #573's
+/// fix-round hook (`.claude/hooks/check-issue-claim.sh`) reads exactly these
+/// four codes to tell a confident lock refusal apart from a merely
+/// ambiguous state and from an operational failure it cannot answer at all
+/// — see `dot_agent_deck::issue_claim::ClaimCheckOutcome`'s doc table for
+/// the full mapping. Do not renumber these without updating that hook.
+///
+/// Code 2 is deliberately SKIPPED (round-2 fix, reviewer B5 / auditor R3):
+/// it is clap's own reserved usage-error code, so any `worker-agent-deck`
+/// binary predating this subcommand answers `claim-check` with exit 2 from
+/// a `clap` usage error, not from this function at all — colliding with
+/// whatever tier claimed 2 and fabricating a claim-state reason that was
+/// never actually determined. `Clear=0, RefusedByLock=1, (2 reserved by
+/// clap, never assigned here), CouldNotDetermine=3, Ambiguous=4`.
+fn run_issue_claim_check_cli(issue: u64, repo: Option<String>) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("issue claim-check: failed to resolve current directory: {e}");
+            return ExitCode::from(3);
+        }
+    };
+    use dot_agent_deck::issue_claim::ClaimCheckOutcome;
+    match dot_agent_deck::issue_claim::run_issue_claim_check(&cwd, repo.as_deref(), issue) {
+        ClaimCheckOutcome::Clear(message) => {
+            print!("{message}");
+            ExitCode::SUCCESS
+        }
+        ClaimCheckOutcome::RefusedByLock(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(1)
+        }
+        ClaimCheckOutcome::CouldNotDetermine(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(3)
+        }
+        ClaimCheckOutcome::Ambiguous(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(4)
         }
     }
 }
