@@ -1047,7 +1047,7 @@ fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeMap<String, u3
 }
 
 /// The text-parsing core of [`parse_catalog_ids`], split out (fork #281) so
-/// check 11 can parse a `tests/CATALOG.md` blob read from another revision
+/// check 12 can parse a `tests/CATALOG.md` blob read from another revision
 /// via `git show <rev>:<path>` — which has no filesystem path to hand
 /// `parse_catalog_ids` — without duplicating the heading grammar.
 fn parse_catalog_ids_from_text(text: &str) -> BTreeMap<String, u32> {
@@ -1148,6 +1148,16 @@ fn parse_catalog_entry_bodies_from_text(text: &str) -> BTreeMap<String, Vec<Stri
         if let Some(caps) = header_re.captures(line) {
             flush!();
             current_id = Some(caps.get(1).unwrap().as_str().to_string());
+            continue;
+        }
+        if line.starts_with('#') {
+            // Any other heading (`###`/`####` sub-sections, or a malformed
+            // `#####` line that doesn't match `header_re`) ends the current
+            // entry's body without starting a new one — otherwise it gets
+            // swallowed into the body text, making two textually-identical
+            // entries compare as different purely because a different
+            // sub-heading happens to follow them (fix round: R1).
+            flush!();
             continue;
         }
         if current_id.is_some() {
@@ -2290,6 +2300,78 @@ let y = 2;"###;
         assert_ne!(
             removal_code, error_code,
             "a real removal and a tool failure must not share an exit code (A3)"
+        );
+    }
+
+    /// A sub-heading (`###`/`####`) immediately following an entry must end
+    /// its body, not be swallowed into it — otherwise the SAME prose,
+    /// differing only by which sub-heading happens to follow it after a
+    /// rebase, fingerprints as two DIFFERENT bodies and check 12 reports a
+    /// false collision (fix round: R1, measured as 100% of the residual
+    /// false positives on `issue/claim/028`, `issue/claim/033`, and
+    /// `dashboard/agent-badge/006`).
+    #[test]
+    fn catalog_entry_bodies_stop_at_a_sub_heading_not_just_the_next_entry_or_section() {
+        let text = "\
+## Test Case Catalog
+
+##### issue/claim/028
+
+Some prose describing the scenario.
+
+#### daemon/protocol
+
+##### issue/claim/033
+
+Different prose entirely.
+
+### Statuses
+
+More trailing text that belongs to no entry.
+";
+        let entries = parse_catalog_entry_bodies_from_text(text);
+        assert_eq!(
+            entries.get("issue/claim/028").map(Vec::as_slice),
+            Some(["Some prose describing the scenario.".to_string()].as_slice()),
+            "the `#### daemon/protocol` sub-heading must not be swallowed into \
+             issue/claim/028's body: {entries:?}"
+        );
+        assert_eq!(
+            entries.get("issue/claim/033").map(Vec::as_slice),
+            Some(["Different prose entirely.".to_string()].as_slice()),
+            "the `### Statuses` sub-heading must not be swallowed into \
+             issue/claim/033's body: {entries:?}"
+        );
+    }
+
+    /// The same entry body, rebased so a *different* sub-heading now follows
+    /// it, must still fingerprint identically — this is the actual
+    /// "inherited, not a new collision" case check 12 depends on.
+    #[test]
+    fn catalog_entry_bodies_are_identical_across_rebase_despite_different_following_sub_heading() {
+        let before = "\
+## Test Case Catalog
+
+##### issue/claim/028
+
+Some prose describing the scenario.
+
+#### daemon/protocol
+";
+        let after = "\
+## Test Case Catalog
+
+##### issue/claim/028
+
+Some prose describing the scenario.
+
+### Statuses
+";
+        assert_eq!(
+            parse_catalog_entry_bodies_from_text(before).get("issue/claim/028"),
+            parse_catalog_entry_bodies_from_text(after).get("issue/claim/028"),
+            "identical entry prose must fingerprint the same regardless of \
+             which sub-heading happens to follow it"
         );
     }
 
