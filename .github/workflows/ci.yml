@@ -209,7 +209,10 @@ jobs:
       # `work_type::resolve_base`, and fails closed with a printed skip
       # rather than a hard failure when it cannot (B1), so removing this
       # flag would make check 11 quietly stop running rather than break the
-      # build outright.
+      # build outright. `cargo xtask linkage-check`'s check 12 (fork #281)
+      # is a third consumer of this same full-history requirement — it
+      # resolves both `refs/remotes/origin/main` and a merge-base against
+      # it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
