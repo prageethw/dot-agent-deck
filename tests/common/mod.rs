@@ -590,10 +590,49 @@ impl TuiDeck {
             // the agent reports its cwd symlink-resolved on some platforms and
             // the trust key is matched verbatim.
             claude_trust_paths.push(work.to_string_lossy().into_owned());
-            if let Ok(canon) = std::fs::canonicalize(&work) {
+            let canon_work = std::fs::canonicalize(&work).ok();
+            if let Some(canon) = &canon_work {
                 let canon = canon.to_string_lossy().into_owned();
                 if !claude_trust_paths.contains(&canon) {
                     claude_trust_paths.push(canon);
+                }
+            }
+            // Fork issue #373: an orchestration's role panes (including the
+            // orchestrator role itself) do NOT run in `work` — PRD fork#544 M2b
+            // made isolated-clone provisioning the sole spawn path for every
+            // orchestration, so the orchestrator's real cwd is a sibling
+            // directory `resolve_workspace_path` derives from `work` and the
+            // orchestration's Name (`src/ui.rs`). Every real-agent orchestration
+            // test in this suite opens exactly one, the FIRST, orchestration
+            // against a fresh deck and accepts the form's suggested default
+            // Name rather than typing one, so that Name is deterministically
+            // `"{work-basename}-orchestrator-1"` (`suggest_orchestration_name`'s
+            // `n=1` candidate, always free on a fresh deck with no other live
+            // orchestrations). Pre-trust that predicted sibling path (raw and
+            // canonicalized) the same way as `work` above — mirroring, not
+            // calling, `sanitize_workspace_segment`/`resolve_workspace_path`,
+            // since both are private to `src/ui.rs` and this harness cannot
+            // depend on that crate's internals. A test that types a different
+            // Name, or opens a second orchestration, needs its own
+            // `with_claude_project_trust(path)` call for that path — this only
+            // covers the common, default-name, first-orchestration case every
+            // caller in this suite actually uses.
+            let isolated_clone_path = isolated_clone_sibling_path(&work, 1);
+            claude_trust_paths.push(isolated_clone_path.to_string_lossy().into_owned());
+            // The isolated clone doesn't exist yet at seed time — it's only
+            // created later, when the orchestration form is submitted — so
+            // canonicalizing it directly always fails with ENOENT and the
+            // canonical form is silently never trusted (fork issue #373 R1:
+            // this reintroduces the exact macOS trust-dialog bug this fix
+            // exists to close, since `canon_work` above IS trusted and this
+            // predicted sibling wasn't). `work` itself already exists, so
+            // canonicalize it (reusing `canon_work` from above) and derive the
+            // predicted sibling from that canonical parent instead.
+            if let Some(canon_work) = &canon_work {
+                let canon_sibling = isolated_clone_sibling_path(canon_work, 1);
+                let canon_sibling = canon_sibling.to_string_lossy().into_owned();
+                if !claude_trust_paths.contains(&canon_sibling) {
+                    claude_trust_paths.push(canon_sibling);
                 }
             }
         }
@@ -3620,6 +3659,66 @@ fn import_claude_plugins_enabled() -> bool {
     )
 }
 
+/// Predict the isolated-clone sibling directory an orchestration's role panes
+/// (the orchestrator role included) actually launch in. Composes with three
+/// production functions rather than fully reimplementing them:
+/// `suggest_orchestration_name` (the form's default Name,
+/// `"{work-basename}-orchestrator-{orchestrator_index}"`, offered when no
+/// other orchestration under that Name is already live) and
+/// `sanitize_workspace_segment` (`src/ui.rs`, private) are still *mirrored*
+/// rather than called — but `sanitize_workspace_segment`'s own first stage,
+/// `sanitize_clone_segment` (`src/issue_dispatch.rs`), is `pub` and is called
+/// directly below rather than re-derived by hand (fork issue #373 R3: the
+/// hand-copied version previously omitted this stage entirely, which is a
+/// real drift hazard even though it happens to be unreachable for every
+/// input this harness can actually produce — see `isolated_clone_sibling_path`'s
+/// pinning test in `tests/codex_trust_fixture.rs`). `resolve_workspace_path`
+/// (`work.with_file_name("{work-basename}-{segment}")`) is still mirrored,
+/// since it is trivial and private.
+///
+/// One stage remains a deliberate, documented gap: `suggest_orchestration_name`
+/// also `.trim()`s the directory basename (fork#192 audit F1b) before this
+/// harness's `typed_name` is built, which this mirror does not do. Every
+/// input this harness produces is a `tempfile`-generated `.tmpXXXXXX`
+/// basename, which has no leading/trailing whitespace, so the omission is
+/// inert for every reachable caller today — a caller that ever changed that
+/// would need this mirror updated too.
+///
+/// Fork issue #373: PRD fork#544 M2b made isolated-clone provisioning the SOLE
+/// spawn path for every orchestration, so a real Claude/Codex process
+/// launched via the new-pane orchestration form runs here, not in `work`
+/// itself — verified byte-for-byte against a captured production path,
+/// `/var/tmp/dad-e2e-.../.tmpUxkQzS-tmpUxkQzS-orchestrator-1`, for
+/// `orchestrator_index = 1`.
+///
+/// `orchestrator_index` is the suggested Name's `-orchestrator-N` suffix —
+/// pass `1` for the common case this harness's callers all use today: a
+/// fresh deck's FIRST orchestration, opened with the form's default Name
+/// left untyped. A caller that types its own Name, or opens more than one
+/// orchestration in the same test, is not covered — trust that path
+/// separately with `with_claude_project_trust`.
+///
+/// `pub(crate)`, not private: unlike `src/`'s library functions (which
+/// integration tests link as an external crate, so `pub(crate)` there is
+/// invisible to them), this module is compiled directly INTO each `mod
+/// common;` test binary — so `pub(crate)` here is visible crate-wide, which
+/// is what lets the pinning test in `tests/codex_trust_fixture.rs` call it.
+pub(crate) fn isolated_clone_sibling_path(work: &Path, orchestrator_index: usize) -> PathBuf {
+    let dir_name = work
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let typed_name = format!("{dir_name}-orchestrator-{orchestrator_index}");
+    let sanitized = dot_agent_deck::issue_dispatch::sanitize_clone_segment(&typed_name);
+    let segment = sanitized.trim_start_matches(['-', '.']);
+    let segment = if segment.is_empty() {
+        "issues"
+    } else {
+        segment
+    };
+    work.with_file_name(format!("{dir_name}-{segment}"))
+}
+
 /// Seed the per-test HOME's `~/.claude.json` so a daemon-spawned interactive
 /// `claude` clears BOTH first-run gates without a human keystroke: the global
 /// onboarding gate (`hasCompletedOnboarding`) and the per-folder trust gate
@@ -4054,6 +4153,26 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// Issue #243: also seeds `version.json` — see [`codex_update_notice_dismissal`]
 /// for why an isolated HOME without it can wedge a real-agent Codex test in a
 /// way that looks like a delivery failure.
+///
+/// Fork issue #373 (R2, known gap — not fixed here): unlike
+/// `with_claude_trust_workdir`'s isolated-clone-sibling pre-trust (above),
+/// this only trusts `project` (`test_home.parent()`, i.e. `work`) — it does
+/// NOT extend to the isolated-clone sibling directory an orchestration's role
+/// panes actually launch in under PRD fork#544 M2b. `write_codex_project_trust`
+/// takes a single `project` and `?`-propagates `canonicalize`, so it can't
+/// simply be handed a not-yet-existent sibling path the way Claude's trust
+/// map (which tolerates an untrusted raw-path fallback) can; extending it
+/// needs its own investigation into deferring/retrying the trust write after
+/// the clone exists. Two real orchestration tests call this function —
+/// `orchestration_seed_016_…` here, and `orchestration/delegate/009`
+/// (`delegate_009_real_codex_worker_acts_on_clear_true_delegate` in
+/// `tests/e2e_codex_delegate.rs`, already on `main`), which opens an
+/// orchestration through the same untrusted-sibling path — and both
+/// self-skip on this machine's Codex credentials, so no machine seen so far
+/// has exercised or observed this gap to fail; that is a statement about
+/// this environment, not about the tests (fork issue #373 F3; follow-up
+/// tracked as fork issue #583). Do not read either test's `CATALOG.md` entry
+/// as verifying this path works.
 pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let src = host_home().join(".codex").join("auth.json");
     let bytes = read_credential_file_no_symlink(

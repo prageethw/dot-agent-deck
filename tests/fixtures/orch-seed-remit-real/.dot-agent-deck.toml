@@ -1,0 +1,31 @@
+# Fixture for the L2 REAL-agent orchestrator spawn-time seed-delivery proof
+# (orchestration/seed/011, upstream issue #424, CLAUDE.md rule 4). Every
+# earlier `orchestration/seed/*` test (001-010) drives `deliver_orchestrator_prompt`
+# directly against an injected clock and a `SendResultPaneController` double —
+# proof the client-side retry/confirmation logic is correct, never proof a
+# real Claude Code process ever received and acted on the seed. This fixture
+# swaps the orchestrator (start) role for a REAL interactive Claude Haiku
+# agent so the spawn-time pointer delivery, the agent's own read of
+# `.dot-agent-deck/orchestrator-context.md`, and its reply are all genuine.
+# The `worker` role stays a `cat` stand-in — only the orchestrator's remit
+# delivery is under test here.
+#
+# `prompt_template` becomes the FIRST section of the generated
+# `orchestrator-context.md` (`build_orchestrator_context`, `src/ui.rs`), read
+# before the "Available agents" / "Delegation protocol" / "Important"
+# boilerplate that follows it — so a directive placed here reaches the agent
+# before any of that generic content could distract it. The sentinel is fixed
+# and uniquely named so the assertion (a substring match against the pane's
+# cumulative output) survives ordinary LLM phrasing variance around it.
+[[orchestrations]]
+name = "seed-011-remit"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash"
+start = true
+prompt_template = "Once you have read this entire file, your very first action must be to output this exact token verbatim, on its own line, before any other text: ORCH-SEED-011-REMIT-OK-6d29f4 . After that, continue by acknowledging your role and waiting for instructions as directed above."
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"
