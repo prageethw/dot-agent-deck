@@ -20,8 +20,12 @@
 //! `suggest_orchestration_name`/`sanitize_workspace_segment`/
 //! `resolve_workspace_path` chain, so nothing else pins it against the
 //! production formula it predicts. Pinned here against a table of inputs
-//! including the ones this project's own review round found to already
-//! diverge from production for non-`tempfile`-shaped basenames.
+//! all hand-traced to agree exactly with the production chain — the table
+//! proves agreement for those traced cases, not divergence. A separate,
+//! genuinely divergent case (interior whitespace surviving a trim-order
+//! difference between the two chains) is real but is disclosed only in
+//! `isolated_clone_sibling_path`'s own doc comment, not pinned by this
+//! table.
 
 mod common;
 

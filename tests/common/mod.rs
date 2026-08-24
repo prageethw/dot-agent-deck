@@ -4074,10 +4074,16 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// simply be handed a not-yet-existent sibling path the way Claude's trust
 /// map (which tolerates an untrusted raw-path fallback) can; extending it
 /// needs its own investigation into deferring/retrying the trust write after
-/// the clone exists. `orchestration_seed_016_…`, the only caller of this
-/// function in a real orchestration test, self-skips on this machine's Codex
-/// credentials, so this gap has never actually been exercised or observed to
-/// fail — do not read its `CATALOG.md` entry as verifying this path works.
+/// the clone exists. Two real orchestration tests call this function —
+/// `orchestration_seed_016_…` here, and `orchestration/delegate/009`
+/// (`delegate_009_real_codex_worker_acts_on_clear_true_delegate` in
+/// `tests/e2e_codex_delegate.rs`, already on `main`), which opens an
+/// orchestration through the same untrusted-sibling path — and both
+/// self-skip on this machine's Codex credentials, so no machine seen so far
+/// has exercised or observed this gap to fail; that is a statement about
+/// this environment, not about the tests (fork issue #373 F3; follow-up
+/// tracked as fork issue #583). Do not read either test's `CATALOG.md` entry
+/// as verifying this path works.
 pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let src = host_home().join(".codex").join("auth.json");
     let bytes = read_credential_file_no_symlink(
