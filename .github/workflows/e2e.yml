@@ -36,12 +36,6 @@ concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-  # `changes` reads the PR's file list to decide whether e2e has anything to
-  # test. Same reasoning as ci.yml's `changes` job.
-  pull-requests: read
-
 jobs:
   # Duplicated from ci.yml verbatim rather than shared: a GitHub Actions job
   # output cannot cross a workflow-file boundary (`needs:` only resolves
@@ -57,6 +51,11 @@ jobs:
   # only if someone edits one and not the other — keep them identical.
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      # This job never checks the repo out -- it only calls `gh api
+      # .../pulls/.../files` to read the PR's file list, so `pull-requests:
+      # read` is the only scope it needs.
+      pull-requests: read
     outputs:
       devbox_only: ${{ steps.detect.outputs.devbox_only }}
       docs_only: ${{ steps.detect.outputs.docs_only }}
@@ -84,7 +83,7 @@ jobs:
           # rather than aborting under `set -e`. A failed `changes` job would
           # skip e2e via `needs`, which is the one outcome worth engineering
           # against here.
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
           echo "changed files:"
           echo "$files"
 
@@ -200,6 +199,9 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
+    permissions:
+      # Only `actions/checkout` needs a grant here; this job calls no PR API.
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1

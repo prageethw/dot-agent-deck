@@ -84,7 +84,7 @@ jobs:
           # rather than aborting under `set -e`. A failed `changes` job would
           # skip every Rust job via `needs`, which is the one outcome worth
           # engineering against here.
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
           echo "changed files:"
           echo "$files"
 
@@ -99,12 +99,20 @@ jobs:
           fi
 
           # docs_only applies to EVERY PR author, unlike devbox_only/flake_only
-          # below -- a doc-only diff can't move anything the Rust/security/e2e
-          # jobs check, whoever wrote it, so there's no equivalent of "the
+          # below -- a doc-only diff can't move most of what the Rust/security/
+          # e2e jobs check, whoever wrote it, so there's no equivalent of "the
           # author might grow this past devbox on the next push" risk to scope
-          # it to Renovate. Reuses .github/labeler.yml's own 'documentation'
-          # glob (docs/** or a root *.md/README*) rather than inventing a
-          # second definition of "docs".
+          # it to Renovate. `build` and `semgrep` stay unskipped even on a
+          # docs-only diff, though: `build`'s work-type-check is the only
+          # enforcement of CLAUDE.md rule 1's branch-prefix requirement and
+          # fires specifically on docs paths, and semgrep's secret scan reads
+          # Markdown too (PR #566). Mirrors .github/labeler.yml's own
+          # 'documentation' glob (docs/** or a root *.md/README*) -- note this
+          # is a hand-transcription, not a shared definition, so nothing keeps
+          # it in sync if labeler.yml's glob changes. A third, independently-
+          # diverging definition of "docs" lives in
+          # xtask/linkage-check/src/work_type.rs's is_doc_path (differs on
+          # site/**, prds/**, and README*) -- don't assume the three match.
           docs_only=true
           while IFS= read -r f; do
             case "$f" in
@@ -117,7 +125,7 @@ jobs:
           done <<< "$files"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           if [ "$docs_only" = true ]; then
-            echo "docs-only diff -> skipping the Rust/security/nix/e2e jobs"
+            echo "docs-only diff -> skipping build-macos/build-windows/windows-cross-check/security/nix/sonarqube/e2e (build and semgrep still run)"
           fi
 
           # devbox_only / flake_only stay Renovate-scoped, unchanged from
@@ -159,7 +167,7 @@ jobs:
 
   build:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     steps:
       # PRD fork#340 (E1): `fetch-depth: 0`, not the default depth-1 checkout
@@ -655,7 +663,7 @@ jobs:
   # use of the same function.
   semgrep:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: ubuntu-latest
     container:
       image: semgrep/semgrep
