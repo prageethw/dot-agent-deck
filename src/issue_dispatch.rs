@@ -1101,6 +1101,45 @@ pub(crate) fn sanitize_claimant_name(name: &str) -> String {
         .collect()
 }
 
+/// Render the "who + where + when" clause shared by [`claim_comment_body`]
+/// and [`release_comment_body`] — the identical two-arm match SonarCloud
+/// flagged as duplication between those two functions (issue #326 follow-up).
+/// `prefix` is the caller's [`CLAIM_COMMENT_PREFIX`] or
+/// [`RELEASE_COMMENT_PREFIX`].
+///
+/// Round-3 audit A3 (`issue/claim/020`): `path` and `branch` can both be
+/// attacker-influenceable with NO forged comment involved at all — a
+/// scheduled-task NAME reaches `path` via `sanitize_clone_segment`, which
+/// strips only `/ \ \0 ..`, not backticks, and a raw git branch name is not
+/// restricted from containing one either. Sanitize both, exactly like a
+/// claimant NAME, before they go inside their own backtick-wrapped span —
+/// otherwise an embedded backtick closes that span early and whatever
+/// follows (an `@mention`, a forged `Claimed by`/`Released by` line) renders
+/// as LIVE markdown. Sanitizing here (not in the stored `Identity`) leaves
+/// the compared identity string untouched. The same reasoning applies
+/// identically to the release side, since it shares this rendering.
+fn render_identity_clause(prefix: &str, identity: &Identity, timestamp: &str) -> String {
+    match identity {
+        Identity::Worktree {
+            path,
+            branch,
+            host,
+            label,
+        } => {
+            let label = label.as_deref().unwrap_or("the orchestration");
+            let path_str = sanitize_claimant_name(&path.display().to_string());
+            let branch_str = sanitize_claimant_name(branch);
+            format!(
+                "{prefix}{label} working `{path_str}` on branch `{branch_str}` on host {host} \
+                 at {timestamp}"
+            )
+        }
+        Identity::Human { login, host } => {
+            format!("{prefix}@{login} working from `{host}` at {timestamp}")
+        }
+    }
+}
+
 /// Render the claim-comment body posted on a claim (PRD #421 M1.1; PRD
 /// fork#235 round 3 re-keys it onto the worktree-path-plus-branch anchor,
 /// CLAUDE.md rule 23): who claimed it, when, for which human (`login`,
@@ -1114,7 +1153,10 @@ pub(crate) fn sanitize_claimant_name(name: &str) -> String {
 /// **The `Claimed by ` prefix is load-bearing** (see
 /// [`CLAIM_COMMENT_PREFIX`]) and must survive every variant of this
 /// rendering, including a takeover — provenance goes in the tail
-/// (`, taking over from …`), never by changing the verb.
+/// (`, taking over from …`), never by changing the verb. The "who + where +
+/// when" clause itself, including the round-3 audit A3 sanitization
+/// reasoning, is shared with [`release_comment_body`] via
+/// [`render_identity_clause`].
 ///
 /// Mirrors [`parse_claim_fields`]'s two shapes exactly — a change to one
 /// without the other breaks round-tripping.
@@ -1124,36 +1166,7 @@ pub fn claim_comment_body(
     login: Option<&str>,
     takeover_from: Option<&str>,
 ) -> String {
-    let mut body = match identity {
-        Identity::Worktree {
-            path,
-            branch,
-            host,
-            label,
-        } => {
-            let label = label.as_deref().unwrap_or("the orchestration");
-            // Round-3 audit A3 (`issue/claim/020`): `path` and `branch` can
-            // both be attacker-influenceable with NO forged comment involved
-            // at all — a scheduled-task NAME reaches `path` via
-            // `sanitize_clone_segment`, which strips only `/ \ \0 ..`, not
-            // backticks, and a raw git branch name is not restricted from
-            // containing one either. Sanitize both, exactly like a claimant
-            // NAME, before they go inside their own backtick-wrapped span —
-            // otherwise an embedded backtick closes that span early and
-            // whatever follows (an `@mention`, a forged `Claimed by` line)
-            // renders as LIVE markdown. Sanitizing here (not in the stored
-            // `Identity`) leaves the compared identity string untouched.
-            let path_str = sanitize_claimant_name(&path.display().to_string());
-            let branch_str = sanitize_claimant_name(branch);
-            format!(
-                "{CLAIM_COMMENT_PREFIX}{label} working `{path_str}` on branch `{branch_str}` on \
-                 host {host} at {timestamp}"
-            )
-        }
-        Identity::Human { login, host } => {
-            format!("{CLAIM_COMMENT_PREFIX}@{login} working from `{host}` at {timestamp}")
-        }
-    };
+    let mut body = render_identity_clause(CLAIM_COMMENT_PREFIX, identity, timestamp);
     // The `for @<login>` clause is meaningful only for the worktree form —
     // a human-form claim already names the login as the identity itself
     // (rendered above), so repeating it would be redundant and would make
@@ -1179,12 +1192,13 @@ pub const RELEASE_COMMENT_PREFIX: &str = "Released by ";
 /// the release-side mirror of [`claim_comment_body`], same fields and same
 /// backtick-wrapping discipline (round-3 audit A3's reasoning applies
 /// identically here: `path`/`branch` can carry an attacker-influenceable
-/// backtick with no forged comment involved). `forced_from` names the
-/// identity a `--force` release displaced — `None` for releasing one's own
-/// claim, or for a forced release of an issue whose holder identity was
-/// never known. `reason` is the caller's optional free-text `--reason`,
-/// sanitized the same way a claimant name is (control characters, backticks)
-/// before it reaches a public comment body.
+/// backtick with no forged comment involved — see [`render_identity_clause`],
+/// which both functions share). `forced_from` names the identity a `--force`
+/// release displaced — `None` for releasing one's own claim, or for a forced
+/// release of an issue whose holder identity was never known. `reason` is
+/// the caller's optional free-text `--reason`, sanitized the same way a
+/// claimant name is (control characters, backticks) before it reaches a
+/// public comment body.
 pub fn release_comment_body(
     identity: &Identity,
     timestamp: &str,
@@ -1192,25 +1206,7 @@ pub fn release_comment_body(
     forced_from: Option<&str>,
     reason: Option<&str>,
 ) -> String {
-    let mut body = match identity {
-        Identity::Worktree {
-            path,
-            branch,
-            host,
-            label,
-        } => {
-            let label = label.as_deref().unwrap_or("the orchestration");
-            let path_str = sanitize_claimant_name(&path.display().to_string());
-            let branch_str = sanitize_claimant_name(branch);
-            format!(
-                "{RELEASE_COMMENT_PREFIX}{label} working `{path_str}` on branch `{branch_str}` \
-                 on host {host} at {timestamp}"
-            )
-        }
-        Identity::Human { login, host } => {
-            format!("{RELEASE_COMMENT_PREFIX}@{login} working from `{host}` at {timestamp}")
-        }
-    };
+    let mut body = render_identity_clause(RELEASE_COMMENT_PREFIX, identity, timestamp);
     if matches!(identity, Identity::Worktree { .. })
         && let Some(login) = login
     {
