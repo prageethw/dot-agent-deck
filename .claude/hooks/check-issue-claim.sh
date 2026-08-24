@@ -32,7 +32,9 @@
 # repo, not just one machine — which is the actual point of #286 (mechanical
 # enforcement that doesn't depend on anyone remembering). See the PR body
 # for the fuller note; JSON has no comment syntax to carry it inline in
-# settings.json itself.
+# settings.json itself. See docs/develop/issue-claim-check-hook.md for a
+# contributor-facing overview of what this hook does and how to read a
+# deny/ask/systemMessage note.
 #
 # Usage:
 #   check-issue-claim.sh              run as a PreToolUse hook (reads stdin)
@@ -56,19 +58,78 @@
 # error (round-2 fix, reviewer L1/R8: an earlier draft of this comment
 # claimed the opposite, that any non-zero exit other than 2 discards the
 # JSON). Exit 2 remains special: it blocks UNCONDITIONALLY and cannot be
-# overridden by JSON at all. `reason` is REQUIRED for both `deny` and `ask`
-# (round-2 fix, reviewer L2 — not "optional for ask" as an earlier draft
-# claimed), optional only for `allow`, which needs no output at all. This
-# script always exits 0 itself and uses stdout JSON as the sole signal
-# regardless. A fail-open (allow) path that should stay visible without
-# blocking the tool call is surfaced via the top-level `systemMessage` JSON
-# field (round-2 fix, reviewer R4: stderr from a hook that exits 0 reaches
-# only the debug log, never the transcript, so a stderr-only note is a
-# fully silent bypass in practice even though it "prints something" —
-# `systemMessage` is documented as shown in the transcript). Grep this
-# script for `add_note` to find every site that contributes to it.
+# overridden by JSON at all. `reason` is OPTIONAL for both `deny` and `ask`
+# (round-3 fix, reviewer N7 — round 2's "REQUIRED for both" was itself
+# wrong; this script supplies one on every gated path anyway, so this has
+# no functional effect, only a documentation one). Its AUDIENCE differs by
+# decision: for `allow`/`ask` the reason is shown to the USER only, never to
+# Claude; for `deny` it is shown to Claude; for the fourth `permissionDecision`
+# value, `defer` (not currently emitted by this script), the reason is
+# ignored entirely. That distinction matters for `sanitize_reason` below —
+# untrusted GitHub-comment text reaches Claude's own context only via the
+# `deny` path, never via `ask`. This script always exits 0 itself and uses
+# stdout JSON as the sole signal regardless. A fail-open (allow) path that
+# should stay visible without blocking the tool call is surfaced via the
+# top-level `systemMessage` JSON field (round-2 fix, reviewer R4: stderr
+# from a hook that exits 0 reaches only the debug log, never the
+# transcript, so a stderr-only note is a fully silent bypass in practice
+# even though it "prints something" — `systemMessage` is documented as
+# shown in the transcript, though on `PreToolUse` specifically it is
+# user-visible only, never seen by the model itself). Grep this script for
+# `add_note` to find every site that contributes to it. Hook output
+# strings, `systemMessage` included, are capped by Claude Code itself at
+# 10,000 characters; overflow is spilled to a file and replaced with a
+# preview (round-3 fix, reviewer N7).
+#
+# KNOWN LIMITATIONS (round-3 fix, reviewer/auditor Priority 3 — real,
+# measured, and deliberately not chased further; this is an
+# accident-preventer for cooperating orchestrations, never an enforcement
+# boundary, per the SCOPE paragraph above):
+#   - An absolute or otherwise path-qualified invocation of `gh`
+#     (`/usr/bin/gh issue close 123`) defeats the `tokens[i] == "gh"` match
+#     entirely — allowed, silently, with no note.
+#   - `bash -c '...'`-wrapped commands, and any `eval`, are opaque to this
+#     tokenizer — the wrapped string is never inspected.
+#   - `GH_REPO=other/repo gh issue close 123` is not recognized as an
+#     alternate repo source; the check still resolves the repo from cwd's
+#     origin (or an explicit `--repo`/`-R`), never from `GH_REPO`. A
+#     natural follow-up once N2's "unrecognized --repo forces ambiguous"
+#     fix has landed (recognizing `GH_REPO` the same way), not a separate
+#     defect to chase in this round.
+#   - (Round-2/round-3 residual, now closed) A `systemMessage` note from an
+#     earlier segment used to be dropped whenever a LATER segment denied or
+#     asked, because the old code exited immediately on the first blocking
+#     verdict. `finish_hook`'s round-3 rewrite (reviewer N3) evaluates
+#     every segment before responding, so a `deny`/`ask` decision now
+#     carries any accumulated notes as `systemMessage` in the SAME
+#     response — see `finish_hook`'s own doc.
+#   - Cross-repo closing references (`Closes
+#     https://github.com/other/elsewhere/issues/N` inside a PR merging
+#     into a different repo) are checked against the MERGE TARGET's repo,
+#     not the referenced repo's — over-blocking, the deliberately safe
+#     direction, not a bug.
+#   - `gh api` REST calls that perform the same writes remain permanently
+#     out of scope — see the SCOPE paragraph above.
+#   - A hook TIMEOUT (the 15-second budget in `.claude/settings.json`) is
+#     the one fail-open path that CANNOT be made visible: per the current
+#     docs, a timed-out hook is canceled, its entire output (including any
+#     `systemMessage`) is discarded, and the tool call proceeds through
+#     the normal permission flow as if the hook had never run. Every other
+#     fail-open path in this script announces itself; this one structurally
+#     cannot. The 15s budget is shared across the whole invocation — one
+#     `derive_repo_slug` `gh repo view` call per gated segment with no
+#     `--repo`, up to two `gh pr view` calls for a merge, and one
+#     `worker-agent-deck issue claim-check` per closing reference (capped —
+#     see `MAX_CLOSING_REFS_PER_MERGE` below) — with no per-subprocess
+#     timeout of its own.
 
 set -euo pipefail
+
+# Round-3 fix (reviewer N5): caps how many closing references a single
+# `gh pr merge` invocation gates — see the call site in `main_hook` and the
+# header's KNOWN LIMITATIONS for why this bounds network round trips
+# rather than latency per call.
+MAX_CLOSING_REFS_PER_MERGE=10
 
 usage() {
     cat <<'EOF'
@@ -100,23 +161,17 @@ else
     CLAIM_CHECK_BIN="worker-agent-deck"
 fi
 
-deny_json() {
-    local reason="$1"
-    jq -n --arg reason "$reason" \
-        '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
-}
-
 # permissionDecision "ask" escalates to the user for a manual permission
 # prompt (re-verified against the current docs during the PR #573 fix
 # round — this is real, not assumed). Used for Priority 1's tier 4:
 # genuinely ambiguous rather than confidently refused (CLAUDE.md rule 14's
-# own guidance is to escalate to a human rather than silently adopt).
-ask_json() {
-    local reason="$1"
-    jq -n --arg reason "$reason" \
-        '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: $reason}}'
-}
-
+# own guidance is to escalate to a human rather than silently adopt). Both
+# `deny` and `ask` JSON responses are now built directly in `finish_hook`
+# (round-3 fix, reviewer N3) rather than by dedicated `deny_json`/`ask_json`
+# helpers, since a single response may also need to carry accumulated
+# `NOTES` as `systemMessage` alongside the decision — see that function's
+# own doc.
+#
 # Truncates and delimits a claim-check reason before it reaches
 # `permissionDecisionReason` or `systemMessage` (auditor A7, generalized in
 # the round-2 fix per reviewer L3): `CLAIM_CHECK_REASON` is claim-check's
@@ -248,17 +303,73 @@ derive_repo_slug() {
 # change, a NONE (for the issue verbs) or AMBIGUOUS segment must NEVER be
 # silently allowed through — the caller asks/denies instead.
 #
-# Exits 1 with nothing on stdout if ANY line of the command cannot be
-# tokenized at all (unbalanced quoting) — the caller treats that exactly
-# like python3 being absent: could-not-determine, not "no match". A single
-# unparseable line fails the WHOLE command's tokenization rather than
-# silently skipping just that line, since a partial result here could
-# discard a genuine match on another line of the same logical command.
+# Round-3 fix (reviewer N1, a regression this round's own newline-pre-split
+# introduced): splitting the raw command on EVERY literal newline, before
+# tokenizing, is wrong when a newline falls INSIDE a quoted argument (a
+# multi-line `--body "..."`, this repo's own commonest gated shape per
+# CLAUDE.md rule 25) or after a backslash line-continuation (this repo's
+# own house style for long `gh` invocations) — either one splits a quote in
+# half, fails to tokenize, and used to fail the WHOLE command's
+# tokenization, silently allowing every segment on every line including
+# ones that had nothing wrong with them. `split_logical_lines` below fixes
+# this at the source: it walks the raw string tracking quote state (are we
+# currently inside a `'...'` or `"..."`?) and only treats a bare newline as
+# a split point when it is OUTSIDE any quote; a backslash immediately
+# before such a newline is a continuation and is dropped, joining the two
+# physical lines into one logical line. Outside quotes, an escaped quote
+# character (`\'`/`\"`) is also recognized so it cannot be mistaken for the
+# start of a quoted region. This is deliberately NOT a full bash-grammar
+# reimplementation — see the KNOWN LIMITATIONS list at the top of this
+# script — it only has to get quote-vs-newline right, since `shlex` (via
+# `tokenize_line`) does the real word-splitting on each resulting logical
+# line afterward.
+#
+# Round-3 fix (auditor A5): a logical line that STILL fails to tokenize
+# (genuinely unbalanced quoting) is now recovered PER LINE, not
+# whole-command — `main()` emits a `tokfail` record for that one line (the
+# bash side turns it into a visible `systemMessage` note) and keeps
+# processing every other logical line normally. Per-line is the narrowest
+# recovery this design can offer: segmentation (`split_segments`) only runs
+# on tokens a line successfully produced, so a line that fails to tokenize
+# at all has no segments to recover independently — but one prose line with
+# an apostrophe (a heredoc-built PR/issue comment is the common real case)
+# no longer defeats every OTHER line of the same multi-line command, which
+# is what the previous whole-command failure did.
 CLAIM_CHECK_PY=$(cat <<'PYEOF'
 import re, shlex, sys
 
-SEPARATORS = {"&&", ";", "||", "&", "|", "|&", ";;"}
-ISSUE_VERBS = {"comment", "close", "edit"}
+# Round-3 fix (reviewer N4): `(` and `)` are added here so a second `gh`
+# invocation inside the same segment — a genuine command substitution
+# (`$(gh issue close 123 …)`) or two parenthesized commands back to back —
+# is split into its own segment rather than silently never reached by
+# `find_gh_verb`, which (deliberately) returns only the first match per
+# segment. Verified this does not disturb the subshell (`(gh issue close
+# 123 …)`) or loop-body cases that already worked: those become their own
+# segment either way, before or after this change.
+SEPARATORS = {"&&", ";", "||", "&", "|", "|&", ";;", "(", ")"}
+
+# Round-3 fix (auditor A4): the original three verbs were the ones round 1
+# happened to pick; `gh issue --help` (2.97.0) lists eight further mutating
+# subcommands that take the same `<number>` positional and therefore need
+# no extraction changes. CLAUDE.md rule 14 defines the gated action as
+# "any write — a comment, a close, a label, an assignee", and `delete` is
+# irreversible, so all eight are gated rather than carved out.
+ISSUE_VERBS = {
+    "comment", "close", "edit",
+    "reopen", "delete", "lock", "unlock", "pin", "unpin", "transfer", "develop",
+}
+
+# Round-3 fix (auditor A2): every punctuation-class token `punctuation_chars
+# =True` can emit as its own standalone token — a shell redirect
+# (`2>/dev/null`) is the case that matters: it tokenizes as `2`, `>`,
+# `/dev/null`, and without this check the bare fd number `2` is mistaken
+# for the positional issue/PR number while the real write lands elsewhere.
+# `extract_repo_and_number` below forces AMBIGUOUS the moment it sees ANY
+# token made entirely of these characters — see that function's own doc for
+# why this is safe even though the fd number is examined first (a
+# left-to-right scan) and gets provisionally assigned as `number` before
+# the operator token is reached.
+PUNCTUATION_CHARS = set("();<>|&")
 
 # Every value-taking flag `gh issue close|comment|edit` and `gh pr merge`
 # accept, long AND short forms, verified directly against `gh --help`
@@ -330,30 +441,77 @@ BOOLEAN_FLAGS = {
         "--help",
     },
 }
+# Two-segment form only (`OWNER/REPO`) and gh's own documented
+# `[HOST/]OWNER/REPO` three-segment form — round-3 fix (reviewer N2).
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+HOST_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def repo_from_value(value):
-    return value if REPO_RE.match(value) else None
+    """Validate a --repo/-R value. Returns (repo_or_None, recognized).
+
+    Round-3 fix (reviewer N2): `gh`'s own help for every gated subcommand
+    documents `-R, --repo [HOST/]OWNER/REPO` — a three-segment value when a
+    host is given (`github.com/acme/widgets`). The old version of this
+    function only matched two segments and returned a bare `None` on
+    anything else, which every call site then read as "no --repo was
+    given" and silently fell through to deriving the repo from cwd's
+    origin remote instead — a write to a HELD issue in the actually-named
+    repo was allowed because the check ran against a completely different
+    repository, with zero output. `recognized` is the actual fix: it lets
+    a caller distinguish "this value parsed to `repo_or_None`" from "this
+    value does not parse as a --repo at all", so an unparseable
+    --repo/-R VALUE can force AMBIGUOUS instead of silently vanishing.
+    """
+    if REPO_RE.match(value):
+        return value, True
+    m = HOST_REPO_RE.match(value)
+    if m:
+        # Drop the host segment; this is exactly gh's own rule for
+        # [HOST/]OWNER/REPO, not a guess.
+        return "/".join(value.split("/")[1:]), True
+    return None, False
 
 
-def extract_repo_and_number(tokens, kind):
+def extract_repo_and_number(tokens, kind, repo=None):
     """Walk a single segment's post-verb tokens for the positional
-    issue/PR number and an optional --repo/-R value. Round-2 fix (reviewer
-    M1 / auditor R2): an unrecognized flag of unknown arity, seen BEFORE the
-    positional has been identified, forces the final status to AMBIGUOUS
-    rather than being assumed boolean (which risked treating its actual
-    VALUE as the positional — the exact redirection primitive round 1's A1
-    fixed for the flags this round's VALUE_FLAGS/BOOLEAN_FLAGS lists
-    happen to cover, reopened for anything they don't). Once forced,
-    nothing downstream un-flags it — a later, perfectly clean integer
-    found after an unknown flag does not restore confidence, since we
-    cannot tell in general whether that integer was itself an unknown
-    flag's swallowed value.
+    issue/PR number and an optional --repo/-R value. `repo` seeds the
+    result with a value already captured from FLAGS BEFORE the verb word
+    (round-3 fix, auditor A3 — see `find_gh_verb`'s `_skip_flags_before_verb`
+    helper); a --repo/-R found here, after the verb, overrides it, matching
+    gh's own last-flag-wins behavior.
+
+    Round-2 fix (reviewer M1 / auditor R2): an unrecognized flag of unknown
+    arity, seen BEFORE the positional has been identified, forces the final
+    status to AMBIGUOUS rather than being assumed boolean (which risked
+    treating its actual VALUE as the positional — the exact redirection
+    primitive round 1's A1 fixed for the flags this round's
+    VALUE_FLAGS/BOOLEAN_FLAGS lists happen to cover, reopened for anything
+    they don't). Once forced, nothing downstream un-flags it — a later,
+    perfectly clean integer found after an unknown flag does not restore
+    confidence, since we cannot tell in general whether that integer was
+    itself an unknown flag's swallowed value.
+
+    Round-3 fix (reviewer N2): an unparseable --repo/-R VALUE now forces
+    AMBIGUOUS the same way, rather than silently discarding the value and
+    falling back to a different repo — see `repo_from_value`'s own doc.
+
+    Round-3 fix (auditor A2): a token made entirely of punctuation
+    characters (`>`, `>>`, `<`, `<<`, `&&`, …) reaching here means
+    `punctuation_chars=True` split a shell redirect into its own token —
+    most commonly `2>/dev/null` tokenizing as `2`, `>`, `/dev/null`, where
+    the bare fd number `2` would otherwise be mistaken for the positional.
+    The check below forces `forced_ambiguous = True` unconditionally the
+    moment such a token is SEEN, regardless of whether `number` already
+    holds a value from an earlier token in this same left-to-right scan —
+    that is deliberate, not a bug: `forced_ambiguous` is checked FIRST in
+    the status computation at the end of this function, so it overrides
+    whatever `number` was provisionally set to. This is what makes `gh
+    issue close 2>/dev/null 123` come out AMBIGUOUS even though `number`
+    gets assigned "2" three tokens before the disqualifying `>` is reached.
     """
     value_flags = VALUE_FLAGS[kind]
     boolean_flags = BOOLEAN_FLAGS[kind]
-    repo = None
     number = None
     forced_ambiguous = False
     i = 0
@@ -362,21 +520,33 @@ def extract_repo_and_number(tokens, kind):
         t = tokens[i]
         if t in ("--repo", "-R"):
             if i + 1 < n:
-                r = repo_from_value(tokens[i + 1])
-                if r:
+                r, recognized = repo_from_value(tokens[i + 1])
+                if recognized:
                     repo = r
+                else:
+                    forced_ambiguous = True
+            else:
+                forced_ambiguous = True
             i += 2
             continue
         if t.startswith("--repo=") or t.startswith("-R="):
-            r = repo_from_value(t.split("=", 1)[1])
-            if r:
+            r, recognized = repo_from_value(t.split("=", 1)[1])
+            if recognized:
                 repo = r
+            else:
+                forced_ambiguous = True
             i += 1
             continue
         if t.startswith("-R") and len(t) > 2 and not t.startswith("--"):
-            r = repo_from_value(t[2:])
-            if r:
+            r, recognized = repo_from_value(t[2:])
+            if recognized:
                 repo = r
+            else:
+                forced_ambiguous = True
+            i += 1
+            continue
+        if t and all(ch in PUNCTUATION_CHARS for ch in t):
+            forced_ambiguous = True
             i += 1
             continue
         if t.startswith("-"):
@@ -425,6 +595,58 @@ def split_segments(tokens):
     return segments
 
 
+def _skip_flags_before_verb(tokens, start):
+    """From index `start` (right after `gh issue`/`gh pr`), skip a run of
+    flag-shaped tokens before the actual verb word. Round-3 fix (auditor
+    A3): real `gh`/Cobra accepts a flag between the subcommand and the
+    verb (`gh issue --repo acme/widgets close 123`), but the old
+    `find_gh_verb` required `gh`/`issue`/`<verb>` to sit at three
+    consecutive indices, so this shape reached ZERO checks with no note.
+
+    `--repo`/`-R` is the one flag common to every gated subcommand and
+    known in advance to take a value, so it is captured here and returned
+    alongside the new scan index; the caller seeds `extract_repo_and_number`
+    with it. Any OTHER flag-shaped token here is skipped assuming it is
+    boolean — this cannot misdirect the check in the dangerous direction:
+    if it were actually a value-taking flag we don't recognize, its value
+    is simply examined next as a candidate "verb" word, fails to match
+    ISSUE_VERBS/"merge", and this whole `gh` occurrence is correctly
+    treated as not a match rather than mis-parsed. An unrecognized --repo
+    value found HERE (pre-verb) is a narrow, accepted residual — it is not
+    forced ambiguous the way a post-verb one is (see `repo_from_value`),
+    since a pre-verb flag is already the edge case this function exists
+    for; if the command also carries no --repo after the verb, `derive_
+    repo_slug`'s cwd-origin fallback applies exactly as it would if no
+    --repo had been given at all.
+    """
+    i = start
+    n = len(tokens)
+    repo = None
+    while i < n and tokens[i].startswith("-"):
+        t = tokens[i]
+        if t in ("--repo", "-R"):
+            if i + 1 < n:
+                r, recognized = repo_from_value(tokens[i + 1])
+                if recognized:
+                    repo = r
+            i += 2
+            continue
+        if t.startswith("--repo=") or t.startswith("-R="):
+            r, recognized = repo_from_value(t.split("=", 1)[1])
+            if recognized:
+                repo = r
+            i += 1
+            continue
+        if t.startswith("-R") and len(t) > 2 and not t.startswith("--"):
+            r, recognized = repo_from_value(t[2:])
+            if recognized:
+                repo = r
+            i += 1
+            continue
+        i += 1
+    return i, repo
+
+
 def find_gh_verb(tokens):
     """Scan ONE segment's tokens for a `gh issue <verb>` or `gh pr merge`
     invocation at ANY index — round-2 fix (reviewer B2, auditor R1):
@@ -435,15 +657,24 @@ def find_gh_verb(tokens):
     commands (`timeout 30 gh …`, `sudo gh …`) that legitimately have `gh`
     somewhere other than index 0 within one segment. Returns None if this
     segment contains no gated verb at all.
+
+    Round-3 fix (auditor A3): `gh`/`issue`|`pr` no longer has to be
+    IMMEDIATELY followed by the verb word — `_skip_flags_before_verb`
+    tolerates a flag (most importantly --repo/-R) in between, matching
+    real `gh`'s own Cobra-based parsing.
     """
     n = len(tokens)
     i = 0
-    while i + 2 < n:
-        if tokens[i] == "gh":
-            if tokens[i + 1] == "issue" and tokens[i + 2] in ISSUE_VERBS:
-                return ("issue",) + extract_repo_and_number(tokens[i + 3:], "issue")
-            if tokens[i + 1] == "pr" and tokens[i + 2] == "merge":
-                return ("merge",) + extract_repo_and_number(tokens[i + 3:], "merge")
+    while i < n:
+        if tokens[i] == "gh" and i + 1 < n and tokens[i + 1] in ("issue", "pr"):
+            sub = tokens[i + 1]
+            j, pre_repo = _skip_flags_before_verb(tokens, i + 2)
+            if j < n:
+                verb = tokens[j]
+                if sub == "issue" and verb in ISSUE_VERBS:
+                    return ("issue",) + extract_repo_and_number(tokens[j + 1:], "issue", repo=pre_repo)
+                if sub == "pr" and verb == "merge":
+                    return ("merge",) + extract_repo_and_number(tokens[j + 1:], "merge", repo=pre_repo)
         i += 1
     return None
 
@@ -451,20 +682,96 @@ def find_gh_verb(tokens):
 def tokenize_line(line):
     lex = shlex.shlex(line, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
+    # Round-3 fix (auditor A1): shlex.shlex defaults `commenters` to '#',
+    # which the `shlex.split()` convenience wrapper this round replaced
+    # does NOT do (it sets commenters=''). Bash only treats `#` as a
+    # comment introducer at the START of a word; shlex without this reset
+    # treats it mid-word too, so `echo a#b; gh issue close 123` silently
+    # discarded everything from the `#` onward — a fully silent, zero-note
+    # allow of a write to a held issue, and a regression against round 1,
+    # which correctly denied this exact string.
+    lex.commenters = ""
     return list(lex)
+
+
+def split_logical_lines(raw):
+    """Split `raw` into the logical lines `tokenize_line` should each
+    process independently — the way bash itself decides where a "line"
+    ends, not a naive `str.split("\\n")` (round-3 fix, reviewer N1, a
+    regression this round's own naive newline-pre-split introduced — see
+    this script's header KNOWN LIMITATIONS / the doc above `CLAIM_CHECK_PY`
+    for the full incident). A bare newline is a split point only when it
+    occurs OUTSIDE any `'...'`/`"..."` quoted region — inside one, it is
+    preserved verbatim as part of that logical line, exactly as bash
+    itself would never split a multi-line quoted argument. A backslash
+    immediately before such an outside-quote newline is a line
+    continuation: both characters are dropped, joining the next physical
+    line onto the current logical one. Outside quotes, a backslash before
+    ANY other character (including a quote character) is also consumed
+    together with it, so an escaped quote (`\\'`/`\\"`) outside a quoted
+    region is never mistaken for the start of one. This does not attempt
+    to fully reproduce bash's own escaping rules inside double quotes —
+    only enough to correctly decide whether a `"` closes the region, which
+    is all a caller that hands the reassembled line to `shlex` afterward
+    needs.
+    """
+    lines = []
+    current = []
+    quote = None
+    i = 0
+    n = len(raw)
+    while i < n:
+        c = raw[i]
+        if quote:
+            current.append(c)
+            if c == quote:
+                quote = None
+            elif quote == '"' and c == "\\" and i + 1 < n:
+                current.append(raw[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt == "\n":
+                # Backslash-newline continuation, outside any quote: drop
+                # both, keep going on the same logical line.
+                i += 2
+                continue
+            current.append(c)
+            current.append(nxt)
+            i += 2
+            continue
+        if c == "'" or c == '"':
+            quote = c
+            current.append(c)
+            i += 1
+            continue
+        if c == "\n":
+            lines.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(c)
+        i += 1
+    lines.append("".join(current))
+    return lines
 
 
 def main():
     raw = sys.stdin.read()
-    for line in raw.split("\n"):
+    for line in split_logical_lines(raw):
         try:
             tokens = tokenize_line(line)
         except ValueError as exc:
-            print(
-                "check-issue-claim.sh: could not tokenize command (unbalanced quoting): {}".format(exc),
-                file=sys.stderr,
-            )
-            return 1
+            # Round-3 fix (auditor A5): recover PER LOGICAL LINE, not
+            # whole-command — a `tokfail` record lets the bash side surface
+            # a visible note for just this one line while every other line
+            # is still gated normally. The kind/repo/number/status shape is
+            # reused so the bash reader needs no second record format.
+            print("tokfail\x1f\x1f\x1funbalanced quoting on one logical line: {}".format(exc))
+            continue
         for seg in split_segments(tokens):
             result = find_gh_verb(seg)
             if result is None:
@@ -603,6 +910,22 @@ extract_closing_issue_numbers() {
 # since a PreToolUse hook gets exactly one JSON response per invocation.
 NOTES=()
 
+# Round-3 fix (reviewer N3): a `deny`/`ask` verdict is now RECORDED here
+# instead of immediately printed and exited. `main_hook`'s per-match loop
+# used to `exit 0` on the very first `ask`/`deny` it produced, so a chain
+# whose FIRST gated segment was merely ambiguous never even evaluated a
+# LATER segment's confident `deny` (a real held-issue violation) — the user
+# got prompted about the wrong thing, and approving that prompt ran the
+# whole command, violation included. `finish_hook` (below) evaluates every
+# segment first, then emits exactly one verdict using the precedence
+# `deny > ask > allow`, matching Claude Code's own documented decision
+# precedence (`deny > defer > ask > allow`) — this script does not use
+# `defer`, so the effective order here is `deny > ask > allow`. Reasons
+# from every segment that produced one are merged into that single
+# response, rather than only the first segment reached.
+DENY_REASONS=()
+ASK_REASONS=()
+
 add_note() {
     NOTES+=("$1")
     # Keep the stderr line too — cheap, and useful for anyone tailing the
@@ -610,23 +933,67 @@ add_note() {
     echo "check-issue-claim.sh: $1" >&2
 }
 
-flush_notes_and_exit() {
+record_deny() {
+    DENY_REASONS+=("$1")
+}
+
+record_ask() {
+    ASK_REASONS+=("$1")
+}
+
+# Round-3 fix (reviewer N3): the single exit point for `main_hook`, called
+# once after every segment of the command has been evaluated. `deny` beats
+# `ask` beats a plain allow — see `DENY_REASONS`/`ASK_REASONS`'s own doc
+# above for why this can no longer be "whichever segment came first".
+#
+# Round-3 fix (reviewer's own Priority 3 residual, closed as a side effect
+# of N3 rather than deferred): a `deny`/`ask` decision now carries any
+# `NOTES` accumulated from OTHER segments as `systemMessage` in the SAME
+# response, instead of discarding them. Before N3, `deny_json`/`ask_json`
+# `exit`ed immediately on the first blocking verdict, so a note from an
+# earlier fail-open segment (an unresolvable repo, an unresolvable `gh pr
+# view`) was silently dropped whenever a later segment denied or asked.
+# Now that every segment is evaluated before any response is built, both
+# can be reported together — the decision is the thing that blocks or
+# prompts; the notes are the record of what ELSE happened in the same
+# command that a human reading the transcript should also see.
+finish_hook() {
+    local decision="" reason="" notes_joined=""
+    if [ "${#DENY_REASONS[@]}" -gt 0 ]; then
+        decision="deny"
+        reason="blocked by check-issue-claim.sh (issue #286):
+$(printf '%s\n\n' "${DENY_REASONS[@]}")"
+        reason="${reason%$'\n\n'}"
+    elif [ "${#ASK_REASONS[@]}" -gt 0 ]; then
+        decision="ask"
+        reason="check-issue-claim.sh (issue #286):
+$(printf '%s\n\n' "${ASK_REASONS[@]}")"
+        reason="${reason%$'\n\n'}"
+    fi
     if [ "${#NOTES[@]}" -gt 0 ]; then
-        local joined
-        joined="$(printf '%s\n' "${NOTES[@]}")"
-        jq -n --arg msg "$joined" '{systemMessage: $msg}'
+        notes_joined="$(printf '%s\n' "${NOTES[@]}")"
+    fi
+    if [ -n "$decision" ] && [ -n "$notes_joined" ]; then
+        jq -n --arg dec "$decision" --arg reason "$reason" --arg msg "$notes_joined" \
+            '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $dec, permissionDecisionReason: $reason}, systemMessage: $msg}'
+    elif [ -n "$decision" ]; then
+        jq -n --arg dec "$decision" --arg reason "$reason" \
+            '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $dec, permissionDecisionReason: $reason}}'
+    elif [ -n "$notes_joined" ]; then
+        jq -n --arg msg "$notes_joined" '{systemMessage: $msg}'
     fi
     exit 0
 }
 
 # Runs claim-check for issue $2 of repo $1 (cwd $3) and reacts per its tier
-# (see run_claim_check's doc): tier 0 returns (nothing to do — the caller's
-# loop moves to the next match); tier 1 denies and exits; tier 4 asks (or
-# would deny if a future hook contract ever dropped "ask" — re-verify
-# against the docs before assuming it still applies) and exits; tier 3
-# allows but leaves a visible note (via `add_note`) and returns. $4 is a
-# note prefix for the deny/ask reason text ("merging this PR would close
-# issue #N, and " for the merge path, empty for a direct gh issue write).
+# (see run_claim_check's doc): tier 0 does nothing (the caller's loop moves
+# to the next match); tier 1 records a deny reason (`record_deny`); tier 4
+# records an ask reason (`record_ask`) — round-3 fix (reviewer N3): neither
+# exits immediately any more, both defer to `finish_hook` once every
+# segment has been evaluated; tier 3 allows but leaves a visible note (via
+# `add_note`). $4 is a note prefix for the deny/ask reason text ("merging
+# this PR would close issue #N, and " for the merge path, empty for a
+# direct gh issue write).
 gate_or_allow() {
     local repo="$1" issue="$2" cwd="$3" note="$4" tier
     if run_claim_check "$repo" "$issue" "$cwd"; then
@@ -639,16 +1006,13 @@ gate_or_allow() {
         return 0
         ;;
     1)
-        deny_json "blocked by check-issue-claim.sh (issue #286): ${note}\`issue claim-check\` refused — $(sanitize_reason "$CLAIM_CHECK_REASON")"
-        exit 0
+        record_deny "${note}\`issue claim-check\` refused — $(sanitize_reason "$CLAIM_CHECK_REASON")"
         ;;
     4)
-        ask_json "check-issue-claim.sh (issue #286): ${note}\`issue claim-check\` could not confirm — $(sanitize_reason "$CLAIM_CHECK_REASON")"
-        exit 0
+        record_ask "${note}\`issue claim-check\` could not confirm — $(sanitize_reason "$CLAIM_CHECK_REASON")"
         ;;
     *)
         add_note "\`issue claim-check\` for issue #$issue of $repo could not determine an answer (operational failure — binary missing, gh auth/network issue, or the caller is not in a linked worktree) — allowing without a claim check: $(sanitize_reason "$CLAIM_CHECK_REASON")"
-        return 0
         ;;
     esac
 }
@@ -661,8 +1025,8 @@ main_hook() {
     # (reviewer L3), since jq is used below just to parse the hook's own
     # stdin contract. Fail open, loudly, once, before any other jq call.
     # jq itself being absent is the one fail-open path that cannot route
-    # through `add_note`/`flush_notes_and_exit` (both need jq to build
-    # valid JSON) — hand-write a fixed, content-free JSON literal instead.
+    # through `add_note`/`finish_hook` (both need jq to build valid JSON) —
+    # hand-write a fixed, content-free JSON literal instead.
     if ! command -v jq >/dev/null 2>&1; then
         echo "check-issue-claim.sh: jq not found - allowing without a claim check" >&2
         printf '{"systemMessage":"check-issue-claim.sh: jq not found - allowing without a claim check"}\n'
@@ -684,20 +1048,36 @@ main_hook() {
     [ -n "$command" ] || exit 0
 
     if ! extract_gated_segments "$command"; then
-        # Could not tokenize (no python3, or unparseable quoting/heredoc) —
-        # Priority 1 tier 3: could-not-determine. Allow, but say so
+        # python3 missing entirely, or the tokenizer crashed outright — the
+        # per-LOGICAL-LINE unbalanced-quoting case is now recovered inside
+        # the Python helper itself (round-3 fix, auditor A5 — see the
+        # `tokfail` record handled in the loop below) and never reaches
+        # here. Priority 1 tier 3: could-not-determine. Allow, but say so
         # visibly (systemMessage, not just stderr) so this is never a
         # silent bypass.
-        add_note "could not tokenize command for claim checking (python3 missing, or unparseable quoting) — allowing without a claim check: $command"
-        flush_notes_and_exit
+        add_note "could not run the tokenizer for claim checking (python3 missing, or the tokenizer failed) — allowing without a claim check: $command"
+        finish_hook
     fi
     if [ "${#MATCHES[@]}" -eq 0 ]; then
-        flush_notes_and_exit
+        finish_hook
     fi
 
     local m kind repo number ext_status
     for m in "${MATCHES[@]}"; do
         IFS=$'\x1f' read -r kind repo number ext_status <<<"$m"
+
+        if [ "$kind" = "tokfail" ]; then
+            # Round-3 fix (auditor A5): one logical line failed to tokenize
+            # (genuinely unbalanced quoting) — allow just that line without
+            # a claim check, visibly, and keep evaluating every OTHER
+            # match already extracted from lines that tokenized fine. This
+            # is what makes the recovery per-line rather than
+            # whole-command: a stray apostrophe in one heredoc's prose no
+            # longer defeats a `gh issue close` on an entirely different
+            # line of the same command.
+            add_note "could not tokenize one logical line of the command (unbalanced quoting) — allowing that line without a claim check while any other lines/segments are still checked normally: $ext_status"
+            continue
+        fi
 
         [ -n "$repo" ] || repo="$(derive_repo_slug "$cwd")"
         if [ -z "$repo" ]; then
@@ -734,18 +1114,24 @@ main_hook() {
             # Matches a gated verb, but the issue/PR number could not be
             # unambiguously determined from the command — Priority 2's key
             # behavioral change: never silently allow this through.
+            # Round-3 fix (reviewer N3): record and move on to the NEXT
+            # match instead of exiting immediately — a later segment in
+            # the same command may still resolve to a confident `deny`,
+            # which must not be skipped just because an earlier one was
+            # merely ambiguous. `finish_hook` picks the strongest verdict
+            # across everything recorded.
             local verb_desc
             if [ "$kind" = "merge" ]; then
                 verb_desc="gh pr merge"
             else
-                verb_desc="gh issue comment/close/edit"
+                verb_desc="gh issue comment/close/edit/…"
             fi
-            ask_json "check-issue-claim.sh (issue #286): this command matches a gated \`${verb_desc}\` form, but the issue/PR number could not be unambiguously determined from it — refusing to guess rather than risk checking the wrong one. Confirm this is safe, or re-run it with an explicit, literal issue/PR number. Command: $command"
-            exit 0
+            record_ask "this command matches a gated \`${verb_desc}\` form, but the issue/PR number could not be unambiguously determined from it — refusing to guess rather than risk checking the wrong one. Confirm this is safe, or re-run it with an explicit, literal issue/PR number. Command: $command"
+            continue
         fi
 
         if [ "$kind" = "merge" ]; then
-            local text numbers n
+            local text numbers n count
             text="$(cd "$cwd" && gh pr view "$number" --repo "$repo" --json title,body,commits \
                 --jq '.title, .body, (.commits[].messageHeadline), (.commits[].messageBody)' 2>/dev/null)" || text=""
             if [ -z "$text" ]; then
@@ -759,15 +1145,30 @@ main_hook() {
             fi
             numbers="$(extract_closing_issue_numbers "$text")"
             [ -n "$numbers" ] || continue
+            # Round-3 fix (reviewer N5): bound the number of closing
+            # references gated per `gh pr merge` invocation — each one is a
+            # full `worker-agent-deck issue claim-check` subprocess, itself
+            # `gh issue view` + `gh api user`, all sequential and sharing
+            # the hook's single 15s timeout budget (see the header's KNOWN
+            # LIMITATIONS). A PR body naming many closing references could
+            # otherwise turn one tool call into an unbounded number of
+            # sequential network round trips. Anything past the cap is
+            # named in a visible note rather than silently skipped.
+            count=0
             while IFS= read -r n; do
                 [ -n "$n" ] || continue
+                count=$((count + 1))
+                if [ "$count" -gt "$MAX_CLOSING_REFS_PER_MERGE" ]; then
+                    add_note "PR #$number of $repo names more closing references than the $MAX_CLOSING_REFS_PER_MERGE this hook checks per merge — only the first $MAX_CLOSING_REFS_PER_MERGE were checked; verify the remainder manually before merging."
+                    break
+                fi
                 gate_or_allow "$repo" "$n" "$cwd" "merging this PR would close issue #$n, and "
             done <<<"$numbers"
         else
             gate_or_allow "$repo" "$number" "$cwd" ""
         fi
     done
-    flush_notes_and_exit
+    finish_hook
 }
 
 self_test() {
@@ -1370,10 +1771,397 @@ EOF
     fi
     rm -f "$fake_bin/gh"
 
+    # --- Round-3 fix round scenarios (PR #573 fix round 4, issue #286) ---
+    # Reuse the "issue 123 HELD, everything else CLEAR" stub scenarios
+    # 11-15 established.
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+if [ "$3" = "123" ]; then
+    echo "issue claim-check: issue #123 of acme/widgets is held by \`orch-a\` — held by another agent" >&2
+    exit 1
+fi
+echo "ok to proceed on issue #$3 of acme/widgets as \`human:x@h\`"
+exit 0
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+
+    # --- Scenario 22 (reviewer N1a): a multi-line quoted --body argument
+    # is no longer split in half by the newline pre-split. ---
+    run_bypass_scenario "a multi-line quoted --body argument (N1a)" \
+        "$(printf 'gh issue close 123 --repo acme/widgets --body "line one\nline two"')"
+
+    # --- Scenario 23 (reviewer N1b): a backslash line-continuation, this
+    # repo's own house style for long gh invocations, is joined rather
+    # than split. ---
+    run_bypass_scenario "a backslash-continued command (N1b)" \
+        "$(printf 'gh issue close 123 \\\n  --repo acme/widgets')"
+
+    # --- Scenario 24 (reviewer N1c): a report-then-close two-command
+    # sequence — CLAUDE.md rule 25's own \`gh pr comment\` merge-report
+    # shape (not itself gated) followed by a genuinely gated close on a
+    # later line. ---
+    run_bypass_scenario "a report-then-close sequence (N1c)" \
+        "$(printf 'gh pr comment 5 --body "Merge report\n\n- CI green\n"\ngh issue close 123 --repo acme/widgets')"
+
+    # --- Scenario 25 (auditor A5): a per-LINE tokenization failure (a
+    # genuinely unbalanced quote on a LATER line) no longer discards a
+    # perfectly well-formed gated command on an EARLIER line of the same
+    # multi-line command — the old whole-command failure would have
+    # silently allowed the close below. ---
+    run_bypass_scenario "per-line recovery when a later line is unbalanced (A5)" \
+        "$(printf 'gh issue close 123 --repo acme/widgets\necho "unterminated')"
+
+    # --- Scenario 26 (reviewer N2): a --repo value that is genuinely
+    # unparseable (not even gh's own [HOST/]OWNER/REPO shape) must force
+    # ASK, never silently fall back to a different repo. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+echo "self-test FAILED: worker-agent-deck should never be invoked when --repo is unparseable" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    local input_badrepo out26 decision26
+    input_badrepo=$(jq -n --arg cwd "$tmp/repo" '{
+        tool_name: "Bash",
+        tool_input: {command: "gh issue close 123 --repo not_a_valid_repo_value!!!"},
+        cwd: $cwd
+    }')
+    out26="$(PATH="$fake_bin:$PATH" bash "$0" <<<"$input_badrepo")"
+    decision26="$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$out26" 2>/dev/null)"
+    if [ "$decision26" != "ask" ]; then
+        echo "self-test FAILED: an unparseable --repo value must force ask, never silently fall back to a different repo; got:" >&2
+        printf '%s\n' "$out26" >&2
+        fail=1
+    else
+        echo "self-test ok: an unparseable --repo value (N2) forces ask rather than silently checking a different repo"
+    fi
+
+    # --- Scenario 27 (reviewer N2): gh's own [HOST/]OWNER/REPO three-
+    # segment --repo form is correctly recognized, and the check runs
+    # against THAT repo, not cwd's origin — repo2's origin is a DIFFERENT
+    # repo (scenario 10's fixture), so a pass here proves the
+    # host-qualified value was used, not merely that the fallback happened
+    # to match. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+if [ "$5" != "acme/widgets" ]; then
+    echo "self-test FAILED: claim-check called with repo=$5, expected the host-qualified --repo value acme/widgets (host stripped), not cwd's origin (wrongowner/wrongrepo)" >&2
+    exit 1
+fi
+echo "issue claim-check: issue #999 of acme/widgets is held by \`orch-a\` — held by another agent" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    local input_hostrepo out27 decision27 reason27
+    input_hostrepo=$(jq -n --arg cwd "$tmp/repo2" '{
+        tool_name: "Bash",
+        tool_input: {command: "gh issue close 999 --repo github.com/acme/widgets"},
+        cwd: $cwd
+    }')
+    out27="$(PATH="$fake_bin:$PATH" bash "$0" <<<"$input_hostrepo")"
+    decision27="$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$out27" 2>/dev/null)"
+    reason27="$(jq -r '.hookSpecificOutput.permissionDecisionReason // empty' <<<"$out27" 2>/dev/null)"
+    if [ "$decision27" != "deny" ] || [[ "$reason27" != *"acme/widgets"* ]]; then
+        echo "self-test FAILED: a HOST/OWNER/REPO --repo value must be recognized and checked against the right repo; got:" >&2
+        printf '%s\n' "$out27" >&2
+        fail=1
+    else
+        echo "self-test ok: gh's own [HOST/]OWNER/REPO --repo form (N2) is correctly extracted, not silently falling back to cwd's origin"
+    fi
+
+    # --- Scenario 28 (auditor A1): shlex's default '#' comment character
+    # no longer truncates the tokenizer mid-command. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+if [ "$3" = "123" ]; then
+    echo "issue claim-check: issue #123 of acme/widgets is held by \`orch-a\` — held by another agent" >&2
+    exit 1
+fi
+echo "ok to proceed on issue #$3 of acme/widgets as \`human:x@h\`"
+exit 0
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    run_bypass_scenario "a mid-word # no longer truncates the command (A1)" "echo a#b; gh issue close 123 --repo acme/widgets"
+
+    # --- Scenario 29 (auditor A2): a shell redirect before the positional
+    # (2>/dev/null) no longer aims the check at the bare fd number — it
+    # must force ask, never silently check the wrong issue. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+echo "self-test FAILED: worker-agent-deck should never be invoked when a redirect precedes the positional" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    local input_redirect out29 decision29
+    input_redirect=$(jq -n --arg cwd "$tmp/repo" '{
+        tool_name: "Bash",
+        tool_input: {command: "gh issue close 2>/dev/null 123 --repo acme/widgets"},
+        cwd: $cwd
+    }')
+    out29="$(PATH="$fake_bin:$PATH" bash "$0" <<<"$input_redirect")"
+    decision29="$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$out29" 2>/dev/null)"
+    if [ "$decision29" != "ask" ]; then
+        echo "self-test FAILED: a redirect before the positional (2>/dev/null 123) must force ask, never silently check the fd number instead; got:" >&2
+        printf '%s\n' "$out29" >&2
+        fail=1
+    else
+        echo "self-test ok: a shell redirect before the positional (A2) forces ask rather than checking the wrong (fd) number"
+    fi
+
+    # --- Scenario 30 (auditor A3): a flag between the subcommand and the
+    # verb (gh issue --repo r/r close N) is no longer missed entirely. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+if [ "$3" != "123" ] || [ "$5" != "acme/widgets" ]; then
+    echo "self-test FAILED: claim-check called with issue=$3 repo=$5, expected issue=123 repo=acme/widgets" >&2
+    exit 1
+fi
+echo "issue claim-check: issue #123 of acme/widgets is held by \`orch-a\` — held by another agent" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    run_bypass_scenario "a flag between the subcommand and the verb (A3)" "gh issue --repo acme/widgets close 123"
+
+    # --- Scenario 31 (auditor A4): the newly-gated verbs (reopen/delete/
+    # transfer/…) are checked, not skipped. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+if [ "$3" != "123" ]; then
+    echo "self-test FAILED: claim-check called with issue=$3, expected 123" >&2
+    exit 1
+fi
+echo "issue claim-check: issue #123 of acme/widgets is held by \`orch-a\` — held by another agent" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    run_bypass_scenario "a newly-gated verb, gh issue delete (A4)" "gh issue delete 123 --repo acme/widgets"
+    run_bypass_scenario "a newly-gated verb, gh issue reopen (A4)" "gh issue reopen 123 --repo acme/widgets"
+    run_bypass_scenario "a newly-gated verb, gh issue transfer (A4)" "gh issue transfer 123 other/repo --repo acme/widgets"
+
+    # --- Scenario 32 (reviewer N4): two gh invocations inside the same
+    # segment via command substitution are BOTH reached now that ( and )
+    # are separators, not just the first. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+case "$3" in
+1)
+    echo "ok to proceed on issue #1 of acme/widgets as \`human:x@h\`"
+    exit 0
+    ;;
+123)
+    echo "issue claim-check: issue #123 of acme/widgets is held by \`orch-a\` — held by another agent" >&2
+    exit 1
+    ;;
+*)
+    echo "self-test FAILED: unexpected issue $3" >&2
+    exit 1
+    ;;
+esac
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    run_bypass_scenario "command substitution reaches the inner gh call too (N4)" \
+        'gh issue close 1 --repo acme/widgets $(gh issue close 123 --repo acme/widgets)'
+
+    # --- Scenario 33 (reviewer N3): an earlier AMBIGUOUS segment no longer
+    # suppresses a later segment's confident DENY — the whole command must
+    # still deny, naming the real violation. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+if [ "$3" = "123" ]; then
+    echo "issue claim-check: issue #123 of acme/widgets is held by \`orch-a\` — held by another agent" >&2
+    exit 1
+fi
+echo "self-test FAILED: worker-agent-deck should not be invoked for any issue but 123 in this scenario" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    local input_ask_then_deny out33 decision33 reason33
+    input_ask_then_deny=$(jq -n --arg cwd "$tmp/repo" '{
+        tool_name: "Bash",
+        tool_input: {command: "gh issue comment $N --body x --repo acme/widgets; gh issue close 123 --repo acme/widgets"},
+        cwd: $cwd
+    }')
+    out33="$(PATH="$fake_bin:$PATH" bash "$0" <<<"$input_ask_then_deny")"
+    decision33="$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$out33" 2>/dev/null)"
+    reason33="$(jq -r '.hookSpecificOutput.permissionDecisionReason // empty' <<<"$out33" 2>/dev/null)"
+    if [ "$decision33" != "deny" ] || [[ "$reason33" != *"#123"* ]]; then
+        echo "self-test FAILED: an earlier ambiguous segment must not suppress a later confident deny (deny > ask precedence); got:" >&2
+        printf '%s\n' "$out33" >&2
+        fail=1
+    else
+        echo "self-test ok: an earlier ambiguous segment does not suppress a later segment's confident deny (N3's deny > ask > allow precedence)"
+    fi
+
+    # --- Scenario 34 (round-2 M3 / round-3 N6): the three closing-keyword
+    # forms beyond bare #N — GH-N, owner/repo#N, and the full issue URL —
+    # are pinned, not just described in prose. Same title-pinning gh stub
+    # discipline as scenario 4. ---
+    cat >"$fake_bin/gh" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+    found_title_field=0
+    for arg in "$@"; do
+        case "$arg" in
+        *title*) found_title_field=1 ;;
+        esac
+    done
+    if [ "$found_title_field" -ne 1 ]; then
+        echo "self-test FAILED: gh pr view was not asked for --json title: $*" >&2
+        exit 1
+    fi
+    case "$PR_VIEW_BODY_MARKER" in
+    GH) echo "Fixed GH-778" ;;
+    OWNERREPO) echo "resolves acme/widgets#778" ;;
+    URL) echo "Closes https://github.com/acme/widgets/issues/778" ;;
+    esac
+    exit 0
+fi
+echo "self-test FAILED: unexpected gh invocation: $*" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/gh"
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+if [ "$3" != "778" ]; then
+    echo "self-test FAILED: claim-check called with issue $3, expected 778" >&2
+    exit 1
+fi
+echo "issue claim-check: issue #778 of acme/widgets is held by \`orch-a\` — held by another agent" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+
+    local closing_form input_closing out_closing decision_closing reason_closing
+    for closing_form in GH OWNERREPO URL; do
+        input_closing=$(jq -n --arg cwd "$tmp/repo" '{
+            tool_name: "Bash",
+            tool_input: {command: "gh pr merge 574 --squash"},
+            cwd: $cwd
+        }')
+        out_closing="$(PATH="$fake_bin:$PATH" PR_VIEW_BODY_MARKER="$closing_form" bash "$0" <<<"$input_closing")"
+        decision_closing="$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$out_closing" 2>/dev/null)"
+        reason_closing="$(jq -r '.hookSpecificOutput.permissionDecisionReason // empty' <<<"$out_closing" 2>/dev/null)"
+        if [ "$decision_closing" != "deny" ] || [[ "$reason_closing" != *"#778"* ]]; then
+            echo "self-test FAILED: closing-keyword form $closing_form must be recognized and checked against issue #778; got:" >&2
+            printf '%s\n' "$out_closing" >&2
+            fail=1
+        else
+            echo "self-test ok: the $closing_form closing-keyword form is recognized and checked against the right issue (N6)"
+        fi
+    done
+    rm -f "$fake_bin/gh"
+
+    # --- Scenario 35 (auditor's structural suggestion): pin the
+    # DOCUMENTED scope limits (header KNOWN LIMITATIONS) as expected-ALLOW
+    # — asserted here, not merely described in prose, so a future
+    # tokenizer change cannot silently move one of these from a safe allow
+    # to a wrong-target check without a self-test scenario going red. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+echo "self-test FAILED: worker-agent-deck should never be invoked for a documented out-of-scope shape" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+
+    run_scope_limit_scenario() {
+        local label="$1" cmd="$2"
+        local inp o dec
+        inp=$(jq -n --arg cwd "$tmp/repo" --arg cmd "$cmd" '{
+            tool_name: "Bash",
+            tool_input: {command: $cmd},
+            cwd: $cwd
+        }')
+        o="$(PATH="$fake_bin:$PATH" bash "$0" <<<"$inp")"
+        dec="$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$o" 2>/dev/null)"
+        if [ -n "$dec" ]; then
+            echo "self-test FAILED ($label): a documented out-of-scope shape must never produce a blocking decision; command was: $cmd; got:" >&2
+            printf '%s\n' "$o" >&2
+            fail=1
+        else
+            echo "self-test ok: $label stays within the documented scope limit (allow, never a blocking decision)"
+        fi
+    }
+
+    run_scope_limit_scenario "an absolute path to gh" "/usr/bin/gh issue close 123"
+    run_scope_limit_scenario "a bash -c wrapped command" "bash -c 'gh issue close 123'"
+    run_scope_limit_scenario "a gh api REST call" "gh api repos/acme/widgets/issues/123/comments -f body=hi"
+
+    # --- Scenario 36 (regression guard): a genuinely unbalanced quote,
+    # with no other well-formed gated command anywhere in the input, still
+    # correctly fails to tier 3 (allow + visible note) — N1's quote-aware
+    # newline handling must not accidentally start ACCEPTING malformed
+    # input. ---
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+echo "self-test FAILED: worker-agent-deck should never be invoked for a genuinely unparseable command" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    local input_unbalanced out36 decision36 sysmsg36
+    input_unbalanced=$(jq -n --arg cwd "$tmp/repo" '{
+        tool_name: "Bash",
+        tool_input: {command: "gh issue close 123 --body \"unterminated"},
+        cwd: $cwd
+    }')
+    out36="$(PATH="$fake_bin:$PATH" bash "$0" <<<"$input_unbalanced")"
+    decision36="$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$out36" 2>/dev/null)"
+    sysmsg36="$(jq -r '.systemMessage // empty' <<<"$out36" 2>/dev/null)"
+    if [ -n "$decision36" ]; then
+        echo "self-test FAILED: a genuinely unbalanced quote must allow (nothing to gate on confidently), not block; got:" >&2
+        printf '%s\n' "$out36" >&2
+        fail=1
+    elif [[ "$sysmsg36" != *"unbalanced quoting"* ]]; then
+        echo "self-test FAILED: a genuinely unbalanced quote must leave a visible systemMessage note, not a silent allow; got: $out36" >&2
+        fail=1
+    else
+        echo "self-test ok: a genuinely unbalanced quote still correctly fails to tier 3 (allow + visible note), not silently and not by denying"
+    fi
+
+    # --- Scenario 37 (reviewer N5): a PR naming more closing references
+    # than MAX_CLOSING_REFS_PER_MERGE is visibly capped — the rest are
+    # named in a note, not silently skipped and not turned into an
+    # unbounded number of sequential network round trips. ---
+    cat >"$fake_bin/gh" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+    printf 'fixes #1, fixes #2, fixes #3, fixes #4, fixes #5, fixes #6, fixes #7, fixes #8, fixes #9, fixes #10, fixes #11\n'
+    exit 0
+fi
+echo "self-test FAILED: unexpected gh invocation: $*" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/gh"
+    cat >"$fake_bin/worker-agent-deck" <<'EOF'
+#!/usr/bin/env bash
+echo "ok to proceed on issue #$3 as human:x@h"
+exit 0
+EOF
+    chmod +x "$fake_bin/worker-agent-deck"
+    local input_manyrefs out37 decision37 sysmsg37
+    input_manyrefs=$(jq -n --arg cwd "$tmp/repo" '{
+        tool_name: "Bash",
+        tool_input: {command: "gh pr merge 575 --squash"},
+        cwd: $cwd
+    }')
+    out37="$(PATH="$fake_bin:$PATH" bash "$0" <<<"$input_manyrefs")"
+    decision37="$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$out37" 2>/dev/null)"
+    sysmsg37="$(jq -r '.systemMessage // empty' <<<"$out37" 2>/dev/null)"
+    if [ -n "$decision37" ]; then
+        echo "self-test FAILED: capping closing references must not itself block the merge; got:" >&2
+        printf '%s\n' "$out37" >&2
+        fail=1
+    elif [[ "$sysmsg37" != *"only the first $MAX_CLOSING_REFS_PER_MERGE were checked"* ]]; then
+        echo "self-test FAILED: more closing references than the cap must produce a visible note naming the cap; got: $out37" >&2
+        fail=1
+    else
+        echo "self-test ok: a PR naming more closing references than the $MAX_CLOSING_REFS_PER_MERGE cap is visibly capped, not silently unbounded (N5)"
+    fi
+    rm -f "$fake_bin/gh"
+
     if [ "$fail" -ne 0 ]; then
         exit 1
     fi
-    echo "self-test ok: all scenarios passed — check-issue-claim.sh blocks a refused claim-check, asks on ambiguity, allows on a clear or could-not-determine result, and (round-2 fix) no longer silently bypasses a newline/unspaced-operator/non-gh-led chain, a short-flag redirection, or an unrecognized-flag ambiguity"
+    echo "self-test ok: all scenarios passed — check-issue-claim.sh blocks a refused claim-check, asks on ambiguity, allows on a clear or could-not-determine result, and (round-2/round-3 fixes) no longer silently bypasses a newline/unspaced-operator/non-gh-led chain, a short-flag redirection, an unrecognized-flag ambiguity, a multi-line quoted argument, a backslash continuation, a mid-word #, a redirect before the positional, an unparseable/host-qualified --repo value, a flag between subcommand and verb, or an ungated verb — and evaluates every segment before responding rather than stopping at the first ask"
 }
 
 case "${1:-}" in
