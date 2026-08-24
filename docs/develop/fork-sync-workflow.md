@@ -40,6 +40,8 @@ You don't need to reproduce these; they're just what "resolve the conflicts with
 `main` never talks to `upstream`. Only `fork-only` rebases onto upstream, then `main` is reset to it.
 
 ```bash
+cd /absolute/path/to/worktree   # every command below runs from here — the two force-pushes and the reset included
+
 git fetch upstream
 git checkout fork-only
 git rebase upstream/main          # conflicts resolved HERE — once, per-commit
@@ -53,7 +55,7 @@ git rebase upstream/main          # conflicts resolved HERE — once, per-commit
 # must be explained in this sync's own re-curation write-up. Run this BEFORE
 # either push below — the whole point is catching a silent drop before it
 # becomes the fork's published history, not after.
-cd /absolute/path/to/worktree && cargo xtask list-tests --compare <fork-only-pre-rebase-sha> fork-only
+cargo xtask list-tests --compare <fork-only-pre-rebase-sha> fork-only
 
 git push --force-with-lease origin fork-only
 git checkout main

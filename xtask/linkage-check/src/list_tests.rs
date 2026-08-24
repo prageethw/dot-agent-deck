@@ -1469,6 +1469,27 @@ mod tests {
         assert!(!layer_token_is_l1("L2 synthetic"));
         assert!(!layer_token_is_l1(""));
     }
+
+    /// Issue #344 R1 (reviewer recheck of A2): pins `git_command`'s env
+    /// isolation directly, with no spawn — `Command::get_envs()` reports
+    /// each `env_remove`'d variable as `(key, None)`, so this asserts all
+    /// eight `GIT_ENV_VARS_TO_CLEAR` entries are explicitly removed on the
+    /// `Command` `git_command` builds, rather than only exercising it
+    /// indirectly via `real_git`'s decoy-env integration tests below.
+    #[test]
+    fn git_command_clears_all_git_location_env_vars() {
+        let cmd = git_command(Path::new("/tmp/git-command-env-test-repo"));
+        for var in GIT_ENV_VARS_TO_CLEAR {
+            let removed = cmd
+                .get_envs()
+                .any(|(k, v)| k == std::ffi::OsStr::new(var) && v.is_none());
+            assert!(
+                removed,
+                "expected {var} to be explicitly removed, got envs: {:?}",
+                cmd.get_envs().collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 /// Issue #344 item 3: `run_compare` shells out to real `git` against two
