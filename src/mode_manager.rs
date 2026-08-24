@@ -6,10 +6,10 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError};
-#[cfg(unix)]
-use crate::platform::shell::quote_shell_arg;
 #[cfg(windows)]
 use crate::platform::shell::{escape_cmd_exe_program, quote_cmd_exe_arg};
+#[cfg(unix)]
+use crate::platform::shell::{quote_shell_arg, sanitize_shell_control_chars};
 use crate::project_config::ModeConfig;
 
 /// Build the outer-shell command line for `dot-agent-deck watch --interval N
@@ -23,6 +23,13 @@ use crate::project_config::ModeConfig;
 /// token, which `{:?}` Debug-escaping does not guarantee (POSIX shells
 /// still expand `$` and backticks inside double quotes, and Rust's escapes
 /// are not a faithful encoding for every character, e.g. a real newline).
+/// Before quoting, `command` is also run through
+/// `sanitize_shell_control_chars` (fork issue #429) — quoting alone is not
+/// enough, because the emitted line is typed keystroke-by-keystroke into a
+/// live PTY on the persistent-watch-pane delivery path, and the tty line
+/// discipline consumes several control characters as editing/signal input
+/// *below* the shell's own grammar, before `sh` ever sees the quotes at
+/// all; see that function's doc comment for which bytes and why.
 ///
 /// **Windows**: position-aware `cmd.exe` quoting (fork issue #283) —
 /// `exe` and `command` sit in two different grammatical positions of a
@@ -47,7 +54,7 @@ fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
         "{} watch --interval {} {}",
         quote_shell_arg(&exe.display().to_string()),
         interval_secs,
-        quote_shell_arg(command)
+        quote_shell_arg(&sanitize_shell_control_chars(command))
     )
 }
 
@@ -260,6 +267,17 @@ impl ModeManager {
                         });
                         watch_invocation(&exe, 10, &pane_cfg.command)
                     } else {
+                        // Not run through `sanitize_shell_control_chars`: this
+                        // value still ends up written keystroke-by-keystroke
+                        // into a live PTY via `write_to_pane` in
+                        // `start_mode_commands` below, the same delivery
+                        // mechanism `watch_invocation` was fixed for, so it is
+                        // not actually *proven* safe against a raw control
+                        // byte either — this is one of the non-watch sites
+                        // fork issue #429's audit flagged (finding E) and is
+                        // tracked by fork issue #565, a separate, broader
+                        // investigation, deliberately left open by this fix,
+                        // which is scoped to `watch_invocation` alone.
                         pane_cfg.command.clone()
                     };
 
@@ -481,6 +499,14 @@ impl ModeManager {
             let interval_secs = interval.unwrap_or(5);
             watch_invocation(&exe, interval_secs, command)
         } else {
+            // Same caveat as `activate_mode`'s non-watch branch: `pane_cmd`
+            // is typed into `old_pane_id`'s live PTY unsanitized below (via
+            // `write_to_pane`, in some cases embedded right after this
+            // function's own `export … && printf … &&` prefix — the exact
+            // shape `watch_invocation` was fixed for), and is not proven
+            // safe against the same control-character/termios-line-
+            // discipline risk. Tracked by fork issue #565 (fork issue #429
+            // audit finding E) rather than closed here.
             command.to_string()
         };
 
@@ -651,6 +677,95 @@ mod tests {
             line,
             "'/usr/local/bin/dot-agent-deck' watch --interval 10 'line one\nline two'"
         );
+    }
+
+    /// Fork issue #429: the identical vulnerability shape fork issue #423
+    /// already closed for the Windows arm
+    /// (`watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
+    /// above), but on the Unix delivery path and with a different set of
+    /// dangerous bytes. `watch_invocation`'s output isn't read by `sh`
+    /// through its own grammar first — it's typed into a mode pane's PTY
+    /// keystroke-by-keystroke (`write_to_pane`), and the tty line
+    /// discipline consumes several control characters *below* the shell's
+    /// own grammar before the shell ever sees them: `ETX`/`\x03` (SIGINT),
+    /// `NAK`/`\x15` and `ETB`/`\x17` (kill-line / word-erase under many
+    /// `stty` configurations), and `EOT`/`\x04` (end-of-input). A `command`
+    /// value containing one of these discards everything the terminal
+    /// driver ate — including the deck's own program token and the
+    /// `export … && printf … &&` prefix `write_to_pane` types ahead of this
+    /// line — landing the remainder at a fresh prompt where the trailing
+    /// newline submits it as an attacker-chosen command.
+    ///
+    /// Deliberately not a copy of the Windows fix: a real newline is
+    /// genuinely safe here today
+    /// (`watch_invocation_preserves_real_newline_posix` above), so whatever
+    /// closes this off must target these specific control characters
+    /// without breaking that.
+    ///
+    /// **Honesty caveat, same as the Windows sibling's**: `sh` here is
+    /// driven via `-c <line>` as a single process argument — not the
+    /// interactive-PTY line discipline a real watch pane types into — so
+    /// this proves the emitted line contains no raw control character and
+    /// behaves safely once handed to a real `sh` that way, but it cannot
+    /// reproduce, and does not prove, the PTY-level consumption itself;
+    /// that remains reasoned rather than executed.
+    ///
+    /// **A second, sharper honesty caveat, specific to this test — not
+    /// shared with the Windows sibling**: the marker-file assertion below
+    /// is unfalsifiable and always was, even pre-fix. There, an embedded
+    /// LF genuinely splits `cmd.exe`'s own parsing of the `/C <string>`
+    /// argument, so that sibling's marker check is a real RED→GREEN
+    /// signal. Here, the payload sits inside `quote_shell_arg`'s
+    /// single-quoted wrapper, and a raw control byte between single
+    /// quotes is inert to `sh`'s own grammar whether or not it was
+    /// sanitized — `touch injected.marker` never runs via this `sh -c`
+    /// invocation regardless of this fix, so the marker assertion cannot
+    /// go red either before or after it. The `!line.chars().any(…)`
+    /// string assertion immediately below is the only assertion in this
+    /// test that actually proves anything about the fix; the marker
+    /// check is kept only as an (unchanging) proof that the quoting
+    /// itself still holds, not as evidence for the control-character
+    /// substitution.
+    #[cfg(unix)]
+    #[test]
+    fn watch_invocation_neutralizes_control_characters_through_real_shell_posix() {
+        for command in [
+            "npm run dev\x03touch injected.marker",
+            "npm run dev\x15touch injected.marker",
+            "npm run dev\x17touch injected.marker",
+            "npm run dev\x04touch injected.marker",
+        ] {
+            let scratch = tempfile::tempdir().expect("scratch tempdir");
+            let marker = scratch.path().join("injected.marker");
+
+            let exe = scratch.path().join("dot-agent-deck");
+            let line = watch_invocation(&exe, 5, command);
+
+            assert!(
+                !line
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\t'),
+                "watch_invocation must never emit a raw control character \
+                 (other than a legitimate real newline or tab) into the \
+                 shell command line\ncommand: {command:?}\nline: {line:?}"
+            );
+
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&line)
+                .current_dir(scratch.path())
+                .output()
+                .expect("sh -c should run");
+
+            assert!(
+                !marker.exists(),
+                "a control character in `command` was not neutralized and \
+                 `touch injected.marker` ran as its own command.\n\
+                 command: {command:?}\nline: {line}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     /// Runs `quote_shell_arg(value)` through a real `sh -c` invocation via a
