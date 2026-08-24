@@ -39385,6 +39385,10 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let _daemon = with_crafted_response_daemon(
             tmp.path(),
@@ -40589,6 +40593,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -40649,6 +40656,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -40712,6 +40722,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let colliding_record = crate::agent_pty::AgentRecord {
             id: "2".into(),
@@ -40736,6 +40749,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -40792,6 +40808,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let colliding_record = crate::agent_pty::AgentRecord {
             id: "2".into(),
@@ -40816,6 +40835,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
 
         let _daemon = with_crafted_response_daemon(

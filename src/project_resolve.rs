@@ -1837,6 +1837,9 @@ command = "cat"
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         }
     }
 

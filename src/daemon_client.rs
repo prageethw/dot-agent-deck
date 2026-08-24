@@ -1311,6 +1311,9 @@ impl DaemonClient {
                     // derivation this field exists to remove.
                     cli_name: None,
                     crashed: None,
+                    outstanding_delegation: None,
+                    silence_watch: None,
+                    delegation_commission: None,
                 })
                 .collect(),
             schedule_revision,
@@ -3461,6 +3464,10 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -3526,6 +3533,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -3554,6 +3564,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

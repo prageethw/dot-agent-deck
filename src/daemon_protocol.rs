@@ -2665,6 +2665,20 @@ async fn handle_connection(
             // resolve from the registry's spawn-time type while the record
             // travels with the live one beside it.
             crate::agent_pty::attach_cli_names(&mut records);
+            // Issue #586 M1/M2: join in each pane's delegation-watch state —
+            // PRD #126's idle-worker watch, PRD #249's silent-worker watch,
+            // issue #448's commission ledger — the same additive-field
+            // pattern as `live`/`daemon_boot_id`/`registration_generation`
+            // above. This needs only `registry`, not the `AppState` lock, so
+            // it runs in its own loop rather than growing the guarded one.
+            for record in &mut records {
+                if let Some(pane_id) = record.pane_id_env.as_deref() {
+                    let snap = registry.delegation_watch_snapshot(pane_id);
+                    record.outstanding_delegation = snap.outstanding_delegation;
+                    record.silence_watch = snap.silence_watch;
+                    record.delegation_commission = snap.delegation_commission;
+                }
+            }
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -6267,6 +6281,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -6290,6 +6307,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -6461,6 +6481,9 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -6748,6 +6771,10 @@ mod tests {
             registration_generation: None,
             cli_name: Some("claude".into()),
             crashed: None,
+
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))
