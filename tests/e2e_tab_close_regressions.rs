@@ -215,6 +215,9 @@ async fn handle_connection(
                 live: None,
                 daemon_boot_id: None,
                 registration_generation: None,
+                outstanding_delegation: None,
+                silence_watch: None,
+                delegation_commission: None,
             });
             write_resp(
                 &mut stream,
@@ -301,6 +304,9 @@ fn mode_record(fixture: &str, mode: &str, agent_id: &str, pane_id: &str) -> Agen
         live: None,
         daemon_boot_id: None,
         registration_generation: None,
+        outstanding_delegation: None,
+        silence_watch: None,
+        delegation_commission: None,
     }
 }
 
