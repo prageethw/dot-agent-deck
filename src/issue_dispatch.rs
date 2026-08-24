@@ -508,6 +508,24 @@ pub fn issue_edit_add_label_argv(repo: &str, issue: u64, label: &str) -> Vec<Str
     ]
 }
 
+/// Build the `gh issue edit --remove-label` argv (arguments after `gh`) that
+/// strips `label` from `issue` — issue #326's `issue release` uses this to
+/// remove [`IN_PROGRESS_LABEL`], the exact mirror of
+/// [`issue_edit_add_label_argv`] with the same `--` end-of-options placement
+/// (see that function's doc comment for why the placement matters).
+pub fn issue_edit_remove_label_argv(repo: &str, issue: u64, label: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--remove-label".to_string(),
+        label.to_string(),
+        "--".to_string(),
+        issue.to_string(),
+    ]
+}
+
 /// Build the `gh issue comment` argv (arguments after `gh`) that posts `body`
 /// as a new comment on `issue` — always APPENDED, never edited in place (PRD
 /// #421 M1.1: the only path that re-runs the dispatch-success flow for the
@@ -1083,6 +1101,45 @@ pub(crate) fn sanitize_claimant_name(name: &str) -> String {
         .collect()
 }
 
+/// Render the "who + where + when" clause shared by [`claim_comment_body`]
+/// and [`release_comment_body`] — the identical two-arm match SonarCloud
+/// flagged as duplication between those two functions (issue #326 follow-up).
+/// `prefix` is the caller's [`CLAIM_COMMENT_PREFIX`] or
+/// [`RELEASE_COMMENT_PREFIX`].
+///
+/// Round-3 audit A3 (`issue/claim/020`): `path` and `branch` can both be
+/// attacker-influenceable with NO forged comment involved at all — a
+/// scheduled-task NAME reaches `path` via `sanitize_clone_segment`, which
+/// strips only `/ \ \0 ..`, not backticks, and a raw git branch name is not
+/// restricted from containing one either. Sanitize both, exactly like a
+/// claimant NAME, before they go inside their own backtick-wrapped span —
+/// otherwise an embedded backtick closes that span early and whatever
+/// follows (an `@mention`, a forged `Claimed by`/`Released by` line) renders
+/// as LIVE markdown. Sanitizing here (not in the stored `Identity`) leaves
+/// the compared identity string untouched. The same reasoning applies
+/// identically to the release side, since it shares this rendering.
+fn render_identity_clause(prefix: &str, identity: &Identity, timestamp: &str) -> String {
+    match identity {
+        Identity::Worktree {
+            path,
+            branch,
+            host,
+            label,
+        } => {
+            let label = label.as_deref().unwrap_or("the orchestration");
+            let path_str = sanitize_claimant_name(&path.display().to_string());
+            let branch_str = sanitize_claimant_name(branch);
+            format!(
+                "{prefix}{label} working `{path_str}` on branch `{branch_str}` on host {host} \
+                 at {timestamp}"
+            )
+        }
+        Identity::Human { login, host } => {
+            format!("{prefix}@{login} working from `{host}` at {timestamp}")
+        }
+    }
+}
+
 /// Render the claim-comment body posted on a claim (PRD #421 M1.1; PRD
 /// fork#235 round 3 re-keys it onto the worktree-path-plus-branch anchor,
 /// CLAUDE.md rule 23): who claimed it, when, for which human (`login`,
@@ -1096,7 +1153,10 @@ pub(crate) fn sanitize_claimant_name(name: &str) -> String {
 /// **The `Claimed by ` prefix is load-bearing** (see
 /// [`CLAIM_COMMENT_PREFIX`]) and must survive every variant of this
 /// rendering, including a takeover — provenance goes in the tail
-/// (`, taking over from …`), never by changing the verb.
+/// (`, taking over from …`), never by changing the verb. The "who + where +
+/// when" clause itself, including the round-3 audit A3 sanitization
+/// reasoning, is shared with [`release_comment_body`] via
+/// [`render_identity_clause`].
 ///
 /// Mirrors [`parse_claim_fields`]'s two shapes exactly — a change to one
 /// without the other breaks round-tripping.
@@ -1106,36 +1166,7 @@ pub fn claim_comment_body(
     login: Option<&str>,
     takeover_from: Option<&str>,
 ) -> String {
-    let mut body = match identity {
-        Identity::Worktree {
-            path,
-            branch,
-            host,
-            label,
-        } => {
-            let label = label.as_deref().unwrap_or("the orchestration");
-            // Round-3 audit A3 (`issue/claim/020`): `path` and `branch` can
-            // both be attacker-influenceable with NO forged comment involved
-            // at all — a scheduled-task NAME reaches `path` via
-            // `sanitize_clone_segment`, which strips only `/ \ \0 ..`, not
-            // backticks, and a raw git branch name is not restricted from
-            // containing one either. Sanitize both, exactly like a claimant
-            // NAME, before they go inside their own backtick-wrapped span —
-            // otherwise an embedded backtick closes that span early and
-            // whatever follows (an `@mention`, a forged `Claimed by` line)
-            // renders as LIVE markdown. Sanitizing here (not in the stored
-            // `Identity`) leaves the compared identity string untouched.
-            let path_str = sanitize_claimant_name(&path.display().to_string());
-            let branch_str = sanitize_claimant_name(branch);
-            format!(
-                "{CLAIM_COMMENT_PREFIX}{label} working `{path_str}` on branch `{branch_str}` on \
-                 host {host} at {timestamp}"
-            )
-        }
-        Identity::Human { login, host } => {
-            format!("{CLAIM_COMMENT_PREFIX}@{login} working from `{host}` at {timestamp}")
-        }
-    };
+    let mut body = render_identity_clause(CLAIM_COMMENT_PREFIX, identity, timestamp);
     // The `for @<login>` clause is meaningful only for the worktree form —
     // a human-form claim already names the login as the identity itself
     // (rendered above), so repeating it would be redundant and would make
@@ -1147,6 +1178,56 @@ pub fn claim_comment_body(
     }
     if let Some(prev) = takeover_from {
         body.push_str(&format!(", taking over from `{prev}`"));
+    }
+    body.push('.');
+    body
+}
+
+/// The literal prefix [`release_comment_body`] always renders — issue #326's
+/// counterpart to [`CLAIM_COMMENT_PREFIX`], recording that a claim was
+/// deliberately relinquished rather than merely never made.
+pub const RELEASE_COMMENT_PREFIX: &str = "Released by ";
+
+/// Render the release-comment body posted on `issue release` (issue #326) —
+/// the release-side mirror of [`claim_comment_body`], same fields and same
+/// backtick-wrapping discipline (round-3 audit A3's reasoning applies
+/// identically here: `path`/`branch` can carry an attacker-influenceable
+/// backtick with no forged comment involved — see [`render_identity_clause`],
+/// which both functions share). `forced_from` names the identity a `--force`
+/// release displaced — `None` for releasing one's own claim, or for a forced
+/// release of an issue whose holder identity was never known. `reason` is
+/// the caller's optional free-text `--reason`, sanitized the same way a
+/// claimant name is (control characters, backticks) and — mirroring the
+/// "forcibly released from" clause immediately above it — wrapped in its
+/// own code span before it reaches a public comment body: `reason` was the
+/// ONLY untrusted value in this module rendered OUTSIDE a code span, so
+/// `--reason "ping @someone"` used to post a live GitHub mention and
+/// `--reason "#421"` used to create a real cross-reference (reviewer/auditor
+/// fix round, PR #582). A `reason` that is empty, or entirely whitespace
+/// once sanitized, is treated as if `--reason` had never been passed at all
+/// — otherwise `--reason ""` would render as the meaningless ", reason: ".
+pub fn release_comment_body(
+    identity: &Identity,
+    timestamp: &str,
+    login: Option<&str>,
+    forced_from: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let mut body = render_identity_clause(RELEASE_COMMENT_PREFIX, identity, timestamp);
+    if matches!(identity, Identity::Worktree { .. })
+        && let Some(login) = login
+    {
+        body.push_str(&format!(", for @{login}"));
+    }
+    if let Some(prev) = forced_from {
+        body.push_str(&format!(", forcibly released from `{prev}`"));
+    }
+    if let Some(reason) = reason {
+        let sanitized = sanitize_claimant_name(reason);
+        let trimmed = sanitized.trim();
+        if !trimmed.is_empty() {
+            body.push_str(&format!(", reason: `{trimmed}`"));
+        }
     }
     body.push('.');
     body
@@ -1747,6 +1828,23 @@ mod tests {
     }
 
     #[test]
+    fn issue_edit_remove_label_argv_shape() {
+        assert_eq!(
+            issue_edit_remove_label_argv("acme/widgets", 7, IN_PROGRESS_LABEL),
+            vec![
+                "issue",
+                "edit",
+                "--repo",
+                "acme/widgets",
+                "--remove-label",
+                "in-progress",
+                "--",
+                "7",
+            ]
+        );
+    }
+
+    #[test]
     fn issue_comment_argv_shape() {
         assert_eq!(
             issue_comment_argv(
@@ -1895,6 +1993,108 @@ mod tests {
         );
         // The takeover clause must never displace the load-bearing prefix.
         assert!(body.starts_with(CLAIM_COMMENT_PREFIX));
+    }
+
+    // --- issue #326: release_comment_body ---
+
+    #[test]
+    fn release_comment_body_names_releaser_and_reason() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = release_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            Some("bob"),
+            None,
+            Some("PR merged"),
+        );
+        assert!(body.starts_with(RELEASE_COMMENT_PREFIX), "got {body:?}");
+        assert!(body.contains(", for @bob"), "got {body:?}");
+        assert!(body.contains("PR merged"), "got {body:?}");
+        assert!(
+            !body.contains("forcibly released"),
+            "no forced_from was supplied, so the forced clause must be omitted, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn release_comment_body_names_who_it_was_forced_from() {
+        let holder =
+            Identity::orchestration("orch-A", Path::new("/work/wt-a"), "branch-a").to_string();
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body =
+            release_comment_body(&identity, "2026-08-09T00:00:00Z", None, Some(&holder), None);
+        assert!(
+            body.contains(&format!("forcibly released from `{holder}`")),
+            "must name who it was forcibly released from, backtick-wrapped, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn release_comment_body_sanitizes_reason() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = release_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            None,
+            None,
+            Some("done`\ninjected"),
+        );
+        assert!(!body.contains('\n'), "got {body:?}");
+        assert!(!body.contains("done`"), "got {body:?}");
+    }
+
+    // --- reviewer/auditor fix round, PR #582: reason wrapped in a code span ---
+
+    #[test]
+    fn release_comment_body_wraps_reason_in_a_code_span() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = release_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            None,
+            None,
+            Some("PR merged"),
+        );
+        assert!(
+            body.contains(", reason: `PR merged`"),
+            "the reason must be wrapped in its own code span, mirroring the `forcibly \
+             released from `{{prev}}`` clause immediately above it, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn release_comment_body_reason_mention_stays_inert_inside_its_code_span() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = release_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            None,
+            None,
+            Some("ping @someone see #421"),
+        );
+        // `reason` used to be the ONLY untrusted value in this module
+        // rendered outside a code span — an even count of backticks
+        // preceding the `@` means it sits OUTSIDE any open span (live).
+        let at_idx = body.find('@').expect("reason must be present");
+        let backticks_before = body[..at_idx].matches('`').count();
+        assert!(
+            !backticks_before.is_multiple_of(2),
+            "an @mention inside the reason must sit inside a code span (odd backtick count \
+             before it), got {body:?}"
+        );
+    }
+
+    #[test]
+    fn release_comment_body_omits_empty_reason() {
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        for reason in [Some(""), Some("   "), Some("```")] {
+            let body = release_comment_body(&identity, "2026-08-09T00:00:00Z", None, None, reason);
+            assert!(
+                !body.contains("reason:"),
+                "an empty (or all-whitespace, or all-backtick) --reason must be treated the \
+                 same as no --reason at all, got {body:?} for input {reason:?}"
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ This is an **accident-preventer for cooperating orchestrations, never a security
 
 ## If it blocks or asks you unexpectedly
 
-Read the reason text — it names the holder (for a `deny`) or the specific ambiguity (for an `ask`). If the claim is stale (the holding orchestration has genuinely stopped), CLAUDE.md rule 23 covers `worker-agent-deck issue claim --takeover --confirm-stopped`. If the hook is simply wrong about which issue a command targets — an unusual quoting form, a flag it doesn't recognize — that is exactly the residual scope this hook accepts; re-run with an explicit, literal issue/PR number, or proceed by hand.
+Read the reason text — it names the holder (for a `deny`) or the specific ambiguity (for an `ask`). If the claim is stale (the holding orchestration has genuinely stopped) and you intend to take over the SAME issue and keep working it, CLAUDE.md rule 23 covers `worker-agent-deck issue claim --takeover --confirm-stopped`. If instead you just want the issue unlocked — you are not going to work it yourself right now — release it with `worker-agent-deck issue release <n> --force --confirm-stopped` (issue #326) rather than taking it over; `release` requires both flags together, the same deliberate two-step friction `claim --takeover --confirm-stopped` requires, so the override can't be satisfied in the same breath the conflict is discovered. If the hook is simply wrong about which issue a command targets — an unusual quoting form, a flag it doesn't recognize — that is exactly the residual scope this hook accepts; re-run with an explicit, literal issue/PR number, or proceed by hand.
 
 ## Testing it yourself
 
