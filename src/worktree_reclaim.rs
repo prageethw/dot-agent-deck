@@ -1831,15 +1831,23 @@ fn git_in_untrusted_dir(dir: &Path) -> Command {
 ///   artifact and correctly reports `owned: false` rather than being
 ///   hidden — mirroring how `owned_git_dir` returning `None` yields
 ///   `owned: false`, never a dropped row.
-/// - **Stale entries.** The artifact is never removed when a clone is
-///   later deleted, so it would vouch for an unrelated directory recreated
-///   at the same path afterward, if that later directory canonicalizes to
-///   the identical clone-dir path the hash was computed from — in practice
-///   this requires reusing the exact same `clone_dir` path after a prior
-///   clone there was destroyed. Broader than a naive per-clone-tree
-///   artifact would be (this one outlives the clone's own deletion by
-///   design), but no broader than M4a's own shared-namespace staleness, and
-///   nothing else in the deck ever writes into this directory.
+/// - **Stale entries.** [`remove_isolated_clone_dir`] now clears the
+///   artifact (best-effort) immediately after removing the clone directory
+///   it names (fork issue #546 hazard 1), so the removal path this deck
+///   itself drives no longer leaves it behind. What remains is narrower
+///   than the original claim: a clone destroyed by some other means (a
+///   manual `rm -rf`, or a removal whose marker-clearing step itself fails
+///   — logged and tolerated, never a hard failure, per that function's own
+///   doc comment) still leaves the artifact in place, and it would then
+///   vouch for an unrelated directory recreated at the same path
+///   afterward, if that later directory canonicalizes to the identical
+///   clone-dir path the hash was computed from — in practice this requires
+///   reusing the exact same `clone_dir` path after a prior clone there was
+///   destroyed outside this deck's own removal path. Broader than a naive
+///   per-clone-tree artifact would be (this one outlives the clone's own
+///   deletion by design), but no broader than M4a's own shared-namespace
+///   staleness, and nothing else in the deck ever writes into this
+///   directory.
 /// - **Path-bound, same as M4a (reviewer R2, PR #515).** Because the key is
 ///   the clone's own canonical PATH rather than anything stored inside the
 ///   clone's tree, `cp -r`/`mv` of a genuine clone to a different sibling
@@ -2531,12 +2539,14 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// re-verification exists to catch. The attach-lock provenance artifact is
 /// nothing like that: it is written once, under `state_dir()`, at
 /// `provision_isolated_clone_sync` time, keyed by the clone's own canonical
-/// PATH rather than anything inside its tree, and — per
-/// [`candidate_has_attach_lock`]'s own documented "stale entries" limit — is
-/// never removed even once the clone it names has been deleted. Nothing a
-/// live orchestration does inside the clone touches it, so it cannot
-/// legitimately flip from present to absent in this window the way the other
-/// four can flip from safe to unsafe. And because the check is purely
+/// PATH rather than anything inside its tree, and this function's own
+/// marker-clearing step (fork issue #546 hazard 1, below) is the only thing
+/// that ever removes it — and that step runs only after `remove_dir_all`
+/// has already succeeded, later in this same function body. So during the
+/// examination-to-removal window this re-verification actually covers,
+/// nothing has touched the marker yet: it cannot legitimately flip from
+/// present to absent in that window the way the other four can flip from
+/// safe to unsafe. And because the check is purely
 /// path-keyed rather than clone-identity-keyed, re-deriving it here would
 /// answer the identical question [`isolated_clone_report`] already answered
 /// at examination time — it cannot even detect the one adjacent hazard that
@@ -2637,6 +2647,12 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
     // genuinely gone from disk as one that is still there and needs
     // attention -- `forget_isolated_workspace` has no such batch
     // classification to corrupt, which is why it can afford to propagate.
+    // `attempt_isolated_clone_cleanup` (issue_dispatch_run.rs) is actually
+    // the closer precedent for this choice, not just an alternative to
+    // contrast against: it clears the same marker after the same
+    // `remove_dir_all`, best-effort, for the same reason -- there, too, the
+    // directory is already gone by the time the marker removal runs, so a
+    // hard failure would only misreport a cleanup that already succeeded.
     let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(worktree_path);
     let marker_cleared = match std::fs::remove_file(&marker_path) {
         Ok(()) => true,
