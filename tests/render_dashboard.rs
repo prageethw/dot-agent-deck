@@ -1695,6 +1695,97 @@ fn agent_badge_006_model_with_format_chars_is_sanitized() {
     );
 }
 
+/// Scenario: issue #670 — apply a `SessionStart` `AgentEvent` whose
+/// `display_name` metadata (`DISPLAY_NAME_METADATA_KEY`) embeds a
+/// Unicode `Cf` format character (U+202E RIGHT-TO-LEFT OVERRIDE) and is
+/// far longer than a reasonable display length, through the real
+/// `AppState::apply_event` seam, then check `SessionState.display_name`
+/// directly — no render involved, since the defect is inside
+/// `apply_event` itself: it used to store `display_name` behind only an
+/// `is_empty()` filter, with no sanitization or length bound, unlike
+/// `event.model` a few lines above (`dashboard/agent-badge/005`,
+/// `dashboard/agent-badge/006`). `apply_event` now routes the value through
+/// [`dot_agent_deck::untrusted_text::sanitize_display_name`], which strips
+/// (not escapes) control/bidi characters and clamps to
+/// `agent_pty::DISPLAY_NAME_MAX_LEN` bytes via `truncate_on_char_boundary`
+/// (the same truncator `session_id` gets, so a clamped name carries the
+/// same trailing `…` a shortened id does).
+#[spec("dashboard/agent-badge/007")]
+#[test]
+fn agent_badge_007_display_name_is_sanitized_and_clamped() {
+    let mut state = AppState::default();
+    state.register_pane("pane-badge-name".to_string());
+    let started = chrono::Utc::now();
+
+    let hostile_display_name = format!("Sonnet\u{202e}-evil-!{}TAIL-MARKER-ZZZZ", "日".repeat(100));
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        DISPLAY_NAME_METADATA_KEY.to_string(),
+        hostile_display_name.clone(),
+    );
+    state.apply_event(AgentEvent {
+        session_id: "name-id-01".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata,
+        pane_id: Some("pane-badge-name".to_string()),
+        agent_id: Some("agent-badge-name".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
+    let session = state
+        .sessions
+        .get("name-id-01")
+        .expect("the session exists after SessionStart");
+
+    let display_name = session
+        .display_name
+        .as_deref()
+        .expect("non-empty display_name metadata must be stored on the session");
+
+    assert!(
+        !display_name.contains('\u{202e}'),
+        "a Cf format char (U+202E RIGHT-TO-LEFT OVERRIDE) in display_name \
+         metadata must not reach session.display_name unsanitized:\n{display_name}"
+    );
+    assert!(
+        !display_name.contains("TAIL-MARKER-ZZZZ"),
+        "an unbounded display_name must be length-clamped to a sane display \
+         cap — the raw tail of a ~340-char display_name must not survive into \
+         session.display_name:\n{display_name}"
+    );
+
+    // `apply_event` must store exactly what `sanitize_display_name` produces
+    // — the single source of truth for this seam's strip-then-clamp policy
+    // (issue #670), so a passing test here does not merely happen to agree
+    // with it by coincidence.
+    let expected = dot_agent_deck::untrusted_text::sanitize_display_name(&hostile_display_name)
+        .expect("the hostile fixture has non-whitespace content surviving sanitization");
+    assert_eq!(
+        display_name, expected,
+        "session.display_name must equal sanitize_display_name's own output for the same input"
+    );
+    assert!(
+        display_name.len() <= dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN + "…".len(),
+        "clamped display_name must not exceed the {}-byte cap plus the trailing ellipsis, got \
+         {} bytes:\n{display_name}",
+        dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN,
+        display_name.len()
+    );
+    assert!(
+        display_name.ends_with('…'),
+        "a display_name clamped below its sanitized length must carry the same trailing \
+         ellipsis session_id truncation does:\n{display_name}"
+    );
+}
+
 /// Scenario: Aggregate a busy mixed deck (14 Claude Code + 8 Codex sessions) and
 /// render its stats bar at 60 columns — the width the bar actually gets, since it
 /// draws into the last row of the left dashboard column whenever panes are open.
