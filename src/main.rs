@@ -2584,6 +2584,14 @@ fn run_issue_claim_cli(
 /// ambiguous state and from an operational failure it cannot answer at all
 /// — see `dot_agent_deck::issue_claim::ClaimCheckOutcome`'s doc table for
 /// the full mapping. Do not renumber these without updating that hook.
+///
+/// Code 2 is deliberately SKIPPED (round-2 fix, reviewer B5 / auditor R3):
+/// it is clap's own reserved usage-error code, so any `worker-agent-deck`
+/// binary predating this subcommand answers `claim-check` with exit 2 from
+/// a `clap` usage error, not from this function at all — colliding with
+/// whatever tier claimed 2 and fabricating a claim-state reason that was
+/// never actually determined. `Clear=0, RefusedByLock=1, (2 reserved by
+/// clap, never assigned here), CouldNotDetermine=3, Ambiguous=4`.
 fn run_issue_claim_check_cli(issue: u64, repo: Option<String>) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
@@ -2602,13 +2610,13 @@ fn run_issue_claim_check_cli(issue: u64, repo: Option<String>) -> ExitCode {
             eprintln!("issue claim-check: {message}");
             ExitCode::from(1)
         }
-        ClaimCheckOutcome::Ambiguous(message) => {
-            eprintln!("issue claim-check: {message}");
-            ExitCode::from(2)
-        }
         ClaimCheckOutcome::CouldNotDetermine(message) => {
             eprintln!("issue claim-check: {message}");
             ExitCode::from(3)
+        }
+        ClaimCheckOutcome::Ambiguous(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(4)
         }
     }
 }

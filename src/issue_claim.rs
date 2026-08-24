@@ -531,8 +531,19 @@ pub fn run_issue_claim(
 /// |---|---|---|
 /// | [`Clear`](ClaimCheckOutcome::Clear) | 0 | allow |
 /// | [`RefusedByLock`](ClaimCheckOutcome::RefusedByLock) | 1 | deny — confident violation |
-/// | [`Ambiguous`](ClaimCheckOutcome::Ambiguous) | 2 | ask (or deny if "ask" is unsupported) |
+/// | (clap usage error — never assigned here) | 2 | reserved by `clap`; see below |
 /// | [`CouldNotDetermine`](ClaimCheckOutcome::CouldNotDetermine) | 3 | allow, but surface the reason |
+/// | [`Ambiguous`](ClaimCheckOutcome::Ambiguous) | 4 | ask (or deny if "ask" is unsupported) |
+///
+/// Code 2 is deliberately skipped (round-2 fix, reviewer B5 / auditor R3):
+/// it is clap's own reserved usage-error exit code, so a `worker-agent-deck`
+/// binary predating this subcommand answers `claim-check` with exit 2 from a
+/// `clap` parse failure — not from this enum at all. Assigning 2 to a real
+/// variant here would make that stale-binary case indistinguishable from a
+/// genuine outcome and fabricate a reason nothing determined. Do not
+/// renumber ANY of these without updating
+/// `.claude/hooks/check-issue-claim.sh`'s `case` statement in the same
+/// commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimCheckOutcome {
     /// `ClaimDecision::Claim` — nobody holds the issue, or the caller

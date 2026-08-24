@@ -13,7 +13,6 @@
           {
             "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/check-issue-claim.sh",
-            "if": "Bash(gh *)",
             "timeout": 15
           }
         ]

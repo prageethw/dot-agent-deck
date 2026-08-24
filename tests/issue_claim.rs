@@ -2131,19 +2131,21 @@ fn issue_claim_028_comment_naming_a_non_assignee_removes_nobody() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #286 (RED half) — `issue claim-check <n> [--repo <owner/name>]`, a
-// NEW, READ-ONLY subcommand that reuses `issue claim`'s own
-// `resolve_caller_identity` + `read_current_claim` + `decide_claim` to report
-// the SAME lock decision without ever writing a comment, a label, or an
-// assignee. This is the mechanical check a Claude Code `PreToolUse` hook will
-// shell out to (issue #286) so the hook's identity logic can never drift from
-// the deck's own — it must never itself become a second, independent
-// implementation of "who holds this issue?" (the exact "two guards out of
-// sync" failure mode fork #174 already warns about). The subcommand does not
-// exist yet: `clap` currently rejects `issue claim-check ...` as an
-// unrecognized subcommand, so these four tests are RED on a parse failure
-// today and must fail on their actual read-only/exit-code assertions once
-// the coder wires it up — not on argument parsing.
+// Issue #286 — `issue claim-check <n> [--repo <owner/name>]`, a READ-ONLY
+// subcommand that reuses `issue claim`'s own `resolve_caller_identity` +
+// `read_current_claim` + `decide_claim` to report the SAME lock decision
+// without ever writing a comment, a label, or an assignee. This is the
+// mechanical check the Claude Code `PreToolUse` hook
+// (`.claude/hooks/check-issue-claim.sh`) shells out to so the hook's
+// identity logic can never drift from the deck's own — it must never itself
+// become a second, independent implementation of "who holds this issue?"
+// (the exact "two guards out of sync" failure mode fork #174 already warns
+// about). Implemented (see `run_issue_claim_check` /
+// `run_issue_claim_check_cli`); `issue_claim_029`-`032` below assert its
+// read-only property and (per PR #573's round-2 fix, reviewer B6 / auditor
+// R5) its exact exit code, since the hook's deny/ask/allow tiering is a
+// direct function of that number — see `ClaimCheckOutcome`'s doc table in
+// `src/issue_claim.rs` for the current 0/1/3/4 mapping.
 // ---------------------------------------------------------------------------
 
 /// Scenario: An unlabelled issue (no `in-progress` label, no claim comment)
@@ -2174,6 +2176,12 @@ fn issue_claim_029_claim_check_on_unlabelled_issue_reports_ok_and_writes_nothing
         out.status.success(),
         "claim-check on an unlabelled issue must report success — nobody holds it, so this \
          identity may proceed (`ClaimDecision::Claim`); out={}",
+        combined(&out)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`Clear` must map to exit 0, the hook's tier-0 (allow) code; out={}",
         combined(&out)
     );
 
@@ -2228,6 +2236,13 @@ fn issue_claim_030_claim_check_refuses_when_held_by_a_different_identity_and_wri
     assert!(
         !check_b.status.success(),
         "claim-check must exit non-zero when the issue is held by a DIFFERENT identity; out={}",
+        combined(&check_b)
+    );
+    assert_eq!(
+        check_b.status.code(),
+        Some(1),
+        "`RefusedByLock` must map to exit 1, the hook's tier-1 (deny) code — this is the code \
+         the hook's `run_claim_check` treats as a confident lock violation; out={}",
         combined(&check_b)
     );
     let text = combined(&check_b);
@@ -2292,6 +2307,13 @@ fn issue_claim_031_claim_check_on_own_claim_is_idempotent_and_writes_nothing() {
          `Claim`); out={}",
         combined(&check)
     );
+    assert_eq!(
+        check.status.code(),
+        Some(0),
+        "the idempotent-refresh `Claim` case must map to exit 0, same as `issue/claim/029`'s \
+         unlabelled case — both are `ClaimCheckOutcome::Clear`; out={}",
+        combined(&check)
+    );
 
     let new_calls: Vec<String> = fx.gh_calls().into_iter().skip(calls_before_check).collect();
     assert!(
@@ -2331,6 +2353,16 @@ fn issue_claim_032_claim_check_refuses_when_labelled_with_no_claim_comment() {
          refuse — the holder's identity is unknown; out={}",
         combined(&out)
     );
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "`Ambiguous` (`RefuseNoIdentity`) must map to exit 4, the hook's tier-4 (ask) code — \
+         renumbered off clap's reserved exit 2 in PR #573's round-2 fix (reviewer B5 / auditor \
+         R3): a pre-`claim-check` `worker-agent-deck` binary answers this subcommand with \
+         clap's own usage-error exit 2, so no real outcome may ever be assigned that code; \
+         out={}",
+        combined(&out)
+    );
     let text = combined(&out);
     assert!(
         text.contains("identity unknown"),
@@ -2342,5 +2374,49 @@ fn issue_claim_032_claim_check_refuses_when_labelled_with_no_claim_comment() {
     assert!(
         !any_claim_write(&calls),
         "a refusal must write nothing; observed gh calls: {calls:?}"
+    );
+}
+
+/// Scenario: `issue claim-check` is run with `DOT_AGENT_DECK_PANE_ID` SET
+/// (an agent-shaped caller) from a directory that is NOT a linked
+/// worktree — the same fixture shape `issue/claim/006` uses to pin
+/// `resolve_caller_identity`'s refusal, which is also CLAUDE.md rule 17's
+/// normal orchestrator-in-the-root-checkout case. Assert the check exits
+/// with `CouldNotDetermine`'s specific code (round-2 fix, reviewer B6 /
+/// auditor R5: this outcome previously had no test on either side) and
+/// writes nothing — an operational failure must never be indistinguishable
+/// from a confident refusal or a confident allow.
+#[spec("issue/claim/033")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_033_claim_check_could_not_determine_when_caller_identity_is_unresolvable() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    fx.set_login("gina");
+
+    let out = fx.run(
+        &fx.repo.clone(),
+        &["issue", "claim-check", "33", "--repo", repo],
+        Some("pane-033"),
+    );
+    assert!(
+        !out.status.success(),
+        "claim-check must refuse to answer when the caller's identity cannot be resolved at \
+         all (an agent-shaped pane whose cwd is not a linked worktree); out={}",
+        combined(&out)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "`CouldNotDetermine` must map to exit 3, the hook's tier-3 (allow, but surface the \
+         reason) code — NOT tier 1 (deny) or tier 4 (ask): a caller that could not even ask the \
+         question must never be treated the same as one who asked and was refused; out={}",
+        combined(&out)
+    );
+
+    let calls = fx.gh_calls();
+    assert!(
+        !any_claim_write(&calls),
+        "a could-not-determine outcome must write nothing; observed gh calls: {calls:?}"
     );
 }
