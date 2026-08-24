@@ -102,6 +102,19 @@ pub fn shell_command_flag() -> &'static str {
 /// special between single quotes, so this preserves whitespace, double
 /// quotes, `$`, backticks, backslashes, real newlines, `;`, `&`, `|`,
 /// redirection, glob characters and parentheses.
+///
+/// **Caller obligation, unlike the Windows arm**: this function quotes but
+/// does not itself neutralize control characters — a raw control byte
+/// survives untouched inside the single quotes it adds, since
+/// single-quoting is a shell-*grammar* defense and a live PTY's line
+/// discipline consumes several control bytes a layer *beneath* that
+/// grammar, before the shell ever reads them (fork issue #429). The
+/// Windows arm ([`quote_cmd_exe_arg`]) bakes that sanitization into its
+/// own private escaping path; this function does not, so a caller that
+/// feeds this function's output to a live PTY — exactly the
+/// `dot-agent-deck watch --interval N <command>` use case named above —
+/// must call [`sanitize_shell_control_chars`] on `arg` itself first, as
+/// `watch_invocation`'s Unix arm now does.
 #[cfg(unix)]
 pub fn quote_shell_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
@@ -120,17 +133,34 @@ pub fn quote_shell_arg(arg: &str) -> String {
 /// shell-grammar defense and this operates a layer beneath it).
 ///
 /// **Deliberately narrower than the Windows sibling**: this excludes `\n`
-/// (and `\t`, which is not a `termios` signal/editing byte in canonical
-/// mode either). A real newline is genuinely safe here today —
-/// `watch_invocation_preserves_real_newline_posix` proves it — because it
-/// lands inside `quote_shell_arg`'s single-quoted wrapper as an
-/// *unterminated* quoted argument from the reading shell's point of view;
-/// POSIX shells recognize the still-open quote and continue reading
-/// (`PS2`) rather than executing anything, so the embedded newline never
-/// produces a fresh, attacker-controlled command line the way it does on
-/// the `cmd.exe` delivery path. Everything else in Unicode's control
-/// category (`char::is_control` — the C0 range `0x00-0x1F` and `DEL`
-/// `0x7F`) is replaced, not only the four bytes fork issue #429 named
+/// (and `\t` — unlike the four bytes fork issue #429 named, no common
+/// terminal ships a *default* `stty` binding that puts any termios
+/// special-character role on `\t` at all, so — while `\t` is in principle
+/// just as remappable via `stty` as anything else — exempting it doesn't
+/// reintroduce the "safe under one particular, unverified configuration"
+/// risk the class-wide replacement below exists to close; it would take a
+/// user-chosen *non-default* remap to make `\t` dangerous here, not merely
+/// an unverified default one, and `\t` also carries none of the other
+/// bytes' width-corrupting/line-splitting effect on the pane if it did
+/// somehow reach a live terminal unreplaced). A real newline is genuinely
+/// safe here today — `watch_invocation_preserves_real_newline_posix`
+/// proves it — because it lands inside `quote_shell_arg`'s single-quoted
+/// wrapper as an *unterminated* quoted argument from the reading shell's
+/// point of view; POSIX shells recognize the still-open quote and
+/// continue reading (`PS2`) rather than executing anything, so the
+/// embedded newline never produces a fresh, attacker-controlled command
+/// line the way it does on the `cmd.exe` delivery path. That reasoning is
+/// verified only for the POSIX-conformant shells this deck actually
+/// invokes by default (`bash`, `dash`, plain `sh`) — `default_shell`'s
+/// Unix arm resolves the process's own `$SHELL`, unconstrained by the
+/// deck, and an auditor review of fork issue #429 demonstrated real
+/// command execution through this same `\n` exemption when `$SHELL` is
+/// `csh`/`tcsh`, whose quoting grammar handles an embedded newline
+/// differently; that gap is pre-existing (not a regression this fix
+/// introduces) and is tracked separately rather than closed here. Everything
+/// else in Unicode's control category (`char::is_control` — the C0 range
+/// `0x00-0x1F`, `DEL` `0x7F`, and the C1 range `U+0080..=U+009F`) is
+/// replaced, not only the four bytes fork issue #429 named
 /// (`\x03` ETX/SIGINT, `\x15` NAK, `\x17` ETB, `\x04` EOT, the ones a
 /// *default* `stty` configuration binds to line-kill/word-erase/EOF): also,
 /// e.g., `\x1A` (SUSPEND/Ctrl-Z, `SIGTSTP`), `\x1C` (Ctrl-\\, `SIGQUIT`) and
@@ -145,6 +175,13 @@ pub fn quote_shell_arg(arg: &str) -> String {
 /// `sanitize_cmd_exe_control_chars`'s doc comment gives: the value then
 /// reads as if the caller had used a space there in the first place, and
 /// stripping outright risks silently joining two words into one.
+///
+/// **`pub`, unlike its Windows sibling [`sanitize_cmd_exe_control_chars`]
+/// (module-private)**: that function's only two callers
+/// ([`escape_cmd_exe_program`], [`quote_cmd_exe_arg`]) both live in this
+/// same file, while this function's only caller,
+/// `mode_manager::watch_invocation`'s Unix arm, lives in a different
+/// module — so this needs at least crate-wide visibility to compile.
 #[cfg(unix)]
 pub fn sanitize_shell_control_chars(s: &str) -> String {
     s.chars()

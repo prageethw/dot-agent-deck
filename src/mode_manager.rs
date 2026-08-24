@@ -267,6 +267,17 @@ impl ModeManager {
                         });
                         watch_invocation(&exe, 10, &pane_cfg.command)
                     } else {
+                        // Not run through `sanitize_shell_control_chars`: this
+                        // value still ends up written keystroke-by-keystroke
+                        // into a live PTY via `write_to_pane` in
+                        // `start_mode_commands` below, the same delivery
+                        // mechanism `watch_invocation` was fixed for, so it is
+                        // not actually *proven* safe against a raw control
+                        // byte either — this is one of the non-watch sites
+                        // fork issue #429's audit flagged (finding E) as a
+                        // separate, broader investigation, deliberately left
+                        // open by this fix, which is scoped to
+                        // `watch_invocation` alone.
                         pane_cfg.command.clone()
                     };
 
@@ -488,6 +499,14 @@ impl ModeManager {
             let interval_secs = interval.unwrap_or(5);
             watch_invocation(&exe, interval_secs, command)
         } else {
+            // Same caveat as `activate_mode`'s non-watch branch: `pane_cmd`
+            // is typed into `old_pane_id`'s live PTY unsanitized below (via
+            // `write_to_pane`, in some cases embedded right after this
+            // function's own `export … && printf … &&` prefix — the exact
+            // shape `watch_invocation` was fixed for), and is not proven
+            // safe against the same control-character/termios-line-
+            // discipline risk. Tracked separately under fork issue #429
+            // audit finding E rather than closed here.
             command.to_string()
         };
 
@@ -690,6 +709,23 @@ mod tests {
     /// behaves safely once handed to a real `sh` that way, but it cannot
     /// reproduce, and does not prove, the PTY-level consumption itself;
     /// that remains reasoned rather than executed.
+    ///
+    /// **A second, sharper honesty caveat, specific to this test — not
+    /// shared with the Windows sibling**: the marker-file assertion below
+    /// is unfalsifiable and always was, even pre-fix. There, an embedded
+    /// LF genuinely splits `cmd.exe`'s own parsing of the `/C <string>`
+    /// argument, so that sibling's marker check is a real RED→GREEN
+    /// signal. Here, the payload sits inside `quote_shell_arg`'s
+    /// single-quoted wrapper, and a raw control byte between single
+    /// quotes is inert to `sh`'s own grammar whether or not it was
+    /// sanitized — `touch injected.marker` never runs via this `sh -c`
+    /// invocation regardless of this fix, so the marker assertion cannot
+    /// go red either before or after it. The `!line.chars().any(…)`
+    /// string assertion immediately below is the only assertion in this
+    /// test that actually proves anything about the fix; the marker
+    /// check is kept only as an (unchanging) proof that the quoting
+    /// itself still holds, not as evidence for the control-character
+    /// substitution.
     #[cfg(unix)]
     #[test]
     fn watch_invocation_neutralizes_control_characters_through_real_shell_posix() {
@@ -706,10 +742,12 @@ mod tests {
             let line = watch_invocation(&exe, 5, command);
 
             assert!(
-                !line.chars().any(|c| c.is_control() && c != '\n'),
+                !line
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\t'),
                 "watch_invocation must never emit a raw control character \
-                 (other than a legitimate real newline) into the shell \
-                 command line\ncommand: {command:?}\nline: {line:?}"
+                 (other than a legitimate real newline or tab) into the \
+                 shell command line\ncommand: {command:?}\nline: {line:?}"
             );
 
             let output = std::process::Command::new("sh")
