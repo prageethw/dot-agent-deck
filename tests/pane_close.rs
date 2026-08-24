@@ -345,6 +345,9 @@ async fn handle_connection(
                         spawned_at_ms: None,
                         daemon_boot_id: None,
                         registration_generation: None,
+                        outstanding_delegation: None,
+                        silence_watch: None,
+                        delegation_commission: None,
                     }]
                 })
                 .unwrap_or_default();

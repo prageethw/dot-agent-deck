@@ -820,6 +820,9 @@ fn agent_record_round_trips_explicit_agent_type() {
         spawned_at_ms: None,
         daemon_boot_id: None,
         registration_generation: None,
+        outstanding_delegation: None,
+        silence_watch: None,
+        delegation_commission: None,
     };
     let json = serde_json::to_string(&rec).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -844,6 +847,9 @@ fn agent_record_omits_agent_type_when_none() {
         spawned_at_ms: None,
         daemon_boot_id: None,
         registration_generation: None,
+        outstanding_delegation: None,
+        silence_watch: None,
+        delegation_commission: None,
     };
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
     assert!(
@@ -967,6 +973,9 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         },
         AgentRecord {
             id: "9".into(),
@@ -981,6 +990,9 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         },
     ];
     let summary = RunningAgentsSummary::from_records(&records);

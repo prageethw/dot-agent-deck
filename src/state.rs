@@ -7271,6 +7271,13 @@ impl AppState {
         // above — see [`record_delegation_commission`] and
         // [`crate::agent_pty::WorkDoneProvenance`] for why that arm cannot tell
         // "never delegated" from "delegated with the idle detector switched off".
+        //
+        // Issue #586 M2/B round 2, closing upstream #590: expiry is now a
+        // fixed, config-independent window (`COMMISSION_MAX_AGE` in
+        // `agent_pty.rs`), checked per-arm — deliberately NOT derived from
+        // `worker_response_timeout_minutes` or any other switchable detector,
+        // per upstream #590's explicit ask. There is no timeout to resolve
+        // here any more.
         let provenance = registry.retire_delegation_commission(&signal.pane_id);
 
         // Fork #358 M1/M4: the compound generation/boot-id check now runs
