@@ -494,6 +494,21 @@ enum IssueCmd {
         #[arg(long = "confirm-stopped")]
         confirm_stopped: bool,
     },
+    /// Report whether the caller is clear to act on issue `<n>`, WITHOUT
+    /// writing anything — the read-only counterpart to `claim`, built to
+    /// back a `PreToolUse` hook (issue #286) that gates `gh issue
+    /// comment`/`close`/`edit` and a closing `gh pr merge` on the same
+    /// identity lock `claim` enforces. No `--takeover`/`--confirm-stopped`:
+    /// this command never writes, so takeover is meaningless here — resolve
+    /// a refusal with `issue claim --takeover --confirm-stopped` instead.
+    ClaimCheck {
+        /// The GitHub issue number.
+        issue: u64,
+        /// `owner/name`; derived from the current directory's `origin`
+        /// remote when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -1736,6 +1751,7 @@ fn main() -> ExitCode {
                 takeover,
                 confirm_stopped,
             } => run_issue_claim_cli(issue, repo, takeover, confirm_stopped),
+            IssueCmd::ClaimCheck { issue, repo } => run_issue_claim_check_cli(issue, repo),
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
@@ -2557,6 +2573,26 @@ fn run_issue_claim_cli(
         }
         Err(e) => {
             eprintln!("issue claim: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_issue_claim_check_cli(issue: u64, repo: Option<String>) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("issue claim-check: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match dot_agent_deck::issue_claim::run_issue_claim_check(&cwd, repo.as_deref(), issue) {
+        Ok(message) => {
+            print!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("issue claim-check: {e}");
             ExitCode::FAILURE
         }
     }

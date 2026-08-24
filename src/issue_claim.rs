@@ -516,6 +516,68 @@ pub fn run_issue_claim(
     }
 }
 
+/// Run `issue claim-check <issue>` against `repo` — the READ-ONLY
+/// counterpart to [`run_issue_claim`] (issue #286), built specifically to
+/// back a Claude Code `PreToolUse` hook that gates `gh issue
+/// comment`/`close`/`edit` and a closing `gh pr merge` on the same identity
+/// lock `issue claim` enforces, without the hook itself ever mutating the
+/// issue. Runs the exact same `resolve_caller_identity` →
+/// `read_current_claim` → `decide_claim` sequence [`run_issue_claim`] does —
+/// with `takeover`/`confirm_stopped` always `false`, since this command
+/// accepts neither flag — but on `ClaimDecision::Claim` stops there: no
+/// `do_claim`, no comment/label/assignee write of any kind. `Ok(message)` is
+/// the success text for stdout (exit 0, safe to proceed); `Err(message)`
+/// covers a refusal only (exit non-zero) — there is no operational-failure
+/// case distinct from a refusal here beyond the same repo-resolution /
+/// identity / `gh` errors [`run_issue_claim`] can also return.
+pub fn run_issue_claim_check(cwd: &Path, repo: Option<&str>, issue: u64) -> Result<String, String> {
+    let repo = match repo {
+        Some(r) => r.to_string(),
+        None => crate::worktree_reclaim::derive_repo_slug(cwd).ok_or_else(|| {
+            format!(
+                "could not derive an `owner/name` repo slug from {}'s `origin` remote; pass \
+                 --repo explicitly",
+                cwd.display()
+            )
+        })?,
+    };
+
+    let identity = resolve_caller_identity(cwd)?;
+    let (label_present, held, _current_assignees) = read_current_claim(&repo, issue)?;
+
+    match decide_claim(
+        label_present,
+        held.as_ref(),
+        &identity.to_string(),
+        false,
+        false,
+    ) {
+        ClaimDecision::Claim { .. } => Ok(format!(
+            "ok to proceed on issue #{issue} of {repo} as `{identity}`\n"
+        )),
+        ClaimDecision::RefuseNoIdentity => Err(format!(
+            "issue #{issue} of {repo} is labelled `{IN_PROGRESS_LABEL}` but no claim comment \
+             names a holder — refusing (identity unknown); this is likely a hand-typed claim \
+             applied outside `dot-agent-deck issue claim`"
+        )),
+        ClaimDecision::RefuseHeldByOther { holder, .. } => {
+            // Same sanitize-before-display discipline as `run_issue_claim`'s
+            // own `RefuseHeldByOther` arm (auditor A4) — `holder` is already
+            // sanitized by `decide_claim`, `timestamp` is a sibling field
+            // from the same untrusted comment and needs its own pass.
+            let since = held
+                .as_ref()
+                .map(|h| format!(" since {}", sanitize_claimant_name(&h.timestamp)))
+                .unwrap_or_default();
+            Err(format!(
+                "issue #{issue} of {repo} is held by `{holder}`{since} — resolve via `issue \
+                 claim --takeover --confirm-stopped` once you have confirmed the other agent \
+                 has stopped, then retry"
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
