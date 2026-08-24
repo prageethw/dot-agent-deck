@@ -580,6 +580,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** `Cc`/ANSI control-byte filtering (verified pre-existing, via the ratatui dependency source, not this repo's code); the truncation cap (`dashboard/agent-badge/005`); model-label normalization (`dashboard/agent-badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/agent-badge/007 — `display_name` metadata reaching `AppState::apply_event` on the same hook-socket wire as `model` gets no sanitization or length clamp at all, unlike `model` (issue #410 — `apply_event` sanitizes+clamps `event.model` right at the top of the function, but stores `event.metadata[DISPLAY_NAME_METADATA_KEY]` into `session.display_name` with only an `is_empty()` filter).
+- **Layer:** L1 (in-process `AppState::apply_event` seam; asserts directly on `SessionState.display_name`, no render involved — the defect is in `apply_event` itself, before any rendering happens).
+- **Agent:** none (a synthetic `SessionStart` carrying `display_name` metadata embedding U+202E RIGHT-TO-LEFT OVERRIDE plus a 300-character multi-byte (CJK) padding run and a distinctive ASCII tail marker).
+- **Asserts:** the raw U+202E character does not appear in `session.display_name` (mirrors `dashboard/agent-badge/006`'s property for `model`); the tail marker of the ~340-char display_name does not survive, proving truncation happened without pinning the exact cap value (mirrors `dashboard/agent-badge/005`'s property for `model`); and `session.display_name` is a truncated prefix of `display_name` run through `crate::terminal_sanitize::sanitize_for_terminal_display` — i.e. sanitize-then-clamp, the same order `apply_event` already uses for `model`.
+- **Does not assert:** the exact truncation cap chosen; rendered-card output (no render seam is exercised — see `dashboard/agent-badge/001` for the card's `display_name` body row); `model`'s own sanitization/clamping (`dashboard/agent-badge/005`, `dashboard/agent-badge/006`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Statuses
 
 #### status/transition
