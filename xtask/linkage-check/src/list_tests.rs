@@ -170,9 +170,8 @@ pub fn run_compare(repo_dir: &Path, ref_a: &str, ref_b: &str) -> Result<CompareO
 /// without depending on its `WorkTypeError` type, which is specific to
 /// work-type derivation rather than this command.
 fn resolve_ref(repo_dir: &Path, reference: &str) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = git_command(repo_dir)
         .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
-        .current_dir(repo_dir)
         .output()
         .map_err(|e| format!("invoke git rev-parse --verify {reference}: {e}"))?;
     if !out.status.success() {
@@ -798,10 +797,40 @@ fn escape_table_cell(value: &str) -> String {
 // I/O — git + filesystem
 // ---------------------------------------------------------------------------
 
+/// Git location environment variables that must never leak into a `git`
+/// invocation in this module (issue #344 auditor finding A2). An ambient
+/// `GIT_DIR` pointed at some other repository makes `git ls-tree` return
+/// empty output at exit 0 rather than erroring — read as "no tests" by
+/// every caller here instead of "wrong repository" — so `--compare`
+/// silently reports a confident all-clear while having read the wrong
+/// tree. Clearing all of them, not just `GIT_DIR`, closes the same door
+/// for its documented siblings (`git(1)` ENVIRONMENT VARIABLES).
+const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// Build a `git` [`Command`] rooted at `repo_dir` with every ambient git
+/// location variable cleared, so ambient environment can never redirect
+/// it to a different repository than the one named by `repo_dir`.
+fn git_command(repo_dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_dir);
+    for var in GIT_ENV_VARS_TO_CLEAR {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn git_merge_base(repo_dir: &Path) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = git_command(repo_dir)
         .args(["merge-base", "HEAD", "origin/main"])
-        .current_dir(repo_dir)
         .output()
         .map_err(|e| format!("invoke git merge-base: {e}"))?;
     if !out.status.success() {
@@ -818,9 +847,8 @@ fn git_merge_base(repo_dir: &Path) -> Result<String, String> {
 }
 
 pub(crate) fn git_show(repo_dir: &Path, reference: &str, path: &str) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = git_command(repo_dir)
         .args(["show", &format!("{reference}:{path}")])
-        .current_dir(repo_dir)
         .output()
         .map_err(|e| format!("invoke git show {reference}:{path}: {e}"))?;
     if !out.status.success() {
@@ -833,9 +861,8 @@ pub(crate) fn git_show(repo_dir: &Path, reference: &str, path: &str) -> Result<S
 }
 
 fn git_ls_tree(repo_dir: &Path, reference: &str, path: &str) -> Result<Vec<String>, String> {
-    let out = Command::new("git")
+    let out = git_command(repo_dir)
         .args(["ls-tree", "-r", "--name-only", reference, path])
-        .current_dir(repo_dir)
         .output()
         .map_err(|e| format!("invoke git ls-tree {reference} {path}: {e}"))?;
     if !out.status.success() {

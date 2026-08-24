@@ -71,11 +71,15 @@
 //!   user before delegating release.
 //!   - `--compare <ref-a> <ref-b>` (issue #344 item 3): reports the
 //!     `#[spec]` test population delta between two explicit refs —
-//!     added, removed, modified — and exits non-zero when a test
-//!     present at `ref-a` is missing at `ref-b`. Meant to be run by
-//!     hand across a sync boundary (`docs/develop/fork-sync-workflow.md`),
-//!     deliberately NOT wired into the automatic per-PR checks below —
-//!     see [`list_tests::run_compare`]'s doc comment for why a
+//!     added, removed, modified — and exits 1 when a test present at
+//!     `ref-a` is missing at `ref-b`. A ref that will not resolve or a
+//!     failing `git` invocation exits 2 instead, so a caller can tell
+//!     "a real removal was found" (1) apart from "the tool itself could
+//!     not run" (2) rather than reading both as the same failure
+//!     (issue #344 auditor finding A3). Meant to be run by hand across a
+//!     sync boundary (`docs/develop/fork-sync-workflow.md`), deliberately
+//!     NOT wired into the automatic per-PR checks below — see
+//!     [`list_tests::run_compare`]'s doc comment for why a
 //!     merge-base-vs-`origin/main` comparison would be structurally
 //!     vacuous or false-positive-prone on this suite's own triggers.
 //! - `work-type-check` — PRD fork#340 M3 R0: derives this diff's work type
@@ -727,9 +731,11 @@ fn run_list_tests(args: &[String]) -> ExitCode {
                 println!();
                 println!("--compare <ref-a> <ref-b> instead reports the #[spec] test");
                 println!("population delta between two arbitrary refs — added, removed,");
-                println!("modified — and exits non-zero if any test present at <ref-a>");
-                println!("is missing at <ref-b> (issue #344). Meant to be run by hand");
-                println!("across a sync boundary, not wired into the per-PR gate.");
+                println!("modified — and exits 1 if any test present at <ref-a> is");
+                println!("missing at <ref-b> (issue #344). Exits 2 instead if a ref will");
+                println!("not resolve or git itself fails, so a caller can tell a real");
+                println!("removal apart from the tool failing to run. Meant to be run by");
+                println!("hand across a sync boundary, not wired into the per-PR gate.");
                 return ExitCode::SUCCESS;
             }
             "--compare" => {
@@ -757,9 +763,14 @@ fn run_list_tests(args: &[String]) -> ExitCode {
 
 /// `cargo xtask list-tests --compare <ref-a> <ref-b>` dispatch (issue
 /// #344 item 3). Always prints the report — a removal is meant to be
-/// seen, not just detected — and exits non-zero exactly when the report
-/// found a removal, so a human (or a sync write-up step) can treat a
-/// non-zero exit as "read this before moving on."
+/// seen, not just detected — and exits 1 exactly when the report found a
+/// removal, so a human (or a sync write-up step) can treat that exit as
+/// "read this before moving on." A hard failure — a bad argument count,
+/// an unresolvable ref, or `git` itself failing — exits 2 instead of 1,
+/// matching the usage-error branch just below: both mean "the tool did
+/// not produce a real answer," which a bare non-zero exit cannot tell
+/// apart from "it ran fine and found a removal" (issue #344 auditor
+/// finding A3).
 fn run_list_tests_compare(args: &[String]) -> ExitCode {
     let (ref_a, ref_b) = match args {
         [a, b] => (a.as_str(), b.as_str()),
@@ -773,19 +784,26 @@ fn run_list_tests_compare(args: &[String]) -> ExitCode {
         }
     };
     let root = repo_root();
-    match list_tests::run_compare(&root, ref_a, ref_b) {
-        Ok(outcome) => {
-            print!("{}", outcome.markdown);
-            if outcome.has_removals {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
-        }
-        Err(e) => {
-            eprintln!("xtask list-tests --compare: {e}");
-            ExitCode::FAILURE
-        }
+    let result = list_tests::run_compare(&root, ref_a, ref_b);
+    match &result {
+        Ok(outcome) => print!("{}", outcome.markdown),
+        Err(e) => eprintln!("xtask list-tests --compare: {e}"),
+    }
+    compare_exit_code(&result)
+}
+
+/// Maps a [`list_tests::run_compare`] result to this command's exit code
+/// (issue #344 auditor finding A3). A removal found (`Ok` with
+/// `has_removals`) exits 1; a clean comparison exits 0; and the
+/// comparison itself failing to run — an unresolvable ref, a failing
+/// `git` invocation — exits 2, kept distinct from 1 so a caller can tell
+/// "a real removal was found" apart from "the tool did not produce an
+/// answer" without parsing stderr.
+fn compare_exit_code(result: &Result<list_tests::CompareOutcome, String>) -> ExitCode {
+    match result {
+        Ok(outcome) if outcome.has_removals => ExitCode::FAILURE,
+        Ok(_) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(2),
     }
 }
 
@@ -1766,5 +1784,45 @@ let y = 2;"###;
         assert!(out.contains("let _ = r_value;"));
         // The trailing line comment is still stripped.
         assert!(!out.contains("line comment after"));
+    }
+
+    // -- issue #344 auditor finding A3: --compare exit codes -----------
+
+    /// A removal found and a hard tool failure must never share an exit
+    /// code — if they did, a caller (or `fork-sync-workflow.md`'s own
+    /// procedure) could not tell "a real removal was found, go read it"
+    /// apart from "the comparison never produced an answer."
+    #[test]
+    fn compare_exit_code_distinguishes_removal_from_hard_error() {
+        let removal_found = Ok(list_tests::CompareOutcome {
+            markdown: String::new(),
+            has_removals: true,
+        });
+        let clean = Ok(list_tests::CompareOutcome {
+            markdown: String::new(),
+            has_removals: false,
+        });
+        let hard_error: Result<list_tests::CompareOutcome, String> =
+            Err("ref \"nope\" does not resolve to a commit".to_string());
+
+        let removal_code = compare_exit_code(&removal_found);
+        let clean_code = compare_exit_code(&clean);
+        let error_code = compare_exit_code(&hard_error);
+
+        assert_eq!(
+            removal_code,
+            ExitCode::FAILURE,
+            "a removal must be non-zero"
+        );
+        assert_eq!(clean_code, ExitCode::SUCCESS, "no removal must be exit 0");
+        assert_eq!(
+            error_code,
+            ExitCode::from(2),
+            "a hard failure must use a distinct exit code, not ExitCode::FAILURE"
+        );
+        assert_ne!(
+            removal_code, error_code,
+            "a real removal and a tool failure must not share an exit code (A3)"
+        );
     }
 }

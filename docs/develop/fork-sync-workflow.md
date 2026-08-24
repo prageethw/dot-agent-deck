@@ -53,7 +53,7 @@ git rebase upstream/main          # conflicts resolved HERE — once, per-commit
 # must be explained in this sync's own re-curation write-up. Run this BEFORE
 # either push below — the whole point is catching a silent drop before it
 # becomes the fork's published history, not after.
-cargo xtask list-tests --compare <fork-only-pre-rebase-sha> fork-only
+cd /absolute/path/to/worktree && cargo xtask list-tests --compare <fork-only-pre-rebase-sha> fork-only
 
 git push --force-with-lease origin fork-only
 git checkout main
