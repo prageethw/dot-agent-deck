@@ -40,17 +40,30 @@ You don't need to reproduce these; they're just what "resolve the conflicts with
 `main` never talks to `upstream`. Only `fork-only` rebases onto upstream, then `main` is reset to it.
 
 ```bash
+cd /absolute/path/to/worktree || exit 1   # every command below runs from here — the two force-pushes and the reset included; a failed cd must not silently fall through to running them in the ambient cwd
+
 git fetch upstream
 git checkout fork-only
 git rebase upstream/main          # conflicts resolved HERE — once, per-commit
 # ... resolve any conflicts with full rigor: read BOTH sides, don't guess, verify
 #     functional overlap beyond the visible conflict hunk, and regenerate + visually
 #     verify any snapshot content that changed ...
+
+# Fork issue #344 item 3: does this sync's rebase quietly drop a test along
+# with a superseded implementation? A removal here is not automatically
+# wrong (see "A fork test bundled with its implementation..." below) but it
+# must be explained in this sync's own re-curation write-up. Run this BEFORE
+# either push below — the whole point is catching a silent drop before it
+# becomes the fork's published history, not after.
+cargo xtask list-tests --compare <fork-only-pre-rebase-sha> fork-only
+
 git push --force-with-lease origin fork-only
 git checkout main
 git reset --hard fork-only
 git push --force origin main   # force-with-lease won't help here: we didn't fetch origin, so its tracking ref for main may be stale
 ```
+
+Capture `<fork-only-pre-rebase-sha>` with `git rev-parse fork-only` *before* the `git rebase upstream/main` step — it is `fork-only`'s tip going into the rebase, compared against `fork-only` coming out of it (identical to comparing against `main`, since `main` is about to be `git reset --hard fork-only`). A non-empty **Removed** section means the `#[spec]` test population shrank across the rebase; treat every row in it the same way the historical "Re-curated…" entries in the stack table below already narrate MIXED/UPSTREAM-WORTHY classifications — named and justified, not waved through because the command exited non-zero for a reason nobody checked.
 
 ### On a conflict over a fork feature, the fork wins
 
@@ -79,6 +92,23 @@ git push --force origin main   # force-with-lease won't help here: we didn't fet
 **Verify before resetting `main`.** The rebase finishing cleanly is not evidence the features survived it. Walk the PERMANENT rows in the stack table below and confirm each is still present, and run the diff-and-restore procedure in [`fork-config-backups.md`](fork-config-backups.md) for the config half (`devbox.json`, `.dot-agent-deck.toml`). `main` is reset to `fork-only` at the last step precisely so there is a window to check first — use it.
 
 **A resolution is not a place to redesign.** If honouring the fork's side looks wrong — the feature is obsolete, upstream's approach is better — raise it with the maintainer and handle it as its own change. A sync PR should read as "upstream's changes, plus the fork's features intact"; anything else in it is a defect, and a rebase is the worst possible place to review a design decision.
+
+### A fork test bundled with its implementation must survive that implementation being dropped
+
+**Fork issue #344.** A PERMANENT row below is usually one commit — test and implementation together, since most fork PRDs land as a single squashed commit. That is fine as long as the commit stays PERMANENT forever. It stops being fine the moment a future rebase decides the *implementation half* is superseded by upstream's own reimplementation (case 1/3 above, or the supersession paragraph in the immediately preceding section) — because dropping "the commit" drops the test with it, and that drop is silent: CI stays green on a smaller population, since upstream never had a test for a feature it never had either.
+
+**The cheapest form of this discipline is authoring, not rebasing.** Land a fork test as its own commit, separate from the implementation commit it protects, *when the commit is first authored* — issue #344 calls this the highest-leverage item by a wide margin, since it costs nothing but commit hygiene and means a later supersession decision can be made per-commit rather than forcing a split at rebase time under pressure.
+
+This is exactly what happened to `619d0f60` (PRD fork#197), dropped in the 2026-08-15 sync as "superseded" by upstream's differently-named reimplementation of the same contract (the symbol-grep paragraph above tells that half of the story). The test half — the M1–M4 coverage that would have caught the two real regressions this drop went on to cause (issue #194 / PR #341, and issue #423's remit re-assertion) — went with it, with nothing going red, because `git ls-tree` genuinely had fewer `#[spec]` tests after the drop and nothing compared that count against before.
+
+**When a future fork commit bundles a test together with the implementation it protects, and a later rebase determines the implementation is superseded, the test's own coverage must not be silently dropped with it.** Either:
+
+- **Split the commit before marking anything superseded** — the test half stays PERMANENT on its own row, the implementation half drops; or
+- **If splitting isn't practical at rebase time, say so explicitly in the stack-table entry**: name that the test half is being carried forward separately, and where (a new commit, a note to re-add it, whatever the actual disposition is) — the same way `754f0ba`'s and `8111027`'s rows below already narrate a partial, residue-only supersession rather than a clean drop.
+
+This is a **documentation and discipline change, not a mechanical enforcement** — nothing here stops a future rebase from making the same mistake again by construction. The closest thing to enforcement is the test-population comparison above (issue #344 item 3), and that catches the *symptom* — the population shrinking across the sync — not this specific *cause* (a bundled commit losing its test half to a supersession call made at the commit level). Treat the two as complementary: this paragraph is what a human resolving the rebase should do; the comparison is what catches it if they don't.
+
+**This discipline is a candidate for promotion into CLAUDE.md rule 24 if the doc-only version here turns out to be insufficient in practice** — a syncing agent only reads this file when it opens it, while CLAUDE.md is re-injected every turn (rule 17's own lesson). Left here for now rather than bundled into this PR: editing CLAUDE.md's rules is itself a rule-25 always-ask trigger regardless of what else is in the diff, and that is a decision for its own change, not a side effect of this one.
 
 ### A resolved-as-superseded commit can be silently un-resolved by a later commit's clean merge
 
