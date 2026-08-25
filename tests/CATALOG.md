@@ -4151,6 +4151,13 @@ without depending on the config struct API.
 - **Does not assert:** the two `src/ui.rs` call sites themselves, which are unchanged by this test (the fix is `coder`'s next step); the client-side suggestion/collision filter (covered by `orchestration/identity/034`/`035`); a genuine two-DIFFERENT-orchestrations same-name-different-dir claim, which is correct today and unrelated (covered by `orchestration/identity/031`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/037 — PRD fork#603 auditor blocker A1: `identity_033`'s two SIBLING-directory opens (`team-a/proj`, `team-b/proj`, same basename, same suggested `proj-orchestrator-1`) actually resolve into the SAME physical isolated-clone workspace at runtime — `identity_033` only checks their tab labels and can't see this.
+- **Layer:** L2 (PTY-attached real binary via `TuiDeck`; stand-in `cat` agent, no real LLM tokens spent, no credentials required).
+- **Agent:** none (both roles of the `orch-deck` fixture run `cat`).
+- **Asserts:** reusing `identity_033`'s own `team-a/proj`/`team-b/proj` setup and open sequence, this test also watches the real sibling workspace directories provisioning creates on disk — every directory adjacent to the launch dir whose name is prefixed by the launch dir's own (test-unique, `tempfile`-randomized) basename. After the first open, exactly one such directory must exist; after the second open, exactly TWO must exist (one per orchestration). `Action::SpawnPane`'s real nested-pick formula derives the sibling workspace from the git TOPLEVEL, not the picked subdirectory (fork issue #595 fix round 2), so both opens — same toplevel, same suggested name — derive the byte-identical `worktree_path`, and the second open's `provision_isolated_clone_or_status` call resumes the FIRST clone (`IsolatedCloneOutcome::Resumed`) instead of provisioning its own.
+- **Does not assert:** the client-side suggestion/collision filter or tab labeling, which is `identity_033`'s own scope; the fix itself (making the isolated-clone destination directory-aware, `coder`'s next step); the daemon-side compound claim (`orchestration/identity/031`/`032`/`036`).
+- **Platform coverage:** mac+linux (PTY-attached, `#[cfg(feature = "e2e")]`, as the other `e2e_orchestration_*.rs` files).
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
