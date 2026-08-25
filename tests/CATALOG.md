@@ -4599,6 +4599,13 @@ without depending on the config struct API.
 - **Does not assert:** the ordinary tracked-subdirectory success path, already covered by `033`; a picked directory that is entirely absent from disk (not this bug's failure mode — the picked directory itself always exists; only its clone-side counterpart can be missing).
 - **Platform coverage:** mac+linux+windows, matching `020`.
 
+##### orchestration/workspace/035 — Driving the REAL `Action::SpawnPane` match arm (not a mirrored derivation) with a project directory nested two levels below a real repo's toplevel places every role pane's actual spawn cwd outside the source repo's working tree (fork issue #595 fix round 3, reviewer R1 — required: `033` exercises `provision_isolated_clone_or_status` directly and mirrors `Action::SpawnPane`'s own toplevel/prefix derivation in the test body rather than invoking the real call site at `src/ui.rs`'s `resolve_workspace_path(resolved_root_dir, &segment)`, so reverting the blocker's actual fix left `033` and every other gate green).
+- **Layer:** L1 (in-process — real `git` subprocesses and a stub attach daemon (`with_recording_daemon`) answering every request `ok`, driving the real `dispatch_action`/`Action::SpawnPane` path end to end via `CapturingPaneController`).
+- **Agent:** none.
+- **Asserts:** for an orchestration launched against a project directory nested two levels below a real repo's toplevel, every role pane's recorded spawn cwd (`CapturingPaneController::recorded_cwds`), canonicalized, is not nested under the (canonicalized) source repo. Canonicalizing both sides matters: a raw tempdir path and git's canonicalized answer share no textual prefix on macOS regardless of correctness, which is exactly the weakness `033`'s own assertion had before this round.
+- **Does not assert:** the resolved pane cwd's exact value (`<workspace>/<relative-subpath>`), already covered by `033`; the untracked-subpath refusal, covered by `034`; real daemon/PTY spawn (a stub `PaneController` records the cwd without spawning a process).
+- **Platform coverage:** mac+linux+windows, matching `020`.
+
 #### orchestration/remit
 
 ##### orchestration/remit/001 — A `Compacting` event on the orchestrator start-role pane re-delivers the remit pointer a second time (upstream issue #423).

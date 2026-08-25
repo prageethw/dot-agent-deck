@@ -1474,10 +1474,8 @@ pub(crate) fn resolve_git_toplevel(dir: &Path) -> Option<(PathBuf, PathBuf)> {
         }
         Err(AddError::Failed(_)) => return None,
     };
-    let toplevel = output
-        .strip_suffix('\n')
-        .unwrap_or(output.as_str())
-        .trim_end_matches('\r');
+    let toplevel = output.strip_suffix('\n').unwrap_or(output.as_str());
+    let toplevel = toplevel.strip_suffix('\r').unwrap_or(toplevel);
     if toplevel.is_empty() {
         return None;
     }
@@ -1513,6 +1511,17 @@ pub(crate) fn resolve_git_toplevel(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((toplevel, prefix))
 }
 
+// Fork issue #595 fix round 3 (reviewer N2): `dispatch.rs`, this wrapper's
+// last production caller, now resolves `source_dir` itself up front (the
+// same way `src/ui.rs`'s `Action::SpawnPane` already did) and calls
+// [`provision_isolated_clone_sync_resolved`] directly, so this
+// self-resolving wrapper has no production caller left at all — every
+// remaining reference is a test in this module, `src/ui.rs`, or
+// `src/worktree_reclaim.rs` reaching for the convenience of not having to
+// resolve a toplevel by hand. `#[cfg(test)]` records that honestly rather
+// than leaving a production-shaped function clippy's `dead_code` lint
+// would otherwise (correctly) flag.
+#[cfg(test)]
 pub(crate) fn provision_isolated_clone_sync(
     source_dir: &Path,
     clone_dir: &Path,
@@ -1523,15 +1532,6 @@ pub(crate) fn provision_isolated_clone_sync(
     // use it everywhere `source_dir` would otherwise have been passed to a
     // path-based `git clone`/`git fetch` below — see `resolve_git_toplevel`'s
     // doc comment for why a nested project directory needs this at all.
-    //
-    // Fork issue #595 fix round 2 (reviewer F6 / auditor's TOCTOU note):
-    // this wrapper exists for callers (`dispatch.rs`, every test in this
-    // module) that pass a possibly-nested `source_dir` and have not already
-    // resolved it themselves. `src/ui.rs`'s `Action::SpawnPane` path — the
-    // one running on the synchronous TUI render/event loop — resolves once
-    // up front and calls [`provision_isolated_clone_sync_resolved`]
-    // directly instead, so it never pays this `git rev-parse` subprocess
-    // twice on the same input per launch.
     let resolved_source_dir = resolve_git_toplevel(source_dir)
         .map(|(toplevel, _prefix)| toplevel)
         .unwrap_or_else(|| source_dir.to_path_buf());

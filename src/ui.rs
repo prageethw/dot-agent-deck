@@ -9907,13 +9907,27 @@ fn provision_isolated_clone_or_status(
         match relative_subpath {
             Some(rel) => {
                 let joined = base.join(rel);
-                if !joined.is_dir() {
+                // Fork issue #595 fix round 3 (auditor R4): `is_dir()`
+                // follows symlinks, and a `git clone` faithfully reproduces
+                // TRACKED symlinks — including ones whose committed target
+                // is an absolute path outside the repository entirely. A
+                // repo whose HEAD tracks such a symlink at this subpath,
+                // with the source's own local working tree having
+                // (uncommitted) replaced it with a real directory, would
+                // otherwise pass this check while the clone's checkout of
+                // the same subpath resolves outside the clone. Canonicalize
+                // `joined` and require it to still be contained in the
+                // canonicalized `base` -- the same containment property the
+                // carve-out above now checks directly rather than inferring.
+                let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+                let canonical_joined = joined.canonicalize().unwrap_or_else(|_| joined.clone());
+                if !joined.is_dir() || !canonical_joined.starts_with(&canonical_base) {
                     return Err(format!(
                         "Orchestration failed: {} was not found inside the provisioned \
                          workspace at {} — the picked subdirectory may be untracked or \
                          excluded by .gitignore",
-                        rel.display(),
-                        base.display(),
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(rel),
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(base),
                     ));
                 }
                 Ok(joined.display().to_string())
@@ -10945,12 +10959,51 @@ fn dispatch_action(
                         .as_ref()
                         .filter(|(_, prefix)| !prefix.as_os_str().is_empty())
                         .map(|(toplevel, _)| toplevel.as_path());
-                    let resolved_root_dir: &Path = nested_toplevel.unwrap_or(&req.dir);
+                    let mut resolved_root_dir: &Path = nested_toplevel.unwrap_or(&req.dir);
                     let relative_subpath: Option<&Path> = toplevel_resolution
                         .as_ref()
                         .map(|(_, prefix)| prefix.as_path())
                         .filter(|prefix| !prefix.as_os_str().is_empty());
-                    let worktree_path = resolve_workspace_path(resolved_root_dir, &segment);
+                    let mut worktree_path = resolve_workspace_path(resolved_root_dir, &segment);
+                    // Fork issue #595 fix round 3 (auditor R1): the
+                    // "root case stays unchanged" carve-out above decides
+                    // "safe to use `req.dir` raw" by asking whether the
+                    // computed prefix came out empty — a proxy for "the
+                    // picked directory IS the toplevel" that a directory
+                    // reached via a symlink PLANTED INSIDE the repository
+                    // and pointing back at the repository's own root also
+                    // satisfies: it canonicalizes to the toplevel (empty
+                    // prefix) while its own raw spelling
+                    // (`<repo>/sub/rootlink`) is structurally inside the
+                    // repo. Deriving the sibling workspace from that raw
+                    // path reopens the exact "clone lands inside the
+                    // source repo" defect (F1) the carve-out exists to
+                    // protect the ordinary root case from.
+                    //
+                    // Check the actual property instead of inferring it
+                    // from the prefix: would the DERIVED workspace path
+                    // land inside the canonicalized toplevel?
+                    // `worktree_path` does not exist on disk yet, so
+                    // `.canonicalize()` fails and falls back to its raw
+                    // form — which is exactly what's wanted, since the
+                    // ordinary root case's raw spelling (e.g. macOS
+                    // `/tmp/...`) never shares a textual (component-wise)
+                    // prefix with git's canonicalized toplevel
+                    // (`/private/tmp/...`) in the first place, so this
+                    // guard cannot fire for it (see F7's reasoning above).
+                    if nested_toplevel.is_none()
+                        && let Some((toplevel, _)) = toplevel_resolution.as_ref()
+                    {
+                        let canonical_toplevel =
+                            toplevel.canonicalize().unwrap_or_else(|_| toplevel.clone());
+                        let canonical_worktree_path = worktree_path
+                            .canonicalize()
+                            .unwrap_or_else(|_| worktree_path.clone());
+                        if canonical_worktree_path.starts_with(&canonical_toplevel) {
+                            resolved_root_dir = toplevel.as_path();
+                            worktree_path = resolve_workspace_path(resolved_root_dir, &segment);
+                        }
+                    }
                     // Issue #164: `Some(raw error)` when
                     // `provision_isolated_clone_or_status` below created the
                     // worktree but its ownership marker write failed.
@@ -11301,7 +11354,9 @@ fn dispatch_action(
                                         warnings.push(format!(
                                             "cloned from {} (the git root of the picked \
                                              directory)",
-                                            resolved_root_dir.display()
+                                            crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                                                resolved_root_dir
+                                            )
                                         ));
                                     }
                                     if let Some(error) = &worktree_origin_warning {
@@ -37619,11 +37674,24 @@ mod tests {
         // keyed off the resolved TOPLEVEL, not the picked (nested) dir.
         let segment = sanitize_workspace_segment("features");
         let worktree_path = resolve_workspace_path(&toplevel, &segment);
+        // Reviewer F4 (round 3 re-confirm): `!worktree_path.starts_with(&repo)`
+        // alone is TRIVIALLY true on macOS regardless of correctness, since
+        // `repo` here is the raw `/var/folders/...` tempdir path while
+        // `toplevel` (and anything derived from it) is git's canonicalized
+        // `/private/var/folders/...` answer -- the two share no prefix even
+        // when the derivation is wrong. Canonicalize both sides (falling
+        // back to the raw form for `worktree_path`, which does not exist on
+        // disk yet) so the assertion is meaningful on every platform, not
+        // just Linux.
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+        let canonical_worktree_path = worktree_path
+            .canonicalize()
+            .unwrap_or_else(|_| worktree_path.clone());
         assert!(
-            !worktree_path.starts_with(&repo),
+            !canonical_worktree_path.starts_with(&canonical_repo),
             "reviewer F1 BLOCKER: the isolated-clone workspace must be a sibling of the repo \
              TOPLEVEL, never a path nested underneath the source repo's own working tree -- \
-             got {worktree_path:?} under {repo:?}"
+             got {canonical_worktree_path:?} under {canonical_repo:?}"
         );
 
         let result = provision_isolated_clone_or_status(
@@ -37687,6 +37755,118 @@ mod tests {
             err.contains("was not found"),
             "the refusal message should explain the missing subdirectory, got: {err}"
         );
+    }
+
+    /// Scenario: fork issue #595 fix round 3 (reviewer R1 — required).
+    /// `033` exercises `provision_isolated_clone_or_status` directly and
+    /// MIRRORS `Action::SpawnPane`'s own toplevel/prefix derivation in the
+    /// test body (`resolve_workspace_path(&toplevel, &segment)`) rather
+    /// than invoking the real call site — so reverting the actual fix at
+    /// `src/ui.rs`'s `Action::SpawnPane` branch (line 10953:
+    /// `resolved_root_dir` back to `&req.dir`) leaves `033` and every
+    /// other gate green. Drives the REAL `dispatch_action`/`Action::SpawnPane`
+    /// path end to end instead — same fixture shape as `worktree_015`
+    /// (`dispatch_action` against a real repo) and `identity_029`
+    /// (`with_recording_daemon` for a genuinely successful claim+confirm
+    /// round trip, `init_committed_git_repo` since isolation is
+    /// unconditional) — against a project directory nested two levels
+    /// below a real repo's toplevel, and asserts the role panes' ACTUAL
+    /// spawn cwd, as recorded by `CapturingPaneController`, is not nested
+    /// under the (canonicalized) source repo — canonicalized on both
+    /// sides so the assertion is not vacuous on macOS, where a raw
+    /// tempdir path and git's canonicalized answer share no prefix
+    /// regardless of correctness.
+    #[spec("orchestration/workspace/035")]
+    #[test]
+    fn workspace_035_action_spawn_pane_places_role_pane_cwd_outside_source_repo_for_nested_pick() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+        let nested = repo.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested project",
+        ]);
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _daemon = with_recording_daemon(tmp.path(), ops.clone());
+
+        let config = make_orchestration("review");
+        let pc = Arc::new(CapturingPaneController::new());
+        let req = NewPaneRequest {
+            dir: nested.clone(),
+            name: "features".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+        };
+
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert_eq!(
+            tm.tab_count(),
+            2,
+            "setup: the nested-pick launch must actually succeed (Dashboard + Orchestration \
+             tab) for this test to exercise anything -- got {} tab(s), status: {:?}",
+            tm.tab_count(),
+            ui.status_message.as_ref().map(|(m, _)| m.clone())
+        );
+
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+        let cwds = pc.recorded_cwds();
+        assert!(
+            !cwds.is_empty(),
+            "setup: at least one role pane must have been spawned"
+        );
+        for cwd in &cwds {
+            let cwd = cwd
+                .as_deref()
+                .expect("every role pane must get an explicit cwd");
+            let canonical_cwd = std::path::Path::new(cwd)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(cwd));
+            assert!(
+                !canonical_cwd.starts_with(&canonical_repo),
+                "reviewer R1: `Action::SpawnPane`'s own fix site (not a mirrored derivation) \
+                 must place every role pane's cwd outside the source repo's working tree for a \
+                 nested pick -- got {canonical_cwd:?} under {canonical_repo:?}"
+            );
+        }
     }
 
     /// Fork #122: a real `.dot-agent-deck.toml` at `dir` defining one

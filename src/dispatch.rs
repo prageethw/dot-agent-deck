@@ -5,7 +5,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
     IsolatedCloneOutcome, RemovalPolicy, RemoveOutcome, WorktreeCreation, WorktreeRegistry,
-    attempt_isolated_clone_cleanup, create_worktree, provision_isolated_clone_sync,
+    attempt_isolated_clone_cleanup, create_worktree, provision_isolated_clone_sync_resolved,
     record_worktree, remove_worktree, run_status, worktree_still_in_use,
 };
 use crate::scheduler::StderrNotifier;
@@ -329,19 +329,67 @@ pub async fn handle_dispatch(
     // would change `derive_dispatch_paths`' output spelling with no change
     // to which directory it names (the same regression this exact
     // reasoning was added to `src/ui.rs`'s `Action::SpawnPane` to avoid).
-    let toplevel_resolution = crate::issue_dispatch_run::resolve_git_toplevel(&ctx.working_dir);
+    // Fork issue #595 fix round 3 (reviewer N2): `resolve_git_toplevel`
+    // spawns a `git` subprocess and blocks on it for up to
+    // `WORKTREE_GIT_TIMEOUT` (30s). Every other blocking git/socket op in
+    // this async path already runs via `spawn_blocking` (see the
+    // live-sibling gate below, whose own comment states the rule this call
+    // was the one exception to) -- run this one the same way rather than
+    // parking a tokio worker thread on a stalled filesystem.
+    let working_dir_for_probe = ctx.working_dir.clone();
+    let toplevel_resolution = match tokio::task::spawn_blocking(move || {
+        crate::issue_dispatch_run::resolve_git_toplevel(&working_dir_for_probe)
+    })
+    .await
+    {
+        Ok(resolution) => resolution,
+        Err(join_err) => {
+            return DispatchResult {
+                worktree_dir: ctx.working_dir.clone(),
+                success: false,
+                message: format!(
+                    "dispatch: git-toplevel resolution task panicked: {}",
+                    crate::terminal_sanitize::sanitize_for_terminal_display(&join_err.to_string())
+                ),
+            };
+        }
+    };
     let relative_subpath = toplevel_resolution
         .as_ref()
         .map(|(_, prefix)| prefix.clone())
         .filter(|prefix| !prefix.as_os_str().is_empty());
-    let resolved_working_dir = if relative_subpath.is_some() {
+    let mut resolved_working_dir = if relative_subpath.is_some() {
         toplevel_resolution
-            .map(|(toplevel, _)| toplevel)
+            .as_ref()
+            .map(|(toplevel, _)| toplevel.clone())
             .unwrap_or_else(|| ctx.working_dir.clone())
     } else {
         ctx.working_dir.clone()
     };
-    let paths = derive_dispatch_paths(&resolved_working_dir, name);
+    let mut paths = derive_dispatch_paths(&resolved_working_dir, name);
+    // Fork issue #595 fix round 3 (auditor R1): same containment check as
+    // `src/ui.rs`'s `Action::SpawnPane` -- see that call site's comment
+    // for the full reasoning. The "root case stays unchanged" carve-out
+    // above decides "safe to use `ctx.working_dir` raw" by asking whether
+    // the computed prefix came out empty, which a `ctx.working_dir`
+    // reached via a symlink PLANTED INSIDE the repo (pointing back at the
+    // repo's own root) also satisfies -- deriving the sibling worktree
+    // from that raw path would reopen F1/F3 one level down. Check the
+    // actual property instead: would the DERIVED worktree dir land inside
+    // the canonicalized toplevel?
+    if relative_subpath.is_none()
+        && let Some((toplevel, _)) = toplevel_resolution.as_ref()
+    {
+        let canonical_toplevel = toplevel.canonicalize().unwrap_or_else(|_| toplevel.clone());
+        let canonical_worktree_dir = paths
+            .worktree_dir
+            .canonicalize()
+            .unwrap_or_else(|_| paths.worktree_dir.clone());
+        if canonical_worktree_dir.starts_with(&canonical_toplevel) {
+            resolved_working_dir = toplevel.clone();
+            paths = derive_dispatch_paths(&resolved_working_dir, name);
+        }
+    }
     let clone_dir = resolved_working_dir;
 
     // Resolve the shape from the CALLER's repo config, BEFORE any git work.
@@ -444,16 +492,27 @@ pub async fn handle_dispatch(
         // A live sibling already shares `clone_dir`'s git-common-dir --
         // isolate this dispatch into its own fresh clone instead of a plain
         // `git worktree add` sibling, mirroring Model A's `Ok(true)` branch
-        // (`provision_isolated_clone_sync`). Same resolved sibling path
-        // (`paths.worktree_dir`) as the shared-checkout arm below -- only
-        // the provisioning mechanism differs. `provision_isolated_clone_sync`
-        // is sync (no async twin exists), so it runs on the blocking pool
-        // exactly like the daemon-query gate above.
+        // (`provision_isolated_clone_sync_resolved`). Same resolved sibling
+        // path (`paths.worktree_dir`) as the shared-checkout arm below --
+        // only the provisioning mechanism differs. It is sync (no async
+        // twin exists), so it runs on the blocking pool exactly like the
+        // daemon-query gate above.
+        //
+        // Fork issue #595 fix round 3 (reviewer N2): `clone_dir` is
+        // `resolved_working_dir` above, already resolved to the real git
+        // toplevel (or left as `ctx.working_dir` unchanged when that IS
+        // the toplevel or it isn't inside a git repository at all) -- so
+        // call the `_resolved` entry point directly rather than the
+        // self-resolving `provision_isolated_clone_sync`, which would
+        // otherwise re-run `resolve_git_toplevel` on an already-resolved,
+        // idempotent input: a second 30s-bounded `git rev-parse`
+        // subprocess per dispatch, and a reopened TOCTOU window between
+        // the two resolutions that the entry-point split exists to close.
         //
         // Fix round 2 (reviewer P2-7): this arm inherits attach-not-refuse
-        // branch-reuse behaviour from `provision_isolated_clone_sync` (it
-        // `git checkout`s the branch if it already exists, same as Model
-        // A's own isolated arm), while the `else` arm below
+        // branch-reuse behaviour from `provision_isolated_clone_sync_resolved`
+        // (it `git checkout`s the branch if it already exists, same as
+        // Model A's own isolated arm), while the `else` arm below
         // (`create_worktree` with `reuse_existing_branch: false`) REFUSES
         // via `WorktreeCreation::BranchExists` to protect possibly-committed
         // work. Which of the two runs is decided by `has_live_sibling`, a
@@ -467,7 +526,12 @@ pub async fn handle_dispatch(
         let branch = paths.branch.clone();
         let creator_for_clone = creator.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            provision_isolated_clone_sync(&source_dir, &clone_target, &branch, &creator_for_clone)
+            provision_isolated_clone_sync_resolved(
+                &source_dir,
+                &clone_target,
+                &branch,
+                &creator_for_clone,
+            )
         })
         .await;
         // PRD fork#544 M3 fix round: release this process-local resume
@@ -685,7 +749,19 @@ pub async fn handle_dispatch(
     let dispatch_working_dir = match relative_subpath.as_deref() {
         Some(rel) => {
             let joined = paths.worktree_dir.join(rel);
-            if !joined.is_dir() {
+            // Fork issue #595 fix round 3 (auditor R4): `is_dir()` follows
+            // symlinks, and a `git clone`/`git worktree add` faithfully
+            // reproduces TRACKED symlinks -- including ones whose committed
+            // target is an absolute path outside the repository entirely.
+            // Canonicalize `joined` and require it to still be contained in
+            // the canonicalized worktree dir, mirroring `src/ui.rs`'s
+            // identical hardening of its own existence check.
+            let canonical_base = paths
+                .worktree_dir
+                .canonicalize()
+                .unwrap_or_else(|_| paths.worktree_dir.clone());
+            let canonical_joined = joined.canonicalize().unwrap_or_else(|_| joined.clone());
+            if !joined.is_dir() || !canonical_joined.starts_with(&canonical_base) {
                 return DispatchResult {
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
@@ -693,8 +769,10 @@ pub async fn handle_dispatch(
                         "dispatch: {} was not found inside the provisioned worktree at {} — \
                          the calling pane's own subdirectory may be untracked or excluded by \
                          .gitignore",
-                        rel.display(),
-                        paths.worktree_dir.display(),
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(rel),
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        ),
                     ),
                 };
             }
@@ -1514,17 +1592,26 @@ mod tests {
         );
     }
 
-    /// Scenario: fork issue #595 fix round 2 (reviewer F3). `ctx.working_dir`
-    /// is the calling pane's own registered cwd, which — after the #595 fix
-    /// to `src/ui.rs` — can legitimately be a NESTED subdirectory of its
-    /// repo's toplevel (any pane already running inside a resolved isolated
-    /// clone at a nested prefix). Left unresolved, `derive_dispatch_paths`
-    /// placed the dispatched worktree as a sibling of that nested directory —
-    /// a full clone of the whole repo materialized INSIDE the calling pane's
-    /// own working tree, the same defect class F1 fixed in `src/ui.rs`'s
-    /// `Action::SpawnPane`, one level down. Dispatches from a nested working
-    /// dir and asserts the resulting worktree is a sibling of the repo
-    /// TOPLEVEL, not nested under it.
+    /// Scenario: fork issue #595 fix round 2 (reviewer F3), extended in fix
+    /// round 3 (reviewer N4). `ctx.working_dir` is the calling pane's own
+    /// registered cwd, which — after the #595 fix to `src/ui.rs` — can
+    /// legitimately be a NESTED subdirectory of its repo's toplevel (any
+    /// pane already running inside a resolved isolated clone at a nested
+    /// prefix). Left unresolved, `derive_dispatch_paths` placed the
+    /// dispatched worktree as a sibling of that nested directory — a full
+    /// clone of the whole repo materialized INSIDE the calling pane's own
+    /// working tree, the same defect class F1 fixed in `src/ui.rs`'s
+    /// `Action::SpawnPane`, one level down. Dispatches from a nested
+    /// working dir and asserts both halves of F3: the resulting worktree
+    /// is a sibling of the repo TOPLEVEL, not nested under it, AND the
+    /// dispatched agent's own cwd reproduces the calling pane's nested
+    /// position inside that worktree rather than landing at its root —
+    /// the real `dispatch_working_dir` value, recorded in the registry
+    /// only when the dispatched process genuinely starts, which needs a
+    /// command that actually execs (`cat`, alive on stdin) rather than the
+    /// round-2 test's nonexistent-binary stand-in. `cat` as the stand-in
+    /// agent, matching `dispatch_shares_the_checkout_when_no_live_sibling_exists`
+    /// above (a single-agent dispatch, no `#[cfg(unix)]` needed there).
     #[tokio::test]
     async fn dispatch_from_a_nested_working_dir_places_the_worktree_outside_the_source_repo() {
         let tmp = crate::test_temp::tempdir().unwrap();
@@ -1556,25 +1643,56 @@ mod tests {
             registry: Arc::new(AgentPtyRegistry::new()),
             event_tx,
             worktrees: new_worktree_registry(),
-            default_command: Some("/definitely-not-a-real-binary-xyz-595".to_string()),
+            default_command: Some("cat".to_string()),
             state: None,
         };
 
         let result = handle_dispatch(&ctx, "nested-unit-595", "task", None).await;
         let worktree = result.worktree_dir.clone();
-        struct Guard(std::path::PathBuf);
+        struct Guard(std::path::PathBuf, Arc<AgentPtyRegistry>);
         impl Drop for Guard {
             fn drop(&mut self) {
+                self.1.shutdown_all();
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let _guard = Guard(worktree.clone());
+        let _guard = Guard(worktree.clone(), ctx.registry.clone());
 
+        assert!(
+            result.success,
+            "setup: the dispatch itself must succeed for this test to exercise anything -- \
+             got: {}",
+            result.message
+        );
         assert!(
             !worktree.starts_with(&repo),
             "reviewer F3: dispatching from a nested working_dir must place the worktree as a \
              sibling of the repo TOPLEVEL, never nested inside the source repo's own working \
              tree -- got {worktree:?} under {repo:?}"
+        );
+
+        // Reviewer N4: F3's second half — the dispatched agent's OWN cwd
+        // must reproduce the calling pane's nested position inside the new
+        // worktree (`<worktree>/baseline/intent`), not the worktree root.
+        // This was implemented (`dispatch_working_dir`, above) but
+        // previously asserted nowhere — the placement check above pins
+        // only where the WORKTREE landed, not where the agent inside it
+        // was actually started.
+        let live = ctx.registry.agent_records();
+        assert_eq!(
+            live.len(),
+            1,
+            "expected exactly one dispatched agent record; got {:?}",
+            live.iter()
+                .map(|r| (r.display_name.clone(), r.cwd.clone()))
+                .collect::<Vec<_>>()
+        );
+        let expected_cwd = worktree.join("baseline").join("intent");
+        assert_eq!(
+            live[0].cwd.as_deref(),
+            Some(expected_cwd.to_string_lossy().as_ref()),
+            "the dispatched agent's cwd must be the calling pane's own nested position inside \
+             the new worktree, not the worktree root"
         );
     }
 
