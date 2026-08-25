@@ -4208,11 +4208,28 @@ impl AgentPtyRegistry {
         // they disagree — either side omitted, or both agree, is not a
         // mismatch (opt-in, never fires for a delegation that didn't use
         // `--subject` at all).
+        //
+        // Fix round 3 (A8): compare SANITIZED values, not raw ones.
+        // `compose_work_done_feedback` renders both sides through
+        // `sanitize_subject_tag` before display, so a worker echoing a subject
+        // that differs only by a frame-breaking character (e.g. a zero-width
+        // space) stripped at render time used to trip this comparison while
+        // showing two identical-looking values in the warning — an
+        // alert-fatigue vector that trains the orchestrator to dismiss real
+        // mismatches. Compare the same values eventually shown.
         let subject_mismatch = match (popped.subject.as_deref(), echoed_subject) {
-            (Some(expected), Some(echoed)) if expected != echoed => Some(SubjectMismatch {
-                expected: expected.to_string(),
-                echoed: echoed.to_string(),
-            }),
+            (Some(expected), Some(echoed)) => {
+                let expected_sanitized = crate::state::sanitize_subject_tag(expected);
+                let echoed_sanitized = crate::state::sanitize_subject_tag(echoed);
+                if expected_sanitized != echoed_sanitized {
+                    Some(SubjectMismatch {
+                        expected: expected.to_string(),
+                        echoed: echoed.to_string(),
+                    })
+                } else {
+                    None
+                }
+            }
             _ => None,
         };
         WorkDoneProvenance::Solicited {
@@ -13237,6 +13254,59 @@ mod spawn_tests {
                 subject_mismatch: None
             },
             "the last fresh sibling must still be credited"
+        );
+    }
+
+    /// Issue #586 M4 fix round 3 (S6): every existing test on this guard only
+    /// ever exercises `(None, None)` for the subject comparison — passing
+    /// under a `_` arm however the guard is actually written, so an inverted
+    /// condition (`==` instead of `!=`) or a widened one would still pass
+    /// every test that existed before this round while firing the warning on
+    /// every correctly-matched report, or never firing on a genuine mismatch.
+    /// Pin the three remaining "both sides present or one absent" shapes:
+    /// matching subjects, and either side alone stated, must never mismatch.
+    #[test]
+    fn retire_delegation_commission_subject_guard_fast_tier_coverage() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // (Some(A), Some(A)) — both sides agree: no mismatch.
+        assert!(reg.arm_delegation_commission("worker-match", "orch", Some("#586".to_string())));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-match", Some("#586")),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "matching subjects on both sides must never be reported as a mismatch"
+        );
+
+        // (Some, None) — delegated a subject, worker echoed none: opt-in, so
+        // an unstated echo is not a mismatch.
+        assert!(reg.arm_delegation_commission(
+            "worker-echo-none",
+            "orch",
+            Some("#586".to_string())
+        ));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-echo-none", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a worker that echoed no subject at all must not be flagged as mismatched"
+        );
+
+        // (None, Some) — no subject was delegated, worker stated one anyway:
+        // still not a mismatch, since nothing was asked.
+        assert!(reg.arm_delegation_commission("worker-undelegated-subject", "orch", None));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-undelegated-subject", Some("#123")),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a subject the worker volunteered without one being delegated must not be \
+             flagged as mismatched"
         );
     }
 

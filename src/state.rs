@@ -1295,14 +1295,18 @@ pub(crate) fn assert_inline_allowlist_agrees_with_explanation(text: &str, surfac
 /// adjacent to the primary instruction, because a worker that cannot write a
 /// file has to resolve it from this text alone. The shell forms stay deleted:
 /// the fallback is inline `--task`, never a heredoc.
-fn work_done_footer(role: &str) -> String {
+fn work_done_footer(role: &str, subject: Option<&str>) -> String {
     let slug = role_path_slug(role);
     let bin = crate::platform::paths::binary_name();
+    let subject_flag = match subject {
+        Some(value) => format!(" --subject \"{}\"", sanitize_subject_tag(value)),
+        None => String::new(),
+    };
     format!(
         "## When done\n\n\
          Signal completion by running this command via Bash:\n\n\
          ```bash\n\
-         {bin} work-done --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'\n\
+         {bin} work-done --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'{subject_flag}\n\
          ```\n\n\
          Write that report with your **file-writing tool**. Do not construct it with shell \
          redirection or a heredoc: a line of your own text can terminate the heredoc, and \
@@ -1580,7 +1584,16 @@ const MAX_SUBJECT_CHARS: usize = 200;
 /// not just markdown), then cap the length. Unlike `quote_untrusted_role`,
 /// no bracket-frame — the caller already wraps the value in backticks as a
 /// short inline label, not a standalone data block.
-fn sanitize_subject_tag(subject: &str) -> String {
+///
+/// Fix round 3 (A8): also called from
+/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] to
+/// sanitize BOTH sides before the equality check that decides whether a
+/// mismatch warning fires at all — not only at render time here. Comparing
+/// raw values let two subjects that render identically (one carrying an
+/// invisible frame-breaking character this function strips) trip a
+/// confusing, seemingly-false warning: `pub(crate)` so that call site can
+/// reach it, since the two modules are siblings, not parent/child.
+pub(crate) fn sanitize_subject_tag(subject: &str) -> String {
     let collapsed: String = subject
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -2671,12 +2684,17 @@ fn arm_delegate_silence_watch(
 /// path is role-interpolated, via [`role_path_slug`]'s readable-slug-plus-digest
 /// form, so two workers sharing a cwd are not handed the same report path (see
 /// [`work_done_footer`] for the exact strength of that claim).
-pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str, role: &str) -> String {
+pub fn compose_worker_task_file(
+    prompt_template: Option<&str>,
+    task: &str,
+    role: &str,
+    subject: Option<&str>,
+) -> String {
     let body = match prompt_template {
         Some(tpl) if !tpl.trim().is_empty() => format!("{tpl}\n\n## Task\n\n{task}"),
         _ => task.to_string(),
     };
-    format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
+    format!("{}\n\n{}", body.trim_end(), work_done_footer(role, subject))
 }
 
 /// Look up the role config for `role_name` inside the orchestration
@@ -3376,8 +3394,9 @@ fn resolve_delegate_task_body(
     task: &str,
     target_role: &str,
     pane_id: &str,
+    subject: Option<&str>,
 ) -> String {
-    let file_content = compose_worker_task_file(prompt_template, task, target_role);
+    let file_content = compose_worker_task_file(prompt_template, task, target_role, subject);
     let Some(cwd) = cwd else {
         // Defensive: the daemon's StartAgent handler always records
         // `pane_cwd_map` for orchestration panes (see `daemon_protocol.rs`), so
@@ -3640,6 +3659,11 @@ async fn dispatch_one_owned(
     // again. `None` for callers with no daemon state (unit fixtures): the
     // delivery still happens, only the re-registration is skipped.
     state: Option<SharedState>,
+    // Issue #586 M4 fix round 3 (H2): the delegation's own subject tag, so the
+    // worker's task file footer can show it the `--subject` flag to echo back
+    // on `work-done`. `None` for a delegation that didn't supply one — the
+    // footer then omits the flag exactly as before this parameter existed.
+    subject: Option<String>,
 ) {
     let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
@@ -3690,6 +3714,7 @@ async fn dispatch_one_owned(
         &task,
         &target_role,
         &pane_id,
+        subject.as_deref(),
     );
     // The single-line pointer the worker receives ("Read
     // .dot-agent-deck/worker-task-<role>.md for your task."). Computed here so
@@ -5620,6 +5645,7 @@ impl AppState {
             let orchestration = orchestration.clone();
             let orchestrator_pane_id = signal.pane_id.clone();
             let task = signal.task.clone();
+            let subject = signal.subject.clone();
             let cwd = self.pane_cwd_map.get(&pane_id).cloned();
 
             // PRD #126: this worker now owes a `work-done`. Arm the record
@@ -5689,6 +5715,7 @@ impl AppState {
                     silence_watch,
                     delegation_seq,
                     state_for_dispatch,
+                    subject,
                 )
                 .await;
             });
@@ -7621,6 +7648,7 @@ mod tests {
             "Implement the thing.",
             "coder",
             "pane-1",
+            None,
         );
 
         assert_eq!(
@@ -7664,6 +7692,7 @@ mod tests {
             "Implement the thing.",
             "coder",
             "pane-1",
+            None,
         );
 
         assert!(
@@ -7694,6 +7723,7 @@ mod tests {
             "Implement the thing.",
             "coder",
             "pane-1",
+            None,
         );
 
         assert!(
@@ -7708,8 +7738,12 @@ mod tests {
 
     #[test]
     fn compose_worker_task_file_appends_work_done_footer() {
-        let content =
-            compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
+        let content = compose_worker_task_file(
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            None,
+        );
         let bin = crate::platform::paths::binary_name();
         assert!(content.starts_with("You are coder.\n\n## Task\n\nImplement the thing."));
         assert!(
@@ -7835,7 +7869,7 @@ mod tests {
         // self-sufficient and agree with its own explanation.
         assert_inline_allowlist_agrees_with_explanation(&content, "worker work-done footer");
 
-        let no_template = compose_worker_task_file(None, "Implement the fallback.", "coder");
+        let no_template = compose_worker_task_file(None, "Implement the fallback.", "coder", None);
         assert!(no_template.starts_with("Implement the fallback.\n\n## When done"));
     }
 
@@ -7847,8 +7881,12 @@ mod tests {
     #[spec("orchestration/delegate/017")]
     #[test]
     fn delegate_017_work_done_footer_names_the_running_binary() {
-        let content =
-            compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
+        let content = compose_worker_task_file(
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            None,
+        );
         let bin = crate::platform::paths::binary_name();
 
         assert_ne!(
@@ -7958,7 +7996,7 @@ mod tests {
 
     /// Extract the single-quoted `--task-file` path out of a generated footer.
     fn footer_suggested_path(role: &str) -> String {
-        work_done_footer(role)
+        work_done_footer(role, None)
             .split("work-done --task-file '")
             .nth(1)
             .and_then(|rest| rest.split('\'').next())
@@ -8395,6 +8433,40 @@ mod tests {
             !feedback.contains('\n'),
             "feedback must stay single-line or it never auto-submits (#187): {feedback:?}"
         );
+    }
+
+    /// Issue #586 M4 fix round 3 (S6): the mismatch warning is only ever
+    /// rendered from `WorkDoneReportChannel::Filed`'s own arm — `Unfiled` and
+    /// `Unsolicited` build their prose independently and never consult
+    /// `subject_mismatch` at all. Pin that structurally, not just by reading
+    /// the source: pass a genuine `Some(mismatch)` through both other
+    /// channels and confirm neither ever emits the warning text, so a future
+    /// refactor that accidentally threads `subject_mismatch` into those arms
+    /// is caught here rather than shipped.
+    #[test]
+    fn compose_work_done_feedback_unfiled_and_unsolicited_never_emit_the_mismatch_warning() {
+        let mismatch = crate::agent_pty::SubjectMismatch {
+            expected: "#586".to_string(),
+            echoed: "#123".to_string(),
+        };
+        for channel in [
+            WorkDoneReportChannel::Unfiled,
+            WorkDoneReportChannel::Unsolicited,
+        ] {
+            let feedback = compose_work_done_feedback(
+                "coder",
+                TEST_FILE_NAME,
+                channel,
+                "",
+                "Did the thing.",
+                Some(&mismatch),
+            );
+            assert!(
+                !feedback.contains("SUBJECT MISMATCH"),
+                "{channel:?} must never emit the mismatch warning even when one would \
+                 apply on the Filed arm: {feedback:?}"
+            );
+        }
     }
 
     /// Issue #586 M4 fix round (reviewer B1 / auditor A1, A2): the mismatch
@@ -8993,6 +9065,7 @@ clear = false
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -9041,6 +9114,7 @@ clear = false
                     orchestration: None,
                 },
             }),
+            None,
             None,
             None,
         )

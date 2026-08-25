@@ -1796,10 +1796,17 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                     )
                     .await;
 
+                // S8: poll for a needle emitted AFTER the worker-controlled
+                // `echoed` value in the warning sentence, not "SUBJECT
+                // MISMATCH" itself (emitted BEFORE it) — a snapshot caught
+                // mid-write could otherwise satisfy the earlier needle while
+                // the untrusted text is still partially written, passing
+                // vacuously in the direction that would hide a real
+                // sanitization regression.
                 let snapshot = wait_for_snapshot_needle(
                     &harness.registry,
                     &harness.orchestrator_agent_id,
-                    b"SUBJECT MISMATCH",
+                    b"for their full report.",
                     Duration::from_secs(2),
                 )
                 .await;
@@ -1814,17 +1821,30 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                     "the raw ESC byte from the worker's echoed subject must never reach the \
                      live orchestrator pane: {text:?}"
                 );
+                // S7: scope the bracket check to just the warning span, not
+                // the whole rendered pane — the full snapshot can legitimately
+                // carry other content, and this assertion must not pass
+                // merely because nothing ELSE on the pane happens to contain
+                // a bracket.
+                let warning_start = text
+                    .find("SUBJECT MISMATCH")
+                    .expect("precondition already confirmed this needle is present");
+                let warning_end = text[warning_start..]
+                    .find("for their full report.")
+                    .map(|offset| warning_start + offset)
+                    .unwrap_or(text.len());
+                let warning_span = &text[warning_start..warning_end];
                 for forbidden in ['[', ']', '<', '>'] {
                     assert!(
-                        !text.contains(forbidden),
+                        !warning_span.contains(forbidden),
                         "frame-breaking character {forbidden:?} from the hostile subject must \
-                         be stripped before reaching the pane: {text:?}"
+                         be stripped before reaching the pane: {warning_span:?}"
                     );
                 }
                 assert!(
-                    text.contains("FAKE-PROMPT") && text.contains("script"),
+                    warning_span.contains("FAKE-PROMPT") && warning_span.contains("script"),
                     "sanitization strips structural characters, not the surrounding words - the \
-                     harmless remainder must still be visible: {text:?}"
+                     harmless remainder must still be visible: {warning_span:?}"
                 );
             }
 
@@ -1879,10 +1899,12 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                     )
                     .await;
 
+                // S8: same reasoning as the first cycle — poll for a needle
+                // emitted AFTER the untrusted echoed subject, not before it.
                 let snapshot = wait_for_snapshot_needle(
                     &harness.registry,
                     &harness.orchestrator_agent_id,
-                    b"SUBJECT MISMATCH",
+                    b"for their full report.",
                     Duration::from_secs(2),
                 )
                 .await;
