@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{TuiDeck, commit_fixture};
+use common::{TuiDeck, commit_fixture, run_git};
 use spec::spec;
 
 /// `role` appears somewhere on the settled grid as its own token — bounded
@@ -140,6 +140,32 @@ fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1()
         std::fs::write(leaf.join(".dot-agent-deck.toml"), &toml)
             .expect("seed leaf .dot-agent-deck.toml");
     }
+    // `commit_fixture` only ever adds its own top-level `.dot-agent-deck.toml`
+    // (deliberately, per its own doc comment — a blanket `add`/`-A` would also
+    // try to walk the harness's `home/` dir and Unix sockets). The two leaf
+    // fixtures above are therefore untracked unless committed explicitly here,
+    // and every orchestration provisions via `git clone`, which only ever
+    // reproduces tracked, committed content (src/ui.rs:9941, fork issue #595)
+    // — an untracked leaf is invisible to the clone and fails
+    // `resolved_dir()`'s nested-subpath check for BOTH opens, not just the
+    // second (PRD fork#603 / PR #604).
+    run_git(&work, &["add", "team-a/proj/.dot-agent-deck.toml"]);
+    run_git(&work, &["add", "team-b/proj/.dot-agent-deck.toml"]);
+    run_git(
+        &work,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "add team-a/team-b fixture leaves",
+        ],
+    );
 
     const LABEL: &str = " proj-orchestrator-1 ";
 
