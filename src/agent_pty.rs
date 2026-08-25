@@ -3913,6 +3913,17 @@ impl AgentPtyRegistry {
         if conflict {
             return false;
         }
+        // PRD fork#603 fix round (reviewer N1): the conflict scan above
+        // already exempts `holder == pane_id`, so the same holder
+        // re-claiming the same name always reaches here rather than being
+        // refused — but re-claiming with a DIFFERENT `cwd` than a key it
+        // already holds used to just `insert` a second key, leaving the
+        // old one stranded under the same holder (also the only way
+        // reviewer N2's "which key gets rebound" ambiguity was reachable).
+        // Remove every existing key this pane_id holds for THIS name
+        // first, so a re-claim is genuinely idempotent across a changed
+        // cwd — one holder, one key, per name.
+        claims.retain(|k, holder| !(k.name == name && holder == pane_id));
         claims.insert(
             OrchestrationClaimKey {
                 name: name.to_string(),
