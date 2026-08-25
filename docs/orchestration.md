@@ -437,6 +437,28 @@ If critical context is missing, surface it in your work-done summary.
 """
 ```
 
+### Tagging delegations with `--subject`
+
+`dot-agent-deck delegate` and `dot-agent-deck work-done` both accept an optional `--subject <tag>` flag — a short token identifying what the delegation is for, typically an issue or PR number. When the orchestrator supplies it on `delegate`, the daemon writes that exact flag into the worker's generated task file as the one to echo back on its own `work-done` call, and compares the two automatically: a mismatch is surfaced to the orchestrator as a visible warning, without blocking delivery either way.
+
+This is the cheapest defense against a `work-done` report that answers the wrong task — a report that is coherent and well-formed but belongs to something else entirely, whether from a stale agent session, a misread task pointer, or cross-talk between concurrent orchestrations. The check only fires when the flag is actually supplied on `delegate`, so an untagged delegation gets no comparison at all — the practice only pays off once the orchestrator's `prompt_template` makes tagging the default rather than the exception:
+
+```toml
+prompt_template = """
+...
+Tag every delegation with --subject "<tag>" (an issue/PR number, or a short token
+when there is no natural one) and check that the worker's work-done echoes the
+same tag back — the daemon flags a mismatch visibly.
+"""
+```
+
+`--subject` is symmetric across both ends of a delegation:
+
+```bash
+dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/coder-task.md' --subject "#42"
+dot-agent-deck work-done --task-file '.dot-agent-deck/report.md' --subject "#42"
+```
+
 ## Validate your config
 
 Run `dot-agent-deck validate` to check your `.dot-agent-deck.toml` for issues before opening an orchestration tab:
@@ -624,6 +646,8 @@ If you want a role to stay gone, remove it from `.dot-agent-deck.toml` (or close
 
 The daemon writes feedback to the orchestrator pane via the PTY. If the orchestrator's pane is closed, the feedback write fails silently. The `.dot-agent-deck/work-done-<role>-<pane digest>.md` file is written first (see "The output path" below), so for a delegated task it can still be read manually — unless the daemon could not write it, in which case the daemon log carries a `failed to write work-done summary` warning and any file at that path belongs to an **earlier** delegation (or is a partial write).
 
+If you instead suspect the delegation itself stalled — rather than a feedback write failing — you don't have to wait out the idle-worker timeout to find out: `dot-agent-deck daemon status --json` reports, per pane, whether a delegation is still outstanding and for how long (`outstanding_delegation`, `silence_watch`, `delegation_commission`). See [Inspecting the local daemon](installation.md#json-for-scripts) for the field shapes.
+
 ### The output path is keyed on the reporting pane, not just the role
 
 Two panes running the same role in the same working directory — two live orchestrations, or one worker re-delegated within the same run — are still two different panes, so the daemon's own output filename, `work-done-<role>-<pane digest>.md`, includes a digest of the reporting pane's id and is not shared between them. If a second `work-done` from the SAME pane arrives before the orchestrator has read the first (a re-delegation to that same worker), the prior report is archived aside — to `<file name>.prev.md`, or `.2.prev.md`, `.3.prev.md`, … on a further collision — rather than clobbered, and the orchestrator's feedback says so explicitly with a trailing sentence naming the archived file. The exact filename actually written is always named in the daemon log line for the write, and in the feedback's own pointer sentence, so nothing here has to be guessed at or reconstructed from the role name alone.
@@ -635,6 +659,8 @@ The daemon records every delegation it dispatches, and a `work-done` that answer
 Nothing is dropped — the report still arrives, framed as information rather than as delivered work — and the daemon's own `work-done-<role>-<pane digest>.md` path for that pane is deliberately left untouched, so an uncommissioned report cannot overwrite the last one the orchestrator did commission from that same pane. If you want a completion to be reported as delegated work, delegate it: task the worker through the orchestrator rather than typing into its pane.
 
 Two consequences of "untouched" are worth knowing before you go looking for a file. An **orchestrator** running `dot-agent-deck work-done` on itself without `--done` counts as uncommissioned too — nobody delegates to the orchestrator — so no `work-done-<orchestrator-role>.md` is written for it; use `--done` to close out the orchestration, or delegate the work to a role. And a delegate that never actually **reached** its worker — the identity gate refused the write, a `clear = true` respawn failed and left the notice `⚠ respawn failed for role '<role>'` in your orchestrator pane, or the replacement never came up and left `⚠ delegated worker never came up` there — commissions nothing, so a completion arriving from that worker afterwards is uncommissioned by the same rule. That is deliberate: the alternative is a stale commission that quietly relabels some later, unrelated completion as delegated work.
+
+Don't stop at the "unsolicited" label, either — the same `daemon status --json` fields that help with a stalled delegation (previous section) are also the right way to sanity-check an *arriving* notification before acting on it, unsolicited or not: compare it against what `outstanding_delegation`/`silence_watch`/`delegation_commission` actually shows for that pane rather than trusting the notification's own framing. A stale or misrouted signal can otherwise look identical to a genuine one, especially with several concurrent orchestrations in play.
 
 ### The summary file could not be written
 
