@@ -1164,6 +1164,47 @@ fn cwd_matches(form_cwd: &Path, candidate: &str) -> bool {
     std::fs::canonicalize(candidate).is_ok_and(|live| live == form_canonical)
 }
 
+/// PRD fork#603 fix round (CI regression on `8523e3c5`): whether a live
+/// orchestration identity `(live_cwd, live_name)` belongs to `form_cwd`, for
+/// the directory-scoped suggestion/collision check
+/// ([`NewPaneFormState::suggest_orchestration_name`],
+/// [`NewPaneFormState::name_collision`]).
+///
+/// [`cwd_matches`] alone (the original fork#603 implementation) is not
+/// enough: PRD fork#544 M2b made isolated-clone provisioning UNCONDITIONAL
+/// for every orchestration, including the very first against a directory —
+/// every orchestration's role panes run in a SIBLING workspace derived from
+/// `(source directory, name)` via [`resolve_workspace_path`] /
+/// [`sanitize_workspace_segment`] (`Action::SpawnPane`, `src/ui.rs`), never
+/// in the picked source directory itself. So `live_cwd` (what `ListAgents`
+/// reports as `orchestration_cwd`, i.e. a live orchestration's ACTUAL
+/// worktree/clone path) is *never* literally or canonically equal to a
+/// second form's own `self.dir` — not even when both orchestrations were
+/// opened from the identical source directory, which is exactly the case
+/// this scoping exists to catch. Left this way, `suggest_orchestration_name`
+/// silently re-offers an already-taken name to a second same-directory open,
+/// and the daemon's compound `(name, cwd)` claim then correctly refuses it —
+/// the orchestration never opens at all (identity/013, newpane/005).
+///
+/// The fix: re-derive the sibling workspace `form_cwd` would ITSELF produce
+/// for `live_name`, using the exact same two functions the real spawn path
+/// used to compute `live_cwd` in the first place, and compare THAT against
+/// `live_cwd`. For a genuinely-same source directory the two values are
+/// byte-identical (same deterministic formula, same inputs), so this
+/// recovers the match without needing the daemon to report anything new.
+/// [`cwd_matches`] is still tried first — it remains correct (and needed)
+/// for a live entry that genuinely IS `form_cwd` itself, e.g. a future
+/// non-isolated caller or the synthetic-cwd render seam in
+/// `render_new_pane_orchestration_name_collision_to_buffer`.
+fn live_orchestration_occupies(form_cwd: &Path, live_cwd: &str, live_name: &str) -> bool {
+    if cwd_matches(form_cwd, live_cwd) {
+        return true;
+    }
+    let segment = sanitize_workspace_segment(live_name);
+    let derived_cwd = resolve_workspace_path(form_cwd, &segment);
+    cwd_matches(&derived_cwd, live_cwd)
+}
+
 /// PRD #140 M4.0 / fork#192 M1.0: directories that currently host a live
 /// orchestration, AND the live orchestration TITLES (for the M1.0
 /// name-uniqueness suggestion/refusal) — both derived from ONE daemon
@@ -1819,10 +1860,14 @@ impl NewPaneFormState {
         // PRD fork#603: filtered to entries whose `cwd` matches this form's
         // directory before building the exclusion set — the suggestion
         // counter is per-directory, matching the uniqueness key it feeds.
+        // PRD fork#603 fix round: `live_orchestration_occupies` rather than
+        // a bare `cwd_matches(&self.dir, cwd)` — see that function's doc for
+        // why a direct compare against `self.dir` alone silently excludes
+        // nothing once isolated-clone provisioning is unconditional.
         let live: HashSet<&str> = self
             .live_orchestration_identities
             .iter()
-            .filter(|(cwd, _)| cwd_matches(&self.dir, cwd))
+            .filter(|(cwd, name)| live_orchestration_occupies(&self.dir, cwd, name))
             .map(|(_, name)| name.as_str())
             .collect();
         // fork#192 review F14: bounded to `live.len() + 1` candidates rather
@@ -1905,9 +1950,12 @@ impl NewPaneFormState {
     fn name_collision(&self) -> bool {
         self.resolved_title().is_some_and(|t| {
             let t = t.trim();
+            // PRD fork#603 fix round: `live_orchestration_occupies` rather
+            // than a bare `cwd_matches(&self.dir, cwd)` — see that
+            // function's doc comment.
             self.live_orchestration_identities
                 .iter()
-                .any(|(cwd, name)| cwd_matches(&self.dir, cwd) && name == t)
+                .any(|(cwd, name)| name == t && live_orchestration_occupies(&self.dir, cwd, name))
         })
     }
 
