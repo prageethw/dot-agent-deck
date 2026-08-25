@@ -333,6 +333,7 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         task: "Remain silent so the idle detector can surface its prompt.".to_string(),
         to: vec!["worker".to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     });
     let line = serde_json::to_string(&message).expect("serialize Delegate hook message");
     common::write_hook_line(deck.hook_socket_path(), &line)

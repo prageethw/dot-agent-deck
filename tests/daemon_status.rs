@@ -459,7 +459,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     assert!(
         daemon
             .registry
-            .arm_delegation_commission(pane_id, JSON_ORCH_PANE),
+            .arm_delegation_commission(pane_id, JSON_ORCH_PANE, None),
         "arm the commission ledger for the schema row's pane"
     );
 

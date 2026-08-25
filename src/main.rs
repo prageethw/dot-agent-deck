@@ -127,6 +127,12 @@ enum Commands {
         /// Role name(s) to delegate to (repeatable)
         #[arg(long)]
         to: Vec<String>,
+        /// Subject tag (issue/PR number, or a short opaque token) this delegation
+        /// is for — issue #586 M4. Optional; when both this and the worker's own
+        /// `work-done --subject` are supplied and they don't match, the daemon
+        /// flags it visibly rather than silently trusting a wrong-content report.
+        #[arg(long)]
+        subject: Option<String>,
     },
     /// Create a git worktree and start an isolated line of work inside it.
     /// Agent-callable, one step (PRD #220).
@@ -184,6 +190,13 @@ enum Commands {
         /// Signal that the entire orchestration is complete (orchestrator only)
         #[arg(long)]
         done: bool,
+        /// Subject tag (issue/PR number, or a short opaque token) this report is
+        /// for — issue #586 M4, echoing back the delegation's own `--subject`.
+        /// Optional; when both this and the delegation's `--subject` are
+        /// supplied and they don't match, the daemon flags it visibly rather
+        /// than silently trusting a wrong-content report.
+        #[arg(long)]
+        subject: Option<String>,
     },
     /// Report an agent lifecycle state so the pane's card status updates
     /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
@@ -1213,6 +1226,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             to,
+            subject,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1244,6 +1258,7 @@ fn main() -> ExitCode {
                 task,
                 to,
                 timestamp: chrono::Utc::now(),
+                subject,
             };
             let msg = dot_agent_deck::event::DaemonMessage::Delegate(signal);
             let json = match serde_json::to_string(&msg) {
@@ -1433,6 +1448,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             done,
+            subject,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1474,6 +1490,7 @@ fn main() -> ExitCode {
                 timestamp: chrono::Utc::now(),
                 generation,
                 daemon_boot_id,
+                subject,
             };
             let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
             let json = match serde_json::to_string(&msg) {
@@ -3325,10 +3342,12 @@ mod tests {
                 task,
                 task_file,
                 to,
+                subject,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("/tmp/t.txt"));
                 assert_eq!(to, vec!["coder".to_string()]);
+                assert_eq!(subject, None);
             }
             _ => panic!("expected `delegate`"),
         }
@@ -3364,10 +3383,12 @@ mod tests {
                 task,
                 task_file,
                 done,
+                subject,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("-"));
                 assert!(!done);
+                assert_eq!(subject, None);
             }
             _ => panic!("expected `work-done`"),
         }

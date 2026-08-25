@@ -245,5 +245,5 @@ Once the PR is open and CI is green, STOP — do NOT merge. Report back via work
 Begin every `work-done` report with a short **Summary** section — two or three sentences naming the PRD number and/or issue number the work belongs to, what changed, and the outcome (done / blocked / needs a decision); the detail follows underneath. Someone reading only the summary should be able to tell which PRD it is and whether it needs their attention.
 
 After a successful merge and issue closure, signal completion by running:
-  dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> closed. <one-line summary of what shipped.>"
+  dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> closed. <one-line summary of what shipped.>" --subject "#<n>"
 """

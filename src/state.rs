@@ -1692,11 +1692,26 @@ fn compose_work_done_feedback(
     channel: WorkDoneReportChannel,
     collision_note: &str,
     summary: &str,
+    subject_mismatch: Option<&crate::agent_pty::SubjectMismatch>,
 ) -> String {
     let head = match channel {
         WorkDoneReportChannel::Filed => {
+            // Issue #586 M4: a mismatch warning AUGMENTS the notification, it
+            // never replaces or suppresses it — the daemon exposes ground
+            // truth, the orchestrator decides (PRD #586's Decisions table).
+            // Only meaningful here, in the arm where a report is actually
+            // being filed/delivered.
+            let warning = match subject_mismatch {
+                Some(m) => format!(
+                    "⚠️ SUBJECT MISMATCH: this delegation was for `{}`, but the worker's own \
+                     work-done report is for `{}`. Verify the report's actual content before \
+                     trusting it. ",
+                    m.expected, m.echoed
+                ),
+                None => String::new(),
+            };
             return compose_delegate_prompt(&format!(
-                "Worker {safe_role} has completed their task. \
+                "{warning}Worker {safe_role} has completed their task. \
                  Read .dot-agent-deck/{file_name} for their full report.{collision_note}"
             ));
         }
@@ -1836,8 +1851,13 @@ fn record_delegation_commission(
     worker_pane_id: &str,
     role: &str,
     orchestrator_pane_id: &str,
+    subject: Option<&str>,
 ) {
-    if !registry.arm_delegation_commission(worker_pane_id, orchestrator_pane_id) {
+    if !registry.arm_delegation_commission(
+        worker_pane_id,
+        orchestrator_pane_id,
+        subject.map(String::from),
+    ) {
         tracing::debug!(
             pane_id = %worker_pane_id,
             role = %role,
@@ -5590,7 +5610,13 @@ impl AppState {
             // Issue #448: which is exactly why the commission ledger is armed
             // separately, immediately below — "the detector is off" and "nobody
             // delegated" must not look the same to `handle_work_done`.
-            record_delegation_commission(&registry, &pane_id, &target_role, &orchestrator_pane_id);
+            record_delegation_commission(
+                &registry,
+                &pane_id,
+                &target_role,
+                &orchestrator_pane_id,
+                signal.subject.as_deref(),
+            );
             let delegation_seq = arm_idle_worker_watch_for_delegation(
                 &registry,
                 &pane_id,
@@ -5809,7 +5835,8 @@ impl AppState {
         // `worker_response_timeout_minutes` or any other switchable detector,
         // per upstream #590's explicit ask. There is no timeout to resolve
         // here any more.
-        let provenance = registry.retire_delegation_commission(&signal.pane_id);
+        let provenance =
+            registry.retire_delegation_commission(&signal.pane_id, signal.subject.as_deref());
 
         // Fork #358 M1/M4: the compound generation/boot-id check now runs
         // BEFORE the retire calls above (see the comment there) — this is
@@ -5869,8 +5896,19 @@ impl AppState {
         // composed below — silence is the defining property of both bugs this
         // closes, so surviving on disk isn't enough on its own.
         let mut collision_note = String::new();
+        // Issue #586 M4: captured alongside `channel` below (out of the match,
+        // since `WorkDoneReportChannel` carries no subject data of its own) and
+        // consumed by `compose_work_done_feedback`, which only surfaces it in
+        // the `Filed` arm — a mismatch is only meaningful for a report that's
+        // actually being delivered.
+        let subject_mismatch = match &provenance {
+            crate::agent_pty::WorkDoneProvenance::Solicited {
+                subject_mismatch, ..
+            } => subject_mismatch.clone(),
+            crate::agent_pty::WorkDoneProvenance::Unsolicited => None,
+        };
         let channel = match provenance {
-            crate::agent_pty::WorkDoneProvenance::Solicited { remaining } => {
+            crate::agent_pty::WorkDoneProvenance::Solicited { remaining, .. } => {
                 if remaining > 0 {
                     tracing::debug!(
                         pane_id = %signal.pane_id,
@@ -5939,6 +5977,7 @@ impl AppState {
             channel,
             &collision_note,
             &signal.task,
+            subject_mismatch.as_ref(),
         );
         // Issue #492: `orch_pane_id` names only the pane, not the agent the
         // worker was delegated under — the orchestrator's pane can change
@@ -8054,7 +8093,8 @@ mod tests {
                 TEST_FILE_NAME,
                 WorkDoneReportChannel::Filed,
                 "",
-                "Did the thing."
+                "Did the thing.",
+                None,
             ),
             "Worker coder has completed their task. Read \
              .dot-agent-deck/work-done-coder-0000000000000000.md for their full report."
@@ -8074,6 +8114,7 @@ mod tests {
              .dot-agent-deck/work-done-coder-0000000000000000.md.prev.md instead of being \
              overwritten.",
             "Did the thing.",
+            None,
         );
         assert!(
             feedback.contains(WORK_DONE_POINTER),
@@ -8096,6 +8137,7 @@ mod tests {
             WorkDoneReportChannel::Unfiled,
             "",
             "Refactored the parser.\n\nAll 41 tests pass.",
+            None,
         );
 
         assert!(
@@ -8134,6 +8176,7 @@ mod tests {
             WorkDoneReportChannel::Unsolicited,
             "",
             "Fixed the flaky test a human asked me about.",
+            None,
         );
 
         assert!(
@@ -8175,6 +8218,7 @@ mod tests {
             WorkDoneReportChannel::Unfiled,
             "",
             hostile,
+            None,
         );
 
         assert_eq!(
@@ -8215,6 +8259,7 @@ mod tests {
             WorkDoneReportChannel::Unfiled,
             "",
             &huge,
+            None,
         );
 
         assert!(
@@ -8241,6 +8286,7 @@ mod tests {
             WorkDoneReportChannel::Unfiled,
             "",
             &bounded,
+            None,
         );
         assert!(
             !untruncated.contains("was cut off"),
@@ -8260,6 +8306,7 @@ mod tests {
                 WorkDoneReportChannel::Unsolicited,
                 "",
                 empty,
+                None,
             );
             assert!(
                 feedback.contains("sent no report text"),
@@ -8672,6 +8719,7 @@ clear = false
                     task: "probe".to_string(),
                     to: to.iter().map(|s| s.to_string()).collect(),
                     timestamp: Utc::now(),
+                    subject: None,
                 },
                 &registry,
                 &event_tx,
@@ -9316,6 +9364,7 @@ clear = false
             // its own. `handle_work_done_refuses_a_stale_signal_from_before_a_daemon_restart`
             // below is the one that pins the cross-restart case.
             daemon_boot_id: state.daemon_boot_id().to_string(),
+            subject: None,
         };
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -9396,7 +9445,7 @@ clear = false
             })
             .expect("spawn the control orchestrator pane's occupant");
         assert!(
-            registry.arm_delegation_commission(CONTROL_WORKER_PANE, CONTROL_ORCH_PANE),
+            registry.arm_delegation_commission(CONTROL_WORKER_PANE, CONTROL_ORCH_PANE, None),
             "neither pane is mid-close, arming must succeed"
         );
         let control_signal = WorkDoneSignal {
@@ -9406,6 +9455,7 @@ clear = false
             timestamp: Utc::now(),
             generation: control_worker_generation,
             daemon_boot_id: state.daemon_boot_id().to_string(),
+            subject: None,
         };
         state.handle_work_done(control_signal, &registry).await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -9450,7 +9500,7 @@ clear = false
             })
             .expect("spawn the race orchestrator pane's original occupant");
         assert!(
-            registry.arm_delegation_commission(RACE_WORKER_PANE, RACE_ORCH_PANE),
+            registry.arm_delegation_commission(RACE_WORKER_PANE, RACE_ORCH_PANE, None),
             "neither pane is mid-close, arming must succeed"
         );
 
@@ -9484,6 +9534,7 @@ clear = false
             timestamp: Utc::now(),
             generation: race_worker_generation,
             daemon_boot_id: state.daemon_boot_id().to_string(),
+            subject: None,
         };
         state.handle_work_done(race_signal, &registry).await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -9560,6 +9611,7 @@ clear = false
             // this from the pre-restart daemon it was actually spawned
             // under.
             daemon_boot_id: state_before.daemon_boot_id().to_string(),
+            subject: None,
         };
 
         // Post-restart daemon: a FRESH AppState — nothing carries over,
@@ -9655,6 +9707,7 @@ clear = false
             timestamp: Utc::now(),
             generation: reserved,
             daemon_boot_id: state.daemon_boot_id().to_string(),
+            subject: None,
         };
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -9665,7 +9718,7 @@ clear = false
         // test predates that gating and must arm a commission for "P" itself
         // or it now proves nothing about the reserve→confirm→signal chain.
         assert!(
-            registry.arm_delegation_commission("P", "orchestrator-pane"),
+            registry.arm_delegation_commission("P", "orchestrator-pane", None),
             "pane P is not mid-close, arming must succeed"
         );
         state.handle_work_done(signal, &registry).await;
@@ -9736,6 +9789,7 @@ clear = false
             timestamp: Utc::now(),
             generation: 0,
             daemon_boot_id: String::new(),
+            subject: None,
         };
 
         state.handle_work_done(mismatched_signal, &registry).await;

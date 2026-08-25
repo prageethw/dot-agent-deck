@@ -337,6 +337,7 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
@@ -552,6 +553,7 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
 
     // `handle_delegate` fans the dispatch out onto a `tokio::spawn`d task
@@ -681,6 +683,7 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
@@ -774,6 +777,7 @@ async fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt_inner() 
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
@@ -852,6 +856,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
@@ -949,6 +954,7 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
@@ -1022,6 +1028,7 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                subject: None,
             },
             &registry,
             &event_tx,
@@ -1085,6 +1092,7 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                subject: None,
             },
             &registry,
             &event_tx,
@@ -1250,6 +1258,7 @@ async fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane_inner()
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
 
@@ -1352,6 +1361,7 @@ impl SilenceHarness {
                     task: "Perform the delegated silence-watch task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    subject: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -1393,6 +1403,7 @@ impl SilenceHarness {
                     task: "Perform the newer delegated silence-watch task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    subject: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -1659,6 +1670,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                             // `AppState.daemon_boot_id()`, same reasoning as
                             // `generation` above — the compound key needs both.
                             daemon_boot_id: harness.state.daemon_boot_id().to_string(),
+                            subject: None,
                         },
                         &harness.registry,
                     )
@@ -1693,6 +1705,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                         generation: 1,
                         // Fork #358 M4: see the first signal in this test.
                         daemon_boot_id: harness.state.daemon_boot_id().to_string(),
+                        subject: None,
                     },
                     &harness.registry,
                 )
@@ -2056,7 +2069,7 @@ fn delegate_029_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
             // this test asserts on.
             for pane in ["collision-coder-a", "collision-coder-b"] {
                 assert!(
-                    registry.arm_delegation_commission(pane, "collision-orch"),
+                    registry.arm_delegation_commission(pane, "collision-orch", None),
                     "arm a commission for {pane} so its work-done is Solicited"
                 );
             }
@@ -2070,6 +2083,7 @@ fn delegate_029_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         timestamp: chrono::Utc::now(),
                         generation: 1,
                         daemon_boot_id: state.daemon_boot_id().to_string(),
+                        subject: None,
                     },
                     &registry,
                 )
@@ -2083,6 +2097,7 @@ fn delegate_029_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         timestamp: chrono::Utc::now(),
                         generation: 1,
                         daemon_boot_id: state.daemon_boot_id().to_string(),
+                        subject: None,
                     },
                     &registry,
                 )
@@ -2237,7 +2252,7 @@ async fn run_two_work_done_calls(
     // be nothing on disk for either the survival check or the collision
     // mechanism under test to observe.
     assert!(
-        registry.arm_delegation_commission(&worker_pane, &orch_pane),
+        registry.arm_delegation_commission(&worker_pane, &orch_pane, None),
         "{label}: arm the commission for the first work-done"
     );
     state
@@ -2249,6 +2264,7 @@ async fn run_two_work_done_calls(
                 timestamp: chrono::Utc::now(),
                 generation: 1,
                 daemon_boot_id: state.daemon_boot_id().to_string(),
+                subject: None,
             },
             &registry,
         )
@@ -2278,7 +2294,7 @@ async fn run_two_work_done_calls(
     }
 
     assert!(
-        registry.arm_delegation_commission(&worker_pane, &orch_pane),
+        registry.arm_delegation_commission(&worker_pane, &orch_pane, None),
         "{label}: arm the commission for the second work-done"
     );
     state
@@ -2290,6 +2306,7 @@ async fn run_two_work_done_calls(
                 timestamp: chrono::Utc::now(),
                 generation: 1,
                 daemon_boot_id: state.daemon_boot_id().to_string(),
+                subject: None,
             },
             &registry,
         )
@@ -2399,7 +2416,7 @@ fn delegate_032_third_collision_destroys_the_first_archived_report() {
                 // each of the three calls needs its own armed commission to stand
                 // in for a genuine re-delegation to this same worker pane.
                 assert!(
-                    registry.arm_delegation_commission("triple-coder", "triple-orch"),
+                    registry.arm_delegation_commission("triple-coder", "triple-orch", None),
                     "arm a commission for {report}"
                 );
                 state
@@ -2411,6 +2428,7 @@ fn delegate_032_third_collision_destroys_the_first_archived_report() {
                             timestamp: chrono::Utc::now(),
                             generation: 1,
                             daemon_boot_id: state.daemon_boot_id().to_string(),
+                            subject: None,
                         },
                         &registry,
                     )
