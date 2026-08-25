@@ -4170,6 +4170,16 @@ impl AgentPtyRegistry {
     /// are purged oldest-first before the oldest still-live commission is
     /// consumed, so one stale entry can no longer expire fresh siblings
     /// sharing the same worker pane (reviewer/auditor finding B2/F2).
+    ///
+    /// Fix round 5 (S4): the oldest-still-live commission is always the one
+    /// consumed (FIFO), with no generation on the wire to match a `work-done`
+    /// to the specific delegation it answers. When multiple commissions are
+    /// outstanding to one worker pane with DIFFERENT subjects and they are
+    /// answered out of order, a completion is credited to the wrong
+    /// commission's `expected` subject and can trip a spurious mismatch
+    /// warning (or, symmetrically, suppress a real one) — the same accepted
+    /// hole [`Self::retire_silence_watch`] documents for its own oldest-first
+    /// accounting, and for the same reason (no generation on the wire).
     pub fn retire_delegation_commission(
         &self,
         worker_pane_id: &str,

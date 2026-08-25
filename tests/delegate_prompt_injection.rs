@@ -1939,6 +1939,117 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
         });
 }
 
+/// Scenario: Delegate with a HOSTILE `--subject` — the ORCHESTRATOR-supplied,
+/// delegated side, not the worker-echoed side every other subject fixture in
+/// this file hostiles. Issue #586 M4 fix round (H7): the sanitize-once
+/// redesign moved the delegated side's neutralization onto ONE line in
+/// `handle_delegate`'s fan-out (`sanitize_subject_tag(signal.subject)`), and
+/// every subject fixture in this repo puts hostile content on the echoed
+/// side only — reverting that one line to `signal.subject.clone()` would
+/// leave the whole suite green while raw ESC/frame-breaking text reached the
+/// worker's task file, and the live PTY it renders into, again. Assert the
+/// worker's task file footer carries the sanitized remainder, not the raw
+/// bytes.
+#[test]
+#[cfg(unix)]
+fn delegate_hostile_delegated_subject_is_sanitized_before_reaching_worker_task_file() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build delegated-subject-sanitization runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+
+            let hostile_subject = "#586\u{001B}[2J\u{1B}[31mFAKE-PROMPT]<script>";
+            harness
+                .state
+                .handle_delegate(
+                    DelegateSignal {
+                        pane_id: ORCH_PANE.to_string(),
+                        task: "Perform the delegated subject-sanitization task.".to_string(),
+                        to: vec![WORKER_ROLE.to_string()],
+                        timestamp: chrono::Utc::now(),
+                        subject: Some(hostile_subject.to_string()),
+                    },
+                    &harness.registry,
+                    &harness.event_tx,
+                )
+                .await;
+            let delivered = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.worker_agent_id,
+                POINTER,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&delivered, POINTER),
+                "precondition failed: worker never received the delegate pointer: {:?}",
+                String::from_utf8_lossy(&delivered)
+            );
+
+            // The task file is written asynchronously by the same fan-out
+            // that delivered the pointer above; poll it rather than assuming
+            // it is already on disk.
+            let task_file = std::path::Path::new(&harness.cwd_str)
+                .join(".dot-agent-deck")
+                .join("worker-task-coder.md");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let file_body = loop {
+                if let Ok(s) = std::fs::read_to_string(&task_file)
+                    && s.contains("--subject")
+                {
+                    break s;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("worker task file never carried a --subject flag: {task_file:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+
+            assert!(
+                !file_body.contains(0x1B as char),
+                "the raw ESC byte from the delegated subject must never reach the worker's \
+                 task file: {file_body:?}"
+            );
+
+            // Scope the frame-breaking-character check to just the rendered
+            // `--subject '...'` argument, not the whole file: the footer's
+            // OWN template prose legitimately contains `<` and `>` (e.g.
+            // `<summary-slug>`), so checking the whole body would false-
+            // positive on text that has nothing to do with the hostile
+            // subject.
+            let subject_start = file_body
+                .find("--subject '")
+                .map(|i| i + "--subject '".len())
+                .expect("precondition already confirmed --subject is present");
+            let subject_end = file_body[subject_start..]
+                .find('\'')
+                .map(|offset| subject_start + offset)
+                .expect("the rendered --subject argument must close with a matching quote");
+            let subject_span = &file_body[subject_start..subject_end];
+            for forbidden in ['[', ']', '<', '>'] {
+                assert!(
+                    !subject_span.contains(forbidden),
+                    "frame-breaking character {forbidden:?} from the delegated subject must be \
+                     stripped before reaching the worker's task file: {subject_span:?}"
+                );
+            }
+            assert!(
+                subject_span.contains("FAKE-PROMPT") && subject_span.contains("script"),
+                "sanitization strips structural characters, not the surrounding words - the \
+                 harmless remainder must still be visible: {subject_span:?}"
+            );
+        });
+}
+
 /// Scenario: Overflow the silence watch's tiny broadcast receiver after pointer
 /// delivery. Because a proof event may have been dropped, the daemon must stay
 /// conservative and emit no unprovable silence notice.

@@ -1309,6 +1309,14 @@ fn work_done_footer(role: &str, subject: Option<&str>) -> String {
     // `work_done_footer_path_is_shell_quotable`). A single-quoted shell
     // string cannot be escaped from inside, so stripping the one character
     // that could close it early is sufficient.
+    //
+    // Issue #586 M4 fix round 5 (H6/A19): `.replace('\'', "")` below is now
+    // a documented no-op — `sanitize_subject_tag` already strips `'` (and
+    // `` ` ``) at the canonicalization point, so `subject` never carries one
+    // by the time it gets here. Left in place as cheap defense-in-depth
+    // rather than removed, unlike the render-side sanitize round 4 removed
+    // elsewhere: keeping it costs nothing and guards against a future caller
+    // that bypasses `sanitize_subject_tag`.
     let subject_flag = match subject {
         Some(value) => format!(" --subject '{}'", value.replace('\'', "")),
         None => String::new(),
@@ -1604,13 +1612,24 @@ const MAX_SUBJECT_CHARS: usize = 200;
 /// invisible frame-breaking character this function strips) trip a
 /// confusing, seemingly-false warning: `pub(crate)` so that call site can
 /// reach it, since the two modules are siblings, not parent/child.
+///
+/// Fix round 5 (H6/A19): also strips `'` and `` ` `` here, not only at
+/// [`work_done_footer`]'s render site. This is the ONE canonicalization
+/// point everything else — the footer's displayed value, the ledger's
+/// `expected`, and the worker's echoed `--subject` — is compared against, so
+/// a character the footer stripped but this function did not left a
+/// guaranteed false mismatch: a worker echoing exactly what the footer
+/// showed it (an apostrophe already removed) could never equal the ledger's
+/// un-stripped `expected`. Stripping `` ` `` too is belt-and-suspenders — a
+/// backtick inside the footer's single-quoted `--subject '...'` is already
+/// inert — but doing it at the canonicalization point removes any doubt.
 pub(crate) fn sanitize_subject_tag(subject: &str) -> String {
     let collapsed: String = subject
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
-        .filter(|c| !is_frame_breaking(*c))
+        .filter(|c| !is_frame_breaking(*c) && *c != '\'' && *c != '`')
         .collect();
     // Issue #586 M4 fix round 4 (S11/A16): the filter above can delete a
     // whole character that whitespace-collapsing had already treated as its
@@ -1619,7 +1638,15 @@ pub(crate) fn sanitize_subject_tag(subject: &str) -> String {
     // have already ruled out. Collapse a second time, after filtering, so
     // this function is idempotent: applying it to its own output is a no-op.
     let collapsed: String = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.chars().take(MAX_SUBJECT_CHARS).collect()
+    // Issue #586 M4 fix round 5 (S13/A17): the cap can land ON a space when
+    // the input's canonical form happens to be truncated exactly at
+    // MAX_SUBJECT_CHARS — collapsing whitespace BEFORE truncating cannot see
+    // that, since the space that ends up trailing only exists once the tail
+    // is cut off. Trim after truncating too, or a second application (a
+    // worker echoing the already-truncated value back) trims that trailing
+    // space and produces a shorter string than the first application did.
+    let truncated: String = collapsed.chars().take(MAX_SUBJECT_CHARS).collect();
+    truncated.trim_end().to_string()
 }
 
 /// Issue #433: the most report text the daemon will inline into the
@@ -8634,6 +8661,72 @@ mod tests {
             "the fix collapses the run of two spaces the filter step leaves \
              behind, so a single application already yields the canonical form"
         );
+
+        // Issue #586 M4 fix round 5 (S13/A17): a boundary-length input whose
+        // COLLAPSED form is over MAX_SUBJECT_CHARS and truncates to exactly
+        // MAX_SUBJECT_CHARS ending in a space — the length cap ran AFTER the
+        // whitespace collapse, so collapsing could never have removed this
+        // trailing space; it only exists once the tail is cut off. Before
+        // the fix, a second application (a worker echoing back the
+        // already-truncated value) trimmed that trailing space and produced
+        // a shorter string than the first application did — not idempotent.
+        let boundary = "aaa ".repeat(80);
+        let boundary_once = sanitize_subject_tag(&boundary);
+        let boundary_twice = sanitize_subject_tag(&boundary_once);
+        assert_eq!(
+            boundary_once, boundary_twice,
+            "sanitize_subject_tag must be idempotent at the truncation boundary: \
+             once={boundary_once:?} twice={boundary_twice:?}"
+        );
+        assert_eq!(
+            boundary_once.chars().count(),
+            MAX_SUBJECT_CHARS - 1,
+            "the boundary input's first MAX_SUBJECT_CHARS characters end in a space; \
+             trim_end() after truncation must remove it, landing one character short \
+             of the cap: {boundary_once:?}"
+        );
+        assert!(
+            !boundary_once.ends_with(' '),
+            "no trailing space may survive truncation, or a second application would \
+             trim it and produce a different string: {boundary_once:?}"
+        );
+    }
+
+    /// Issue #586 M4 fix round 5: what a worker sees and would retype after
+    /// [`work_done_footer`] renders `s` into its `--subject '...'` example —
+    /// mirrors the one transformation the footer still applies to the value,
+    /// stripping a literal `'` so a hostile string can't reopen the shell
+    /// argument (round 4's fix, now redundant with `sanitize_subject_tag`
+    /// per H6/A19 but kept as defense-in-depth; see `work_done_footer`).
+    fn footer_argument_of(s: &str) -> String {
+        s.replace('\'', "")
+    }
+
+    /// Issue #586 M4 fix round 5 (H6/A19, S13/A17): the actual invariant both
+    /// defects violated, made explicit — sanitizing a subject, rendering it
+    /// into the footer's `--subject '...'` example exactly as a worker sees
+    /// it, then sanitizing AGAIN (simulating a worker that echoes back
+    /// precisely what the footer showed it, which is the correct, expected
+    /// behavior) must be a no-op. Neither round 3's nor round 4's tests
+    /// exercised this: round 4 proved `sanitize_subject_tag` idempotent on
+    /// its OWN output, but H6 and S13 both slipped through by making the
+    /// footer's rendered value diverge from `sanitize_subject_tag`'s output
+    /// on the first pass — an idempotency test alone cannot see that,
+    /// because it never renders through the footer in between.
+    #[test]
+    fn sanitize_subject_tag_round_trips_through_footer_argument() {
+        let boundary = "aaa ".repeat(80);
+        for input in ["PR #593's fix", "'", "A \u{200B} B", boundary.as_str()] {
+            let expected = sanitize_subject_tag(input);
+            let echoed = footer_argument_of(&expected);
+            let round_tripped = sanitize_subject_tag(&echoed);
+            assert_eq!(
+                round_tripped, expected,
+                "a worker echoing exactly what the footer showed it must round-trip \
+                 to the same canonical value for {input:?}: sanitize={expected:?} \
+                 footer_argument={echoed:?} round_tripped={round_tripped:?}"
+            );
+        }
     }
 
     /// Issue #433: the write reports what it did. Every failure path returns
