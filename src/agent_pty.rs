@@ -3069,13 +3069,31 @@ pub struct AgentPtyRegistry {
     /// moment a claim is actually taken rather than against a
     /// point-in-time snapshot. Root cause this replaces: `name_collision()`
     /// (`src/ui.rs`) refuses a New-Pane form submit against
-    /// `live_orchestration_names`, a list captured ONCE at form-open via a
+    /// `live_orchestration_identities`, a list captured ONCE at form-open via a
     /// single `ListAgents` round-trip — two forms opened close together
     /// both read the same stale snapshot, so neither submit is refused even
-    /// though both would claim the same name. Keyed by name, valued by the
+    /// though both would claim the same name. Keyed by [`OrchestrationClaimKey`]
+    /// (PRD fork#603: name + directory, not name alone), valued by the
     /// owning pane id (see [`Self::claim_orchestration_name`] /
     /// [`Self::release_orchestration_name`]).
-    orchestration_name_claims: Mutex<HashMap<String, String>>,
+    orchestration_name_claims: Mutex<HashMap<OrchestrationClaimKey, String>>,
+}
+
+/// PRD fork#603: the daemon-side claim key — name scoped to the directory
+/// the orchestration runs in, rather than name alone. A dedicated type
+/// rather than a reuse of [`crate::state::OrchestrationIdentity`]: that
+/// enum's shape serves message-routing identity (a structurally separate
+/// concern from creation-time uniqueness), and reusing it here would blur
+/// the two.
+///
+/// `cwd: None` is a deliberate backward-compat wildcard (see
+/// [`AgentPtyRegistry::claim_orchestration_name`]'s doc comment) — an older
+/// client that never learned to send a directory still gets the same
+/// global-only exclusivity it always had.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OrchestrationClaimKey {
+    name: String,
+    cwd: Option<String>,
 }
 
 /// Issue #586 M1/M2: a point-in-time snapshot of all delegation-watch state
@@ -3860,12 +3878,23 @@ impl AgentPtyRegistry {
         *self.hook_socket.lock().unwrap() = Some(path);
     }
 
-    /// Issue #201 option (b): atomically claim an orchestrator pane's own
-    /// name/title. Returns `true` when `name` was unclaimed (now claimed by
-    /// `pane_id`) OR already claimed by this exact `pane_id` (idempotent
-    /// re-claim — a caller confirming its own already-held claim is not a
-    /// conflict). Returns `false` when `name` is held by a *different*
-    /// `pane_id`.
+    /// Issue #201 option (b) / PRD fork#603: atomically claim an
+    /// orchestrator pane's own name/title, scoped to `cwd`. Returns `true`
+    /// when `(name, cwd)` was unclaimed (now claimed by `pane_id`) OR
+    /// already claimed by this exact `pane_id` (idempotent re-claim — a
+    /// caller confirming its own already-held claim is not a conflict).
+    /// Returns `false` when a conflicting claim is already held by a
+    /// *different* `pane_id`.
+    ///
+    /// `cwd: None` is a global wildcard, both as the caller's own claim and
+    /// as a candidate it is compared against (PRD fork#603 backward
+    /// compatibility): an older client that doesn't yet send a directory
+    /// still gets its claim treated as exclusive against every directory,
+    /// and still conflicts with (and is conflicted with by) every
+    /// `Some(cwd)` claim of the same name — this can only ever OVER-refuse
+    /// relative to a `Some`/`Some` comparison, never let a real
+    /// same-`(dir, name)` collision through. Cannot be a plain
+    /// `get`/`insert` on the compound key because of this wildcard scan.
     ///
     /// The wire-level caller (`AttachRequest::ClaimOrchestrationName`,
     /// `src/daemon_protocol.rs`) uses the New-Pane spawn path's real,
@@ -3874,15 +3903,24 @@ impl AgentPtyRegistry {
     /// that real id is known (the daemon mints `pane_id` in `StartAgent`,
     /// so no pane id exists yet at form-submit time) and rolls the spawn
     /// back on refusal.
-    pub fn claim_orchestration_name(&self, name: &str, pane_id: &str) -> bool {
+    pub fn claim_orchestration_name(&self, name: &str, cwd: Option<&str>, pane_id: &str) -> bool {
         let mut claims = self.orchestration_name_claims.lock().unwrap();
-        match claims.get(name) {
-            Some(holder) => holder == pane_id,
-            None => {
-                claims.insert(name.to_string(), pane_id.to_string());
-                true
-            }
+        let conflict = claims.iter().any(|(k, holder)| {
+            k.name == name
+                && holder != pane_id
+                && (k.cwd.is_none() || cwd.is_none() || k.cwd.as_deref() == cwd)
+        });
+        if conflict {
+            return false;
         }
+        claims.insert(
+            OrchestrationClaimKey {
+                name: name.to_string(),
+                cwd: cwd.map(str::to_string),
+            },
+            pane_id.to_string(),
+        );
+        true
     }
 
     /// Issue #201 option (b): release whatever orchestration-name claim (if
