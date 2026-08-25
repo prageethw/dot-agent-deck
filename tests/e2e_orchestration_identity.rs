@@ -285,6 +285,39 @@ fn provisioned_sibling_workspaces(parent: &std::path::Path, prefix: &str) -> Vec
     names
 }
 
+/// Poll [`provisioned_sibling_workspaces`] until it reports exactly
+/// `expected` entries, or [`common::OBSERVATION_BUDGET`] elapses — rather
+/// than reading the filesystem once. A single point-in-time read races the
+/// real `git clone`: `deck.wait_for_string(LABEL)` (`LABEL` is
+/// `" proj-orchestrator-1 "`) is meant to confirm the FIRST open's tab is up
+/// before the filesystem is checked, but `send_bytes` writes the submit
+/// keystrokes to the PTY asynchronously, and that exact needle is ALSO what
+/// the still-open New Pane form's own Name field already renders — padded
+/// with spaces on both sides — the moment the Orchestration mode chip is
+/// selected (`suggest_name_if_orchestration_selected`, `src/ui.rs`), well
+/// before Enter is even processed, let alone before
+/// `provision_isolated_clone_sync_resolved`'s `git clone` runs. So the wait
+/// can be satisfied by the FORM's pre-filled suggestion instead of the
+/// finished tab, and the very next filesystem read can land before real
+/// provisioning has started. Polling here — via [`common::wait_until`],
+/// which owns the actual sleep/timeout loop (Decision 21 forbids a raw one
+/// in an `e2e_*.rs` body) — absorbs that gap without depending on exactly
+/// how large it is.
+fn wait_for_sibling_workspace_count(
+    parent: &std::path::Path,
+    prefix: &str,
+    expected: usize,
+) -> Vec<String> {
+    let last = std::cell::RefCell::new(Vec::new());
+    common::wait_until(common::OBSERVATION_BUDGET, || {
+        let found = provisioned_sibling_workspaces(parent, prefix);
+        let hit = found.len() == expected;
+        *last.borrow_mut() = found;
+        hit
+    });
+    last.into_inner()
+}
+
 /// Scenario: PRD fork#603's accepted fix (PR #604) keys the claim/comparison
 /// layer on the FULL resolved directory (toplevel + segment + relative
 /// subpath), which is enough to let `team-a/proj` and `team-b/proj` both
@@ -380,10 +413,17 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     // Real isolated-clone provisioning runs synchronously inside
     // `Action::SpawnPane` before this tab's role panes can spawn, so by the
     // time its label is visible, the workspace directory it provisioned
-    // already exists on disk.
+    // already exists on disk — but `wait_for_string(LABEL)` itself can
+    // return before that point: the New Pane form's own Name field already
+    // renders the identical, space-padded `LABEL` text as soon as the
+    // Orchestration mode chip is selected, several keystrokes before the
+    // asynchronously-delivered submit is processed. So this wait alone does
+    // NOT guarantee provisioning has run; `wait_for_sibling_workspace_count`
+    // below is what actually waits for it, by polling the filesystem side
+    // effect itself rather than a proxy for it.
     deck.wait_for_string(LABEL); // first open's tab is up, labeled -orchestrator-1
 
-    let after_first = provisioned_sibling_workspaces(&parent, &prefix);
+    let after_first = wait_for_sibling_workspace_count(&parent, &prefix, 1);
     assert_eq!(
         after_first.len(),
         1,
@@ -421,7 +461,15 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     // clone directory rather than two. This is the residual the auditor's
     // original "must not share one physical workspace" framing predicted
     // as a bug; it is now the accepted, documented boundary of the fix.
-    let after_second = provisioned_sibling_workspaces(&parent, &prefix);
+    //
+    // Same reasoning as `after_first` above: the `wait_until_grid` predicate
+    // above can itself be satisfied by the SECOND form's own pre-filled Name
+    // field supplying the second `LABEL` match (tab 1's real bar label plus
+    // tab 2's still-open form both rendering `" proj-orchestrator-1 "`) —
+    // count() >= 2 without a second real tab existing yet — so read the
+    // filesystem via a poll here too rather than a single point-in-time
+    // check.
+    let after_second = wait_for_sibling_workspace_count(&parent, &prefix, 1);
     assert_eq!(
         after_second.len(),
         1,
