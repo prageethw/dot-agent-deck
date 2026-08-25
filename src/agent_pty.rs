@@ -3208,6 +3208,19 @@ struct SilenceWatchRecord {
 /// abandoned debt — reviewer's explicit ask was "days, not hours."
 const COMMISSION_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// Issue #586 M4: one still-unanswered delegation to a worker pane, tracked
+/// per-arm rather than as a bare timestamp. Alongside the M1/M2 `armed_at`
+/// (used, "in arm order", to age and purge stale entries — see
+/// `retire_delegation_commission`), this carries the `subject` the
+/// delegation itself stated, so a later `work-done`'s own echoed subject can
+/// be checked against what was actually delegated and a disagreement
+/// surfaced as [`WorkDoneProvenance::Solicited::subject_mismatch`].
+#[derive(Debug, Clone, PartialEq)]
+struct ArmedCommission {
+    armed_at: Instant,
+    subject: Option<String>,
+}
+
 /// Issue #448: the commission ledger's per-worker-pane entry — how many
 /// delegations that pane still owes a `work-done` for.
 ///
@@ -3226,7 +3239,10 @@ struct DelegationCommission {
     /// prior single-`armed_at`-plus-counter shape let one stale entry expire
     /// two fresh siblings sharing the same worker pane. See
     /// `retire_delegation_commission` for how this is aged and purged.
-    arm_times: VecDeque<Instant>,
+    /// Issue #586 M4: each entry is now an [`ArmedCommission`], adding a
+    /// per-arm `subject` alongside the per-arm `armed_at` this comment
+    /// already described.
+    arm_times: VecDeque<ArmedCommission>,
     /// Pane of the orchestrator that issued them, so closing the ORCHESTRATOR
     /// clears the ledger as well as the two watches — a commission is owed to a
     /// specific orchestrator, and a pane id freed by a close can be inherited by
@@ -3244,11 +3260,13 @@ struct DelegationCommission {
 /// first of those the completion is genuine and must still be reported as such.
 /// Reading `Nothing` as "unsolicited" would silently mislabel every completion
 /// in every project that has turned the detector off.
-// `Clone, Copy` for parity with its sibling `state::WorkDoneReportChannel`
-// (issue #448 review, finding 7 minor): both are small plain enums describing one
-// completion, and a caller that has to `match`-and-rebuild one but not the other
-// is an avoidable papercut. No behavioural effect today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Clone` for parity with its sibling `state::WorkDoneReportChannel` (issue
+// #448 review, finding 7 minor): both are small plain enums describing one
+// completion, and a caller that has to `match`-and-rebuild one but not the
+// other is an avoidable papercut. `Copy` was dropped in the #586 M4 GREEN
+// commit: `Solicited::subject_mismatch` can carry a `SubjectMismatch`, which
+// owns two `String`s, and a `String`-bearing type cannot implement `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkDoneProvenance {
     /// The orchestrator had at least one unanswered delegation to this worker
     /// pane; one is now credited to this completion.
@@ -3257,6 +3275,12 @@ pub enum WorkDoneProvenance {
         /// orchestrator re-delegated before the worker reported, which its
         /// protocol forbids.
         remaining: u32,
+        /// Issue #586 M4: `Some` only when both the delegate's own `--subject`
+        /// and the worker's echoed `work-done --subject` were supplied and
+        /// disagree. `None` covers every other case — either side omitted, or
+        /// both agree — so this is opt-in and never fires for a delegation that
+        /// didn't use `--subject` at all.
+        subject_mismatch: Option<SubjectMismatch>,
     },
     /// Nothing was outstanding: the orchestrator commissioned no work this
     /// completion could be answering. The commonest cause is a human tasking the
@@ -3264,6 +3288,14 @@ pub enum WorkDoneProvenance {
     /// context from an earlier delegation (`work_done_footer`), so it runs again
     /// for work the orchestrator never asked for.
     Unsolicited,
+}
+
+/// Issue #586 M4: the two disagreeing subjects behind a
+/// [`WorkDoneProvenance::Solicited::subject_mismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectMismatch {
+    pub expected: String,
+    pub echoed: String,
 }
 
 /// PRD #249 M3 review (finding B4/S4): handed back by
@@ -4069,6 +4101,7 @@ impl AgentPtyRegistry {
         &self,
         worker_pane_id: &str,
         orchestrator_pane_id: &str,
+        subject: Option<String>,
     ) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
@@ -4083,7 +4116,10 @@ impl AgentPtyRegistry {
                 arm_times: VecDeque::new(),
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
             });
-        entry.arm_times.push_back(Instant::now());
+        entry.arm_times.push_back(ArmedCommission {
+            armed_at: Instant::now(),
+            subject,
+        });
         // Last delegate wins: a pane id that has changed hands (orchestrator
         // closed, successor spawned onto the same id) must not leave the ledger
         // pointing its close sweep at the dead pane.
@@ -4110,9 +4146,9 @@ impl AgentPtyRegistry {
                     orchestrator_pane_id: r.orchestrator_pane_id.clone(),
                 }),
             delegation_commission: tracker.commissions.get(worker_pane_id).and_then(|c| {
-                c.arm_times.front().map(|&oldest| CommissionSnapshot {
+                c.arm_times.front().map(|oldest| CommissionSnapshot {
                     outstanding: c.arm_times.len() as u32,
-                    oldest_armed_secs_ago: now.duration_since(oldest).as_secs(),
+                    oldest_armed_secs_ago: now.duration_since(oldest.armed_at).as_secs(),
                     orchestrator_pane_id: c.orchestrator_pane_id.clone(),
                 })
             }),
@@ -4134,7 +4170,21 @@ impl AgentPtyRegistry {
     /// are purged oldest-first before the oldest still-live commission is
     /// consumed, so one stale entry can no longer expire fresh siblings
     /// sharing the same worker pane (reviewer/auditor finding B2/F2).
-    pub fn retire_delegation_commission(&self, worker_pane_id: &str) -> WorkDoneProvenance {
+    ///
+    /// Fix round 5 (S4): the oldest-still-live commission is always the one
+    /// consumed (FIFO), with no generation on the wire to match a `work-done`
+    /// to the specific delegation it answers. When multiple commissions are
+    /// outstanding to one worker pane with DIFFERENT subjects and they are
+    /// answered out of order, a completion is credited to the wrong
+    /// commission's `expected` subject and can trip a spurious mismatch
+    /// warning (or, symmetrically, suppress a real one) — the same accepted
+    /// hole [`Self::retire_silence_watch`] documents for its own oldest-first
+    /// accounting, and for the same reason (no generation on the wire).
+    pub fn retire_delegation_commission(
+        &self,
+        worker_pane_id: &str,
+        echoed_subject: Option<&str>,
+    ) -> WorkDoneProvenance {
         let mut tracker = self.delegations.lock().unwrap();
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return WorkDoneProvenance::Unsolicited;
@@ -4144,8 +4194,8 @@ impl AgentPtyRegistry {
         // is in arm order, so the first non-expired entry means everything after
         // it is fresher still. A single stale entry no longer takes fresh
         // siblings down with it (issue #586 M2/B round 2, finding B2/F2).
-        while let Some(&front) = entry.arm_times.front() {
-            if now.duration_since(front) > COMMISSION_MAX_AGE {
+        while let Some(front) = entry.arm_times.front() {
+            if now.duration_since(front.armed_at) > COMMISSION_MAX_AGE {
                 entry.arm_times.pop_front();
             } else {
                 break;
@@ -4156,12 +4206,48 @@ impl AgentPtyRegistry {
             return WorkDoneProvenance::Unsolicited;
         }
         // Consume the oldest still-live commission.
-        entry.arm_times.pop_front();
+        let popped = entry
+            .arm_times
+            .pop_front()
+            .expect("checked non-empty above");
         let remaining = entry.arm_times.len() as u32;
         if remaining == 0 {
             tracker.commissions.remove(worker_pane_id);
         }
-        WorkDoneProvenance::Solicited { remaining }
+        // Issue #586 M4: only a mismatch when BOTH sides stated a subject and
+        // they disagree — either side omitted, or both agree, is not a
+        // mismatch (opt-in, never fires for a delegation that didn't use
+        // `--subject` at all).
+        //
+        // Fix round 4 (S11/A16): sanitize-once-at-ingest. `popped.subject`
+        // (the armed/expected side) was already sanitized by
+        // `handle_delegate`'s fan-out loop before it was ever armed — it is
+        // canonical here and must NOT be sanitized again, because
+        // `sanitize_subject_tag` is not idempotent for every input, and a
+        // second pass over an already-canonical value can produce a
+        // different string than the first pass did. The echoed side is fresh
+        // off the worker's `work-done --subject` CLI call and has never been
+        // sanitized before, so it gets exactly one pass, here. Both fields of
+        // `SubjectMismatch` therefore hold canonical (sanitized) values by
+        // construction, addressing A16.
+        let subject_mismatch = match (popped.subject.as_deref(), echoed_subject) {
+            (Some(expected), Some(echoed)) => {
+                let echoed_sanitized = crate::state::sanitize_subject_tag(echoed);
+                if expected != echoed_sanitized {
+                    Some(SubjectMismatch {
+                        expected: expected.to_string(),
+                        echoed: echoed_sanitized,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        WorkDoneProvenance::Solicited {
+            remaining,
+            subject_mismatch,
+        }
     }
 
     /// Issue #448 review (finding 1): release ONE commission armed for
@@ -12842,25 +12928,31 @@ mod spawn_tests {
     fn commission_ledger_credits_one_completion_per_delegation() {
         let reg = Arc::new(AgentPtyRegistry::new());
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a worker nobody delegated to owes nothing"
         );
 
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 1 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 1,
+                subject_mismatch: None
+            },
             "the first completion answers one of two outstanding commissions"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "the second answers the last one"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a third completion is answering nothing — the defect in #448"
         );
@@ -12880,27 +12972,30 @@ mod spawn_tests {
         );
 
         // One delegate, undelivered: the ledger must not keep the debt.
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         assert!(reg.release_delegation_commission("worker"));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a failed delegate must not leave a phantom commission for a later \
              uncommissioned work-done to spend — that is #448 through its own fix"
         );
 
         // Two delegates, only the second undelivered: the first is still owed.
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         assert!(reg.release_delegation_commission("worker"));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "releasing one failed delegate must not discard a sibling delegation's \
              genuine commission"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "and only the one that landed is credited"
         );
@@ -12913,20 +13008,23 @@ mod spawn_tests {
     #[test]
     fn commission_ledger_is_swept_by_either_panes_close_and_refuses_mid_close() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        assert!(reg.arm_delegation_commission("worker-a", "orch-1"));
-        assert!(reg.arm_delegation_commission("worker-b", "orch-2"));
+        assert!(reg.arm_delegation_commission("worker-a", "orch-1", None));
+        assert!(reg.arm_delegation_commission("worker-b", "orch-2", None));
 
         // Closing the ORCHESTRATOR clears what was owed to it; an unrelated
         // orchestration's commission survives.
         drop(reg.begin_pane_close("orch-1"));
         assert_eq!(
-            reg.retire_delegation_commission("worker-a"),
+            reg.retire_delegation_commission("worker-a", None),
             WorkDoneProvenance::Unsolicited,
             "a commission owed to a closed orchestrator must not survive it"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker-b"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("worker-b", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "another orchestration's commission must be untouched by the close"
         );
 
@@ -12935,17 +13033,17 @@ mod spawn_tests {
         // completion into a solicited one.
         assert!(reg.is_pane_closing("orch-1"));
         assert!(
-            !reg.arm_delegation_commission("worker-a", "orch-1"),
+            !reg.arm_delegation_commission("worker-a", "orch-1", None),
             "a closing orchestrator must not accept new commissions"
         );
-        assert!(reg.arm_delegation_commission("worker-a", "orch-live"));
+        assert!(reg.arm_delegation_commission("worker-a", "orch-live", None));
         drop(reg.begin_pane_close("worker-a"));
         assert!(
-            !reg.arm_delegation_commission("worker-a", "orch-live"),
+            !reg.arm_delegation_commission("worker-a", "orch-live", None),
             "a closing worker must not accept new commissions"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker-a"),
+            reg.retire_delegation_commission("worker-a", None),
             WorkDoneProvenance::Unsolicited,
             "the worker's own close swept its ledger entry too"
         );
@@ -12980,15 +13078,15 @@ mod spawn_tests {
     #[test]
     fn delegation_commission_records_a_timestamp_per_arm() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         let (len, first, second) = {
             let tracker = reg.delegations.lock().unwrap();
             let entry = tracker.commissions.get("worker").expect("just armed");
             (
                 entry.arm_times.len(),
-                entry.arm_times.front().copied(),
-                entry.arm_times.get(1).copied(),
+                entry.arm_times.front().cloned(),
+                entry.arm_times.get(1).cloned(),
             )
         };
 
@@ -13020,8 +13118,8 @@ mod spawn_tests {
         reg.arm_outstanding_delegation("worker", "role", "orch", "orch-agent", None);
         reg.arm_silence_watch("worker", "orch", None)
             .expect("arm succeeds for two open panes");
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
 
         let snap = reg.delegation_watch_snapshot("worker");
         let outstanding = snap
@@ -13051,22 +13149,26 @@ mod spawn_tests {
         let reg = Arc::new(AgentPtyRegistry::new());
 
         // A fresh commission, armed moments ago, must still be credited.
-        assert!(reg.arm_delegation_commission("fresh", "orch"));
+        assert!(reg.arm_delegation_commission("fresh", "orch", None));
         assert_eq!(
-            reg.retire_delegation_commission("fresh"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("fresh", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "a commission within COMMISSION_MAX_AGE is unaffected by the expiry check"
         );
 
         // A stale commission, backdated past COMMISSION_MAX_AGE, must expire.
-        assert!(reg.arm_delegation_commission("stale", "orch"));
+        assert!(reg.arm_delegation_commission("stale", "orch", None));
         {
             let mut tracker = reg.delegations.lock().unwrap();
             let entry = tracker.commissions.get_mut("stale").expect("just armed");
-            entry.arm_times[0] = Instant::now() - (COMMISSION_MAX_AGE + Duration::from_secs(60));
+            entry.arm_times[0].armed_at =
+                Instant::now() - (COMMISSION_MAX_AGE + Duration::from_secs(60));
         }
         assert_eq!(
-            reg.retire_delegation_commission("stale"),
+            reg.retire_delegation_commission("stale", None),
             WorkDoneProvenance::Unsolicited,
             "upstream #590: a commission older than COMMISSION_MAX_AGE must not be \
              credited to a much-later genuine work-done"
@@ -13093,26 +13195,32 @@ mod spawn_tests {
     #[test]
     fn retire_delegation_commission_ages_two_arms_independently() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         {
             let mut tracker = reg.delegations.lock().unwrap();
             let entry = tracker.commissions.get_mut("worker").expect("just armed");
-            entry.arm_times[0] = Instant::now() - Duration::from_secs(100 * 60);
+            entry.arm_times[0].armed_at = Instant::now() - Duration::from_secs(100 * 60);
         }
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
 
         // Retiring once consumes the OLDER (~100m old) entry first.
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 1 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 1,
+                subject_mismatch: None
+            },
             "the first completion answers the older of the two outstanding commissions"
         );
 
         // The remaining entry is the fresh (~0m old) one — nowhere near
         // COMMISSION_MAX_AGE — and must still be credited, not wrongly expired.
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "the second, genuinely fresh commission must not be caught by the first \
              arm's age"
         );
@@ -13130,27 +13238,132 @@ mod spawn_tests {
     #[test]
     fn retire_delegation_commission_purges_only_the_stale_sibling() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         {
             let mut tracker = reg.delegations.lock().unwrap();
             let entry = tracker.commissions.get_mut("worker").expect("just armed");
             // Backdate only the FRONT (oldest) entry past COMMISSION_MAX_AGE;
             // the other two stay fresh.
-            entry.arm_times[0] = Instant::now() - (COMMISSION_MAX_AGE + Duration::from_secs(60));
+            entry.arm_times[0].armed_at =
+                Instant::now() - (COMMISSION_MAX_AGE + Duration::from_secs(60));
         }
 
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 1 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 1,
+                subject_mismatch: None
+            },
             "the stale front entry must be purged and a fresh sibling credited instead \
              of reporting Unsolicited because the stale entry was at the front"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "the last fresh sibling must still be credited"
+        );
+    }
+
+    /// Issue #586 M4 fix round 3 (S6): every existing test on this guard only
+    /// ever exercises `(None, None)` for the subject comparison — passing
+    /// under a `_` arm however the guard is actually written, so an inverted
+    /// condition (`==` instead of `!=`) or a widened one would still pass
+    /// every test that existed before this round while firing the warning on
+    /// every correctly-matched report, or never firing on a genuine mismatch.
+    /// Pin the three remaining "both sides present or one absent" shapes:
+    /// matching subjects, and either side alone stated, must never mismatch.
+    #[test]
+    fn retire_delegation_commission_subject_guard_fast_tier_coverage() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // (Some(A), Some(A)) — both sides agree: no mismatch.
+        assert!(reg.arm_delegation_commission("worker-match", "orch", Some("#586".to_string())));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-match", Some("#586")),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "matching subjects on both sides must never be reported as a mismatch"
+        );
+
+        // (Some, None) — delegated a subject, worker echoed none: opt-in, so
+        // an unstated echo is not a mismatch.
+        assert!(reg.arm_delegation_commission(
+            "worker-echo-none",
+            "orch",
+            Some("#586".to_string())
+        ));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-echo-none", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a worker that echoed no subject at all must not be flagged as mismatched"
+        );
+
+        // (None, Some) — no subject was delegated, worker stated one anyway:
+        // still not a mismatch, since nothing was asked.
+        assert!(reg.arm_delegation_commission("worker-undelegated-subject", "orch", None));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-undelegated-subject", Some("#123")),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a subject the worker volunteered without one being delegated must not be \
+             flagged as mismatched"
+        );
+    }
+
+    /// Issue #586 M4 fix round 4 (S11/A16): regression guard for the exact bug
+    /// this round closes. `sanitize_subject_tag("A \u{200B} B")` is not
+    /// idempotent under the pre-fix implementation — `"A  B"` (double space)
+    /// once, `"A B"` (single space) twice — so a worker that does exactly
+    /// what H2's footer told it (echo the ALREADY-sanitized subject the
+    /// footer showed) used to trip a false SUBJECT MISMATCH once
+    /// `retire_delegation_commission` sanitized that echo a second time.
+    ///
+    /// This test simulates the real ingest flow rather than calling
+    /// `sanitize_subject_tag` twice directly: `handle_delegate`'s fan-out
+    /// loop sanitizes the subject ONCE, before arming (state.rs), so the
+    /// value handed to `arm_delegation_commission` here is already
+    /// canonical — exactly as the real caller supplies it — and the worker's
+    /// echo is the raw, once-sanitized text the footer rendered, unsanitized
+    /// until `retire_delegation_commission` sanitizes it here for the first
+    /// and only time.
+    #[test]
+    fn retire_delegation_commission_zero_width_space_echo_is_not_a_false_mismatch() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // What `handle_delegate`'s fan-out would have armed: the raw subject,
+        // sanitized once at ingest.
+        let canonical = crate::state::sanitize_subject_tag("A \u{200B} B");
+        assert_eq!(
+            canonical, "A B",
+            "sanity check on the fixed sanitize function itself before using it \
+             to build this test's fixture"
+        );
+        assert!(reg.arm_delegation_commission("worker", "orch", Some(canonical.clone())));
+
+        // What the worker echoes back: exactly the canonical value H2's
+        // footer showed it — the correct, expected behavior.
+        assert_eq!(
+            reg.retire_delegation_commission("worker", Some(&canonical)),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a worker echoing exactly the canonical subject the footer showed it must \
+             never trip a false SUBJECT MISMATCH, even though the underlying subject \
+             text originally contained a zero-width space that disproved \
+             sanitize_subject_tag's idempotency before this round's fix"
         );
     }
 

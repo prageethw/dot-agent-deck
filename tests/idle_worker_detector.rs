@@ -337,6 +337,7 @@ impl IdleHarness {
             task: "Perform the delegated test task.".to_string(),
             to: roles.iter().map(|role| (*role).to_string()).collect(),
             timestamp: chrono::Utc::now(),
+            subject: None,
         };
         self.state
             .read()
@@ -363,6 +364,7 @@ impl IdleHarness {
                     // never re-registered mid-test.
                     generation: 1,
                     daemon_boot_id,
+                    subject: None,
                 },
                 &self.registry,
             )
