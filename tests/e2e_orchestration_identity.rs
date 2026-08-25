@@ -259,3 +259,172 @@ fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1()
          (PRD fork#603)\n=== rendered grid ===\n{grid}"
     );
 }
+
+/// The provisioned sibling workspace directories PRD fork#603's isolated
+/// clone provisioning has produced so far for THIS test's own launch
+/// directory — every sibling of `parent` whose name is prefixed by `prefix`
+/// (`<launch-dir-basename>-`, the shape `resolve_workspace_path` in
+/// `src/ui.rs` always emits: `dir.with_file_name(format!("{dir_name}-{segment}"))`
+/// keeps the same parent as `dir`). `parent` is `harness_temp_root()`,
+/// shared by every concurrently running test's own per-test tempdir, but
+/// `work`'s own basename is a `tempfile`-randomized name unique to this
+/// test, so filtering on it as a prefix isolates exactly this test's own
+/// provisioned workspaces. Reads the real filesystem rather than
+/// recomputing the segment name `sanitize_workspace_segment` would derive,
+/// so it observes what provisioning ACTUALLY produced at runtime rather
+/// than what a hand-computed formula predicts it should have.
+fn provisioned_sibling_workspaces(parent: &std::path::Path, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(parent)
+        .expect("read the launch dir's parent to observe provisioned sibling workspaces")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(prefix))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Scenario: PRD fork#603 auditor blocker A1 — the runtime counterpart to
+/// `identity_033`, which only checks the two tabs' LABELS. Seeds the same
+/// `team-a/proj` / `team-b/proj` sibling leaves (two genuinely different
+/// directories sharing the basename `proj`) and opens an orchestration in
+/// each, exactly as `identity_033` does. But instead of stopping at the tab
+/// strip, this test watches the real sibling workspace directories each
+/// open's isolated-clone provisioning actually creates on disk (siblings of
+/// the fixture's own launch dir, named `<launch-dir-basename>-<segment>` —
+/// `resolve_workspace_path`, `src/ui.rs`) and asserts the two opens produce
+/// TWO distinct clone directories. `Action::SpawnPane`'s real nested-pick
+/// provisioning formula derives the sibling workspace from the git
+/// TOPLEVEL (`src/ui.rs:11041-11162`, fork issue #595 fix round 2), not the
+/// picked subdirectory — so `team-a/proj` and `team-b/proj` (same
+/// toplevel, same PRD fork#603 suggested name `proj-orchestrator-1`)
+/// derive the byte-identical workspace path, and the second open's
+/// `provision_isolated_clone_or_status` call resumes the FIRST clone
+/// (`IsolatedCloneOutcome::Resumed`) instead of creating its own. Two
+/// orchestrations `identity_033` shows as two distinct tabs actually share
+/// one physical clone, one branch, and one `created-by:` marker — the
+/// exact fork #74 collision this whole claim mechanism exists to prevent.
+#[spec("orchestration/identity/037")]
+#[test]
+fn identity_037_sibling_directories_with_the_same_name_must_not_share_one_physical_workspace() {
+    let deck = TuiDeck::launch_with_fixture("orch-deck");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+    deck.wait_for_string("No active sessions");
+
+    let toml = std::fs::read_to_string(work.join(".dot-agent-deck.toml"))
+        .expect("read fixture's own .dot-agent-deck.toml to duplicate into each leaf");
+    for team in ["team-a", "team-b"] {
+        let leaf = work.join(team).join("proj");
+        std::fs::create_dir_all(&leaf).expect("create leaf project dir");
+        std::fs::write(leaf.join(".dot-agent-deck.toml"), &toml)
+            .expect("seed leaf .dot-agent-deck.toml");
+    }
+    // Same reasoning as `identity_033`: every orchestration provisions via
+    // `git clone`, which only ever reproduces tracked, committed content, so
+    // the two leaf fixtures must be committed explicitly here.
+    run_git(&work, &["add", "team-a/proj/.dot-agent-deck.toml"]);
+    run_git(&work, &["add", "team-b/proj/.dot-agent-deck.toml"]);
+    run_git(
+        &work,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "add team-a/team-b fixture leaves",
+        ],
+    );
+
+    const LABEL: &str = " proj-orchestrator-1 ";
+
+    let work_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let prefix = format!("{work_basename}-");
+    let parent = work
+        .parent()
+        .expect("launch dir has a parent")
+        .to_path_buf();
+
+    let before = provisioned_sibling_workspaces(&parent, &prefix);
+    assert!(
+        before.is_empty(),
+        "no sibling workspace should exist for this test's launch dir before any orchestration \
+         is opened; found {before:?} under {}",
+        parent.display()
+    );
+
+    // First open: team-a/proj.
+    deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
+    let (col, row) = deck.wait_for_in_grid("team-a");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-a
+    let (col, row) = deck.wait_for_in_grid("proj/");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-a/proj
+    deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_bytes(b"\x1b[C"); // Right -> [Orch: demo-orch]
+    deck.send_bytes(b"\r"); // Mode -> Name
+    deck.send_bytes(b"\r"); // submit the suggested name, unedited
+    // Real isolated-clone provisioning runs synchronously inside
+    // `Action::SpawnPane` before this tab's role panes can spawn, so by the
+    // time its label is visible, the workspace directory it provisioned
+    // already exists on disk.
+    deck.wait_for_string(LABEL); // first open's tab is up, labeled -orchestrator-1
+
+    let after_first = provisioned_sibling_workspaces(&parent, &prefix);
+    assert_eq!(
+        after_first.len(),
+        1,
+        "the first open must provision exactly one sibling workspace directory prefixed \
+         {prefix:?}; found {after_first:?} under {}",
+        parent.display()
+    );
+
+    // Back to the Dashboard to open the second orchestration.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
+    deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    // Second open: team-b/proj — a DIFFERENT absolute path with the
+    // IDENTICAL basename `proj`.
+    deck.send_bytes(b"\x0e");
+    let (col, row) = deck.wait_for_in_grid("team-b");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-b
+    let (col, row) = deck.wait_for_in_grid("proj/");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-b/proj
+    deck.send_bytes(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_bytes(b"\x1b[C");
+    deck.send_bytes(b"\r");
+    deck.send_bytes(b"\r"); // submit the suggested name, unedited
+    deck.wait_until_grid("both orchestration tabs labeled -orchestrator-1", |g| {
+        g.matches(LABEL).count() >= 2
+    });
+
+    let after_second = provisioned_sibling_workspaces(&parent, &prefix);
+    assert_eq!(
+        after_second.len(),
+        2,
+        "team-a/proj and team-b/proj must each provision their OWN sibling workspace \
+         directory — two genuinely distinct physical clones, not one clone the second open's \
+         `IsolatedCloneOutcome::Resumed` silently reuses (auditor finding A1, PRD fork#603): \
+         two orchestrations the tab strip shows as distinct are actually sharing one clone, one \
+         branch, and one `created-by:` marker — the exact fork #74 condition this whole claim \
+         mechanism exists to prevent; found {after_second:?} under {} (after the first open \
+         alone: {after_first:?})",
+        parent.display()
+    );
+}
