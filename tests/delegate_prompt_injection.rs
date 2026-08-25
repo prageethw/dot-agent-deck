@@ -1724,6 +1724,189 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
         });
 }
 
+/// Scenario: Delegate with `--subject #586`, then report `work-done` with a
+/// worker-echoed `--subject` that disagrees and carries a control/ESC byte
+/// plus frame-breaking brackets — the exact channel reviewer B1/auditor A1
+/// traced from `--subject` through to the orchestrator's live pane on the
+/// normal `Filed` delivery path. Assert the raw hostile bytes never reach the
+/// pane. A second cycle repeats this with an oversized echoed subject and
+/// asserts it is capped, not typed in full as one giant synthetic paste.
+#[test]
+#[cfg(unix)]
+fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build subject-mismatch-sanitization runtime")
+        .block_on(async {
+            // Control/ESC byte + frame-breaking brackets, on the WORKER's own
+            // echoed subject — the more hostile of the two sides, since a
+            // worker's `work-done --subject` is free text under the worker's
+            // control, unlike the orchestrator's own `delegate --subject`.
+            {
+                let harness = SilenceHarness::new(64).await;
+                harness
+                    .state
+                    .handle_delegate(
+                        DelegateSignal {
+                            pane_id: ORCH_PANE.to_string(),
+                            task: "Perform the delegated subject-mismatch task.".to_string(),
+                            to: vec![WORKER_ROLE.to_string()],
+                            timestamp: chrono::Utc::now(),
+                            subject: Some("#586".to_string()),
+                        },
+                        &harness.registry,
+                        &harness.event_tx,
+                    )
+                    .await;
+                let delivered = wait_for_snapshot_needle(
+                    &harness.registry,
+                    &harness.worker_agent_id,
+                    POINTER,
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(
+                    snapshot_contains(&delivered, POINTER),
+                    "precondition failed: worker never received the delegate pointer: {:?}",
+                    String::from_utf8_lossy(&delivered)
+                );
+
+                let hostile_echo = "#123\u{1B}[2J\u{1B}[31mFAKE-PROMPT]<script>";
+                harness
+                    .state
+                    .handle_work_done(
+                        WorkDoneSignal {
+                            pane_id: WORKER_PANE.to_string(),
+                            task: "Completed the delegated task.".to_string(),
+                            done: false,
+                            timestamp: chrono::Utc::now(),
+                            generation: 1,
+                            daemon_boot_id: harness.state.daemon_boot_id().to_string(),
+                            subject: Some(hostile_echo.to_string()),
+                        },
+                        &harness.registry,
+                    )
+                    .await;
+
+                let snapshot = wait_for_snapshot_needle(
+                    &harness.registry,
+                    &harness.orchestrator_agent_id,
+                    b"SUBJECT MISMATCH",
+                    Duration::from_secs(2),
+                )
+                .await;
+                let text = String::from_utf8_lossy(&snapshot);
+                assert!(
+                    text.contains("SUBJECT MISMATCH"),
+                    "precondition failed: the mismatch warning never reached the orchestrator \
+                     pane: {text:?}"
+                );
+                assert!(
+                    !snapshot.contains(&0x1Bu8),
+                    "the raw ESC byte from the worker's echoed subject must never reach the \
+                     live orchestrator pane: {text:?}"
+                );
+                for forbidden in ['[', ']', '<', '>'] {
+                    assert!(
+                        !text.contains(forbidden),
+                        "frame-breaking character {forbidden:?} from the hostile subject must \
+                         be stripped before reaching the pane: {text:?}"
+                    );
+                }
+                assert!(
+                    text.contains("FAKE-PROMPT") && text.contains("script"),
+                    "sanitization strips structural characters, not the surrounding words - the \
+                     harmless remainder must still be visible: {text:?}"
+                );
+            }
+
+            // An oversized echoed subject (either side) must be capped,
+            // mirroring `quote_untrusted_report`'s bound on the sibling
+            // report-body sink one function away.
+            {
+                let harness = SilenceHarness::new(64).await;
+                harness
+                    .state
+                    .handle_delegate(
+                        DelegateSignal {
+                            pane_id: ORCH_PANE.to_string(),
+                            task: "Perform the delegated subject-mismatch task.".to_string(),
+                            to: vec![WORKER_ROLE.to_string()],
+                            timestamp: chrono::Utc::now(),
+                            subject: Some("#586".to_string()),
+                        },
+                        &harness.registry,
+                        &harness.event_tx,
+                    )
+                    .await;
+                let delivered = wait_for_snapshot_needle(
+                    &harness.registry,
+                    &harness.worker_agent_id,
+                    POINTER,
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(
+                    snapshot_contains(&delivered, POINTER),
+                    "precondition failed: worker never received the delegate pointer: {:?}",
+                    String::from_utf8_lossy(&delivered)
+                );
+
+                // Mirrors `state::MAX_SUBJECT_CHARS`, private to that module.
+                const MAX_SUBJECT_CHARS: usize = 200;
+                let oversized_echo = "y".repeat(MAX_SUBJECT_CHARS * 3);
+                harness
+                    .state
+                    .handle_work_done(
+                        WorkDoneSignal {
+                            pane_id: WORKER_PANE.to_string(),
+                            task: "Completed the delegated task.".to_string(),
+                            done: false,
+                            timestamp: chrono::Utc::now(),
+                            generation: 1,
+                            daemon_boot_id: harness.state.daemon_boot_id().to_string(),
+                            subject: Some(oversized_echo),
+                        },
+                        &harness.registry,
+                    )
+                    .await;
+
+                let snapshot = wait_for_snapshot_needle(
+                    &harness.registry,
+                    &harness.orchestrator_agent_id,
+                    b"SUBJECT MISMATCH",
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(
+                    snapshot_contains(&snapshot, b"SUBJECT MISMATCH"),
+                    "precondition failed: the mismatch warning never reached the orchestrator \
+                     pane: {:?}",
+                    String::from_utf8_lossy(&snapshot)
+                );
+                let y_count = snapshot.iter().filter(|&&b| b == b'y').count();
+                assert!(
+                    y_count <= MAX_SUBJECT_CHARS,
+                    "an oversized echoed subject must be capped before it reaches the pane, not \
+                     typed in full as one giant synthetic paste: {y_count} 'y' bytes found"
+                );
+                assert!(
+                    y_count > 0,
+                    "the capped subject must still be visible, just bounded: {y_count} 'y' bytes \
+                     found"
+                );
+            }
+        });
+}
+
 /// Scenario: Overflow the silence watch's tiny broadcast receiver after pointer
 /// delivery. Because a proof event may have been dropped, the daemon must stay
 /// conservative and emit no unprovable silence notice.
