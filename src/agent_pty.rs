@@ -4209,22 +4209,24 @@ impl AgentPtyRegistry {
         // mismatch (opt-in, never fires for a delegation that didn't use
         // `--subject` at all).
         //
-        // Fix round 3 (A8): compare SANITIZED values, not raw ones.
-        // `compose_work_done_feedback` renders both sides through
-        // `sanitize_subject_tag` before display, so a worker echoing a subject
-        // that differs only by a frame-breaking character (e.g. a zero-width
-        // space) stripped at render time used to trip this comparison while
-        // showing two identical-looking values in the warning — an
-        // alert-fatigue vector that trains the orchestrator to dismiss real
-        // mismatches. Compare the same values eventually shown.
+        // Fix round 4 (S11/A16): sanitize-once-at-ingest. `popped.subject`
+        // (the armed/expected side) was already sanitized by
+        // `handle_delegate`'s fan-out loop before it was ever armed — it is
+        // canonical here and must NOT be sanitized again, because
+        // `sanitize_subject_tag` is not idempotent for every input, and a
+        // second pass over an already-canonical value can produce a
+        // different string than the first pass did. The echoed side is fresh
+        // off the worker's `work-done --subject` CLI call and has never been
+        // sanitized before, so it gets exactly one pass, here. Both fields of
+        // `SubjectMismatch` therefore hold canonical (sanitized) values by
+        // construction, addressing A16.
         let subject_mismatch = match (popped.subject.as_deref(), echoed_subject) {
             (Some(expected), Some(echoed)) => {
-                let expected_sanitized = crate::state::sanitize_subject_tag(expected);
                 let echoed_sanitized = crate::state::sanitize_subject_tag(echoed);
-                if expected_sanitized != echoed_sanitized {
+                if expected != echoed_sanitized {
                     Some(SubjectMismatch {
                         expected: expected.to_string(),
-                        echoed: echoed.to_string(),
+                        echoed: echoed_sanitized,
                     })
                 } else {
                     None
@@ -13307,6 +13309,51 @@ mod spawn_tests {
             },
             "a subject the worker volunteered without one being delegated must not be \
              flagged as mismatched"
+        );
+    }
+
+    /// Issue #586 M4 fix round 4 (S11/A16): regression guard for the exact bug
+    /// this round closes. `sanitize_subject_tag("A \u{200B} B")` is not
+    /// idempotent under the pre-fix implementation — `"A  B"` (double space)
+    /// once, `"A B"` (single space) twice — so a worker that does exactly
+    /// what H2's footer told it (echo the ALREADY-sanitized subject the
+    /// footer showed) used to trip a false SUBJECT MISMATCH once
+    /// `retire_delegation_commission` sanitized that echo a second time.
+    ///
+    /// This test simulates the real ingest flow rather than calling
+    /// `sanitize_subject_tag` twice directly: `handle_delegate`'s fan-out
+    /// loop sanitizes the subject ONCE, before arming (state.rs), so the
+    /// value handed to `arm_delegation_commission` here is already
+    /// canonical — exactly as the real caller supplies it — and the worker's
+    /// echo is the raw, once-sanitized text the footer rendered, unsanitized
+    /// until `retire_delegation_commission` sanitizes it here for the first
+    /// and only time.
+    #[test]
+    fn retire_delegation_commission_zero_width_space_echo_is_not_a_false_mismatch() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // What `handle_delegate`'s fan-out would have armed: the raw subject,
+        // sanitized once at ingest.
+        let canonical = crate::state::sanitize_subject_tag("A \u{200B} B");
+        assert_eq!(
+            canonical, "A B",
+            "sanity check on the fixed sanitize function itself before using it \
+             to build this test's fixture"
+        );
+        assert!(reg.arm_delegation_commission("worker", "orch", Some(canonical.clone())));
+
+        // What the worker echoes back: exactly the canonical value H2's
+        // footer showed it — the correct, expected behavior.
+        assert_eq!(
+            reg.retire_delegation_commission("worker", Some(&canonical)),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a worker echoing exactly the canonical subject the footer showed it must \
+             never trip a false SUBJECT MISMATCH, even though the underlying subject \
+             text originally contained a zero-width space that disproved \
+             sanitize_subject_tag's idempotency before this round's fix"
         );
     }
 
