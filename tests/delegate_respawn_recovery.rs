@@ -207,6 +207,7 @@ async fn delegate(fx: &Fixture, task: &str) {
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     fx.daemon
         .state
@@ -576,6 +577,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
         task: "list the files in this directory".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state

@@ -150,6 +150,7 @@ async fn codex_worker_001_inner() {
         ),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
