@@ -377,14 +377,29 @@ pub async fn handle_dispatch(
     // from that raw path would reopen F1/F3 one level down. Check the
     // actual property instead: would the DERIVED worktree dir land inside
     // the canonicalized toplevel?
+    //
+    // Fork issue #595 fix round 4 (reviewer N7 / auditor S1): round 3's
+    // fallback on `.canonicalize()` failure used `paths.worktree_dir`'s
+    // own RAW spelling, which is only symmetric with the canonicalized
+    // toplevel when `ctx.working_dir` was itself reached by a physical
+    // path -- a `ctx.working_dir` reached through a SYMLINKED ANCESTOR
+    // shares no textual prefix with the canonicalized toplevel either
+    // way, so the guard stayed silent for that narrower shape. Canonicalize
+    // `paths.worktree_dir`'s PARENT instead (it exists on disk -- it is
+    // the same parent `ctx.working_dir` itself lives in) and re-attach the
+    // worktree's own file name, matching the fix in `src/ui.rs`.
     if relative_subpath.is_none()
         && let Some((toplevel, _)) = toplevel_resolution.as_ref()
     {
         let canonical_toplevel = toplevel.canonicalize().unwrap_or_else(|_| toplevel.clone());
-        let canonical_worktree_dir = paths
-            .worktree_dir
-            .canonicalize()
-            .unwrap_or_else(|_| paths.worktree_dir.clone());
+        let canonical_worktree_dir =
+            match (paths.worktree_dir.parent(), paths.worktree_dir.file_name()) {
+                (Some(parent), Some(file_name)) => parent
+                    .canonicalize()
+                    .map(|canonical_parent| canonical_parent.join(file_name))
+                    .unwrap_or_else(|_| paths.worktree_dir.clone()),
+                _ => paths.worktree_dir.clone(),
+            };
         if canonical_worktree_dir.starts_with(&canonical_toplevel) {
             resolved_working_dir = toplevel.clone();
             paths = derive_dispatch_paths(&resolved_working_dir, name);
@@ -761,7 +776,7 @@ pub async fn handle_dispatch(
                 .canonicalize()
                 .unwrap_or_else(|_| paths.worktree_dir.clone());
             let canonical_joined = joined.canonicalize().unwrap_or_else(|_| joined.clone());
-            if !joined.is_dir() || !canonical_joined.starts_with(&canonical_base) {
+            if !joined.is_dir() {
                 return DispatchResult {
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
@@ -769,6 +784,26 @@ pub async fn handle_dispatch(
                         "dispatch: {} was not found inside the provisioned worktree at {} — \
                          the calling pane's own subdirectory may be untracked or excluded by \
                          .gitignore",
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(rel),
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        ),
+                    ),
+                };
+            }
+            // Fork issue #595 fix round 4 (reviewer N9): a distinct
+            // message from the not-found case above -- the path WAS
+            // found, but a tracked symlink at this subpath resolves
+            // outside the provisioned worktree, so "untracked or
+            // gitignored" is not the cause and ".gitignore" is not the
+            // remedy.
+            if !canonical_joined.starts_with(&canonical_base) {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: {} escapes the provisioned worktree at {} — a tracked \
+                         symlink at this subpath resolves outside the isolated worktree",
                         crate::terminal_sanitize::sanitize_path_for_terminal_display(rel),
                         crate::terminal_sanitize::sanitize_path_for_terminal_display(
                             &paths.worktree_dir
@@ -1693,6 +1728,88 @@ mod tests {
             Some(expected_cwd.to_string_lossy().as_ref()),
             "the dispatched agent's cwd must be the calling pane's own nested position inside \
              the new worktree, not the worktree root"
+        );
+    }
+
+    /// Scenario: fork issue #595 fix round 4 (reviewer N7 / auditor S1),
+    /// the `src/dispatch.rs` mirror of `workspace_036` in `src/ui.rs` --
+    /// see that test's comment for the full reasoning. `ctx.working_dir`
+    /// reaches an in-repo root symlink (planted inside the repo, pointing
+    /// back at its own root -- the shape round 3 already covers) through a
+    /// SYMLINKED ANCESTOR above the repo, so `relative_subpath` still comes
+    /// out empty. Round 3's containment guard falls back to the derived
+    /// worktree dir's own raw spelling when `.canonicalize()` fails (since
+    /// it doesn't exist on disk yet), which shares no textual prefix with
+    /// the canonicalized toplevel in this shape either, so the guard stays
+    /// silent and the worktree lands inside the source repo's own working
+    /// tree. Dispatches from that picked path and asserts the resulting
+    /// worktree is a sibling of the repo TOPLEVEL instead.
+    #[tokio::test]
+    async fn dispatch_from_a_symlinked_ancestor_closes_the_containment_guard_gap() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let repo = real_root.join("repo");
+        init_repo(&repo);
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let rootlink = sub.join("rootlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&repo, &rootlink).expect("symlink rootlink -> repo");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&repo, &rootlink).expect("symlink rootlink -> repo");
+
+        let ancestor_link = tmp.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_root, &ancestor_link).expect("symlink link -> real_root");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real_root, &ancestor_link)
+            .expect("symlink link -> real_root");
+
+        let picked = ancestor_link.join("repo").join("sub").join("rootlink");
+
+        // Same gate-stub as every other `handle_dispatch` test above: no live
+        // sibling, so the has_live_sibling gate takes its `Ok(false)` branch.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: picked.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "symlinked-ancestor-595", "task", None).await;
+        let worktree = result.worktree_dir.clone();
+        struct Guard(std::path::PathBuf, Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.shutdown_all();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(worktree.clone(), ctx.registry.clone());
+
+        assert!(
+            result.success,
+            "setup: the dispatch itself must succeed for this test to exercise anything -- \
+             got: {}",
+            result.message
+        );
+
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+        let canonical_worktree = worktree.canonicalize().unwrap_or_else(|_| worktree.clone());
+        assert!(
+            !canonical_worktree.starts_with(&canonical_repo),
+            "reviewer N7 / auditor S1: dispatching from a picked path reached through a \
+             symlinked ancestor must place the worktree as a sibling of the repo TOPLEVEL, \
+             never nested inside (or reproducing) the source repo's own working tree -- got \
+             {canonical_worktree:?} under {canonical_repo:?}"
         );
     }
 

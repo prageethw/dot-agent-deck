@@ -4606,6 +4606,13 @@ without depending on the config struct API.
 - **Does not assert:** the resolved pane cwd's exact value (`<workspace>/<relative-subpath>`), already covered by `033`; the untracked-subpath refusal, covered by `034`; real daemon/PTY spawn (a stub `PaneController` records the cwd without spawning a process).
 - **Platform coverage:** mac+linux+windows, matching `020`.
 
+##### orchestration/workspace/036 — The containment guard must still close the "clone lands inside the source repo" defect when the picked directory reaches an in-repo root symlink through a SYMLINKED ANCESTOR above the repo, not only when it is spelled physically (fork issue #595 fix round 4, reviewer N7 / auditor S1: round 3's guard compared a canonicalized toplevel against the derived destination's raw spelling, which is symmetric only for a physically-spelled pick — a symlinked ancestor shares no textual prefix with the canonicalized toplevel either way, so the guard stayed silent and F1/F3 reopened for that narrower shape).
+- **Layer:** L1 (in-process — real `git` subprocesses, a real symlinked ancestor directory plus the in-repo root symlink `035` already builds, and a stub attach daemon (`with_recording_daemon`), driving the real `dispatch_action`/`Action::SpawnPane` path end to end via `CapturingPaneController`, exactly as `035` does).
+- **Agent:** none.
+- **Asserts:** for an orchestration launched against a project directory reached through a symlinked ancestor (`link -> real`, picked = `link/repo/sub/rootlink`, where `rootlink` is itself a symlink back to the repo's own root), every role pane's recorded spawn cwd (`CapturingPaneController::recorded_cwds`), canonicalized, is not nested under the (canonicalized) source repo. GREEN: the containment guard now canonicalizes the derived destination's PARENT (which exists on disk) and re-attaches the file name, rather than falling back to the destination's raw, as-constructed spelling.
+- **Does not assert:** the physically-spelled in-repo-root-symlink shape, already covered by `035` (this test adds the extra ancestor-symlink layer on top of it); the ordinary nested-pick case, covered by `033`; real daemon/PTY spawn (a stub `PaneController` records the cwd without spawning a process).
+- **Platform coverage:** mac+linux+windows, matching `035` — the symlink creation itself is `#[cfg(unix)]`/`#[cfg(not(unix))]`-gated per `same_cwd_guard_sees_through_a_symlinked_alias`'s own precedent.
+
 #### orchestration/remit
 
 ##### orchestration/remit/001 — A `Compacting` event on the orchestrator start-role pane re-delivers the remit pointer a second time (upstream issue #423).

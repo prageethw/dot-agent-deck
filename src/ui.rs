@@ -9921,11 +9921,25 @@ fn provision_isolated_clone_or_status(
                 // carve-out above now checks directly rather than inferring.
                 let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
                 let canonical_joined = joined.canonicalize().unwrap_or_else(|_| joined.clone());
-                if !joined.is_dir() || !canonical_joined.starts_with(&canonical_base) {
+                if !joined.is_dir() {
                     return Err(format!(
                         "Orchestration failed: {} was not found inside the provisioned \
                          workspace at {} — the picked subdirectory may be untracked or \
                          excluded by .gitignore",
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(rel),
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(base),
+                    ));
+                }
+                // Fork issue #595 fix round 4 (reviewer N9): a distinct
+                // message from the not-found case above -- the path WAS
+                // found, but a tracked symlink at this subpath resolves
+                // outside the provisioned workspace, so "untracked or
+                // gitignored" is not the cause and ".gitignore" is not the
+                // remedy.
+                if !canonical_joined.starts_with(&canonical_base) {
+                    return Err(format!(
+                        "Orchestration failed: {} escapes the provisioned workspace at {} — a \
+                         tracked symlink at this subpath resolves outside the isolated clone",
                         crate::terminal_sanitize::sanitize_path_for_terminal_display(rel),
                         crate::terminal_sanitize::sanitize_path_for_terminal_display(base),
                     ));
@@ -10983,22 +10997,40 @@ fn dispatch_action(
                     // Check the actual property instead of inferring it
                     // from the prefix: would the DERIVED workspace path
                     // land inside the canonicalized toplevel?
-                    // `worktree_path` does not exist on disk yet, so
-                    // `.canonicalize()` fails and falls back to its raw
-                    // form — which is exactly what's wanted, since the
-                    // ordinary root case's raw spelling (e.g. macOS
-                    // `/tmp/...`) never shares a textual (component-wise)
-                    // prefix with git's canonicalized toplevel
-                    // (`/private/tmp/...`) in the first place, so this
-                    // guard cannot fire for it (see F7's reasoning above).
+                    // `worktree_path` does not exist on disk yet, so a
+                    // direct `.canonicalize()` on it always fails. Fork
+                    // issue #595 fix round 4 (reviewer N7 / auditor S1):
+                    // round 3 fell back to `worktree_path`'s own RAW
+                    // spelling on that failure, which is symmetric with
+                    // the canonicalized toplevel only when `req.dir`
+                    // itself was reached by a physical path — a picked
+                    // directory reached through a SYMLINKED ANCESTOR (not
+                    // just the in-repo root symlink this guard already
+                    // handles) shares no textual prefix with the
+                    // canonicalized toplevel either way, so the guard
+                    // stayed silent and F1/F3 reopened for that narrower
+                    // shape. `worktree_path`'s PARENT does exist on disk
+                    // (it is the same parent `req.dir` itself lives in),
+                    // so canonicalize that instead and re-attach the
+                    // workspace's own file name — this resolves any
+                    // symlinked ancestor while still comparing two
+                    // physically-spelled paths, and it does not disturb
+                    // the ordinary root case: `<repo>-<segment>` still
+                    // does not start with `<repo>` once both are
+                    // canonicalized the same way.
                     if nested_toplevel.is_none()
                         && let Some((toplevel, _)) = toplevel_resolution.as_ref()
                     {
                         let canonical_toplevel =
                             toplevel.canonicalize().unwrap_or_else(|_| toplevel.clone());
-                        let canonical_worktree_path = worktree_path
-                            .canonicalize()
-                            .unwrap_or_else(|_| worktree_path.clone());
+                        let canonical_worktree_path =
+                            match (worktree_path.parent(), worktree_path.file_name()) {
+                                (Some(parent), Some(file_name)) => parent
+                                    .canonicalize()
+                                    .map(|canonical_parent| canonical_parent.join(file_name))
+                                    .unwrap_or_else(|_| worktree_path.clone()),
+                                _ => worktree_path.clone(),
+                            };
                         if canonical_worktree_path.starts_with(&canonical_toplevel) {
                             resolved_root_dir = toplevel.as_path();
                             worktree_path = resolve_workspace_path(resolved_root_dir, &segment);
@@ -37865,6 +37897,114 @@ mod tests {
                 "reviewer R1: `Action::SpawnPane`'s own fix site (not a mirrored derivation) \
                  must place every role pane's cwd outside the source repo's working tree for a \
                  nested pick -- got {canonical_cwd:?} under {canonical_repo:?}"
+            );
+        }
+    }
+
+    /// Scenario: fork issue #595 fix round 4 (reviewer N7 / auditor S1).
+    /// `035`'s fixture reaches the in-repo root symlink (`repo/sub/rootlink`
+    /// pointing back at the repo's own root) through the repo's own
+    /// PHYSICAL path. Round 3's containment guard falls back to the
+    /// derived workspace path's own raw spelling when `.canonicalize()`
+    /// fails (since the workspace doesn't exist on disk yet), which is
+    /// symmetric with the canonicalized toplevel only when the picked
+    /// directory itself was reached physically -- so a pick reached
+    /// through a SYMLINKED ANCESTOR above the repo (`link -> real`, picked
+    /// = `link/repo/sub/rootlink`) shares no textual prefix with the
+    /// canonicalized toplevel either way, and the round-3 guard stays
+    /// silent. Drives the real `dispatch_action`/`Action::SpawnPane` path
+    /// exactly as `035` does, with that extra ancestor symlink layered in,
+    /// and asserts every role pane's cwd still lands outside the source
+    /// repo's working tree, canonicalized on both sides so the assertion
+    /// isn't vacuous on macOS.
+    #[spec("orchestration/workspace/036")]
+    #[test]
+    fn workspace_036_action_spawn_pane_closes_symlinked_ancestor_containment_gap() {
+        let tmp = tempdir().expect("tempdir");
+        let real_root = tmp.path().join("real");
+        let repo = real_root.join("repo");
+        init_committed_git_repo(&repo);
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).expect("create sub dir");
+        // The in-repo root symlink round 3 already covers: a symlink
+        // planted inside the repo, pointing back at the repo's own root.
+        let rootlink = sub.join("rootlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&repo, &rootlink).expect("symlink rootlink -> repo");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&repo, &rootlink).expect("symlink rootlink -> repo");
+
+        // The extra layer round 4 closes: a symlinked ANCESTOR above the
+        // repo itself, so the picked path's spelling never matches the
+        // repo's physical location at all.
+        let ancestor_link = tmp.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_root, &ancestor_link).expect("symlink link -> real_root");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real_root, &ancestor_link)
+            .expect("symlink link -> real_root");
+
+        let picked = ancestor_link.join("repo").join("sub").join("rootlink");
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _daemon = with_recording_daemon(tmp.path(), ops.clone());
+
+        let config = make_orchestration("review");
+        let pc = Arc::new(CapturingPaneController::new());
+        let req = NewPaneRequest {
+            dir: picked.clone(),
+            name: "features".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+        };
+
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert_eq!(
+            tm.tab_count(),
+            2,
+            "setup: the symlinked-ancestor launch must actually succeed (Dashboard + \
+             Orchestration tab) for this test to exercise anything -- got {} tab(s), status: \
+             {:?}",
+            tm.tab_count(),
+            ui.status_message.as_ref().map(|(m, _)| m.clone())
+        );
+
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+        let cwds = pc.recorded_cwds();
+        assert!(
+            !cwds.is_empty(),
+            "setup: at least one role pane must have been spawned"
+        );
+        for cwd in &cwds {
+            let cwd = cwd
+                .as_deref()
+                .expect("every role pane must get an explicit cwd");
+            let canonical_cwd = std::path::Path::new(cwd)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(cwd));
+            assert!(
+                !canonical_cwd.starts_with(&canonical_repo),
+                "reviewer N7 / auditor S1: the containment guard must fire even when the \
+                 picked path is reached through a symlinked ancestor, not only when it is \
+                 spelled physically -- got {canonical_cwd:?} under {canonical_repo:?}"
             );
         }
     }
