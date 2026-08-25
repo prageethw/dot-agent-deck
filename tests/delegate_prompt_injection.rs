@@ -1892,16 +1892,26 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                      pane: {:?}",
                     String::from_utf8_lossy(&snapshot)
                 );
-                let y_count = snapshot.iter().filter(|&&b| b == b'y').count();
+                // Count the longest CONTIGUOUS run of 'y', not every 'y' byte in the
+                // snapshot: the daemon's own fixed warning prose ("Verify the report's
+                // actual content...") contributes an unrelated, isolated 'y' that a
+                // total count would wrongly fold into the capped subject's budget.
+                let text = String::from_utf8_lossy(&snapshot);
+                let longest_y_run = text
+                    .split(|c: char| c != 'y')
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0);
                 assert!(
-                    y_count <= MAX_SUBJECT_CHARS,
+                    longest_y_run <= MAX_SUBJECT_CHARS,
                     "an oversized echoed subject must be capped before it reaches the pane, not \
-                     typed in full as one giant synthetic paste: {y_count} 'y' bytes found"
+                     typed in full as one giant synthetic paste: longest run of {longest_y_run} \
+                     'y' bytes found"
                 );
                 assert!(
-                    y_count > 0,
-                    "the capped subject must still be visible, just bounded: {y_count} 'y' bytes \
-                     found"
+                    longest_y_run > 0,
+                    "the capped subject must still be visible, just bounded: longest run of \
+                     {longest_y_run} 'y' bytes found"
                 );
             }
         });
