@@ -7240,4 +7240,182 @@ mod tests {
             provenance_path.display()
         );
     }
+
+    /// Scenario: fork issue #546 hazard 2 (RED, maintainer-decided design).
+    /// An isolated clone that satisfies every one of M4c's five existing
+    /// reclaim-eligibility gates (owned, clean, single local branch, empty
+    /// stash, HEAD equal to a merged PR's `headRefOid`) -- the exact
+    /// fixture `worktree_reclaim_062` proves reclaim-eligible on its own --
+    /// must NEVER report as auto-reclaim-eligible once it has been
+    /// explicitly pinned via `issue_dispatch_run::pin_isolated_clone`.
+    /// `name=` in the provenance artifact is populated for every isolated
+    /// clone, intentionally named or not, so it can't be used on its own to
+    /// tell "ephemeral clone, fine to delete" apart from "the user is
+    /// deliberately still resuming this by name" -- an explicit pin flag
+    /// is the signal that does.
+    #[spec("worktree/reclaim/075")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_075_pinned_clone_never_reclaim_eligible_even_when_all_five_gates_hold() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-pinned");
+        let creator = "issue-dispatch:pinned#2013";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "pinned-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        // Same fixture shape as worktree_reclaim_062's full positive case:
+        // a fresh provisioned clone is already clean, single-branch, and
+        // stash-empty, so only the merged-PR headRefOid match needs
+        // setting up before pinning is layered on top.
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        crate::issue_dispatch_run::pin_isolated_clone(&clone_dir)
+            .expect("pin_isolated_clone must succeed against a real, just-provisioned clone");
+
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "pinned-branch", &clone_head_sha);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+
+        assert_ne!(
+            clone_report.verdict.as_str(),
+            "isolated_clone_reclaimable",
+            "a PINNED isolated clone must never report as auto-reclaim-eligible, even when all \
+             five M4c gates hold exactly as worktree_reclaim_062's fixture proves them \
+             sufficient on their own -- got verdict {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+
+        // Never actually removed either, bare or with --yes -- mirrors
+        // worktree_reclaim_063's own removal assertions for the other
+        // negative gates.
+        let bare = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !bare.removed.iter().any(|r| r.real_path == clone_dir),
+            "a bare `worktree reclaim` must never remove a pinned isolated clone, got removed: \
+             {:?}",
+            bare.removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        let yes = run_reclaim(&repo, true, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !yes.removed.iter().any(|r| r.real_path == clone_dir),
+            "`worktree reclaim --yes` must never remove a pinned isolated clone, got removed: \
+             {:?}",
+            yes.removed.iter().map(|r| &r.real_path).collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the pinned isolated clone must still exist on disk after both reclaim attempts"
+        );
+    }
+
+    /// Scenario: fork issue #546 hazard 2 (RED), regression guard for the
+    /// explicit-off case. An isolated clone whose provenance artifact has
+    /// been explicitly written to schema=3 with `pinned=false` -- via
+    /// `issue_dispatch_run::unpin_isolated_clone`, called here on a clone
+    /// that was never pinned to begin with -- must behave exactly like
+    /// today's unpinned (schema=2) clone: reclaim-eligible once all five
+    /// existing M4c gates hold. Only `pinned=true` is meant to narrow
+    /// eligibility; `pinned=false` (whether written by an explicit unpin
+    /// or never touched at all) must never change it relative to today's
+    /// schema=2 behavior (`worktree_reclaim_062`, which remains the
+    /// regression guard for the untouched-schema=2 case and needs no
+    /// duplicate here).
+    #[spec("worktree/reclaim/076")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_076_explicitly_unpinned_schema3_clone_stays_reclaim_eligible() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-explicitly-unpinned");
+        let creator = "issue-dispatch:explicitly-unpinned#2014";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "explicitly-unpinned-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        // This clone was never pinned -- calling unpin on it must still
+        // succeed and rewrite the artifact to schema=3 with `pinned=false`
+        // explicitly, rather than requiring a prior pin call first.
+        crate::issue_dispatch_run::unpin_isolated_clone(&clone_dir).expect(
+            "unpin_isolated_clone must succeed against a real, just-provisioned clone even when \
+             it was never pinned",
+        );
+
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(
+            &bindir,
+            "explicitly-unpinned-branch",
+            &clone_head_sha,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+
+        assert_eq!(
+            clone_report.verdict.as_str(),
+            "isolated_clone_reclaimable",
+            "an explicitly-unpinned (schema=3, pinned=false) isolated clone must behave exactly \
+             like today's schema=2 clone once all five existing M4c gates hold -- reclaim- \
+             eligible, unchanged by adding the pin mechanism -- got verdict {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+    }
 }
