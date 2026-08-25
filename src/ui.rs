@@ -35147,8 +35147,8 @@ mod tests {
     }
 
     /// Scenario: With `myproj-orchestrator-1` already live (a name a running
-    /// orchestration in the same folder currently holds, injected via the
-    /// test-only `with_live_orchestration_names` builder that mirrors
+    /// orchestration in the SAME directory currently holds, injected via the
+    /// test-only `with_live_orchestration_identities` builder that mirrors
     /// `with_live_orchestration_cwds`), selecting the form's orchestration
     /// must suggest `myproj-orchestrator-2`, skipping the taken slot
     /// (fork#192 M1.0). Then simulate a stale/resubmitted taken name still
@@ -35168,7 +35168,10 @@ mod tests {
                 vec![],
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+            .with_live_orchestration_identities(vec![(
+                "/tmp/myproj".to_string(),
+                "myproj-orchestrator-1".to_string(),
+            )]),
         );
 
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -35322,7 +35325,10 @@ mod tests {
                 vec![],
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(vec!["review".to_string()]),
+            .with_live_orchestration_identities(vec![(
+                "/tmp/myproj".to_string(),
+                "review".to_string(),
+            )]),
         );
 
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -35455,8 +35461,8 @@ mod tests {
         ui.new_pane_form
             .as_mut()
             .unwrap()
-            .live_orchestration_names
-            .push(name.clone());
+            .live_orchestration_identities
+            .push(("/tmp/myproj".to_string(), name.clone()));
         // Select the orchestration directly (bypassing the arrow-key path,
         // which would overwrite `name` with a fresh suggestion) so
         // `name_collision()` — which requires a selected orchestration —
@@ -35494,7 +35500,10 @@ mod tests {
                 vec![],
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+            .with_live_orchestration_identities(vec![(
+                "/tmp/myproj".to_string(),
+                "myproj-orchestrator-1".to_string(),
+            )]),
         );
         ui.new_pane_form.as_mut().unwrap().selection_index = 1;
 
@@ -35525,7 +35534,10 @@ mod tests {
         )
         // The trimmed identity a previous open from this same directory
         // already recorded.
-        .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]);
+        .with_live_orchestration_identities(vec![(
+            "/tmp/ myproj".to_string(),
+            "myproj-orchestrator-1".to_string(),
+        )]);
 
         assert_eq!(
             padded_dir_form.suggest_orchestration_name(),
@@ -35618,7 +35630,10 @@ mod tests {
                 vec![],
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+            .with_live_orchestration_identities(vec![(
+                "/tmp/myproj".to_string(),
+                "myproj-orchestrator-1".to_string(),
+            )]),
         );
         handle_new_pane_form_key(right, &mut ui2); // select -> suggestion skips the taken slot
         assert_eq!(
@@ -35634,8 +35649,11 @@ mod tests {
         ui2.new_pane_form
             .as_mut()
             .unwrap()
-            .live_orchestration_names
-            .push("myproj-orchestrator-2".to_string());
+            .live_orchestration_identities
+            .push((
+                "/tmp/myproj".to_string(),
+                "myproj-orchestrator-2".to_string(),
+            ));
         handle_new_pane_form_key(left, &mut ui2); // -> "No mode"
         handle_new_pane_form_key(right, &mut ui2); // -> orchestration reselected
 
@@ -35645,6 +35663,48 @@ mod tests {
             "an untouched suggestion must still be replaced on a later \
              selection landing, skipping the now-taken slot — the fix for \
              the typed-name case above must not freeze the field outright"
+        );
+    }
+
+    /// Scenario: PRD fork#603 widens orchestration-name uniqueness from name
+    /// alone to the compound (directory, name) pair. Build a new-pane form
+    /// for `/tmp/proj` whose only live orchestration identity is reported
+    /// for a DIFFERENT directory (`/tmp/proj-b`) that already holds the
+    /// name `proj-orchestrator-1` — the exact name this form's own
+    /// directory would also suggest. Assert the form's own suggestion is
+    /// NOT bumped to `-2` because of that entry, and that typing the
+    /// identical name does not register as a collision, since the live
+    /// entry belongs to an unrelated directory.
+    #[spec("orchestration/identity/030")]
+    #[test]
+    fn identity_030_different_directories_suggesting_the_same_name_do_not_collide() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            "proj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_identities(vec![(
+            "/tmp/proj-b".to_string(),
+            "proj-orchestrator-1".to_string(),
+        )]);
+
+        assert_eq!(
+            form.suggest_orchestration_name(),
+            "proj-orchestrator-1",
+            "a live orchestration named `proj-orchestrator-1` in a DIFFERENT \
+             directory must not bump this form's own suggestion to -2 — \
+             uniqueness is scoped to (directory, name), not name alone \
+             (PRD fork#603)"
+        );
+
+        form.selection_index = 1; // the only orchestration
+        form.name = "proj-orchestrator-1".to_string();
+        assert!(
+            !form.name_collision(),
+            "a name held by a live orchestration in a DIFFERENT directory \
+             must not be treated as a collision here (PRD fork#603)"
         );
     }
 
@@ -35682,7 +35742,11 @@ mod tests {
                 Vec::new(),
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(live.iter().map(|s| s.to_string()).collect());
+            .with_live_orchestration_identities(
+                live.iter()
+                    .map(|s| ("/work/collision-check".to_string(), s.to_string()))
+                    .collect(),
+            );
             form.selection_index = 1; // the only orchestration
 
             let backend = TestBackend::new(100, 28);
@@ -35796,7 +35860,10 @@ mod tests {
             vec![],
             vec![make_orchestration("review")],
         )
-        .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]);
+        .with_live_orchestration_identities(vec![(
+            "/tmp/myproj".to_string(),
+            "myproj-orchestrator-1".to_string(),
+        )]);
         form.selection_index = 1; // the only orchestration, already selected
 
         let pc = Arc::new(CapturingPaneController::new());

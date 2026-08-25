@@ -4028,6 +4028,34 @@ without depending on the config struct API.
 - **Does not assert:** the session-restore call site's own confirm-refusal handling (`src/ui.rs:13566`), which shares the same `if !confirmed { release_orchestration_claim_token(...) }` shape but is not exercised by this test; the exact refusal reason string; a confirm that times out rather than being answered with an explicit refusal (both are treated identically by production code, matching `resp.ok` as `false`/absent either way, but only the explicit-refusal wire shape is exercised here).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/030 — PRD fork#603: two different directories that would each suggest/hold the identical `<basename>-orchestrator-1` title do not collide — uniqueness is scoped to the compound (directory, name) pair, not name alone.
+- **Layer:** L1 (in-process, `src/ui.rs`'s own `#[cfg(test)] mod tests`, direct calls against `NewPaneFormState`; no PTY, no daemon).
+- **Agent:** none (a synthetic live-orchestration identity for an unrelated directory).
+- **Asserts:** a form for `/tmp/proj` with `live_orchestration_identities` containing only `("/tmp/proj-b", "proj-orchestrator-1")` — a name matching this form's own eventual suggestion, but reported for a DIFFERENT directory — still suggests `proj-orchestrator-1` via `suggest_orchestration_name()` (not bumped to `-2`); and with the Name field set to that same string and the orchestration selected, `name_collision()` is `false`.
+- **Does not assert:** the daemon-side compound claim (`orchestration/identity/031`/`032`); the SAME-directory collision case, which is unchanged and covered by `orchestration/identity/003`/`010`; the cross-directory flow end to end through the real binary (`orchestration/identity/033`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/031 — PRD fork#603: the daemon-side claim registry's uniqueness key widens from name alone to the compound (directory, name) pair — two claims of the identical name from two DIFFERENT directories both succeed; the same name AND the same directory as an existing holder is still refused for a different pane.
+- **Layer:** fast unit test, in-process (`src/agent_pty.rs`'s own `#[cfg(test)] mod tests`, direct calls against `AgentPtyRegistry::claim_orchestration_name`; no PTY, no daemon wire).
+- **Agent:** none.
+- **Asserts:** `claim("x", Some("/a"), "p1")` succeeds; `claim("x", Some("/b"), "p2")` also succeeds (different directory, same name); `claim("x", Some("/a"), "p3")` is refused (same name AND same directory as `p1`'s existing claim, different pane).
+- **Does not assert:** the `cwd: None` wildcard/backward-compat semantics (covered by `orchestration/identity/032`); the wire-level `cwd` field on `AttachRequest::ClaimOrchestrationName` (covered indirectly by the M3 call-site changes, not directly unit-tested here); the client-side suggestion/collision filter (`orchestration/identity/030`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/032 — PRD fork#603 backward compatibility: a claim with `cwd: None` (an old-TUI claim that doesn't know its directory) is a GLOBAL WILDCARD, conflicting with a directory-scoped claim of the same name regardless of which order the two claims arrive in.
+- **Layer:** fast unit test, in-process (`src/agent_pty.rs`'s own `#[cfg(test)] mod tests`, direct calls against `AgentPtyRegistry::claim_orchestration_name`; no PTY, no daemon wire).
+- **Agent:** none.
+- **Asserts:** (a) `claim("x", None, "p-old")` then `claim("x", Some("/a"), "p-new")` — the second call is refused; (b) `claim("y", Some("/a"), "p-new")` then `claim("y", None, "p-old")` — the second call is also refused. Both directions of the wildcard-vs-scoped conflict are covered, in two independent registries so the outcome of (a) can't leak into (b).
+- **Does not assert:** two `Some(cwd)` claims of the same name from different directories, which never conflict (covered by `orchestration/identity/031`); the actual wire-level default (`#[serde(default)] cwd: Option<String>`) an old TUI's message would deserialize to `None` for — this test exercises the registry's own semantics once `cwd` is already `None`, not the deserialization path.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/033 — PRD fork#603, the cross-directory counterpart to `orchestration/identity/013`: two SIBLING directories with the identical basename `proj` (`team-a/proj`, `team-b/proj`) each get their own `proj-orchestrator-1` — never forced apart into `-1`/`-2`, since they don't share a directory.
+- **Layer:** L2 (PTY-attached real binary via `TuiDeck`; stand-in `cat` agent, no real LLM tokens spent, no credentials required).
+- **Agent:** none (both roles of the `orch-deck` fixture run `cat`).
+- **Asserts:** the fixture's `.dot-agent-deck.toml` is committed first (`commit_fixture`, same reason as `identity/013`: the isolated-clone provisioning under each open needs a ref to branch from), then duplicated into two freshly created leaf directories, `team-a/proj` and `team-b/proj`. Navigating the directory picker into each in turn (mouse clicks to descend, mirroring `e2e_scheduler_manager.rs`'s `form_006_edit_repick_different_dir_wins_in_seed`) and accepting the form's suggested Name both times with a single unedited Enter lands BOTH as live, un-refused orchestration tabs — the rendered tab strip contains the literal substring `" proj-orchestrator-1 "` exactly twice (waited for via a grid predicate rather than a bare `wait_for_string`, since the identical label is already present after the first open — fork#192 review F7's same vacuous-wait trap, here because both suggestions are meant to coincide rather than incidentally so), and never contains `-orchestrator-2` anywhere.
+- **Does not assert:** the suggestion/refusal MECHANISMS in isolation (covered by `orchestration/identity/030`/`031`/`032`); the SAME-directory case, which stays distinctly numbered (covered by `orchestration/identity/013`); the exact isolated-clone/worktree path each open provisions into (covered by the `orchestration/worktree/*` catalog).
+- **Platform coverage:** mac+linux (PTY-attached, `#[cfg(feature = "e2e")]`, as the other `e2e_orchestration_*.rs` files).
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
