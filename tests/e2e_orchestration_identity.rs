@@ -233,8 +233,14 @@ fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1()
     // FIRST tab's own identical label (fork#192 review F7's same trap, here
     // because both suggestions are meant to be identical rather than
     // incidentally so) — wait until BOTH tabs carry it instead.
+    //
+    // PRD fork#603 reviewer N6: `>= 2` rather than `== 2` — the exact count
+    // is already pinned by the `assert_eq!` below, so a future THIRD
+    // incidental occurrence of the label (a pane title, a status line) fails
+    // there with a clear assertion message instead of stalling this wait to
+    // a bare 30s timeout.
     deck.wait_until_grid("both orchestration tabs labeled -orchestrator-1", |g| {
-        g.matches(LABEL).count() == 2
+        g.matches(LABEL).count() >= 2
     });
 
     let grid = deck.snapshot_grid();
