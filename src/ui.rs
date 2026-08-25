@@ -9878,6 +9878,29 @@ fn provision_isolated_clone_or_status(
     branch: &str,
     creator: &str,
 ) -> Result<ProvisionedWorkspace, String> {
+    // Fork issue #595: `root_dir` may be a subdirectory of its git repo
+    // rather than the repo's own root (e.g. `.dot-agent-deck.toml` living at
+    // `<repo>/baseline/intent`) — `provision_isolated_clone_sync` below
+    // clones from the resolved git TOPLEVEL instead of `root_dir` itself
+    // (see `resolve_git_toplevel`'s doc comment for why), so the role
+    // panes' working directory inside the fresh/resumed clone must
+    // reproduce `root_dir`'s position relative to that same toplevel —
+    // `<worktree_path>/<relative-subpath>`, not `worktree_path` itself.
+    // Resolved independently here rather than threaded back through
+    // `IsolatedCloneOutcome`: it depends only on `root_dir`, which this
+    // function already has, and doing so keeps `IsolatedCloneOutcome`'s
+    // shape (and its other caller, `src/dispatch.rs`) unchanged. `None`
+    // both when `root_dir` already IS the toplevel and when `root_dir`
+    // isn't inside a git repository at all — the latter is pre-existing,
+    // unaffected behavior, so `worktree_path` unchanged is exactly right.
+    let relative_subpath = crate::issue_dispatch_run::resolve_git_toplevel(root_dir)
+        .map(|(_toplevel, prefix)| prefix)
+        .filter(|prefix| !prefix.as_os_str().is_empty());
+    let resolved_dir = |base: &Path| match relative_subpath.as_deref() {
+        Some(rel) => base.join(rel).display().to_string(),
+        None => base.display().to_string(),
+    };
+
     match crate::issue_dispatch_run::provision_isolated_clone_sync(
         root_dir,
         worktree_path,
@@ -9888,7 +9911,7 @@ fn provision_isolated_clone_or_status(
             marker_warning,
             origin_warning,
         }) => Ok((
-            worktree_path.display().to_string(),
+            resolved_dir(worktree_path),
             marker_warning,
             origin_warning,
             None,
@@ -9899,12 +9922,9 @@ fn provision_isolated_clone_or_status(
         // `worktree_path` identically either way, just skipping the `git
         // clone` step that already happened (or never needed to, this
         // time).
-        Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { fetch_warning }) => Ok((
-            worktree_path.display().to_string(),
-            None,
-            None,
-            fetch_warning,
-        )),
+        Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { fetch_warning }) => {
+            Ok((resolved_dir(worktree_path), None, None, fetch_warning))
+        }
         // PRD fork#544 M3: `clone_dir` existed but failed the three-part
         // eligibility check plus health probe — name which of the four
         // distinguishable reasons via the shared `ResumeRejection::describe`

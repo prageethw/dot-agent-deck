@@ -1416,6 +1416,43 @@ pub(crate) enum IsolatedCloneOutcome {
 /// described above still left the plain `git clone` default local-path
 /// `origin` in place for its whole duration when the source has no origin —
 /// see [`ISOLATED_CLONE_NO_ORIGIN_SENTINEL`]'s doc comment for the fix.
+///
+/// Fork issue #595: resolves the git repository TOPLEVEL `dir` sits under,
+/// plus `dir`'s own path relative to that toplevel (git's `--show-prefix`,
+/// e.g. `baseline/intent/`, or empty when `dir` already IS the toplevel).
+/// Every ordinary git subcommand discovers its repository by walking up from
+/// the working directory, but `git clone <path>`/`git fetch <path>` treat
+/// `<path>` as a transport target instead and require it to literally
+/// contain `.git` — so launching an orchestration from a project directory
+/// that is a SUBDIRECTORY of its repo (`.dot-agent-deck.toml` living at
+/// `<repo>/sub/dir`) made `provision_isolated_clone_sync`'s `git clone`
+/// fail instantly with "does not exist", even though `dir` is a perfectly
+/// ordinary, valid place to run git commands from. Returns `None` when
+/// `dir` is not inside a git repository at all — pre-existing, unaffected
+/// behavior; callers fall back to `dir` itself, so the subsequent clone
+/// attempt fails exactly as it always has.
+pub(crate) fn resolve_git_toplevel(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let output = run_capture_sync(
+        "git",
+        &[
+            "-C".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "rev-parse".to_string(),
+            "--show-toplevel".to_string(),
+            "--show-prefix".to_string(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .ok()?;
+    let mut lines = output.lines();
+    let toplevel = lines.next()?.trim();
+    if toplevel.is_empty() {
+        return None;
+    }
+    let prefix = lines.next().unwrap_or("").trim();
+    Some((PathBuf::from(toplevel), PathBuf::from(prefix)))
+}
+
 pub(crate) fn provision_isolated_clone_sync(
     source_dir: &Path,
     clone_dir: &Path,
@@ -1424,7 +1461,18 @@ pub(crate) fn provision_isolated_clone_sync(
 ) -> Result<IsolatedCloneOutcome, String> {
     ensure_worktree_parent_dir(clone_dir)?;
 
-    let lock_path = worktree_attach_lock_path(source_dir, clone_dir)
+    // Fork issue #595: resolve the real repo toplevel ONCE, up front, and
+    // use it everywhere `source_dir` would otherwise have been passed to a
+    // path-based `git clone`/`git fetch` below — see `resolve_git_toplevel`'s
+    // doc comment for why a nested project directory needs this at all.
+    // `source_dir` itself stays the picked directory throughout (still used
+    // by the caller, `provision_isolated_clone_or_status`, to compute the
+    // final pane cwd relative to this same toplevel).
+    let resolved_source_dir = resolve_git_toplevel(source_dir)
+        .map(|(toplevel, _prefix)| toplevel)
+        .unwrap_or_else(|| source_dir.to_path_buf());
+
+    let lock_path = worktree_attach_lock_path(&resolved_source_dir, clone_dir)
         .map_err(|e| format!("failed to resolve isolated-clone attach lock path: {e}"))?;
     if let Some(parent) = lock_path.parent() {
         crate::platform::fsperm::ensure_owner_only_dir(parent).map_err(|e| {
@@ -1450,7 +1498,7 @@ pub(crate) fn provision_isolated_clone_sync(
         // reports a distinguishable rejection reason. This REPLACES the
         // flat `AlreadyClaimed` this branch used to return; it does not run
         // alongside it.
-        return resume_existing_isolated_clone(source_dir, clone_dir, creator);
+        return resume_existing_isolated_clone(&resolved_source_dir, clone_dir, creator);
     }
 
     // Issue #325 auditor A2: `--` end-of-options separator before both
@@ -1477,7 +1525,7 @@ pub(crate) fn provision_isolated_clone_sync(
             "--origin".to_string(),
             "origin".to_string(),
             "--".to_string(),
-            source_dir.to_string_lossy().into_owned(),
+            resolved_source_dir.to_string_lossy().into_owned(),
             clone_dir.to_string_lossy().into_owned(),
         ],
         WORKTREE_GIT_TIMEOUT,
@@ -1502,7 +1550,9 @@ pub(crate) fn provision_isolated_clone_sync(
     // failure here does not fail the whole provisioning call, since the
     // clone itself is already fully usable — it only means this clone will
     // never report `owned: true` from `worktree list`.
-    if let Err(e) = write_isolated_clone_provenance(source_dir, clone_dir, branch, creator) {
+    if let Err(e) =
+        write_isolated_clone_provenance(&resolved_source_dir, clone_dir, branch, creator)
+    {
         tracing::warn!(
             clone = %clone_dir.display(),
             error = %e,
@@ -1561,7 +1611,7 @@ pub(crate) fn provision_isolated_clone_sync(
     // other git subprocess in this module uses) rather than a raw
     // `std::process::Command`, so it does carry `WORKTREE_GIT_TIMEOUT` now
     // — cheap enough not to matter, and no longer a bare, unbounded spawn.
-    let source_origin = read_source_origin_url(source_dir);
+    let source_origin = read_source_origin_url(&resolved_source_dir);
     let mut origin_warning = match source_origin.as_deref() {
         Some(url) => point_isolated_clone_origin(clone_dir, url),
         None => point_isolated_clone_origin(clone_dir, ISOLATED_CLONE_NO_ORIGIN_SENTINEL),
@@ -7087,6 +7137,69 @@ exit 0
              `git clone`'s default local-path origin must be removed, not left pointing \
              back at {}",
             source.display()
+        );
+    }
+
+    /// Scenario: fork issue #595's underlying primitive. Directly exercises
+    /// `resolve_git_toplevel` against both shapes it must distinguish: a
+    /// directory that already IS the repo root (regression guard — must
+    /// report an EMPTY relative prefix, so a caller appends nothing) and a
+    /// nested subdirectory (must report the real toplevel, not the
+    /// subdirectory, plus the exact relative path back down to it).
+    #[test]
+    fn resolve_git_toplevel_distinguishes_root_from_nested_subdirectory() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let repo_root = ws.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        git(&repo_root, &["init", "--initial-branch=main", "--quiet"]);
+        git(&repo_root, &["config", "user.email", "test@example.com"]);
+        git(&repo_root, &["config", "user.name", "Test"]);
+        git(&repo_root, &["config", "commit.gpgsign", "false"]);
+        let nested = repo_root.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("marker.txt"), "hi\n").unwrap();
+        git(&repo_root, &["add", "-A"]);
+        git(&repo_root, &["commit", "--quiet", "-m", "seed"]);
+
+        let (root_toplevel, root_prefix) =
+            resolve_git_toplevel(&repo_root).expect("repo_root is a real git repo");
+        assert_eq!(
+            canonicalize_best_effort(&root_toplevel),
+            canonicalize_best_effort(&repo_root),
+            "toplevel of the root itself must be the root"
+        );
+        assert!(
+            root_prefix.as_os_str().is_empty(),
+            "no subpath must be reported when the picked directory already IS the toplevel, \
+             got {root_prefix:?}"
+        );
+
+        let (nested_toplevel, nested_prefix) =
+            resolve_git_toplevel(&nested).expect("nested is inside the same real git repo");
+        assert_eq!(
+            canonicalize_best_effort(&nested_toplevel),
+            canonicalize_best_effort(&repo_root),
+            "toplevel of a nested subdirectory must be the repo root, not the subdirectory \
+             itself"
+        );
+        assert_eq!(
+            nested_prefix,
+            PathBuf::from("baseline/intent"),
+            "the relative prefix must be the exact path from the toplevel down to the picked \
+             directory, got {nested_prefix:?}"
         );
     }
 
