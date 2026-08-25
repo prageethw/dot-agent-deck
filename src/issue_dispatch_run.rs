@@ -7261,8 +7261,17 @@ exit 0
             "the clone must contain the nested subdirectory's own committed content at {}",
             marker_in_clone.display()
         );
+        // Normalizes `\r\n` -> `\n` before comparing: on Windows, `git
+        // clone`'s destination checkout applies the RUNNER's own (not the
+        // source repo's) `core.autocrlf`, which defaults to true and
+        // rewrites text files on checkout — a platform difference this
+        // assertion has no business caring about, since it exists to prove
+        // the clone is real and correctly positioned, not to pin line-ending
+        // translation.
         assert_eq!(
-            std::fs::read_to_string(&marker_in_clone).unwrap(),
+            std::fs::read_to_string(&marker_in_clone)
+                .unwrap()
+                .replace("\r\n", "\n"),
             "issue-595-marker\n",
             "the marker file's content must survive the clone unchanged"
         );
