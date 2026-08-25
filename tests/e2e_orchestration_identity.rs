@@ -109,3 +109,96 @@ fn identity_013_two_orchestration_opens_land_as_distinctly_named_tabs() {
          twice\n=== rendered grid ===\n{grid}"
     );
 }
+
+/// Scenario: PRD fork#603 — the cross-directory counterpart to
+/// `identity_013`. Seed two SIBLING subtrees under the launch dir, each
+/// carrying an inner directory literally named `proj` (`team-a/proj` and
+/// `team-b/proj`, each with its own copy of the fixture's
+/// `.dot-agent-deck.toml`) — two genuinely distinct absolute paths that
+/// share the identical basename `suggest_orchestration_name` derives its
+/// suggestion from. Navigate the directory picker into each in turn (mouse
+/// clicks to descend, mirroring `e2e_scheduler_manager.rs`'s
+/// `form_006_edit_repick_different_dir_wins_in_seed`), accepting the form's
+/// suggested Name both times with a single Enter, never typing over it.
+/// Both opens must land un-refused as their own live orchestration tab
+/// titled EXACTLY `proj-orchestrator-1` — never forced apart into `-1`/`-2`
+/// (today's name-only global uniqueness check would bump the second open to
+/// `-2` even though the two directories share nothing).
+#[spec("orchestration/identity/033")]
+#[test]
+fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1() {
+    let deck = TuiDeck::launch_with_fixture("orch-deck");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+    deck.wait_for_string("No active sessions");
+
+    let toml = std::fs::read_to_string(work.join(".dot-agent-deck.toml"))
+        .expect("read fixture's own .dot-agent-deck.toml to duplicate into each leaf");
+    for team in ["team-a", "team-b"] {
+        let leaf = work.join(team).join("proj");
+        std::fs::create_dir_all(&leaf).expect("create leaf project dir");
+        std::fs::write(leaf.join(".dot-agent-deck.toml"), &toml)
+            .expect("seed leaf .dot-agent-deck.toml");
+    }
+
+    const LABEL: &str = " proj-orchestrator-1 ";
+
+    // First open: team-a/proj.
+    deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
+    let (col, row) = deck.wait_for_in_grid("team-a");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-a
+    let (col, row) = deck.wait_for_in_grid("proj");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-a/proj
+    deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_bytes(b"\x1b[C"); // Right -> [Orch: demo-orch]
+    deck.send_bytes(b"\r"); // Mode -> Name
+    deck.send_bytes(b"\r"); // submit the suggested name, unedited
+    deck.wait_for_string(LABEL); // first open's tab is up, labeled -orchestrator-1
+
+    // Back to the Dashboard to open the second orchestration.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
+    deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    // Second open: team-b/proj — a DIFFERENT absolute path with the
+    // IDENTICAL basename `proj`.
+    deck.send_bytes(b"\x0e");
+    let (col, row) = deck.wait_for_in_grid("team-b");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-b
+    let (col, row) = deck.wait_for_in_grid("proj");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-b/proj
+    deck.send_bytes(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_bytes(b"\x1b[C");
+    deck.send_bytes(b"\r");
+    deck.send_bytes(b"\r"); // submit the suggested name, unedited
+
+    // `wait_for_string(LABEL)` alone would be vacuously satisfied by the
+    // FIRST tab's own identical label (fork#192 review F7's same trap, here
+    // because both suggestions are meant to be identical rather than
+    // incidentally so) — wait until BOTH tabs carry it instead.
+    deck.wait_until_grid("both orchestration tabs labeled -orchestrator-1", |g| {
+        g.matches(LABEL).count() == 2
+    });
+
+    let grid = deck.snapshot_grid();
+    assert_eq!(
+        grid.matches(LABEL).count(),
+        2,
+        "both `team-a/proj` and `team-b/proj` must land as their own, un-refused, live \
+         orchestration tab titled exactly {LABEL:?} — two directories with the same basename \
+         must each get their own `-orchestrator-1` rather than being forced apart (PRD \
+         fork#603)\n=== rendered grid ===\n{grid}"
+    );
+    assert!(
+        !grid.contains("-orchestrator-2"),
+        "the second open must never be bumped to `-orchestrator-2` — that would mean the \
+         client-side suggestion is still scoped to name alone rather than (directory, name) \
+         (PRD fork#603)\n=== rendered grid ===\n{grid}"
+    );
+}
