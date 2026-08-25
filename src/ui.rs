@@ -10924,12 +10924,28 @@ fn dispatch_action(
                     // instead makes the clone a genuine sibling of the
                     // repo, matching CLAUDE.md rule 18's `../<repo>-<suffix>`
                     // convention everywhere else in this codebase.
+                    //
+                    // `git rev-parse --show-toplevel` also CANONICALIZES its
+                    // answer (symlinks resolved — e.g. macOS `/var` ->
+                    // `/private/var`, the very shape GitHub's macOS runners
+                    // use for their temp dir), so the toplevel is only used
+                    // as the base below when `req.dir` is a GENUINE
+                    // subdirectory of it (a non-empty relative prefix). When
+                    // `req.dir` already IS the toplevel (or isn't inside a
+                    // git repository at all), `req.dir` itself stays the
+                    // base, unchanged — otherwise a canonicalization-only
+                    // difference at the always-was-the-root case would
+                    // change the derived workspace path's spelling with no
+                    // change to which directory it names (caught in CI:
+                    // `/private/var/folders/.../repo-my-feature` vs the
+                    // expected `/var/folders/.../repo-my-feature`).
                     let toplevel_resolution =
                         crate::issue_dispatch_run::resolve_git_toplevel(&req.dir);
-                    let resolved_root_dir: &Path = toplevel_resolution
+                    let nested_toplevel: Option<&Path> = toplevel_resolution
                         .as_ref()
-                        .map(|(toplevel, _)| toplevel.as_path())
-                        .unwrap_or(&req.dir);
+                        .filter(|(_, prefix)| !prefix.as_os_str().is_empty())
+                        .map(|(toplevel, _)| toplevel.as_path());
+                    let resolved_root_dir: &Path = nested_toplevel.unwrap_or(&req.dir);
                     let relative_subpath: Option<&Path> = toplevel_resolution
                         .as_ref()
                         .map(|(_, prefix)| prefix.as_path())

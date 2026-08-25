@@ -1486,13 +1486,28 @@ pub(crate) fn resolve_git_toplevel(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     // `/tmp` -> `/private/tmp`) — canonicalize `dir` the same way before
     // stripping, or a symlinked picked directory spuriously fails to be
     // recognized as a descendant of `toplevel` and the prefix silently
-    // comes back empty (reviewer F7). Falls back to `dir` unchanged when
-    // canonicalization itself fails (e.g. a dangling symlink component);
-    // `strip_prefix` then simply may not match, which is the same safe
-    // "no subpath" fallback as the not-inside-`toplevel` case below.
+    // comes back empty (reviewer F7).
+    //
+    // Canonicalize `toplevel` too, to the SAME representation, rather than
+    // stripping a canonicalized `dir` against git's raw (uncanonicalized)
+    // answer directly — caught in CI on Windows, where `Path::canonicalize`
+    // returns the `\\?\`-prefixed verbatim form while git's own
+    // `--show-toplevel` never does, so the two sides disagreed on their
+    // root component and `strip_prefix` failed even for the ordinary,
+    // no-symlinks-involved nested case, silently returning an empty
+    // prefix. Both sides now go through the identical `.canonicalize()`
+    // call, so whatever representation it produces on a given platform is
+    // shared by both operands being compared.
+    //
+    // Falls back to the raw (as returned by git / as passed in) form on
+    // either side when canonicalization itself fails (e.g. a dangling
+    // symlink component); `strip_prefix` then simply may not match, which
+    // is the same safe "no subpath" fallback as the not-inside-`toplevel`
+    // case below.
+    let canonical_toplevel = toplevel.canonicalize().unwrap_or_else(|_| toplevel.clone());
     let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let prefix = canonical_dir
-        .strip_prefix(&toplevel)
+        .strip_prefix(&canonical_toplevel)
         .unwrap_or(Path::new(""))
         .to_path_buf();
     Some((toplevel, prefix))
@@ -7274,7 +7289,7 @@ exit 0
         // actually caught here.
         assert_eq!(
             nested_prefix.as_os_str(),
-            std::ffi::OsStr::new("baseline/intent"),
+            Path::new("baseline").join("intent").as_os_str(),
             "the relative prefix must carry no trailing separator, got {nested_prefix:?}"
         );
     }

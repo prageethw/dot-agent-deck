@@ -317,14 +317,30 @@ pub async fn handle_dispatch(
     // reproduces the calling pane's own position inside the dispatched
     // worktree so the dispatched agent's cwd matches where the caller
     // actually is rather than always landing at the worktree root.
+    //
+    // `git rev-parse --show-toplevel` also CANONICALIZES its answer
+    // (symlinks resolved — e.g. macOS `/var` -> `/private/var`, the shape
+    // GitHub's macOS runners use for their temp dir), so the resolved
+    // toplevel is only substituted in below when `ctx.working_dir` is a
+    // GENUINE subdirectory of it (a non-empty relative prefix). When
+    // `ctx.working_dir` already IS the toplevel (or isn't inside a git
+    // repository at all), it stays the base unchanged — otherwise a
+    // canonicalization-only difference at the always-was-the-root case
+    // would change `derive_dispatch_paths`' output spelling with no change
+    // to which directory it names (the same regression this exact
+    // reasoning was added to `src/ui.rs`'s `Action::SpawnPane` to avoid).
     let toplevel_resolution = crate::issue_dispatch_run::resolve_git_toplevel(&ctx.working_dir);
-    let resolved_working_dir = toplevel_resolution
-        .as_ref()
-        .map(|(toplevel, _)| toplevel.clone())
-        .unwrap_or_else(|| ctx.working_dir.clone());
     let relative_subpath = toplevel_resolution
-        .map(|(_, prefix)| prefix)
+        .as_ref()
+        .map(|(_, prefix)| prefix.clone())
         .filter(|prefix| !prefix.as_os_str().is_empty());
+    let resolved_working_dir = if relative_subpath.is_some() {
+        toplevel_resolution
+            .map(|(toplevel, _)| toplevel)
+            .unwrap_or_else(|| ctx.working_dir.clone())
+    } else {
+        ctx.working_dir.clone()
+    };
     let paths = derive_dispatch_paths(&resolved_working_dir, name);
     let clone_dir = resolved_working_dir;
 
