@@ -13772,15 +13772,14 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
+            cli_name: None,
+            crashed: None,
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
-
-            spawned_at_ms: None,
-            cli_name: None,
-            crashed: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
