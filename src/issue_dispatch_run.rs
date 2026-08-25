@@ -7090,6 +7090,139 @@ exit 0
         );
     }
 
+    /// Scenario: fork issue #595. The project directory
+    /// `provision_isolated_clone_sync` is asked to isolate is a SUBDIRECTORY
+    /// of its git repository (`.dot-agent-deck.toml` living at
+    /// `<repo>/baseline/intent`, mirroring the issue's own reproduction),
+    /// not the repository's own root. Before the fix, the initial `git
+    /// clone -- <source_dir> <clone_dir>` failed instantly with "does not
+    /// exist" — `git clone`, unlike ordinary git subcommands, does not walk
+    /// up parent directories to find `.git`, so `provision_isolated_clone_sync`
+    /// itself returned a top-level `Err`. Asserts provisioning now succeeds
+    /// (`Ok(Created { .. })`) and that the resulting clone genuinely
+    /// contains the nested subdirectory with the marker file the source
+    /// repo committed there — proving the clone is real and correctly
+    /// positioned, not just that a path string was computed.
+    #[test]
+    fn provision_isolated_clone_sync_succeeds_when_source_dir_is_a_repo_subdirectory() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let repo_root = ws.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        git(&repo_root, &["init", "--initial-branch=main", "--quiet"]);
+        git(&repo_root, &["config", "user.email", "test@example.com"]);
+        git(&repo_root, &["config", "user.name", "Test"]);
+        git(&repo_root, &["config", "commit.gpgsign", "false"]);
+
+        // The nested project directory `.dot-agent-deck.toml` would live in
+        // — issue #595's own reproduction shape.
+        let nested = repo_root.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("marker.txt"), "issue-595-marker\n").unwrap();
+        git(&repo_root, &["add", "-A"]);
+        git(&repo_root, &["commit", "--quiet", "-m", "seed"]);
+
+        let clone_dir = ws.path().join("repo-my-feature");
+        let result = provision_isolated_clone_sync(&nested, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "isolated clone must succeed when the picked directory is a repo subdirectory, \
+             got {result:?}"
+        );
+
+        let marker_in_clone = clone_dir.join("baseline").join("intent").join("marker.txt");
+        assert!(
+            marker_in_clone.is_file(),
+            "the clone must contain the nested subdirectory's own committed content at {}",
+            marker_in_clone.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker_in_clone).unwrap(),
+            "issue-595-marker\n",
+            "the marker file's content must survive the clone unchanged"
+        );
+    }
+
+    /// Scenario: fork issue #595, resume path. Same nested-subdirectory
+    /// shape as the create-path test above, but the isolated clone already
+    /// exists on disk (a re-opened orchestration workspace) —
+    /// `resume_existing_isolated_clone`'s ancestry probe has its OWN
+    /// path-based `git fetch` fallback (run only when the clone's object
+    /// database is missing the source's HEAD commit), sharing the exact
+    /// same "does not walk up to find .git" defect the create path has.
+    /// Provisions once to create the clone, advances the SOURCE repo with a
+    /// second commit the clone's object database does not yet have (forcing
+    /// the fallback-fetch branch of the ancestry probe), then provisions
+    /// again from the same nested subdirectory and asserts the second call
+    /// resumes successfully rather than being refused as unverifiable.
+    #[test]
+    fn provision_isolated_clone_sync_resumes_when_source_dir_is_a_repo_subdirectory() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let repo_root = ws.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        git(&repo_root, &["init", "--initial-branch=main", "--quiet"]);
+        git(&repo_root, &["config", "user.email", "test@example.com"]);
+        git(&repo_root, &["config", "user.name", "Test"]);
+        git(&repo_root, &["config", "commit.gpgsign", "false"]);
+
+        let nested = repo_root.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("marker.txt"), "issue-595-marker\n").unwrap();
+        git(&repo_root, &["add", "-A"]);
+        git(&repo_root, &["commit", "--quiet", "-m", "seed"]);
+
+        let clone_dir = ws.path().join("repo-my-feature");
+        let created = provision_isolated_clone_sync(&nested, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "initial isolated clone must succeed, got {created:?}"
+        );
+        release_resumed_isolated_clone_registration(&clone_dir);
+
+        // Advance the source past what the clone's object database has, so
+        // the ancestry probe's fallback fetch (the second path-based git
+        // invocation this fix must cover) actually runs.
+        std::fs::write(nested.join("marker.txt"), "issue-595-marker-v2\n").unwrap();
+        git(&repo_root, &["add", "-A"]);
+        git(&repo_root, &["commit", "--quiet", "-m", "advance"]);
+
+        let result = provision_isolated_clone_sync(&nested, &clone_dir, "my-feature", "tester");
+        assert!(
+            matches!(result, Ok(IsolatedCloneOutcome::Resumed { .. })),
+            "resuming from the same repo subdirectory must succeed, got {result:?}"
+        );
+    }
+
     /// Scenario: PRD fork#325 fix round 2 (reviewer P2-A), reproducing the
     /// reviewer's own empirical transcript. The source repo has TWO
     /// branches — `main` (checked out) and `clonegate1`, carrying a commit
