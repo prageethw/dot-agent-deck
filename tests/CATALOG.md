@@ -4056,6 +4056,27 @@ without depending on the config struct API.
 - **Does not assert:** the suggestion/refusal MECHANISMS in isolation (covered by `orchestration/identity/030`/`031`/`032`); the SAME-directory case, which stays distinctly numbered (covered by `orchestration/identity/013`); the exact isolated-clone/worktree path each open provisions into (covered by the `orchestration/worktree/*` catalog).
 - **Platform coverage:** mac+linux (PTY-attached, `#[cfg(feature = "e2e")]`, as the other `e2e_orchestration_*.rs` files).
 
+##### orchestration/identity/034 — PRD fork#603 reviewer finding H2/regression-pin: a live orchestration reported under its ACTUAL production sibling-workspace cwd (`/tmp/myproj-myproj-orchestrator-1`, never the picked directory itself, post-fork#544 M2b) must still be recognized by `live_orchestration_occupies` as occupying this form's directory, for the NON-nested case.
+- **Layer:** L1 (in-process, `src/ui.rs`'s own `#[cfg(test)] mod tests`, direct calls against `NewPaneFormState`; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** a form for `/tmp/myproj` with `live_orchestration_identities` containing only `("/tmp/myproj-myproj-orchestrator-1", "myproj-orchestrator-1")` — the real sibling-workspace shape production produces, not the picked directory itself — suggests `myproj-orchestrator-2` via `suggest_orchestration_name()`; with the Name field set to `myproj-orchestrator-1` and the orchestration selected, `name_collision()` is `true`.
+- **Does not assert:** the NESTED-pick shape, where the derivation additionally needs the git-toplevel/relative-subpath layer (covered by `orchestration/identity/035`); the DIFFERENT-directory non-collision case (covered by `orchestration/identity/030`); the daemon-side compound claim (covered by `orchestration/identity/031`/`032`/`036`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/035 — PRD fork#603 reviewer finding B1 (blocker): a live orchestration reported under the real NESTED-pick provisioning shape (issue #595's toplevel-sibling + rejoined relative-subpath, `<toplevel>-<segment>/<relative-subpath>`) must still be recognized by `live_orchestration_occupies` as occupying this form's directory — the shape the function's re-derivation currently omits entirely.
+- **Layer:** L1 (in-process, `src/ui.rs`'s own `#[cfg(test)] mod tests`, direct calls against `NewPaneFormState`; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** a form for the nested pick `/tmp/myrepo/team-a/proj` (a subdirectory of the git repo rooted at `/tmp/myrepo`) with `live_orchestration_identities` containing only `("/tmp/myrepo-proj-orchestrator-1/team-a/proj", "proj-orchestrator-1")` — the real nested-pick shape `Action::SpawnPane`'s toplevel/segment/rejoin logic produces — suggests `proj-orchestrator-2` via `suggest_orchestration_name()`; with the Name field set to `proj-orchestrator-1` and the orchestration selected, `name_collision()` is `true`. This is the direct pin for reviewer blocker B1: `live_orchestration_occupies` re-derives only `resolve_workspace_path` applied to the picked directory directly, never the toplevel-then-rejoin formula the real spawn path uses since issue #595, so it cannot match this shape today.
+- **Does not assert:** the NON-nested case, which already passes (covered by `orchestration/identity/034`); the round-3/4 symlink guard's narrower non-nested instance of the same gap (reviewer B1's closing paragraph, not separately pinned); the fix itself (a shared derivation function, `coder`'s next step).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/036 — PRD fork#603 reviewer finding B2 (blocker): the two `ClaimOrchestrationName` call sites key the SAME orchestration on two different notions of "directory" — live spawn on the picked source directory, restore/reconnect on the provisioned workspace directory — so a restored orchestration's claim no longer blocks a fresh same-name open of the same orchestration.
+- **Layer:** fast unit test, in-process (`src/agent_pty.rs`'s own `#[cfg(test)] mod tests`, direct calls against `AgentPtyRegistry::claim_orchestration_name`; no PTY, no daemon wire).
+- **Agent:** none.
+- **Asserts:** `claim("proj-orchestrator-1", Some("/tmp/myproj-proj-orchestrator-1"), "restored-pane")` (replicating the restore path's workspace-directory key) succeeds; a subsequent `claim("proj-orchestrator-1", Some("/tmp/myproj"), "new-live-pane")` (replicating the live-spawn path's source-directory key, for the SAME orchestration) must be refused but is not — the daemon's compound key sees two different directory strings and finds no conflict, the exact fork #74 condition the claim registry exists to prevent.
+- **Does not assert:** the two `src/ui.rs` call sites themselves, which are unchanged by this test (the fix is `coder`'s next step); the client-side suggestion/collision filter (covered by `orchestration/identity/034`/`035`); a genuine two-DIFFERENT-orchestrations same-name-different-dir claim, which is correct today and unrelated (covered by `orchestration/identity/031`).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
