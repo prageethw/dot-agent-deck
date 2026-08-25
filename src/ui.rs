@@ -38251,6 +38251,99 @@ mod tests {
         );
     }
 
+    /// Scenario: Build a new-pane form for `/tmp/myproj` whose only live
+    /// orchestration identity carries the PRODUCTION shape — a sibling
+    /// workspace path (`/tmp/myproj-myproj-orchestrator-1`), not the picked
+    /// directory itself — since PRD fork#544 M2b made isolated-clone
+    /// provisioning unconditional, `orchestration_cwd` is never literally
+    /// `form.dir`. Assert `suggest_orchestration_name()` correctly skips the
+    /// taken slot (`-orchestrator-2`) and `name_collision()` is `true` for
+    /// the taken name — the exact re-derivation `live_orchestration_occupies`
+    /// exists to perform (reviewer finding H2's suggested minimum, PRD
+    /// fork#603).
+    #[spec("orchestration/identity/034")]
+    #[test]
+    fn identity_034_production_shaped_sibling_live_cwd_is_recognized_non_nested() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_identities(vec![(
+            "/tmp/myproj-myproj-orchestrator-1".to_string(),
+            "myproj-orchestrator-1".to_string(),
+        )]);
+
+        assert_eq!(
+            form.suggest_orchestration_name(),
+            "myproj-orchestrator-2",
+            "a live orchestration reported under its ACTUAL sibling-workspace \
+             cwd (never the picked directory itself, post-fork#544 M2b) must \
+             still be recognized as occupying this form's directory, bumping \
+             the suggestion to -2 (PRD fork#603 / reviewer H2)"
+        );
+
+        form.selection_index = 1; // the only orchestration
+        form.name = "myproj-orchestrator-1".to_string();
+        assert!(
+            form.name_collision(),
+            "a name held by a live orchestration whose reported cwd is the \
+             production sibling-workspace shape must register as a collision \
+             (PRD fork#603 / reviewer H2)"
+        );
+    }
+
+    /// Scenario: PRD fork#603 reviewer finding B1 — build a new-pane form for
+    /// a NESTED pick (`/tmp/myrepo/team-a/proj`, a subdirectory of the git
+    /// repo rooted at `/tmp/myrepo`) whose only live orchestration identity
+    /// carries the real nested-pick provisioning shape issue #595 produces:
+    /// `<toplevel>-<segment>/<relative-subpath>`, i.e.
+    /// `/tmp/myrepo-proj-orchestrator-1/team-a/proj` — the isolated clone
+    /// sibling of the TOPLEVEL, with the picked directory's own relative
+    /// path rejoined underneath, not `resolve_workspace_path` applied to the
+    /// picked directory directly. `live_orchestration_occupies` re-derives
+    /// only the latter (missing the toplevel/rejoin layer entirely), so it
+    /// can never match this shape — the suggestion and collision check must
+    /// still recognize the live orchestration as occupying this directory,
+    /// exactly as `identity_034` pins for the non-nested case.
+    #[spec("orchestration/identity/035")]
+    #[test]
+    fn identity_035_production_shaped_sibling_live_cwd_is_recognized_nested() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/myrepo/team-a/proj"),
+            "proj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_identities(vec![(
+            "/tmp/myrepo-proj-orchestrator-1/team-a/proj".to_string(),
+            "proj-orchestrator-1".to_string(),
+        )]);
+
+        assert_eq!(
+            form.suggest_orchestration_name(),
+            "proj-orchestrator-2",
+            "a live orchestration reported under the real NESTED-pick \
+             provisioning shape (toplevel sibling + rejoined relative \
+             subpath, issue #595) must still be recognized as occupying \
+             this form's directory, bumping the suggestion to -2 — \
+             `live_orchestration_occupies` re-derives only the non-nested \
+             half of the spawn path's formula (PRD fork#603 reviewer B1)"
+        );
+
+        form.selection_index = 1; // the only orchestration
+        form.name = "proj-orchestrator-1".to_string();
+        assert!(
+            form.name_collision(),
+            "a name held by a live orchestration under the real nested-pick \
+             provisioning shape must register as a collision — the same gap \
+             as the suggestion above (PRD fork#603 reviewer B1)"
+        );
+    }
+
     /// Scenario: Render the new-pane form with an orchestration selected,
     /// once with its typed Name colliding with a live orchestration and
     /// once with a distinct name, driving the private `render_new_pane_form`

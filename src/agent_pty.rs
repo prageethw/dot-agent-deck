@@ -10185,6 +10185,54 @@ mod spawn_tests {
         );
     }
 
+    /// Scenario: PRD fork#603 reviewer finding B2 — replicate what each of
+    /// the two `ClaimOrchestrationName` call sites in `src/ui.rs` actually
+    /// computes today for the SAME orchestration. Restore/reconnect
+    /// (`src/ui.rs:13787-13800`) claims with the restored pane's own cwd,
+    /// which for an orchestration pane is the PROVISIONED WORKSPACE
+    /// directory (e.g. `/tmp/myproj-proj-orchestrator-1`, the
+    /// `resolve_workspace_path` sibling), never the original source
+    /// directory. A fresh live spawn of the same orchestration name
+    /// (`src/ui.rs:10931-10947`) claims with the picked SOURCE directory
+    /// (`/tmp/myproj`) instead. Because the daemon's compound key compares
+    /// those two different directory strings, the second claim for what is
+    /// really one orchestration is wrongly allowed — the exact fork #74
+    /// condition the claim registry exists to prevent, and the case
+    /// `origin/main`'s old name-only key caught but this compound key does
+    /// not.
+    #[spec("orchestration/identity/036")]
+    #[test]
+    fn identity_036_restore_and_live_spawn_key_the_same_orchestration_on_different_dirs() {
+        let registry = AgentPtyRegistry::new();
+
+        // Restore/reconnect claims with the provisioned WORKSPACE directory.
+        assert!(registry.claim_orchestration_name(
+            "proj-orchestrator-1",
+            Some("/tmp/myproj-proj-orchestrator-1"),
+            "restored-pane",
+        ));
+
+        // A fresh live-spawn open of the SAME orchestration name, from the
+        // ORIGINAL SOURCE directory it was picked from, must be refused
+        // while the restored orchestration is still live — instead it
+        // succeeds today because the two call sites claim under two
+        // different directories for what is really one orchestration.
+        assert!(
+            !registry.claim_orchestration_name(
+                "proj-orchestrator-1",
+                Some("/tmp/myproj"),
+                "new-live-pane",
+            ),
+            "a fresh live-spawn open of an orchestration name already held \
+             by a restored session for the SAME orchestration must be \
+             refused — instead the two claim call sites key on two \
+             different directories (workspace vs. source) for the same \
+             orchestration, so the daemon sees no conflict and both are \
+             allowed to hold the name simultaneously (PRD fork#603 \
+             reviewer B2)"
+        );
+    }
+
     #[test]
     fn registry_resize_rejects_zero_dims() {
         let registry = Arc::new(AgentPtyRegistry::new());
