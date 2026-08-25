@@ -21,6 +21,7 @@
 mod common;
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use common::{TuiDeck, commit_fixture};
@@ -398,10 +399,15 @@ fn run_work_done_cli_with_subject(
 }
 
 /// Look up the currently-registered worker pane's fork-#358 identity
-/// (`registration_generation` + `daemon_boot_id`), exactly as
-/// `work_done_004`'s inline lookup above does — needed by both `006` and
-/// `007` to construct a legitimate `work-done` signal for a real CLI
-/// subprocess that never inherited a real spawn's environment.
+/// (`registration_generation` + `daemon_boot_id`) plus its real `cwd`, exactly
+/// as `work_done_004`'s inline lookup above does for the identity half —
+/// needed by both `006` and `007` to construct a legitimate `work-done`
+/// signal for a real CLI subprocess that never inherited a real spawn's
+/// environment, and by `006` alone to know where the daemon actually wrote
+/// its summary file: `open_orchestration` provisions an isolated clone in a
+/// sibling directory of `deck.workdir()` (`resolve_workspace_path`,
+/// `src/ui.rs`), so the worker pane's real `cwd` — and therefore the base
+/// `write_work_done_summary` writes under — is never `deck.workdir()` itself.
 ///
 /// Both callers invoke this immediately after a real `delegate` CLI call, and
 /// the `orch-deck` fixture sets no `clear` override on either role so it
@@ -411,9 +417,9 @@ fn run_work_done_cli_with_subject(
 /// respawn completes, and the registry briefly holds both the old and the new
 /// agent for one pane with `ListAgents` order unspecified (fork issue #513).
 /// So this re-resolves on every poll rather than caching, and only accepts a
-/// record once BOTH identity fields are populated — a mid-respawn record
-/// might carry one but not the other.
-fn worker_fail_closed_identity(deck: &TuiDeck, worker_pane: &str) -> (u64, String) {
+/// record once ALL THREE fields are populated — a mid-respawn record might
+/// carry some but not others.
+fn worker_fail_closed_identity(deck: &TuiDeck, worker_pane: &str) -> (u64, String, PathBuf) {
     let identity = RefCell::new(None);
     let found = common::wait_until(Duration::from_secs(30), || {
         let Some(record) = common::agent_records_on(deck.attach_socket_path())
@@ -422,18 +428,20 @@ fn worker_fail_closed_identity(deck: &TuiDeck, worker_pane: &str) -> (u64, Strin
         else {
             return false;
         };
-        let (Some(boot_id), Some(generation)) =
-            (record.daemon_boot_id, record.registration_generation)
-        else {
+        let (Some(boot_id), Some(generation), Some(cwd)) = (
+            record.daemon_boot_id,
+            record.registration_generation,
+            record.cwd,
+        ) else {
             return false;
         };
-        *identity.borrow_mut() = Some((generation, boot_id));
+        *identity.borrow_mut() = Some((generation, boot_id, PathBuf::from(cwd)));
         true
     });
     assert!(
         found,
-        "the worker pane must eventually reappear in ListAgents with a daemon_boot_id and \
-         registration_generation, post-respawn (fork issue #513)"
+        "the worker pane must eventually reappear in ListAgents with a daemon_boot_id, \
+         registration_generation and cwd, post-respawn (fork issue #513)"
     );
     identity.into_inner().expect("wait_until returned true")
 }
@@ -453,10 +461,6 @@ fn work_done_006_subject_mismatch_produces_a_visible_warning_in_the_attached_tui
 
     let (worker_pane, orchestrator_agent, orchestrator_pane) = orchestration_ids(&deck);
     let summary_file_name = work_done_file_name(WORKER_ROLE, &worker_pane);
-    let summary_path = deck
-        .workdir()
-        .join(".dot-agent-deck")
-        .join(&summary_file_name);
     let pointer_needle_text = pointer_needle(&worker_pane);
 
     let delegate_output = run_delegate_cli_with_subject(
@@ -475,7 +479,14 @@ fn work_done_006_subject_mismatch_produces_a_visible_warning_in_the_attached_tui
         String::from_utf8_lossy(&delegate_output.stderr)
     );
 
-    let (worker_generation, worker_boot_id) = worker_fail_closed_identity(&deck, &worker_pane);
+    // The worker pane's REAL cwd, not `deck.workdir()`: `open_orchestration`
+    // provisions an isolated clone in a sibling directory
+    // (`resolve_workspace_path`, `src/ui.rs`), and that resolved path — not
+    // `deck.workdir()` — is what `write_work_done_summary` actually writes
+    // under.
+    let (worker_generation, worker_boot_id, worker_cwd) =
+        worker_fail_closed_identity(&deck, &worker_pane);
+    let summary_path = worker_cwd.join(".dot-agent-deck").join(&summary_file_name);
 
     const SENTINEL: &str = "e2e-subject-mismatch-report-9c31";
     let work_done_output = run_work_done_cli_with_subject(
@@ -582,7 +593,8 @@ fn work_done_007_matching_subjects_produce_no_mismatch_warning() {
         String::from_utf8_lossy(&delegate_output.stderr)
     );
 
-    let (worker_generation, worker_boot_id) = worker_fail_closed_identity(&deck, &worker_pane);
+    let (worker_generation, worker_boot_id, _worker_cwd) =
+        worker_fail_closed_identity(&deck, &worker_pane);
 
     const SENTINEL: &str = "e2e-subject-match-report-71ae";
     let work_done_output = run_work_done_cli_with_subject(
