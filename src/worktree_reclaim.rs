@@ -2163,9 +2163,10 @@ fn resolve_isolated_clone_stash_list(clone_dir: &Path) -> Option<Vec<String>> {
 /// with no new match arm needed there at all.
 ///
 /// **Fork#325 M4c exception (maintainer-decided rule, tightened after an
-/// audit found the first shipped version had 3 blocker-severity gaps):** the
-/// one condition under which `verdict` is NOT hard-coded to
-/// [`KIND_ISOLATED_CLONE`] is the AND of all five: (1) `has_attach_lock` —
+/// audit found the first shipped version had 3 blocker-severity gaps),
+/// widened to six by fork issue #546 hazard 2:** the one condition under
+/// which `verdict` is NOT hard-coded to [`KIND_ISOLATED_CLONE`] is the AND
+/// of all six: (1) `has_attach_lock` —
 /// the deck's own provenance artifact, since a forged sibling directory can
 /// satisfy every other condition below with no deck involvement at all
 /// (auditor A2); (2) the working tree is [`Cleanliness::Clean`] —
@@ -2188,34 +2189,49 @@ fn resolve_isolated_clone_stash_list(clone_dir: &Path) -> Option<Vec<String>> {
 /// merge `5742ad1f93dd`), so round 2's rule could (almost) never fire for a
 /// genuine clone — `headRefOid` is exactly the clone's own reachable commit
 /// history instead (auditor A8's original tree-SHA tightening is
-/// superseded by this redesign, not layered on top of it). [`run_reclaim`]
+/// superseded by this redesign, not layered on top of it); and (6) the
+/// clone must not be explicitly pinned
+/// ([`crate::issue_dispatch_run::pin_isolated_clone`]/
+/// [`unpin_isolated_clone`], fork issue #546 hazard 2) — a deliberate,
+/// caller-set override read via [`isolated_clone_provenance_field`]'s
+/// `pinned=` field, trusted only once `has_attach_lock` has already
+/// verified the artifact is this deck's own; only a literal `pinned=true`
+/// counts (see the Known residual paragraph below for what this override
+/// closes and what it still doesn't). [`run_reclaim`]
 /// gets a dedicated match arm for [`VERDICT_ISOLATED_CLONE_RECLAIMABLE`],
 /// using a removal primitive other than `remove_worktree_dir`'s `git
 /// worktree remove` (which fails loudly against a plain clone, not a linked
 /// worktree). Every other case is unaffected and still hard-codes
 /// [`KIND_ISOLATED_CLONE`] exactly as before this milestone.
-/// `None`/unresolvable anywhere in this five-way chain fails closed to "not
+/// `None`/unresolvable anywhere in this six-way chain fails closed to "not
 /// eligible" — the same stance the pre-tightening rule took for an
 /// unresolvable merge SHA.
 ///
-/// **Known residual (M2, PR #526 round 3):** these five conditions prove
-/// PROVENANCE (the deck created this clone) and CONTENT SAFETY (nothing
-/// would be lost), never LIVENESS (whether the clone is currently in active
-/// use). Issue #325's original incident was exactly "an orchestration
-/// deleted another orchestration's actively-in-use worktree" — and a clone
-/// can satisfy every condition above while a live orchestration is still
-/// working in it (e.g. about to make a new commit). The daemon tracks
-/// liveness for its own dispatched worktrees in-process
+/// **Known residual (M2, PR #526 round 3; narrowed by fork issue #546
+/// hazard 2):** the original five conditions prove PROVENANCE (the deck
+/// created this clone) and CONTENT SAFETY (nothing would be lost), never
+/// LIVENESS (whether the clone is currently in active use). Issue #325's
+/// original incident was exactly "an orchestration deleted another
+/// orchestration's actively-in-use worktree" — and a clone could satisfy
+/// every one of the original five conditions while a live orchestration
+/// was still working in it (e.g. about to make a new commit). The daemon
+/// tracks liveness for its own dispatched worktrees in-process
 /// ([`crate::issue_dispatch_run::WorktreeRegistry`] /
 /// `worktree_still_in_use`), but `worktree reclaim` is a plain CLI
 /// subprocess (`run_worktree_reclaim_cli`) that never connects to the
-/// daemon socket at all — that in-memory signal is not reachable from this
-/// call path, and nothing here invents a substitute for it (a heuristic
-/// liveness probe would be worse than none: a false "not live" reads as
-/// license to delete). This is accepted as a residual rather than gated,
-/// consistent with this module's existing honesty about other limits (see
-/// `owned`'s same-uid caveat above) — closing it needs a signal `worktree
-/// reclaim` can actually reach, which is future work, not this milestone.
+/// daemon socket at all — that in-memory signal is still not reachable
+/// from this call path, and nothing here invents an automatic substitute
+/// for it (a heuristic liveness probe would be worse than none: a false
+/// "not live" reads as license to delete). Fork issue #546's sixth
+/// condition is not that automatic signal — it is a manual one: whoever
+/// (or whatever) knows a clone is still in active use, or otherwise wants
+/// it kept, can now say so explicitly via `pin_isolated_clone` and have
+/// this function honor it. That closes the "no way to say keep this one"
+/// gap for a clone someone is deliberately still resuming by name, but it
+/// is opt-in and does nothing for a clone nobody thought to pin — a fully
+/// automatic liveness signal `worktree reclaim` can consult without being
+/// told is still open, consistent with this module's existing honesty
+/// about other limits (see `owned`'s same-uid caveat above).
 ///
 /// Final round (reviewer F13 / auditor A1/B1): `owned` and `owner`/
 /// `owner_kind` below are now backed by `candidate.has_attach_lock` —
@@ -2290,8 +2306,34 @@ fn isolated_clone_report(
             head_ref_oid: Some(oid),
         } if head_sha.as_deref() == Some(oid.as_str())
     );
-    let is_reclaim_eligible =
-        has_attach_lock && clean && single_local_branch && stash_empty && head_matches_merge;
+    // Fork issue #546 hazard 2 (maintainer-decided design): a sixth,
+    // independent gate on top of the original five -- an explicit pin is
+    // never inferred from the other five holding, and is only ever trusted
+    // once `has_attach_lock` has already verified this artifact is the
+    // deck's own (the same trust gate `owner`/`owner_kind` below apply to
+    // this same artifact's other fields). Only the literal `pinned=true`
+    // counts as pinned; a missing field (no artifact, or a pre-#546
+    // `schema=2` artifact that predates the pin mechanism entirely), an
+    // explicit `pinned=false` (`unpin_isolated_clone`), or any other value
+    // all read as not pinned -- `pin_isolated_clone`/`unpin_isolated_clone`
+    // only ever write `true` or `false` here, so anything else is not
+    // evidence this deck itself produced.
+    let is_pinned = has_attach_lock
+        && std::fs::read_to_string(crate::issue_dispatch_run::isolated_clone_provenance_path(
+            &path,
+        ))
+        .ok()
+        .and_then(|content| {
+            crate::issue_dispatch_run::isolated_clone_provenance_field(&content, "pinned")
+        })
+        .as_deref()
+            == Some("true");
+    let is_reclaim_eligible = has_attach_lock
+        && clean
+        && single_local_branch
+        && stash_empty
+        && head_matches_merge
+        && !is_pinned;
     let (verdict, reason) = if is_reclaim_eligible {
         (
             VERDICT_ISOLATED_CLONE_RECLAIMABLE.to_string(),
@@ -2323,12 +2365,16 @@ fn isolated_clone_report(
         if !head_matches_merge {
             unmet_gates.push("HEAD commit SHA does not equal a merged PR's headRefOid");
         }
+        if is_pinned {
+            unmet_gates.push("isolated clone is explicitly pinned (fork issue #546)");
+        }
         (
             KIND_ISOLATED_CLONE.to_string(),
             format!(
                 "isolated clone: not eligible for automatic reclaim -- {} (fork#325 M4c \
                  requires all five: a deck attach-lock, a clean tree, exactly one local \
-                 branch, an empty stash, and HEAD == a merged PR's headRefOid)",
+                 branch, an empty stash, and HEAD == a merged PR's headRefOid; fork#546 adds a \
+                 sixth: the clone must not be explicitly pinned)",
                 unmet_gates.join(", ")
             ),
         )

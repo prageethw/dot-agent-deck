@@ -2742,16 +2742,27 @@ pub(crate) fn isolated_clone_provenance_path(clone_dir: &Path) -> PathBuf {
 }
 
 /// Read one `key=value` field out of a provenance artifact's raw `content`,
-/// but only when the artifact carries a recognized `schema=2` tag — a
-/// pre-M4 `b"deck\n"` artifact (or anything else that doesn't parse as
-/// today's format) has no such fields to trust, and every caller of this
+/// but only when the artifact carries a recognized `schema=2` or `schema=3`
+/// tag — a pre-M4 `b"deck\n"` artifact (or anything else that doesn't parse
+/// as either format) has no such fields to trust, and every caller of this
 /// function must treat that as "no evidence to contradict," never as a
 /// literal empty string (PRD fork#544 review-findings fix round; shared by
 /// [`resume_existing_isolated_clone`]'s creator check and
 /// [`forget_isolated_workspace`]'s `path=` verification rather than each
-/// growing its own parser).
-fn isolated_clone_provenance_field(content: &str, key: &str) -> Option<String> {
-    if !content.lines().any(|line| line.trim() == "schema=2") {
+/// growing its own parser). `schema=3` ([`pin_isolated_clone`]/
+/// [`unpin_isolated_clone`], fork issue #546) is additive on `schema=2` —
+/// the same `root-hash=`/`name=`/`creator=`/`path=` fields plus a
+/// `pinned=` line — so widening this check to accept it changes nothing
+/// for an existing `schema=2` artifact and every field already read from
+/// one (`path=`, `creator=`, …) resolves identically; it only stops a
+/// `pinned=` read (or any other field) on a `schema=3` artifact from
+/// silently returning `None` as if the artifact carried no evidence at
+/// all.
+pub(crate) fn isolated_clone_provenance_field(content: &str, key: &str) -> Option<String> {
+    let recognized_schema = content
+        .lines()
+        .any(|line| matches!(line.trim(), "schema=2" | "schema=3"));
+    if !recognized_schema {
         return None;
     }
     let prefix = format!("{key}=");
@@ -2862,6 +2873,114 @@ fn write_isolated_clone_provenance(
         let _ = std::fs::remove_file(&tmp_path);
         format!("failed to finalize isolated-clone provenance artifact: {e}")
     })
+}
+
+/// Fork issue #546 hazard 2 (maintainer-decided design): rewrite an
+/// isolated clone's existing M4b provenance artifact in place as
+/// `schema=3`, preserving its `root-hash=`/`name=`/`creator=`/`path=`
+/// fields exactly as [`isolated_clone_provenance_field`] reads them back
+/// (never re-derived from `clone_dir` itself — this is a REWRITE of
+/// existing evidence, not a fresh [`write_isolated_clone_provenance`]) and
+/// adding a `pinned=` line recording `pinned`. Shared by
+/// [`pin_isolated_clone`] (`pinned=true`) and [`unpin_isolated_clone`]
+/// (`pinned=false`) rather than each duplicating the read-preserve-rewrite
+/// dance.
+///
+/// Requires an existing provenance artifact — [`std::fs::read_to_string`]
+/// surfaces the same `io::Error` (typically `NotFound`) a caller would get
+/// reading it directly if `clone_dir` was never provisioned by this deck,
+/// or was already forgotten ([`forget_isolated_workspace`]); this function
+/// never fabricates a fresh artifact for a clone that doesn't already have
+/// one. A missing `root-hash=`/`path=` field on an otherwise-parseable
+/// artifact is likewise refused rather than silently written with an
+/// empty value, since a widened [`isolated_clone_provenance_field`] schema
+/// check (`schema=2` OR `schema=3`) means this can run against a clone
+/// this same call already rewrote to `schema=3` on a previous pin/unpin.
+///
+/// Atomic write-then-rename, the identical pattern
+/// [`write_isolated_clone_provenance`] already uses and for the same
+/// reason (see that function's own doc comment): a partially-written
+/// artifact must never be observable at the final path, since
+/// [`crate::worktree_reclaim::candidate_has_attach_lock`] and every reader
+/// of this artifact trust presence alone.
+fn set_isolated_clone_pinned(clone_dir: &Path, pinned: bool) -> std::io::Result<()> {
+    let marker_path = isolated_clone_provenance_path(clone_dir);
+    let content = std::fs::read_to_string(&marker_path)?;
+    let root_hash = isolated_clone_provenance_field(&content, "root-hash").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "provenance artifact at {} has no root-hash= field to preserve",
+                marker_path.display()
+            ),
+        )
+    })?;
+    let path = isolated_clone_provenance_field(&content, "path").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "provenance artifact at {} has no path= field to preserve",
+                marker_path.display()
+            ),
+        )
+    })?;
+    let name = isolated_clone_provenance_field(&content, "name").unwrap_or_default();
+    let creator = isolated_clone_provenance_field(&content, "creator").unwrap_or_default();
+
+    let parent = marker_path.parent().expect(
+        "isolated_clone_provenance_path always nests under state_dir(), which has a parent",
+    );
+    let file_name = marker_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("provenance");
+    let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+    let new_content = format!(
+        "schema=3\nroot-hash={root_hash}\nname={name}\ncreator={creator}\npath={path}\npinned={pinned}\n"
+    );
+
+    std::fs::write(&tmp_path, new_content.as_bytes()).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })?;
+    std::fs::rename(&tmp_path, &marker_path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })
+}
+
+/// Pin an isolated clone against fork#325 M4c's automatic reclaim (fork
+/// issue #546 hazard 2): rewrites its provenance artifact to `schema=3`
+/// with `pinned=true`, which [`crate::worktree_reclaim::isolated_clone_report`]
+/// then AND's into its reclaim-eligibility check alongside the five
+/// existing gates. See [`set_isolated_clone_pinned`] for the rewrite
+/// itself.
+///
+/// `#[allow(dead_code)]`: fork issue #546 deliberately ships no CLI wiring
+/// yet (that is a fast-follow-up) — this function is exercised directly by
+/// `worktree_reclaim_075` and nothing else calls it today, the same honest
+/// state [`forget_isolated_workspace`]'s own `#[allow(dead_code)]`
+/// documents rather than papering over with a synthetic caller.
+#[allow(dead_code)]
+pub(crate) fn pin_isolated_clone(clone_dir: &Path) -> std::io::Result<()> {
+    set_isolated_clone_pinned(clone_dir, true)
+}
+
+/// Unpin an isolated clone previously pinned via [`pin_isolated_clone`]
+/// (fork issue #546 hazard 2), or explicitly record `pinned=false` on one
+/// that was never pinned to begin with — both rewrite the provenance
+/// artifact to `schema=3` with `pinned=false`, and both must succeed
+/// rather than requiring a prior pin call first. See
+/// [`set_isolated_clone_pinned`] for the rewrite itself, and that
+/// function's own doc comment for why a clone with no existing provenance
+/// artifact is refused rather than given a fresh one here.
+///
+/// `#[allow(dead_code)]`: fork issue #546 deliberately ships no CLI wiring
+/// yet (that is a fast-follow-up) — this function is exercised directly by
+/// `worktree_reclaim_076` and nothing else calls it today, the same honest
+/// state [`forget_isolated_workspace`]'s own `#[allow(dead_code)]`
+/// documents rather than papering over with a synthetic caller.
+#[allow(dead_code)]
+pub(crate) fn unpin_isolated_clone(clone_dir: &Path) -> std::io::Result<()> {
+    set_isolated_clone_pinned(clone_dir, false)
 }
 
 /// PRD fork#544 M5: the only deliberate way a named workspace is ever
