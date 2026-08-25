@@ -744,7 +744,13 @@ pub enum AttachRequest {
         /// which conflicts with a claim of the same name from ANY
         /// directory, preserving an old client's own assumption that its
         /// claim was exclusive everywhere.
-        #[serde(default)]
+        ///
+        /// PRD fork#603 fix round (reviewer N3): `skip_serializing_if`
+        /// matches the convention every other additive optional field in
+        /// this file already uses (`orchestration_cwd`, `display_title`,
+        /// `seed`, `isolated_clone_origin`) — without it, a new TUI sends
+        /// `"cwd": null` to an old daemon that has never heard of the key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
     /// Fork issue #201 redesign: rebind the orchestration-name claim
