@@ -2903,6 +2903,25 @@ fn write_isolated_clone_provenance(
 /// artifact must never be observable at the final path, since
 /// [`crate::worktree_reclaim::candidate_has_attach_lock`] and every reader
 /// of this artifact trust presence alone.
+///
+/// Field order in the rewritten content matters and is not incidental
+/// (review-findings fix round, reviewer/auditor L1/F5): `path=` is NOT
+/// sanitized (see [`write_isolated_clone_provenance`]'s own doc comment for
+/// why), so every field this rewrite trusts is written BEFORE `path=` --
+/// `pinned=` included -- exactly mirroring the write path's own
+/// `creator=`/`name=` ordering. [`isolated_clone_provenance_field`]'s read
+/// side returns the FIRST line matching a given key, so a `pinned=` line
+/// appearing after `path=` would let a hypothetically-injected line inside
+/// an unsanitized `path` value shadow the real `pinned=` field; writing it
+/// first closes that off the same way the original ordering closes it for
+/// `creator=`.
+///
+/// Re-asserts the containing directory owner-only (`ensure_owner_only_dir`,
+/// review-findings fix round, reviewer/auditor L2) exactly as
+/// [`write_isolated_clone_provenance`] does on every write to this same
+/// location -- this call rewrites the artifact in place rather than
+/// creating it fresh, but nothing else re-asserts the permission on the
+/// rewrite path if this doesn't.
 fn set_isolated_clone_pinned(clone_dir: &Path, pinned: bool) -> std::io::Result<()> {
     let marker_path = isolated_clone_provenance_path(clone_dir);
     let content = std::fs::read_to_string(&marker_path)?;
@@ -2930,13 +2949,14 @@ fn set_isolated_clone_pinned(clone_dir: &Path, pinned: bool) -> std::io::Result<
     let parent = marker_path.parent().expect(
         "isolated_clone_provenance_path always nests under state_dir(), which has a parent",
     );
+    crate::platform::fsperm::ensure_owner_only_dir(parent)?;
     let file_name = marker_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("provenance");
     let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
     let new_content = format!(
-        "schema=3\nroot-hash={root_hash}\nname={name}\ncreator={creator}\npath={path}\npinned={pinned}\n"
+        "schema=3\nroot-hash={root_hash}\nname={name}\ncreator={creator}\npinned={pinned}\npath={path}\n"
     );
 
     std::fs::write(&tmp_path, new_content.as_bytes()).inspect_err(|_| {

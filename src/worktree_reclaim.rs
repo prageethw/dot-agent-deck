@@ -2317,23 +2317,21 @@ fn isolated_clone_report(
     // explicit `pinned=false` (`unpin_isolated_clone`), or any other value
     // all read as not pinned -- `pin_isolated_clone`/`unpin_isolated_clone`
     // only ever write `true` or `false` here, so anything else is not
-    // evidence this deck itself produced.
-    let is_pinned = has_attach_lock
-        && std::fs::read_to_string(crate::issue_dispatch_run::isolated_clone_provenance_path(
-            &path,
-        ))
-        .ok()
-        .and_then(|content| {
-            crate::issue_dispatch_run::isolated_clone_provenance_field(&content, "pinned")
-        })
-        .as_deref()
-            == Some("true");
+    // evidence this deck itself produced. An artifact that exists but
+    // cannot be READ (reviewer/auditor gap 2) is a THIRD outcome, distinct
+    // from both -- see [`isolated_clone_pin_state`]'s own doc comment for
+    // why it fails closed (`pin_unresolvable`) rather than collapsing into
+    // "not pinned".
+    let pin_state = has_attach_lock.then(|| isolated_clone_pin_state(&path));
+    let is_pinned = matches!(pin_state, Some(Ok(true)));
+    let pin_unresolvable = matches!(pin_state, Some(Err(_)));
     let is_reclaim_eligible = has_attach_lock
         && clean
         && single_local_branch
         && stash_empty
         && head_matches_merge
-        && !is_pinned;
+        && !is_pinned
+        && !pin_unresolvable;
     let (verdict, reason) = if is_reclaim_eligible {
         (
             VERDICT_ISOLATED_CLONE_RECLAIMABLE.to_string(),
@@ -2368,13 +2366,20 @@ fn isolated_clone_report(
         if is_pinned {
             unmet_gates.push("isolated clone is explicitly pinned (fork issue #546)");
         }
+        if pin_unresolvable {
+            unmet_gates.push(
+                "isolated clone's pin state could not be read -- fails closed, treated as \
+                 pinned (fork issue #546 hazard 2)",
+            );
+        }
         (
             KIND_ISOLATED_CLONE.to_string(),
             format!(
                 "isolated clone: not eligible for automatic reclaim -- {} (fork#325 M4c \
                  requires all five: a deck attach-lock, a clean tree, exactly one local \
                  branch, an empty stash, and HEAD == a merged PR's headRefOid; fork#546 adds a \
-                 sixth: the clone must not be explicitly pinned)",
+                 sixth: the clone must not be explicitly pinned, and an unreadable pin signal \
+                 fails closed exactly like every other unresolvable signal here)",
                 unmet_gates.join(", ")
             ),
         )
@@ -2421,6 +2426,40 @@ fn isolated_clone_report(
         real_path,
         removed_by: None,
         kind: KIND_ISOLATED_CLONE.to_string(),
+    }
+}
+
+/// Resolve fork issue #546 hazard 2's pin gate for one isolated clone,
+/// shared by [`isolated_clone_report`]'s examination-time check and
+/// [`remove_isolated_clone_dir`]'s TOCTOU re-verification so both read the
+/// same artifact through the same logic rather than each growing its own
+/// parser (reviewer/auditor gap 1). `Ok(true)` means the artifact was read
+/// successfully and its `pinned=` field is the literal string `"true"`;
+/// `Ok(false)` means it was read successfully and the field is absent,
+/// `"false"`, or any other value. `Err` means the artifact could not be
+/// read at all (permission denied, or any other I/O error) -- **the caller
+/// must treat that identically to `Ok(true)`, never to `Ok(false)`**
+/// (reviewer/auditor gap 2): every other gate in this heuristic fails
+/// closed on an unresolvable signal (`None` anywhere in the chain makes
+/// the corresponding gate `false`, never a pass), and collapsing a read
+/// error to "not pinned" via `.ok()` was this exact heuristic failing
+/// OPEN on the one gate the whole hazard exists to enforce. Only called
+/// once `has_attach_lock` is already known `true` -- the artifact's
+/// content is trusted only once that has verified it is this deck's own
+/// (the same trust gate `owner`/`owner_kind` apply to this same
+/// artifact's other fields).
+fn isolated_clone_pin_state(path: &Path) -> Result<bool, String> {
+    match std::fs::read_to_string(crate::issue_dispatch_run::isolated_clone_provenance_path(
+        path,
+    )) {
+        Ok(content) => Ok(crate::issue_dispatch_run::isolated_clone_provenance_field(
+            &content, "pinned",
+        )
+        .as_deref()
+            == Some("true")),
+        Err(e) => Err(format!(
+            "isolated clone provenance artifact could not be read to resolve its pin state: {e}"
+        )),
     }
 }
 
@@ -2561,46 +2600,60 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// either removal path.
 ///
 /// **M1 TOCTOU re-verification (fork#325 M4c, PR #526 round 3, reviewer
-/// M1):** the `.git`-shape check above is only a structural sanity check,
-/// not a re-run of the eligibility gate — [`examine_worktrees`]'s
-/// examination pass and this removal can be seconds to minutes apart on a
-/// large reclaim batch, and the clone could have been actively worked on in
-/// that window (a new commit, a stash push, a second branch, uncommitted
-/// content). Immediately before the actual `remove_dir_all`, 4 of the 5
-/// signals [`isolated_clone_report`]'s eligibility gate reads are re-derived
-/// FRESH from `worktree_path` alone — cleanliness, the local branch list,
-/// the stash list, and the merged PR's `headRefOid` compared against a
-/// freshly re-resolved `git rev-parse HEAD` — rather than trusting anything
-/// computed during examination; any mismatch refuses (returns `Err`, never
-/// deletes). This deliberately takes the signature's own two arguments as
-/// its only input (matching [`worktree/reclaim/071`]'s direct-call contract)
-/// rather than threading the examination pass's cached values through, so a
-/// caller can never accidentally pass a stale expectation.
+/// M1; widened to six by fork issue #546 hazard 1):** the `.git`-shape check
+/// above is only a structural sanity check, not a re-run of the eligibility
+/// gate — [`examine_worktrees`]'s examination pass and this removal can be
+/// seconds to minutes apart on a large reclaim batch, and the clone could
+/// have changed state in that window: a new commit, a stash push, a second
+/// branch, uncommitted content, or (fork issue #546 hazard 2) a pin applied
+/// after examination confirmed the clone eligible. Immediately before the
+/// actual `remove_dir_all`, 5 of the 6 signals [`isolated_clone_report`]'s
+/// eligibility gate reads are re-derived FRESH from `worktree_path` alone —
+/// cleanliness, the local branch list, the stash list, the merged PR's
+/// `headRefOid` compared against a freshly re-resolved `git rev-parse
+/// HEAD`, and (via [`isolated_clone_pin_state`], the same helper
+/// [`isolated_clone_report`] itself calls) the clone's own pin state —
+/// rather than trusting anything computed during examination; any mismatch
+/// refuses (returns `Err`, never deletes), and an unreadable pin signal
+/// refuses exactly like every other unresolvable signal in this chain,
+/// never silently treated as unpinned. This deliberately takes the
+/// signature's own two arguments as its only input (matching
+/// [`worktree/reclaim/071`]'s direct-call contract) rather than threading
+/// the examination pass's cached values through, so a caller can never
+/// accidentally pass a stale expectation.
 ///
-/// **`has_attach_lock` is deliberately the one signal NOT re-derived here**
-/// (auditor N5 / reviewer N3, PR #526 final round). The other four reflect
-/// content a legitimately concurrent process could change during the
-/// examination-to-removal window — a new commit, a stash push, a second
-/// branch, an untracked file — which is exactly the hazard this
-/// re-verification exists to catch. The attach-lock provenance artifact is
-/// nothing like that: it is written once, under `state_dir()`, at
-/// `provision_isolated_clone_sync` time, keyed by the clone's own canonical
-/// PATH rather than anything inside its tree, and this function's own
-/// marker-clearing step (fork issue #546 hazard 1, below) is the only thing
-/// that ever removes it — and that step runs only after `remove_dir_all`
-/// has already succeeded, later in this same function body. So during the
-/// examination-to-removal window this re-verification actually covers,
-/// nothing has touched the marker yet: it cannot legitimately flip from
-/// present to absent in that window the way the other four can flip from
-/// safe to unsafe. And because the check is purely
-/// path-keyed rather than clone-identity-keyed, re-deriving it here would
-/// answer the identical question [`isolated_clone_report`] already answered
-/// at examination time — it cannot even detect the one adjacent hazard that
+/// **`has_attach_lock` is deliberately the one signal whose PRESENCE is NOT
+/// re-derived here** (auditor N5 / reviewer N3, PR #526 final round). The
+/// other five reflect content a legitimately concurrent process could
+/// change during the examination-to-removal window — a new commit, a stash
+/// push, a second branch, an untracked file, or a pin — which is exactly the
+/// hazard this re-verification exists to catch. The attach-lock provenance
+/// artifact's presence is nothing like that: the file is created once,
+/// under `state_dir()`, at `provision_isolated_clone_sync` time, keyed by
+/// the clone's own canonical PATH rather than anything inside its tree, and
+/// this function's own marker-clearing step (fork issue #546 hazard 1,
+/// below) is the only thing that ever removes the file outright — and that
+/// step runs only after `remove_dir_all` has already succeeded, later in
+/// this same function body. So during the examination-to-removal window
+/// this re-verification actually covers, nothing deletes the marker file:
+/// its PRESENCE cannot legitimately flip from present to absent in that
+/// window the way the other five signals can flip from safe to unsafe.
+/// (Corrected by fork issue #546 hazard 1: this comment previously extended
+/// that same "cannot legitimately flip" claim to the marker's CONTENT as a
+/// whole, which is false — [`crate::issue_dispatch_run::pin_isolated_clone`]/
+/// `unpin_isolated_clone` rewrite that exact artifact's `pinned=` field at
+/// arbitrary times, entirely independent of this removal window. That is
+/// precisely why the pin state is now re-derived above as its own signal
+/// rather than folded into "has_attach_lock cannot change.") And because
+/// the has_attach_lock check is purely path-keyed rather than
+/// clone-identity-keyed, re-deriving its PRESENCE here would answer the
+/// identical question [`isolated_clone_report`] already answered at
+/// examination time — it cannot even detect the one adjacent hazard that
 /// sounds similar (a different directory swapped in at the same path),
 /// since a swapped-in directory at that path still reads as `owned` by the
-/// same stale-path marker. Re-checking it would cost one more `is_file()`
-/// call but would not close any window this removal doesn't already close by
-/// re-deriving the four signals that genuinely can change.
+/// same stale-path marker. Re-checking presence would cost one more
+/// `is_file()` call but would not close any window this removal doesn't
+/// already close by re-deriving the five signals that genuinely can change.
 fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), String> {
     if !worktree_path.join(".git").is_dir() {
         return Err(
@@ -2673,6 +2726,32 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
              since it was examined"
                 .to_string(),
         );
+    }
+    // Fork issue #546 hazard 1: the sixth re-derived signal -- closes the
+    // TOCTOU window a pin applied during the examination-to-removal window
+    // would otherwise slip through. Uses the same helper
+    // `isolated_clone_report` itself calls, so both read the artifact
+    // through identical logic (see [`isolated_clone_pin_state`]'s own doc
+    // comment). An unreadable artifact refuses exactly like `Ok(true)`,
+    // never like `Ok(false)` -- fails closed the same way every other
+    // unresolvable signal above does.
+    match isolated_clone_pin_state(worktree_path) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(
+                "refusing to remove: the clone has been pinned immediately before deletion \
+                 (fork issue #546 hazard 2) -- a pin applied since it was examined must never \
+                 be silently overridden"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            return Err(format!(
+                "refusing to remove: the clone's pin state could not be re-resolved \
+                 immediately before deletion ({e}) -- an unreadable pin signal fails closed \
+                 here exactly as it does in `isolated_clone_report`, never treated as unpinned"
+            ));
+        }
     }
 
     std::fs::remove_dir_all(worktree_path).map_err(|e| {
