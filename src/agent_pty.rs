@@ -12458,6 +12458,7 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
             daemon_boot_id: None,
             registration_generation: None,
             outstanding_delegation: None,
