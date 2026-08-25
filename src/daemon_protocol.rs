@@ -737,6 +737,15 @@ pub enum AttachRequest {
     ClaimOrchestrationName {
         name: String,
         token: String,
+        /// PRD fork#603: the canonicalized directory this claim is scoped
+        /// to. `#[serde(default)]` so an older client that omits it still
+        /// decodes — its `None` is then treated as a global wildcard by
+        /// [`crate::agent_pty::AgentPtyRegistry::claim_orchestration_name`],
+        /// which conflicts with a claim of the same name from ANY
+        /// directory, preserving an old client's own assumption that its
+        /// claim was exclusive everywhere.
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Fork issue #201 redesign: rebind the orchestration-name claim
     /// currently held by `token` onto `pane_id`, once `Action::SpawnPane`'s
@@ -2686,7 +2695,7 @@ async fn handle_connection(
             resp.kept_worktree = kept;
             write_resp(&mut stream, &resp).await?
         }
-        AttachRequest::ClaimOrchestrationName { name, token } => {
+        AttachRequest::ClaimOrchestrationName { name, token, cwd } => {
             // Fork issue #201 redesign: the authoritative, race-free check
             // — see the variant's own doc comment for why `token` is a
             // caller-minted opaque string rather than a real pane id (none
@@ -2700,7 +2709,7 @@ async fn handle_connection(
                     &AttachResponse::err(format!("orchestration name {name:?} is not valid")),
                 )
                 .await?;
-            } else if registry.claim_orchestration_name(&name, &token) {
+            } else if registry.claim_orchestration_name(&name, cwd.as_deref(), &token) {
                 write_resp(&mut stream, &AttachResponse::ok()).await?;
             } else {
                 write_resp(
@@ -5111,6 +5120,7 @@ mod tests {
         let req = AttachRequest::ClaimOrchestrationName {
             name: "myrepo-orchestrator-1".into(),
             token: "spawn-token-abc123".into(),
+            cwd: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -5120,9 +5130,10 @@ mod tests {
 
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
         match back {
-            AttachRequest::ClaimOrchestrationName { name, token } => {
+            AttachRequest::ClaimOrchestrationName { name, token, cwd } => {
                 assert_eq!(name, "myrepo-orchestrator-1");
                 assert_eq!(token, "spawn-token-abc123");
+                assert_eq!(cwd, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -5247,6 +5258,7 @@ mod tests {
             &AttachRequest::ClaimOrchestrationName {
                 name: NAME.into(),
                 token: "tok-1".into(),
+                cwd: None,
             },
         )
         .await;
@@ -5276,6 +5288,7 @@ mod tests {
             &AttachRequest::ClaimOrchestrationName {
                 name: NAME.into(),
                 token: "tok-2".into(),
+                cwd: None,
             },
         )
         .await;
@@ -5313,6 +5326,7 @@ mod tests {
             &AttachRequest::ClaimOrchestrationName {
                 name: NAME.into(),
                 token: "tok-3".into(),
+                cwd: None,
             },
         )
         .await;

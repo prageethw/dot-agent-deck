@@ -1155,18 +1155,32 @@ const NAME_COLLISION_WARNING: [&str; 1] =
 /// [`NewPaneFormState::with_live_orchestration_cwds`] — the warning decision is
 /// read every frame, and the filesystem must not be.
 fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[String]) -> bool {
-    if live_orchestration_cwds
+    live_orchestration_cwds
         .iter()
-        .any(|c| Path::new(c) == form_cwd)
-    {
+        .any(|c| cwd_matches(form_cwd, c))
+}
+
+/// PRD fork#603: the single shared "is this the same directory" comparison,
+/// extracted from [`live_orchestration_in_same_cwd`]'s per-candidate logic so
+/// both the existing same-cwd warning and the new `(directory, name)`
+/// uniqueness filter ([`NewPaneFormState::suggest_orchestration_name`],
+/// [`NewPaneFormState::name_collision`]) use exactly one notion of "same
+/// directory" rather than letting a literal-string compare and a
+/// canonicalized one drift apart.
+///
+/// Literal-string fast path first (works even when neither side exists on
+/// disk, e.g. an L1 render seam's synthetic path), then a best-effort
+/// [`std::fs::canonicalize`] of both sides to also catch a symlinked or
+/// otherwise non-canonical alias of the same directory. Any canonicalization
+/// error just falls back to the raw verdict — never panics.
+fn cwd_matches(form_cwd: &Path, candidate: &str) -> bool {
+    if Path::new(candidate) == form_cwd {
         return true;
     }
     let Ok(form_canonical) = std::fs::canonicalize(form_cwd) else {
         return false;
     };
-    live_orchestration_cwds
-        .iter()
-        .any(|c| std::fs::canonicalize(c).is_ok_and(|live| live == form_canonical))
+    std::fs::canonicalize(candidate).is_ok_and(|live| live == form_canonical)
 }
 
 /// PRD #140 M4.0 / fork#192 M1.0: directories that currently host a live
@@ -1223,17 +1237,20 @@ fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[St
 /// description of what stays safe, so update this invariant at the next
 /// consumer added here rather than assuming the warning above still covers
 /// every shape a future one might take.
-fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
+fn live_orchestration_cwds_and_titles() -> Vec<(String, String)> {
     let Ok(resp) = send_daemon_request_blocking_with_timeout(
         &crate::daemon_protocol::AttachRequest::ListAgents,
         DAEMON_HINT_TIMEOUT,
     ) else {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     };
-    let mut seen_cwds: HashSet<String> = HashSet::new();
-    let mut seen_titles: HashSet<String> = HashSet::new();
-    let mut cwds = Vec::new();
-    let mut titles = Vec::new();
+    // PRD fork#603: the pairing survives all the way to `NewPaneFormState`
+    // now, so dedup on the whole `(cwd, title)` pair rather than shredding
+    // it into two independently-deduped lists — a strict generalization of
+    // the previous per-list dedup (two role panes of one orchestration still
+    // collapse to one entry).
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut pairs = Vec::new();
     for r in resp.agent_records.unwrap_or_default() {
         let Some(TabMembership::Orchestration {
             name,
@@ -1244,17 +1261,15 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
         else {
             continue;
         };
-        if let Some(cwd) = orchestration_cwd
-            && seen_cwds.insert(cwd.clone())
-        {
-            cwds.push(cwd);
-        }
+        let Some(cwd) = orchestration_cwd else {
+            continue;
+        };
         let title = display_title.filter(|t| !t.is_empty()).unwrap_or(name);
-        if seen_titles.insert(title.clone()) {
-            titles.push(title);
+        if seen.insert((cwd.clone(), title.clone())) {
+            pairs.push((cwd, title));
         }
     }
-    (cwds, titles)
+    pairs
 }
 
 /// PRD fork#325 M3: the Nth-concurrent-orchestration GATE — does
@@ -1654,9 +1669,9 @@ struct NewPaneFormState {
     /// warning, so every other form construction site renders byte-for-byte as
     /// before.
     live_orchestration_in_same_cwd: bool,
-    /// fork#192 M1.0: the live orchestration TITLES the daemon reported (see
-    /// [`live_orchestration_cwds_and_titles`]) — the uniqueness universe both
-    /// [`NewPaneFormState::suggest_orchestration_name`] and
+    /// fork#192 M1.0: the live orchestration `(cwd, title)` pairs the daemon
+    /// reported (see [`live_orchestration_cwds_and_titles`]) — the uniqueness
+    /// universe both [`NewPaneFormState::suggest_orchestration_name`] and
     /// [`NewPaneFormState::name_collision`] check against. Unlike
     /// `live_orchestration_in_same_cwd`, kept as the raw list rather than a
     /// pre-decided verdict: the typed Name changes every keystroke, so there is
@@ -1664,7 +1679,14 @@ struct NewPaneFormState {
     /// list every frame, which costs nothing (plain string compares, no
     /// filesystem). Empty (the `new` default) means "nothing known live" — the
     /// suggestion starts at `-orchestrator-1` and nothing is ever refused.
-    live_orchestration_names: Vec<String>,
+    ///
+    /// PRD fork#603: widened from a flat `Vec<String>` of titles to
+    /// `(cwd, title)` pairs — uniqueness is scoped to `(directory, name)`, not
+    /// name alone (fork#192's global-only rejection of per-directory scoping
+    /// was about a per-cwd *suggestion counter* sitting under global-only
+    /// *uniqueness*; it does not transfer to a compound uniqueness key, and is
+    /// superseded here rather than silently ignored — see the PRD).
+    live_orchestration_identities: Vec<(String, String)>,
     /// fork#192 review F4 / audit F7: whether the Name field still holds a
     /// value [`Self::suggest_name_if_orchestration_selected`] itself wrote (or the
     /// untouched construction-time pre-fill), as opposed to something the
@@ -1747,11 +1769,12 @@ impl NewPaneFormState {
             // cwds via `with_live_orchestration_cwds`; unattached means no
             // warning.
             live_orchestration_in_same_cwd: false,
-            // fork#192 M1.0: the caller attaches the daemon's live-orchestration
-            // titles via `with_live_orchestration_names`; unattached means
-            // nothing is known live, so the suggestion starts at
-            // `-orchestrator-1` and nothing is ever refused.
-            live_orchestration_names: Vec::new(),
+            // fork#192 M1.0 / fork#603: the caller attaches the daemon's
+            // live-orchestration `(cwd, title)` pairs via
+            // `with_live_orchestration_identities`; unattached means nothing
+            // is known live, so the suggestion starts at `-orchestrator-1`
+            // and nothing is ever refused.
+            live_orchestration_identities: Vec::new(),
             // fork#192 review F4 / audit F7: an untyped construction-time
             // value (the bare basename pre-fill) is fair game to overwrite
             // with the first suggestion.
@@ -1773,24 +1796,32 @@ impl NewPaneFormState {
         self
     }
 
-    /// fork#192 M1.0: attach the daemon's live-orchestration TITLES to the
-    /// form — the uniqueness universe [`Self::suggest_orchestration_name`] and
-    /// [`Self::name_collision`] check against. Mirrors
+    /// fork#192 M1.0 / fork#603: attach the daemon's live-orchestration
+    /// `(cwd, title)` pairs to the form — the uniqueness universe
+    /// [`Self::suggest_orchestration_name`] and [`Self::name_collision`]
+    /// check against, both scoped by [`cwd_matches`]. Mirrors
     /// [`Self::with_live_orchestration_cwds`]'s shape; unlike that one, the raw
     /// list is kept (not a pre-decided verdict) since the typed Name changes
     /// every keystroke — see the field doc.
-    fn with_live_orchestration_names(mut self, names: Vec<String>) -> Self {
-        self.live_orchestration_names = names;
+    fn with_live_orchestration_identities(mut self, identities: Vec<(String, String)>) -> Self {
+        self.live_orchestration_identities = identities;
         self
     }
 
-    /// fork#192 M1.0: the next free `<foldername>-orchestrator-N` for this
-    /// form's directory, skipping any `N` a live orchestration's title already
-    /// holds (see [`Self::live_orchestration_names`]). `N` is counted globally
-    /// over ALL live orchestrations, not per-directory — uniqueness is the
-    /// whole point of the name, and a per-cwd counter would offer
-    /// `-orchestrator-1` in two different directories at once (PRD decision,
-    /// not reopened here).
+    /// fork#192 M1.0 / fork#603: the next free `<foldername>-orchestrator-N`
+    /// for this form's directory, skipping any `N` a live orchestration's
+    /// title already holds IN THIS SAME DIRECTORY (see
+    /// [`Self::live_orchestration_identities`], filtered by [`cwd_matches`]).
+    /// `N` is counted per-directory, not globally: fork#192 originally
+    /// rejected a per-cwd counter because it sat under global-only *name*
+    /// uniqueness, where two directories' suggestions really could later
+    /// collide (e.g. after a rename). PRD fork#603 widens uniqueness itself
+    /// to the compound `(directory, name)` key, which supersedes that
+    /// concern rather than leaving it unaddressed — see the PRD's "Resolving
+    /// the prior rename collision decision" section. Under a per-directory
+    /// key, a global counter would be strictly worse: a brand-new directory
+    /// could be offered `-orchestrator-3` purely because an unrelated
+    /// directory happens to hold three live orchestrations.
     fn suggest_orchestration_name(&self) -> String {
         // fork#192 audit F1b: trim the basename before comparing — the sink
         // (`build_new_pane_request`) stores `form.name.trim()`, so an
@@ -1805,10 +1836,15 @@ impl NewPaneFormState {
         // fork#192 audit F5: a `HashSet` turns each membership check into
         // O(1) instead of an O(K) linear scan, making the whole suggestion
         // loop O(K) instead of O(K^2).
+        //
+        // PRD fork#603: filtered to entries whose `cwd` matches this form's
+        // directory before building the exclusion set — the suggestion
+        // counter is per-directory, matching the uniqueness key it feeds.
         let live: HashSet<&str> = self
-            .live_orchestration_names
+            .live_orchestration_identities
             .iter()
-            .map(String::as_str)
+            .filter(|(cwd, _)| cwd_matches(&self.dir, cwd))
+            .map(|(_, name)| name.as_str())
             .collect();
         // fork#192 review F14: bounded to `live.len() + 1` candidates rather
         // than an open `loop` — with K distinct live titles, at most K of
@@ -1888,8 +1924,12 @@ impl NewPaneFormState {
     /// both point at is that the gate must ultimately compare
     /// POST-`sanitize_marker_creator` values, not just post-trim ones.
     fn name_collision(&self) -> bool {
-        self.resolved_title()
-            .is_some_and(|t| self.live_orchestration_names.iter().any(|l| l == t.trim()))
+        self.resolved_title().is_some_and(|t| {
+            let t = t.trim();
+            self.live_orchestration_identities
+                .iter()
+                .any(|(cwd, name)| cwd_matches(&self.dir, cwd) && name == t)
+        })
     }
 
     /// PRD #140 M4.0: whether the form should render
@@ -1961,10 +2001,10 @@ impl NewPaneFormState {
             // PRD #140 M4.0: the locked schedule form can't select an
             // orchestration, so the same-cwd warning never applies to it.
             live_orchestration_in_same_cwd: false,
-            // fork#192 M1.0: the locked schedule form can't select an
-            // orchestration either, so there is never a name to suggest or
-            // collide.
-            live_orchestration_names: Vec::new(),
+            // fork#192 M1.0 / fork#603: the locked schedule form can't
+            // select an orchestration either, so there is never a name to
+            // suggest or collide.
+            live_orchestration_identities: Vec::new(),
             // fork#192 review F4 / audit F7: unreachable on a locked
             // schedule form (no orchestration to select), but the value
             // must still be set.
@@ -9220,14 +9260,18 @@ fn transition_after_dir_pick(ui: &mut UiState) {
             // yields no warning and suggests `-orchestrator-1`. The query is
             // skipped when the project offers no orchestration to select, so
             // the common plain-pane `Ctrl+n` costs no extra round-trip.
-            let (live_orch_cwds, live_orch_names) = if orchestrations.is_empty() {
-                (Vec::new(), Vec::new())
+            let live_orch_identities = if orchestrations.is_empty() {
+                Vec::new()
             } else {
                 live_orchestration_cwds_and_titles()
             };
+            let live_orch_cwds: Vec<String> = live_orch_identities
+                .iter()
+                .map(|(cwd, _)| cwd.clone())
+                .collect();
             NewPaneFormState::new(dir, name, command, modes, orchestrations)
                 .with_live_orchestration_cwds(live_orch_cwds)
-                .with_live_orchestration_names(live_orch_names)
+                .with_live_orchestration_identities(live_orch_identities)
         }
         // PRD #170: the picked dir is pre-seeded as the schedule's working_dir;
         // the Command field pre-fills from the resolved authoring command so a
@@ -11338,10 +11382,22 @@ fn dispatch_action(
                         )
                     };
                     let orchestration_claim_token = mint_orchestration_claim_token();
+                    // PRD fork#603: scope the claim to this orchestration's
+                    // own directory — canonicalize once here (the daemon-side
+                    // comparison stays a plain string equality), falling back
+                    // to the raw path on a canonicalize failure rather than
+                    // dropping the claim's directory scope entirely.
+                    let orchestration_claim_cwd = req
+                        .dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| req.dir.clone())
+                        .display()
+                        .to_string();
                     let claim_result = send_daemon_request_blocking_with_timeout(
                         &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
                             name: orchestration_claim_name.clone(),
                             token: orchestration_claim_token.clone(),
+                            cwd: Some(orchestration_claim_cwd),
                         },
                         DAEMON_REQUEST_TIMEOUT,
                     );
@@ -14256,11 +14312,19 @@ pub fn run_tui(
                                         )
                                     });
                                 let restore_claim_token = mint_orchestration_claim_token();
+                                // PRD fork#603: same canonicalize-then-fallback
+                                // treatment as the live spawn path, adapted for
+                                // `saved_pane.dir`'s `String` type.
+                                let restore_claim_cwd = std::path::Path::new(&saved_pane.dir)
+                                    .canonicalize()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|_| saved_pane.dir.clone());
                                 let restore_claimed = matches!(
                                     send_daemon_request_blocking_with_timeout(
                                         &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
                                             name: restore_claim_name.clone(),
                                             token: restore_claim_token.clone(),
+                                            cwd: Some(restore_claim_cwd),
                                         },
                                         DAEMON_REQUEST_TIMEOUT,
                                     ),
@@ -24820,10 +24884,10 @@ pub fn render_new_pane_orchestration_name_collision_to_buffer(
         Vec::new(),
         orchestrations,
     )
-    .with_live_orchestration_names(
+    .with_live_orchestration_identities(
         live_orchestration_names
             .iter()
-            .map(|n| (*n).to_string())
+            .map(|n| ("/work/collision-check".to_string(), (*n).to_string()))
             .collect(),
     );
     // Select the single orchestration option directly (bypassing
