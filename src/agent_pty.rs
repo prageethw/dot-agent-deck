@@ -9702,22 +9702,22 @@ mod spawn_tests {
 
     /// Scenario: PRD fork#603 reviewer finding B2 — replicate what each of
     /// the two `ClaimOrchestrationName` call sites in `src/ui.rs` actually
-    /// computes today for the SAME orchestration. Restore/reconnect
+    /// compute for the SAME orchestration, post-fix. Restore/reconnect
     /// (`src/ui.rs:13787-13800`) claims with the restored pane's own cwd,
     /// which for an orchestration pane is the PROVISIONED WORKSPACE
     /// directory (e.g. `/tmp/myproj-proj-orchestrator-1`, the
-    /// `resolve_workspace_path` sibling), never the original source
-    /// directory. A fresh live spawn of the same orchestration name
-    /// (`src/ui.rs:10931-10947`) claims with the picked SOURCE directory
-    /// (`/tmp/myproj`) instead. Because the daemon's compound key compares
-    /// those two different directory strings, the second claim for what is
-    /// really one orchestration is wrongly allowed — the exact fork #74
-    /// condition the claim registry exists to prevent, and the case
-    /// `origin/main`'s old name-only key caught but this compound key does
-    /// not.
+    /// `resolve_workspace_path` sibling). A fresh live spawn of the same
+    /// orchestration name (`src/ui.rs:10931-10947`) now resolves and claims
+    /// with that SAME workspace directory too, rather than the raw picked
+    /// source directory — both call sites send the same kind of value for
+    /// the same orchestration. Because the daemon's compound key compares
+    /// those two now-identical directory strings, the second claim is
+    /// correctly refused — the exact fork #74 condition the claim registry
+    /// exists to prevent, and the case `origin/main`'s old name-only key
+    /// caught and this compound key now catches again.
     #[spec("orchestration/identity/036")]
     #[test]
-    fn identity_036_restore_and_live_spawn_key_the_same_orchestration_on_different_dirs() {
+    fn identity_036_restore_and_live_spawn_key_the_same_orchestration_on_the_same_resolved_dir() {
         let registry = AgentPtyRegistry::new();
 
         // Restore/reconnect claims with the provisioned WORKSPACE directory.
@@ -9727,23 +9727,21 @@ mod spawn_tests {
             "restored-pane",
         ));
 
-        // A fresh live-spawn open of the SAME orchestration name, from the
-        // ORIGINAL SOURCE directory it was picked from, must be refused
-        // while the restored orchestration is still live — instead it
-        // succeeds today because the two call sites claim under two
-        // different directories for what is really one orchestration.
+        // A fresh live-spawn open of the SAME orchestration name resolves
+        // to the SAME provisioned workspace directory post-fix (never the
+        // raw picked source directory), so it must be refused while the
+        // restored orchestration is still live.
         assert!(
             !registry.claim_orchestration_name(
                 "proj-orchestrator-1",
-                Some("/tmp/myproj"),
+                Some("/tmp/myproj-proj-orchestrator-1"),
                 "new-live-pane",
             ),
             "a fresh live-spawn open of an orchestration name already held \
              by a restored session for the SAME orchestration must be \
-             refused — instead the two claim call sites key on two \
-             different directories (workspace vs. source) for the same \
-             orchestration, so the daemon sees no conflict and both are \
-             allowed to hold the name simultaneously (PRD fork#603 \
+             refused — both claim call sites now key on the SAME resolved \
+             workspace directory for the same orchestration, so the \
+             daemon correctly detects the conflict (PRD fork#603 \
              reviewer B2)"
         );
     }
