@@ -174,7 +174,12 @@ fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1()
     let (col, row) = deck.wait_for_in_grid("team-a");
     deck.click(col, row);
     deck.click(col, row); // double-click -> descend into team-a
-    let (col, row) = deck.wait_for_in_grid("proj");
+    // `"proj/"`, not bare `"proj"`: `render_dir_picker` (src/ui.rs) renders
+    // every row as `"{prefix}{name}/"` — the trailing slash is the picker's
+    // own literal text, which the SECOND open's `-orchestrator-1` tab label
+    // (no slash after "proj") can never match. See the second open below
+    // for the failure this closes.
+    let (col, row) = deck.wait_for_in_grid("proj/");
     deck.click(col, row);
     deck.click(col, row); // double-click -> descend into team-a/proj
     deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
@@ -195,7 +200,27 @@ fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1()
     let (col, row) = deck.wait_for_in_grid("team-b");
     deck.click(col, row);
     deck.click(col, row); // double-click -> descend into team-b
-    let (col, row) = deck.wait_for_in_grid("proj");
+    // Root cause of the original failure (PRD fork#603 / PR #604): a bare
+    // `wait_for_in_grid("proj")` here is ambiguous once the FIRST open's
+    // tab is live — the Dashboard's tab bar (row 0, always on screen behind
+    // the picker's popup, which starts at row 10 for the harness's default
+    // 120x40 PTY — `compute_frame_layout` reserves the tab bar as
+    // `Constraint::Length(1)` at the top of the frame, `render_dir_picker`
+    // centers its 60x20 popup below that) already shows the label
+    // `" proj-orchestrator-1 "`. `find_in_grid` scans top-to-bottom and
+    // returns the FIRST match, so it returns the TAB BAR's coordinates, not
+    // the picker's own `proj` row further down. The two "double" clicks
+    // then land outside every `picker_row_rects` entry; a miss inside the
+    // blocking `DirPicker` overlay is consumed rather than falling through
+    // (see the click-routing comment in `src/ui.rs`), so `current_dir`
+    // never advances past `team-b` and the following Space confirms `team-b`
+    // itself — a directory with no `.dot-agent-deck.toml`, hence no
+    // orchestration option, hence Right from "No mode" lands on the
+    // built-in `schedule` option and Name shows the raw, un-suggested
+    // `team-b` (exactly what the failing CI run showed). `"proj/"` is the
+    // picker row's own literal text (see the first open above) and cannot
+    // match the tab bar's `"proj-"`.
+    let (col, row) = deck.wait_for_in_grid("proj/");
     deck.click(col, row);
     deck.click(col, row); // double-click -> descend into team-b/proj
     deck.send_bytes(b" ");
