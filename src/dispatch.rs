@@ -303,8 +303,30 @@ pub async fn handle_dispatch(
     task: &str,
     shape: Option<&crate::event::DispatchShape>,
 ) -> DispatchResult {
-    let paths = derive_dispatch_paths(&ctx.working_dir, name);
-    let clone_dir = ctx.working_dir.clone();
+    // Fork issue #595 fix round 2 (reviewer F3): `ctx.working_dir` is the
+    // calling pane's own registered cwd — after this fix that can
+    // legitimately be a nested subdirectory of its repo's toplevel, since
+    // any pane already running inside a resolved isolated clone at a
+    // nested prefix now has one. Left unresolved, `derive_dispatch_paths`
+    // below places the new worktree as a sibling of that NESTED directory
+    // — a full clone materialised inside the calling pane's own working
+    // tree — the same defect class F1 fixed in `src/ui.rs`'s
+    // `Action::SpawnPane`, one level down. Resolve once, up front, exactly
+    // as that call site does, and thread the result through: the toplevel
+    // becomes the sibling base and the clone source, `relative_subpath`
+    // reproduces the calling pane's own position inside the dispatched
+    // worktree so the dispatched agent's cwd matches where the caller
+    // actually is rather than always landing at the worktree root.
+    let toplevel_resolution = crate::issue_dispatch_run::resolve_git_toplevel(&ctx.working_dir);
+    let resolved_working_dir = toplevel_resolution
+        .as_ref()
+        .map(|(toplevel, _)| toplevel.clone())
+        .unwrap_or_else(|| ctx.working_dir.clone());
+    let relative_subpath = toplevel_resolution
+        .map(|(_, prefix)| prefix)
+        .filter(|prefix| !prefix.as_os_str().is_empty());
+    let paths = derive_dispatch_paths(&resolved_working_dir, name);
+    let clone_dir = resolved_working_dir;
 
     // Resolve the shape from the CALLER's repo config, BEFORE any git work.
     //
@@ -637,11 +659,39 @@ pub async fn handle_dispatch(
         },
     );
 
+    // Fork issue #595 fix round 2: reproduce the calling pane's own
+    // position inside the freshly-provisioned worktree, mirroring
+    // `src/ui.rs`'s `provision_isolated_clone_or_status` existence check —
+    // a `git clone`/`git worktree add` only ever reproduces TRACKED
+    // content, so a `relative_subpath` that is gitignored, untracked, or
+    // simply empty (git tracks no empty directories) would otherwise hand
+    // the dispatched agent a nonexistent cwd silently.
+    let dispatch_working_dir = match relative_subpath.as_deref() {
+        Some(rel) => {
+            let joined = paths.worktree_dir.join(rel);
+            if !joined.is_dir() {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: {} was not found inside the provisioned worktree at {} — \
+                         the calling pane's own subdirectory may be untracked or excluded by \
+                         .gitignore",
+                        rel.display(),
+                        paths.worktree_dir.display(),
+                    ),
+                };
+            }
+            joined
+        }
+        None => paths.worktree_dir.clone(),
+    };
+
     let prompt = task.to_string();
 
     let req = SpawnRequest {
         task_name: format!("dispatch-{name}"),
-        working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
+        working_dir: dispatch_working_dir.to_string_lossy().into_owned(),
         // A real agent command, never `None` — see `resolve_single_agent_command`.
         // Ignored when the dispatch starts an orchestration (role commands win).
         command: Some(single_command),
@@ -1445,6 +1495,70 @@ mod tests {
         assert!(
             content.contains("## Your task") && content.contains("Verify PR #232"),
             "the caller's task must ride inside the context file:\n{content}"
+        );
+    }
+
+    /// Scenario: fork issue #595 fix round 2 (reviewer F3). `ctx.working_dir`
+    /// is the calling pane's own registered cwd, which — after the #595 fix
+    /// to `src/ui.rs` — can legitimately be a NESTED subdirectory of its
+    /// repo's toplevel (any pane already running inside a resolved isolated
+    /// clone at a nested prefix). Left unresolved, `derive_dispatch_paths`
+    /// placed the dispatched worktree as a sibling of that nested directory —
+    /// a full clone of the whole repo materialized INSIDE the calling pane's
+    /// own working tree, the same defect class F1 fixed in `src/ui.rs`'s
+    /// `Action::SpawnPane`, one level down. Dispatches from a nested working
+    /// dir and asserts the resulting worktree is a sibling of the repo
+    /// TOPLEVEL, not nested under it.
+    #[tokio::test]
+    async fn dispatch_from_a_nested_working_dir_places_the_worktree_outside_the_source_repo() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let nested = repo.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("marker.txt"), "hi\n").unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git available");
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "seed nested project"]);
+
+        // Same gate-stub as every other `handle_dispatch` test above: no live
+        // sibling, so the has_live_sibling gate takes its `Ok(false)` branch.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: nested.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-595".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "nested-unit-595", "task", None).await;
+        let worktree = result.worktree_dir.clone();
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(worktree.clone());
+
+        assert!(
+            !worktree.starts_with(&repo),
+            "reviewer F3: dispatching from a nested working_dir must place the worktree as a \
+             sibling of the repo TOPLEVEL, never nested inside the source repo's own working \
+             tree -- got {worktree:?} under {repo:?}"
         );
     }
 

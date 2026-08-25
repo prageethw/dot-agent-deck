@@ -9873,36 +9873,57 @@ fn commit_rename(
 type ProvisionedWorkspace = (String, Option<String>, Option<String>, Option<String>);
 
 fn provision_isolated_clone_or_status(
-    root_dir: &Path,
+    resolved_root_dir: &Path,
+    relative_subpath: Option<&Path>,
     worktree_path: &Path,
     branch: &str,
     creator: &str,
 ) -> Result<ProvisionedWorkspace, String> {
-    // Fork issue #595: `root_dir` may be a subdirectory of its git repo
-    // rather than the repo's own root (e.g. `.dot-agent-deck.toml` living at
-    // `<repo>/baseline/intent`) — `provision_isolated_clone_sync` below
-    // clones from the resolved git TOPLEVEL instead of `root_dir` itself
-    // (see `resolve_git_toplevel`'s doc comment for why), so the role
-    // panes' working directory inside the fresh/resumed clone must
-    // reproduce `root_dir`'s position relative to that same toplevel —
-    // `<worktree_path>/<relative-subpath>`, not `worktree_path` itself.
-    // Resolved independently here rather than threaded back through
-    // `IsolatedCloneOutcome`: it depends only on `root_dir`, which this
-    // function already has, and doing so keeps `IsolatedCloneOutcome`'s
-    // shape (and its other caller, `src/dispatch.rs`) unchanged. `None`
-    // both when `root_dir` already IS the toplevel and when `root_dir`
-    // isn't inside a git repository at all — the latter is pre-existing,
-    // unaffected behavior, so `worktree_path` unchanged is exactly right.
-    let relative_subpath = crate::issue_dispatch_run::resolve_git_toplevel(root_dir)
-        .map(|(_toplevel, prefix)| prefix)
-        .filter(|prefix| !prefix.as_os_str().is_empty());
-    let resolved_dir = |base: &Path| match relative_subpath.as_deref() {
-        Some(rel) => base.join(rel).display().to_string(),
-        None => base.display().to_string(),
+    // Fork issue #595 fix round 2: `resolved_root_dir` and
+    // `relative_subpath` are now resolved ONCE by the caller
+    // (`Action::SpawnPane`) and threaded through here rather than each
+    // re-derived independently in `ui.rs` and `issue_dispatch_run.rs`
+    // (reviewer F6 / auditor's TOCTOU note) — this function calls
+    // [`crate::issue_dispatch_run::provision_isolated_clone_sync_resolved`]
+    // directly, which does no `git rev-parse` of its own, so a launch pays
+    // exactly one such subprocess total rather than two.
+    //
+    // `relative_subpath` reproduces the picked directory's own position
+    // relative to the toplevel (`<worktree_path>/<relative-subpath>`, not
+    // `worktree_path` itself) — `None` both when the picked directory
+    // already IS the toplevel and when it isn't inside a git repository at
+    // all (pre-existing, unaffected behavior; `worktree_path` unchanged is
+    // exactly right).
+    //
+    // Fork issue #595 fix round 2 (reviewer F2 / auditor F3 second point):
+    // a `git clone`/`git worktree add` only ever reproduces TRACKED
+    // content, so if the picked subdirectory is gitignored, untracked, or
+    // simply empty (git tracks no empty directories), it is absent from
+    // the clone even though the clone itself succeeded. `resolved_dir`
+    // below now verifies the joined path actually exists before handing it
+    // to the caller, rather than silently returning a cwd role panes then
+    // fail to spawn into.
+    let resolved_dir = |base: &Path| -> Result<String, String> {
+        match relative_subpath {
+            Some(rel) => {
+                let joined = base.join(rel);
+                if !joined.is_dir() {
+                    return Err(format!(
+                        "Orchestration failed: {} was not found inside the provisioned \
+                         workspace at {} — the picked subdirectory may be untracked or \
+                         excluded by .gitignore",
+                        rel.display(),
+                        base.display(),
+                    ));
+                }
+                Ok(joined.display().to_string())
+            }
+            None => Ok(base.display().to_string()),
+        }
     };
 
-    match crate::issue_dispatch_run::provision_isolated_clone_sync(
-        root_dir,
+    match crate::issue_dispatch_run::provision_isolated_clone_sync_resolved(
+        resolved_root_dir,
         worktree_path,
         branch,
         creator,
@@ -9911,7 +9932,7 @@ fn provision_isolated_clone_or_status(
             marker_warning,
             origin_warning,
         }) => Ok((
-            resolved_dir(worktree_path),
+            resolved_dir(worktree_path)?,
             marker_warning,
             origin_warning,
             None,
@@ -9923,7 +9944,7 @@ fn provision_isolated_clone_or_status(
         // clone` step that already happened (or never needed to, this
         // time).
         Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { fetch_warning }) => {
-            Ok((resolved_dir(worktree_path), None, None, fetch_warning))
+            Ok((resolved_dir(worktree_path)?, None, None, fetch_warning))
         }
         // PRD fork#544 M3: `clone_dir` existed but failed the three-part
         // eligibility check plus health probe — name which of the four
@@ -10886,7 +10907,34 @@ fn dispatch_action(
                     // assigning one).
                     let creator = orchestration_creator_string(typed_name);
                     let segment = sanitize_workspace_segment(typed_name);
-                    let worktree_path = resolve_workspace_path(&req.dir, &segment);
+                    // Fork issue #595 fix round 2 (reviewer F1 BLOCKER):
+                    // resolve the git toplevel & `req.dir`'s relative
+                    // subpath ONCE, here, for this whole launch — and
+                    // derive the isolated-clone destination from the
+                    // TOPLEVEL, not from `req.dir` (the picked directory)
+                    // as `resolve_workspace_path` alone would. For a nested
+                    // pick (`.dot-agent-deck.toml` living at
+                    // `<repo>/baseline/intent`), keying the sibling off
+                    // `req.dir` placed a full clone of the whole repo
+                    // INSIDE the repo's own working tree
+                    // (`<repo>/baseline/intent-<segment>`) — explicitly
+                    // named as a risk in issue #595's own "Candidate
+                    // direction" section and reproduced end to end by both
+                    // the reviewer and the auditor. Keying off the toplevel
+                    // instead makes the clone a genuine sibling of the
+                    // repo, matching CLAUDE.md rule 18's `../<repo>-<suffix>`
+                    // convention everywhere else in this codebase.
+                    let toplevel_resolution =
+                        crate::issue_dispatch_run::resolve_git_toplevel(&req.dir);
+                    let resolved_root_dir: &Path = toplevel_resolution
+                        .as_ref()
+                        .map(|(toplevel, _)| toplevel.as_path())
+                        .unwrap_or(&req.dir);
+                    let relative_subpath: Option<&Path> = toplevel_resolution
+                        .as_ref()
+                        .map(|(_, prefix)| prefix.as_path())
+                        .filter(|prefix| !prefix.as_os_str().is_empty());
+                    let worktree_path = resolve_workspace_path(resolved_root_dir, &segment);
                     // Issue #164: `Some(raw error)` when
                     // `provision_isolated_clone_or_status` below created the
                     // worktree but its ownership marker write failed.
@@ -10907,7 +10955,8 @@ fn dispatch_action(
                     // they're kept apart from each other (see that
                     // function's doc comment).
                     let provision_result = provision_isolated_clone_or_status(
-                        &req.dir,
+                        resolved_root_dir,
+                        relative_subpath,
                         &worktree_path,
                         &segment,
                         &creator,
@@ -11221,6 +11270,24 @@ fn dispatch_action(
                                     // inside it lands there silently instead
                                     // of reaching the real remote.
                                     let mut warnings: Vec<String> = Vec::new();
+                                    // Fork issue #595 fix round 2 (auditor
+                                    // F2): the clone source is resolved to
+                                    // the git TOPLEVEL, which can differ
+                                    // from the picked directory — the
+                                    // common dotfiles-repo case is `$HOME`
+                                    // itself being a git repository, so a
+                                    // pick nested under it silently clones
+                                    // and points `origin` at that repo
+                                    // instead. One line converts that from
+                                    // a silent widening into an informed
+                                    // one.
+                                    if resolved_root_dir != req.dir.as_path() {
+                                        warnings.push(format!(
+                                            "cloned from {} (the git root of the picked \
+                                             directory)",
+                                            resolved_root_dir.display()
+                                        ));
+                                    }
                                     if let Some(error) = &worktree_origin_warning {
                                         warnings.push(format!(
                                             "this clone's `origin` could not be pointed at the \
@@ -37477,6 +37544,132 @@ mod tests {
              it IS the same directory, just opened under a different colliding Name), and gets \
              silently `Resumed` -- two live orchestrations then attach to the same \
              directory/branch concurrently. Got {second:?}"
+        );
+    }
+
+    /// Scenario: fork issue #595 fix round 2 (reviewer F1 BLOCKER / F4
+    /// MAJOR). Exercises `provision_isolated_clone_or_status` directly —
+    /// the function `Action::SpawnPane`'s orchestration branch actually
+    /// calls, and the half of the original fix no test covered. Builds a
+    /// real git repo with a project directory nested two levels down,
+    /// resolves its toplevel and relative subpath exactly as the
+    /// `SpawnPane` branch now does, and asserts: (1) the derived workspace
+    /// path is a SIBLING of the repo toplevel, never a path underneath the
+    /// source repo's own working tree (the issue's own reproduction shape,
+    /// and the reviewer's demonstrated blocker); and (2) the function's
+    /// returned directory string is `<worktree_path>/<relative subpath>`,
+    /// the picked directory's own position reproduced inside the clone —
+    /// not the workspace root.
+    #[spec("orchestration/workspace/033")]
+    #[test]
+    fn workspace_033_isolated_clone_workspace_lands_outside_source_repo_at_nested_prefix() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_git_repo(&repo);
+        let nested = repo.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ]);
+
+        let (toplevel, prefix) = crate::issue_dispatch_run::resolve_git_toplevel(&nested)
+            .expect("nested is inside a real git repo");
+        assert_eq!(
+            toplevel.canonicalize().expect("canonicalize toplevel"),
+            repo.canonicalize().expect("canonicalize repo"),
+            "setup: sanity -- the resolved toplevel must be the repo root"
+        );
+
+        // Mirrors `Action::SpawnPane`'s own derivation: the workspace is
+        // keyed off the resolved TOPLEVEL, not the picked (nested) dir.
+        let segment = sanitize_workspace_segment("features");
+        let worktree_path = resolve_workspace_path(&toplevel, &segment);
+        assert!(
+            !worktree_path.starts_with(&repo),
+            "reviewer F1 BLOCKER: the isolated-clone workspace must be a sibling of the repo \
+             TOPLEVEL, never a path nested underneath the source repo's own working tree -- \
+             got {worktree_path:?} under {repo:?}"
+        );
+
+        let result = provision_isolated_clone_or_status(
+            &toplevel,
+            Some(prefix.as_path()),
+            &worktree_path,
+            &segment,
+            "tester",
+        );
+        let (resolved_dir, ..) = result.expect("provisioning a genuine nested pick must succeed");
+        assert_eq!(
+            PathBuf::from(&resolved_dir),
+            worktree_path.join(&prefix),
+            "the resolved pane cwd must be the workspace joined with the picked directory's \
+             relative subpath, not the workspace root"
+        );
+        assert!(
+            PathBuf::from(&resolved_dir).is_dir(),
+            "the resolved pane cwd must actually exist in the clone, got {resolved_dir:?}"
+        );
+    }
+
+    /// Scenario: fork issue #595 fix round 2 (reviewer F2 MAJOR). A picked
+    /// project directory that is not tracked in the repository (never
+    /// added/committed) is absent from a fresh clone, since `git clone`
+    /// only ever reproduces tracked content. Asserts
+    /// `provision_isolated_clone_or_status` refuses the launch with a
+    /// clear error naming the missing subdirectory rather than reporting
+    /// success with a cwd that does not exist in the clone -- the same
+    /// "launch silently does nothing" symptom class issue #595 was
+    /// originally filed about, relocated one step later in the flow.
+    #[spec("orchestration/workspace/034")]
+    #[test]
+    fn workspace_034_isolated_clone_refuses_when_the_picked_subpath_is_not_tracked() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+        // Deliberately created but never `git add`ed/committed, so a fresh
+        // clone of `repo`'s HEAD will not contain it at all.
+        let untracked = repo.join("scratch").join("dir");
+        std::fs::create_dir_all(&untracked).expect("create untracked dir");
+
+        let (toplevel, prefix) = crate::issue_dispatch_run::resolve_git_toplevel(&untracked)
+            .expect("untracked dir is still inside a real git repo");
+        let segment = sanitize_workspace_segment("features");
+        let worktree_path = resolve_workspace_path(&toplevel, &segment);
+
+        let result = provision_isolated_clone_or_status(
+            &toplevel,
+            Some(prefix.as_path()),
+            &worktree_path,
+            &segment,
+            "tester",
+        );
+
+        let err = result.expect_err(
+            "an untracked picked subdirectory must be refused, not silently reported as \
+             success with a nonexistent cwd",
+        );
+        assert!(
+            err.contains("was not found"),
+            "the refusal message should explain the missing subdirectory, got: {err}"
         );
     }
 

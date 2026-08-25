@@ -4585,6 +4585,20 @@ without depending on the config struct API.
 - **Does not assert:** the ordinary DWIM path where the local branch already exists (already tracked correctly, uncovered by this bug); the adversarial ref-name case, already covered by `028`.
 - **Platform coverage:** mac+linux+windows, matching `020`.
 
+##### orchestration/workspace/033 — For a project directory nested inside its git repository, the isolated-clone workspace must be a sibling of the repo's TOPLEVEL and the resolved pane cwd must reproduce the picked directory's own position inside it (fork issue #595 fix round 2, reviewer F1 BLOCKER / F4 MAJOR: the original fix cloned from the resolved toplevel but still placed the destination as a sibling of the picked, nested directory, materializing a full clone of the repo inside the repo's own working tree — explicitly named as a risk in issue #595's own "Candidate direction" section).
+- **Layer:** L1 (in-process — real `git` subprocesses, exercising `provision_isolated_clone_or_status` directly, the function `Action::SpawnPane`'s orchestration branch actually calls).
+- **Agent:** none.
+- **Asserts:** for a project directory two levels below a real repo's toplevel, `resolve_workspace_path(&toplevel, &segment)` yields a path that is not nested under the repo (`!worktree_path.starts_with(&repo)`), and `provision_isolated_clone_or_status(&toplevel, Some(&prefix), &worktree_path, ...)` returns a resolved directory equal to `worktree_path.join(&prefix)` that actually exists on disk. GREEN: the isolated-clone destination is now derived from the resolved toplevel, not the picked directory.
+- **Does not assert:** the clone-source resolution itself, already covered by `issue_dispatch_run.rs`'s `resolve_git_toplevel_distinguishes_root_from_nested_subdirectory`; the repo-root (non-nested) case, unaffected by this fix and already covered elsewhere in this file.
+- **Platform coverage:** mac+linux+windows, matching `020`.
+
+##### orchestration/workspace/034 — A picked project directory that is not tracked in the repository (never added/committed) must refuse the launch with a clear error rather than report success with a pane cwd that does not exist in the clone (fork issue #595 fix round 2, reviewer F2 MAJOR: `git clone` only ever reproduces tracked content, so an untracked picked subdirectory is silently absent from a fresh clone and every role pane would otherwise spawn into a nonexistent cwd — the same "launch silently does nothing" symptom class issue #595 was originally filed about, relocated one step later in the flow).
+- **Layer:** L1 (in-process — real `git` subprocesses, exercising `provision_isolated_clone_or_status` directly).
+- **Agent:** none.
+- **Asserts:** picking a directory that exists on disk but was never `git add`ed/committed causes `provision_isolated_clone_or_status` to return `Err` naming the missing subdirectory, rather than `Ok` with a directory string that does not exist. GREEN: the resolved directory is now checked with `is_dir()` before being returned.
+- **Does not assert:** the ordinary tracked-subdirectory success path, already covered by `033`; a picked directory that is entirely absent from disk (not this bug's failure mode — the picked directory itself always exists; only its clone-side counterpart can be missing).
+- **Platform coverage:** mac+linux+windows, matching `020`.
+
 #### orchestration/remit
 
 ##### orchestration/remit/001 — A `Compacting` event on the orchestrator start-role pane re-delivers the remit pointer a second time (upstream issue #423).
