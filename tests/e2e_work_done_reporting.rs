@@ -402,18 +402,40 @@ fn run_work_done_cli_with_subject(
 /// `work_done_004`'s inline lookup above does — needed by both `006` and
 /// `007` to construct a legitimate `work-done` signal for a real CLI
 /// subprocess that never inherited a real spawn's environment.
+///
+/// Both callers invoke this immediately after a real `delegate` CLI call, and
+/// the `orch-deck` fixture sets no `clear` override on either role so it
+/// defaults to `true` — a delegate RESPAWNS the worker pane, exactly the race
+/// `wait_for_delegate_pointer` in `e2e_dispatcher_mode.rs` documents: the
+/// agent id that existed when the delegate was sent is dead by the time the
+/// respawn completes, and the registry briefly holds both the old and the new
+/// agent for one pane with `ListAgents` order unspecified (fork issue #513).
+/// So this re-resolves on every poll rather than caching, and only accepts a
+/// record once BOTH identity fields are populated — a mid-respawn record
+/// might carry one but not the other.
 fn worker_fail_closed_identity(deck: &TuiDeck, worker_pane: &str) -> (u64, String) {
-    let worker_record = common::agent_records_on(deck.attach_socket_path())
-        .into_iter()
-        .find(|r| r.pane_id_env.as_deref() == Some(worker_pane))
-        .expect("the worker pane must still be present in ListAgents");
-    let worker_boot_id = worker_record
-        .daemon_boot_id
-        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
-    let worker_generation = worker_record
-        .registration_generation
-        .expect("the worker pane must carry a registration_generation once registered as an orchestration role (fork issue #513)");
-    (worker_generation, worker_boot_id)
+    let identity = RefCell::new(None);
+    let found = common::wait_until(Duration::from_secs(30), || {
+        let Some(record) = common::agent_records_on(deck.attach_socket_path())
+            .into_iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(worker_pane))
+        else {
+            return false;
+        };
+        let (Some(boot_id), Some(generation)) =
+            (record.daemon_boot_id, record.registration_generation)
+        else {
+            return false;
+        };
+        *identity.borrow_mut() = Some((generation, boot_id));
+        true
+    });
+    assert!(
+        found,
+        "the worker pane must eventually reappear in ListAgents with a daemon_boot_id and \
+         registration_generation, post-respawn (fork issue #513)"
+    );
+    identity.into_inner().expect("wait_until returned true")
 }
 
 /// Scenario: Launch the real TUI and its lazy daemon, open the two-role `orch-deck` fixture, then run the REAL `dot-agent-deck delegate` CLI from the orchestrator's identity stating subject `#589`, followed by the REAL `dot-agent-deck work-done` CLI from the worker's identity echoing back a DIFFERENT subject `#544` — Problem 2's exact observed shape, a coherent report on the wrong subject. The rendered orchestration surface must visibly carry a subject-mismatch warning naming both subjects, and must still carry the ordinary completion pointer to the worker's summary file (a mismatch warning augments the notification; it does not replace or suppress it).
