@@ -112,6 +112,7 @@ impl SyntheticAgent {
             task: task.into(),
             to: to.iter().map(|r| r.to_string()).collect(),
             timestamp: chrono::Utc::now(),
+            subject: None,
         }
     }
 
@@ -142,6 +143,7 @@ impl SyntheticAgent {
             timestamp: chrono::Utc::now(),
             generation: 0,
             daemon_boot_id: String::new(),
+            subject: None,
         }
     }
 
