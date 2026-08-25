@@ -449,6 +449,7 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
@@ -718,6 +719,7 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
 
     // `handle_delegate` fans the dispatch out onto a `tokio::spawn`d task
@@ -847,6 +849,7 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
@@ -940,6 +943,7 @@ async fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt_inner() 
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
@@ -1018,6 +1022,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
@@ -1137,6 +1142,7 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
@@ -1211,6 +1217,7 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                subject: None,
             },
             &registry,
             &event_tx,
@@ -1275,6 +1282,7 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                subject: None,
             },
             &registry,
             &event_tx,
@@ -1530,6 +1538,7 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
         .await
         .handle_delegate(
             DelegateSignal {
+                subject: None,
                 pane_id: ORCH_PANE.to_string(),
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
@@ -1842,6 +1851,7 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
         .await
         .handle_delegate(
             DelegateSignal {
+                subject: None,
                 pane_id: ORCH_PANE.to_string(),
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
@@ -2444,6 +2454,7 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
         .await
         .handle_delegate(
             DelegateSignal {
+                subject: None,
                 pane_id: ORCH_PANE.to_string(),
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
@@ -2652,6 +2663,7 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
     state
         .handle_delegate(
             DelegateSignal {
+                subject: None,
                 pane_id: ORCH_PANE.to_string(),
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
@@ -2982,6 +2994,7 @@ impl SilentWorkerArm {
                     task: "List the files in the current directory.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    subject: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -3203,6 +3216,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
             state
                 .handle_delegate(
                     DelegateSignal {
+                        subject: None,
                         pane_id: ORCH_PANE.to_string(),
                         task: "Generation A must remain silent.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
@@ -3255,6 +3269,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
             state
                 .handle_delegate(
                     DelegateSignal {
+                        subject: None,
                         pane_id: ORCH_PANE.to_string(),
                         task: "Generation B must supersede A and remain silent.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
@@ -3435,6 +3450,7 @@ impl SilenceHarness {
                     task: "Perform the delegated silence-watch task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    subject: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -3476,6 +3492,7 @@ impl SilenceHarness {
                     task: "Perform the newer delegated silence-watch task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    subject: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -3743,6 +3760,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                             // `AppState.daemon_boot_id()`, same reasoning as
                             // `generation` above — the compound key needs both.
                             daemon_boot_id: harness.state.daemon_boot_id().to_string(),
+                            subject: None,
                         },
                         &harness.registry,
                     )
@@ -3777,6 +3795,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                         generation: 1,
                         // Fork #358 M4: see the first signal in this test.
                         daemon_boot_id: harness.state.daemon_boot_id().to_string(),
+                        subject: None,
                     },
                     &harness.registry,
                 )
@@ -3791,6 +3810,332 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                 snapshot_has_silence_notice(&notice),
                 "stale work-done cancelled the newer delegation's no-event watch: {:?}",
                 String::from_utf8_lossy(&notice)
+            );
+        });
+}
+
+/// Scenario: Delegate with `--subject #586`, then report `work-done` with a
+/// worker-echoed `--subject` that disagrees and carries a control/ESC byte
+/// plus frame-breaking brackets — the exact channel reviewer B1/auditor A1
+/// traced from `--subject` through to the orchestrator's live pane on the
+/// normal `Filed` delivery path. Assert the raw hostile bytes never reach the
+/// pane. A second cycle repeats this with an oversized echoed subject and
+/// asserts it is capped, not typed in full as one giant synthetic paste.
+#[test]
+#[cfg(unix)]
+fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build subject-mismatch-sanitization runtime")
+        .block_on(async {
+            // Control/ESC byte + frame-breaking brackets, on the WORKER's own
+            // echoed subject — the more hostile of the two sides, since a
+            // worker's `work-done --subject` is free text under the worker's
+            // control, unlike the orchestrator's own `delegate --subject`.
+            {
+                let harness = SilenceHarness::new(64).await;
+                harness
+                    .state
+                    .handle_delegate(
+                        DelegateSignal {
+                            pane_id: ORCH_PANE.to_string(),
+                            task: "Perform the delegated subject-mismatch task.".to_string(),
+                            to: vec![WORKER_ROLE.to_string()],
+                            timestamp: chrono::Utc::now(),
+                            subject: Some("#586".to_string()),
+                        },
+                        &harness.registry,
+                        &harness.event_tx,
+                    )
+                    .await;
+                let delivered = wait_for_snapshot_needle(
+                    &harness.registry,
+                    &harness.worker_agent_id,
+                    POINTER,
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(
+                    snapshot_contains(&delivered, POINTER),
+                    "precondition failed: worker never received the delegate pointer: {:?}",
+                    String::from_utf8_lossy(&delivered)
+                );
+
+                let hostile_echo = "#123\u{1B}[2J\u{1B}[31mFAKE-PROMPT]<script>";
+                harness
+                    .state
+                    .handle_work_done(
+                        WorkDoneSignal {
+                            pane_id: WORKER_PANE.to_string(),
+                            task: "Completed the delegated task.".to_string(),
+                            done: false,
+                            timestamp: chrono::Utc::now(),
+                            generation: 1,
+                            daemon_boot_id: harness.state.daemon_boot_id().to_string(),
+                            subject: Some(hostile_echo.to_string()),
+                        },
+                        &harness.registry,
+                    )
+                    .await;
+
+                // S8: poll for a needle emitted AFTER the worker-controlled
+                // `echoed` value in the warning sentence, not "SUBJECT
+                // MISMATCH" itself (emitted BEFORE it) — a snapshot caught
+                // mid-write could otherwise satisfy the earlier needle while
+                // the untrusted text is still partially written, passing
+                // vacuously in the direction that would hide a real
+                // sanitization regression.
+                let snapshot = wait_for_snapshot_needle(
+                    &harness.registry,
+                    &harness.orchestrator_agent_id,
+                    b"for their full report.",
+                    Duration::from_secs(2),
+                )
+                .await;
+                let text = String::from_utf8_lossy(&snapshot);
+                assert!(
+                    text.contains("SUBJECT MISMATCH"),
+                    "precondition failed: the mismatch warning never reached the orchestrator \
+                     pane: {text:?}"
+                );
+                assert!(
+                    !snapshot.contains(&0x1Bu8),
+                    "the raw ESC byte from the worker's echoed subject must never reach the \
+                     live orchestrator pane: {text:?}"
+                );
+                // S7: scope the bracket check to just the warning span, not
+                // the whole rendered pane — the full snapshot can legitimately
+                // carry other content, and this assertion must not pass
+                // merely because nothing ELSE on the pane happens to contain
+                // a bracket.
+                let warning_start = text
+                    .find("SUBJECT MISMATCH")
+                    .expect("precondition already confirmed this needle is present");
+                let warning_end = text[warning_start..]
+                    .find("for their full report.")
+                    .map(|offset| warning_start + offset)
+                    .unwrap_or(text.len());
+                let warning_span = &text[warning_start..warning_end];
+                for forbidden in ['[', ']', '<', '>'] {
+                    assert!(
+                        !warning_span.contains(forbidden),
+                        "frame-breaking character {forbidden:?} from the hostile subject must \
+                         be stripped before reaching the pane: {warning_span:?}"
+                    );
+                }
+                assert!(
+                    warning_span.contains("FAKE-PROMPT") && warning_span.contains("script"),
+                    "sanitization strips structural characters, not the surrounding words - the \
+                     harmless remainder must still be visible: {warning_span:?}"
+                );
+            }
+
+            // An oversized echoed subject (either side) must be capped,
+            // mirroring `quote_untrusted_report`'s bound on the sibling
+            // report-body sink one function away.
+            {
+                let harness = SilenceHarness::new(64).await;
+                harness
+                    .state
+                    .handle_delegate(
+                        DelegateSignal {
+                            pane_id: ORCH_PANE.to_string(),
+                            task: "Perform the delegated subject-mismatch task.".to_string(),
+                            to: vec![WORKER_ROLE.to_string()],
+                            timestamp: chrono::Utc::now(),
+                            subject: Some("#586".to_string()),
+                        },
+                        &harness.registry,
+                        &harness.event_tx,
+                    )
+                    .await;
+                let delivered = wait_for_snapshot_needle(
+                    &harness.registry,
+                    &harness.worker_agent_id,
+                    POINTER,
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(
+                    snapshot_contains(&delivered, POINTER),
+                    "precondition failed: worker never received the delegate pointer: {:?}",
+                    String::from_utf8_lossy(&delivered)
+                );
+
+                // Mirrors `state::MAX_SUBJECT_CHARS`, private to that module.
+                const MAX_SUBJECT_CHARS: usize = 200;
+                let oversized_echo = "y".repeat(MAX_SUBJECT_CHARS * 3);
+                harness
+                    .state
+                    .handle_work_done(
+                        WorkDoneSignal {
+                            pane_id: WORKER_PANE.to_string(),
+                            task: "Completed the delegated task.".to_string(),
+                            done: false,
+                            timestamp: chrono::Utc::now(),
+                            generation: 1,
+                            daemon_boot_id: harness.state.daemon_boot_id().to_string(),
+                            subject: Some(oversized_echo),
+                        },
+                        &harness.registry,
+                    )
+                    .await;
+
+                // S8: same reasoning as the first cycle — poll for a needle
+                // emitted AFTER the untrusted echoed subject, not before it.
+                let snapshot = wait_for_snapshot_needle(
+                    &harness.registry,
+                    &harness.orchestrator_agent_id,
+                    b"for their full report.",
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(
+                    snapshot_contains(&snapshot, b"SUBJECT MISMATCH"),
+                    "precondition failed: the mismatch warning never reached the orchestrator \
+                     pane: {:?}",
+                    String::from_utf8_lossy(&snapshot)
+                );
+                // Count the longest CONTIGUOUS run of 'y', not every 'y' byte in the
+                // snapshot: the daemon's own fixed warning prose ("Verify the report's
+                // actual content...") contributes an unrelated, isolated 'y' that a
+                // total count would wrongly fold into the capped subject's budget.
+                let text = String::from_utf8_lossy(&snapshot);
+                let longest_y_run = text
+                    .split(|c: char| c != 'y')
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    longest_y_run <= MAX_SUBJECT_CHARS,
+                    "an oversized echoed subject must be capped before it reaches the pane, not \
+                     typed in full as one giant synthetic paste: longest run of {longest_y_run} \
+                     'y' bytes found"
+                );
+                assert!(
+                    longest_y_run > 0,
+                    "the capped subject must still be visible, just bounded: longest run of \
+                     {longest_y_run} 'y' bytes found"
+                );
+            }
+        });
+}
+
+/// Scenario: Delegate with a HOSTILE `--subject` — the ORCHESTRATOR-supplied,
+/// delegated side, not the worker-echoed side every other subject fixture in
+/// this file hostiles. Issue #586 M4 fix round (H7): the sanitize-once
+/// redesign moved the delegated side's neutralization onto ONE line in
+/// `handle_delegate`'s fan-out (`sanitize_subject_tag(signal.subject)`), and
+/// every subject fixture in this repo puts hostile content on the echoed
+/// side only — reverting that one line to `signal.subject.clone()` would
+/// leave the whole suite green while raw ESC/frame-breaking text reached the
+/// worker's task file, and the live PTY it renders into, again. Assert the
+/// worker's task file footer carries the sanitized remainder, not the raw
+/// bytes.
+#[test]
+#[cfg(unix)]
+fn delegate_hostile_delegated_subject_is_sanitized_before_reaching_worker_task_file() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build delegated-subject-sanitization runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+
+            let hostile_subject = "#586\u{001B}[2J\u{1B}[31mFAKE-PROMPT]<script>";
+            harness
+                .state
+                .handle_delegate(
+                    DelegateSignal {
+                        pane_id: ORCH_PANE.to_string(),
+                        task: "Perform the delegated subject-sanitization task.".to_string(),
+                        to: vec![WORKER_ROLE.to_string()],
+                        timestamp: chrono::Utc::now(),
+                        subject: Some(hostile_subject.to_string()),
+                    },
+                    &harness.registry,
+                    &harness.event_tx,
+                )
+                .await;
+            let delivered = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.worker_agent_id,
+                POINTER,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&delivered, POINTER),
+                "precondition failed: worker never received the delegate pointer: {:?}",
+                String::from_utf8_lossy(&delivered)
+            );
+
+            // The task file is written asynchronously by the same fan-out
+            // that delivered the pointer above; poll it rather than assuming
+            // it is already on disk.
+            let task_file = std::path::Path::new(&harness.cwd_str)
+                .join(".dot-agent-deck")
+                .join("worker-task-coder.md");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let file_body = loop {
+                if let Ok(s) = std::fs::read_to_string(&task_file)
+                    && s.contains("--subject")
+                {
+                    break s;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("worker task file never carried a --subject flag: {task_file:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+
+            assert!(
+                !file_body.contains(0x1B as char),
+                "the raw ESC byte from the delegated subject must never reach the worker's \
+                 task file: {file_body:?}"
+            );
+
+            // Scope the frame-breaking-character check to just the rendered
+            // `--subject '...'` argument, not the whole file: the footer's
+            // OWN template prose legitimately contains `<` and `>` (e.g.
+            // `<summary-slug>`), so checking the whole body would false-
+            // positive on text that has nothing to do with the hostile
+            // subject.
+            let subject_start = file_body
+                .find("--subject '")
+                .map(|i| i + "--subject '".len())
+                .expect("precondition already confirmed --subject is present");
+            let subject_end = file_body[subject_start..]
+                .find('\'')
+                .map(|offset| subject_start + offset)
+                .expect("the rendered --subject argument must close with a matching quote");
+            let subject_span = &file_body[subject_start..subject_end];
+            for forbidden in ['[', ']', '<', '>'] {
+                assert!(
+                    !subject_span.contains(forbidden),
+                    "frame-breaking character {forbidden:?} from the delegated subject must be \
+                     stripped before reaching the worker's task file: {subject_span:?}"
+                );
+            }
+            assert!(
+                subject_span.contains("FAKE-PROMPT") && subject_span.contains("script"),
+                "sanitization strips structural characters, not the surrounding words - the \
+                 harmless remainder must still be visible: {subject_span:?}"
             );
         });
 }
@@ -4140,7 +4485,7 @@ fn delegate_031_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
             // this test asserts on.
             for pane in ["collision-coder-a", "collision-coder-b"] {
                 assert!(
-                    registry.arm_delegation_commission(pane, "collision-orch"),
+                    registry.arm_delegation_commission(pane, "collision-orch", None),
                     "arm a commission for {pane} so its work-done is Solicited"
                 );
             }
@@ -4154,6 +4499,7 @@ fn delegate_031_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         timestamp: chrono::Utc::now(),
                         generation: 1,
                         daemon_boot_id: state.daemon_boot_id().to_string(),
+                        subject: None,
                     },
                     &registry,
                 )
@@ -4167,6 +4513,7 @@ fn delegate_031_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         timestamp: chrono::Utc::now(),
                         generation: 1,
                         daemon_boot_id: state.daemon_boot_id().to_string(),
+                        subject: None,
                     },
                     &registry,
                 )
@@ -4321,7 +4668,7 @@ async fn run_two_work_done_calls(
     // be nothing on disk for either the survival check or the collision
     // mechanism under test to observe.
     assert!(
-        registry.arm_delegation_commission(&worker_pane, &orch_pane),
+        registry.arm_delegation_commission(&worker_pane, &orch_pane, None),
         "{label}: arm the commission for the first work-done"
     );
     state
@@ -4333,6 +4680,7 @@ async fn run_two_work_done_calls(
                 timestamp: chrono::Utc::now(),
                 generation: 1,
                 daemon_boot_id: state.daemon_boot_id().to_string(),
+                subject: None,
             },
             &registry,
         )
@@ -4362,7 +4710,7 @@ async fn run_two_work_done_calls(
     }
 
     assert!(
-        registry.arm_delegation_commission(&worker_pane, &orch_pane),
+        registry.arm_delegation_commission(&worker_pane, &orch_pane, None),
         "{label}: arm the commission for the second work-done"
     );
     state
@@ -4374,6 +4722,7 @@ async fn run_two_work_done_calls(
                 timestamp: chrono::Utc::now(),
                 generation: 1,
                 daemon_boot_id: state.daemon_boot_id().to_string(),
+                subject: None,
             },
             &registry,
         )
@@ -4483,7 +4832,7 @@ fn delegate_034_third_collision_destroys_the_first_archived_report() {
                 // each of the three calls needs its own armed commission to stand
                 // in for a genuine re-delegation to this same worker pane.
                 assert!(
-                    registry.arm_delegation_commission("triple-coder", "triple-orch"),
+                    registry.arm_delegation_commission("triple-coder", "triple-orch", None),
                     "arm a commission for {report}"
                 );
                 state
@@ -4495,6 +4844,7 @@ fn delegate_034_third_collision_destroys_the_first_archived_report() {
                             timestamp: chrono::Utc::now(),
                             generation: 1,
                             daemon_boot_id: state.daemon_boot_id().to_string(),
+                            subject: None,
                         },
                         &registry,
                     )

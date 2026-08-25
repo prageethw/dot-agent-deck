@@ -94,7 +94,6 @@ use crate::worktree_owner::{OWNER_MARKER_FILENAME, path_from_bytes, trim_trailin
 /// ever carried v3's `"isolated_clone"`).
 pub const SCHEMA_VERSION: u32 = 4;
 
-
 /// The name of fork#325 M4b's isolated-clone-specific provenance artifact,
 /// and the sub-directory name it is written under. Written by
 /// `provision_isolated_clone_sync` at

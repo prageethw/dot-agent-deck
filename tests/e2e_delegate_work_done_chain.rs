@@ -182,6 +182,7 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
             .to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
@@ -431,6 +432,7 @@ async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inne
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        subject: None,
     };
     daemon
         .state
