@@ -316,13 +316,12 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
 
 // --- PRD #586 M4: `--subject` echo + mismatch warning (Problem 2) ---------
 //
-// Neither `delegate` nor `work-done` recognizes `--subject` yet — this is the
-// RED round the M4 implementation task is written against. The two tests
-// below are written as if the flag already existed; until it lands, the
-// first `assert!(...status.success()...)` each hits is expected to fail on a
-// clap "unrecognized argument" runtime error rather than a compile error,
-// since the flag is passed as a subprocess argument rather than referenced
-// from Rust source.
+// `--subject` has existed on both `delegate` and `work-done` since PRD #586
+// M4 landed in PR #593. The two tests below exercise the real CLI end to
+// end: `run_delegate_cli_with_subject`/`run_work_done_cli_with_subject`
+// invoke the actual subprocess argument, so a regression that dropped the
+// flag would fail here on a clap "unrecognized argument" runtime error
+// rather than a compile error.
 
 /// Subject the orchestrator states when arming the delegation below — PRD
 /// #586 M4's `--subject` flag on `dot-agent-deck delegate`.
@@ -472,8 +471,8 @@ fn work_done_006_subject_mismatch_produces_a_visible_warning_in_the_attached_tui
     );
     assert!(
         delegate_output.status.success(),
-        "`delegate --subject {DELEGATED_SUBJECT}` exited {:?} — PRD #586 M4's `--subject` \
-         flag does not exist on the `Delegate` CLI yet\nstdout: {}\nstderr: {}",
+        "`delegate --subject {DELEGATED_SUBJECT}` exited {:?} — expected `--subject` to be \
+         accepted by the `Delegate` CLI\nstdout: {}\nstderr: {}",
         delegate_output.status.code(),
         String::from_utf8_lossy(&delegate_output.stdout),
         String::from_utf8_lossy(&delegate_output.stderr)
@@ -499,8 +498,8 @@ fn work_done_006_subject_mismatch_produces_a_visible_warning_in_the_attached_tui
     );
     assert!(
         work_done_output.status.success(),
-        "`work-done --subject {REPORTED_SUBJECT}` exited {:?} — PRD #586 M4's `--subject` \
-         flag does not exist on the `WorkDone` CLI yet\nstdout: {}\nstderr: {}",
+        "`work-done --subject {REPORTED_SUBJECT}` exited {:?} — expected `--subject` to be \
+         accepted by the `WorkDone` CLI\nstdout: {}\nstderr: {}",
         work_done_output.status.code(),
         String::from_utf8_lossy(&work_done_output.stdout),
         String::from_utf8_lossy(&work_done_output.stderr)
@@ -586,8 +585,8 @@ fn work_done_007_matching_subjects_produce_no_mismatch_warning() {
     );
     assert!(
         delegate_output.status.success(),
-        "`delegate --subject {SAME_SUBJECT}` exited {:?} — PRD #586 M4's `--subject` flag \
-         does not exist on the `Delegate` CLI yet\nstdout: {}\nstderr: {}",
+        "`delegate --subject {SAME_SUBJECT}` exited {:?} — expected `--subject` to be \
+         accepted by the `Delegate` CLI\nstdout: {}\nstderr: {}",
         delegate_output.status.code(),
         String::from_utf8_lossy(&delegate_output.stdout),
         String::from_utf8_lossy(&delegate_output.stderr)
@@ -607,8 +606,8 @@ fn work_done_007_matching_subjects_produce_no_mismatch_warning() {
     );
     assert!(
         work_done_output.status.success(),
-        "`work-done --subject {SAME_SUBJECT}` exited {:?} — PRD #586 M4's `--subject` flag \
-         does not exist on the `WorkDone` CLI yet\nstdout: {}\nstderr: {}",
+        "`work-done --subject {SAME_SUBJECT}` exited {:?} — expected `--subject` to be \
+         accepted by the `WorkDone` CLI\nstdout: {}\nstderr: {}",
         work_done_output.status.code(),
         String::from_utf8_lossy(&work_done_output.stdout),
         String::from_utf8_lossy(&work_done_output.stderr)

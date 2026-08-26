@@ -1705,21 +1705,33 @@ fn work_done_footer(role: &str, subject: Option<&str>) -> String {
     // subject is sanitized on the ingest side. This is a display-AND-shell
     // sink, since both example commands below are rendered into a ```bash
     // fence the footer's own prose tells the worker to execute: single-quote
-    // the value and strip any `'` it contains, the same idiom already used on
-    // this exact sink for `--task-file`'s path argument (see
-    // `work_done_footer_path_is_shell_quotable`). A single-quoted shell
-    // string cannot be escaped from inside, so stripping the one character
-    // that could close it early is sufficient.
+    // the value and strip any `'` it contains. `--task-file`'s path argument,
+    // on this exact sink, uses a different and strictly stronger defense
+    // instead — an ASCII allowlist plus a digest (see `role_path_slug`,
+    // `work_done_footer_path_is_shell_quotable`) — not this quote-and-strip
+    // idiom. A single-quoted shell string cannot be escaped from inside, so
+    // stripping the one character that could close it early is sufficient
+    // for `--subject`.
     //
     // Issue #586 M4 fix round 5 (H6/A19): `.replace('\'', "")` below is now
-    // a documented no-op — `sanitize_subject_tag` already strips `'` (and
-    // `` ` ``) at the canonicalization point, so `subject` never carries one
-    // by the time it gets here. Left in place as cheap defense-in-depth
-    // rather than removed, unlike the render-side sanitize round 4 removed
-    // elsewhere: keeping it costs nothing and guards against a future caller
-    // that bypasses `sanitize_subject_tag`.
+    // a documented no-op on the production path — `sanitize_subject_tag`
+    // already strips `'` (and `` ` ``) at the canonicalization point, so
+    // `subject` never carries one by the time it gets here. Left in place as
+    // cheap defense-in-depth rather than removed, unlike the render-side
+    // sanitize round 4 removed elsewhere: keeping it costs nothing and
+    // guards against a future caller that bypasses `sanitize_subject_tag`.
+    //
+    // Issue #598 (A18): `sanitize_subject_tag` itself is applied here too,
+    // not only the `'`/`` ` `` strip — `compose_worker_task_file` requires a
+    // canonical `subject`, but `sanitize_subject_tag` is `pub(crate)`, so an
+    // external caller has no way to satisfy that invariant on its own. This
+    // is a provable no-op on the production path (the only caller already
+    // passes a canonical value) and a real defense for any future one.
     let subject_flag = match subject {
-        Some(value) => format!(" --subject '{}'", value.replace('\'', "")),
+        Some(value) => format!(
+            " --subject '{}'",
+            sanitize_subject_tag(value).replace('\'', "")
+        ),
         None => String::new(),
     };
     format!(
@@ -3407,6 +3419,11 @@ fn settle_silence_report_payload_record(
 /// path is role-interpolated, via [`role_path_slug`]'s readable-slug-plus-digest
 /// form, so two workers sharing a cwd are not handed the same report path (see
 /// [`work_done_footer`] for the exact strength of that claim).
+///
+/// Issue #598 (A18): `subject`, when present, must already be canonical —
+/// i.e. already passed through [`sanitize_subject_tag`] — the same
+/// requirement [`work_done_footer`] documents at its own call site, which
+/// now also defends against a non-canonical value reaching it.
 pub fn compose_worker_task_file(
     prompt_template: Option<&str>,
     task: &str,
@@ -7165,13 +7182,12 @@ impl AppState {
             // exactly once, HERE, at the point it first enters the system —
             // not at render time (`work_done_footer`) and not again when
             // comparing against the worker's echo (`retire_delegation_commission`).
-            // `sanitize_subject_tag` is not idempotent for every input (a
-            // frame-breaking character surrounded by spaces can collapse
-            // differently depending on how many times it's applied), so
-            // sanitizing more than once on the same value can produce a
-            // false SUBJECT MISMATCH for a worker that echoed back exactly
-            // what the footer showed it. This canonical value is threaded to
-            // both consumers below instead of the raw one.
+            // Sanitize exactly once, at the point of ingest: `sanitize_subject_tag`
+            // is the single source of truth for what "canonical" means, and
+            // every downstream consumer must treat its output as already
+            // canonical rather than re-deriving it independently. This
+            // canonical value is threaded to both consumers below instead of
+            // the raw one.
             let subject = signal.subject.as_deref().map(sanitize_subject_tag);
             let cwd = self.pane_cwd_map.get(&pane_id).cloned();
 
@@ -10138,6 +10154,20 @@ mod tests {
             sanitize_subject_tag(&oversized).chars().count(),
             MAX_SUBJECT_CHARS,
             "an oversized subject must be capped at MAX_SUBJECT_CHARS"
+        );
+    }
+
+    /// Issue #598 (N9/A23): fix round 5 (H6/A19) added a backtick strip to
+    /// `sanitize_subject_tag` alongside the apostrophe strip, but only the
+    /// apostrophe half was ever pinned by a test — reverting just the
+    /// backtick character-class member left the whole suite green.
+    #[test]
+    fn sanitize_subject_tag_strips_backtick() {
+        assert_eq!(
+            sanitize_subject_tag("`rm -rf /`#586"),
+            "rm -rf /#586",
+            "a backtick must be stripped, matching the apostrophe strip added \
+             in the same fix round"
         );
     }
 
