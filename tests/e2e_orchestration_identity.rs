@@ -318,6 +318,23 @@ fn wait_for_sibling_workspace_count(
     last.into_inner()
 }
 
+/// The deck's tab-bar row — always row 0 of the rendered grid regardless of
+/// which overlay (the New Pane form, the directory picker) is drawn beneath
+/// it; `identity_033`'s own comment above establishes why (the picker's
+/// popup starts at row 10, while `compute_frame_layout` in `src/ui.rs`
+/// reserves the tab bar as a fixed `Constraint::Length(1)` at the very top
+/// of the frame). Restricting a `LABEL` search to this one line, rather than
+/// the whole grid, is what turns a wait on it into a genuine barrier in
+/// `identity_037` below: the New Pane form's own pre-filled Name field
+/// supplies the SAME `LABEL` text the moment the Orchestration mode chip is
+/// selected — well before the submit keystroke is even processed, let alone
+/// before the daemon has decided whether to grant or refuse the claim — but
+/// that field lives inside the popup and can never reach row 0. A match here
+/// can only come from a real tab.
+fn tab_bar_line(grid: &str) -> &str {
+    grid.lines().next().unwrap_or("")
+}
+
 /// Scenario: PRD fork#603's accepted fix (PR #604) keys the claim/comparison
 /// layer on the FULL resolved directory (toplevel + segment + relative
 /// subpath), which is enough to let `team-a/proj` and `team-b/proj` both
@@ -337,7 +354,10 @@ fn wait_for_sibling_workspace_count(
 /// and `<clone>/team-b/proj`) as real, distinct, populated directories —
 /// i.e. each orchestration is genuinely working in the subdirectory it was
 /// opened against, not silently aliased to or missing in favor of the
-/// other, even though they share one parent clone.
+/// other, even though they share one parent clone. The second open's claim
+/// is confirmed genuinely granted (not silently refused while stale
+/// filesystem state from the shared clone happens to look right anyway) by
+/// waiting on the tab-bar row specifically, rather than the whole grid.
 #[spec("orchestration/identity/037")]
 #[test]
 fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_working_subdirectory()
@@ -451,8 +471,30 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     deck.send_bytes(b"\x1b[C");
     deck.send_bytes(b"\r");
     deck.send_bytes(b"\r"); // submit the suggested name, unedited
+
+    // PRD fork#603 auditor (final verification pass): a whole-grid
+    // `g.matches(LABEL).count() >= 2` here is vacuous — it is satisfied the
+    // instant the SECOND form's own Name field pre-fills with the identical
+    // `LABEL` text (fork#192 review F7's same trap, here because both
+    // suggestions are meant to be identical rather than incidentally so, so
+    // there is no distinctly-numbered `second_label` to fall back on the way
+    // `identity_013` does), well before the submit keystroke above is even
+    // processed, let alone before the daemon has decided whether to grant or
+    // refuse the second claim. It therefore cannot distinguish "the second
+    // claim was granted" from "the second open was silently refused (the
+    // daemon's `ClaimOrchestrationName` handler in `src/daemon_protocol.rs`
+    // returns `orchestration name {name:?} is already held`, and the New
+    // Pane form stays open showing `Orchestration failed: ...`) while tab
+    // 1's own real label plus tab 2's still-open form happen to add up to
+    // two matches anyway". Scoping the match to `tab_bar_line` (row 0 only,
+    // defined above) closes that gap: the form's popup starts at row 10, so
+    // a match on row 0 can only come from a real tab-bar entry, and a
+    // refused second claim leaves row 0 showing exactly ONE `LABEL`
+    // occurrence forever — timing this wait out (with the daemon's refusal
+    // text captured in the panic's own final-grid dump) instead of passing
+    // vacuously.
     deck.wait_until_grid("both orchestration tabs labeled -orchestrator-1", |g| {
-        g.matches(LABEL).count() >= 2
+        tab_bar_line(g).matches(LABEL).count() >= 2
     });
 
     // The accepted PRD fork#603 design fixes the CLAIM/comparison layer
@@ -462,13 +504,14 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     // original "must not share one physical workspace" framing predicted
     // as a bug; it is now the accepted, documented boundary of the fix.
     //
-    // Same reasoning as `after_first` above: the `wait_until_grid` predicate
-    // above can itself be satisfied by the SECOND form's own pre-filled Name
-    // field supplying the second `LABEL` match (tab 1's real bar label plus
-    // tab 2's still-open form both rendering `" proj-orchestrator-1 "`) —
-    // count() >= 2 without a second real tab existing yet — so read the
-    // filesystem via a poll here too rather than a single point-in-time
-    // check.
+    // This filesystem poll is NOT a substitute for the tab-bar wait above —
+    // both `before`/`after_first` and this `after_second` read converge on
+    // the same `expected=1`, because the shared clone's whole committed tree
+    // (both leaf directories) is already on disk after the FIRST open alone;
+    // a silently refused second open would leave this count identical. Its
+    // job is only to locate the one shared clone directory for the
+    // subdirectory checks below, now that the wait above has already proven
+    // the second claim was genuinely granted.
     let after_second = wait_for_sibling_workspace_count(&parent, &prefix, 1);
     assert_eq!(
         after_second.len(),
