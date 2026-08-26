@@ -1384,3 +1384,575 @@ async fn wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner() 
 
     daemon.registry.shutdown_all();
 }
+
+// ---------------------------------------------------------------------------
+// Round 3 (PRD #499, PR #617 round-3 reviewer/auditor findings) — closing the
+// test-coverage gap that let BLOCKER A / auditor B1 (daemon-only composition
+// state, invisible to an attached client) ship undetected by any of the
+// nine round-1/round-2 tests above, all of which read `AppState` directly on
+// the daemon side. Round 3 moved the composition state off the daemon-only
+// `AppState::monitored_waits` map onto three new `SessionState`/
+// `SessionSnapshot` fields (`monitored_wait_active`, `wait_synthetic_working`,
+// `shell_descendant_busy`) set/cleared inside `apply_event` itself, so every
+// consumer of the broadcast event stream converges identically. These three
+// tests pin that convergence directly, plus the two untested directions
+// (respawn-suppression, same-card real-activity protection) coder's own
+// report named as still needing coverage.
+// ---------------------------------------------------------------------------
+
+/// The pane's current `(status, monitored_wait_active, wait_synthetic_working,
+/// shell_descendant_busy)` tuple, read directly off the DAEMON's own
+/// `AppState` — `None` if no session names this pane at all.
+#[cfg(unix)]
+async fn daemon_composition_state(
+    daemon: &common::InProcDaemon,
+    pane_id: &str,
+) -> Option<(SessionStatus, bool, bool, bool)> {
+    daemon
+        .state
+        .read()
+        .await
+        .sessions
+        .values()
+        .find(|s| s.pane_id.as_deref() == Some(pane_id))
+        .map(|s| {
+            (
+                s.status.clone(),
+                s.monitored_wait_active,
+                s.wait_synthetic_working,
+                s.shell_descendant_busy,
+            )
+        })
+}
+
+/// The identical tuple [`daemon_composition_state`] reads, but off an
+/// independent, freshly-constructed CLIENT `AppState` that has only ever
+/// seen events replayed onto it via `apply_event` — never read from the
+/// daemon's own state directly. This is the read that would have caught
+/// round 2's BLOCKER A/B1: a daemon-only `AppState::monitored_waits` map
+/// gave the two answers above no reason to agree.
+#[cfg(unix)]
+fn client_composition_state(
+    client_state: &AppState,
+    pane_id: &str,
+) -> Option<(SessionStatus, bool, bool, bool)> {
+    client_state
+        .sessions
+        .values()
+        .find(|s| s.pane_id.as_deref() == Some(pane_id))
+        .map(|s| {
+            (
+                s.status.clone(),
+                s.monitored_wait_active,
+                s.wait_synthetic_working,
+                s.shell_descendant_busy,
+            )
+        })
+}
+
+/// Await the next broadcast event naming `pane_id` on `events` — the same
+/// filter `wait/monitored/014` applies inline, factored out here so the two
+/// scenarios in `wait/monitored/016` don't repeat it.
+#[cfg(unix)]
+async fn recv_matching_event(
+    events: &mut tokio::sync::broadcast::Receiver<BroadcastMsg>,
+    pane_id: &str,
+    timeout: Duration,
+) -> Option<AgentEvent> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            match events.recv().await {
+                Ok(BroadcastMsg::Event(event)) if event.pane_id.as_deref() == Some(pane_id) => {
+                    break Some(event);
+                }
+                Ok(_) => continue,
+                Err(_) => break None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+const PANE_016_A: &str = "wait-monitored-pane-016a-replay-idle-7d2f83";
+const LABEL_016_A: &str = "wait-monitored-label-016a-replay-idle";
+const PANE_016_B: &str = "wait-monitored-pane-016b-replay-shell-9e4c17";
+const LABEL_016_B: &str = "wait-monitored-label-016b-replay-shell";
+
+/// Scenario: subscribe to the daemon's broadcast stream and replay every
+/// captured event onto an independent, freshly-constructed client `AppState`
+/// (the same mechanic `wait/monitored/014` uses for the bare promotion
+/// event, extended here past just the promotion) across two full
+/// compositions on two independent panes: (A) `wait start` followed by a
+/// real `Idle` while the wait is still outstanding — the PRD's own
+/// motivating scenario, an agent ending its turn with an external dependency
+/// still unresolved — and (B) `wait start`, an injected `ShellBusy`, then
+/// `wait done` while the shell signal is still live (OR composition,
+/// Direction A). After every event, assert the client's
+/// independently-replayed `(status, monitored_wait_active,
+/// wait_synthetic_working, shell_descendant_busy)` tuple is identical to the
+/// daemon's own — this is the test that would have caught round 2's
+/// BLOCKER A/B1: a daemon-only `AppState::monitored_waits` map meant an
+/// attached client never learned a wait was live at all, so its own
+/// `apply_event` had nothing to suppress the real `Idle` with and it read
+/// `Idle` while the daemon read `Working`.
+#[spec("wait/monitored/016")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_016_daemon_and_client_converge_across_replayed_events() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/016 runtime")
+        .block_on(wait_monitored_016_daemon_and_client_converge_across_replayed_events_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+
+    // --- Case A: MonitoredWaitStart, then a real Idle while the wait holds. ---
+    let pane_a = setup_idle_pane(&daemon, &cwd_str, PANE_016_A).await;
+    let session_a = format!("{PANE_016_A}-session");
+    let mut events_a = daemon.event_tx.subscribe();
+    let mut client_a = AppState::default();
+    client_a.register_pane(pane_a.pane_id.clone());
+
+    let start_a = run_wait_cli(&daemon, &pane_a.pane_id, &["start", LABEL_016_A], &[]).await;
+    assert!(
+        start_a.status.success(),
+        "wait/monitored/016 (case A): `wait start {LABEL_016_A}` must succeed; status={:?} \
+         stdout={:?} stderr={:?}",
+        start_a.status,
+        start_a.stdout,
+        start_a.stderr
+    );
+    let start_event = recv_matching_event(&mut events_a, &pane_a.pane_id, Duration::from_secs(3))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "wait/monitored/016 (case A, BLOCKER 1 regression): `wait start` must broadcast \
+                 an event naming pane {:?} — none arrived within 3s",
+                pane_a.pane_id
+            )
+        });
+    client_a.apply_event(start_event);
+    wait_for_status(
+        &daemon,
+        &pane_a.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/016 (case A, after wait start): {e}"));
+    assert_eq!(
+        client_composition_state(&client_a, &pane_a.pane_id),
+        daemon_composition_state(&daemon, &pane_a.pane_id).await,
+        "wait/monitored/016 (case A, BLOCKER A/B1): after MonitoredWaitStart, the client's \
+         independently-replayed composition state must already match the daemon's"
+    );
+
+    // A real Stop-hook Idle arrives while the wait is still outstanding.
+    // Round 3 (Direction C): the daemon suppresses the status write because
+    // `monitored_wait_active` is set on THIS card; a client that applied the
+    // identical MonitoredWaitStart event above must suppress it identically.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&idle_event(&pane_a.pane_id, &pane_a.agent_id, &session_a))
+            .expect("serialize real Idle event"),
+    )
+    .expect("write real Idle event to the daemon hook socket");
+    let idle_event_seen =
+        recv_matching_event(&mut events_a, &pane_a.pane_id, Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "wait/monitored/016 (case A): the real Idle event itself must still \
+                     broadcast (composition suppresses the STATUS write, not the broadcast) — \
+                     none arrived within 3s"
+                )
+            });
+    client_a.apply_event(idle_event_seen);
+    // Daemon-side precondition, matching round 1's own read: the real Idle
+    // must NOT have reverted the pane while the wait is outstanding.
+    assert_status_holds(
+        &daemon,
+        &pane_a.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/016 (case A, daemon precondition)",
+    )
+    .await;
+    assert_eq!(
+        client_composition_state(&client_a, &pane_a.pane_id).map(|(status, ..)| status),
+        Some(SessionStatus::Working),
+        "wait/monitored/016 (case A, BLOCKER A/B1 — the original bug): the client's own \
+         independent AppState must read Working, NOT Idle, after applying the same real Idle \
+         event the daemon applied — it has monitored_wait_active set from having applied the \
+         identical MonitoredWaitStart event above, so Direction C suppresses the write exactly \
+         as it does on the daemon"
+    );
+    assert_eq!(
+        client_composition_state(&client_a, &pane_a.pane_id),
+        daemon_composition_state(&daemon, &pane_a.pane_id).await,
+        "wait/monitored/016 (case A, BLOCKER A/B1): the client and daemon composition state \
+         must still agree after the real Idle"
+    );
+
+    let done_a = run_wait_cli(
+        &daemon,
+        &pane_a.pane_id,
+        &["done", LABEL_016_A, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done_a.status.success(),
+        "wait/monitored/016 (case A): `wait done {LABEL_016_A} --outcome success` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        done_a.status,
+        done_a.stdout,
+        done_a.stderr
+    );
+    let done_event_a = recv_matching_event(&mut events_a, &pane_a.pane_id, Duration::from_secs(3))
+        .await
+        .unwrap_or_else(|| {
+            panic!("wait/monitored/016 (case A): `wait done` must also broadcast an event")
+        });
+    client_a.apply_event(done_event_a);
+    wait_for_status(
+        &daemon,
+        &pane_a.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/016 (case A, after wait done): {e}"));
+    assert_eq!(
+        client_composition_state(&client_a, &pane_a.pane_id),
+        daemon_composition_state(&daemon, &pane_a.pane_id).await,
+        "wait/monitored/016 (case A, BLOCKER A/B1): the client and daemon composition state \
+         must converge back to the cleared baseline together"
+    );
+
+    // --- Case B: MonitoredWaitStart, an injected ShellBusy, then wait done
+    // while the shell signal is still live (Direction A, mirroring
+    // `wait/monitored/011` daemon-side, now with client convergence). ---
+    let pane_b = setup_idle_pane(&daemon, &cwd_str, PANE_016_B).await;
+    let session_b = format!("{PANE_016_B}-session");
+    let mut events_b = daemon.event_tx.subscribe();
+    let mut client_b = AppState::default();
+    client_b.register_pane(pane_b.pane_id.clone());
+
+    let start_b = run_wait_cli(&daemon, &pane_b.pane_id, &["start", LABEL_016_B], &[]).await;
+    assert!(
+        start_b.status.success(),
+        "wait/monitored/016 (case B): `wait start {LABEL_016_B}` must succeed; status={:?} \
+         stdout={:?} stderr={:?}",
+        start_b.status,
+        start_b.stdout,
+        start_b.stderr
+    );
+    let start_event_b = recv_matching_event(&mut events_b, &pane_b.pane_id, Duration::from_secs(3))
+        .await
+        .unwrap_or_else(|| panic!("wait/monitored/016 (case B): `wait start` must broadcast"));
+    client_b.apply_event(start_event_b);
+    wait_for_status(
+        &daemon,
+        &pane_b.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/016 (case B, after wait start): {e}"));
+    assert_eq!(
+        client_composition_state(&client_b, &pane_b.pane_id),
+        daemon_composition_state(&daemon, &pane_b.pane_id).await,
+        "wait/monitored/016 (case B): client/daemon must converge after MonitoredWaitStart"
+    );
+
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&shell_activity_event(
+            &pane_b.pane_id,
+            &pane_b.agent_id,
+            &session_b,
+            EventType::ShellBusy,
+        ))
+        .expect("serialize synthetic ShellBusy event"),
+    )
+    .expect("write synthetic ShellBusy event to the daemon hook socket");
+    let shell_busy_event =
+        recv_matching_event(&mut events_b, &pane_b.pane_id, Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|| panic!("wait/monitored/016 (case B): ShellBusy must broadcast"));
+    client_b.apply_event(shell_busy_event);
+    assert_status_holds(
+        &daemon,
+        &pane_b.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/016 (case B, after injected ShellBusy)",
+    )
+    .await;
+    assert_eq!(
+        client_composition_state(&client_b, &pane_b.pane_id),
+        daemon_composition_state(&daemon, &pane_b.pane_id).await,
+        "wait/monitored/016 (case B): client/daemon must converge after the injected ShellBusy \
+         too (shell_descendant_busy set unconditionally on both sides)"
+    );
+
+    let done_b = run_wait_cli(
+        &daemon,
+        &pane_b.pane_id,
+        &["done", LABEL_016_B, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done_b.status.success(),
+        "wait/monitored/016 (case B): `wait done {LABEL_016_B} --outcome success` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        done_b.status,
+        done_b.stdout,
+        done_b.stderr
+    );
+    let done_event_b = recv_matching_event(&mut events_b, &pane_b.pane_id, Duration::from_secs(3))
+        .await
+        .unwrap_or_else(|| panic!("wait/monitored/016 (case B): `wait done` must broadcast"));
+    client_b.apply_event(done_event_b);
+    // The ShellBusy signal never got a paired ShellIdle, so OR composition
+    // requires BOTH sides to stay Working — mirrors `011`'s daemon-only
+    // assertion, now checked on the independently-replayed client too.
+    assert_status_holds(
+        &daemon,
+        &pane_b.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(300),
+        "wait/monitored/016 (case B, after wait done, daemon precondition)",
+    )
+    .await;
+    assert_eq!(
+        client_composition_state(&client_b, &pane_b.pane_id).map(|(status, ..)| status),
+        Some(SessionStatus::Working),
+        "wait/monitored/016 (case B, BLOCKER A/B1): the client must also stay Working — the \
+         still-live ShellBusy it independently replayed keeps `shell_descendant_busy` set, \
+         which blocks the revert exactly as it does on the daemon"
+    );
+    assert_eq!(
+        client_composition_state(&client_b, &pane_b.pane_id),
+        daemon_composition_state(&daemon, &pane_b.pane_id).await,
+        "wait/monitored/016 (case B): client and daemon composition state must converge after \
+         wait done too"
+    );
+
+    daemon.registry.shutdown_all();
+}
+
+const RESPAWN2_PANE_ID: &str = "wait-monitored-pane-017-respawn-idle-3f8b52";
+const RESPAWN2_LABEL: &str = "wait-monitored-label-017-respawn-idle";
+
+/// Scenario: pin the untested direction of reviewer HIGH C directly against
+/// `AppState`, sibling to `wait/monitored/012`'s bare-state respawn fixture.
+/// Card A gets a monitored wait declared and it is deliberately NEVER
+/// cleared before the pane respawns — the real-world shape the mechanism
+/// exists for. The pane respawns to card B, which does genuine work via a
+/// real `ToolStart`, then genuinely finishes via a real `Idle`. Assert card
+/// B's `Idle` takes effect — it must NOT stay wedged `Working` because of
+/// the stale wait still recorded (in `AppState::monitored_waits`, keyed by
+/// pane, never cleared) against the now-retired card A. `012` only proves
+/// `wait done` doesn't clobber card B's `ToolStart`-driven `Working`; this
+/// is the opposite direction — a genuinely idle card B must be allowed to
+/// go idle.
+#[spec("wait/monitored/017")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_017_stale_wait_on_retired_card_does_not_wedge_new_card_idle() {
+    let t0 = chrono::Utc::now();
+    let t1 = t0 + chrono::Duration::seconds(1);
+    let t2 = t1 + chrono::Duration::seconds(1);
+    let t3 = t2 + chrono::Duration::seconds(1);
+
+    let mut state = AppState::default();
+    state.register_pane(RESPAWN2_PANE_ID.to_string());
+
+    // Card A: an idle agent.
+    state.apply_event(card_event(
+        RESPAWN2_PANE_ID,
+        "card-a2-session",
+        "agent-a2",
+        EventType::SessionStart,
+        None,
+        t0,
+    ));
+    assert_eq!(
+        state.sessions["card-a2-session"].status,
+        SessionStatus::Idle,
+        "precondition: card A starts Idle"
+    );
+
+    // A monitored wait promotes card A to Working — and is deliberately
+    // never cleared, mirroring the real-world shape: the pane respawns
+    // before anyone calls `wait done`.
+    state.start_monitored_wait(
+        RESPAWN2_PANE_ID,
+        RESPAWN2_LABEL.to_string(),
+        Duration::from_secs(300),
+    );
+    assert_eq!(
+        state.sessions["card-a2-session"].status,
+        SessionStatus::Working,
+        "precondition: `wait start` promotes card A to Working"
+    );
+
+    // The pane respawns: card A is retired, card B is created. The stale
+    // `monitored_waits` entry (keyed by pane, pointing at card A) survives
+    // this — a respawn is not a teardown, so `013`'s eager-cleanup fix does
+    // not apply here.
+    state.apply_event(card_event(
+        RESPAWN2_PANE_ID,
+        "card-b2-session",
+        "agent-b2",
+        EventType::SessionStart,
+        None,
+        t1,
+    ));
+    assert!(
+        !state.sessions.contains_key("card-a2-session"),
+        "precondition: the respawn's SessionStart must retire card A"
+    );
+    assert!(
+        state.monitored_waits.contains_key(RESPAWN2_PANE_ID),
+        "precondition: the stale wait against card A is still recorded on the pane — nobody \
+         ever called `wait done` for it, so the daemon-only bookkeeping map still names it"
+    );
+
+    // Card B genuinely starts working via a real ToolStart, unrelated to the
+    // old wait.
+    state.apply_event(card_event(
+        RESPAWN2_PANE_ID,
+        "card-b2-session",
+        "agent-b2",
+        EventType::ToolStart,
+        Some("Bash"),
+        t2,
+    ));
+    assert_eq!(
+        state.sessions["card-b2-session"].status,
+        SessionStatus::Working,
+        "precondition: card B is genuinely Working via a real ToolStart"
+    );
+
+    // Card B genuinely finishes — a real Stop-hook Idle, nothing to do with
+    // the stale wait against its predecessor.
+    state.apply_event(card_event(
+        RESPAWN2_PANE_ID,
+        "card-b2-session",
+        "agent-b2",
+        EventType::Idle,
+        None,
+        t3,
+    ));
+
+    assert_eq!(
+        state.sessions["card-b2-session"].status,
+        SessionStatus::Idle,
+        "wait/monitored/017 (HIGH C, untested direction): card B's own real Idle must take \
+         effect — it must not stay wedged Working because of a stale wait recorded (in \
+         `AppState::monitored_waits`) against the retired card A. `monitored_wait_active` lives \
+         on `SessionState` per-card, and card B never had a MonitoredWaitStart applied to it, \
+         so it must read false regardless of what the daemon-only pane-keyed `monitored_waits` \
+         map still says about the pane"
+    );
+}
+
+const SAME_CARD_PANE_ID: &str = "wait-monitored-pane-018-same-card-clobber-6a9d31";
+const SAME_CARD_LABEL: &str = "wait-monitored-label-018-same-card-clobber";
+
+/// Scenario: pin the untested same-card direction of reviewer HIGH B/B2
+/// directly against `AppState`, sibling to `wait/monitored/012`'s bare-state
+/// style. A single card: `wait start` promotes it Idle -> Working, then a
+/// real `ToolStart` re-asserts `Working` on the SAME card — the exact
+/// scenario round 3's own `MonitoredWaitDone` doc comment names ("a real
+/// ToolStart asserted after the wait started"). `wait done` follows. Assert
+/// the real Working survives — `wait done` must not revert it just because
+/// a monitored wait was once involved. `012` only pins the CROSS-card
+/// version (a respawn to a different card); this is the SAME-card case the
+/// task specifically calls out as untested.
+#[spec("wait/monitored/018")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_018_same_card_real_tool_start_survives_wait_done() {
+    let t0 = chrono::Utc::now();
+    let t1 = t0 + chrono::Duration::seconds(1);
+
+    let mut state = AppState::default();
+    state.register_pane(SAME_CARD_PANE_ID.to_string());
+
+    state.apply_event(card_event(
+        SAME_CARD_PANE_ID,
+        "same-card-session",
+        "same-card-agent",
+        EventType::SessionStart,
+        None,
+        t0,
+    ));
+    assert_eq!(
+        state.sessions["same-card-session"].status,
+        SessionStatus::Idle,
+        "precondition: the card starts Idle"
+    );
+
+    state.start_monitored_wait(
+        SAME_CARD_PANE_ID,
+        SAME_CARD_LABEL.to_string(),
+        Duration::from_secs(300),
+    );
+    assert_eq!(
+        state.sessions["same-card-session"].status,
+        SessionStatus::Working,
+        "precondition: `wait start` promotes the card to Working"
+    );
+    assert!(
+        state.sessions["same-card-session"].wait_synthetic_working,
+        "precondition: the wait's own promotion is what asserted this Working"
+    );
+
+    // A real ToolStart re-asserts Working on the SAME card — round 3's own
+    // motivating case for switching the revert guard from
+    // `!shell_synthetic_working` to `wait_synthetic_working`.
+    state.apply_event(card_event(
+        SAME_CARD_PANE_ID,
+        "same-card-session",
+        "same-card-agent",
+        EventType::ToolStart,
+        Some("Bash"),
+        t1,
+    ));
+    assert_eq!(
+        state.sessions["same-card-session"].status,
+        SessionStatus::Working,
+        "precondition: the real ToolStart re-asserts Working"
+    );
+    assert!(
+        !state.sessions["same-card-session"].wait_synthetic_working,
+        "precondition: a real event other than ShellBusy/MonitoredWaitStart/MonitoredWaitDone \
+         clears the wait's own provenance marker — the wait no longer owns this Working"
+    );
+
+    state.clear_monitored_wait(SAME_CARD_PANE_ID, SAME_CARD_LABEL, WaitOutcome::Success);
+
+    assert_eq!(
+        state.sessions["same-card-session"].status,
+        SessionStatus::Working,
+        "wait/monitored/018 (HIGH B/B2, untested same-card direction): a real ToolStart's \
+         Working, re-asserted on the SAME card after the wait started, must survive `wait \
+         done` — reverting because a monitored wait was merely once involved (round 2's \
+         `!shell_synthetic_working` guard) would clobber genuine, real-agent activity that has \
+         nothing to do with the wait any more"
+    );
+}
