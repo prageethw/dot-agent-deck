@@ -4719,6 +4719,7 @@ mod tests {
                 monitored_wait_active: false,
                 wait_synthetic_working: false,
                 shell_descendant_busy: false,
+                wait_deferred_revert: false,
                 model: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
@@ -4759,6 +4760,7 @@ mod tests {
                 monitored_wait_active: false,
                 wait_synthetic_working: false,
                 shell_descendant_busy: false,
+                wait_deferred_revert: false,
                 model: None,
             }),
             spawned_at_ms: None,
@@ -4839,6 +4841,7 @@ mod tests {
             monitored_wait_active: false,
             wait_synthetic_working: false,
             shell_descendant_busy: false,
+            wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
         };
