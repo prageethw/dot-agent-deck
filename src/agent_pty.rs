@@ -4272,13 +4272,13 @@ impl AgentPtyRegistry {
         // (the armed/expected side) was already sanitized by
         // `handle_delegate`'s fan-out loop before it was ever armed — it is
         // canonical here and must NOT be sanitized again, because
-        // `sanitize_subject_tag` is not idempotent for every input, and a
-        // second pass over an already-canonical value can produce a
-        // different string than the first pass did. The echoed side is fresh
-        // off the worker's `work-done --subject` CLI call and has never been
-        // sanitized before, so it gets exactly one pass, here. Both fields of
-        // `SubjectMismatch` therefore hold canonical (sanitized) values by
-        // construction, addressing A16.
+        // `sanitize_subject_tag` is the single source of truth for
+        // canonicalization: a value it has already produced must be treated
+        // as canonical, not fed back through it as if it were still raw. The
+        // echoed side is fresh off the worker's `work-done --subject` CLI
+        // call and has never been sanitized before, so it gets exactly one
+        // pass, here. Both fields of `SubjectMismatch` therefore hold
+        // canonical (sanitized) values by construction, addressing A16.
         let subject_mismatch = match (popped.subject.as_deref(), echoed_subject) {
             (Some(expected), Some(echoed)) => {
                 let echoed_sanitized = crate::state::sanitize_subject_tag(echoed);
