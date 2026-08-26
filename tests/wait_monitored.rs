@@ -73,21 +73,29 @@ struct TestPane {
     agent_id: String,
 }
 
-/// A synthetic `Idle` `AgentEvent` naming `pane_id`/`agent_id` — the raw
-/// shape a real agent's Stop hook would send, used here purely to seed a
-/// known `SessionState` at a deterministic `Idle` baseline (`apply_event`'s
-/// `EventType::Idle` arm sets `SessionStatus::Idle` unconditionally,
-/// `src/state.rs`).
+/// Shared `AgentEvent` construction for every synthetic-event helper below —
+/// all four differ only in `agent_type`, `tool_name` and `timestamp`, with
+/// every other field fixed at the same "no tool/session metadata" baseline.
+/// Factored out (PRD #499 round 7, SonarCloud duplication) so each helper is
+/// a one-line call rather than repeating this 14-field struct literal.
 #[cfg(unix)]
-fn idle_event(pane_id: &str, agent_id: &str, session_id: &str) -> AgentEvent {
+fn base_agent_event(
+    pane_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    event_type: EventType,
+    agent_type: AgentType,
+    tool_name: Option<&str>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> AgentEvent {
     AgentEvent {
         session_id: session_id.to_string(),
-        agent_type: AgentType::Pi,
-        event_type: EventType::Idle,
-        tool_name: None,
+        agent_type,
+        event_type,
+        tool_name: tool_name.map(str::to_string),
         tool_detail: None,
         cwd: None,
-        timestamp: chrono::Utc::now(),
+        timestamp,
         user_prompt: None,
         metadata: std::collections::HashMap::new(),
         pane_id: Some(pane_id.to_string()),
@@ -97,6 +105,24 @@ fn idle_event(pane_id: &str, agent_id: &str, session_id: &str) -> AgentEvent {
         live_target: None,
         model: None,
     }
+}
+
+/// A synthetic `Idle` `AgentEvent` naming `pane_id`/`agent_id` — the raw
+/// shape a real agent's Stop hook would send, used here purely to seed a
+/// known `SessionState` at a deterministic `Idle` baseline (`apply_event`'s
+/// `EventType::Idle` arm sets `SessionStatus::Idle` unconditionally,
+/// `src/state.rs`).
+#[cfg(unix)]
+fn idle_event(pane_id: &str, agent_id: &str, session_id: &str) -> AgentEvent {
+    base_agent_event(
+        pane_id,
+        agent_id,
+        session_id,
+        EventType::Idle,
+        AgentType::Pi,
+        None,
+        chrono::Utc::now(),
+    )
 }
 
 /// A synthetic `ShellBusy`/`ShellIdle` `AgentEvent`, shaped the way the
@@ -113,23 +139,15 @@ fn shell_activity_event(
     session_id: &str,
     event_type: EventType,
 ) -> AgentEvent {
-    AgentEvent {
-        session_id: session_id.to_string(),
-        agent_type: AgentType::None,
+    base_agent_event(
+        pane_id,
+        agent_id,
+        session_id,
         event_type,
-        tool_name: None,
-        tool_detail: None,
-        cwd: None,
-        timestamp: chrono::Utc::now(),
-        user_prompt: None,
-        metadata: std::collections::HashMap::new(),
-        pane_id: Some(pane_id.to_string()),
-        agent_id: Some(agent_id.to_string()),
-        agent_version: None,
-        schema_version: None,
-        live_target: None,
-        model: None,
-    }
+        AgentType::None,
+        None,
+        chrono::Utc::now(),
+    )
 }
 
 /// A synthetic `ToolStart`/`ToolEnd` `AgentEvent`, shaped the way a real
@@ -145,23 +163,15 @@ fn tool_event(
     event_type: EventType,
     tool_name: Option<&str>,
 ) -> AgentEvent {
-    AgentEvent {
-        session_id: session_id.to_string(),
-        agent_type: AgentType::ClaudeCode,
+    base_agent_event(
+        pane_id,
+        agent_id,
+        session_id,
         event_type,
-        tool_name: tool_name.map(str::to_string),
-        tool_detail: None,
-        cwd: None,
-        timestamp: chrono::Utc::now(),
-        user_prompt: None,
-        metadata: std::collections::HashMap::new(),
-        pane_id: Some(pane_id.to_string()),
-        agent_id: Some(agent_id.to_string()),
-        agent_version: None,
-        schema_version: None,
-        live_target: None,
-        model: None,
-    }
+        AgentType::ClaudeCode,
+        tool_name,
+        chrono::Utc::now(),
+    )
 }
 
 /// A raw hook-shaped `AgentEvent` for driving `AppState::apply_event`
@@ -178,23 +188,15 @@ fn card_event(
     tool_name: Option<&str>,
     timestamp: chrono::DateTime<chrono::Utc>,
 ) -> AgentEvent {
-    AgentEvent {
-        session_id: session_id.to_string(),
-        agent_type: AgentType::ClaudeCode,
+    base_agent_event(
+        pane_id,
+        agent_id,
+        session_id,
         event_type,
-        tool_name: tool_name.map(str::to_string),
-        tool_detail: None,
-        cwd: None,
+        AgentType::ClaudeCode,
+        tool_name,
         timestamp,
-        user_prompt: None,
-        metadata: std::collections::HashMap::new(),
-        pane_id: Some(pane_id.to_string()),
-        agent_id: Some(agent_id.to_string()),
-        agent_version: None,
-        schema_version: None,
-        live_target: None,
-        model: None,
-    }
+    )
 }
 
 /// Register a `cat`-stub pane directly on the daemon's own live
@@ -278,6 +280,22 @@ async fn run_wait_cli(
     .expect("wait CLI subprocess task did not panic")
 }
 
+/// Assert a `run_wait_cli` result exited successfully, panicking with
+/// `message` plus the process's status/stdout/stderr — the exact `assert!`
+/// shape this file repeats at nearly every `run_wait_cli` call site,
+/// factored out here (PRD #499 round 7, SonarCloud duplication) so each call
+/// site states only what is unique to it: the message.
+#[cfg(unix)]
+fn assert_wait_cli_succeeded(result: &CliResult, message: &str) {
+    assert!(
+        result.status.success(),
+        "{message}; status={:?} stdout={:?} stderr={:?}",
+        result.status,
+        result.stdout,
+        result.stderr
+    );
+}
+
 /// The pane's current `SessionStatus`, joined by `pane_id` — `None` if no
 /// session names this pane at all.
 #[cfg(unix)]
@@ -316,6 +334,27 @@ async fn wait_for_status(
     }
 }
 
+/// `wait_for_status`, panicking with `{message}: {error}` on timeout — the
+/// `wait_for_status(...).await.unwrap_or_else(|e| panic!("{message}: {e}"))`
+/// shape repeated at most call sites in this file, factored out here (PRD
+/// #499 round 7, SonarCloud duplication) so each call site states only its
+/// own message. A handful of call sites build a longer, finding-specific
+/// explanation that doesn't fit this `{message}: {error}` shape (the error
+/// isn't simply appended at the end) and are left calling `wait_for_status`
+/// directly rather than being forced through this helper.
+#[cfg(unix)]
+async fn assert_reaches_status(
+    daemon: &common::InProcDaemon,
+    pane_id: &str,
+    expected: &SessionStatus,
+    timeout: Duration,
+    message: &str,
+) {
+    wait_for_status(daemon, pane_id, expected, timeout)
+        .await
+        .unwrap_or_else(|e| panic!("{message}: {e}"));
+}
+
 /// Sample `pane_id`'s status repeatedly across `hold`, asserting it equals
 /// `expected` on every sample — proves persistence across multiple
 /// `run_shell_activity_monitor` poll ticks (500ms), not just a single
@@ -344,6 +383,21 @@ async fn assert_status_holds(
     }
 }
 
+/// Build a fresh multi-threaded Tokio runtime and block on `fut` — the
+/// `tokio::runtime::Builder::new_multi_thread()...block_on(...)` shape every
+/// `#[test]` wrapper in this file repeats verbatim around its own `_inner`
+/// future, factored out here (PRD #499 round 7, SonarCloud duplication) so
+/// each `#[test]` fn is a one-line call naming its own spec id and future.
+#[cfg(unix)]
+fn run_async_test<F: std::future::Future<Output = ()>>(spec_id: &str, fut: F) {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| panic!("build {spec_id} runtime: {e}"))
+        .block_on(fut);
+}
+
 const PANE_001: &str = "wait-monitored-pane-001-4f8a2c";
 const LABEL_001: &str = "wait-monitored-label-001-ci-check";
 
@@ -356,12 +410,10 @@ const LABEL_001: &str = "wait-monitored-label-001-ci-check";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_001_start_sets_working_done_clears_to_idle() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/001 runtime")
-        .block_on(wait_monitored_001_start_sets_working_done_clears_to_idle_inner());
+    run_async_test(
+        "wait/monitored/001",
+        wait_monitored_001_start_sets_working_done_clears_to_idle_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -372,22 +424,20 @@ async fn wait_monitored_001_start_sets_working_done_clears_to_idle_inner() {
     let pane = setup_idle_pane(&daemon, &cwd_str, PANE_001).await;
 
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_001], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/001: `wait start {LABEL_001}` must succeed in an otherwise-idle pane; \
-         status={:?} stdout={:?} stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!(
+            "wait/monitored/001: `wait start {LABEL_001}` must succeed in an otherwise-idle pane"
+        ),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/001 (after start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/001 (after start): {e}"));
+    .await;
 
     let done = run_wait_cli(
         &daemon,
@@ -396,22 +446,18 @@ async fn wait_monitored_001_start_sets_working_done_clears_to_idle_inner() {
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/001: `wait done {LABEL_001} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/001: `wait done {LABEL_001} --outcome success` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Idle,
         Duration::from_secs(5),
+        "wait/monitored/001 (after done)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/001 (after done): {e}"));
+    .await;
 
     let _ = &pane.agent_id;
     daemon.registry.shutdown_all();
@@ -431,12 +477,10 @@ const LABEL_002: &str = "wait-monitored-label-002-poll-gaps";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_002_persists_across_polling_gaps_with_no_descendant() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/002 runtime")
-        .block_on(wait_monitored_002_persists_across_polling_gaps_with_no_descendant_inner());
+    run_async_test(
+        "wait/monitored/002",
+        wait_monitored_002_persists_across_polling_gaps_with_no_descendant_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -447,22 +491,18 @@ async fn wait_monitored_002_persists_across_polling_gaps_with_no_descendant_inne
     let pane = setup_idle_pane(&daemon, &cwd_str, PANE_002).await;
 
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_002], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/002: `wait start {LABEL_002}` must succeed; status={:?} stdout={:?} \
-         stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/002: `wait start {LABEL_002}` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/002 (after start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/002 (after start): {e}"));
+    .await;
 
     assert_status_holds(
         &daemon,
@@ -480,22 +520,18 @@ async fn wait_monitored_002_persists_across_polling_gaps_with_no_descendant_inne
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/002: `wait done {LABEL_002} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/002: `wait done {LABEL_002} --outcome success` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Idle,
         Duration::from_secs(5),
+        "wait/monitored/002 (after done)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/002 (after done): {e}"));
+    .await;
 
     daemon.registry.shutdown_all();
 }
@@ -514,12 +550,10 @@ const LABEL_003: &str = "wait-monitored-label-003-attribution";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_003_attribution_is_per_pane_not_global() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/003 runtime")
-        .block_on(wait_monitored_003_attribution_is_per_pane_not_global_inner());
+    run_async_test(
+        "wait/monitored/003",
+        wait_monitored_003_attribution_is_per_pane_not_global_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -531,22 +565,18 @@ async fn wait_monitored_003_attribution_is_per_pane_not_global_inner() {
     let pane_b = setup_idle_pane(&daemon, &cwd_str, PANE_003_B).await;
 
     let start = run_wait_cli(&daemon, &pane_a.pane_id, &["start", LABEL_003], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/003: `wait start {LABEL_003}` on pane A must succeed; status={:?} \
-         stdout={:?} stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/003: `wait start {LABEL_003}` on pane A must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane_a.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/003 (pane A after start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/003 (pane A after start): {e}"));
+    .await;
 
     // Sample both concurrently across the same hold window: A must stay
     // Working, B must stay Idle throughout — never a global flag flipping
@@ -581,22 +611,20 @@ async fn wait_monitored_003_attribution_is_per_pane_not_global_inner() {
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/003: `wait done {LABEL_003} --outcome success` on pane A must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!(
+            "wait/monitored/003: `wait done {LABEL_003} --outcome success` on pane A must succeed"
+        ),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane_a.pane_id,
         &SessionStatus::Idle,
         Duration::from_secs(5),
+        "wait/monitored/003 (pane A after done)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/003 (pane A after done): {e}"));
+    .await;
 
     let _ = &pane_b.agent_id;
     daemon.registry.shutdown_all();
@@ -614,12 +642,10 @@ const PANE_004: &str = "wait-monitored-pane-004-baseline-3a71dd";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_004_untouched_pane_stays_idle() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/004 runtime")
-        .block_on(wait_monitored_004_untouched_pane_stays_idle_inner());
+    run_async_test(
+        "wait/monitored/004",
+        wait_monitored_004_untouched_pane_stays_idle_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -661,21 +687,18 @@ async fn wait_monitored_outcome_clears_working_inner(
     let pane = setup_idle_pane(&daemon, &cwd_str, pane_id).await;
 
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", label], &[]).await;
-    assert!(
-        start.status.success(),
-        "{spec_id}: `wait start {label}` must succeed; status={:?} stdout={:?} stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("{spec_id}: `wait start {label}` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        &format!("{spec_id} (after start)"),
     )
-    .await
-    .unwrap_or_else(|e| panic!("{spec_id} (after start): {e}"));
+    .await;
 
     let done = run_wait_cli(
         &daemon,
@@ -684,22 +707,18 @@ async fn wait_monitored_outcome_clears_working_inner(
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "{spec_id}: `wait done {label} --outcome {outcome}` must succeed; status={:?} \
-         stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("{spec_id}: `wait done {label} --outcome {outcome}` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Idle,
         Duration::from_secs(5),
+        &format!("{spec_id} (after done --outcome {outcome})"),
     )
-    .await
-    .unwrap_or_else(|e| panic!("{spec_id} (after done --outcome {outcome}): {e}"));
+    .await;
 
     daemon.registry.shutdown_all();
 }
@@ -713,17 +732,15 @@ const LABEL_005: &str = "wait-monitored-label-005-outcome-success";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_005_outcome_success_clears_working() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/005 runtime")
-        .block_on(wait_monitored_outcome_clears_working_inner(
+    run_async_test(
+        "wait/monitored/005",
+        wait_monitored_outcome_clears_working_inner(
             PANE_005,
             LABEL_005,
             "success",
             "wait/monitored/005",
-        ));
+        ),
+    );
 }
 
 const PANE_006: &str = "wait-monitored-pane-006-outcome-failure";
@@ -736,17 +753,15 @@ const LABEL_006: &str = "wait-monitored-label-006-outcome-failure";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_006_outcome_failure_clears_working() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/006 runtime")
-        .block_on(wait_monitored_outcome_clears_working_inner(
+    run_async_test(
+        "wait/monitored/006",
+        wait_monitored_outcome_clears_working_inner(
             PANE_006,
             LABEL_006,
             "failure",
             "wait/monitored/006",
-        ));
+        ),
+    );
 }
 
 const PANE_007: &str = "wait-monitored-pane-007-outcome-cancelled";
@@ -758,17 +773,15 @@ const LABEL_007: &str = "wait-monitored-label-007-outcome-cancelled";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_007_outcome_cancelled_clears_working() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/007 runtime")
-        .block_on(wait_monitored_outcome_clears_working_inner(
+    run_async_test(
+        "wait/monitored/007",
+        wait_monitored_outcome_clears_working_inner(
             PANE_007,
             LABEL_007,
             "cancelled",
             "wait/monitored/007",
-        ));
+        ),
+    );
 }
 
 const PANE_008: &str = "wait-monitored-pane-008-outcome-timeout";
@@ -780,17 +793,15 @@ const LABEL_008: &str = "wait-monitored-label-008-outcome-timeout";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_008_outcome_timeout_clears_working() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/008 runtime")
-        .block_on(wait_monitored_outcome_clears_working_inner(
+    run_async_test(
+        "wait/monitored/008",
+        wait_monitored_outcome_clears_working_inner(
             PANE_008,
             LABEL_008,
             "timeout",
             "wait/monitored/008",
-        ));
+        ),
+    );
 }
 
 const PANE_009: &str = "wait-monitored-pane-009-ttl-2f91ab";
@@ -807,12 +818,10 @@ const LABEL_009: &str = "wait-monitored-label-009-ttl-selfheal";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_009_ttl_self_heals_without_explicit_done() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/009 runtime")
-        .block_on(wait_monitored_009_ttl_self_heals_without_explicit_done_inner());
+    run_async_test(
+        "wait/monitored/009",
+        wait_monitored_009_ttl_self_heals_without_explicit_done_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -829,36 +838,34 @@ async fn wait_monitored_009_ttl_self_heals_without_explicit_done_inner() {
         &[("DOT_AGENT_DECK_WAIT_TTL_SECS", "2")],
     )
     .await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/009: `wait start {LABEL_009}` with a 2s TTL override must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!(
+            "wait/monitored/009: `wait start {LABEL_009}` with a 2s TTL override must succeed"
+        ),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/009 (after start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/009 (after start): {e}"));
+    .await;
 
     // Deliberately no `wait done` call. Sleep past the 2s TTL plus enough
     // margin for the 500ms shell-activity poll cadence and a sweep tick to
     // notice, then confirm the self-heal happened with nobody clearing it
     // explicitly.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Idle,
         Duration::from_secs(5),
+        "wait/monitored/009 (TTL self-heal)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/009 (TTL self-heal): {e}"));
+    .await;
 
     daemon.registry.shutdown_all();
 }
@@ -887,12 +894,10 @@ const LABEL_010: &str = "wait-monitored-label-010-ttl-refresh";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_010_repeated_start_refresh_still_lets_done_clear() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/010 runtime")
-        .block_on(wait_monitored_010_repeated_start_refresh_still_lets_done_clear_inner());
+    run_async_test(
+        "wait/monitored/010",
+        wait_monitored_010_repeated_start_refresh_still_lets_done_clear_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -903,31 +908,23 @@ async fn wait_monitored_010_repeated_start_refresh_still_lets_done_clear_inner()
     let pane = setup_idle_pane(&daemon, &cwd_str, PANE_010).await;
 
     let start1 = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_010], &[]).await;
-    assert!(
-        start1.status.success(),
-        "wait/monitored/010: first `wait start {LABEL_010}` must succeed; status={:?} \
-         stdout={:?} stderr={:?}",
-        start1.status,
-        start1.stdout,
-        start1.stderr
+    assert_wait_cli_succeeded(
+        &start1,
+        &format!("wait/monitored/010: first `wait start {LABEL_010}` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/010 (after first start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/010 (after first start): {e}"));
+    .await;
 
     let start2 = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_010], &[]).await;
-    assert!(
-        start2.status.success(),
-        "wait/monitored/010: second (refreshing) `wait start {LABEL_010}` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        start2.status,
-        start2.stdout,
-        start2.stderr
+    assert_wait_cli_succeeded(
+        &start2,
+        &format!("wait/monitored/010: second (refreshing) `wait start {LABEL_010}` must succeed"),
     );
     assert_status_holds(
         &daemon,
@@ -945,13 +942,9 @@ async fn wait_monitored_010_repeated_start_refresh_still_lets_done_clear_inner()
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/010: `wait done {LABEL_010} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/010: `wait done {LABEL_010} --outcome success` must succeed"),
     );
     wait_for_status(
         &daemon,
@@ -990,12 +983,10 @@ const LABEL_011: &str = "wait-monitored-label-011-composition-or";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_011_composition_is_or_not_mutual_clobber() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/011 runtime")
-        .block_on(wait_monitored_011_composition_is_or_not_mutual_clobber_inner());
+    run_async_test(
+        "wait/monitored/011",
+        wait_monitored_011_composition_is_or_not_mutual_clobber_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -1007,22 +998,18 @@ async fn wait_monitored_011_composition_is_or_not_mutual_clobber_inner() {
     let session_id = format!("{PANE_011}-session");
 
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_011], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/011: `wait start {LABEL_011}` must succeed; status={:?} stdout={:?} \
-         stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/011: `wait start {LABEL_011}` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/011 (after start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/011 (after start): {e}"));
+    .await;
 
     // A real foreground descendant starts on the SAME pane, the way
     // `run_shell_activity_monitor` would report it — injected directly over
@@ -1055,13 +1042,9 @@ async fn wait_monitored_011_composition_is_or_not_mutual_clobber_inner() {
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/011: `wait done {LABEL_011} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/011: `wait done {LABEL_011} --outcome success` must succeed"),
     );
 
     // The descendant this ShellBusy represents never went idle, so
@@ -1251,12 +1234,10 @@ const LABEL_014: &str = "wait-monitored-label-014-broadcast";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_014_promotion_reaches_an_attached_client_via_broadcast() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/014 runtime")
-        .block_on(wait_monitored_014_promotion_reaches_an_attached_client_via_broadcast_inner());
+    run_async_test(
+        "wait/monitored/014",
+        wait_monitored_014_promotion_reaches_an_attached_client_via_broadcast_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -1269,24 +1250,20 @@ async fn wait_monitored_014_promotion_reaches_an_attached_client_via_broadcast_i
     let mut events = daemon.event_tx.subscribe();
 
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_014], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/014: `wait start {LABEL_014}` must succeed; status={:?} stdout={:?} \
-         stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/014: `wait start {LABEL_014}` must succeed"),
     );
     // Precondition, matching round 1's own daemon-side read: the daemon's
     // OWN AppState does reach Working.
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/014 (daemon-side precondition)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/014 (daemon-side precondition): {e}"));
+    .await;
 
     let pane_id = pane.pane_id.clone();
     let observed = tokio::time::timeout(Duration::from_secs(3), async {
@@ -1352,12 +1329,10 @@ const LABEL_015_WRONG: &str = "wait-monitored-label-015-different-check";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_015_label_mismatch_still_clears_the_active_wait() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/015 runtime")
-        .block_on(wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner());
+    run_async_test(
+        "wait/monitored/015",
+        wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -1368,22 +1343,18 @@ async fn wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner() 
     let pane = setup_idle_pane(&daemon, &cwd_str, PANE_015).await;
 
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_015_ACTIVE], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/015: `wait start {LABEL_015_ACTIVE}` must succeed; status={:?} \
-         stdout={:?} stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/015: `wait start {LABEL_015_ACTIVE}` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/015 (after start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/015 (after start): {e}"));
+    .await;
 
     let done = run_wait_cli(
         &daemon,
@@ -1392,14 +1363,10 @@ async fn wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner() 
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
+    assert_wait_cli_succeeded(
+        &done,
         "wait/monitored/015 (MEDIUM 9): `wait done` naming a DIFFERENT label than the pane's \
-         active wait must still exit successfully (clear-anyway-with-warning, not refuse) — \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+         active wait must still exit successfully (clear-anyway-with-warning, not refuse)",
     );
     wait_for_status(
         &daemon,
@@ -1439,23 +1406,24 @@ async fn wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner() 
 // field would otherwise pass this check silently.
 // ---------------------------------------------------------------------------
 
-/// The pane's current `(status, monitored_wait_active, wait_synthetic_working,
-/// shell_descendant_busy, wait_deferred_revert)` tuple, read directly off the
-/// DAEMON's own `AppState` — `None` if no session names this pane at all.
+/// The `(status, monitored_wait_active, wait_synthetic_working,
+/// shell_descendant_busy, wait_deferred_revert)` tuple for `pane_id` inside
+/// `state` — `None` if no session names this pane at all. Shared by
+/// [`daemon_composition_state`] and [`client_composition_state`] (PRD #499
+/// round 7, SonarCloud duplication), which differ only in where `state`
+/// comes from — the daemon's own live `AppState` behind a lock, versus an
+/// independent client `AppState` built by replaying broadcast events.
 ///
 /// MEDIUM J (PRD #499 round 6): `wait_deferred_revert` was added in round 5
 /// but never joined this tuple, so a future daemon-only write to that field
 /// — precisely the defect this convergence check exists to catch — would
 /// pass silently. Extended here to close that gap.
 #[cfg(unix)]
-async fn daemon_composition_state(
-    daemon: &common::InProcDaemon,
+fn composition_state_tuple(
+    state: &AppState,
     pane_id: &str,
 ) -> Option<(SessionStatus, bool, bool, bool, bool)> {
-    daemon
-        .state
-        .read()
-        .await
+    state
         .sessions
         .values()
         .find(|s| s.pane_id.as_deref() == Some(pane_id))
@@ -1470,30 +1438,28 @@ async fn daemon_composition_state(
         })
 }
 
-/// The identical tuple [`daemon_composition_state`] reads, but off an
-/// independent, freshly-constructed CLIENT `AppState` that has only ever
-/// seen events replayed onto it via `apply_event` — never read from the
-/// daemon's own state directly. This is the read that would have caught
-/// round 2's BLOCKER A/B1: a daemon-only `AppState::monitored_waits` map
-/// gave the two answers above no reason to agree.
+/// [`composition_state_tuple`] read directly off the DAEMON's own live
+/// `AppState`.
+#[cfg(unix)]
+async fn daemon_composition_state(
+    daemon: &common::InProcDaemon,
+    pane_id: &str,
+) -> Option<(SessionStatus, bool, bool, bool, bool)> {
+    let state = daemon.state.read().await;
+    composition_state_tuple(&state, pane_id)
+}
+
+/// [`composition_state_tuple`] read off an independent, freshly-constructed
+/// CLIENT `AppState` that has only ever seen events replayed onto it via
+/// `apply_event` — never read from the daemon's own state directly. This is
+/// the read that would have caught round 2's BLOCKER A/B1: a daemon-only
+/// `AppState::monitored_waits` map gave the two answers no reason to agree.
 #[cfg(unix)]
 fn client_composition_state(
     client_state: &AppState,
     pane_id: &str,
 ) -> Option<(SessionStatus, bool, bool, bool, bool)> {
-    client_state
-        .sessions
-        .values()
-        .find(|s| s.pane_id.as_deref() == Some(pane_id))
-        .map(|s| {
-            (
-                s.status.clone(),
-                s.monitored_wait_active,
-                s.wait_synthetic_working,
-                s.shell_descendant_busy,
-                s.wait_deferred_revert,
-            )
-        })
+    composition_state_tuple(client_state, pane_id)
 }
 
 /// Await the next broadcast event naming `pane_id` on `events` — the same
@@ -1547,12 +1513,10 @@ const LABEL_016_B: &str = "wait-monitored-label-016b-replay-shell";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_016_daemon_and_client_converge_across_replayed_events() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/016 runtime")
-        .block_on(wait_monitored_016_daemon_and_client_converge_across_replayed_events_inner());
+    run_async_test(
+        "wait/monitored/016",
+        wait_monitored_016_daemon_and_client_converge_across_replayed_events_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -1569,13 +1533,9 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
     client_a.register_pane(pane_a.pane_id.clone());
 
     let start_a = run_wait_cli(&daemon, &pane_a.pane_id, &["start", LABEL_016_A], &[]).await;
-    assert!(
-        start_a.status.success(),
-        "wait/monitored/016 (case A): `wait start {LABEL_016_A}` must succeed; status={:?} \
-         stdout={:?} stderr={:?}",
-        start_a.status,
-        start_a.stdout,
-        start_a.stderr
+    assert_wait_cli_succeeded(
+        &start_a,
+        &format!("wait/monitored/016 (case A): `wait start {LABEL_016_A}` must succeed"),
     );
     let start_event = recv_matching_event(&mut events_a, &pane_a.pane_id, Duration::from_secs(3))
         .await
@@ -1587,14 +1547,14 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
             )
         });
     client_a.apply_event(start_event);
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane_a.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/016 (case A, after wait start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/016 (case A, after wait start): {e}"));
+    .await;
     assert_eq!(
         client_composition_state(&client_a, &pane_a.pane_id),
         daemon_composition_state(&daemon, &pane_a.pane_id).await,
@@ -1656,13 +1616,11 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
         &[],
     )
     .await;
-    assert!(
-        done_a.status.success(),
-        "wait/monitored/016 (case A): `wait done {LABEL_016_A} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done_a.status,
-        done_a.stdout,
-        done_a.stderr
+    assert_wait_cli_succeeded(
+        &done_a,
+        &format!(
+            "wait/monitored/016 (case A): `wait done {LABEL_016_A} --outcome success` must succeed"
+        ),
     );
     let done_event_a = recv_matching_event(&mut events_a, &pane_a.pane_id, Duration::from_secs(3))
         .await
@@ -1670,14 +1628,14 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
             panic!("wait/monitored/016 (case A): `wait done` must also broadcast an event")
         });
     client_a.apply_event(done_event_a);
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane_a.pane_id,
         &SessionStatus::Idle,
         Duration::from_secs(5),
+        "wait/monitored/016 (case A, after wait done)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/016 (case A, after wait done): {e}"));
+    .await;
     assert_eq!(
         client_composition_state(&client_a, &pane_a.pane_id),
         daemon_composition_state(&daemon, &pane_a.pane_id).await,
@@ -1695,26 +1653,22 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
     client_b.register_pane(pane_b.pane_id.clone());
 
     let start_b = run_wait_cli(&daemon, &pane_b.pane_id, &["start", LABEL_016_B], &[]).await;
-    assert!(
-        start_b.status.success(),
-        "wait/monitored/016 (case B): `wait start {LABEL_016_B}` must succeed; status={:?} \
-         stdout={:?} stderr={:?}",
-        start_b.status,
-        start_b.stdout,
-        start_b.stderr
+    assert_wait_cli_succeeded(
+        &start_b,
+        &format!("wait/monitored/016 (case B): `wait start {LABEL_016_B}` must succeed"),
     );
     let start_event_b = recv_matching_event(&mut events_b, &pane_b.pane_id, Duration::from_secs(3))
         .await
         .unwrap_or_else(|| panic!("wait/monitored/016 (case B): `wait start` must broadcast"));
     client_b.apply_event(start_event_b);
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane_b.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/016 (case B, after wait start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/016 (case B, after wait start): {e}"));
+    .await;
     assert_eq!(
         client_composition_state(&client_b, &pane_b.pane_id),
         daemon_composition_state(&daemon, &pane_b.pane_id).await,
@@ -1759,13 +1713,11 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
         &[],
     )
     .await;
-    assert!(
-        done_b.status.success(),
-        "wait/monitored/016 (case B): `wait done {LABEL_016_B} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done_b.status,
-        done_b.stdout,
-        done_b.stderr
+    assert_wait_cli_succeeded(
+        &done_b,
+        &format!(
+            "wait/monitored/016 (case B): `wait done {LABEL_016_B} --outcome success` must succeed"
+        ),
     );
     let done_event_b = recv_matching_event(&mut events_b, &pane_b.pane_id, Duration::from_secs(3))
         .await
@@ -2020,12 +1972,10 @@ const LABEL_019: &str = "wait-monitored-label-019-headline-tool";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/019 runtime")
-        .block_on(wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_inner());
+    run_async_test(
+        "wait/monitored/019",
+        wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -2050,14 +2000,14 @@ async fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_
         .expect("serialize ToolStart event"),
     )
     .expect("write ToolStart event to the daemon hook socket");
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/019 (after ToolStart)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/019 (after ToolStart): {e}"));
+    .await;
 
     // 2. ToolEnd — declines (status != WaitingForInput); no visible change.
     common::write_hook_line(
@@ -2085,13 +2035,9 @@ async fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_
     // (not Idle/Unknown), so it declines to promote and
     // `wait_synthetic_working` is never set.
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_019], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/019: `wait start {LABEL_019}` must succeed; status={:?} stdout={:?} \
-         stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/019: `wait start {LABEL_019}` must succeed"),
     );
     assert_status_holds(
         &daemon,
@@ -2130,13 +2076,9 @@ async fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/019: `wait done {LABEL_019} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/019: `wait done {LABEL_019} --outcome success` must succeed"),
     );
     wait_for_status(
         &daemon,
@@ -2176,12 +2118,10 @@ const LABEL_020: &str = "wait-monitored-label-020-direction-a-tail";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_020_direction_a_tail_shell_idle_still_reverts() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/020 runtime")
-        .block_on(wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner());
+    run_async_test(
+        "wait/monitored/020",
+        wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -2195,22 +2135,18 @@ async fn wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner() {
     // 1. `wait start` on an Idle pane — MonitoredWaitStart promotes:
     // status = Working, wait_synthetic_working = true.
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_020], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/020: `wait start {LABEL_020}` must succeed; status={:?} stdout={:?} \
-         stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/020: `wait start {LABEL_020}` must succeed"),
     );
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/020 (after wait start)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/020 (after wait start): {e}"));
+    .await;
 
     // 2. Injected ShellBusy — declines to promote (already Working);
     // shell_descendant_busy = true unconditionally, shell_synthetic_working
@@ -2245,13 +2181,9 @@ async fn wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner() {
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/020: `wait done {LABEL_020} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/020: `wait done {LABEL_020} --outcome success` must succeed"),
     );
     assert_status_holds(
         &daemon,
@@ -2317,12 +2249,10 @@ const LABEL_021: &str = "wait-monitored-label-021-direction-b-tail";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_021_direction_b_tail_wait_done_still_reverts() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/021 runtime")
-        .block_on(wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner());
+    run_async_test(
+        "wait/monitored/021",
+        wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -2346,26 +2276,22 @@ async fn wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner() {
         .expect("serialize synthetic ShellBusy event"),
     )
     .expect("write synthetic ShellBusy event to the daemon hook socket");
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/021 (after injected ShellBusy)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/021 (after injected ShellBusy): {e}"));
+    .await;
 
     // 2. `wait start` — MonitoredWaitStart lands on an already-Working card
     // (not Idle/Unknown), so it declines to promote and
     // wait_synthetic_working is never set.
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_021], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/021: `wait start {LABEL_021}` must succeed; status={:?} stdout={:?} \
-         stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/021: `wait start {LABEL_021}` must succeed"),
     );
     assert_status_holds(
         &daemon,
@@ -2412,13 +2338,9 @@ async fn wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner() {
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/021: `wait done {LABEL_021} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/021: `wait done {LABEL_021} --outcome success` must succeed"),
     );
     wait_for_status(
         &daemon,
@@ -2523,12 +2445,10 @@ const LABEL_023: &str = "wait-monitored-label-023-direction-a-deferred-tail";
 #[test]
 #[cfg(unix)]
 fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build wait/monitored/023 runtime")
-        .block_on(wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner());
+    run_async_test(
+        "wait/monitored/023",
+        wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner(),
+    );
 }
 
 #[cfg(unix)]
@@ -2553,14 +2473,14 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
         .expect("serialize ToolStart event"),
     )
     .expect("write ToolStart event to the daemon hook socket");
-    wait_for_status(
+    assert_reaches_status(
         &daemon,
         &pane.pane_id,
         &SessionStatus::Working,
         Duration::from_secs(5),
+        "wait/monitored/023 (after ToolStart)",
     )
-    .await
-    .unwrap_or_else(|e| panic!("wait/monitored/023 (after ToolStart): {e}"));
+    .await;
 
     // 2. ToolEnd — declines (status != WaitingForInput); no visible change.
     common::write_hook_line(
@@ -2588,13 +2508,9 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
     // (not Idle/Unknown), so it declines to promote and
     // wait_synthetic_working is never set.
     let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_023], &[]).await;
-    assert!(
-        start.status.success(),
-        "wait/monitored/023: `wait start {LABEL_023}` must succeed; status={:?} stdout={:?} \
-         stderr={:?}",
-        start.status,
-        start.stdout,
-        start.stderr
+    assert_wait_cli_succeeded(
+        &start,
+        &format!("wait/monitored/023: `wait start {LABEL_023}` must succeed"),
     );
     assert_status_holds(
         &daemon,
@@ -2660,13 +2576,9 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
         &[],
     )
     .await;
-    assert!(
-        done.status.success(),
-        "wait/monitored/023: `wait done {LABEL_023} --outcome success` must succeed; \
-         status={:?} stdout={:?} stderr={:?}",
-        done.status,
-        done.stdout,
-        done.stderr
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/023: `wait done {LABEL_023} --outcome success` must succeed"),
     );
     assert_status_holds(
         &daemon,
