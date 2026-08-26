@@ -56,6 +56,9 @@ fn fixture_session() -> SessionState {
         agent_id: Some("1".to_string()),
         display_name: None,
         shell_synthetic_working: false,
+        monitored_wait_active: false,
+        wait_synthetic_working: false,
+        shell_descendant_busy: false,
         model: None,
         expects_agent_report: false,
     }

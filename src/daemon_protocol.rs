@@ -4716,6 +4716,9 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
                 model: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
@@ -4753,6 +4756,9 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
                 model: None,
             }),
             spawned_at_ms: None,
@@ -4830,6 +4836,9 @@ mod tests {
             agent_id: Some("agent-745".into()),
             display_name: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
             model: None,
             expects_agent_report: false,
         };

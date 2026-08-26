@@ -280,6 +280,9 @@ mod tests {
             live_target: None,
             last_activity_ms: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
             model: None,
         }
     }
