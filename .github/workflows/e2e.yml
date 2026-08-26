@@ -232,18 +232,22 @@ jobs:
       # always retrying — treat it as broken and file it.
       #
       # `--workspace` (issue #606): matches `.cargo/config.toml`'s `test-e2e`
-      # alias (`nextest run --workspace --features e2e`) exactly, the same
-      # flag-completeness reasoning as ci.yml's `build` job (rule 2's clippy
-      # widening, rule 5's `--workspace` on both nextest aliases). This job
-      # previously ran bare on the theory that ci.yml's `build` already covers
-      # `xtask/*` via its own `cargo nextest run --workspace` (no `e2e`
-      # feature) and no workspace member gates any test behind `e2e`, so
-      # adding it here re-runs the same xtask tests a second time for no new
-      # coverage today. That is still true — the xtask tests here are pure
-      # redundancy, and cheap: rule 5 measured the whole added set at ~0.07s
-      # wall. What bare invocation actually risked: if a workspace member ever
-      # grows its own `e2e`-gated test, this job would silently not run it
-      # unless someone remembered to come back and add the flag here — the
+      # alias (`nextest run --workspace --features e2e`) in package and
+      # feature selection — this job's own `--retries 2` is additional, not
+      # part of the alias — the same flag-completeness reasoning as ci.yml's
+      # `build` job (rule 2's clippy widening, rule 5's `--workspace` on both
+      # nextest aliases). This job previously ran bare on the theory that
+      # ci.yml's `build` already covers `xtask/*` on the same `ubuntu-latest`
+      # image via its own `cargo nextest run --workspace` (no `e2e` feature)
+      # and no workspace member gates any test behind `e2e`, so adding it here
+      # re-runs the same xtask tests a second time for no new coverage today.
+      # That is still true — the xtask tests here are pure redundancy, and
+      # free: measured A/B on this very change, the job ran 11050 tests in
+      # 726.9s bare and 11311 in 696.8s with the flag, so the 261 added tests
+      # and the three extra crates to compile are below the runner's own
+      # variance. What bare invocation actually risked: if a workspace member
+      # ever grows its own `e2e`-gated test, this job would silently not run
+      # it unless someone remembered to come back and add the flag here — the
       # exact kind of drift `--workspace` closes everywhere else it was added.
       # Matching the alias means that never has to be remembered again.
       - run: cargo nextest run --workspace --features e2e --retries 2
