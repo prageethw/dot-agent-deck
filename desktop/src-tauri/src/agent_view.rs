@@ -655,6 +655,9 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             shell_synthetic_working: false,
             model: None,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
         });
 
         let mut view = AgentView::default();
@@ -696,6 +699,9 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             shell_synthetic_working: false,
             model: None,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
         });
 
         let mut view = AgentView::default();

@@ -1360,7 +1360,7 @@ fn main() -> ExitCode {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
-                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a worker-agent-deck managed pane."
                     );
                     return ExitCode::FAILURE;
                 }
@@ -1458,7 +1458,7 @@ fn main() -> ExitCode {
                 Err(_) => {
                     eprintln!(
                         "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\n\
-                         This command should be run from within a dot-agent-deck managed pane."
+                         This command should be run from within a worker-agent-deck managed pane."
                     );
                     return ExitCode::FAILURE;
                 }
@@ -1582,7 +1582,7 @@ fn main() -> ExitCode {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
-                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a worker-agent-deck managed pane."
                     );
                     return ExitCode::FAILURE;
                 }
@@ -1639,7 +1639,7 @@ fn main() -> ExitCode {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
-                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a worker-agent-deck managed pane."
                     );
                     return ExitCode::FAILURE;
                 }
@@ -1702,7 +1702,7 @@ fn main() -> ExitCode {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
-                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a worker-agent-deck managed pane."
                     );
                     return ExitCode::FAILURE;
                 }
@@ -2128,7 +2128,7 @@ fn main() -> ExitCode {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
-                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a worker-agent-deck managed pane."
                     );
                     return ExitCode::FAILURE;
                 }
