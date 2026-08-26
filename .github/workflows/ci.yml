@@ -57,6 +57,7 @@ jobs:
     outputs:
       devbox_only: ${{ steps.detect.outputs.devbox_only }}
       flake_only: ${{ steps.detect.outputs.flake_only }}
+      docs_only: ${{ steps.detect.outputs.docs_only }}
     steps:
       - id: detect
         env:
@@ -67,16 +68,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Anything that is not a Renovate PR gets the full matrix. On `push` to
-          # main and on workflow_dispatch there is no pull_request payload, so
-          # PR_AUTHOR is empty and we exit here — which is what keeps the
-          # post-merge verification described above intact. That matters most for
-          # exactly these PRs: they land unreviewed, so the push-to-main run is
-          # the first time the Rust jobs ever see the merged result.
-          if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
-            echo "author='${PR_AUTHOR:-}' is not Renovate -> full CI"
+          # No PR payload at all (push to main's post-merge check, or a bare
+          # workflow_dispatch) -- always run the full matrix. This is what
+          # keeps the post-merge verification meaningful (see the trigger
+          # comment above): that run must never apply any reduction below.
+          if [ -z "${PR_NUMBER:-}" ]; then
+            echo "no PR number (push/workflow_dispatch) -> full CI"
             echo "devbox_only=false" >> "$GITHUB_OUTPUT"
             echo "flake_only=false" >> "$GITHUB_OUTPUT"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -84,7 +84,7 @@ jobs:
           # rather than aborting under `set -e`. A failed `changes` job would
           # skip every Rust job via `needs`, which is the one outcome worth
           # engineering against here.
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
           echo "changed files:"
           echo "$files"
 
@@ -92,6 +92,47 @@ jobs:
           # everything rather than read that as "nothing to test".
           if [ -z "$files" ]; then
             echo "no files reported -> full CI"
+            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            echo "flake_only=false" >> "$GITHUB_OUTPUT"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # docs_only applies to EVERY PR author, unlike devbox_only/flake_only
+          # below -- a doc-only diff can't move most of what the Rust/security/
+          # e2e jobs check, whoever wrote it, so there's no equivalent of "the
+          # author might grow this past devbox on the next push" risk to scope
+          # it to Renovate. `build` and `semgrep` stay unskipped even on a
+          # docs-only diff, though: `build`'s work-type-check is the only
+          # enforcement of CLAUDE.md rule 1's branch-prefix requirement and
+          # fires specifically on docs paths, and semgrep's secret scan reads
+          # Markdown too (PR #566). Mirrors .github/labeler.yml's own
+          # 'documentation' glob (docs/** or a root *.md/README*) -- note this
+          # is a hand-transcription, not a shared definition, so nothing keeps
+          # it in sync if labeler.yml's glob changes. A third, independently-
+          # diverging definition of "docs" lives in
+          # xtask/linkage-check/src/work_type.rs's is_doc_path (differs on
+          # site/**, prds/**, and README*) -- don't assume the three match.
+          docs_only=true
+          while IFS= read -r f; do
+            case "$f" in
+              docs/*) ;;
+              */*) docs_only=false ;;
+              *.md | README*) ;;
+              *) docs_only=false ;;
+            esac
+            [ "$docs_only" = false ] && break
+          done <<< "$files"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          if [ "$docs_only" = true ]; then
+            echo "docs-only diff -> skipping build-macos/build-windows/windows-cross-check/security/nix/sonarqube/e2e (build and semgrep still run)"
+          fi
+
+          # devbox_only / flake_only stay Renovate-scoped, unchanged from
+          # before: anything that is not a Renovate PR gets the full matrix
+          # for these two, regardless of what docs_only above decided.
+          if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
+            echo "author='${PR_AUTHOR:-}' is not Renovate -> devbox_only/flake_only stay false"
             echo "devbox_only=false" >> "$GITHUB_OUTPUT"
             echo "flake_only=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -134,7 +175,16 @@ jobs:
       # merge-base HEAD origin/main`, and on a `pull_request` event a depth-1
       # checkout has no `origin/main` ref at all — `list-tests` never ran in
       # CI, so this has never mattered before. A full clone is what makes
-      # that ref resolvable.
+      # that ref resolvable. Issue #259: `cargo xtask linkage-check`'s check
+      # 11 (resurrected-changelog-fragment detection) is a second consumer
+      # of the same property — it also resolves `origin/main` via
+      # `work_type::resolve_base`, and fails closed with a printed skip
+      # rather than a hard failure when it cannot (B1), so removing this
+      # flag would make check 11 quietly stop running rather than break the
+      # build outright. `cargo xtask linkage-check`'s check 12 (fork #281)
+      # is a third consumer of this same full-history requirement — it
+      # resolves both `refs/remotes/origin/main` and a merge-base against
+      # it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
@@ -248,6 +298,17 @@ jobs:
       # folded into the branch-prefix exemption list.
       - run: cargo xtask work-type-check --self-test
       - run: cargo xtask work-type-check
+      # PR #573 fix round / issue #286 — `.claude/hooks/check-issue-claim.sh
+      # --self-test` was invoked NOWHERE: no CI, no shellcheck, no Rust/e2e
+      # test touches it (reviewer M4, auditor A4 — both independently flagged
+      # this as its own blocker). Same pattern as the two self-tests above:
+      # exercised on every push before anything trusts the script. Needs no
+      # toolchain and no network (~0.3s here); the script's own header names
+      # both of those as its model. There is no "real invocation" pairing to
+      # add alongside it (unlike check-symlinks.sh/work-type-check above) —
+      # this script is a live PreToolUse hook, not a checker with a real
+      # target to run against in CI.
+      - run: .claude/hooks/check-issue-claim.sh --self-test
 
   # Issue #368 — run the LOCAL Windows pre-PR gate in CI, for one reason only:
   # so that it cannot rot again. `scripts/windows-cross-check.sh` had been
@@ -274,7 +335,7 @@ jobs:
   # runner with CC and AR unset is enough (verified).
   windows-cross-check:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -318,7 +379,7 @@ jobs:
   # tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9), not M8.
   build-windows:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -428,7 +489,7 @@ jobs:
   # `cargo nextest run` runs the same test-fast tier as the Linux `build` job.
   build-macos:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -460,6 +521,17 @@ jobs:
           # RUST_BACKTRACE comment. Capture only happens on panic, so this
           # tier's passing runs pay nothing.
           RUST_BACKTRACE: "1"
+      # PR #573 fix round 4 / issue #286, reviewer N6: the Linux `build` job
+      # above already runs this self-test, but that only ever answered the
+      # bash-3.2/macOS portability question by inspection (round-2 L5,
+      # round-3 N6 — the script's own risky-looking `"${NOTES[@]}"`/
+      # `"${MATCHES[@]}"` expansions are guarded by a length check first, but
+      # nobody had actually run the self-test on a bash this old). macOS
+      # ships bash 3.2 by default and this runner is real macOS, so this
+      # settles the question empirically rather than leaving it a guess.
+      # Same reasoning as the Linux placement: needs no toolchain and no
+      # network, so it costs nothing extra on the already-required job.
+      - run: .claude/hooks/check-issue-claim.sh --self-test
       # Issue #564: preserve THIS attempt's test results, so a job-level re-run
       # cannot destroy the evidence from a failing one.
       #
@@ -503,7 +575,7 @@ jobs:
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -547,7 +619,7 @@ jobs:
   # from-source release build of the whole crate.
   nix:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -716,7 +788,7 @@ jobs:
   # over findings Sonar is about to read anyway.
   sonarqube:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -787,6 +859,8 @@ jobs:
   # SCOPE: x86_64-linux only. The aarch64-darwin entries in devbox.lock stay
   # unvalidated; add a macos-latest leg if that gap starts to bite.
   devbox:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

@@ -21,10 +21,39 @@
 //! | Held by a different identity | `--takeover` | still refuses |
 //! | Held by a different identity | `--takeover --confirm-stopped` | claim, recording the takeover |
 //!
-//! The exit code is the mechanism — [`run_issue_claim`] returns `Err` for
-//! every refusal AND every operational failure alike, so the CLI wrapper in
-//! `main.rs` can map both uniformly to a non-zero exit; the two are
-//! distinguished only by the message text.
+//! `issue release` (issue #326) is the mirror-image write — see
+//! [`decide_release`] for the pure form:
+//!
+//! | State | Flags | Result |
+//! |---|---|---|
+//! | Unlabelled | — | refuse (nothing to release) |
+//! | Held by THIS identity | — | release |
+//! | Held by a DIFFERENT identity | — | refuse |
+//! | Labelled, no claim comment | — | refuse (identity unknown) |
+//! | Held by a different identity | `--force` | still refuses |
+//! | Held by a different identity | `--force --confirm-stopped` | release, recording who it was forced from |
+//! | Labelled, no claim comment | `--force` | still refuses |
+//! | Labelled, no claim comment | `--force --confirm-stopped` | release |
+//!
+//! `release` originally required only `--force` on its own (a single
+//! flag). Reviewer/auditor's fix round on PR #582 found that a bare
+//! `--force` alone unlocked an issue held by a different, known identity,
+//! after which an unflagged `issue claim` landed in exactly the end state
+//! `claim --takeover --confirm-stopped` reaches — routing around the
+//! deliberate two-flag friction that override requires (CLAUDE.md rule 23:
+//! "an agent can't satisfy the override in the same breath it discovers the
+//! conflict"), and the resulting claim comment recorded `takeover_from:
+//! None`, since it read as an ordinary claim on a now-unlabelled issue — the
+//! displacement fact survived only in the separate, earlier release
+//! comment. `release` now requires the SAME two flags together
+//! (`--force --confirm-stopped`) that `claim` does, mirroring its own
+//! precedent exactly.
+//!
+//! The exit code is the mechanism — [`run_issue_claim`] and
+//! [`run_issue_release`] both return `Err` for every refusal AND every
+//! operational failure alike, so the CLI wrapper in `main.rs` can map both
+//! uniformly to a non-zero exit; the two are distinguished only by the
+//! message text.
 
 use std::path::Path;
 use std::process::Command;
@@ -32,7 +61,8 @@ use std::process::Command;
 use crate::issue_dispatch::{
     IN_PROGRESS_LABEL, Identity, ParsedClaim, claim_comment_body, gh_current_login_argv,
     issue_comment_argv, issue_edit_add_label_argv, issue_edit_assignee_argv,
-    issue_view_claim_state_argv, parse_claim_state, sanitize_claimant_name, validate_gh_login,
+    issue_edit_remove_label_argv, issue_view_claim_state_argv, parse_claim_state,
+    release_comment_body, sanitize_claimant_name, validate_gh_login,
 };
 
 // ---------------------------------------------------------------------------
@@ -120,6 +150,82 @@ pub fn decide_claim(
     ClaimDecision::RefuseHeldByOther {
         holder,
         takeover_requested: takeover,
+    }
+}
+
+/// The pure release decision (issue #326) — the release-side mirror of
+/// [`ClaimDecision`]. `release` now requires the SAME two-step
+/// `--force --confirm-stopped` override [`decide_claim`]'s own
+/// `--takeover --confirm-stopped` requires, rather than `--force` alone
+/// (reviewer/auditor fix round, PR #582 — see this module's doc for the
+/// incident: a bare `--force` was a lower-friction route to the exact end
+/// state `claim --takeover --confirm-stopped` reaches, routing around the
+/// deliberate friction CLAUDE.md rule 23 requires of that override).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseDecision {
+    /// Release. `forced_from` names the identity displaced by a forced
+    /// release of a DIFFERENT holder's claim — `None` for releasing one's
+    /// own claim, or for a forced release of an issue whose holder identity
+    /// was never known (nothing to name).
+    Release { forced_from: Option<String> },
+    /// No `in-progress` label at all — nothing to release. Catches a
+    /// typo'd issue number rather than silently succeeding.
+    RefuseNothingToRelease,
+    /// Labelled but no claim comment names a holder — same ambiguous state
+    /// [`ClaimDecision::RefuseNoIdentity`] refuses on. Escapable with
+    /// `--force --confirm-stopped`, same as a known-holder refusal.
+    RefuseNoIdentity,
+    /// Held by a different identity. `force_requested` distinguishes the
+    /// two REFUSE rows that differ only in message — the release-side
+    /// mirror of [`ClaimDecision::RefuseHeldByOther`]'s own
+    /// `takeover_requested`: a bare refusal vs. `--force` alone (deliberate
+    /// friction — an agent must not be able to satisfy the override in the
+    /// same breath it discovers the conflict).
+    RefuseHeldByOther {
+        holder: String,
+        force_requested: bool,
+    },
+}
+
+/// The pure decision function backing [`ReleaseDecision`]'s doc table (see
+/// this module's own doc comment for the full release decision table).
+pub fn decide_release(
+    label_present: bool,
+    held: Option<&ParsedClaim>,
+    caller_identity: &str,
+    force: bool,
+    confirm_stopped: bool,
+) -> ReleaseDecision {
+    if !label_present {
+        return ReleaseDecision::RefuseNothingToRelease;
+    }
+    let Some(held) = held else {
+        // Escapable with the SAME two-step override as a known-holder
+        // refusal — see `RefuseNoIdentity`'s own doc, mirroring
+        // `decide_claim`'s identical `RefuseNoIdentity` branch.
+        return if force && confirm_stopped {
+            ReleaseDecision::Release { forced_from: None }
+        } else {
+            ReleaseDecision::RefuseNoIdentity
+        };
+    };
+    if held.identity == caller_identity {
+        return ReleaseDecision::Release { forced_from: None };
+    }
+    // Same untrusted-comment-content reasoning as `decide_claim`'s own
+    // `holder` field (auditor F3): sanitize before it is echoed into a
+    // refusal message or a release comment's "forcibly released from …"
+    // tail. The comparison just above already happened against the raw
+    // value, so this cannot change the decision itself.
+    let holder = sanitize_claimant_name(&held.identity);
+    if force && confirm_stopped {
+        return ReleaseDecision::Release {
+            forced_from: Some(holder),
+        };
+    }
+    ReleaseDecision::RefuseHeldByOther {
+        holder,
+        force_requested: force,
     }
 }
 
@@ -400,6 +506,35 @@ fn do_claim(
     Ok(())
 }
 
+/// Post the release comment, then remove the `in-progress` label — the
+/// release-side mirror of [`do_claim`]'s comment-FIRST, label-SECOND order
+/// (same reasoning: a failed comment write, the first call, simply leaves
+/// the issue still labelled and still discoverably held — recoverable by
+/// retrying release — rather than the inverse, an unlabelled issue with no
+/// discoverable release record). No assignee write: `release` (issue #326)
+/// only ever removes the label and posts a comment, unlike `claim`, which
+/// also replaces the assignee.
+fn do_release(
+    repo: &str,
+    issue: u64,
+    identity: &Identity,
+    login: Option<&str>,
+    forced_from: Option<&str>,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let body = release_comment_body(identity, &timestamp, login, forced_from, reason);
+    run_gh_status(&issue_comment_argv(repo, issue, &body))?;
+
+    run_gh_status(&issue_edit_remove_label_argv(
+        repo,
+        issue,
+        IN_PROGRESS_LABEL,
+    ))?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -516,6 +651,214 @@ pub fn run_issue_claim(
     }
 }
 
+/// Run `issue release <issue>` against `repo` (or, when `None`, the
+/// `owner/name` derived from `cwd`'s `origin` remote) — issue #326's
+/// missing release half of [`run_issue_claim`]'s lock: a stale claim (an
+/// orchestration that stopped) previously locked the issue against re-entry
+/// until someone manually posted a comment and stripped the label by hand.
+/// `Ok(message)` is the success text for stdout (exit 0); `Err(message)`
+/// covers both a refusal and an operational failure (exit non-zero) — same
+/// exit-code-is-the-mechanism discipline as [`run_issue_claim`].
+pub fn run_issue_release(
+    cwd: &Path,
+    repo: Option<&str>,
+    issue: u64,
+    force: bool,
+    confirm_stopped: bool,
+    reason: Option<&str>,
+) -> Result<String, String> {
+    let repo = match repo {
+        Some(r) => r.to_string(),
+        None => crate::worktree_reclaim::derive_repo_slug(cwd).ok_or_else(|| {
+            format!(
+                "could not derive an `owner/name` repo slug from {}'s `origin` remote; pass \
+                 --repo explicitly",
+                cwd.display()
+            )
+        })?,
+    };
+
+    let identity = resolve_caller_identity(cwd)?;
+    let (label_present, held, _current_assignees) = read_current_claim(&repo, issue)?;
+
+    match decide_release(
+        label_present,
+        held.as_ref(),
+        &identity.to_string(),
+        force,
+        confirm_stopped,
+    ) {
+        ReleaseDecision::Release { forced_from } => {
+            let login = resolve_assignee_login(&identity);
+            do_release(
+                &repo,
+                issue,
+                &identity,
+                login.as_deref(),
+                forced_from.as_deref(),
+                reason,
+            )?;
+            Ok(format!(
+                "released issue #{issue} of {repo} as `{identity}`\n"
+            ))
+        }
+        ReleaseDecision::RefuseNothingToRelease => Err(format!(
+            "issue #{issue} of {repo} is not labelled `{IN_PROGRESS_LABEL}` — nothing to \
+             release"
+        )),
+        ReleaseDecision::RefuseNoIdentity => Err(format!(
+            "issue #{issue} of {repo} is labelled `{IN_PROGRESS_LABEL}` but no claim comment \
+             names a holder — refusing (identity unknown); pass `--force --confirm-stopped` \
+             once you have confirmed there is nobody left holding this issue"
+        )),
+        ReleaseDecision::RefuseHeldByOther {
+            holder,
+            force_requested,
+        } => {
+            // Same sanitize-before-display discipline as `run_issue_claim`'s
+            // own `RefuseHeldByOther` arm — `holder` is already sanitized by
+            // `decide_release`, `timestamp` is a sibling field from the same
+            // untrusted comment and needs its own pass.
+            let since = held
+                .as_ref()
+                .map(|h| format!(" since {}", sanitize_claimant_name(&h.timestamp)))
+                .unwrap_or_default();
+            let instruction = if force_requested {
+                "`--force` alone does not release it — this is deliberate friction, mirroring \
+                 `issue claim`'s own `--takeover`-alone-still-refuses behavior, so an agent \
+                 can't satisfy the override in the same breath it discovers the conflict; \
+                 re-run with `--force --confirm-stopped` once you have confirmed the other \
+                 agent has stopped"
+            } else {
+                "pass `--force --confirm-stopped` once you have confirmed that agent has \
+                 stopped"
+            };
+            Err(format!(
+                "issue #{issue} of {repo} is held by `{holder}`{since} — {instruction}"
+            ))
+        }
+    }
+}
+
+/// The outcome of [`run_issue_claim_check`] — PR #573 review-round fix
+/// (reviewer B1/B2, auditor A5): a plain `Result<String, String>` collapses
+/// a confident lock refusal, a genuinely ambiguous state, and an
+/// operational failure (the checker binary missing, `gh` unauthenticated,
+/// or [`resolve_caller_identity`] refusing because the caller is an
+/// agent-shaped pane whose cwd is not a linked worktree — e.g. the
+/// orchestrator running in the root checkout, which is normal and common
+/// per CLAUDE.md rule 17) into the SAME `Err` arm. The CLI wrapper in
+/// `main.rs` maps each variant to a DISTINCT exit code so the calling hook
+/// script can tell them apart and react correctly to each:
+///
+/// | Variant | Exit code | Hook should |
+/// |---|---|---|
+/// | [`Clear`](ClaimCheckOutcome::Clear) | 0 | allow |
+/// | [`RefusedByLock`](ClaimCheckOutcome::RefusedByLock) | 1 | deny — confident violation |
+/// | (clap usage error — never assigned here) | 2 | reserved by `clap`; see below |
+/// | [`CouldNotDetermine`](ClaimCheckOutcome::CouldNotDetermine) | 3 | allow, but surface the reason |
+/// | [`Ambiguous`](ClaimCheckOutcome::Ambiguous) | 4 | ask (or deny if "ask" is unsupported) |
+///
+/// Code 2 is deliberately skipped (round-2 fix, reviewer B5 / auditor R3):
+/// it is clap's own reserved usage-error exit code, so a `worker-agent-deck`
+/// binary predating this subcommand answers `claim-check` with exit 2 from a
+/// `clap` parse failure — not from this enum at all. Assigning 2 to a real
+/// variant here would make that stale-binary case indistinguishable from a
+/// genuine outcome and fabricate a reason nothing determined. Do not
+/// renumber ANY of these without updating
+/// `.claude/hooks/check-issue-claim.sh`'s `case` statement in the same
+/// commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimCheckOutcome {
+    /// `ClaimDecision::Claim` — nobody holds the issue, or the caller
+    /// already does. Safe to proceed.
+    Clear(String),
+    /// `ClaimDecision::RefuseHeldByOther` — a DIFFERENT identity holds the
+    /// issue. A confident violation; the caller should not proceed.
+    RefusedByLock(String),
+    /// `ClaimDecision::RefuseNoIdentity` — labelled but no claim comment
+    /// names a holder. Genuinely ambiguous, per CLAUDE.md rule 14's own
+    /// guidance to escalate rather than silently adopt.
+    Ambiguous(String),
+    /// Repo resolution, identity resolution, or the `gh` read failed —
+    /// nothing about the LOCK could be determined at all. This is the
+    /// operational-failure case [`run_issue_claim`]'s doc comment folds
+    /// into the same `Err` as a refusal; here it is kept distinct on
+    /// purpose, since a caller that could not even ask the question must
+    /// never be treated the same as one who asked and was refused.
+    CouldNotDetermine(String),
+}
+
+/// Run `issue claim-check <issue>` against `repo` — the READ-ONLY
+/// counterpart to [`run_issue_claim`] (issue #286), built specifically to
+/// back a Claude Code `PreToolUse` hook that gates `gh issue
+/// comment`/`close`/`edit` and a closing `gh pr merge` on the same identity
+/// lock `issue claim` enforces, without the hook itself ever mutating the
+/// issue. Runs the exact same `resolve_caller_identity` →
+/// `read_current_claim` → `decide_claim` sequence [`run_issue_claim`] does —
+/// with `takeover`/`confirm_stopped` always `false`, since this command
+/// accepts neither flag — but on `ClaimDecision::Claim` stops there: no
+/// `do_claim`, no comment/label/assignee write of any kind. See
+/// [`ClaimCheckOutcome`] for why this returns a 4-way enum rather than a
+/// `Result`: an operational failure must never be indistinguishable from a
+/// confident refusal to whatever calls this.
+pub fn run_issue_claim_check(cwd: &Path, repo: Option<&str>, issue: u64) -> ClaimCheckOutcome {
+    let repo = match repo {
+        Some(r) => r.to_string(),
+        None => match crate::worktree_reclaim::derive_repo_slug(cwd) {
+            Some(r) => r,
+            None => {
+                return ClaimCheckOutcome::CouldNotDetermine(format!(
+                    "could not derive an `owner/name` repo slug from {}'s `origin` remote; pass \
+                     --repo explicitly",
+                    cwd.display()
+                ));
+            }
+        },
+    };
+
+    let identity = match resolve_caller_identity(cwd) {
+        Ok(identity) => identity,
+        Err(e) => return ClaimCheckOutcome::CouldNotDetermine(e),
+    };
+    let (label_present, held, _current_assignees) = match read_current_claim(&repo, issue) {
+        Ok(v) => v,
+        Err(e) => return ClaimCheckOutcome::CouldNotDetermine(e),
+    };
+
+    match decide_claim(
+        label_present,
+        held.as_ref(),
+        &identity.to_string(),
+        false,
+        false,
+    ) {
+        ClaimDecision::Claim { .. } => ClaimCheckOutcome::Clear(format!(
+            "ok to proceed on issue #{issue} of {repo} as `{identity}`\n"
+        )),
+        ClaimDecision::RefuseNoIdentity => ClaimCheckOutcome::Ambiguous(format!(
+            "issue #{issue} of {repo} is labelled `{IN_PROGRESS_LABEL}` but no claim comment \
+             names a holder — refusing (identity unknown); this is likely a hand-typed claim \
+             applied outside `dot-agent-deck issue claim`"
+        )),
+        ClaimDecision::RefuseHeldByOther { holder, .. } => {
+            // Same sanitize-before-display discipline as `run_issue_claim`'s
+            // own `RefuseHeldByOther` arm (auditor A4) — `holder` is already
+            // sanitized by `decide_claim`, `timestamp` is a sibling field
+            // from the same untrusted comment and needs its own pass.
+            let since = held
+                .as_ref()
+                .map(|h| format!(" since {}", sanitize_claimant_name(&h.timestamp)))
+                .unwrap_or_default();
+            ClaimCheckOutcome::RefusedByLock(format!(
+                "issue #{issue} of {repo} is held by `{holder}`{since} — resolve via `issue \
+                 claim --takeover --confirm-stopped` once you have confirmed the other agent \
+                 has stopped, then retry"
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +962,107 @@ mod tests {
                 takeover_from: None
             }
         );
+    }
+
+    // --- issue #326: decide_release ---
+
+    #[test]
+    fn decide_release_unlabelled_refuses_nothing_to_release() {
+        assert_eq!(
+            decide_release(false, None, "orchestration:a@h:1", false, false),
+            ReleaseDecision::RefuseNothingToRelease
+        );
+        assert_eq!(
+            decide_release(false, None, "orchestration:a@h:1", true, true),
+            ReleaseDecision::RefuseNothingToRelease
+        );
+    }
+
+    #[test]
+    fn decide_release_own_claim_releases() {
+        let held = claim("orchestration:a@h:1", Some("alice"), "ts");
+        assert_eq!(
+            decide_release(true, Some(&held), "orchestration:a@h:1", false, false),
+            ReleaseDecision::Release { forced_from: None }
+        );
+    }
+
+    #[test]
+    fn decide_release_held_by_other_no_flags_refuses() {
+        let held = claim("orchestration:a@h:1", Some("alice"), "ts");
+        assert_eq!(
+            decide_release(true, Some(&held), "orchestration:b@h:2", false, false),
+            ReleaseDecision::RefuseHeldByOther {
+                holder: "orchestration:a@h:1".to_string(),
+                force_requested: false,
+            }
+        );
+    }
+
+    // --- reviewer/auditor fix round, PR #582: `--force` alone must not be
+    // enough — it must not be a lower-friction route to the same end state
+    // `claim --takeover --confirm-stopped` reaches (CLAUDE.md rule 23).
+
+    #[test]
+    fn decide_release_force_alone_still_refuses() {
+        let held = claim("orchestration:a@h:1", Some("alice"), "ts");
+        assert_eq!(
+            decide_release(true, Some(&held), "orchestration:b@h:2", true, false),
+            ReleaseDecision::RefuseHeldByOther {
+                holder: "orchestration:a@h:1".to_string(),
+                force_requested: true,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_release_held_by_other_with_force_and_confirm_stopped_releases_naming_who() {
+        let held = claim("orchestration:a@h:1", Some("alice"), "ts");
+        assert_eq!(
+            decide_release(true, Some(&held), "orchestration:b@h:2", true, true),
+            ReleaseDecision::Release {
+                forced_from: Some("orchestration:a@h:1".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn decide_release_no_identity_no_flags_refuses() {
+        assert_eq!(
+            decide_release(true, None, "orchestration:a@h:1", false, false),
+            ReleaseDecision::RefuseNoIdentity
+        );
+    }
+
+    #[test]
+    fn decide_release_no_identity_force_alone_still_refuses() {
+        assert_eq!(
+            decide_release(true, None, "orchestration:a@h:1", true, false),
+            ReleaseDecision::RefuseNoIdentity
+        );
+    }
+
+    #[test]
+    fn decide_release_no_identity_escapes_with_force_and_confirm_stopped() {
+        assert_eq!(
+            decide_release(true, None, "orchestration:a@h:1", true, true),
+            ReleaseDecision::Release { forced_from: None }
+        );
+    }
+
+    #[test]
+    fn decide_release_sanitizes_held_identity_before_displaying_it() {
+        let held = claim("worktree:/work/evil\ninjected@branch", Some("alice"), "ts");
+        match decide_release(true, Some(&held), "orchestration:b@h:2", false, false) {
+            ReleaseDecision::RefuseHeldByOther { holder, .. } => {
+                assert!(
+                    !holder.contains('\n'),
+                    "a raw newline parsed out of a held claim comment must not survive into a \
+                     new refusal message/comment tail, got {holder:?}"
+                );
+            }
+            other => panic!("expected RefuseHeldByOther, got {other:?}"),
+        }
     }
 
     // --- auditor F3: a held identity's display is sanitized before reuse ---

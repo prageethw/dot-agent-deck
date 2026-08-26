@@ -365,6 +365,9 @@ impl DaemonClient {
                 live: None,
                 daemon_boot_id: None,
                 registration_generation: None,
+                outstanding_delegation: None,
+                silence_watch: None,
+                delegation_commission: None,
             })
             .collect())
     }
@@ -1242,6 +1245,9 @@ mod tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -1267,6 +1273,9 @@ mod tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

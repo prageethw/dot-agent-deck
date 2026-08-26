@@ -1831,15 +1831,23 @@ fn git_in_untrusted_dir(dir: &Path) -> Command {
 ///   artifact and correctly reports `owned: false` rather than being
 ///   hidden — mirroring how `owned_git_dir` returning `None` yields
 ///   `owned: false`, never a dropped row.
-/// - **Stale entries.** The artifact is never removed when a clone is
-///   later deleted, so it would vouch for an unrelated directory recreated
-///   at the same path afterward, if that later directory canonicalizes to
-///   the identical clone-dir path the hash was computed from — in practice
-///   this requires reusing the exact same `clone_dir` path after a prior
-///   clone there was destroyed. Broader than a naive per-clone-tree
-///   artifact would be (this one outlives the clone's own deletion by
-///   design), but no broader than M4a's own shared-namespace staleness, and
-///   nothing else in the deck ever writes into this directory.
+/// - **Stale entries.** [`remove_isolated_clone_dir`] now clears the
+///   artifact (best-effort) immediately after removing the clone directory
+///   it names (fork issue #546 hazard 1), so the removal path this deck
+///   itself drives no longer leaves it behind. What remains is narrower
+///   than the original claim: a clone destroyed by some other means (a
+///   manual `rm -rf`, or a removal whose marker-clearing step itself fails
+///   — logged and tolerated, never a hard failure, per that function's own
+///   doc comment) still leaves the artifact in place, and it would then
+///   vouch for an unrelated directory recreated at the same path
+///   afterward, if that later directory canonicalizes to the identical
+///   clone-dir path the hash was computed from — in practice this requires
+///   reusing the exact same `clone_dir` path after a prior clone there was
+///   destroyed outside this deck's own removal path. Broader than a naive
+///   per-clone-tree artifact would be (this one outlives the clone's own
+///   deletion by design), but no broader than M4a's own shared-namespace
+///   staleness, and nothing else in the deck ever writes into this
+///   directory.
 /// - **Path-bound, same as M4a (reviewer R2, PR #515).** Because the key is
 ///   the clone's own canonical PATH rather than anything stored inside the
 ///   clone's tree, `cp -r`/`mv` of a genuine clone to a different sibling
@@ -2155,9 +2163,10 @@ fn resolve_isolated_clone_stash_list(clone_dir: &Path) -> Option<Vec<String>> {
 /// with no new match arm needed there at all.
 ///
 /// **Fork#325 M4c exception (maintainer-decided rule, tightened after an
-/// audit found the first shipped version had 3 blocker-severity gaps):** the
-/// one condition under which `verdict` is NOT hard-coded to
-/// [`KIND_ISOLATED_CLONE`] is the AND of all five: (1) `has_attach_lock` —
+/// audit found the first shipped version had 3 blocker-severity gaps),
+/// widened to six by fork issue #546 hazard 2:** the one condition under
+/// which `verdict` is NOT hard-coded to [`KIND_ISOLATED_CLONE`] is the AND
+/// of all six: (1) `has_attach_lock` —
 /// the deck's own provenance artifact, since a forged sibling directory can
 /// satisfy every other condition below with no deck involvement at all
 /// (auditor A2); (2) the working tree is [`Cleanliness::Clean`] —
@@ -2180,34 +2189,49 @@ fn resolve_isolated_clone_stash_list(clone_dir: &Path) -> Option<Vec<String>> {
 /// merge `5742ad1f93dd`), so round 2's rule could (almost) never fire for a
 /// genuine clone — `headRefOid` is exactly the clone's own reachable commit
 /// history instead (auditor A8's original tree-SHA tightening is
-/// superseded by this redesign, not layered on top of it). [`run_reclaim`]
+/// superseded by this redesign, not layered on top of it); and (6) the
+/// clone must not be explicitly pinned
+/// ([`crate::issue_dispatch_run::pin_isolated_clone`]/
+/// [`unpin_isolated_clone`], fork issue #546 hazard 2) — a deliberate,
+/// caller-set override read via [`isolated_clone_provenance_field`]'s
+/// `pinned=` field, trusted only once `has_attach_lock` has already
+/// verified the artifact is this deck's own; only a literal `pinned=true`
+/// counts (see the Known residual paragraph below for what this override
+/// closes and what it still doesn't). [`run_reclaim`]
 /// gets a dedicated match arm for [`VERDICT_ISOLATED_CLONE_RECLAIMABLE`],
 /// using a removal primitive other than `remove_worktree_dir`'s `git
 /// worktree remove` (which fails loudly against a plain clone, not a linked
 /// worktree). Every other case is unaffected and still hard-codes
 /// [`KIND_ISOLATED_CLONE`] exactly as before this milestone.
-/// `None`/unresolvable anywhere in this five-way chain fails closed to "not
+/// `None`/unresolvable anywhere in this six-way chain fails closed to "not
 /// eligible" — the same stance the pre-tightening rule took for an
 /// unresolvable merge SHA.
 ///
-/// **Known residual (M2, PR #526 round 3):** these five conditions prove
-/// PROVENANCE (the deck created this clone) and CONTENT SAFETY (nothing
-/// would be lost), never LIVENESS (whether the clone is currently in active
-/// use). Issue #325's original incident was exactly "an orchestration
-/// deleted another orchestration's actively-in-use worktree" — and a clone
-/// can satisfy every condition above while a live orchestration is still
-/// working in it (e.g. about to make a new commit). The daemon tracks
-/// liveness for its own dispatched worktrees in-process
+/// **Known residual (M2, PR #526 round 3; narrowed by fork issue #546
+/// hazard 2):** the original five conditions prove PROVENANCE (the deck
+/// created this clone) and CONTENT SAFETY (nothing would be lost), never
+/// LIVENESS (whether the clone is currently in active use). Issue #325's
+/// original incident was exactly "an orchestration deleted another
+/// orchestration's actively-in-use worktree" — and a clone could satisfy
+/// every one of the original five conditions while a live orchestration
+/// was still working in it (e.g. about to make a new commit). The daemon
+/// tracks liveness for its own dispatched worktrees in-process
 /// ([`crate::issue_dispatch_run::WorktreeRegistry`] /
 /// `worktree_still_in_use`), but `worktree reclaim` is a plain CLI
 /// subprocess (`run_worktree_reclaim_cli`) that never connects to the
-/// daemon socket at all — that in-memory signal is not reachable from this
-/// call path, and nothing here invents a substitute for it (a heuristic
-/// liveness probe would be worse than none: a false "not live" reads as
-/// license to delete). This is accepted as a residual rather than gated,
-/// consistent with this module's existing honesty about other limits (see
-/// `owned`'s same-uid caveat above) — closing it needs a signal `worktree
-/// reclaim` can actually reach, which is future work, not this milestone.
+/// daemon socket at all — that in-memory signal is still not reachable
+/// from this call path, and nothing here invents an automatic substitute
+/// for it (a heuristic liveness probe would be worse than none: a false
+/// "not live" reads as license to delete). Fork issue #546's sixth
+/// condition is not that automatic signal — it is a manual one: whoever
+/// (or whatever) knows a clone is still in active use, or otherwise wants
+/// it kept, can now say so explicitly via `pin_isolated_clone` and have
+/// this function honor it. That closes the "no way to say keep this one"
+/// gap for a clone someone is deliberately still resuming by name, but it
+/// is opt-in and does nothing for a clone nobody thought to pin — a fully
+/// automatic liveness signal `worktree reclaim` can consult without being
+/// told is still open, consistent with this module's existing honesty
+/// about other limits (see `owned`'s same-uid caveat above).
 ///
 /// Final round (reviewer F13 / auditor A1/B1): `owned` and `owner`/
 /// `owner_kind` below are now backed by `candidate.has_attach_lock` —
@@ -2282,8 +2306,32 @@ fn isolated_clone_report(
             head_ref_oid: Some(oid),
         } if head_sha.as_deref() == Some(oid.as_str())
     );
-    let is_reclaim_eligible =
-        has_attach_lock && clean && single_local_branch && stash_empty && head_matches_merge;
+    // Fork issue #546 hazard 2 (maintainer-decided design): a sixth,
+    // independent gate on top of the original five -- an explicit pin is
+    // never inferred from the other five holding, and is only ever trusted
+    // once `has_attach_lock` has already verified this artifact is the
+    // deck's own (the same trust gate `owner`/`owner_kind` below apply to
+    // this same artifact's other fields). Only the literal `pinned=true`
+    // counts as pinned; a missing field (no artifact, or a pre-#546
+    // `schema=2` artifact that predates the pin mechanism entirely), an
+    // explicit `pinned=false` (`unpin_isolated_clone`), or any other value
+    // all read as not pinned -- `pin_isolated_clone`/`unpin_isolated_clone`
+    // only ever write `true` or `false` here, so anything else is not
+    // evidence this deck itself produced. An artifact that exists but
+    // cannot be READ (reviewer/auditor gap 2) is a THIRD outcome, distinct
+    // from both -- see [`isolated_clone_pin_state`]'s own doc comment for
+    // why it fails closed (`pin_unresolvable`) rather than collapsing into
+    // "not pinned".
+    let pin_state = has_attach_lock.then(|| isolated_clone_pin_state(&path));
+    let is_pinned = matches!(pin_state, Some(Ok(true)));
+    let pin_unresolvable = matches!(pin_state, Some(Err(_)));
+    let is_reclaim_eligible = has_attach_lock
+        && clean
+        && single_local_branch
+        && stash_empty
+        && head_matches_merge
+        && !is_pinned
+        && !pin_unresolvable;
     let (verdict, reason) = if is_reclaim_eligible {
         (
             VERDICT_ISOLATED_CLONE_RECLAIMABLE.to_string(),
@@ -2315,12 +2363,23 @@ fn isolated_clone_report(
         if !head_matches_merge {
             unmet_gates.push("HEAD commit SHA does not equal a merged PR's headRefOid");
         }
+        if is_pinned {
+            unmet_gates.push("isolated clone is explicitly pinned (fork issue #546)");
+        }
+        if pin_unresolvable {
+            unmet_gates.push(
+                "isolated clone's pin state could not be read -- fails closed, treated as \
+                 pinned (fork issue #546 hazard 2)",
+            );
+        }
         (
             KIND_ISOLATED_CLONE.to_string(),
             format!(
                 "isolated clone: not eligible for automatic reclaim -- {} (fork#325 M4c \
                  requires all five: a deck attach-lock, a clean tree, exactly one local \
-                 branch, an empty stash, and HEAD == a merged PR's headRefOid)",
+                 branch, an empty stash, and HEAD == a merged PR's headRefOid; fork#546 adds a \
+                 sixth: the clone must not be explicitly pinned, and an unreadable pin signal \
+                 fails closed exactly like every other unresolvable signal here)",
                 unmet_gates.join(", ")
             ),
         )
@@ -2367,6 +2426,40 @@ fn isolated_clone_report(
         real_path,
         removed_by: None,
         kind: KIND_ISOLATED_CLONE.to_string(),
+    }
+}
+
+/// Resolve fork issue #546 hazard 2's pin gate for one isolated clone,
+/// shared by [`isolated_clone_report`]'s examination-time check and
+/// [`remove_isolated_clone_dir`]'s TOCTOU re-verification so both read the
+/// same artifact through the same logic rather than each growing its own
+/// parser (reviewer/auditor gap 1). `Ok(true)` means the artifact was read
+/// successfully and its `pinned=` field is the literal string `"true"`;
+/// `Ok(false)` means it was read successfully and the field is absent,
+/// `"false"`, or any other value. `Err` means the artifact could not be
+/// read at all (permission denied, or any other I/O error) -- **the caller
+/// must treat that identically to `Ok(true)`, never to `Ok(false)`**
+/// (reviewer/auditor gap 2): every other gate in this heuristic fails
+/// closed on an unresolvable signal (`None` anywhere in the chain makes
+/// the corresponding gate `false`, never a pass), and collapsing a read
+/// error to "not pinned" via `.ok()` was this exact heuristic failing
+/// OPEN on the one gate the whole hazard exists to enforce. Only called
+/// once `has_attach_lock` is already known `true` -- the artifact's
+/// content is trusted only once that has verified it is this deck's own
+/// (the same trust gate `owner`/`owner_kind` apply to this same
+/// artifact's other fields).
+fn isolated_clone_pin_state(path: &Path) -> Result<bool, String> {
+    match std::fs::read_to_string(crate::issue_dispatch_run::isolated_clone_provenance_path(
+        path,
+    )) {
+        Ok(content) => Ok(crate::issue_dispatch_run::isolated_clone_provenance_field(
+            &content, "pinned",
+        )
+        .as_deref()
+            == Some("true")),
+        Err(e) => Err(format!(
+            "isolated clone provenance artifact could not be read to resolve its pin state: {e}"
+        )),
     }
 }
 
@@ -2507,44 +2600,60 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// either removal path.
 ///
 /// **M1 TOCTOU re-verification (fork#325 M4c, PR #526 round 3, reviewer
-/// M1):** the `.git`-shape check above is only a structural sanity check,
-/// not a re-run of the eligibility gate — [`examine_worktrees`]'s
-/// examination pass and this removal can be seconds to minutes apart on a
-/// large reclaim batch, and the clone could have been actively worked on in
-/// that window (a new commit, a stash push, a second branch, uncommitted
-/// content). Immediately before the actual `remove_dir_all`, 4 of the 5
-/// signals [`isolated_clone_report`]'s eligibility gate reads are re-derived
-/// FRESH from `worktree_path` alone — cleanliness, the local branch list,
-/// the stash list, and the merged PR's `headRefOid` compared against a
-/// freshly re-resolved `git rev-parse HEAD` — rather than trusting anything
-/// computed during examination; any mismatch refuses (returns `Err`, never
-/// deletes). This deliberately takes the signature's own two arguments as
-/// its only input (matching [`worktree/reclaim/071`]'s direct-call contract)
-/// rather than threading the examination pass's cached values through, so a
-/// caller can never accidentally pass a stale expectation.
+/// M1; widened to six by fork issue #546 hazard 1):** the `.git`-shape check
+/// above is only a structural sanity check, not a re-run of the eligibility
+/// gate — [`examine_worktrees`]'s examination pass and this removal can be
+/// seconds to minutes apart on a large reclaim batch, and the clone could
+/// have changed state in that window: a new commit, a stash push, a second
+/// branch, uncommitted content, or (fork issue #546 hazard 2) a pin applied
+/// after examination confirmed the clone eligible. Immediately before the
+/// actual `remove_dir_all`, 5 of the 6 signals [`isolated_clone_report`]'s
+/// eligibility gate reads are re-derived FRESH from `worktree_path` alone —
+/// cleanliness, the local branch list, the stash list, the merged PR's
+/// `headRefOid` compared against a freshly re-resolved `git rev-parse
+/// HEAD`, and (via [`isolated_clone_pin_state`], the same helper
+/// [`isolated_clone_report`] itself calls) the clone's own pin state —
+/// rather than trusting anything computed during examination; any mismatch
+/// refuses (returns `Err`, never deletes), and an unreadable pin signal
+/// refuses exactly like every other unresolvable signal in this chain,
+/// never silently treated as unpinned. This deliberately takes the
+/// signature's own two arguments as its only input (matching
+/// [`worktree/reclaim/071`]'s direct-call contract) rather than threading
+/// the examination pass's cached values through, so a caller can never
+/// accidentally pass a stale expectation.
 ///
-/// **`has_attach_lock` is deliberately the one signal NOT re-derived here**
-/// (auditor N5 / reviewer N3, PR #526 final round). The other four reflect
-/// content a legitimately concurrent process could change during the
-/// examination-to-removal window — a new commit, a stash push, a second
-/// branch, an untracked file — which is exactly the hazard this
-/// re-verification exists to catch. The attach-lock provenance artifact is
-/// nothing like that: it is written once, under `state_dir()`, at
-/// `provision_isolated_clone_sync` time, keyed by the clone's own canonical
-/// PATH rather than anything inside its tree, and — per
-/// [`candidate_has_attach_lock`]'s own documented "stale entries" limit — is
-/// never removed even once the clone it names has been deleted. Nothing a
-/// live orchestration does inside the clone touches it, so it cannot
-/// legitimately flip from present to absent in this window the way the other
-/// four can flip from safe to unsafe. And because the check is purely
-/// path-keyed rather than clone-identity-keyed, re-deriving it here would
-/// answer the identical question [`isolated_clone_report`] already answered
-/// at examination time — it cannot even detect the one adjacent hazard that
+/// **`has_attach_lock` is deliberately the one signal whose PRESENCE is NOT
+/// re-derived here** (auditor N5 / reviewer N3, PR #526 final round). The
+/// other five reflect content a legitimately concurrent process could
+/// change during the examination-to-removal window — a new commit, a stash
+/// push, a second branch, an untracked file, or a pin — which is exactly the
+/// hazard this re-verification exists to catch. The attach-lock provenance
+/// artifact's presence is nothing like that: the file is created once,
+/// under `state_dir()`, at `provision_isolated_clone_sync` time, keyed by
+/// the clone's own canonical PATH rather than anything inside its tree, and
+/// this function's own marker-clearing step (fork issue #546 hazard 1,
+/// below) is the only thing that ever removes the file outright — and that
+/// step runs only after `remove_dir_all` has already succeeded, later in
+/// this same function body. So during the examination-to-removal window
+/// this re-verification actually covers, nothing deletes the marker file:
+/// its PRESENCE cannot legitimately flip from present to absent in that
+/// window the way the other five signals can flip from safe to unsafe.
+/// (Corrected by fork issue #546 hazard 1: this comment previously extended
+/// that same "cannot legitimately flip" claim to the marker's CONTENT as a
+/// whole, which is false — [`crate::issue_dispatch_run::pin_isolated_clone`]/
+/// `unpin_isolated_clone` rewrite that exact artifact's `pinned=` field at
+/// arbitrary times, entirely independent of this removal window. That is
+/// precisely why the pin state is now re-derived above as its own signal
+/// rather than folded into "has_attach_lock cannot change.") And because
+/// the has_attach_lock check is purely path-keyed rather than
+/// clone-identity-keyed, re-deriving its PRESENCE here would answer the
+/// identical question [`isolated_clone_report`] already answered at
+/// examination time — it cannot even detect the one adjacent hazard that
 /// sounds similar (a different directory swapped in at the same path),
 /// since a swapped-in directory at that path still reads as `owned` by the
-/// same stale-path marker. Re-checking it would cost one more `is_file()`
-/// call but would not close any window this removal doesn't already close by
-/// re-deriving the four signals that genuinely can change.
+/// same stale-path marker. Re-checking presence would cost one more
+/// `is_file()` call but would not close any window this removal doesn't
+/// already close by re-deriving the five signals that genuinely can change.
 fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), String> {
     if !worktree_path.join(".git").is_dir() {
         return Err(
@@ -2618,10 +2727,73 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
                 .to_string(),
         );
     }
+    // Fork issue #546 hazard 1: the sixth re-derived signal -- closes the
+    // TOCTOU window a pin applied during the examination-to-removal window
+    // would otherwise slip through. Uses the same helper
+    // `isolated_clone_report` itself calls, so both read the artifact
+    // through identical logic (see [`isolated_clone_pin_state`]'s own doc
+    // comment). An unreadable artifact refuses exactly like `Ok(true)`,
+    // never like `Ok(false)` -- fails closed the same way every other
+    // unresolvable signal above does.
+    match isolated_clone_pin_state(worktree_path) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(
+                "refusing to remove: the clone has been pinned immediately before deletion \
+                 (fork issue #546 hazard 2) -- a pin applied since it was examined must never \
+                 be silently overridden"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            return Err(format!(
+                "refusing to remove: the clone's pin state could not be re-resolved \
+                 immediately before deletion ({e}) -- an unreadable pin signal fails closed \
+                 here exactly as it does in `isolated_clone_report`, never treated as unpinned"
+            ));
+        }
+    }
 
     std::fs::remove_dir_all(worktree_path).map_err(|e| {
         format!("failed to remove isolated clone directory (requested by {remover}): {e}")
     })?;
+
+    // Fork issue #546 hazard 1: the directory is gone, but the M4b
+    // provenance artifact lives entirely outside it (in `state_dir()`, by
+    // design) and survives unless explicitly cleared here -- otherwise a
+    // later, unrelated directory created at this same path would be
+    // silently vouched for by this stale evidence. Best-effort, not
+    // `?`-propagated like `forget_isolated_workspace`'s equivalent removal:
+    // this function is called from `run_reclaim`'s batch loop, which
+    // classifies a row as "removed" on `Ok` and "kept" (with a "removal
+    // failed" reason) on `Err`. By the time the marker removal is
+    // attempted the directory removal above has already succeeded, so a
+    // hard failure here would misreport an isolated clone that is
+    // genuinely gone from disk as one that is still there and needs
+    // attention -- `forget_isolated_workspace` has no such batch
+    // classification to corrupt, which is why it can afford to propagate.
+    // `attempt_isolated_clone_cleanup` (issue_dispatch_run.rs) is actually
+    // the closer precedent for this choice, not just an alternative to
+    // contrast against: it clears the same marker after the same
+    // `remove_dir_all`, best-effort, for the same reason -- there, too, the
+    // directory is already gone by the time the marker removal runs, so a
+    // hard failure would only misreport a cleanup that already succeeded.
+    let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(worktree_path);
+    let marker_cleared = match std::fs::remove_file(&marker_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(
+                path = %sanitize_path_for_terminal_display(&marker_path),
+                remover = %sanitize_for_terminal_display(remover),
+                error = %e,
+                "failed to remove isolated clone provenance artifact after directory removal \
+                 succeeded -- stale evidence may remain at this path"
+            );
+            false
+        }
+    };
+
     // Issue #325 / reviewer B1 / auditor F2 precedent, carried to the M4c
     // removal path: the ONLY durable trace of a confirmed removal. `remover`
     // is an unauthenticated, caller-supplied string (auditor F3) -- sanitize
@@ -2630,6 +2802,7 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
     tracing::info!(
         path = %sanitize_path_for_terminal_display(worktree_path),
         remover = %sanitize_for_terminal_display(remover),
+        marker_cleared,
         "isolated clone removed"
     );
     Ok(())
@@ -5282,10 +5455,17 @@ mod tests {
     /// Scenario: a deck-owned isolated clone that is CLEAN and whose branch
     /// has a MERGED PR -- the exact combination that makes an ordinary
     /// linked worktree `Verdict::Remove` -- must never be automatically
-    /// removed by `worktree reclaim`, with or without `--yes`. This is
-    /// M4a's deliberate, conservative stopping point: whether an isolated
-    /// clone ever becomes safely auto-reclaimable (and under what stricter
-    /// condition) is left to a documented follow-up, not implemented here.
+    /// removed by `worktree reclaim`, with or without `--yes`, when the
+    /// `gh` stub's merged-PR response carries no `headRefOid` field at all.
+    /// CORRECTED (fork issue #546): this does NOT pin a guarantee that
+    /// isolated clones are never auto-reclaimed -- `worktree/reclaim/062`
+    /// proves the opposite once `headRefOid` genuinely matches the clone's
+    /// own HEAD. This test only ever exercises the "head ref unresolvable"
+    /// (`None`) branch, because [`write_merged_gh_stub`] omits the field
+    /// entirely; it passes for that specific fixture shape, not because of
+    /// any stronger guarantee the codebase actually makes (see
+    /// `worktree/reclaim/072`, which names this same gap for the
+    /// present-but-mismatched case).
     #[spec("worktree/reclaim/052")]
     #[test]
     #[cfg(unix)]
@@ -7088,6 +7268,593 @@ mod tests {
         assert!(
             clone_dir.join("dirtied-after-examination.txt").exists(),
             "the refusal must not touch the directory's other contents"
+        );
+    }
+
+    /// Scenario: fork issue #546 hazard 1 -- `remove_isolated_clone_dir`
+    /// deletes an isolated clone's directory via `remove_dir_all` but never
+    /// clears the M4b provenance artifact
+    /// (`issue_dispatch_run::isolated_clone_provenance_path`) that vouches
+    /// for that path, even though the artifact lives entirely outside the
+    /// directory being deleted (in `state_dir()`, by design -- see that
+    /// function's own doc comment). A later, unrelated directory created at
+    /// the same path would then be silently vouched for by this stale
+    /// evidence -- exactly the hazard PRD #544's own Risks section names,
+    /// reachable here via the heuristic-reclaim path that PRD never
+    /// touched. A genuinely eligible isolated clone (owned, clean,
+    /// single-branch, no stash, HEAD equal to the merged PR's
+    /// `headRefOid`) removed via `worktree reclaim --yes` must leave no
+    /// provenance artifact behind.
+    #[spec("worktree/reclaim/074")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_074_removal_clears_the_provenance_artifact() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-provenance-cleared");
+        let creator = "issue-dispatch:provenance-cleared#2012";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "provenance-cleared-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let provenance_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
+        assert!(
+            provenance_path.is_file(),
+            "sanity: the real provisioner must have written a provenance artifact at {} before \
+             removal is exercised, or this test isn't exercising the clearing behavior at all",
+            provenance_path.display()
+        );
+
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "provenance-cleared-branch", &head_ref_oid);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let outcome = run_reclaim(&repo, true, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            outcome.removed.iter().any(|r| r.real_path == clone_dir),
+            "sanity: the clone must actually be removed for this test to prove anything about \
+             what removal leaves behind, got removed={:?} pending={:?} kept={:?}",
+            outcome
+                .removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>(),
+            outcome
+                .pending
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>(),
+            outcome
+                .kept
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !clone_dir.exists(),
+            "the isolated clone directory must be gone from disk after `worktree reclaim --yes`"
+        );
+
+        assert!(
+            !provenance_path.is_file(),
+            "the M4b provenance artifact at {} must be cleared when the isolated clone it \
+             vouches for is removed -- a later, unrelated directory created at the same path \
+             would otherwise be silently vouched for by this stale evidence (fork issue #546 \
+             hazard 1)",
+            provenance_path.display()
+        );
+    }
+
+    /// Scenario: fork issue #546 hazard 2 (RED, maintainer-decided design).
+    /// An isolated clone that satisfies every one of M4c's five existing
+    /// reclaim-eligibility gates (owned, clean, single local branch, empty
+    /// stash, HEAD equal to a merged PR's `headRefOid`) -- the exact
+    /// fixture `worktree_reclaim_062` proves reclaim-eligible on its own --
+    /// must NEVER report as auto-reclaim-eligible once it has been
+    /// explicitly pinned via `issue_dispatch_run::pin_isolated_clone`.
+    /// `name=` in the provenance artifact is populated for every isolated
+    /// clone, intentionally named or not, so it can't be used on its own to
+    /// tell "ephemeral clone, fine to delete" apart from "the user is
+    /// deliberately still resuming this by name" -- an explicit pin flag
+    /// is the signal that does.
+    #[spec("worktree/reclaim/075")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_075_pinned_clone_never_reclaim_eligible_even_when_all_five_gates_hold() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-pinned");
+        let creator = "issue-dispatch:pinned#2013";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "pinned-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        // Same fixture shape as worktree_reclaim_062's full positive case:
+        // a fresh provisioned clone is already clean, single-branch, and
+        // stash-empty, so only the merged-PR headRefOid match needs
+        // setting up before pinning is layered on top.
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        crate::issue_dispatch_run::pin_isolated_clone(&clone_dir)
+            .expect("pin_isolated_clone must succeed against a real, just-provisioned clone");
+
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "pinned-branch", &clone_head_sha);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+
+        assert_ne!(
+            clone_report.verdict.as_str(),
+            "isolated_clone_reclaimable",
+            "a PINNED isolated clone must never report as auto-reclaim-eligible, even when all \
+             five M4c gates hold exactly as worktree_reclaim_062's fixture proves them \
+             sufficient on their own -- got verdict {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+
+        // Never actually removed either, bare or with --yes -- mirrors
+        // worktree_reclaim_063's own removal assertions for the other
+        // negative gates.
+        let bare = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !bare.removed.iter().any(|r| r.real_path == clone_dir),
+            "a bare `worktree reclaim` must never remove a pinned isolated clone, got removed: \
+             {:?}",
+            bare.removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        let yes = run_reclaim(&repo, true, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !yes.removed.iter().any(|r| r.real_path == clone_dir),
+            "`worktree reclaim --yes` must never remove a pinned isolated clone, got removed: \
+             {:?}",
+            yes.removed.iter().map(|r| &r.real_path).collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the pinned isolated clone must still exist on disk after both reclaim attempts"
+        );
+    }
+
+    /// Scenario: fork issue #546 hazard 2 (RED), regression guard for the
+    /// explicit-off case. An isolated clone whose provenance artifact has
+    /// been explicitly written to schema=3 with `pinned=false` -- via
+    /// `issue_dispatch_run::unpin_isolated_clone`, called here on a clone
+    /// that was never pinned to begin with -- must behave exactly like
+    /// today's unpinned (schema=2) clone: reclaim-eligible once all five
+    /// existing M4c gates hold. Only `pinned=true` is meant to narrow
+    /// eligibility; `pinned=false` (whether written by an explicit unpin
+    /// or never touched at all) must never change it relative to today's
+    /// schema=2 behavior (`worktree_reclaim_062`, which remains the
+    /// regression guard for the untouched-schema=2 case and needs no
+    /// duplicate here).
+    #[spec("worktree/reclaim/076")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_076_explicitly_unpinned_schema3_clone_stays_reclaim_eligible() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-explicitly-unpinned");
+        let creator = "issue-dispatch:explicitly-unpinned#2014";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "explicitly-unpinned-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        // This clone was never pinned -- calling unpin on it must still
+        // succeed and rewrite the artifact to schema=3 with `pinned=false`
+        // explicitly, rather than requiring a prior pin call first.
+        crate::issue_dispatch_run::unpin_isolated_clone(&clone_dir).expect(
+            "unpin_isolated_clone must succeed against a real, just-provisioned clone even when \
+             it was never pinned",
+        );
+
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(
+            &bindir,
+            "explicitly-unpinned-branch",
+            &clone_head_sha,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+
+        assert_eq!(
+            clone_report.verdict.as_str(),
+            "isolated_clone_reclaimable",
+            "an explicitly-unpinned (schema=3, pinned=false) isolated clone must behave exactly \
+             like today's schema=2 clone once all five existing M4c gates hold -- reclaim- \
+             eligible, unchanged by adding the pin mechanism -- got verdict {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+    }
+
+    /// Scenario: fork issue #546 hazard 2, review round (RED -- reviewer F1 /
+    /// auditor B1, blocker). `remove_isolated_clone_dir`'s TOCTOU
+    /// re-verification re-derives cleanliness, the local branch list, the
+    /// stash list, and HEAD-vs-merged-PR headRefOid fresh immediately before
+    /// deletion, but never re-derives the pin gate `isolated_clone_report`
+    /// added -- so a clone examined as reclaim-eligible while unpinned, then
+    /// pinned during the examination-to-removal window (the doc comment's
+    /// own "seconds to minutes" batch window), is still deleted. This test
+    /// opens exactly that window: examine the clone unpinned and confirm it
+    /// is reclaim-eligible, THEN pin it, THEN call `remove_isolated_clone_dir`
+    /// directly, carrying the now-stale eligibility `run_reclaim` would have
+    /// handed it -- the clone must be refused, not deleted.
+    #[spec("worktree/reclaim/077")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_077_toctou_reverification_refuses_a_clone_pinned_after_examination() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch
+            .path()
+            .join("repo-isolated-pinned-after-examination");
+        let creator = "issue-dispatch:pinned-after-examination#2015";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "pinned-after-examination-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(
+            &bindir,
+            "pinned-after-examination-branch",
+            &head_ref_oid,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        // Confirm the clone is genuinely eligible at examination time, still
+        // unpinned -- proves this is a real TOCTOU window opened by pinning
+        // AFTER examination, not a fixture that was already ineligible when
+        // handed to the removal primitive.
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports
+            .iter()
+            .find(|r| r.real_path == clone_dir)
+            .expect("the isolated clone must be present in the report");
+        assert_eq!(
+            clone_report.verdict.as_str(),
+            VERDICT_ISOLATED_CLONE_RECLAIMABLE,
+            "sanity: the clone must be reclaim-eligible at examination time, before it is \
+             pinned below, or this test would not be exercising the TOCTOU refusal path at all \
+             -- got {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+
+        // Open the TOCTOU window: pin the clone after examination confirmed
+        // it eligible, before removal actually runs -- the exact scenario
+        // reviewer F1 / auditor B1 describe: "the manual signal that a clone
+        // is still in use" arriving during the batch window.
+        crate::issue_dispatch_run::pin_isolated_clone(&clone_dir)
+            .expect("pin_isolated_clone must succeed against a real, just-provisioned clone");
+
+        // Call the removal primitive directly, carrying the now-stale
+        // eligibility `run_reclaim` would have carried from the report
+        // above -- this is exactly the sequence `run_reclaim` follows
+        // internally, with the pin inserted in the window between its two
+        // steps.
+        let result = remove_isolated_clone_dir(&clone_dir, "test-remover");
+
+        assert!(
+            result.is_err(),
+            "remove_isolated_clone_dir must refuse when the clone has been pinned since it was \
+             examined, not trust the stale examination-time verdict, got {result:?}"
+        );
+        assert!(
+            clone_dir.exists(),
+            "the clone directory must be left on disk when the TOCTOU refusal fires for a pin \
+             applied during the removal window"
+        );
+    }
+
+    /// Scenario: fork issue #546 hazard 2, review round (RED -- reviewer F2).
+    /// Every one of the six gates `isolated_clone_report` ANDs together is
+    /// documented to fail CLOSED (unresolvable -> not eligible) except the
+    /// pin gate, which reads `.ok()` on the provenance artifact and so fails
+    /// OPEN: an unreadable artifact (permissions, race, corruption) becomes
+    /// `None` -> "not pinned" -> reclaim-eligible. This test builds a clone
+    /// that satisfies every other gate, strips read permission from its own
+    /// provenance artifact (the same file `has_attach_lock`'s `is_file()`
+    /// check already proved present, which needs no read permission to
+    /// stat), and asserts the clone must NOT report as reclaim-eligible --
+    /// fails closed, exactly like every other unresolvable signal in this
+    /// chain.
+    #[spec("worktree/reclaim/078")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_078_unreadable_provenance_artifact_fails_closed_not_reclaim_eligible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-unreadable-provenance");
+        let creator = "issue-dispatch:unreadable-provenance#2016";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "unreadable-provenance-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        let provenance_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
+        assert!(
+            provenance_path.is_file(),
+            "sanity: the real provisioner must have written a provenance artifact at {} before \
+             its read permission is stripped below, or this test isn't exercising the \
+             fail-open gap at all",
+            provenance_path.display()
+        );
+        std::fs::set_permissions(&provenance_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(
+            &bindir,
+            "unreadable-provenance-branch",
+            &clone_head_sha,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+
+        // Restore read permission before any assertion (and before the
+        // tempdir is dropped) so a failure here doesn't leave an unreadable
+        // artifact behind for a later test sharing the same scratch cleanup
+        // path.
+        std::fs::set_permissions(&provenance_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+
+        assert_ne!(
+            clone_report.verdict.as_str(),
+            VERDICT_ISOLATED_CLONE_RECLAIMABLE,
+            "an isolated clone whose provenance artifact exists but cannot be READ must fail \
+             closed on the pin gate exactly like every other unresolvable signal in this \
+             six-way chain -- not be treated as unpinned and reclaim-eligible -- got verdict \
+             {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+    }
+
+    /// Scenario: fork issue #546 hazard 2, review round (coverage gap --
+    /// reviewer F4 / auditor M1/M2). `worktree_reclaim_075`/`076` each call
+    /// pin or unpin exactly once against a fresh schema=2 artifact, so
+    /// `set_isolated_clone_pinned` never reads back an artifact it itself
+    /// already rewrote to schema=3 -- exactly the case its own doc comment
+    /// reasons about. This test provisions a clone with a deliberately
+    /// non-default `name`/`creator`, then pins, unpins, and re-pins it
+    /// (three successive rewrites, the second and third each against a
+    /// schema=3 artifact the previous call produced), and asserts the four
+    /// preserved fields (`name=`, `creator=`, `root-hash=`, `path=`) are
+    /// byte-identical to their pre-pin values after all three rewrites --
+    /// the blast radius `resume_existing_isolated_clone`'s `creator=` check
+    /// and `forget_isolated_workspace`'s `path=` check both depend on.
+    #[spec("worktree/reclaim/079")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_079_pin_unpin_repin_round_trip_preserves_inherited_fields() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-round-trip");
+        let name = "distinctive-workspace-name";
+        let creator = "issue-dispatch:round-trip#2017";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo, &clone_dir, name, creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let provenance_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
+        let original_content = std::fs::read_to_string(&provenance_path)
+            .expect("sanity: the freshly provisioned artifact must be readable");
+        let original_name =
+            crate::issue_dispatch_run::isolated_clone_provenance_field(&original_content, "name")
+                .expect("sanity: a freshly provisioned artifact must carry a name= field");
+        let original_creator = crate::issue_dispatch_run::isolated_clone_provenance_field(
+            &original_content,
+            "creator",
+        )
+        .expect("sanity: a freshly provisioned artifact must carry a creator= field");
+        let original_root_hash = crate::issue_dispatch_run::isolated_clone_provenance_field(
+            &original_content,
+            "root-hash",
+        )
+        .expect("sanity: a freshly provisioned artifact must carry a root-hash= field");
+        let original_path =
+            crate::issue_dispatch_run::isolated_clone_provenance_field(&original_content, "path")
+                .expect("sanity: a freshly provisioned artifact must carry a path= field");
+        assert_eq!(
+            original_name, name,
+            "sanity: the provisioned artifact's name= must reflect the deliberately \
+             non-default name this test provisioned with, or this test proves nothing about \
+             preservation"
+        );
+
+        crate::issue_dispatch_run::pin_isolated_clone(&clone_dir)
+            .expect("pin_isolated_clone must succeed against a real, just-provisioned clone");
+        crate::issue_dispatch_run::unpin_isolated_clone(&clone_dir).expect(
+            "unpin_isolated_clone must succeed against a schema=3 clone this same test already \
+             pinned",
+        );
+        crate::issue_dispatch_run::pin_isolated_clone(&clone_dir).expect(
+            "pin_isolated_clone must succeed a SECOND time, against a schema=3 clone this same \
+             test already pinned and unpinned -- the exact case set_isolated_clone_pinned's own \
+             doc comment reasons about",
+        );
+
+        let final_content = std::fs::read_to_string(&provenance_path)
+            .expect("the provenance artifact must still be readable after three rewrites");
+        assert!(
+            final_content.lines().any(|l| l.trim() == "schema=3"),
+            "after pin/unpin/re-pin the artifact must carry schema=3, got:\n{final_content}"
+        );
+        assert_eq!(
+            crate::issue_dispatch_run::isolated_clone_provenance_field(&final_content, "pinned")
+                .as_deref(),
+            Some("true"),
+            "after pin/unpin/re-pin the artifact must record pinned=true (the final call was a \
+             pin), got:\n{final_content}"
+        );
+        assert_eq!(
+            crate::issue_dispatch_run::isolated_clone_provenance_field(&final_content, "name")
+                .as_deref(),
+            Some(original_name.as_str()),
+            "name= must survive three successive rewrites (pin, unpin, re-pin) byte-identical \
+             to its pre-pin value, got:\n{final_content}"
+        );
+        assert_eq!(
+            crate::issue_dispatch_run::isolated_clone_provenance_field(&final_content, "creator")
+                .as_deref(),
+            Some(original_creator.as_str()),
+            "creator= must survive three successive rewrites byte-identical to its pre-pin \
+             value -- a corrupted creator= would make this clone permanently unresumable by \
+             name (resume_existing_isolated_clone's NameCollision guard), got:\n{final_content}"
+        );
+        assert_eq!(
+            crate::issue_dispatch_run::isolated_clone_provenance_field(&final_content, "root-hash")
+                .as_deref(),
+            Some(original_root_hash.as_str()),
+            "root-hash= must survive three successive rewrites byte-identical to its pre-pin \
+             value, got:\n{final_content}"
+        );
+        assert_eq!(
+            crate::issue_dispatch_run::isolated_clone_provenance_field(&final_content, "path")
+                .as_deref(),
+            Some(original_path.as_str()),
+            "path= must survive three successive rewrites byte-identical to its pre-pin value \
+             -- a corrupted path= would make this clone permanently un-forgettable \
+             (forget_isolated_workspace's stale-evidence guard), got:\n{final_content}"
         );
     }
 }

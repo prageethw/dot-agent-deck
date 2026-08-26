@@ -2394,6 +2394,25 @@ pub struct AgentRecord {
     /// no live session/registry access is available (dummy-state test path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_generation: Option<u64>,
+    /// Issue #586 M1/M2: whether PRD #126's idle-worker watch is currently
+    /// armed for this pane, joined in by the `ListAgents` handler from
+    /// [`AgentPtyRegistry::delegation_watch_snapshot`] the same way `live` /
+    /// `daemon_boot_id` above are. `None` when the detector isn't armed for
+    /// this pane (no outstanding delegation, the detector is disabled, or no
+    /// registry access is available). `skip_serializing_if` keeps the wire
+    /// shape backwards-compatible with daemons predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outstanding_delegation: Option<WatchSnapshot>,
+    /// Issue #586 M1/M2: whether PRD #249's delegate silent-worker watch is
+    /// currently armed for this pane. See `outstanding_delegation` above for
+    /// the join and backwards-compatibility rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence_watch: Option<WatchSnapshot>,
+    /// Issue #586 M1/M2: issue #448's commission ledger entry for this pane,
+    /// if any delegation is still unanswered. See `outstanding_delegation`
+    /// above for the join and backwards-compatibility rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_commission: Option<CommissionSnapshot>,
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -3042,13 +3061,66 @@ pub struct AgentPtyRegistry {
     /// moment a claim is actually taken rather than against a
     /// point-in-time snapshot. Root cause this replaces: `name_collision()`
     /// (`src/ui.rs`) refuses a New-Pane form submit against
-    /// `live_orchestration_names`, a list captured ONCE at form-open via a
+    /// `live_orchestration_identities`, a list captured ONCE at form-open via a
     /// single `ListAgents` round-trip — two forms opened close together
     /// both read the same stale snapshot, so neither submit is refused even
-    /// though both would claim the same name. Keyed by name, valued by the
+    /// though both would claim the same name. Keyed by [`OrchestrationClaimKey`]
+    /// (PRD fork#603: name + directory, not name alone), valued by the
     /// owning pane id (see [`Self::claim_orchestration_name`] /
     /// [`Self::release_orchestration_name`]).
-    orchestration_name_claims: Mutex<HashMap<String, String>>,
+    orchestration_name_claims: Mutex<HashMap<OrchestrationClaimKey, String>>,
+}
+
+/// PRD fork#603: the daemon-side claim key — name scoped to the directory
+/// the orchestration runs in, rather than name alone. A dedicated type
+/// rather than a reuse of [`crate::state::OrchestrationIdentity`]: that
+/// enum's shape serves message-routing identity (a structurally separate
+/// concern from creation-time uniqueness), and reusing it here would blur
+/// the two.
+///
+/// `cwd: None` is a deliberate backward-compat wildcard (see
+/// [`AgentPtyRegistry::claim_orchestration_name`]'s doc comment) — an older
+/// client that never learned to send a directory still gets the same
+/// global-only exclusivity it always had.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OrchestrationClaimKey {
+    name: String,
+    cwd: Option<String>,
+}
+
+/// Issue #586 M1/M2: a point-in-time snapshot of all delegation-watch state
+/// armed for one worker pane, for exposure via `daemon status --json`
+/// ([`crate::daemon_status`]) and the `ListAgents` attach response
+/// ([`crate::daemon_protocol`]). Each field is `None` when that particular
+/// watch isn't armed for the pane — three independent detectors (PRD #126,
+/// PRD #249, issue #448), so all three states are reported rather than
+/// collapsed into one.
+///
+/// Rides over the wire inside [`AgentRecord`], so its derives mirror that
+/// struct's.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DelegationWatchSnapshot {
+    pub outstanding_delegation: Option<WatchSnapshot>,
+    pub silence_watch: Option<WatchSnapshot>,
+    pub delegation_commission: Option<CommissionSnapshot>,
+}
+
+/// Issue #586 M1/M2: the wire-safe shape of an armed [`OutstandingDelegation`]
+/// or [`SilenceWatchRecord`] — plain `u64` seconds rather than `Duration` or
+/// `Instant`, neither of which can be serialized, mirroring how the rest of
+/// this file already keeps raw internal types off the wire.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WatchSnapshot {
+    pub armed_secs_ago: u64,
+    pub orchestrator_pane_id: String,
+}
+
+/// Issue #586 M1/M2: the wire-safe shape of an armed [`DelegationCommission`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommissionSnapshot {
+    pub outstanding: u32,
+    pub oldest_armed_secs_ago: u64,
+    pub orchestrator_pane_id: String,
 }
 
 /// PRD #126: the outstanding-delegation side state — records plus the
@@ -3138,6 +3210,33 @@ struct SilenceWatchRecord {
     /// watch's own conditional take). Mirrors
     /// [`OutstandingDelegation::_watch_cancel`].
     _cancel: oneshot::Sender<()>,
+    /// Issue #586 M1/M2: when this watch was armed, for exposure via
+    /// [`AgentPtyRegistry::delegation_watch_snapshot`]. Mirrors
+    /// [`OutstandingDelegation::armed_at`].
+    armed_at: Instant,
+}
+
+/// Issue #586 M2/B round 2, closing upstream #590: the commission ledger's
+/// own age-based expiry window — deliberately NOT derived from
+/// `worker_response_timeout_minutes` or `delegate_no_event_window` (upstream
+/// #590 forbids coupling to either, since "the ledger must not depend on a
+/// switchable detector"). Long enough that no legitimately in-flight
+/// delegation on this fork (rule 5: every test run is a CI round trip,
+/// so hours-long delegations are ordinary) could ever be mistaken for
+/// abandoned debt — reviewer's explicit ask was "days, not hours."
+const COMMISSION_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Issue #586 M4: one still-unanswered delegation to a worker pane, tracked
+/// per-arm rather than as a bare timestamp. Alongside the M1/M2 `armed_at`
+/// (used, "in arm order", to age and purge stale entries — see
+/// `retire_delegation_commission`), this carries the `subject` the
+/// delegation itself stated, so a later `work-done`'s own echoed subject can
+/// be checked against what was actually delegated and a disagreement
+/// surfaced as [`WorkDoneProvenance::Solicited::subject_mismatch`].
+#[derive(Debug, Clone, PartialEq)]
+struct ArmedCommission {
+    armed_at: Instant,
+    subject: Option<String>,
 }
 
 /// Issue #448: the commission ledger's per-worker-pane entry — how many
@@ -3151,9 +3250,17 @@ struct SilenceWatchRecord {
 /// generations already own every accounting decision that depends on knowing
 /// *which* one.
 struct DelegationCommission {
-    /// Delegations dispatched to this worker pane that no completion has been
-    /// credited to yet. Saturating, like [`OutstandingDelegation::superseded`].
-    outstanding: u32,
+    /// One entry per still-unanswered delegation to this worker pane, in
+    /// arm order (oldest at the front). `len()` is what `outstanding` used
+    /// to be — replaces it, since a scalar count can't be independently
+    /// aged. Issue #586 M2/B round 2 (reviewer/auditor B1/B2/F1/F2): the
+    /// prior single-`armed_at`-plus-counter shape let one stale entry expire
+    /// two fresh siblings sharing the same worker pane. See
+    /// `retire_delegation_commission` for how this is aged and purged.
+    /// Issue #586 M4: each entry is now an [`ArmedCommission`], adding a
+    /// per-arm `subject` alongside the per-arm `armed_at` this comment
+    /// already described.
+    arm_times: VecDeque<ArmedCommission>,
     /// Pane of the orchestrator that issued them, so closing the ORCHESTRATOR
     /// clears the ledger as well as the two watches — a commission is owed to a
     /// specific orchestrator, and a pane id freed by a close can be inherited by
@@ -3171,11 +3278,13 @@ struct DelegationCommission {
 /// first of those the completion is genuine and must still be reported as such.
 /// Reading `Nothing` as "unsolicited" would silently mislabel every completion
 /// in every project that has turned the detector off.
-// `Clone, Copy` for parity with its sibling `state::WorkDoneReportChannel`
-// (issue #448 review, finding 7 minor): both are small plain enums describing one
-// completion, and a caller that has to `match`-and-rebuild one but not the other
-// is an avoidable papercut. No behavioural effect today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Clone` for parity with its sibling `state::WorkDoneReportChannel` (issue
+// #448 review, finding 7 minor): both are small plain enums describing one
+// completion, and a caller that has to `match`-and-rebuild one but not the
+// other is an avoidable papercut. `Copy` was dropped in the #586 M4 GREEN
+// commit: `Solicited::subject_mismatch` can carry a `SubjectMismatch`, which
+// owns two `String`s, and a `String`-bearing type cannot implement `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkDoneProvenance {
     /// The orchestrator had at least one unanswered delegation to this worker
     /// pane; one is now credited to this completion.
@@ -3184,6 +3293,12 @@ pub enum WorkDoneProvenance {
         /// orchestrator re-delegated before the worker reported, which its
         /// protocol forbids.
         remaining: u32,
+        /// Issue #586 M4: `Some` only when both the delegate's own `--subject`
+        /// and the worker's echoed `work-done --subject` were supplied and
+        /// disagree. `None` covers every other case — either side omitted, or
+        /// both agree — so this is opt-in and never fires for a delegation that
+        /// didn't use `--subject` at all.
+        subject_mismatch: Option<SubjectMismatch>,
     },
     /// Nothing was outstanding: the orchestrator commissioned no work this
     /// completion could be answering. The commonest cause is a human tasking the
@@ -3191,6 +3306,14 @@ pub enum WorkDoneProvenance {
     /// context from an earlier delegation (`work_done_footer`), so it runs again
     /// for work the orchestrator never asked for.
     Unsolicited,
+}
+
+/// Issue #586 M4: the two disagreeing subjects behind a
+/// [`WorkDoneProvenance::Solicited::subject_mismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectMismatch {
+    pub expected: String,
+    pub echoed: String,
 }
 
 /// PRD #249 M3 review (finding B4/S4): handed back by
@@ -3718,12 +3841,23 @@ impl AgentPtyRegistry {
         *self.hook_socket.lock().unwrap() = Some(path);
     }
 
-    /// Issue #201 option (b): atomically claim an orchestrator pane's own
-    /// name/title. Returns `true` when `name` was unclaimed (now claimed by
-    /// `pane_id`) OR already claimed by this exact `pane_id` (idempotent
-    /// re-claim — a caller confirming its own already-held claim is not a
-    /// conflict). Returns `false` when `name` is held by a *different*
-    /// `pane_id`.
+    /// Issue #201 option (b) / PRD fork#603: atomically claim an
+    /// orchestrator pane's own name/title, scoped to `cwd`. Returns `true`
+    /// when `(name, cwd)` was unclaimed (now claimed by `pane_id`) OR
+    /// already claimed by this exact `pane_id` (idempotent re-claim — a
+    /// caller confirming its own already-held claim is not a conflict).
+    /// Returns `false` when a conflicting claim is already held by a
+    /// *different* `pane_id`.
+    ///
+    /// `cwd: None` is a global wildcard, both as the caller's own claim and
+    /// as a candidate it is compared against (PRD fork#603 backward
+    /// compatibility): an older client that doesn't yet send a directory
+    /// still gets its claim treated as exclusive against every directory,
+    /// and still conflicts with (and is conflicted with by) every
+    /// `Some(cwd)` claim of the same name — this can only ever OVER-refuse
+    /// relative to a `Some`/`Some` comparison, never let a real
+    /// same-`(dir, name)` collision through. Cannot be a plain
+    /// `get`/`insert` on the compound key because of this wildcard scan.
     ///
     /// The wire-level caller (`AttachRequest::ClaimOrchestrationName`,
     /// `src/daemon_protocol.rs`) uses the New-Pane spawn path's real,
@@ -3732,15 +3866,35 @@ impl AgentPtyRegistry {
     /// that real id is known (the daemon mints `pane_id` in `StartAgent`,
     /// so no pane id exists yet at form-submit time) and rolls the spawn
     /// back on refusal.
-    pub fn claim_orchestration_name(&self, name: &str, pane_id: &str) -> bool {
+    pub fn claim_orchestration_name(&self, name: &str, cwd: Option<&str>, pane_id: &str) -> bool {
         let mut claims = self.orchestration_name_claims.lock().unwrap();
-        match claims.get(name) {
-            Some(holder) => holder == pane_id,
-            None => {
-                claims.insert(name.to_string(), pane_id.to_string());
-                true
-            }
+        let conflict = claims.iter().any(|(k, holder)| {
+            k.name == name
+                && holder != pane_id
+                && (k.cwd.is_none() || cwd.is_none() || k.cwd.as_deref() == cwd)
+        });
+        if conflict {
+            return false;
         }
+        // PRD fork#603 fix round (reviewer N1): the conflict scan above
+        // already exempts `holder == pane_id`, so the same holder
+        // re-claiming the same name always reaches here rather than being
+        // refused — but re-claiming with a DIFFERENT `cwd` than a key it
+        // already holds used to just `insert` a second key, leaving the
+        // old one stranded under the same holder (also the only way
+        // reviewer N2's "which key gets rebound" ambiguity was reachable).
+        // Remove every existing key this pane_id holds for THIS name
+        // first, so a re-claim is genuinely idempotent across a changed
+        // cwd — one holder, one key, per name.
+        claims.retain(|k, holder| !(k.name == name && holder == pane_id));
+        claims.insert(
+            OrchestrationClaimKey {
+                name: name.to_string(),
+                cwd: cwd.map(str::to_string),
+            },
+            pane_id.to_string(),
+        );
+        true
     }
 
     /// Issue #201 option (b): release whatever orchestration-name claim (if
@@ -3958,6 +4112,7 @@ impl AgentPtyRegistry {
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
                 worker_agent_id: worker_agent_id.map(str::to_string),
                 _cancel: cancel_tx,
+                armed_at: Instant::now(),
             },
         );
         Some(ArmedSilenceWatch {
@@ -3995,6 +4150,7 @@ impl AgentPtyRegistry {
         &self,
         worker_pane_id: &str,
         orchestrator_pane_id: &str,
+        subject: Option<String>,
     ) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
@@ -4006,15 +4162,46 @@ impl AgentPtyRegistry {
             .commissions
             .entry(worker_pane_id.to_string())
             .or_insert_with(|| DelegationCommission {
-                outstanding: 0,
+                arm_times: VecDeque::new(),
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
             });
-        entry.outstanding = entry.outstanding.saturating_add(1);
+        entry.arm_times.push_back(ArmedCommission {
+            armed_at: Instant::now(),
+            subject,
+        });
         // Last delegate wins: a pane id that has changed hands (orchestrator
         // closed, successor spawned onto the same id) must not leave the ledger
         // pointing its close sweep at the dead pane.
         entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
         true
+    }
+
+    /// Issue #586 M1/M2: a point-in-time snapshot of the delegation-watch state
+    /// armed for `worker_pane_id`, for exposure via `daemon status --json`.
+    /// One lock acquisition; each field is `None` when that watch isn't armed.
+    pub fn delegation_watch_snapshot(&self, worker_pane_id: &str) -> DelegationWatchSnapshot {
+        let tracker = self.delegations.lock().unwrap();
+        let now = Instant::now();
+        DelegationWatchSnapshot {
+            outstanding_delegation: tracker.records.get(worker_pane_id).map(|r| WatchSnapshot {
+                armed_secs_ago: now.duration_since(r.armed_at).as_secs(),
+                orchestrator_pane_id: r.orchestrator_pane_id.clone(),
+            }),
+            silence_watch: tracker
+                .silence_watches
+                .get(worker_pane_id)
+                .map(|r| WatchSnapshot {
+                    armed_secs_ago: now.duration_since(r.armed_at).as_secs(),
+                    orchestrator_pane_id: r.orchestrator_pane_id.clone(),
+                }),
+            delegation_commission: tracker.commissions.get(worker_pane_id).and_then(|c| {
+                c.arm_times.front().map(|oldest| CommissionSnapshot {
+                    outstanding: c.arm_times.len() as u32,
+                    oldest_armed_secs_ago: now.duration_since(oldest.armed_at).as_secs(),
+                    orchestrator_pane_id: c.orchestrator_pane_id.clone(),
+                })
+            }),
+        }
     }
 
     /// Issue #448: credit a `work-done` from `worker_pane_id` against the
@@ -4024,33 +4211,99 @@ impl AgentPtyRegistry {
     /// The last commission for a pane removes its entry rather than leaving a
     /// zero behind, so the map tracks live debt instead of every worker pane that
     /// has ever been delegated to.
-    pub fn retire_delegation_commission(&self, worker_pane_id: &str) -> WorkDoneProvenance {
+    ///
+    /// Issue #586 M2/B round 2, closing upstream #590: expiry is checked
+    /// per-arm against the fixed [`COMMISSION_MAX_AGE`] window, never against
+    /// `worker_response_timeout_minutes` or any other switchable detector
+    /// (upstream #590 forbids that coupling). Individually-expired entries
+    /// are purged oldest-first before the oldest still-live commission is
+    /// consumed, so one stale entry can no longer expire fresh siblings
+    /// sharing the same worker pane (reviewer/auditor finding B2/F2).
+    ///
+    /// Fix round 5 (S4): the oldest-still-live commission is always the one
+    /// consumed (FIFO), with no generation on the wire to match a `work-done`
+    /// to the specific delegation it answers. When multiple commissions are
+    /// outstanding to one worker pane with DIFFERENT subjects and they are
+    /// answered out of order, a completion is credited to the wrong
+    /// commission's `expected` subject and can trip a spurious mismatch
+    /// warning (or, symmetrically, suppress a real one) — the same accepted
+    /// hole [`Self::retire_silence_watch`] documents for its own oldest-first
+    /// accounting, and for the same reason (no generation on the wire).
+    pub fn retire_delegation_commission(
+        &self,
+        worker_pane_id: &str,
+        echoed_subject: Option<&str>,
+    ) -> WorkDoneProvenance {
         let mut tracker = self.delegations.lock().unwrap();
-        let Some(outstanding) = tracker
-            .commissions
-            .get(worker_pane_id)
-            .map(|entry| entry.outstanding)
-        else {
+        let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return WorkDoneProvenance::Unsolicited;
         };
-        if outstanding <= 1 {
-            tracker.commissions.remove(worker_pane_id);
-            // A `0` entry cannot normally exist — this branch removes an entry as
-            // it reaches zero — so the `Unsolicited` half is defense in depth
-            // against a future arming path that leaves one behind.
-            return if outstanding == 0 {
-                WorkDoneProvenance::Unsolicited
+        let now = Instant::now();
+        // Purge only the individually-expired entries, oldest first — `arm_times`
+        // is in arm order, so the first non-expired entry means everything after
+        // it is fresher still. A single stale entry no longer takes fresh
+        // siblings down with it (issue #586 M2/B round 2, finding B2/F2).
+        while let Some(front) = entry.arm_times.front() {
+            if now.duration_since(front.armed_at) > COMMISSION_MAX_AGE {
+                entry.arm_times.pop_front();
             } else {
-                WorkDoneProvenance::Solicited { remaining: 0 }
-            };
+                break;
+            }
         }
-        let remaining = outstanding - 1;
-        tracker
-            .commissions
-            .get_mut(worker_pane_id)
-            .expect("entry present under the same lock")
-            .outstanding = remaining;
-        WorkDoneProvenance::Solicited { remaining }
+        if entry.arm_times.is_empty() {
+            tracker.commissions.remove(worker_pane_id);
+            return WorkDoneProvenance::Unsolicited;
+        }
+        // Consume the oldest still-live commission.
+        let popped = entry
+            .arm_times
+            .pop_front()
+            .expect("checked non-empty above");
+        let remaining = entry.arm_times.len() as u32;
+        if remaining == 0 {
+            tracker.commissions.remove(worker_pane_id);
+        }
+        // Issue #586 M4: only a mismatch when BOTH sides stated a subject and
+        // they disagree — either side omitted, or both agree, is not a
+        // mismatch (opt-in, never fires for a delegation that didn't use
+        // `--subject` at all).
+        //
+        // Fix round 4 (S11/A16): sanitize-once-at-ingest. `popped.subject`
+        // (the armed/expected side) was already sanitized by
+        // `handle_delegate`'s fan-out loop before it was ever armed — it is
+        // canonical here and is not sanitized again on this comparison path.
+        // `sanitize_subject_tag` is the single source of truth for
+        // canonicalization: ingest is the one place canonical status is
+        // established, and every downstream consumer (including this one)
+        // must treat its output as already canonical rather than
+        // re-deriving it independently. Issue #598 (A18) added a defensive
+        // re-application of `sanitize_subject_tag` at `work_done_footer`'s
+        // render site — safe only because the function is idempotent, not
+        // because it is a second canonicalization point; the invariant here
+        // is "idempotent re-application at a public boundary is fine", not
+        // "never sanitize twice". The echoed side is fresh off the worker's
+        // `work-done --subject` CLI call and has never been sanitized
+        // before, so it gets exactly one pass, here. Both fields of
+        // `SubjectMismatch` therefore hold canonical (sanitized) values by
+        // construction, addressing A16.
+        let subject_mismatch = match (popped.subject.as_deref(), echoed_subject) {
+            (Some(expected), Some(echoed)) => {
+                let echoed_sanitized = crate::state::sanitize_subject_tag(echoed);
+                if expected != echoed_sanitized {
+                    Some(SubjectMismatch {
+                        expected: expected.to_string(),
+                        echoed: echoed_sanitized,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        WorkDoneProvenance::Solicited {
+            remaining,
+            subject_mismatch,
+        }
     }
 
     /// Issue #448 review (finding 1): release ONE commission armed for
@@ -4066,20 +4319,24 @@ impl AgentPtyRegistry {
     /// reported as `Solicited`. That is #448 and its summary-file clobber,
     /// reproduced through the very ledger added to prevent them.
     ///
-    /// DECREMENTS rather than removing the entry: two delegations may be
-    /// outstanding to one worker and only one of them failed, so dropping the
-    /// whole entry would discard a sibling delegation's genuine commission and
-    /// mislabel ITS completion as unsolicited. Saturating for the same
-    /// defense-in-depth reason as [`Self::retire_delegation_commission`], and
-    /// the entry is removed as it reaches zero so the map keeps tracking live
-    /// debt rather than every pane ever delegated to.
+    /// Pops ONE entry rather than removing the whole record: two delegations
+    /// may be outstanding to one worker and only one of them failed, so
+    /// dropping the whole entry would discard a sibling delegation's genuine
+    /// commission and mislabel ITS completion as unsolicited. Pops from the
+    /// BACK (newest): the commission being released belongs to the delegate
+    /// that was just refused by the guarded send, which is always the most
+    /// recently armed entry for this worker pane, not the oldest. Popping the
+    /// front would remove a different, still-outstanding commission and leave
+    /// the failed delegate's phantom entry standing. The entry is removed as
+    /// it empties so the map keeps tracking live debt rather than every pane
+    /// ever delegated to.
     pub fn release_delegation_commission(&self, worker_pane_id: &str) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
-        entry.outstanding = entry.outstanding.saturating_sub(1);
-        if entry.outstanding == 0 {
+        entry.arm_times.pop_back();
+        if entry.arm_times.is_empty() {
             tracker.commissions.remove(worker_pane_id);
         }
         true
@@ -6820,6 +7077,9 @@ impl AgentPtyRegistry {
             // `AppState` themselves.
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         })
     }
 
@@ -7117,6 +7377,9 @@ impl AgentPtyRegistry {
                 // both in from `AppState`.
                 daemon_boot_id: None,
                 registration_generation: None,
+                outstanding_delegation: None,
+                silence_watch: None,
+                delegation_commission: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -9160,15 +9423,17 @@ mod spawn_tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let barrier = Arc::new(std::sync::Barrier::new(2));
 
+        const DIR: &str = "/tmp/myrepo";
+
         let (registry_a, barrier_a) = (registry.clone(), barrier.clone());
         let claim_a = std::thread::spawn(move || {
             barrier_a.wait();
-            registry_a.claim_orchestration_name(NAME, "pane-a")
+            registry_a.claim_orchestration_name(NAME, Some(DIR), "pane-a")
         });
         let (registry_b, barrier_b) = (registry.clone(), barrier.clone());
         let claim_b = std::thread::spawn(move || {
             barrier_b.wait();
-            registry_b.claim_orchestration_name(NAME, "pane-b")
+            registry_b.claim_orchestration_name(NAME, Some(DIR), "pane-b")
         });
 
         let won_a = claim_a.join().expect("claiming thread a must not panic");
@@ -9185,7 +9450,7 @@ mod spawn_tests {
         registry.release_orchestration_name(winner_pane);
 
         assert!(
-            registry.claim_orchestration_name(NAME, "pane-c"),
+            registry.claim_orchestration_name(NAME, Some(DIR), "pane-c"),
             "releasing the winner's claim must free the name for a later claimant"
         );
     }
@@ -9206,32 +9471,33 @@ mod spawn_tests {
     #[spec("orchestration/identity/022")]
     #[test]
     fn identity_022_daemon_side_name_claim_distinct_names_idempotent_reclaim_and_noop_release() {
+        const DIR: &str = "/tmp/repo";
         let registry = AgentPtyRegistry::new();
 
         // (1) distinct names never cross-block.
-        assert!(registry.claim_orchestration_name("repo-orchestrator-1", "pane-x"));
-        assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-y"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-x"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-y"));
 
         // (2) idempotent re-claim by the SAME holder.
         assert!(
-            registry.claim_orchestration_name("repo-orchestrator-1", "pane-x"),
+            registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-x"),
             "a pane re-claiming its own already-held name must succeed, not be refused"
         );
         // A DIFFERENT pane is still refused after that idempotent re-claim —
         // proves the re-claim didn't accidentally release or transfer it.
-        assert!(!registry.claim_orchestration_name("repo-orchestrator-1", "pane-z"));
+        assert!(!registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-z"));
 
         // (3) releasing a pane with no claim is a no-op, and never touches
         // an unrelated pane's live claim.
         registry.release_orchestration_name("pane-never-claimed-anything");
         assert!(
-            !registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"),
+            !registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-z"),
             "an unrelated no-op release must not have freed pane-y's claim"
         );
 
         // Releasing the real holder still works after the no-op release above.
         registry.release_orchestration_name("pane-y");
-        assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-z"));
     }
 
     /// Fork issue #201 redesign (reviewer P2-2/P2-5, auditor A1): the claim
@@ -9254,13 +9520,14 @@ mod spawn_tests {
     #[test]
     fn identity_023_confirm_orchestration_claim_rebinds_token_to_real_pane_id() {
         const NAME: &str = "myrepo-orchestrator-1";
+        const DIR: &str = "/tmp/myrepo";
         const TOKEN: &str = "spawn-token-abc123";
         const REAL_PANE_ID: &str = "pane-42";
 
         let registry = AgentPtyRegistry::new();
 
         // Pre-spawn: claim by token, before any pane exists.
-        assert!(registry.claim_orchestration_name(NAME, TOKEN));
+        assert!(registry.claim_orchestration_name(NAME, Some(DIR), TOKEN));
 
         // Post-spawn: the real pane id is now known — rebind onto it.
         assert!(
@@ -9270,15 +9537,15 @@ mod spawn_tests {
 
         // The name is still held — a fresh claimant (whether it guesses the
         // old token or uses a new one) is refused.
-        assert!(!registry.claim_orchestration_name(NAME, TOKEN));
-        assert!(!registry.claim_orchestration_name(NAME, "some-other-token"));
+        assert!(!registry.claim_orchestration_name(NAME, Some(DIR), TOKEN));
+        assert!(!registry.claim_orchestration_name(NAME, Some(DIR), "some-other-token"));
 
         // `StopAgent`'s existing release-by-pane-id mechanism must still
         // work post-rebind — this is the whole point of confirming onto the
         // real id instead of leaving the claim stuck under the token.
         registry.release_orchestration_name(REAL_PANE_ID);
         assert!(
-            registry.claim_orchestration_name(NAME, "new-claimant"),
+            registry.claim_orchestration_name(NAME, Some(DIR), "new-claimant"),
             "releasing the rebound pane id must free the name for a new claimant"
         );
     }
@@ -9296,16 +9563,17 @@ mod spawn_tests {
     #[test]
     fn identity_024_confirm_with_wrong_token_is_refused_and_release_by_token_frees_the_name() {
         const NAME: &str = "myrepo-orchestrator-2";
+        const DIR: &str = "/tmp/myrepo";
         const TOKEN: &str = "spawn-token-xyz789";
 
         let registry = AgentPtyRegistry::new();
-        assert!(registry.claim_orchestration_name(NAME, TOKEN));
+        assert!(registry.claim_orchestration_name(NAME, Some(DIR), TOKEN));
 
         // A confirm naming a token that never claimed anything must be
         // refused, and must not rebind or otherwise disturb the real claim.
         assert!(!registry.confirm_orchestration_claim("wrong-token", "pane-99"));
         assert!(
-            !registry.claim_orchestration_name(NAME, "some-other-token"),
+            !registry.claim_orchestration_name(NAME, Some(DIR), "some-other-token"),
             "a rejected confirm must leave the original token's claim intact"
         );
 
@@ -9315,7 +9583,7 @@ mod spawn_tests {
         // pane that never existed times out.
         registry.release_orchestration_name(TOKEN);
         assert!(
-            registry.claim_orchestration_name(NAME, "new-claimant"),
+            registry.claim_orchestration_name(NAME, Some(DIR), "new-claimant"),
             "releasing the token-held claim after a spawn failure must free the name \
              immediately"
         );
@@ -9335,6 +9603,7 @@ mod spawn_tests {
     #[tokio::test]
     async fn identity_028_a_confirmed_claim_is_released_when_its_pane_exits_without_stop_agent() {
         const NAME: &str = "myrepo-orchestrator-3";
+        const DIR: &str = "/tmp/myrepo";
         const PANE_ID_ENV: &str = "issue-201-crash-pane";
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -9349,7 +9618,7 @@ mod spawn_tests {
         // Simulates the post-confirm state: the claim is bound to the
         // real, daemon-known pane id, exactly as `confirm_orchestration_claim`
         // leaves it — see `identity_023`.
-        assert!(registry.claim_orchestration_name(NAME, PANE_ID_ENV));
+        assert!(registry.claim_orchestration_name(NAME, Some(DIR), PANE_ID_ENV));
 
         // Wait for the reader thread to observe EOF on its own (no
         // `close_agent`/`StopAgent` call anywhere in this test) — mirrors
@@ -9374,13 +9643,114 @@ mod spawn_tests {
         );
 
         assert!(
-            registry.claim_orchestration_name(NAME, "new-claimant-after-crash"),
+            registry.claim_orchestration_name(NAME, Some(DIR), "new-claimant-after-crash"),
             "a claim confirmed onto a pane whose process then exited on its own, with no \
              StopAgent ever sent, must be released once the daemon observes the exit — \
              otherwise the name is squatted for the daemon's entire remaining lifetime"
         );
 
         registry.shutdown_all();
+    }
+
+    /// Scenario: PRD fork#603 widens the daemon-side claim key from name
+    /// alone to the compound (directory, name) pair. Claim the name `x`
+    /// from directory `/a`, then claim the SAME name `x` from a DIFFERENT
+    /// directory `/b` — both must succeed, since the two directories don't
+    /// conflict. A third claim of `x` from `/a` again, by a different pane,
+    /// must still be refused: the same name AND the same directory as an
+    /// existing holder is still a real collision.
+    #[spec("orchestration/identity/031")]
+    #[test]
+    fn identity_031_claim_scoped_to_directory_allows_same_name_in_different_dirs() {
+        let registry = AgentPtyRegistry::new();
+
+        assert!(registry.claim_orchestration_name("x", Some("/a"), "p1"));
+        assert!(
+            registry.claim_orchestration_name("x", Some("/b"), "p2"),
+            "the same name claimed from a DIFFERENT directory must not \
+             conflict with an existing claim (PRD fork#603)"
+        );
+        assert!(
+            !registry.claim_orchestration_name("x", Some("/a"), "p3"),
+            "the same name AND the same directory as an existing holder \
+             must still be refused for a different pane"
+        );
+    }
+
+    /// Scenario: PRD fork#603 backward-compat semantics — a claim with
+    /// `cwd: None` (an old-TUI claim that doesn't know its directory) is a
+    /// GLOBAL WILDCARD: it conflicts with a directory-scoped claim of the
+    /// same name regardless of order. (a) a wildcard claim made first
+    /// blocks a later directory-scoped claim of the same name. (b) a
+    /// directory-scoped claim made first also blocks a later wildcard claim
+    /// of the same name.
+    #[spec("orchestration/identity/032")]
+    #[test]
+    fn identity_032_none_cwd_is_a_global_wildcard_against_a_scoped_claim_in_either_order() {
+        // (a) wildcard first, scoped claim second.
+        let registry = AgentPtyRegistry::new();
+        assert!(registry.claim_orchestration_name("x", None, "p-old"));
+        assert!(
+            !registry.claim_orchestration_name("x", Some("/a"), "p-new"),
+            "an old-style global claim (cwd: None) must block a new \
+             directory-scoped claim of the same name (PRD fork#603)"
+        );
+
+        // (b) scoped claim first, wildcard second.
+        let registry = AgentPtyRegistry::new();
+        assert!(registry.claim_orchestration_name("y", Some("/a"), "p-new"));
+        assert!(
+            !registry.claim_orchestration_name("y", None, "p-old"),
+            "a directory-scoped claim must also block a later wildcard \
+             claim (cwd: None) of the same name, in the other order \
+             (PRD fork#603)"
+        );
+    }
+
+    /// Scenario: PRD fork#603 reviewer finding B2 — replicate what each of
+    /// the two `ClaimOrchestrationName` call sites in `src/ui.rs` actually
+    /// compute for the SAME orchestration, post-fix. Restore/reconnect
+    /// (`src/ui.rs:13787-13800`) claims with the restored pane's own cwd,
+    /// which for an orchestration pane is the PROVISIONED WORKSPACE
+    /// directory (e.g. `/tmp/myproj-proj-orchestrator-1`, the
+    /// `resolve_workspace_path` sibling). A fresh live spawn of the same
+    /// orchestration name (`src/ui.rs:10931-10947`) now resolves and claims
+    /// with that SAME workspace directory too, rather than the raw picked
+    /// source directory — both call sites send the same kind of value for
+    /// the same orchestration. Because the daemon's compound key compares
+    /// those two now-identical directory strings, the second claim is
+    /// correctly refused — the exact fork #74 condition the claim registry
+    /// exists to prevent, and the case `origin/main`'s old name-only key
+    /// caught and this compound key now catches again.
+    #[spec("orchestration/identity/036")]
+    #[test]
+    fn identity_036_restore_and_live_spawn_key_the_same_orchestration_on_the_same_resolved_dir() {
+        let registry = AgentPtyRegistry::new();
+
+        // Restore/reconnect claims with the provisioned WORKSPACE directory.
+        assert!(registry.claim_orchestration_name(
+            "proj-orchestrator-1",
+            Some("/tmp/myproj-proj-orchestrator-1"),
+            "restored-pane",
+        ));
+
+        // A fresh live-spawn open of the SAME orchestration name resolves
+        // to the SAME provisioned workspace directory post-fix (never the
+        // raw picked source directory), so it must be refused while the
+        // restored orchestration is still live.
+        assert!(
+            !registry.claim_orchestration_name(
+                "proj-orchestrator-1",
+                Some("/tmp/myproj-proj-orchestrator-1"),
+                "new-live-pane",
+            ),
+            "a fresh live-spawn open of an orchestration name already held \
+             by a restored session for the SAME orchestration must be \
+             refused — both claim call sites now key on the SAME resolved \
+             workspace directory for the same orchestration, so the \
+             daemon correctly detects the conflict (PRD fork#603 \
+             reviewer B2)"
+        );
     }
 
     #[test]
@@ -11707,6 +12077,9 @@ mod spawn_tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -11733,6 +12106,48 @@ mod spawn_tests {
             .expect("older daemon shape must decode via #[serde(default)] on rows/cols");
         assert_eq!(back.rows, 0);
         assert_eq!(back.cols, 0);
+    }
+
+    /// Issue #586 M1/M2: with the three new watch fields all `None`, the
+    /// `skip_serializing_if` contract must hold — none of the three keys
+    /// appears on the wire, so an older client decoding this record sees the
+    /// same JSON shape it always has.
+    #[test]
+    fn agent_record_with_no_watches_armed_omits_the_new_keys() {
+        let rec = AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in [
+            "outstanding_delegation",
+            "silence_watch",
+            "delegation_commission",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "{key} must be omitted from the wire payload when None, per \
+                 skip_serializing_if — an older client must see nothing new"
+            );
+        }
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert!(back.outstanding_delegation.is_none());
+        assert!(back.silence_watch.is_none());
+        assert!(back.delegation_commission.is_none());
     }
 
     #[test]
@@ -11970,6 +12385,9 @@ mod spawn_tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -12673,25 +13091,31 @@ mod spawn_tests {
     fn commission_ledger_credits_one_completion_per_delegation() {
         let reg = Arc::new(AgentPtyRegistry::new());
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a worker nobody delegated to owes nothing"
         );
 
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 1 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 1,
+                subject_mismatch: None
+            },
             "the first completion answers one of two outstanding commissions"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "the second answers the last one"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a third completion is answering nothing — the defect in #448"
         );
@@ -12711,27 +13135,30 @@ mod spawn_tests {
         );
 
         // One delegate, undelivered: the ledger must not keep the debt.
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         assert!(reg.release_delegation_commission("worker"));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "a failed delegate must not leave a phantom commission for a later \
              uncommissioned work-done to spend — that is #448 through its own fix"
         );
 
         // Two delegates, only the second undelivered: the first is still owed.
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
         assert!(reg.release_delegation_commission("worker"));
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "releasing one failed delegate must not discard a sibling delegation's \
              genuine commission"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker"),
+            reg.retire_delegation_commission("worker", None),
             WorkDoneProvenance::Unsolicited,
             "and only the one that landed is credited"
         );
@@ -12744,20 +13171,23 @@ mod spawn_tests {
     #[test]
     fn commission_ledger_is_swept_by_either_panes_close_and_refuses_mid_close() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        assert!(reg.arm_delegation_commission("worker-a", "orch-1"));
-        assert!(reg.arm_delegation_commission("worker-b", "orch-2"));
+        assert!(reg.arm_delegation_commission("worker-a", "orch-1", None));
+        assert!(reg.arm_delegation_commission("worker-b", "orch-2", None));
 
         // Closing the ORCHESTRATOR clears what was owed to it; an unrelated
         // orchestration's commission survives.
         drop(reg.begin_pane_close("orch-1"));
         assert_eq!(
-            reg.retire_delegation_commission("worker-a"),
+            reg.retire_delegation_commission("worker-a", None),
             WorkDoneProvenance::Unsolicited,
             "a commission owed to a closed orchestrator must not survive it"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker-b"),
-            WorkDoneProvenance::Solicited { remaining: 0 },
+            reg.retire_delegation_commission("worker-b", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
             "another orchestration's commission must be untouched by the close"
         );
 
@@ -12766,19 +13196,337 @@ mod spawn_tests {
         // completion into a solicited one.
         assert!(reg.is_pane_closing("orch-1"));
         assert!(
-            !reg.arm_delegation_commission("worker-a", "orch-1"),
+            !reg.arm_delegation_commission("worker-a", "orch-1", None),
             "a closing orchestrator must not accept new commissions"
         );
-        assert!(reg.arm_delegation_commission("worker-a", "orch-live"));
+        assert!(reg.arm_delegation_commission("worker-a", "orch-live", None));
         drop(reg.begin_pane_close("worker-a"));
         assert!(
-            !reg.arm_delegation_commission("worker-a", "orch-live"),
+            !reg.arm_delegation_commission("worker-a", "orch-live", None),
             "a closing worker must not accept new commissions"
         );
         assert_eq!(
-            reg.retire_delegation_commission("worker-a"),
+            reg.retire_delegation_commission("worker-a", None),
             WorkDoneProvenance::Unsolicited,
             "the worker's own close swept its ledger entry too"
+        );
+    }
+
+    /// Issue #586 M1/M2: `arm_silence_watch` must stamp the record with a real
+    /// time, so [`AgentPtyRegistry::delegation_watch_snapshot`] can report how
+    /// long ago the watch was armed.
+    #[test]
+    fn arm_silence_watch_stamps_armed_at() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        reg.arm_silence_watch("worker", "orch", None)
+            .expect("arm succeeds for two open panes");
+        let armed_at = {
+            let tracker = reg.delegations.lock().unwrap();
+            tracker
+                .silence_watches
+                .get("worker")
+                .expect("just armed")
+                .armed_at
+        };
+        assert!(
+            armed_at.elapsed() < Duration::from_secs(5),
+            "armed_at must reflect the moment of arming, not a default/zero value"
+        );
+    }
+
+    /// Issue #586 M2/B round 2: each arm pushes its OWN timestamp onto
+    /// `arm_times` rather than sharing one pinned clock — the data-model fix
+    /// for reviewer/auditor finding B1/B2/F1/F2, where a single `armed_at`
+    /// shared across re-arms let one stale delegation expire fresh siblings.
+    #[test]
+    fn delegation_commission_records_a_timestamp_per_arm() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        let (len, first, second) = {
+            let tracker = reg.delegations.lock().unwrap();
+            let entry = tracker.commissions.get("worker").expect("just armed");
+            (
+                entry.arm_times.len(),
+                entry.arm_times.front().cloned(),
+                entry.arm_times.get(1).cloned(),
+            )
+        };
+
+        assert_eq!(
+            len, 2,
+            "two arms must record two entries, not a shared counter"
+        );
+        assert!(
+            first.is_some() && second.is_some() && first != second,
+            "each arm must get its own timestamp rather than sharing the first arm's clock"
+        );
+    }
+
+    /// Issue #586 M1/M2: `delegation_watch_snapshot` reports each of the three
+    /// independent detectors — absent (`None`) when unarmed, populated with a
+    /// sane elapsed time when armed.
+    #[test]
+    fn delegation_watch_snapshot_reports_each_armed_watch() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        let unarmed = reg.delegation_watch_snapshot("worker");
+        assert!(
+            unarmed.outstanding_delegation.is_none()
+                && unarmed.silence_watch.is_none()
+                && unarmed.delegation_commission.is_none(),
+            "an unarmed worker pane must report all-None"
+        );
+
+        reg.arm_outstanding_delegation("worker", "role", "orch", "orch-agent", None);
+        reg.arm_silence_watch("worker", "orch", None)
+            .expect("arm succeeds for two open panes");
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+
+        let snap = reg.delegation_watch_snapshot("worker");
+        let outstanding = snap
+            .outstanding_delegation
+            .expect("idle-worker watch is armed");
+        assert_eq!(outstanding.orchestrator_pane_id, "orch");
+        assert!(outstanding.armed_secs_ago < 5);
+
+        let silence = snap.silence_watch.expect("silent-worker watch is armed");
+        assert_eq!(silence.orchestrator_pane_id, "orch");
+        assert!(silence.armed_secs_ago < 5);
+
+        let commission = snap
+            .delegation_commission
+            .expect("commission ledger is armed");
+        assert_eq!(commission.orchestrator_pane_id, "orch");
+        assert_eq!(commission.outstanding, 2);
+        assert!(commission.oldest_armed_secs_ago < 5);
+    }
+
+    /// Issue #586 M2/B round 2, closing upstream #590: a commission entry
+    /// older than [`COMMISSION_MAX_AGE`] expires — purged and the completion
+    /// is reported `Unsolicited` rather than crediting stale debt. A fresh
+    /// commission is unaffected (regression guard for the common case).
+    #[test]
+    fn retire_delegation_commission_expires_a_stale_commission() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // A fresh commission, armed moments ago, must still be credited.
+        assert!(reg.arm_delegation_commission("fresh", "orch", None));
+        assert_eq!(
+            reg.retire_delegation_commission("fresh", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a commission within COMMISSION_MAX_AGE is unaffected by the expiry check"
+        );
+
+        // A stale commission, backdated past COMMISSION_MAX_AGE, must expire.
+        assert!(reg.arm_delegation_commission("stale", "orch", None));
+        {
+            let mut tracker = reg.delegations.lock().unwrap();
+            let entry = tracker.commissions.get_mut("stale").expect("just armed");
+            entry.arm_times[0].armed_at =
+                Instant::now() - (COMMISSION_MAX_AGE + Duration::from_secs(60));
+        }
+        assert_eq!(
+            reg.retire_delegation_commission("stale", None),
+            WorkDoneProvenance::Unsolicited,
+            "upstream #590: a commission older than COMMISSION_MAX_AGE must not be \
+             credited to a much-later genuine work-done"
+        );
+        assert!(
+            reg.delegation_watch_snapshot("stale")
+                .delegation_commission
+                .is_none(),
+            "the expired entry must be removed from the ledger, not merely reported stale"
+        );
+    }
+
+    /// Issue #586 M2/B round 2: two commissions for the SAME worker pane,
+    /// armed at different times, must each be credited on completion and
+    /// consumed oldest-first — a correctness/plumbing check on independent
+    /// per-arm ages, not a discriminating regression guard. Its 100-minute
+    /// backdate only distinguished the old single-`armed_at`-plus-counter
+    /// shape from the redesign against the OLD 120-minute expiry window; against
+    /// the current 7-day `COMMISSION_MAX_AGE` both entries are "fresh" either
+    /// way, so this test alone would pass identically whether or not the
+    /// redesign had happened. [`retire_delegation_commission_purges_only_the_stale_sibling`]
+    /// below is the one that actually discriminates, since it backdates past
+    /// `COMMISSION_MAX_AGE` itself.
+    #[test]
+    fn retire_delegation_commission_ages_two_arms_independently() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        {
+            let mut tracker = reg.delegations.lock().unwrap();
+            let entry = tracker.commissions.get_mut("worker").expect("just armed");
+            entry.arm_times[0].armed_at = Instant::now() - Duration::from_secs(100 * 60);
+        }
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+
+        // Retiring once consumes the OLDER (~100m old) entry first.
+        assert_eq!(
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 1,
+                subject_mismatch: None
+            },
+            "the first completion answers the older of the two outstanding commissions"
+        );
+
+        // The remaining entry is the fresh (~0m old) one — nowhere near
+        // COMMISSION_MAX_AGE — and must still be credited, not wrongly expired.
+        assert_eq!(
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "the second, genuinely fresh commission must not be caught by the first \
+             arm's age"
+        );
+    }
+
+    /// Issue #586 M2/B round 2 (finding B2's other half): one stale entry
+    /// sharing a worker pane with fresh siblings must be purged on its own,
+    /// without taking the fresh ones down with it — not `Unsolicited` just
+    /// because the stale entry happened to be at the front of the queue. This
+    /// is the actually-discriminating regression guard for reviewer's B2
+    /// counterexample: it backdates one arm past `COMMISSION_MAX_AGE` itself,
+    /// so it is the test that would fail against the pre-fix single-`armed_at`
+    /// design, where the whole pane's age was governed by one shared field
+    /// rather than per-arm timestamps.
+    #[test]
+    fn retire_delegation_commission_purges_only_the_stale_sibling() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        assert!(reg.arm_delegation_commission("worker", "orch", None));
+        {
+            let mut tracker = reg.delegations.lock().unwrap();
+            let entry = tracker.commissions.get_mut("worker").expect("just armed");
+            // Backdate only the FRONT (oldest) entry past COMMISSION_MAX_AGE;
+            // the other two stay fresh.
+            entry.arm_times[0].armed_at =
+                Instant::now() - (COMMISSION_MAX_AGE + Duration::from_secs(60));
+        }
+
+        assert_eq!(
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 1,
+                subject_mismatch: None
+            },
+            "the stale front entry must be purged and a fresh sibling credited instead \
+             of reporting Unsolicited because the stale entry was at the front"
+        );
+        assert_eq!(
+            reg.retire_delegation_commission("worker", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "the last fresh sibling must still be credited"
+        );
+    }
+
+    /// Issue #586 M4 fix round 3 (S6): every existing test on this guard only
+    /// ever exercises `(None, None)` for the subject comparison — passing
+    /// under a `_` arm however the guard is actually written, so an inverted
+    /// condition (`==` instead of `!=`) or a widened one would still pass
+    /// every test that existed before this round while firing the warning on
+    /// every correctly-matched report, or never firing on a genuine mismatch.
+    /// Pin the three remaining "both sides present or one absent" shapes:
+    /// matching subjects, and either side alone stated, must never mismatch.
+    #[test]
+    fn retire_delegation_commission_subject_guard_fast_tier_coverage() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // (Some(A), Some(A)) — both sides agree: no mismatch.
+        assert!(reg.arm_delegation_commission("worker-match", "orch", Some("#586".to_string())));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-match", Some("#586")),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "matching subjects on both sides must never be reported as a mismatch"
+        );
+
+        // (Some, None) — delegated a subject, worker echoed none: opt-in, so
+        // an unstated echo is not a mismatch.
+        assert!(reg.arm_delegation_commission(
+            "worker-echo-none",
+            "orch",
+            Some("#586".to_string())
+        ));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-echo-none", None),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a worker that echoed no subject at all must not be flagged as mismatched"
+        );
+
+        // (None, Some) — no subject was delegated, worker stated one anyway:
+        // still not a mismatch, since nothing was asked.
+        assert!(reg.arm_delegation_commission("worker-undelegated-subject", "orch", None));
+        assert_eq!(
+            reg.retire_delegation_commission("worker-undelegated-subject", Some("#123")),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a subject the worker volunteered without one being delegated must not be \
+             flagged as mismatched"
+        );
+    }
+
+    /// Issue #586 M4 fix round 4 (S11/A16): regression guard for the exact bug
+    /// this round closes. `sanitize_subject_tag("A \u{200B} B")` is not
+    /// idempotent under the pre-fix implementation — `"A  B"` (double space)
+    /// once, `"A B"` (single space) twice — so a worker that does exactly
+    /// what H2's footer told it (echo the ALREADY-sanitized subject the
+    /// footer showed) used to trip a false SUBJECT MISMATCH once
+    /// `retire_delegation_commission` sanitized that echo a second time.
+    ///
+    /// This test simulates the real ingest flow rather than calling
+    /// `sanitize_subject_tag` twice directly: `handle_delegate`'s fan-out
+    /// loop sanitizes the subject ONCE, before arming (state.rs), so the
+    /// value handed to `arm_delegation_commission` here is already
+    /// canonical — exactly as the real caller supplies it — and the worker's
+    /// echo is the raw, once-sanitized text the footer rendered, unsanitized
+    /// until `retire_delegation_commission` sanitizes it here for the first
+    /// and only time.
+    #[test]
+    fn retire_delegation_commission_zero_width_space_echo_is_not_a_false_mismatch() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // What `handle_delegate`'s fan-out would have armed: the raw subject,
+        // sanitized once at ingest.
+        let canonical = crate::state::sanitize_subject_tag("A \u{200B} B");
+        assert_eq!(
+            canonical, "A B",
+            "sanity check on the fixed sanitize function itself before using it \
+             to build this test's fixture"
+        );
+        assert!(reg.arm_delegation_commission("worker", "orch", Some(canonical.clone())));
+
+        // What the worker echoes back: exactly the canonical value H2's
+        // footer showed it — the correct, expected behavior.
+        assert_eq!(
+            reg.retire_delegation_commission("worker", Some(&canonical)),
+            WorkDoneProvenance::Solicited {
+                remaining: 0,
+                subject_mismatch: None
+            },
+            "a worker echoing exactly the canonical subject the footer showed it must \
+             never trip a false SUBJECT MISMATCH, even though the underlying subject \
+             text originally contained a zero-width space that disproved \
+             sanitize_subject_tag's idempotency before this round's fix"
         );
     }
 

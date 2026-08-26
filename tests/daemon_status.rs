@@ -44,6 +44,8 @@ const TOOL_DETAIL_SENTINEL: &str = "DAEMON-STATUS-TOOL-DETAIL-SENTINEL-7c4b2e";
 const CLI_DRIVEN_PANE: &str = "status-cli-driven-pane-6a8d31";
 #[cfg(unix)]
 const CLI_CONTROL_PANE: &str = "status-cli-control-pane-8c2f47";
+#[cfg(unix)]
+const JSON_ORCH_PANE: &str = "status-json-orch-pane-3f7c9a";
 
 /// Build the same raw `AgentEvent` the `agent-event --type running` CLI path
 /// sends (`agent_event_type_from_state("running") == EventType::Thinking`),
@@ -362,7 +364,7 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Spawn a fully described managed pane through the daemon attach API, drive it through the real `agent-event --type running` CLI and into an active tool, then invoke `dot-agent-deck daemon status --json`. Assert the document pins the exact current schema version, every public field in a populated agent row, and all six supported live-status strings.
+/// Scenario: Spawn a fully described managed pane through the daemon attach API, drive it through the real `agent-event --type running` CLI and into an active tool, arm all three delegation-watch detectors (idle, silence, commission) for that same pane directly on the registry, then invoke `dot-agent-deck daemon status --json`. Assert the document pins the exact current schema version, every public field in a populated agent row — including the three joined delegation-watch fields — and all six supported live-status strings. Issue #586 M1: the arm-then-assert step proves the `ListAgents` handler actually wires `delegation_watch_snapshot` onto the live record, not just that the snapshot function itself is correct in isolation (already covered by `agent_pty`'s own unit tests).
 #[spec("daemon/status/002")]
 #[test]
 #[cfg(unix)]
@@ -438,6 +440,29 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    // Issue #586 M1: arm all three delegation-watch detectors directly on the
+    // registry for the SAME pane this test already drives, so the assertions
+    // below prove the `ListAgents` handler's join actually reaches the wire —
+    // not merely that `delegation_watch_snapshot` computes the right value in
+    // isolation.
+    assert!(
+        daemon
+            .registry
+            .arm_outstanding_delegation(pane_id, "coder", JSON_ORCH_PANE, "orch-agent", None)
+            .is_some(),
+        "arm the idle-worker watch for the schema row's pane"
+    );
+    daemon
+        .registry
+        .arm_silence_watch(pane_id, JSON_ORCH_PANE, None)
+        .expect("arm the silent-worker watch for two open panes");
+    assert!(
+        daemon
+            .registry
+            .arm_delegation_commission(pane_id, JSON_ORCH_PANE, None),
+        "arm the commission ledger for the schema row's pane"
+    );
+
     let result = run_daemon_status_cli(&daemon.attach_path, true).await;
     assert!(
         result.status.success(),
@@ -492,17 +517,42 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "active_tool",
             "agent_id",
             "cwd",
+            "delegation_commission",
             "label",
+            "outstanding_delegation",
             "pane_id",
             "role",
             "shell_synthetic_working",
+            "silence_watch",
             "status",
         ]),
-        "the current schema version must pin every public field name on a fully populated agent row; got agent={agent:?}"
+        "the current schema version must pin every public field name on a fully populated agent row \
+         (issue #586 M1: including the three joined delegation-watch fields); got agent={agent:?}"
     );
+
+    // The three delegation-watch fields carry a live, per-request timestamp
+    // (`armed_secs_ago` / `oldest_armed_secs_ago`), so they cannot be pinned
+    // by exact equality alongside the rest of the row. Pull them out, assert
+    // the base row exactly as before, then assert each watch field's static
+    // content (orchestrator pane id, count) plus a sane bound on its dynamic
+    // age.
+    let mut agent_obj = agent
+        .as_object()
+        .expect("each `agents` entry must be an object")
+        .clone();
+    let outstanding_delegation = agent_obj
+        .remove("outstanding_delegation")
+        .expect("issue #586 M1: the armed idle-worker watch must be joined onto the record");
+    let silence_watch = agent_obj
+        .remove("silence_watch")
+        .expect("issue #586 M1: the armed silent-worker watch must be joined onto the record");
+    let delegation_commission = agent_obj
+        .remove("delegation_commission")
+        .expect("issue #586 M1: the armed commission ledger entry must be joined onto the record");
+
     assert_eq!(
-        agent,
-        &serde_json::json!({
+        serde_json::Value::Object(agent_obj),
+        serde_json::json!({
             "active_tool": { "name": JSON_TOOL },
             "agent_id": agent_id,
             "cwd": cwd_str,
@@ -512,7 +562,56 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "shell_synthetic_working": false,
             "status": "Working",
         }),
-        "the representative row must pin the value and shape of every public field"
+        "the representative row must pin the value and shape of every base public field"
+    );
+
+    assert_eq!(
+        outstanding_delegation.get("orchestrator_pane_id"),
+        Some(&serde_json::Value::String(JSON_ORCH_PANE.to_string())),
+        "the idle-worker watch join must carry the orchestrator pane id it was armed with; \
+         got {outstanding_delegation:?}"
+    );
+    assert!(
+        outstanding_delegation
+            .get("armed_secs_ago")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|secs| secs < 5),
+        "the idle-worker watch's age must reflect a real, recent arm time; \
+         got {outstanding_delegation:?}"
+    );
+
+    assert_eq!(
+        silence_watch.get("orchestrator_pane_id"),
+        Some(&serde_json::Value::String(JSON_ORCH_PANE.to_string())),
+        "the silent-worker watch join must carry the orchestrator pane id it was armed with; \
+         got {silence_watch:?}"
+    );
+    assert!(
+        silence_watch
+            .get("armed_secs_ago")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|secs| secs < 5),
+        "the silent-worker watch's age must reflect a real, recent arm time; got {silence_watch:?}"
+    );
+
+    assert_eq!(
+        delegation_commission.get("orchestrator_pane_id"),
+        Some(&serde_json::Value::String(JSON_ORCH_PANE.to_string())),
+        "the commission ledger join must carry the orchestrator pane id it was armed with; \
+         got {delegation_commission:?}"
+    );
+    assert_eq!(
+        delegation_commission.get("outstanding"),
+        Some(&serde_json::Value::from(1_u64)),
+        "one arm must be joined as exactly one outstanding commission; got {delegation_commission:?}"
+    );
+    assert!(
+        delegation_commission
+            .get("oldest_armed_secs_ago")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|secs| secs < 5),
+        "the commission ledger's oldest-arm age must reflect a real, recent arm time; \
+         got {delegation_commission:?}"
     );
 
     for (status, expected) in [

@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{TuiDeck, commit_fixture};
+use common::{TuiDeck, commit_fixture, run_git};
 use spec::spec;
 
 /// `role` appears somewhere on the settled grid as its own token — bounded
@@ -107,5 +107,502 @@ fn identity_013_two_orchestration_opens_land_as_distinctly_named_tabs() {
         "the second orchestration's tab must be labeled {second_label:?}, distinct from the \
          first — not the identical basename-derived title fork#192 exists to stop recording \
          twice\n=== rendered grid ===\n{grid}"
+    );
+}
+
+/// Scenario: PRD fork#603 — the cross-directory counterpart to
+/// `identity_013`. Seed two SIBLING subtrees under the launch dir, each
+/// carrying an inner directory literally named `proj` (`team-a/proj` and
+/// `team-b/proj`, each with its own copy of the fixture's
+/// `.dot-agent-deck.toml`) — two genuinely distinct absolute paths that
+/// share the identical basename `suggest_orchestration_name` derives its
+/// suggestion from. Navigate the directory picker into each in turn (mouse
+/// clicks to descend, mirroring `e2e_scheduler_manager.rs`'s
+/// `form_006_edit_repick_different_dir_wins_in_seed`), accepting the form's
+/// suggested Name both times with a single Enter, never typing over it.
+/// Both opens must land un-refused as their own live orchestration tab
+/// titled EXACTLY `proj-orchestrator-1` — never forced apart into `-1`/`-2`
+/// (today's name-only global uniqueness check would bump the second open to
+/// `-2` even though the two directories share nothing).
+#[spec("orchestration/identity/033")]
+#[test]
+fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1() {
+    let deck = TuiDeck::launch_with_fixture("orch-deck");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+    deck.wait_for_string("No active sessions");
+
+    let toml = std::fs::read_to_string(work.join(".dot-agent-deck.toml"))
+        .expect("read fixture's own .dot-agent-deck.toml to duplicate into each leaf");
+    for team in ["team-a", "team-b"] {
+        let leaf = work.join(team).join("proj");
+        std::fs::create_dir_all(&leaf).expect("create leaf project dir");
+        std::fs::write(leaf.join(".dot-agent-deck.toml"), &toml)
+            .expect("seed leaf .dot-agent-deck.toml");
+    }
+    // `commit_fixture` only ever adds its own top-level `.dot-agent-deck.toml`
+    // (deliberately, per its own doc comment — a blanket `add`/`-A` would also
+    // try to walk the harness's `home/` dir and Unix sockets). The two leaf
+    // fixtures above are therefore untracked unless committed explicitly here,
+    // and every orchestration provisions via `git clone`, which only ever
+    // reproduces tracked, committed content (src/ui.rs:9941, fork issue #595)
+    // — an untracked leaf is invisible to the clone and fails
+    // `resolved_dir()`'s nested-subpath check for BOTH opens, not just the
+    // second (PRD fork#603 / PR #604).
+    run_git(&work, &["add", "team-a/proj/.dot-agent-deck.toml"]);
+    run_git(&work, &["add", "team-b/proj/.dot-agent-deck.toml"]);
+    run_git(
+        &work,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "add team-a/team-b fixture leaves",
+        ],
+    );
+
+    const LABEL: &str = " proj-orchestrator-1 ";
+
+    // First open: team-a/proj.
+    deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
+    let (col, row) = deck.wait_for_in_grid("team-a");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-a
+    // `"proj/"`, not bare `"proj"`: `render_dir_picker` (src/ui.rs) renders
+    // every row as `"{prefix}{name}/"` — the trailing slash is the picker's
+    // own literal text, which the SECOND open's `-orchestrator-1` tab label
+    // (no slash after "proj") can never match. See the second open below
+    // for the failure this closes.
+    let (col, row) = deck.wait_for_in_grid("proj/");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-a/proj
+    deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_bytes(b"\x1b[C"); // Right -> [Orch: demo-orch]
+    deck.send_bytes(b"\r"); // Mode -> Name
+    deck.send_bytes(b"\r"); // submit the suggested name, unedited
+    deck.wait_for_string(LABEL); // first open's tab is up, labeled -orchestrator-1
+
+    // Back to the Dashboard to open the second orchestration.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
+    deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    // Second open: team-b/proj — a DIFFERENT absolute path with the
+    // IDENTICAL basename `proj`.
+    deck.send_bytes(b"\x0e");
+    let (col, row) = deck.wait_for_in_grid("team-b");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-b
+    // Root cause of the original failure (PRD fork#603 / PR #604): a bare
+    // `wait_for_in_grid("proj")` here is ambiguous once the FIRST open's
+    // tab is live — the Dashboard's tab bar (row 0, always on screen behind
+    // the picker's popup, which starts at row 10 for the harness's default
+    // 120x40 PTY — `compute_frame_layout` reserves the tab bar as
+    // `Constraint::Length(1)` at the top of the frame, `render_dir_picker`
+    // centers its 60x20 popup below that) already shows the label
+    // `" proj-orchestrator-1 "`. `find_in_grid` scans top-to-bottom and
+    // returns the FIRST match, so it returns the TAB BAR's coordinates, not
+    // the picker's own `proj` row further down. The two "double" clicks
+    // then land outside every `picker_row_rects` entry; a miss inside the
+    // blocking `DirPicker` overlay is consumed rather than falling through
+    // (see the click-routing comment in `src/ui.rs`), so `current_dir`
+    // never advances past `team-b` and the following Space confirms `team-b`
+    // itself — a directory with no `.dot-agent-deck.toml`, hence no
+    // orchestration option, hence Right from "No mode" lands on the
+    // built-in `schedule` option and Name shows the raw, un-suggested
+    // `team-b` (exactly what the failing CI run showed). `"proj/"` is the
+    // picker row's own literal text (see the first open above) and cannot
+    // match the tab bar's `"proj-"`.
+    let (col, row) = deck.wait_for_in_grid("proj/");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-b/proj
+    deck.send_bytes(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_bytes(b"\x1b[C");
+    deck.send_bytes(b"\r");
+    deck.send_bytes(b"\r"); // submit the suggested name, unedited
+
+    // `wait_for_string(LABEL)` alone would be vacuously satisfied by the
+    // FIRST tab's own identical label (fork#192 review F7's same trap, here
+    // because both suggestions are meant to be identical rather than
+    // incidentally so) — wait until BOTH tabs carry it instead.
+    //
+    // PRD fork#603 reviewer N6: `>= 2` rather than `== 2` — the exact count
+    // is already pinned by the `assert_eq!` below, so a future THIRD
+    // incidental occurrence of the label (a pane title, a status line) fails
+    // there with a clear assertion message instead of stalling this wait to
+    // a bare 30s timeout.
+    //
+    // PRD fork#603 reviewer F5: a whole-grid `g.matches(LABEL).count() >= 2`
+    // here is the exact same vacuity `identity_037` had (see `tab_bar_line`'s
+    // own doc comment above) — it is satisfiable by tab 1's real tab-bar
+    // label plus tab 2's still-open New Pane form, whose Name field
+    // pre-fills the identical `LABEL` text the moment the Orchestration mode
+    // chip is selected, well before the submit keystroke above is even
+    // processed, let alone before the daemon has decided whether to grant or
+    // refuse the second claim. Scoping the match to `tab_bar_line` (row 0
+    // only) closes that gap exactly as it does there: the form's popup
+    // starts at row 10, so a match on row 0 can only come from a real
+    // tab-bar entry, and a silently refused second claim leaves row 0
+    // showing exactly ONE `LABEL` occurrence forever, timing this wait out
+    // instead of passing vacuously.
+    deck.wait_until_grid("both orchestration tabs labeled -orchestrator-1", |g| {
+        tab_bar_line(g).matches(LABEL).count() >= 2
+    });
+
+    // Scoped to the tab-bar row for the same reason as the wait above: by
+    // this point the wait has already proven row 0 carries two real
+    // `LABEL` occurrences, so re-checking the WHOLE grid here would let an
+    // incidental third occurrence elsewhere (a pane title, a status line)
+    // fail this assertion for a reason unrelated to what it claims to test
+    // — tab labeling, not arbitrary grid content. Keeping the exact-count
+    // check on the same row it was proven on is what makes the `== 2`
+    // guarantee (reviewer N6's own reasoning above) actually about the tab
+    // bar rather than the grid at large.
+    let grid = deck.snapshot_grid();
+    assert_eq!(
+        tab_bar_line(&grid).matches(LABEL).count(),
+        2,
+        "both `team-a/proj` and `team-b/proj` must land as their own, un-refused, live \
+         orchestration tab titled exactly {LABEL:?} — two directories with the same basename \
+         must each get their own `-orchestrator-1` rather than being forced apart (PRD \
+         fork#603)\n=== rendered grid ===\n{grid}"
+    );
+    assert!(
+        !grid.contains("-orchestrator-2"),
+        "the second open must never be bumped to `-orchestrator-2` — that would mean the \
+         client-side suggestion is still scoped to name alone rather than (directory, name) \
+         (PRD fork#603)\n=== rendered grid ===\n{grid}"
+    );
+}
+
+/// The provisioned sibling workspace directories PRD fork#603's isolated
+/// clone provisioning has produced so far for THIS test's own launch
+/// directory — every sibling of `parent` whose name is prefixed by `prefix`
+/// (`<launch-dir-basename>-`, the shape `resolve_workspace_path` in
+/// `src/ui.rs` always emits: `dir.with_file_name(format!("{dir_name}-{segment}"))`
+/// keeps the same parent as `dir`). `parent` is `harness_temp_root()`,
+/// shared by every concurrently running test's own per-test tempdir, but
+/// `work`'s own basename is a `tempfile`-randomized name unique to this
+/// test, so filtering on it as a prefix isolates exactly this test's own
+/// provisioned workspaces. Reads the real filesystem rather than
+/// recomputing the segment name `sanitize_workspace_segment` would derive,
+/// so it observes what provisioning ACTUALLY produced at runtime rather
+/// than what a hand-computed formula predicts it should have.
+fn provisioned_sibling_workspaces(parent: &std::path::Path, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(parent)
+        .expect("read the launch dir's parent to observe provisioned sibling workspaces")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(prefix))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Poll [`provisioned_sibling_workspaces`] until it reports exactly
+/// `expected` entries, or [`common::OBSERVATION_BUDGET`] elapses — rather
+/// than reading the filesystem once. A single point-in-time read races the
+/// real `git clone`: `deck.wait_for_string(LABEL)` (`LABEL` is
+/// `" proj-orchestrator-1 "`) is meant to confirm the FIRST open's tab is up
+/// before the filesystem is checked, but `send_bytes` writes the submit
+/// keystrokes to the PTY asynchronously, and that exact needle is ALSO what
+/// the still-open New Pane form's own Name field already renders — padded
+/// with spaces on both sides — the moment the Orchestration mode chip is
+/// selected (`suggest_name_if_orchestration_selected`, `src/ui.rs`), well
+/// before Enter is even processed, let alone before
+/// `provision_isolated_clone_sync_resolved`'s `git clone` runs. So the wait
+/// can be satisfied by the FORM's pre-filled suggestion instead of the
+/// finished tab, and the very next filesystem read can land before real
+/// provisioning has started. Polling here — via [`common::wait_until`],
+/// which owns the actual sleep/timeout loop (Decision 21 forbids a raw one
+/// in an `e2e_*.rs` body) — absorbs that gap without depending on exactly
+/// how large it is.
+fn wait_for_sibling_workspace_count(
+    parent: &std::path::Path,
+    prefix: &str,
+    expected: usize,
+) -> Vec<String> {
+    let last = std::cell::RefCell::new(Vec::new());
+    common::wait_until(common::OBSERVATION_BUDGET, || {
+        let found = provisioned_sibling_workspaces(parent, prefix);
+        let hit = found.len() == expected;
+        *last.borrow_mut() = found;
+        hit
+    });
+    last.into_inner()
+}
+
+/// The deck's tab-bar row — always row 0 of the rendered grid regardless of
+/// which overlay (the New Pane form, the directory picker) is drawn beneath
+/// it; `identity_033`'s own comment above establishes why (the picker's
+/// popup starts at row 10, while `compute_frame_layout` in `src/ui.rs`
+/// reserves the tab bar as a fixed `Constraint::Length(1)` at the very top
+/// of the frame). Restricting a `LABEL` search to this one line, rather than
+/// the whole grid, is what turns a wait on it into a genuine barrier in
+/// `identity_033` above and `identity_037` below: the New Pane form's own
+/// pre-filled Name field supplies the SAME `LABEL` text the moment the
+/// Orchestration mode chip is selected — well before the submit keystroke is
+/// even processed, let alone before the daemon has decided whether to grant
+/// or refuse the claim — but that field lives inside the popup and can
+/// never reach row 0. A match here can only come from a real tab. (PRD
+/// fork#603 reviewer F5: `identity_033` originally matched against the
+/// whole grid, the same vacuity this function was written to close in
+/// `identity_037`.)
+fn tab_bar_line(grid: &str) -> &str {
+    grid.lines().next().unwrap_or("")
+}
+
+/// Scenario: PRD fork#603's accepted fix (PR #604) keys the claim/comparison
+/// layer on the FULL resolved directory (toplevel + segment + relative
+/// subpath), which is enough to let `team-a/proj` and `team-b/proj` both
+/// succeed as distinctly-claimed, un-refused orchestrations — that much is
+/// already covered by `identity_033`'s tab-label check. What the fix does
+/// NOT do is change physical workspace provisioning:
+/// `resolve_workspace_path` (`src/ui.rs`) still derives the clone location
+/// from toplevel+segment alone, ignoring which subdirectory was picked
+/// (deliberately deferred, tracked as issue #607), so both opens — same
+/// toplevel, same suggested name `proj-orchestrator-1` — provision into the
+/// SAME physical clone directory, as two nested subdirectories rather than
+/// two separate clones. This test seeds the same `team-a/proj` /
+/// `team-b/proj` sibling leaves as `identity_033`, opens an orchestration
+/// in each, then verifies on the real filesystem that the one shared clone
+/// directory `provisioned_sibling_workspaces` observes actually contains
+/// BOTH orchestrations' own working subdirectories (`<clone>/team-a/proj`
+/// and `<clone>/team-b/proj`) as real, distinct, populated directories —
+/// i.e. each orchestration is genuinely working in the subdirectory it was
+/// opened against, not silently aliased to or missing in favor of the
+/// other, even though they share one parent clone. The second open's claim
+/// is confirmed genuinely granted (not silently refused while stale
+/// filesystem state from the shared clone happens to look right anyway) by
+/// waiting on the tab-bar row specifically, rather than the whole grid.
+#[spec("orchestration/identity/037")]
+#[test]
+fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_working_subdirectory()
+{
+    let deck = TuiDeck::launch_with_fixture("orch-deck");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+    deck.wait_for_string("No active sessions");
+
+    let toml = std::fs::read_to_string(work.join(".dot-agent-deck.toml"))
+        .expect("read fixture's own .dot-agent-deck.toml to duplicate into each leaf");
+    for team in ["team-a", "team-b"] {
+        let leaf = work.join(team).join("proj");
+        std::fs::create_dir_all(&leaf).expect("create leaf project dir");
+        std::fs::write(leaf.join(".dot-agent-deck.toml"), &toml)
+            .expect("seed leaf .dot-agent-deck.toml");
+    }
+    // Same reasoning as `identity_033`: every orchestration provisions via
+    // `git clone`, which only ever reproduces tracked, committed content, so
+    // the two leaf fixtures must be committed explicitly here.
+    run_git(&work, &["add", "team-a/proj/.dot-agent-deck.toml"]);
+    run_git(&work, &["add", "team-b/proj/.dot-agent-deck.toml"]);
+    run_git(
+        &work,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "add team-a/team-b fixture leaves",
+        ],
+    );
+
+    const LABEL: &str = " proj-orchestrator-1 ";
+
+    let work_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let prefix = format!("{work_basename}-");
+    let parent = work
+        .parent()
+        .expect("launch dir has a parent")
+        .to_path_buf();
+
+    let before = provisioned_sibling_workspaces(&parent, &prefix);
+    assert!(
+        before.is_empty(),
+        "no sibling workspace should exist for this test's launch dir before any orchestration \
+         is opened; found {before:?} under {}",
+        parent.display()
+    );
+
+    // First open: team-a/proj.
+    deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
+    let (col, row) = deck.wait_for_in_grid("team-a");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-a
+    let (col, row) = deck.wait_for_in_grid("proj/");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-a/proj
+    deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_bytes(b"\x1b[C"); // Right -> [Orch: demo-orch]
+    deck.send_bytes(b"\r"); // Mode -> Name
+    deck.send_bytes(b"\r"); // submit the suggested name, unedited
+    // Real isolated-clone provisioning runs synchronously inside
+    // `Action::SpawnPane` before this tab's role panes can spawn, so by the
+    // time its label is visible, the workspace directory it provisioned
+    // already exists on disk — but `wait_for_string(LABEL)` itself can
+    // return before that point: the New Pane form's own Name field already
+    // renders the identical, space-padded `LABEL` text as soon as the
+    // Orchestration mode chip is selected, several keystrokes before the
+    // asynchronously-delivered submit is processed. So this wait alone does
+    // NOT guarantee provisioning has run; `wait_for_sibling_workspace_count`
+    // below is what actually waits for it, by polling the filesystem side
+    // effect itself rather than a proxy for it.
+    deck.wait_for_string(LABEL); // first open's tab is up, labeled -orchestrator-1
+
+    let after_first = wait_for_sibling_workspace_count(&parent, &prefix, 1);
+    assert_eq!(
+        after_first.len(),
+        1,
+        "the first open must provision exactly one sibling workspace directory prefixed \
+         {prefix:?}; found {after_first:?} under {}",
+        parent.display()
+    );
+
+    // Back to the Dashboard to open the second orchestration.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
+    deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    // Second open: team-b/proj — a DIFFERENT absolute path with the
+    // IDENTICAL basename `proj`.
+    deck.send_bytes(b"\x0e");
+    let (col, row) = deck.wait_for_in_grid("team-b");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-b
+    let (col, row) = deck.wait_for_in_grid("proj/");
+    deck.click(col, row);
+    deck.click(col, row); // double-click -> descend into team-b/proj
+    deck.send_bytes(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_bytes(b"\x1b[C");
+    deck.send_bytes(b"\r");
+    deck.send_bytes(b"\r"); // submit the suggested name, unedited
+
+    // PRD fork#603 auditor (final verification pass): a whole-grid
+    // `g.matches(LABEL).count() >= 2` here is vacuous — it is satisfied the
+    // instant the SECOND form's own Name field pre-fills with the identical
+    // `LABEL` text (fork#192 review F7's same trap, here because both
+    // suggestions are meant to be identical rather than incidentally so, so
+    // there is no distinctly-numbered `second_label` to fall back on the way
+    // `identity_013` does), well before the submit keystroke above is even
+    // processed, let alone before the daemon has decided whether to grant or
+    // refuse the second claim. It therefore cannot distinguish "the second
+    // claim was granted" from "the second open was silently refused (the
+    // daemon's `ClaimOrchestrationName` handler in `src/daemon_protocol.rs`
+    // returns `orchestration name {name:?} is already held`, and the New
+    // Pane form stays open showing `Orchestration failed: ...`) while tab
+    // 1's own real label plus tab 2's still-open form happen to add up to
+    // two matches anyway". Scoping the match to `tab_bar_line` (row 0 only,
+    // defined above) closes that gap: the form's popup starts at row 10, so
+    // a match on row 0 can only come from a real tab-bar entry, and a
+    // refused second claim leaves row 0 showing exactly ONE `LABEL`
+    // occurrence forever — timing this wait out (with the daemon's refusal
+    // text captured in the panic's own final-grid dump) instead of passing
+    // vacuously.
+    deck.wait_until_grid("both orchestration tabs labeled -orchestrator-1", |g| {
+        tab_bar_line(g).matches(LABEL).count() >= 2
+    });
+
+    // The accepted PRD fork#603 design fixes the CLAIM/comparison layer
+    // only — physical workspace provisioning is deliberately unchanged
+    // (issue #607), so both opens still resolve to ONE shared sibling
+    // clone directory rather than two. This is the residual the auditor's
+    // original "must not share one physical workspace" framing predicted
+    // as a bug; it is now the accepted, documented boundary of the fix.
+    //
+    // This filesystem poll is NOT a substitute for the tab-bar wait above —
+    // both `before`/`after_first` and this `after_second` read converge on
+    // the same `expected=1`, because the shared clone's whole committed tree
+    // (both leaf directories) is already on disk after the FIRST open alone;
+    // a silently refused second open would leave this count identical. Its
+    // job is only to locate the one shared clone directory for the
+    // subdirectory checks below, now that the wait above has already proven
+    // the second claim was genuinely granted.
+    let after_second = wait_for_sibling_workspace_count(&parent, &prefix, 1);
+    assert_eq!(
+        after_second.len(),
+        1,
+        "team-a/proj and team-b/proj are expected to share exactly ONE physical clone \
+         directory under the accepted PRD fork#603 design — the fix corrects the claim/\
+         comparison layer, not physical workspace provisioning (deliberately deferred, issue \
+         #607); found {after_second:?} under {} (after the first open alone: {after_first:?})",
+        parent.display()
+    );
+    let clone_dir = parent.join(&after_second[0]);
+
+    // What DOES have to be true under the accepted design: each
+    // orchestration's own working subdirectory inside that shared clone
+    // must genuinely exist, distinctly, as the picked leaf — not aliased
+    // to or missing in favor of the other. This is the concrete, checkable
+    // form of "each orchestration is working in its own directory, not
+    // silently sharing one" that survives the fix, and it exercises the
+    // real provisioning path (reading the filesystem the real `git clone`
+    // populated) rather than a hand-computed formula.
+    let team_a_dir = clone_dir.join("team-a").join("proj");
+    let team_b_dir = clone_dir.join("team-b").join("proj");
+    assert!(
+        team_a_dir.is_dir(),
+        "team-a/proj's orchestration must be working in {} inside the shared clone {} — \
+         directory not found",
+        team_a_dir.display(),
+        clone_dir.display()
+    );
+    assert!(
+        team_b_dir.is_dir(),
+        "team-b/proj's orchestration must be working in {} inside the shared clone {} — \
+         directory not found",
+        team_b_dir.display(),
+        clone_dir.display()
+    );
+
+    let canonical_a = team_a_dir
+        .canonicalize()
+        .expect("team-a/proj's working subdirectory must resolve on disk");
+    let canonical_b = team_b_dir
+        .canonicalize()
+        .expect("team-b/proj's working subdirectory must resolve on disk");
+    assert_ne!(
+        canonical_a, canonical_b,
+        "team-a/proj and team-b/proj must resolve to two DISTINCT working subdirectories \
+         inside the shared clone — one must never be aliased to (e.g. via a symlink) or stand \
+         in for the other"
+    );
+
+    // Each leaf carries its own committed marker file (seeded above and
+    // committed into the fixture repo before either open) — its presence
+    // confirms the real `git clone` provisioning path actually checked out
+    // THIS exact subpath's tracked content, rather than an empty directory
+    // merely existing at the expected name.
+    assert!(
+        team_a_dir.join(".dot-agent-deck.toml").is_file(),
+        "team-a/proj's working subdirectory at {} must contain its own committed \
+         .dot-agent-deck.toml, proving the real clone actually checked out this subpath",
+        team_a_dir.display()
+    );
+    assert!(
+        team_b_dir.join(".dot-agent-deck.toml").is_file(),
+        "team-b/proj's working subdirectory at {} must contain its own committed \
+         .dot-agent-deck.toml, proving the real clone actually checked out this subpath",
+        team_b_dir.display()
     );
 }

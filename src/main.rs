@@ -5,7 +5,10 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
+use dot_agent_deck::agent_pty::{
+    DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
+    DOT_AGENT_DECK_REGISTRATION_GENERATION,
+};
 use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path, state_dir};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
@@ -124,6 +127,12 @@ enum Commands {
         /// Role name(s) to delegate to (repeatable)
         #[arg(long)]
         to: Vec<String>,
+        /// Subject tag (issue/PR number, or a short opaque token) this delegation
+        /// is for — issue #586 M4. Optional; when both this and the worker's own
+        /// `work-done --subject` are supplied and they don't match, the daemon
+        /// flags it visibly rather than silently trusting a wrong-content report.
+        #[arg(long)]
+        subject: Option<String>,
     },
     /// Create a git worktree and start an isolated line of work inside it.
     /// Agent-callable, one step (PRD #220).
@@ -181,6 +190,13 @@ enum Commands {
         /// Signal that the entire orchestration is complete (orchestrator only)
         #[arg(long)]
         done: bool,
+        /// Subject tag (issue/PR number, or a short opaque token) this report is
+        /// for — issue #586 M4, echoing back the delegation's own `--subject`.
+        /// Optional; when both this and the delegation's `--subject` are
+        /// supplied and they don't match, the daemon flags it visibly rather
+        /// than silently trusting a wrong-content report.
+        #[arg(long)]
+        subject: Option<String>,
     },
     /// Report an agent lifecycle state so the pane's card status updates
     /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
@@ -494,6 +510,56 @@ enum IssueCmd {
         #[arg(long = "confirm-stopped")]
         confirm_stopped: bool,
     },
+    /// Report whether the caller is clear to act on issue `<n>`, WITHOUT
+    /// writing anything — the read-only counterpart to `claim`, built to
+    /// back a `PreToolUse` hook (issue #286) that gates `gh issue
+    /// comment`/`close`/`edit` and a closing `gh pr merge` on the same
+    /// identity lock `claim` enforces. No `--takeover`/`--confirm-stopped`:
+    /// this command never writes, so takeover is meaningless here — resolve
+    /// a refusal with `issue claim --takeover --confirm-stopped` instead.
+    ClaimCheck {
+        /// The GitHub issue number.
+        issue: u64,
+        /// `owner/name`; derived from the current directory's `origin`
+        /// remote when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Release issue `<n>`'s claim (issue #326) — the missing release half
+    /// of `claim`'s lock: removes the `in-progress` label and posts a
+    /// comment recording the release. Refuses on an unclaimed issue, and
+    /// refuses on an issue held by a DIFFERENT identity or one whose
+    /// holder identity is unknown unless BOTH `--force` and
+    /// `--confirm-stopped` are passed. See
+    /// `dot_agent_deck::issue_claim`'s module doc for the full release
+    /// decision table.
+    Release {
+        /// The GitHub issue number.
+        issue: u64,
+        /// `owner/name`; derived from the current directory's `origin`
+        /// remote when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Signal intent to release an issue held by a different identity,
+        /// or whose holder identity is unknown. Alone, this still refuses —
+        /// deliberate friction mirroring `claim`'s own
+        /// `--takeover`-alone-still-refuses behavior, so an agent can't
+        /// satisfy the override in the same breath it discovers the
+        /// conflict. Pass `--confirm-stopped` too, once you have confirmed
+        /// the other agent has stopped.
+        #[arg(long)]
+        force: bool,
+        /// Confirms the previous holder's agent has been stopped. Only
+        /// takes effect together with `--force`; nothing verifies the
+        /// assertion.
+        #[arg(long = "confirm-stopped")]
+        confirm_stopped: bool,
+        /// Optional free-text reason, included verbatim (after
+        /// sanitization, wrapped in a code span) in the posted release
+        /// comment.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -727,6 +793,39 @@ fn resolve_work_done_candidate(path: &std::path::Path) -> (std::path::PathBuf, b
         return (resolved_parent.join(name), true);
     }
     (path.to_path_buf(), false)
+}
+
+/// Read the registration generation and daemon boot id THIS WORKER WAS
+/// SPAWNED UNDER from its own environment — injected at spawn time, sibling
+/// to `DOT_AGENT_DECK_PANE_ID` — rather than asking the live daemon what the
+/// pane's generation/boot currently are.
+///
+/// Fork #358 (M2 redesign, M4): asking the daemon at send time answers "what
+/// generation does this pane currently hold", which is the SAME question
+/// `handle_work_done` asks again microseconds later at delivery — a signal
+/// produced that way can never disagree with itself, so a worker that
+/// outlives its own orchestration's teardown (the actual #358 repro) would
+/// ask the *new* tenant's daemon state and get delivered into the *new*
+/// tenant's worktree unchanged. Reading it from the env instead means the
+/// value genuinely travels with the worker process from spawn, so a mismatch
+/// at delivery means what it's supposed to mean: the pane was re-registered
+/// since THIS worker began.
+///
+/// Missing or unparseable (an old CLI predating these variables, or a caller
+/// that didn't go through a dot-agent-deck-managed spawn) degrades to
+/// `(0, String::new())` — `0` never matches a real registration (those start
+/// at `1`), and `""` is never a real `daemon_boot_id` (see
+/// `DaemonBootId::default`) — so a report built from a defaulted context is
+/// refused at delivery rather than silently delivered unchecked. See
+/// `WorkDoneSignal::generation`'s doc for the cross-version cost of that
+/// choice.
+fn read_registration_context() -> (u64, String) {
+    let generation: u64 = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let daemon_boot_id: String = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).unwrap_or_default();
+    (generation, daemon_boot_id)
 }
 
 /// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
@@ -1127,6 +1226,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             to,
+            subject,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1158,6 +1258,7 @@ fn main() -> ExitCode {
                 task,
                 to,
                 timestamp: chrono::Utc::now(),
+                subject,
             };
             let msg = dot_agent_deck::event::DaemonMessage::Delegate(signal);
             let json = match serde_json::to_string(&msg) {
@@ -1347,6 +1448,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             done,
+            subject,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1377,45 +1479,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // Fork #358 (M2 redesign): read the registration generation THIS
-            // WORKER WAS SPAWNED UNDER from its own environment — injected
-            // at spawn time, sibling to `DOT_AGENT_DECK_PANE_ID` — rather
-            // than asking the live daemon what the pane's generation is
-            // right now. Asking the daemon at send time answers "what
-            // generation does this pane currently hold", which is the SAME
-            // question `handle_work_done` asks again microseconds later at
-            // delivery — a signal produced that way can never disagree with
-            // itself, so a worker that outlives its own orchestration's
-            // teardown (the actual #358 repro) would ask the *new* tenant's
-            // daemon state and get delivered into the *new* tenant's
-            // worktree unchanged. Reading it from the env instead means the
-            // value genuinely travels with the worker process from spawn,
-            // so a mismatch at delivery means what it's supposed to mean:
-            // the pane was re-registered since THIS worker began. Missing
-            // or unparseable (an old CLI predating this variable, or a
-            // caller that didn't go through a dot-agent-deck-managed spawn)
-            // degrades to `0`, which never matches a real registration
-            // (those start at `1`) — so this report is refused at delivery
-            // rather than silently delivered unchecked. See
-            // `WorkDoneSignal::generation`'s doc for the cross-version cost
-            // of that choice.
-            let generation: u64 =
-                std::env::var(dot_agent_deck::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION)
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-            // Fork #358 M4: sibling to `generation` above — read from its own
-            // env var, injected at spawn time alongside
-            // `DOT_AGENT_DECK_REGISTRATION_GENERATION`, for the same
-            // "travels with the worker process from spawn" reason. Missing
-            // (an old CLI predating this variable, or a non-managed caller)
-            // degrades to `""`, which no real `daemon_boot_id` is ever
-            // minted as (see `DaemonBootId::default`), so this report is
-            // refused at delivery exactly like a bare `generation: 0`
-            // already was.
-            let daemon_boot_id: String =
-                std::env::var(dot_agent_deck::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID)
-                    .unwrap_or_default();
+            // Fork #358 (M2 redesign, M4) / issue #461: see
+            // `read_registration_context`'s doc for why these are read from
+            // this process's own env rather than asked of the live daemon.
+            let (generation, daemon_boot_id) = read_registration_context();
             let signal = dot_agent_deck::event::WorkDoneSignal {
                 pane_id,
                 task,
@@ -1423,6 +1490,7 @@ fn main() -> ExitCode {
                 timestamp: chrono::Utc::now(),
                 generation,
                 daemon_boot_id,
+                subject,
             };
             let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
             let json = match serde_json::to_string(&msg) {
@@ -1736,6 +1804,14 @@ fn main() -> ExitCode {
                 takeover,
                 confirm_stopped,
             } => run_issue_claim_cli(issue, repo, takeover, confirm_stopped),
+            IssueCmd::ClaimCheck { issue, repo } => run_issue_claim_check_cli(issue, repo),
+            IssueCmd::Release {
+                issue,
+                repo,
+                force,
+                confirm_stopped,
+                reason,
+            } => run_issue_release_cli(issue, repo, force, confirm_stopped, reason),
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
@@ -2562,6 +2638,86 @@ fn run_issue_claim_cli(
     }
 }
 
+/// Same shape as [`run_issue_claim_cli`] — a refusal and an operational
+/// failure both map to `ExitCode::FAILURE` here (distinguished only by the
+/// printed message); `dot_agent_deck::issue_claim::run_issue_release` is
+/// where the actual decision lives.
+fn run_issue_release_cli(
+    issue: u64,
+    repo: Option<String>,
+    force: bool,
+    confirm_stopped: bool,
+    reason: Option<String>,
+) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("issue release: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match dot_agent_deck::issue_claim::run_issue_release(
+        &cwd,
+        repo.as_deref(),
+        issue,
+        force,
+        confirm_stopped,
+        reason.as_deref(),
+    ) {
+        Ok(message) => {
+            print!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("issue release: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The exit code IS the mechanism here, more than usually: PR #573's
+/// fix-round hook (`.claude/hooks/check-issue-claim.sh`) reads exactly these
+/// four codes to tell a confident lock refusal apart from a merely
+/// ambiguous state and from an operational failure it cannot answer at all
+/// — see `dot_agent_deck::issue_claim::ClaimCheckOutcome`'s doc table for
+/// the full mapping. Do not renumber these without updating that hook.
+///
+/// Code 2 is deliberately SKIPPED (round-2 fix, reviewer B5 / auditor R3):
+/// it is clap's own reserved usage-error code, so any `worker-agent-deck`
+/// binary predating this subcommand answers `claim-check` with exit 2 from
+/// a `clap` usage error, not from this function at all — colliding with
+/// whatever tier claimed 2 and fabricating a claim-state reason that was
+/// never actually determined. `Clear=0, RefusedByLock=1, (2 reserved by
+/// clap, never assigned here), CouldNotDetermine=3, Ambiguous=4`.
+fn run_issue_claim_check_cli(issue: u64, repo: Option<String>) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("issue claim-check: failed to resolve current directory: {e}");
+            return ExitCode::from(3);
+        }
+    };
+    use dot_agent_deck::issue_claim::ClaimCheckOutcome;
+    match dot_agent_deck::issue_claim::run_issue_claim_check(&cwd, repo.as_deref(), issue) {
+        ClaimCheckOutcome::Clear(message) => {
+            print!("{message}");
+            ExitCode::SUCCESS
+        }
+        ClaimCheckOutcome::RefusedByLock(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(1)
+        }
+        ClaimCheckOutcome::CouldNotDetermine(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(3)
+        }
+        ClaimCheckOutcome::Ambiguous(message) => {
+            eprintln!("issue claim-check: {message}");
+            ExitCode::from(4)
+        }
+    }
+}
+
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).
 /// Documented, non-`kill -9` way to recycle the local daemon after a
 /// binary upgrade. Idempotent (no-op exit 0 when no daemon is running)
@@ -3186,10 +3342,12 @@ mod tests {
                 task,
                 task_file,
                 to,
+                subject,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("/tmp/t.txt"));
                 assert_eq!(to, vec!["coder".to_string()]);
+                assert_eq!(subject, None);
             }
             _ => panic!("expected `delegate`"),
         }
@@ -3225,10 +3383,12 @@ mod tests {
                 task,
                 task_file,
                 done,
+                subject,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("-"));
                 assert!(!done);
+                assert_eq!(subject, None);
             }
             _ => panic!("expected `work-done`"),
         }
@@ -3443,5 +3603,111 @@ mod tests {
             mode, 0o600,
             "expected the log file to be created owner-only (mode 0o600), got {mode:#o}"
         );
+    }
+
+    // --- issue #461: `read_registration_context`'s reader-seam extraction ---
+    //
+    // `std::env::set_var`/`remove_var` are process-global, and all three
+    // tests below mutate the same two vars, so they serialize against this
+    // module-level lock. As with `issue_claim.rs`'s `PANE_ID_ENV_LOCK`, real
+    // soundness rests on `cargo nextest`'s process-per-test isolation
+    // (CLAUDE.md rule 5's actual gate) — this mutex only protects this
+    // module's own tests from each other under a plain thread-per-test
+    // `cargo test` run.
+    static WORK_DONE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Scenario: set both `DOT_AGENT_DECK_REGISTRATION_GENERATION` and
+    /// `DOT_AGENT_DECK_DAEMON_BOOT_ID` to real values, call
+    /// `read_registration_context`, and confirm it returns exactly what was
+    /// set — the parsed generation and the boot id verbatim.
+    #[test]
+    fn read_registration_context_reads_both_vars_when_present() {
+        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
+        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
+
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, "3");
+            std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, "boot-abc123");
+        }
+
+        assert_eq!(read_registration_context(), (3, "boot-abc123".to_string()));
+
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
+            }
+            match prev_boot {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
+            }
+        }
+    }
+
+    /// Scenario: with both env vars unset, call `read_registration_context`
+    /// and confirm it falls back to `(0, String::new())` — the defaults an
+    /// old CLI predating these variables, or a caller that didn't go through
+    /// a dot-agent-deck-managed spawn, must degrade to so the report is
+    /// refused at delivery rather than silently accepted.
+    #[test]
+    fn read_registration_context_defaults_when_vars_are_unset() {
+        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
+        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
+
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION);
+            std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID);
+        }
+
+        assert_eq!(read_registration_context(), (0, String::new()));
+
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
+            }
+            match prev_boot {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
+            }
+        }
+    }
+
+    /// Scenario: set `DOT_AGENT_DECK_REGISTRATION_GENERATION` to a
+    /// non-numeric value with the boot id unset, and confirm
+    /// `read_registration_context` silently falls back to `0` rather than
+    /// panicking — matching `.and_then(|v| v.parse().ok())`'s existing
+    /// silent-fallback behavior for a malformed value.
+    #[test]
+    fn read_registration_context_falls_back_to_zero_on_unparseable_generation() {
+        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
+        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
+
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, "not-a-number");
+            std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID);
+        }
+
+        assert_eq!(read_registration_context(), (0, String::new()));
+
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
+            }
+            match prev_boot {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
+            }
+        }
     }
 }

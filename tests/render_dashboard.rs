@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
@@ -1690,6 +1690,138 @@ fn agent_badge_006_model_with_format_chars_is_sanitized() {
         text.contains(&sanitized),
         "the model must be routed through the repo's terminal sanitizer \
          (src/terminal_sanitize.rs) before rendering:\n{text}"
+    );
+}
+
+/// Scenario: issue #410 — apply a `SessionStart` `AgentEvent` whose
+/// `display_name` metadata (`DISPLAY_NAME_METADATA_KEY`) embeds a
+/// Unicode `Cf` format character (U+202E RIGHT-TO-LEFT OVERRIDE) and is
+/// far longer than a reasonable display length, through the real
+/// `AppState::apply_event` seam, then check `SessionState.display_name`
+/// directly — no render involved, since the defect is inside
+/// `apply_event` itself: it sanitizes and length-clamps `event.model` on
+/// ingest (`dashboard/agent-badge/005`, `dashboard/agent-badge/006`) but
+/// does nothing of the kind for `display_name`, which arrives on the
+/// same wire and is stored with only an `is_empty()` filter. Mirrors
+/// `agent-badge/006`'s Cf-sanitization property and `agent-badge/005`'s
+/// length-clamp property, both applied to the sibling field. The fixture's
+/// prefix length is chosen (reviewer finding F2) so the 128-byte clamp
+/// lands mid-character rather than on a CJK char boundary, which is the
+/// only way this test can tell `clamp_display_name_bytes`'s boundary-
+/// snapping loop apart from a naive `&s[..128]` slice — see the exact
+/// snapped-length assertion below.
+#[spec("dashboard/agent-badge/007")]
+#[test]
+fn agent_badge_007_display_name_is_sanitized_and_clamped() {
+    let mut state = AppState::default();
+    state.register_pane("pane-badge-name".to_string());
+    let started = chrono::Utc::now();
+
+    // Reviewer finding F2: the sanitized prefix ("Sonnet" + the 8-byte
+    // `\u{202e}` escape spelling + "-evil-!") is deliberately 21 bytes, not
+    // 20 — with a 20-byte prefix, 128 - 20 = 108 is an exact multiple of the
+    // CJK filler's 3-byte width, so the 128-byte clamp lands exactly on a
+    // char boundary and `clamp_display_name_bytes`'s boundary-snapping loop
+    // is never exercised (a naive `&s[..128]` would pass too). With this
+    // 21-byte prefix, 128 - 21 = 107 is NOT a multiple of 3: the clamp lands
+    // 2 bytes into the 36th CJK char (which spans sanitized bytes
+    // [126, 129)), so `&s[..128]` alone would panic ("byte index 128 is not
+    // a char boundary"), and the loop must snap back to 126 for this test to
+    // observe a valid, in-range result at all.
+    let hostile_display_name = format!("Sonnet\u{202e}-evil-!{}TAIL-MARKER-ZZZZ", "日".repeat(100));
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        DISPLAY_NAME_METADATA_KEY.to_string(),
+        hostile_display_name.clone(),
+    );
+    state.apply_event(AgentEvent {
+        session_id: "name-id-01".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata,
+        pane_id: Some("pane-badge-name".to_string()),
+        agent_id: Some("agent-badge-name".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
+    let session = state
+        .sessions
+        .get("name-id-01")
+        .expect("the session exists after SessionStart");
+
+    let display_name = session
+        .display_name
+        .as_deref()
+        .expect("non-empty display_name metadata must be stored on the session");
+
+    assert!(
+        !display_name.contains('\u{202e}'),
+        "a Cf format char (U+202E RIGHT-TO-LEFT OVERRIDE) in display_name \
+         metadata must not reach session.display_name unsanitized:\n{display_name}"
+    );
+    assert!(
+        !display_name.contains("TAIL-MARKER-ZZZZ"),
+        "an unbounded display_name must be length-clamped to a sane display \
+         cap — the raw tail of a ~340-char display_name must not survive into \
+         session.display_name:\n{display_name}"
+    );
+
+    let sanitized_full =
+        dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display(&hostile_display_name);
+    assert!(
+        sanitized_full.starts_with(display_name) && display_name.len() < sanitized_full.len(),
+        "session.display_name must be a truncated prefix of the display_name \
+         run through the repo's terminal sanitizer (src/terminal_sanitize.rs) \
+         — sanitize-then-clamp, mirroring how `model` is handled at the top \
+         of AppState::apply_event:\ndisplay_name:\n{display_name}\n\
+         sanitized_full:\n{sanitized_full}"
+    );
+
+    // Reviewer finding F2: prove the clamp is the boundary-snapping loop in
+    // `clamp_display_name_bytes`, not merely a length cap. `String` already
+    // guarantees valid UTF-8, so a naive `&s[..128]` slice at this fixture's
+    // (deliberately) non-boundary 128th byte would panic outright rather
+    // than produce a wrong-but-passing result — the fact this assertion
+    // runs at all, and lands on the hand-computed snap-back length, is the
+    // proof the loop ran.
+    assert!(
+        display_name.len() <= dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN,
+        "clamped display_name must never exceed the {}-byte cap, got {} bytes:\n{display_name}",
+        dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN,
+        display_name.len()
+    );
+    assert_eq!(
+        display_name.len(),
+        126,
+        "with this fixture's 21-byte sanitized prefix, the 128-byte clamp \
+         must snap back to 126 bytes (2 bytes short of the cap, since the \
+         char straddling the cut starts at sanitized byte 126) — a \
+         different length means the boundary-snapping loop did not run as \
+         reasoned above:\n{display_name}"
+    );
+    // NOTE: checking "the last byte isn't a UTF-8 continuation-byte pattern"
+    // is NOT a valid way to detect a mid-character cut here — the final byte
+    // of a *complete* multi-byte character (e.g. CJK's 0xA5 in 日's E6 97 A5
+    // encoding) legitimately matches the continuation-byte bit pattern
+    // 10xxxxxx too, so that check would fail on correct output whenever the
+    // clamp happens to end on a multi-byte char. The only sound proof that
+    // the cut landed on a real char boundary of the sanitized source (and
+    // not merely that the *output* is well-formed UTF-8, which any `String`
+    // guarantees trivially) is checking the boundary against the source
+    // string the offset was computed from:
+    assert!(
+        sanitized_full.is_char_boundary(display_name.len()),
+        "the clamp must land on a char boundary of the sanitized source, not \
+         merely produce a well-formed (but arbitrarily re-encoded) output — \
+         byte {} is not a char boundary of sanitized_full:\n{sanitized_full}",
+        display_name.len()
     );
 }
 

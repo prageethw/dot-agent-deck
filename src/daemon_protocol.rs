@@ -641,6 +641,21 @@ pub enum AttachRequest {
     ClaimOrchestrationName {
         name: String,
         token: String,
+        /// PRD fork#603: the canonicalized directory this claim is scoped
+        /// to. `#[serde(default)]` so an older client that omits it still
+        /// decodes — its `None` is then treated as a global wildcard by
+        /// [`crate::agent_pty::AgentPtyRegistry::claim_orchestration_name`],
+        /// which conflicts with a claim of the same name from ANY
+        /// directory, preserving an old client's own assumption that its
+        /// claim was exclusive everywhere.
+        ///
+        /// PRD fork#603 fix round (reviewer N3): `skip_serializing_if`
+        /// matches the convention every other additive optional field in
+        /// this file already uses (`orchestration_cwd`, `display_title`,
+        /// `seed`, `isolated_clone_origin`) — without it, a new TUI sends
+        /// `"cwd": null` to an old daemon that has never heard of the key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     /// Fork issue #201 redesign: rebind the orchestration-name claim
     /// currently held by `token` onto `pane_id`, once `Action::SpawnPane`'s
@@ -1616,6 +1631,20 @@ async fn handle_connection(
                         .copied();
                 }
             }
+            // Issue #586 M1/M2: join in each pane's delegation-watch state —
+            // PRD #126's idle-worker watch, PRD #249's silent-worker watch,
+            // issue #448's commission ledger — the same additive-field
+            // pattern as `live`/`daemon_boot_id`/`registration_generation`
+            // above. This needs only `registry`, not the `AppState` lock, so
+            // it runs in its own loop rather than growing the guarded one.
+            for record in &mut records {
+                if let Some(pane_id) = record.pane_id_env.as_deref() {
+                    let snap = registry.delegation_watch_snapshot(pane_id);
+                    record.outstanding_delegation = snap.outstanding_delegation;
+                    record.silence_watch = snap.silence_watch;
+                    record.delegation_commission = snap.delegation_commission;
+                }
+            }
             write_resp(&mut stream, &AttachResponse::agent_records(records)).await?;
         }
         AttachRequest::StartAgent {
@@ -2543,7 +2572,7 @@ async fn handle_connection(
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
         }
-        AttachRequest::ClaimOrchestrationName { name, token } => {
+        AttachRequest::ClaimOrchestrationName { name, token, cwd } => {
             // Fork issue #201 redesign: the authoritative, race-free check
             // — see the variant's own doc comment for why `token` is a
             // caller-minted opaque string rather than a real pane id (none
@@ -2557,7 +2586,16 @@ async fn handle_connection(
                     &AttachResponse::err(format!("orchestration name {name:?} is not valid")),
                 )
                 .await?;
-            } else if registry.claim_orchestration_name(&name, &token) {
+            } else if cwd
+                .as_deref()
+                .is_some_and(|c| !crate::agent_pty::is_valid_orchestration_cwd(c))
+            {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!("orchestration cwd {cwd:?} is not valid")),
+                )
+                .await?;
+            } else if registry.claim_orchestration_name(&name, cwd.as_deref(), &token) {
                 write_resp(&mut stream, &AttachResponse::ok()).await?;
             } else {
                 write_resp(
@@ -4394,6 +4432,9 @@ mod tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -4414,6 +4455,9 @@ mod tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -4580,6 +4624,9 @@ mod tests {
             }),
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -4720,6 +4767,7 @@ mod tests {
         let req = AttachRequest::ClaimOrchestrationName {
             name: "myrepo-orchestrator-1".into(),
             token: "spawn-token-abc123".into(),
+            cwd: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4729,9 +4777,10 @@ mod tests {
 
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
         match back {
-            AttachRequest::ClaimOrchestrationName { name, token } => {
+            AttachRequest::ClaimOrchestrationName { name, token, cwd } => {
                 assert_eq!(name, "myrepo-orchestrator-1");
                 assert_eq!(token, "spawn-token-abc123");
+                assert_eq!(cwd, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -4856,6 +4905,7 @@ mod tests {
             &AttachRequest::ClaimOrchestrationName {
                 name: NAME.into(),
                 token: "tok-1".into(),
+                cwd: None,
             },
         )
         .await;
@@ -4885,6 +4935,7 @@ mod tests {
             &AttachRequest::ClaimOrchestrationName {
                 name: NAME.into(),
                 token: "tok-2".into(),
+                cwd: None,
             },
         )
         .await;
@@ -4922,12 +4973,86 @@ mod tests {
             &AttachRequest::ClaimOrchestrationName {
                 name: NAME.into(),
                 token: "tok-3".into(),
+                cwd: None,
             },
         )
         .await;
         assert!(
             reclaimed.ok,
             "releasing by the rebound real pane id must free the name for a new claimant"
+        );
+    }
+
+    /// Fork issue #603 auditor S1: the `ClaimOrchestrationName` handler must
+    /// reject a claim carrying an invalid `cwd` (empty, relative, or
+    /// containing control characters, per `is_valid_orchestration_cwd`) with
+    /// an `err` response, before it ever reaches
+    /// `registry.claim_orchestration_name` — the same boundary discipline
+    /// already applied to `name` via `is_valid_display_name`.
+    /// `is_valid_orchestration_cwd` itself has its own unit tests in
+    /// `src/agent_pty.rs`; this pins only the HANDLER's use of it.
+    ///
+    /// Scenario: spin up a real registry + real `serve_attach` (mirroring
+    /// `confirm_orchestration_claim_rejects_a_pane_id_the_daemon_never_minted`'s
+    /// own harness), then send a `ClaimOrchestrationName` request with
+    /// `cwd: Some("relative/proj".to_string())` — refused with an `err`
+    /// response. A subsequent claim of the SAME name with a valid absolute
+    /// `cwd` then succeeds, proving the rejected attempt left nothing behind
+    /// to squat the name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claim_orchestration_name_rejects_an_invalid_cwd() {
+        const NAME: &str = "myrepo-orchestrator-42";
+
+        let registry = std::sync::Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("attach.sock");
+        let listener = bind_attach_listener(&socket_path).expect("bind stub attach listener");
+        let reg = registry.clone();
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        tokio::spawn(async move {
+            let _ = serve_attach(listener, reg, event_tx).await;
+        });
+
+        async fn issue(socket_path: &std::path::Path, req: &AttachRequest) -> AttachResponse {
+            let stream = IpcStream::connect(socket_path)
+                .await
+                .expect("connect to stub attach listener");
+            let (mut rd, mut wr) = stream.into_split();
+            crate::daemon_client::issue_command(&mut rd, &mut wr, req)
+                .await
+                .expect("issue_command")
+        }
+
+        let bad_claim = issue(
+            &socket_path,
+            &AttachRequest::ClaimOrchestrationName {
+                name: NAME.into(),
+                token: "tok-1".into(),
+                cwd: Some("relative/proj".to_string()),
+            },
+        )
+        .await;
+        assert!(
+            !bad_claim.ok,
+            "a relative cwd must be rejected before ever reaching claim_orchestration_name"
+        );
+
+        // The rejected claim must not have squatted the name — a fresh
+        // claim of the SAME name with a valid absolute cwd must still
+        // succeed.
+        let good_claim = issue(
+            &socket_path,
+            &AttachRequest::ClaimOrchestrationName {
+                name: NAME.into(),
+                token: "tok-2".into(),
+                cwd: Some("/work/proj".to_string()),
+            },
+        )
+        .await;
+        assert!(
+            good_claim.ok,
+            "an invalid-cwd claim attempt must not leave the name held"
         );
     }
 

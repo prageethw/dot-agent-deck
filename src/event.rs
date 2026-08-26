@@ -940,6 +940,12 @@ pub struct DelegateSignal {
     /// Role names to delegate to (one or more).
     pub to: Vec<String>,
     pub timestamp: DateTime<Utc>,
+    /// Issue #586 M4: an optional subject tag (issue/PR number, or a short
+    /// opaque token) this delegation is for. `#[serde(default)]` so an older
+    /// CLI's payload (no `subject` field) still parses to `None` — additive,
+    /// never rejects, no `PROTOCOL_VERSION` bump.
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 /// Daemon → attached-TUI broadcast (PRD #76 M2.17). The daemon publishes
@@ -1190,6 +1196,13 @@ pub struct WorkDoneSignal {
     /// already was; see `changelog.d/358.breaking.md`).
     #[serde(default)]
     pub daemon_boot_id: String,
+    /// Issue #586 M4: the subject tag this worker is echoing back on its own
+    /// report, so the daemon can compare it against the delegation's own
+    /// `DelegateSignal::subject` and flag a disagreement. `#[serde(default)]`
+    /// so an older CLI's payload (no `subject` field) still parses to
+    /// `None` — additive, never rejects, no `PROTOCOL_VERSION` bump.
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 #[cfg(test)]
@@ -1638,6 +1651,7 @@ mod tests {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            subject: None,
         };
         let msg = DaemonMessage::Delegate(signal);
         let json = serde_json::to_string(&msg).unwrap();
@@ -1663,6 +1677,7 @@ mod tests {
                 .with_timezone(&Utc),
             generation: 0,
             daemon_boot_id: "boot-deadbeef".into(),
+            subject: None,
         };
         let msg = DaemonMessage::WorkDone(signal);
         let json = serde_json::to_string(&msg).unwrap();

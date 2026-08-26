@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    IsolatedCloneOutcome, RemovalPolicy, WorktreeCreation, WorktreeRegistry,
-    attempt_isolated_clone_cleanup, create_worktree, provision_isolated_clone_sync,
+    IsolatedCloneOutcome, RemovalPolicy, RemoveOutcome, WorktreeCreation, WorktreeRegistry,
+    attempt_isolated_clone_cleanup, create_worktree, provision_isolated_clone_sync_resolved,
     record_worktree, remove_worktree, run_status, worktree_still_in_use,
 };
 use crate::scheduler::StderrNotifier;
@@ -303,8 +303,109 @@ pub async fn handle_dispatch(
     task: &str,
     shape: Option<&crate::event::DispatchShape>,
 ) -> DispatchResult {
-    let paths = derive_dispatch_paths(&ctx.working_dir, name);
-    let clone_dir = ctx.working_dir.clone();
+    // Fork issue #595 fix round 2 (reviewer F3): `ctx.working_dir` is the
+    // calling pane's own registered cwd — after this fix that can
+    // legitimately be a nested subdirectory of its repo's toplevel, since
+    // any pane already running inside a resolved isolated clone at a
+    // nested prefix now has one. Left unresolved, `derive_dispatch_paths`
+    // below places the new worktree as a sibling of that NESTED directory
+    // — a full clone materialised inside the calling pane's own working
+    // tree — the same defect class F1 fixed in `src/ui.rs`'s
+    // `Action::SpawnPane`, one level down. Resolve once, up front, exactly
+    // as that call site does, and thread the result through: the toplevel
+    // becomes the sibling base and the clone source, `relative_subpath`
+    // reproduces the calling pane's own position inside the dispatched
+    // worktree so the dispatched agent's cwd matches where the caller
+    // actually is rather than always landing at the worktree root.
+    //
+    // `git rev-parse --show-toplevel` also CANONICALIZES its answer
+    // (symlinks resolved — e.g. macOS `/var` -> `/private/var`, the shape
+    // GitHub's macOS runners use for their temp dir), so the resolved
+    // toplevel is only substituted in below when `ctx.working_dir` is a
+    // GENUINE subdirectory of it (a non-empty relative prefix). When
+    // `ctx.working_dir` already IS the toplevel (or isn't inside a git
+    // repository at all), it stays the base unchanged — otherwise a
+    // canonicalization-only difference at the always-was-the-root case
+    // would change `derive_dispatch_paths`' output spelling with no change
+    // to which directory it names (the same regression this exact
+    // reasoning was added to `src/ui.rs`'s `Action::SpawnPane` to avoid).
+    // Fork issue #595 fix round 3 (reviewer N2): `resolve_git_toplevel`
+    // spawns a `git` subprocess and blocks on it for up to
+    // `WORKTREE_GIT_TIMEOUT` (30s). Every other blocking git/socket op in
+    // this async path already runs via `spawn_blocking` (see the
+    // live-sibling gate below, whose own comment states the rule this call
+    // was the one exception to) -- run this one the same way rather than
+    // parking a tokio worker thread on a stalled filesystem.
+    let working_dir_for_probe = ctx.working_dir.clone();
+    let toplevel_resolution = match tokio::task::spawn_blocking(move || {
+        crate::issue_dispatch_run::resolve_git_toplevel(&working_dir_for_probe)
+    })
+    .await
+    {
+        Ok(resolution) => resolution,
+        Err(join_err) => {
+            return DispatchResult {
+                worktree_dir: ctx.working_dir.clone(),
+                success: false,
+                message: format!(
+                    "dispatch: git-toplevel resolution task panicked: {}",
+                    crate::terminal_sanitize::sanitize_for_terminal_display(&join_err.to_string())
+                ),
+            };
+        }
+    };
+    let relative_subpath = toplevel_resolution
+        .as_ref()
+        .map(|(_, prefix)| prefix.clone())
+        .filter(|prefix| !prefix.as_os_str().is_empty());
+    let mut resolved_working_dir = if relative_subpath.is_some() {
+        toplevel_resolution
+            .as_ref()
+            .map(|(toplevel, _)| toplevel.clone())
+            .unwrap_or_else(|| ctx.working_dir.clone())
+    } else {
+        ctx.working_dir.clone()
+    };
+    let mut paths = derive_dispatch_paths(&resolved_working_dir, name);
+    // Fork issue #595 fix round 3 (auditor R1): same containment check as
+    // `src/ui.rs`'s `Action::SpawnPane` -- see that call site's comment
+    // for the full reasoning. The "root case stays unchanged" carve-out
+    // above decides "safe to use `ctx.working_dir` raw" by asking whether
+    // the computed prefix came out empty, which a `ctx.working_dir`
+    // reached via a symlink PLANTED INSIDE the repo (pointing back at the
+    // repo's own root) also satisfies -- deriving the sibling worktree
+    // from that raw path would reopen F1/F3 one level down. Check the
+    // actual property instead: would the DERIVED worktree dir land inside
+    // the canonicalized toplevel?
+    //
+    // Fork issue #595 fix round 4 (reviewer N7 / auditor S1): round 3's
+    // fallback on `.canonicalize()` failure used `paths.worktree_dir`'s
+    // own RAW spelling, which is only symmetric with the canonicalized
+    // toplevel when `ctx.working_dir` was itself reached by a physical
+    // path -- a `ctx.working_dir` reached through a SYMLINKED ANCESTOR
+    // shares no textual prefix with the canonicalized toplevel either
+    // way, so the guard stayed silent for that narrower shape. Canonicalize
+    // `paths.worktree_dir`'s PARENT instead (it exists on disk -- it is
+    // the same parent `ctx.working_dir` itself lives in) and re-attach the
+    // worktree's own file name, matching the fix in `src/ui.rs`.
+    if relative_subpath.is_none()
+        && let Some((toplevel, _)) = toplevel_resolution.as_ref()
+    {
+        let canonical_toplevel = toplevel.canonicalize().unwrap_or_else(|_| toplevel.clone());
+        let canonical_worktree_dir =
+            match (paths.worktree_dir.parent(), paths.worktree_dir.file_name()) {
+                (Some(parent), Some(file_name)) => parent
+                    .canonicalize()
+                    .map(|canonical_parent| canonical_parent.join(file_name))
+                    .unwrap_or_else(|_| paths.worktree_dir.clone()),
+                _ => paths.worktree_dir.clone(),
+            };
+        if canonical_worktree_dir.starts_with(&canonical_toplevel) {
+            resolved_working_dir = toplevel.clone();
+            paths = derive_dispatch_paths(&resolved_working_dir, name);
+        }
+    }
+    let clone_dir = resolved_working_dir;
 
     // Resolve the shape from the CALLER's repo config, BEFORE any git work.
     //
@@ -406,16 +507,27 @@ pub async fn handle_dispatch(
         // A live sibling already shares `clone_dir`'s git-common-dir --
         // isolate this dispatch into its own fresh clone instead of a plain
         // `git worktree add` sibling, mirroring Model A's `Ok(true)` branch
-        // (`provision_isolated_clone_sync`). Same resolved sibling path
-        // (`paths.worktree_dir`) as the shared-checkout arm below -- only
-        // the provisioning mechanism differs. `provision_isolated_clone_sync`
-        // is sync (no async twin exists), so it runs on the blocking pool
-        // exactly like the daemon-query gate above.
+        // (`provision_isolated_clone_sync_resolved`). Same resolved sibling
+        // path (`paths.worktree_dir`) as the shared-checkout arm below --
+        // only the provisioning mechanism differs. It is sync (no async
+        // twin exists), so it runs on the blocking pool exactly like the
+        // daemon-query gate above.
+        //
+        // Fork issue #595 fix round 3 (reviewer N2): `clone_dir` is
+        // `resolved_working_dir` above, already resolved to the real git
+        // toplevel (or left as `ctx.working_dir` unchanged when that IS
+        // the toplevel or it isn't inside a git repository at all) -- so
+        // call the `_resolved` entry point directly rather than the
+        // self-resolving `provision_isolated_clone_sync`, which would
+        // otherwise re-run `resolve_git_toplevel` on an already-resolved,
+        // idempotent input: a second 30s-bounded `git rev-parse`
+        // subprocess per dispatch, and a reopened TOCTOU window between
+        // the two resolutions that the entry-point split exists to close.
         //
         // Fix round 2 (reviewer P2-7): this arm inherits attach-not-refuse
-        // branch-reuse behaviour from `provision_isolated_clone_sync` (it
-        // `git checkout`s the branch if it already exists, same as Model
-        // A's own isolated arm), while the `else` arm below
+        // branch-reuse behaviour from `provision_isolated_clone_sync_resolved`
+        // (it `git checkout`s the branch if it already exists, same as
+        // Model A's own isolated arm), while the `else` arm below
         // (`create_worktree` with `reuse_existing_branch: false`) REFUSES
         // via `WorktreeCreation::BranchExists` to protect possibly-committed
         // work. Which of the two runs is decided by `has_live_sibling`, a
@@ -429,7 +541,12 @@ pub async fn handle_dispatch(
         let branch = paths.branch.clone();
         let creator_for_clone = creator.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            provision_isolated_clone_sync(&source_dir, &clone_target, &branch, &creator_for_clone)
+            provision_isolated_clone_sync_resolved(
+                &source_dir,
+                &clone_target,
+                &branch,
+                &creator_for_clone,
+            )
         })
         .await;
         // PRD fork#544 M3 fix round: release this process-local resume
@@ -637,11 +754,73 @@ pub async fn handle_dispatch(
         },
     );
 
+    // Fork issue #595 fix round 2: reproduce the calling pane's own
+    // position inside the freshly-provisioned worktree, mirroring
+    // `src/ui.rs`'s `provision_isolated_clone_or_status` existence check —
+    // a `git clone`/`git worktree add` only ever reproduces TRACKED
+    // content, so a `relative_subpath` that is gitignored, untracked, or
+    // simply empty (git tracks no empty directories) would otherwise hand
+    // the dispatched agent a nonexistent cwd silently.
+    let dispatch_working_dir = match relative_subpath.as_deref() {
+        Some(rel) => {
+            let joined = paths.worktree_dir.join(rel);
+            // Fork issue #595 fix round 3 (auditor R4): `is_dir()` follows
+            // symlinks, and a `git clone`/`git worktree add` faithfully
+            // reproduces TRACKED symlinks -- including ones whose committed
+            // target is an absolute path outside the repository entirely.
+            // Canonicalize `joined` and require it to still be contained in
+            // the canonicalized worktree dir, mirroring `src/ui.rs`'s
+            // identical hardening of its own existence check.
+            let canonical_base = paths
+                .worktree_dir
+                .canonicalize()
+                .unwrap_or_else(|_| paths.worktree_dir.clone());
+            let canonical_joined = joined.canonicalize().unwrap_or_else(|_| joined.clone());
+            if !joined.is_dir() {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: {} was not found inside the provisioned worktree at {} — \
+                         the calling pane's own subdirectory may be untracked or excluded by \
+                         .gitignore",
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(rel),
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        ),
+                    ),
+                };
+            }
+            // Fork issue #595 fix round 4 (reviewer N9): a distinct
+            // message from the not-found case above -- the path WAS
+            // found, but a tracked symlink at this subpath resolves
+            // outside the provisioned worktree, so "untracked or
+            // gitignored" is not the cause and ".gitignore" is not the
+            // remedy.
+            if !canonical_joined.starts_with(&canonical_base) {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: {} escapes the provisioned worktree at {} — a tracked \
+                         symlink at this subpath resolves outside the isolated worktree",
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(rel),
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        ),
+                    ),
+                };
+            }
+            joined
+        }
+        None => paths.worktree_dir.clone(),
+    };
+
     let prompt = task.to_string();
 
     let req = SpawnRequest {
         task_name: format!("dispatch-{name}"),
-        working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
+        working_dir: dispatch_working_dir.to_string_lossy().into_owned(),
         // A real agent command, never `None` — see `resolve_single_agent_command`.
         // Ignored when the dispatch starts an orchestration (role commands win).
         command: Some(single_command),
@@ -778,6 +957,14 @@ pub async fn handle_dispatch(
             // with no error surfaced, since the delete itself succeeds
             // against the wrong repository (auditor A1, verified
             // empirically).
+            // issue #473: `should_drop_registry` tracks whether the
+            // worktree was actually removed from disk -- the isolated-clone
+            // arm's cleanup is unconditional (see its own comment below), but
+            // the shared-checkout arm's `remove_worktree` can genuinely fail
+            // (e.g. a locked worktree), and dropping the registry entry in
+            // that case would lose the only record that the worktree is
+            // still on disk.
+            let mut should_drop_registry = true;
             let cleanup_failed = if has_live_sibling {
                 // The clone directory IS `paths.worktree_dir` -- remove it
                 // with the same helper `provision_isolated_clone_sync`'s own
@@ -808,18 +995,38 @@ pub async fn handle_dispatch(
                         .flatten();
                 cleaned_up_by.is_none()
             } else {
-                let _ = remove_worktree(
+                // Match the outcome instead of discarding it (`let _ = ...`)
+                // -- `RemoveOutcome` is `#[must_use]` for exactly this
+                // reason (PRD 236 review). Mirrors the tab-close precedent
+                // in `daemon_protocol.rs` that already matches on
+                // `Kept`/`RemoveFailed`/`Removed`.
+                let remove_outcome = remove_worktree(
                     &paths.worktree_dir,
                     &clone_dir,
                     RemovalPolicy::Force,
                     &creator,
                 )
                 .await;
+                // issue #473: removal genuinely not happening (failed, or --
+                // though `RemovalPolicy::Force` never produces it -- kept)
+                // must not drop the registry entry, since that entry is the
+                // only record that the worktree is still on disk.
+                // auditor A4: don't trust git's reported exit status alone --
+                // mirror the `removed && !dir.exists()` second signal
+                // `attempt_worktree_cleanup`/`attempt_worktree_cleanup_async`
+                // already require elsewhere in this repo
+                // (`issue_dispatch_run.rs`) before treating a removal as
+                // confirmed.
+                let remove_failed = match remove_outcome {
+                    RemoveOutcome::Removed(_) => paths.worktree_dir.exists(),
+                    RemoveOutcome::Kept(_) | RemoveOutcome::RemoveFailed(_) => true,
+                };
+                should_drop_registry = !remove_failed;
                 // Also delete the branch: `git worktree remove` never
                 // deletes it. Same multi-role caveat as above — a still-live
                 // sibling role may hold committed work whose only record is
                 // this branch.
-                run_status(
+                let branch_delete_failed = run_status(
                     "git",
                     &[
                         "-C",
@@ -830,7 +1037,8 @@ pub async fn handle_dispatch(
                     ],
                 )
                 .await
-                .is_err()
+                .is_err();
+                remove_failed || branch_delete_failed
             };
 
             if cleanup_failed {
@@ -842,7 +1050,7 @@ pub async fn handle_dispatch(
                 );
             }
 
-            {
+            if should_drop_registry {
                 let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
                 wts.remove(&paths.worktree_dir);
             }
@@ -857,7 +1065,23 @@ pub async fn handle_dispatch(
                     )
                 )
             } else {
-                " (cleanup failed: branch may still exist — name may be wedged)".to_string()
+                // issue #473 review round (reviewer P2-1 / auditor A2): this
+                // message is the actual recovery path a human will read --
+                // retaining the registry entry buys no automatic recovery,
+                // since its only production consumer (tab-close) needs a
+                // live agent rooted here. Name both things that can still be
+                // on disk (the branch delete and the worktree removal are
+                // separate calls, either of which can fail independently)
+                // and give the same actionable hint the `has_live_sibling`
+                // arm above already gives.
+                format!(
+                    " (cleanup failed: branch and/or worktree directory may still exist — \
+                     check `{}`; if it's still there, run `rm -rf` on it and delete the \
+                     branch manually, then try again)",
+                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                        &paths.worktree_dir
+                    )
+                )
             };
 
             DispatchResult {
@@ -1403,6 +1627,192 @@ mod tests {
         );
     }
 
+    /// Scenario: fork issue #595 fix round 2 (reviewer F3), extended in fix
+    /// round 3 (reviewer N4). `ctx.working_dir` is the calling pane's own
+    /// registered cwd, which — after the #595 fix to `src/ui.rs` — can
+    /// legitimately be a NESTED subdirectory of its repo's toplevel (any
+    /// pane already running inside a resolved isolated clone at a nested
+    /// prefix). Left unresolved, `derive_dispatch_paths` placed the
+    /// dispatched worktree as a sibling of that nested directory — a full
+    /// clone of the whole repo materialized INSIDE the calling pane's own
+    /// working tree, the same defect class F1 fixed in `src/ui.rs`'s
+    /// `Action::SpawnPane`, one level down. Dispatches from a nested
+    /// working dir and asserts both halves of F3: the resulting worktree
+    /// is a sibling of the repo TOPLEVEL, not nested under it, AND the
+    /// dispatched agent's own cwd reproduces the calling pane's nested
+    /// position inside that worktree rather than landing at its root —
+    /// the real `dispatch_working_dir` value, recorded in the registry
+    /// only when the dispatched process genuinely starts, which needs a
+    /// command that actually execs (`cat`, alive on stdin) rather than the
+    /// round-2 test's nonexistent-binary stand-in. `cat` as the stand-in
+    /// agent, matching `dispatch_shares_the_checkout_when_no_live_sibling_exists`
+    /// above (a single-agent dispatch, no `#[cfg(unix)]` needed there).
+    #[tokio::test]
+    async fn dispatch_from_a_nested_working_dir_places_the_worktree_outside_the_source_repo() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let nested = repo.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("marker.txt"), "hi\n").unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git available");
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "seed nested project"]);
+
+        // Same gate-stub as every other `handle_dispatch` test above: no live
+        // sibling, so the has_live_sibling gate takes its `Ok(false)` branch.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: nested.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "nested-unit-595", "task", None).await;
+        let worktree = result.worktree_dir.clone();
+        struct Guard(std::path::PathBuf, Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.shutdown_all();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(worktree.clone(), ctx.registry.clone());
+
+        assert!(
+            result.success,
+            "setup: the dispatch itself must succeed for this test to exercise anything -- \
+             got: {}",
+            result.message
+        );
+        assert!(
+            !worktree.starts_with(&repo),
+            "reviewer F3: dispatching from a nested working_dir must place the worktree as a \
+             sibling of the repo TOPLEVEL, never nested inside the source repo's own working \
+             tree -- got {worktree:?} under {repo:?}"
+        );
+
+        // Reviewer N4: F3's second half — the dispatched agent's OWN cwd
+        // must reproduce the calling pane's nested position inside the new
+        // worktree (`<worktree>/baseline/intent`), not the worktree root.
+        // This was implemented (`dispatch_working_dir`, above) but
+        // previously asserted nowhere — the placement check above pins
+        // only where the WORKTREE landed, not where the agent inside it
+        // was actually started.
+        let live = ctx.registry.agent_records();
+        assert_eq!(
+            live.len(),
+            1,
+            "expected exactly one dispatched agent record; got {:?}",
+            live.iter()
+                .map(|r| (r.display_name.clone(), r.cwd.clone()))
+                .collect::<Vec<_>>()
+        );
+        let expected_cwd = worktree.join("baseline").join("intent");
+        assert_eq!(
+            live[0].cwd.as_deref(),
+            Some(expected_cwd.to_string_lossy().as_ref()),
+            "the dispatched agent's cwd must be the calling pane's own nested position inside \
+             the new worktree, not the worktree root"
+        );
+    }
+
+    /// Scenario: fork issue #595 fix round 4 (reviewer N7 / auditor S1),
+    /// the `src/dispatch.rs` mirror of `workspace_036` in `src/ui.rs` --
+    /// see that test's comment for the full reasoning. `ctx.working_dir`
+    /// reaches an in-repo root symlink (planted inside the repo, pointing
+    /// back at its own root -- the shape round 3 already covers) through a
+    /// SYMLINKED ANCESTOR above the repo, so `relative_subpath` still comes
+    /// out empty. Round 3's containment guard falls back to the derived
+    /// worktree dir's own raw spelling when `.canonicalize()` fails (since
+    /// it doesn't exist on disk yet), which shares no textual prefix with
+    /// the canonicalized toplevel in this shape either, so the guard stays
+    /// silent and the worktree lands inside the source repo's own working
+    /// tree. Dispatches from that picked path and asserts the resulting
+    /// worktree is a sibling of the repo TOPLEVEL instead.
+    #[tokio::test]
+    async fn dispatch_from_a_symlinked_ancestor_closes_the_containment_guard_gap() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let repo = real_root.join("repo");
+        init_repo(&repo);
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let rootlink = sub.join("rootlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&repo, &rootlink).expect("symlink rootlink -> repo");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&repo, &rootlink).expect("symlink rootlink -> repo");
+
+        let ancestor_link = tmp.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_root, &ancestor_link).expect("symlink link -> real_root");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real_root, &ancestor_link)
+            .expect("symlink link -> real_root");
+
+        let picked = ancestor_link.join("repo").join("sub").join("rootlink");
+
+        // Same gate-stub as every other `handle_dispatch` test above: no live
+        // sibling, so the has_live_sibling gate takes its `Ok(false)` branch.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: picked.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "symlinked-ancestor-595", "task", None).await;
+        let worktree = result.worktree_dir.clone();
+        struct Guard(std::path::PathBuf, Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.shutdown_all();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(worktree.clone(), ctx.registry.clone());
+
+        assert!(
+            result.success,
+            "setup: the dispatch itself must succeed for this test to exercise anything -- \
+             got: {}",
+            result.message
+        );
+
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+        let canonical_worktree = worktree.canonicalize().unwrap_or_else(|_| worktree.clone());
+        assert!(
+            !canonical_worktree.starts_with(&canonical_repo),
+            "reviewer N7 / auditor S1: dispatching from a picked path reached through a \
+             symlinked ancestor must place the worktree as a sibling of the repo TOPLEVEL, \
+             never nested inside (or reproducing) the source repo's own working tree -- got \
+             {canonical_worktree:?} under {canonical_repo:?}"
+        );
+    }
+
     /// Issues #575 and #600 — the partial-orchestration dispatch, at the altitude
     /// the user meets it: one role's command is wrong, the dispatch reports
     /// failure, and the roles that DID start are left running as orphans in a
@@ -1756,6 +2166,110 @@ mod tests {
         );
     }
 
+    /// Scenario: issue #473 regression guard. Forces the shared-checkout
+    /// rollback arm's `git worktree remove --force` to genuinely fail (the
+    /// worktree is locked the instant `git worktree add` creates it, via a
+    /// `PATH`-shimmed `git`), then asserts the CORRECT post-rollback
+    /// behavior: the registry entry for the worktree must still be present,
+    /// since removal did not actually succeed. `dispatch.rs` now matches on
+    /// `remove_worktree`'s `RemoveOutcome` instead of discarding it
+    /// (`let _ = remove_worktree(...)`) and only drops the registry entry
+    /// when removal actually succeeded, restoring the guarantee
+    /// `RemoveOutcome::RemoveFailed` exists to provide (see its own doc
+    /// comment, PRD 236 review).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_rollback_retains_registry_entry_when_force_removal_fails() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "lockfail-unit");
+
+        // Same daemon-gate bypass as the sibling test above -- without it,
+        // issue #490's live-sibling gate fails closed before the rollback
+        // arm this test targets is ever reached.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
+        // Force the rollback's eventual `git worktree remove --force` to
+        // genuinely fail: a `PATH`-shimmed `git` locks the worktree the
+        // moment `git worktree add` creates it -- synchronously, inside the
+        // same subprocess call `create_worktree` awaits, so there is no
+        // timing race against `handle_dispatch`'s later spawn-then-rollback
+        // steps. `git worktree remove --force` refuses a locked worktree
+        // even with a single `--force` (`remove_worktree_argv` only ever
+        // pushes one) -- verified directly against git 2.55.0, matching
+        // `RemoveOutcome::RemoveFailed`'s own doc comment on how PRD 236
+        // originally reproduced this.
+        let _git_stub = with_git_worktree_add_locking_the_new_worktree(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-473".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "lockfail-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached -- every other assertion \
+             here is a negative that a fail-closed early return (creating nothing) would \
+             also satisfy, so this is the one assertion that distinguishes a genuine \
+             rollback attempt from the gate refusing before it ever got there: {}",
+            result.message
+        );
+        assert!(
+            paths.worktree_dir.exists(),
+            "removal was forced to fail (the worktree is locked) -- the directory must \
+             still be on disk: {}",
+            result.message
+        );
+        assert!(
+            ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "issue #473: the registry entry for {} must still be present -- removal \
+             genuinely failed (locked worktree), so dropping the entry anyway loses the \
+             only record that this worktree is still on disk: {}",
+            paths.worktree_dir.display(),
+            result.message
+        );
+        assert!(
+            result.message.contains("cleanup failed"),
+            "reviewer P2-3: every other assertion here is a positive that the earlier \
+             `worktree_still_in_use` early-return would also satisfy, so this is the one \
+             assertion that proves the rollback arm was genuinely reached (not the early \
+             return) AND pins the second half of the behavior change -- that \
+             `cleanup_failed` is actually set to true here, not just that the registry \
+             retains the entry: {}",
+            result.message
+        );
+
+        // Best-effort cleanup: `tmp`'s own Drop removes everything under it
+        // regardless, but unlock first so a leftover admin lock file cannot
+        // confuse anything that inspects `repo/.git/worktrees/` before then.
+        let _ = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "worktree",
+                "unlock",
+                "--",
+                &paths.worktree_dir.to_string_lossy(),
+            ])
+            .output();
+        let _ = std::fs::remove_dir_all(&paths.worktree_dir);
+    }
+
     // --- issue #490 (PRD fork#325 M3, Model B): the live-sibling clone gate ---
     //
     // Model A's equivalent (`src/ui.rs`'s `Action::SpawnPane` handler) consults
@@ -1913,6 +2427,9 @@ mod tests {
             live: None,
             daemon_boot_id: None,
             registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         }
     }
 
@@ -2056,6 +2573,201 @@ mod tests {
             std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
         }
         FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Prepend a fake `git` to `PATH` that LOCKS a worktree the instant `git
+    /// worktree add` creates it -- synchronously, inside the same subprocess
+    /// call `create_worktree`'s `run_status_killable_args` awaits, so there
+    /// is no timing race against anything `handle_dispatch` does afterward
+    /// (recording the worktree, attempting the spawn, or -- issue #473's
+    /// target -- the rollback's own `git worktree remove --force`). Every
+    /// other invocation, including that eventual removal attempt, passes
+    /// straight through to the real `git`.
+    ///
+    /// Word-scanned rather than positional, mirroring
+    /// `with_git_clone_failing_with_hostile_stderr`'s own reasoning: matches
+    /// wherever `worktree` is immediately followed by `add`, and reads
+    /// `clone_dir`/`worktree_dir` off the values immediately following
+    /// `-C`/`add` respectively -- so the `-c core.fsmonitor=` hardening
+    /// `spawn_git_status_child` prepends to every call through this shared
+    /// core cannot shift the match off a fixed `$N` the way it did to an
+    /// earlier, positional version of that sibling stub.
+    #[cfg(unix)]
+    fn with_git_worktree_add_locking_the_new_worktree(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-worktree-add-lock-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 is_add=0\n\
+                 clone_dir=\"\"\n\
+                 worktree_dir=\"\"\n\
+                 prev=\"\"\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$prev\" = \"-C\" ]; then\n\
+                 \x20\x20\x20\x20clone_dir=\"$a\"\n\
+                 \x20\x20fi\n\
+                 \x20\x20if [ \"$prev\" = \"worktree\" ] && [ \"$a\" = \"add\" ]; then\n\
+                 \x20\x20\x20\x20is_add=1\n\
+                 \x20\x20fi\n\
+                 \x20\x20if [ \"$prev\" = \"add\" ]; then\n\
+                 \x20\x20\x20\x20worktree_dir=\"$a\"\n\
+                 \x20\x20fi\n\
+                 \x20\x20prev=\"$a\"\n\
+                 done\n\
+                 if [ \"$is_add\" = \"1\" ] && [ -n \"$worktree_dir\" ]; then\n\
+                 \x20\x20{real_git} \"$@\"\n\
+                 \x20\x20status=$?\n\
+                 \x20\x20if [ \"$status\" -eq 0 ]; then\n\
+                 \x20\x20\x20\x20{real_git} -C \"$clone_dir\" worktree lock -- \"$worktree_dir\" 1>&2\n\
+                 \x20\x20fi\n\
+                 \x20\x20exit \"$status\"\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Prepend a fake `git` to `PATH` that fails ONLY `git branch -D`
+    /// invocations -- the shared-checkout rollback arm's separate
+    /// branch-deletion call -- and passes every other invocation, including
+    /// its own `git worktree remove --force`, straight through to the real
+    /// `git`. Lets a test force the worktree removal to genuinely succeed
+    /// while the branch delete alone fails (issue #473 sibling gap, auditor
+    /// A3).
+    ///
+    /// Word-scanned rather than positional (matches `branch` immediately
+    /// followed by `-D` anywhere in argv), the same reasoning
+    /// `with_git_worktree_add_locking_the_new_worktree` documents: the
+    /// rollback's `branch -D` call goes through `run_status`, a raw
+    /// `tokio::process::Command` with no global-option prefix today, but a
+    /// positional match would silently stop matching if that ever changed.
+    #[cfg(unix)]
+    fn with_git_branch_delete_failing(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-branch-delete-fail-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 prev=\"\"\n\
+                 is_branch_delete=0\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$prev\" = \"branch\" ] && [ \"$a\" = \"-D\" ]; then\n\
+                 \x20\x20\x20\x20is_branch_delete=1\n\
+                 \x20\x20fi\n\
+                 \x20\x20prev=\"$a\"\n\
+                 done\n\
+                 if [ \"$is_branch_delete\" = \"1\" ]; then\n\
+                 \x20\x20echo 'stub: simulated git branch -D failure' >&2\n\
+                 \x20\x20exit 1\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Scenario: issue #473 sibling gap (auditor A3). Forces the
+    /// shared-checkout rollback arm's worktree removal to succeed for real
+    /// while the SEPARATE `git branch -D` call fails, via
+    /// `with_git_branch_delete_failing`. Guards against
+    /// `should_drop_registry = !cleanup_failed` -- a plausible-looking but
+    /// wrong simplification the auditor reproduced directly: it would
+    /// compile, pass every other rollback test, and silently reintroduce
+    /// phantom registry retention for a worktree that is actually gone. The
+    /// worktree here IS gone (only the branch delete failed), so the
+    /// registry entry -- the only record of a still-on-disk worktree -- must
+    /// still be dropped, even though `cleanup_failed` is separately true.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_rollback_drops_registry_entry_when_only_branch_delete_fails() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "branchfail-unit");
+
+        // Same daemon-gate bypass every sibling rollback test in this file
+        // uses -- without it, issue #490's live-sibling gate fails closed
+        // before the rollback arm this test targets is ever reached.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+        let _git_stub = with_git_branch_delete_failing(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-473b".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "branchfail-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached: {}",
+            result.message
+        );
+        assert!(
+            !paths.worktree_dir.exists(),
+            "worktree removal itself must have genuinely succeeded (only the branch \
+             delete was stubbed to fail): {}",
+            result.message
+        );
+        assert!(
+            branch_exists(&repo, &paths.branch),
+            "the branch delete must have genuinely failed, or this test proves nothing \
+             about the sibling gap it targets"
+        );
+        assert!(
+            !ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "issue #473 sibling gap: the worktree itself is gone, so the registry entry \
+             must still be dropped even though the branch delete failed -- dropping the \
+             registry must track whether the WORKTREE was removed, not whether cleanup as \
+             a whole (including the branch delete) succeeded: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("cleanup failed"),
+            "cleanup_failed must still be true, separately from should_drop_registry, \
+             since the branch delete genuinely failed: {}",
+            result.message
+        );
     }
 
     /// Scenario: issue #490, case 1 -- regression guard. No live orchestration
