@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{RwLock, broadcast};
@@ -9,7 +10,7 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, GuardedSendDetail};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, WorkDoneSignal, WorktreeKeptNotice, Writable,
+    LiveTarget, OrchestrationSurface, WaitOutcome, WorkDoneSignal, WorktreeKeptNotice, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -1138,9 +1139,37 @@ impl Default for DaemonBootId {
     }
 }
 
+/// PRD #499 (reopened): a role's active declaration that it is still
+/// responsible for noticing an external dependency resolve (`wait start
+/// <label>`) — a second, explicit source of [`SessionStatus::Working`]
+/// alongside the process-derived `shell_synthetic_working` signal. Cleared
+/// by `wait done <label> --outcome ...` (any outcome — M7) or by
+/// [`AppState::sweep_expired_monitored_waits`] once `expires_at` passes with
+/// no explicit clear (M8). Stored in [`AppState::monitored_waits`], keyed by
+/// pane_id — see that field's doc for why this lives there rather than on
+/// [`SessionState`].
+#[derive(Debug, Clone)]
+pub struct MonitoredWait {
+    pub label: String,
+    pub expires_at: Instant,
+    /// `true` when declaring this wait promoted the pane's card from
+    /// `Idle`/`Unknown` to `Working` (`EventType::ShellBusy`'s exact
+    /// precedence). Mirrors `shell_synthetic_working`'s role: clearing this
+    /// wait only reverts a `Working` THIS mechanism itself set, never a
+    /// real agent-emitted one.
+    pub promoted: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
+    /// PRD #499 (reopened) M3/M5: active monitored waits, keyed by pane_id —
+    /// NOT a field on [`SessionState`], which is constructed as a literal at
+    /// dozens of call sites across `src/ui.rs` and the render-snapshot test
+    /// suites and has no need to grow a field for this. Per-pane attribution
+    /// (M5: "never a global flag") falls out of the key being the pane_id
+    /// itself, exactly like every other pane-keyed map in this struct.
+    pub monitored_waits: HashMap<String, MonitoredWait>,
     /// PRD #254: pane ids whose Codex native hook install/trust
     /// (`codex_spawn_prep` in `src/wrap.rs`) is KNOWN to have failed for that
     /// specific pane. Populated in [`Self::apply_event`] from the wrapper-fork
@@ -7716,6 +7745,141 @@ impl AppState {
                     error = %e,
                     "work-done: failed to write feedback into orchestrator pane"
                 );
+            }
+        }
+    }
+
+    /// PRD #499 (reopened) M3/M8: declare a monitored external wait for
+    /// `pane_id` (`wait start <label>`) — a second, explicit source of
+    /// [`SessionStatus::Working`] alongside the process-derived
+    /// `shell_synthetic_working` signal (PRD fork#370/#386), so a role that
+    /// is polling an external dependency in discrete steps (not one
+    /// sustained foreground call) reads `Working` throughout, and so does a
+    /// role whose own delegated task already reported done but is still
+    /// responsible for noticing an outcome.
+    ///
+    /// Recorded in [`Self::monitored_waits`], keyed by `pane_id` — NOT
+    /// threaded onto [`SessionState`] itself, deliberately: that struct is
+    /// constructed as a literal at dozens of call sites across `src/ui.rs`
+    /// and the render-snapshot test suites, and this mechanism has no need
+    /// to be there. A separate map also survives the pane's card
+    /// (`session_id`) changing underneath it — e.g. a respawn — since every
+    /// operation here re-resolves the CURRENT card via
+    /// [`Self::pane_session_id`] at the time it runs, the same target the
+    /// shell-activity monitor's `ShellBusy` re-emit uses.
+    ///
+    /// Only PROMOTES a stale/no-opinion status (`Idle`/`Unknown`), mirroring
+    /// `EventType::ShellBusy`'s precedence: a real agent-emitted
+    /// `Thinking`/`Working`/`WaitingForInput`/`Compacting`/`Error` is never
+    /// clobbered. The wait itself is recorded regardless of whether it
+    /// promoted anything, so `wait done`/TTL expiry (M7/M8) has something to
+    /// clear either way — `promoted` on the stored [`MonitoredWait`] is
+    /// what `clear_monitored_wait`/`sweep_expired_monitored_waits` check
+    /// before touching `status` at all.
+    ///
+    /// No-ops (with a warning) when `pane_id` names no known session yet —
+    /// same posture as `run_shell_activity_monitor`'s "a bare shell pane
+    /// that has never emitted a single agent event has no `SessionState` to
+    /// update at all."
+    pub fn start_monitored_wait(&mut self, pane_id: &str, label: String, ttl: Duration) {
+        let Some(card_id) = self.pane_session_id(pane_id) else {
+            warn!(
+                pane_id = %pane_id,
+                label = %label,
+                "wait start: no known session for this pane yet"
+            );
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&card_id) else {
+            return;
+        };
+        let promoted = matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown);
+        if promoted {
+            session.status = SessionStatus::Working;
+        }
+        self.monitored_waits.insert(
+            pane_id.to_string(),
+            MonitoredWait {
+                label,
+                expires_at: Instant::now() + ttl,
+                promoted,
+            },
+        );
+    }
+
+    /// PRD #499 (reopened) M7: clear a previously declared monitored wait
+    /// (`wait done <label> --outcome ...`). Every terminal outcome clears it
+    /// identically — the daemon's status computation draws no distinction
+    /// between success/failure/cancelled/timeout, only the caller's own
+    /// bookkeeping does, so `outcome` is accepted for logging only.
+    ///
+    /// A pane carries at most one monitored wait at a time, so this clears
+    /// whichever is active; `label` is compared only to warn on a mismatch,
+    /// never to refuse the clear — refusing would risk exactly the
+    /// stale-claim wedge (PRD #421/#464) M7/M8 exist to rule out.
+    pub fn clear_monitored_wait(&mut self, pane_id: &str, label: &str, outcome: WaitOutcome) {
+        let Some(wait) = self.monitored_waits.remove(pane_id) else {
+            warn!(
+                pane_id = %pane_id,
+                label = %label,
+                "wait done: no active monitored wait for this pane"
+            );
+            return;
+        };
+        if wait.label != label {
+            warn!(
+                pane_id = %pane_id,
+                active_label = %wait.label,
+                done_label = %label,
+                "wait done: label does not match the pane's active monitored wait; \
+                 clearing it anyway"
+            );
+        }
+        // Only revert a `Working` THIS wait promoted, and only if the card
+        // is still reading `Working` — a real event that took the status
+        // somewhere else since `start_monitored_wait` (e.g. a genuine
+        // `Thinking`/`WaitingForInput`) must not be clobbered back to
+        // `Idle` by a wait clearing.
+        if wait.promoted
+            && let Some(card_id) = self.pane_session_id(pane_id)
+            && let Some(session) = self.sessions.get_mut(&card_id)
+            && session.status == SessionStatus::Working
+        {
+            session.status = SessionStatus::Idle;
+        }
+        tracing::debug!(
+            pane_id = %pane_id,
+            label = %label,
+            outcome = ?outcome,
+            "wait done: cleared monitored wait"
+        );
+    }
+
+    /// PRD #499 (reopened) M8: self-healing TTL sweep, called on a periodic
+    /// tick by the daemon's monitored-wait poll loop
+    /// (`run_monitored_wait_sweep` in `src/daemon.rs`). A wait past its TTL
+    /// stops contributing to `Working` without an explicit `wait done` —
+    /// the mitigation the PRD's Risks table requires so this mechanism can
+    /// never wedge a pane `Working` forever the way an unclearable stale
+    /// claim would (PRD #421/#464).
+    pub fn sweep_expired_monitored_waits(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .monitored_waits
+            .iter()
+            .filter(|(_, wait)| now >= wait.expires_at)
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect();
+        for pane_id in expired {
+            let Some(wait) = self.monitored_waits.remove(&pane_id) else {
+                continue;
+            };
+            if wait.promoted
+                && let Some(card_id) = self.pane_session_id(&pane_id)
+                && let Some(session) = self.sessions.get_mut(&card_id)
+                && session.status == SessionStatus::Working
+            {
+                session.status = SessionStatus::Idle;
             }
         }
     }
