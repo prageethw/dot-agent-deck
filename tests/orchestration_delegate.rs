@@ -34,7 +34,6 @@ use common::synthetic_agent::SyntheticAgent;
 const ORCH_PANE: &str = "pi-orchestrator-pane";
 const WORKER_PANE: &str = "coder-worker-pane";
 const WORKER_ROLE: &str = "coder";
-const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
 /// Poll the agent's PTY snapshot until `needle` appears or `timeout` elapses,
 /// returning the final snapshot either way.
@@ -135,9 +134,16 @@ async fn delegate_005_pi_orchestrator_delegate_routes_to_worker_inner() {
     let signal = pi.delegate("List the files in the current directory.", &[WORKER_ROLE]);
     state.handle_delegate(signal, &registry, &event_tx).await;
 
-    let snap = wait_for_needle(&registry, &worker_agent_id, POINTER, Duration::from_secs(5)).await;
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
+    let snap = wait_for_needle(
+        &registry,
+        &worker_agent_id,
+        &pointer,
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(
-        snap.windows(POINTER.len()).any(|w| w == POINTER),
+        snap.windows(pointer.len()).any(|w| w == pointer.as_slice()),
         "Pi orchestrator's delegate never reached the coder worker pane; snapshot = {:?}",
         String::from_utf8_lossy(&snap)
     );
@@ -206,15 +212,16 @@ async fn delegate_006_pi_worker_delegate_is_rejected_by_role_guard_inner() {
     // handle_delegate rejects a non-orchestrator sender synchronously (before
     // spawning any dispatch task), so a bounded grace window with the pointer
     // still absent is a strong "never delivered" signal.
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     let snap = wait_for_needle(
         &registry,
         &worker_agent_id,
-        POINTER,
+        &pointer,
         Duration::from_millis(1500),
     )
     .await;
     assert!(
-        !snap.windows(POINTER.len()).any(|w| w == POINTER),
+        !snap.windows(pointer.len()).any(|w| w == pointer.as_slice()),
         "a Pi WORKER's delegate must be rejected by the role guard, but the coder pane \
          received the task; snapshot = {:?}",
         String::from_utf8_lossy(&snap)
