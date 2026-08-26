@@ -100,6 +100,7 @@ fn pane_004_card_title_row() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     };
@@ -150,6 +151,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     }
@@ -547,6 +549,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     };
@@ -790,6 +793,7 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     };
@@ -886,6 +890,7 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     };
@@ -1007,6 +1012,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         // PRD fork#378: no model known — the badge must keep the bare
         // `<Label> · <name>` form asserted below unchanged.
         model: None,
@@ -1350,6 +1356,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     };
@@ -1959,6 +1966,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     }
@@ -2665,6 +2673,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     };
@@ -2872,6 +2881,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: Some("Opus".to_string()),
         expects_agent_report: false,
     };
@@ -3146,6 +3156,7 @@ fn filled_session() -> SessionState {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     }
@@ -3910,6 +3921,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         pending_permission_tool: None,
         model: None,
         expects_agent_report: false,

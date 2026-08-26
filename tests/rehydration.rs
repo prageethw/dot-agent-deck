@@ -392,6 +392,7 @@ fn make_session(
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     }
@@ -2524,6 +2525,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
     };
 
@@ -2662,6 +2664,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         monitored_wait_active: false,
                         wait_synthetic_working: false,
                         shell_descendant_busy: false,
+                        wait_deferred_revert: false,
                         model: None,
                     }),
                     daemon_boot_id: None,
@@ -2835,6 +2838,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     };
@@ -3369,6 +3373,7 @@ async fn live_014_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
             monitored_wait_active: false,
             wait_synthetic_working: false,
             shell_descendant_busy: false,
+            wait_deferred_revert: false,
             model: None,
         }),
         daemon_boot_id: None,
@@ -3671,6 +3676,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
             monitored_wait_active: false,
             wait_synthetic_working: false,
             shell_descendant_busy: false,
+            wait_deferred_revert: false,
             model: None,
         }),
         daemon_boot_id: None,

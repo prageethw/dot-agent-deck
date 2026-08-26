@@ -455,6 +455,26 @@ dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/coder-task.md' -
 dot-agent-deck work-done --task-file '.dot-agent-deck/report.md' --subject "#42"
 ```
 
+### Monitored external waits (`wait start` / `wait done`)
+
+A role's pane shows `Working` for as long as its agent has a live foreground process (see [rule 28 in `CLAUDE.md`](https://github.com/prageethw/dot-agent-deck/blob/main/CLAUDE.md) for the convention of keeping a sustained foreground command running for anything you're actively waiting on). That signal only exists while the agent's own turn is still open, though — it says nothing about the case where a role has already called `work-done` and its turn has ended, but it is still the party responsible for noticing an external outcome (a CI run settling, another agent finishing, an approval landing). Without something else to mark that span, the pane reads `Idle` for the whole time real work is still outstanding.
+
+`wait start <label>` and `wait done <label> --outcome <success|failure|cancelled|timeout>` cover exactly that gap — a mechanical, explicit backstop for the case rule 28's live-process convention cannot reach, not a replacement for it. Run `wait start` once you become responsible for noticing an external dependency resolve, even after your own delegated task is done; run `wait done` with the terminal outcome once it does. While a wait is outstanding the pane composes to `Working` (unless a real agent event or a live shell descendant already says otherwise — see the composition rules below), even across polling gaps and even after the agent's own Stop hook has fired:
+
+```bash
+dot-agent-deck wait start ci-check
+# ... time passes, possibly across multiple tool calls, possibly after work-done ...
+dot-agent-deck wait done ci-check --outcome success
+```
+
+A pane carries at most one monitored wait at a time; `wait done`'s `<label>` is compared against the pane's active wait for attribution/logging only — a mismatch still clears the wait rather than being refused. `wait start` re-run before a matching `wait done` just resets the TTL clock and re-records the label.
+
+**Composition, not clobber.** A monitored wait is one signal among several (a real agent event, a live shell descendant) that can each independently justify `Working`; the pane reverts to `Idle` only once every live signal has cleared. Concretely: if `wait start` is called while the pane is already `Working` for some other reason, `wait done` alone won't revert it while that other reason is still live, and conversely a `wait done` will still correctly revert the pane once it becomes the last live signal standing, even if it never itself promoted the status.
+
+**Self-healing TTL.** A wait that is never explicitly cleared self-heals rather than wedging the pane `Working` forever: it expires after `DOT_AGENT_DECK_WAIT_TTL_SECS` seconds (default 30 minutes), clamped server-side to a hard ceiling of 6 hours regardless of what the environment variable requests, at which point the daemon clears it exactly as an explicit `wait done` would.
+
+**Relationship to CLAUDE.md rule 28.** Rule 28 is a *convention* — how to structure a wait so the deck's existing shell-activity signal shows it. `wait start`/`wait done` is the *mechanical backstop* for the one shape that convention cannot express: a wait that outlives the role's own turn, with no foreground process left to be the evidence. Prefer rule 28's live-process pattern when your wait is a single foreground command within one turn; reach for `wait start`/`wait done` when the waiting genuinely spans turns.
+
 ## Validate your config
 
 Run `dot-agent-deck validate` to check your `.dot-agent-deck.toml` for issues before opening an orchestration tab:
