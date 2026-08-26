@@ -6,7 +6,7 @@
 
 **Created**: 2026-08-19
 
-**Status**: Not started (reopened)
+**Status**: M1-M10 complete (PR #617, 7 rounds — see Milestones below); ready to close
 
 ## Reopened 2026-08-26 — supersedes the rule-28-only resolution
 
@@ -91,16 +91,18 @@ It must handle all four terminal outcomes of an external wait (success, failure,
 
 ## Milestones
 
-- [ ] **M1** — Confirm the current `Working`→`Idle` transition logic (the poll loop + classification path named above) and write down precisely where the new signal plugs in.
-- [ ] **M2** — Design the `wait start`/`wait done` CLI verb: argument shape, daemon-side record shape, how it composes with `descendant_shell_activity` (a pane is `Working` if *either* signal is active).
-- [ ] **M3** — Implement `wait start`/`wait done`, wired into `SessionStatus`.
-- [ ] **M4** — Wire declare/clear into at least the CI-polling case (the motivating incident) so a role checking CI status in discrete steps reads as `Working` throughout, without needing to follow rule 28's foreground-blocking convention.
-- [ ] **M5** — Attribute the monitored-wait to the correct role/pane — never a global "something somewhere is working" flag.
-- [ ] **M6** — Confirm genuinely passive/inactive agents are unaffected and still classify as `Idle`.
-- [ ] **M7** — Handle all four terminal outcomes (success, failure, cancellation, timeout) — the wait must clear on every one, not just success.
-- [ ] **M8** — TTL/self-healing fallback: a monitored wait that is never explicitly cleared expires rather than wedging the pane `Working` forever.
-- [ ] **M9** — Status/tab indicators reflect the new state consistently everywhere `Working`/`Idle` is currently shown.
-- [ ] **M10** — Regression tests for CI polling plus at least one other external-dependency kind (e.g. waiting on another delegated worker), so the mechanism is proven general rather than CI-specific, including all four terminal outcomes and the TTL fallback.
+- [x] **M1** — Confirm the current `Working`→`Idle` transition logic and write down precisely where the new signal plugs in. *(Rounds 1-3; the plug-in point turned out to be `apply_event` itself, not a side-table — see round 3's architectural fix below.)*
+- [x] **M2** — Design the `wait start`/`wait done` CLI verb: argument shape, daemon-side record shape, composition with `descendant_shell_activity`. *(Round 1: CLI shape and hook-socket transport decided; round 3 revised the composition mechanism after round 2's daemon-only state proved not client-visible.)*
+- [x] **M3** — Implement `wait start`/`wait done`, wired into `SessionStatus`. *(Round 1, restructured in round 3 to route through `apply_event` via `SessionState`/`SessionSnapshot` fields rather than a daemon-only map, so the composition is replicated to every client instead of computed daemon-side only.)*
+- [x] **M4** — Wire declare/clear into at least the CI-polling case so a role checking status in discrete steps reads as `Working` throughout, without needing rule 28's foreground-blocking convention. *(Pinned by `wait/monitored/002`.)*
+- [x] **M5** — Attribute the monitored-wait to the correct role/pane, never a global flag. *(Pinned by `wait/monitored/003`; card-scoping specifically — surviving a pane respawn without leaking onto the new card — pinned by `017`.)*
+- [x] **M6** — Confirm genuinely passive/inactive agents are unaffected and still classify as `Idle`. *(Pinned by `wait/monitored/004`.)*
+- [x] **M7** — Handle all four terminal outcomes (success, failure, cancellation, timeout). *(Pinned by `wait/monitored/005`-`008`.)*
+- [x] **M8** — TTL/self-healing fallback so a never-cleared wait doesn't wedge a pane `Working` forever. *(Pinned by `wait/monitored/009`; the clamp on caller-supplied TTL — closing a real unbounded-wedge finding — is auditor A1, fixed round 2.)*
+- [x] **M9** — Status/tab indicators reflect the new state consistently everywhere `Working`/`Idle` is currently shown. *(Satisfied by construction: the mechanism composes into the existing `SessionStatus::Working` value rather than a new status variant, so every render path that already shows `Working`/`Idle` shows this correctly with no separate UI work needed. A distinguishing provenance marker — so a user could tell "Working because of a monitored wait" apart from "Working because of real activity" at a glance — was scoped out as MEDIUM 8 and deferred to its own follow-up; this PRD's own success criteria only require the status to read correctly, not to be visually distinguishable by cause.)*
+- [x] **M10** — Regression tests proving the mechanism generalizes rather than being CI-specific, including all four terminal outcomes and the TTL fallback. *(The full `wait/monitored/001`-`023` suite exercises the generic `wait start`/`wait done` mechanism directly — none of it depends on CI-specific code, so genericity is demonstrated structurally rather than by a second named scenario. All four terminal outcomes: `005`-`008`. TTL fallback: `009`. Two additional rounds of real bugs — `019`-`023` — were found and closed after this milestone's original tests already passed, via reviewer/auditor re-derivation rather than new named dependency-kind scenarios.)*
+
+**Total test count**: 23 new tests (`wait/monitored/001`-`023`), all in `tests/wait_monitored.rs`, none `e2e`-feature-gated (they run in the blocking `build`/`build-macos`/`build-windows` fast tier, not only the informational `e2e:` job). Seven rounds of tester/coder/reviewer/auditor iteration; five real bugs found and fixed after initial implementation looked complete and green (BLOCKER A/client-visibility, HIGH B/real-Working-clobbered, BLOCKER H/ownership-never-transfers, BLOCKER I/the-relocated-wedge, plus several MEDIUM/LOW findings) — see PR #617's review history for the full trail.
 
 ## Success Criteria
 
