@@ -9302,13 +9302,31 @@ impl AppState {
         // on the CURRENT `Working` exactly as it drops shell's, so neither
         // mechanism can later revert a status a real event has since
         // reasserted.
-        if !matches!(
-            event.event_type,
-            EventType::ShellBusy
-                | EventType::Unknown
-                | EventType::MonitoredWaitStart
-                | EventType::MonitoredWaitDone
-        ) {
+        //
+        // Round 4 (tester `wait/monitored/016` case A): the type exclusion
+        // above is necessary but not sufficient. It stops `ShellBusy` and
+        // `MonitoredWaitStart` from wiping the marker THEY just set one arm
+        // up, but every other type cleared unconditionally regardless of
+        // whether its own match arm actually changed anything — so a
+        // SUPPRESSED, no-op `Idle` (Direction C declines to write status
+        // while `monitored_wait_active` is true) still wiped
+        // `wait_synthetic_working`, and a later `wait done` then read that
+        // marker as already-false and declined to revert, leaving the pane
+        // wedged `Working` forever with `monitored_wait_active` cleared too
+        // (nothing left standing that could ever revert it). `ShellIdle` has
+        // the identical gap via its own `was_holding` decline. Gate on
+        // `asserted_status` (this arm's own already-computed verdict) as
+        // well as the type: an event that changed nothing about the CURRENT
+        // status has no basis for revoking another mechanism's claim on it.
+        if asserted_status
+            && !matches!(
+                event.event_type,
+                EventType::ShellBusy
+                    | EventType::Unknown
+                    | EventType::MonitoredWaitStart
+                    | EventType::MonitoredWaitDone
+            )
+        {
             session.shell_synthetic_working = false;
             session.wait_synthetic_working = false;
         }
