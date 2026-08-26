@@ -814,6 +814,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #499 (reopened) M8: unconditional, like the shell-activity monitor
+    // above — every daemon needs the self-healing sweep regardless of
+    // idle-shutdown config, since an abandoned `wait start` has to expire
+    // even on a daemon nobody is attached to.
+    let monitored_wait_sweep_handle = {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            run_monitored_wait_sweep(sweep_state).await;
+        })
+    };
+
     let result = run_hook_loop(
         listener,
         state,
@@ -831,6 +842,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     shell_activity_handle.abort();
+    monitored_wait_sweep_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -1978,6 +1990,40 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
+/// PRD #499 (reopened) M8: periodically sweeps every session for an expired
+/// `monitored_wait` (`AppState::sweep_expired_monitored_waits`), so a `wait
+/// start` that is never followed by an explicit `wait done` self-heals
+/// rather than wedging its pane `Working` forever — the same self-healing
+/// requirement the shell-activity signal gets for free from watching a real
+/// process (it goes away on its own), which a declared-but-never-cleared
+/// wait has no equivalent for.
+///
+/// Deliberately a SEPARATE, much simpler poll loop from
+/// [`run_shell_activity_monitor_with`] rather than folded into its tick: that
+/// loop's cadence is built around an expensive, conditional process-table
+/// sample (skipped entirely with zero candidates, retained across a slow
+/// tick, aged out past `MAX_TABLE_AGE`, ...) that a plain in-memory scan over
+/// `AppState.sessions` has no need to share. Composition with that signal is
+/// still OR, not entanglement: each keeps its own provenance marker
+/// (`shell_synthetic_working` vs. `monitored_wait_synthetic_working` — see
+/// `SessionState`'s doc), so this sweep can never revert a `Working` the
+/// other signal (or a real agent-emitted event) set.
+///
+/// No internal shutdown signal — like `shell_activity_handle`, this task is
+/// torn down by `.abort()` in `run_daemon_with`'s cleanup.
+async fn run_monitored_wait_sweep(state: SharedState) {
+    // Same cadence as the shell-activity poll (PRD #370 M2) — frequent
+    // enough that a TTL's expiry is noticed promptly (`wait/monitored/009`
+    // sleeps only 1s past its 2s TTL before requiring the self-heal to have
+    // landed), cheap enough that a bare HashMap scan with no process-table
+    // sampling costs nothing running twice a second.
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        state.write().await.sweep_expired_monitored_waits();
+    }
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -2260,6 +2306,32 @@ async fn run_hook_loop(
                                         "Received work-done signal"
                                     );
                                     state.read().await.handle_work_done(signal, &pty_registry).await;
+                                }
+                                DaemonMessage::WaitStart(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        label = %signal.label,
+                                        ttl_secs = signal.ttl_secs,
+                                        "Received wait-start signal"
+                                    );
+                                    state.write().await.start_monitored_wait(
+                                        &signal.pane_id,
+                                        signal.label,
+                                        Duration::from_secs(signal.ttl_secs),
+                                    );
+                                }
+                                DaemonMessage::WaitDone(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        label = %signal.label,
+                                        outcome = ?signal.outcome,
+                                        "Received wait-done signal"
+                                    );
+                                    state.write().await.clear_monitored_wait(
+                                        &signal.pane_id,
+                                        &signal.label,
+                                        signal.outcome,
+                                    );
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the

@@ -278,6 +278,19 @@ enum Commands {
         #[command(subcommand)]
         cmd: IssueCmd,
     },
+    /// Declare or clear a monitored external wait for the calling pane
+    /// (PRD #499, reopened) — a role invokes `wait start <label>` when it
+    /// becomes responsible for noticing an external dependency resolve (CI,
+    /// another agent/worker, an approval), and `wait done <label> --outcome
+    /// <...>` once it does, so the pane reads `Working` for the whole span
+    /// even across polling gaps or after its own delegated task has already
+    /// reported done. A wait that is never explicitly cleared self-heals
+    /// after a TTL (`DOT_AGENT_DECK_WAIT_TTL_SECS`) rather than wedging the
+    /// pane `Working` forever.
+    Wait {
+        #[command(subcommand)]
+        cmd: WaitCmd,
+    },
     /// Wrap an agent command, passing its stdio through transparently while
     /// tee-ing output through pattern detection into `AgentEvent`s (PRD #20 M6
     /// — the generic stdout-wrapper integration strategy). The child stays
@@ -560,6 +573,51 @@ enum IssueCmd {
         #[arg(long)]
         reason: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum WaitCmd {
+    /// Declare a monitored external wait for this pane, identified by
+    /// `<label>` (a short opaque token, e.g. `ci-check`). Idempotent-ish:
+    /// re-running `start` before a matching `done` just resets the TTL
+    /// clock and re-records the label.
+    Start {
+        /// Short label naming what this wait is for. Not interpreted by the
+        /// daemon beyond attribution/logging.
+        label: String,
+    },
+    /// Clear a previously declared monitored wait for this pane.
+    Done {
+        /// The same label passed to `start`. A pane carries at most one
+        /// monitored wait at a time, so this clears it regardless of an
+        /// exact match — a mismatch is logged daemon-side, not refused.
+        label: String,
+        /// The terminal outcome of the external dependency this wait was
+        /// for. All four clear the wait identically — a role reports which
+        /// one occurred for its own bookkeeping / logging, not because the
+        /// daemon's status computation treats them differently.
+        #[arg(long, value_enum)]
+        outcome: CliWaitOutcome,
+    },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliWaitOutcome {
+    Success,
+    Failure,
+    Cancelled,
+    Timeout,
+}
+
+impl From<CliWaitOutcome> for dot_agent_deck::event::WaitOutcome {
+    fn from(value: CliWaitOutcome) -> Self {
+        match value {
+            CliWaitOutcome::Success => Self::Success,
+            CliWaitOutcome::Failure => Self::Failure,
+            CliWaitOutcome::Cancelled => Self::Cancelled,
+            CliWaitOutcome::Timeout => Self::Timeout,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -1813,6 +1871,50 @@ fn main() -> ExitCode {
                 reason,
             } => run_issue_release_cli(issue, repo, force, confirm_stopped, reason),
         },
+        Some(Commands::Wait { cmd }) => {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let msg = match cmd {
+                WaitCmd::Start { label } => {
+                    let ttl_secs = dot_agent_deck::agent_pty::wait_ttl_secs();
+                    dot_agent_deck::event::DaemonMessage::WaitStart(
+                        dot_agent_deck::event::WaitStartSignal {
+                            pane_id,
+                            label,
+                            ttl_secs,
+                            timestamp: chrono::Utc::now(),
+                        },
+                    )
+                }
+                WaitCmd::Done { label, outcome } => dot_agent_deck::event::DaemonMessage::WaitDone(
+                    dot_agent_deck::event::WaitDoneSignal {
+                        pane_id,
+                        label,
+                        outcome: outcome.into(),
+                        timestamp: chrono::Utc::now(),
+                    },
+                ),
+            };
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize wait signal: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                eprintln!("Failed to send wait signal to daemon socket.");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
         Some(Commands::Snapshot { cmd }) => match cmd {
