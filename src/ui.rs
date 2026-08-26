@@ -37218,6 +37218,106 @@ mod tests {
         }
     }
 
+    /// PRD fork#603 reviewer F2: like [`with_recording_daemon`], but records
+    /// the `cwd` field of every `claim-orchestration-name` request into
+    /// `captured_cwds` (in arrival order) instead of just the bare `op`
+    /// string. `with_recording_daemon`'s log can only ever prove a claim was
+    /// SENT, never what directory it was scoped to — which is exactly the
+    /// gap that let `identity_036` pass while mirroring both `src/ui.rs`
+    /// call sites' derivation in its own body rather than reading back what
+    /// either one actually computed and sent. Still answers every request
+    /// with `AttachResponse::ok()` (an always-available daemon), so this
+    /// only ever OBSERVES the real call site's payload; it never influences
+    /// which branch the code under test takes.
+    fn with_recording_daemon_capturing_claim_cwd(
+        unique_dir: &std::path::Path,
+        captured_cwds: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "build stub claim-cwd-capturing recording-daemon runtime: {e}"
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "bind stub claim-cwd-capturing recording listener: {e}"
+                            )));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let ok_payload = serde_json::to_vec(&crate::daemon_protocol::AttachResponse::ok())
+                    .expect("serialize AttachResponse::ok()");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(Some((_, payload))) =
+                        crate::daemon_protocol::read_frame(&mut stream).await
+                    else {
+                        continue;
+                    };
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload)
+                        && v.get("op").and_then(|o| o.as_str()) == Some("claim-orchestration-name")
+                    {
+                        let cwd = v.get("cwd").and_then(|c| c.as_str()).map(str::to_string);
+                        captured_cwds.lock().unwrap().push(cwd);
+                    }
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &ok_payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub claim-cwd-capturing recording daemon must report readiness within 10s")
+            .expect("stub claim-cwd-capturing recording daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
     /// A `PaneController` that succeeds for every `create_pane_with_options`
     /// call except the `fail_at`-th (0-indexed), which it fails — modeling a
     /// role-pane spawn that dies partway through
@@ -38940,6 +39040,135 @@ mod tests {
                  spelled physically -- got {canonical_cwd:?} under {canonical_repo:?}"
             );
         }
+    }
+
+    /// Scenario: PRD fork#603 reviewer finding F2. `identity_036`
+    /// (`src/agent_pty.rs`) replicates what each of the two
+    /// `ClaimOrchestrationName` call sites is SUPPOSED to compute post-fix,
+    /// directly inside the test body — it says nothing about whether
+    /// `Action::SpawnPane`'s live-spawn call site (`src/ui.rs`, the hoisted
+    /// `resolve_orchestration_workspace` call feeding the pre-spawn claim)
+    /// actually computes and sends that value, rather than the raw picked
+    /// `req.dir`. Reverting that hoisted call back to `req.dir` leaves
+    /// `identity_036` and every other gate green, because nothing exercises
+    /// the real call site. This test does: same nested-pick fixture shape
+    /// as `workspace_035` (a real git repo, a project directory two levels
+    /// down), driven through the real `dispatch_action`/`Action::SpawnPane`
+    /// path exactly as `workspace_035`/`identity_029` do, against a daemon
+    /// stub (`with_recording_daemon_capturing_claim_cwd`) that records the
+    /// actual `cwd` field of the `claim-orchestration-name` request as it
+    /// arrives on the wire — not a value this test independently computes
+    /// by transcribing the derivation formula (which could silently drift
+    /// from the real one, `workspace_035`'s own doc comment explains this
+    /// same trap), but the real call site's own resolved-root-dir
+    /// (`resolve_orchestration_workspace`, canonicalized, per
+    /// `Action::SpawnPane`'s own comment on why it canonicalizes
+    /// `resolved_root_dir` rather than the not-yet-provisioned
+    /// `worktree_path`) rejoined with `resolve_workspace_path` and the
+    /// relative subpath — the exact shared primitives `Action::SpawnPane`
+    /// itself calls, read back rather than reimplemented.
+    #[spec("orchestration/identity/038")]
+    #[test]
+    fn identity_038_live_spawn_claim_sends_the_real_resolved_workspace_cwd_for_a_nested_pick() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+        let nested = repo.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested project",
+        ]);
+
+        let captured_cwds = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let _daemon = with_recording_daemon_capturing_claim_cwd(tmp.path(), captured_cwds.clone());
+
+        let config = make_orchestration("review");
+        let pc = Arc::new(CapturingPaneController::new());
+        let req = NewPaneRequest {
+            dir: nested.clone(),
+            name: "features".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+        };
+
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert_eq!(
+            tm.tab_count(),
+            2,
+            "setup: the nested-pick launch must actually succeed (Dashboard + Orchestration \
+             tab) for this test to exercise anything -- got {} tab(s), status: {:?}",
+            tm.tab_count(),
+            ui.status_message.as_ref().map(|(m, _)| m.clone())
+        );
+
+        // Read back what the real call site's own shared primitives compute
+        // for this fixture -- NOT a hand-transcribed copy of the formula.
+        let segment = sanitize_workspace_segment("features");
+        let resolution = resolve_orchestration_workspace(&nested, &segment);
+        let canonical_root = resolution
+            .resolved_root_dir
+            .canonicalize()
+            .expect("resolved_root_dir already exists on disk (it's the git toplevel)");
+        let mut expected_cwd = resolve_workspace_path(&canonical_root, &segment);
+        if let Some(rel) = &resolution.relative_subpath {
+            expected_cwd = expected_cwd.join(rel);
+        }
+        let expected_cwd = expected_cwd.display().to_string();
+
+        let captured = captured_cwds.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one claim-orchestration-name request must have been sent; got {captured:?}"
+        );
+        assert_eq!(
+            captured[0].as_deref(),
+            Some(expected_cwd.as_str()),
+            "reviewer F2: `Action::SpawnPane`'s own pre-spawn claim (not a mirrored derivation) \
+             must send the REAL resolved workspace directory as `cwd` -- got {:?}, expected \
+             {expected_cwd:?}. Reverting the hoisted `resolve_orchestration_workspace` call back \
+             to sending raw `req.dir` would send {:?} instead, and this assertion would catch \
+             that even though `identity_036` stays green.",
+            captured[0],
+            nested.display().to_string()
+        );
     }
 
     /// Fork #122: a real `.dot-agent-deck.toml` at `dir` defining one
