@@ -1916,10 +1916,10 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the warning log line's exact content (out of scope for this harness).
 - **Platform coverage:** mac+linux.
 
-##### wait/monitored/016 — the daemon and an independent, freshly-constructed client `AppState` converge on identical composition state (`status`, `monitored_wait_active`, `wait_synthetic_working`, `shell_descendant_busy`) after replaying the identical broadcast event sequence, across a `MonitoredWaitStart`+real-`Idle` composition and a `MonitoredWaitStart`+`ShellBusy`+`MonitoredWaitDone` composition (PRD #499 round 3, reviewer BLOCKER A / auditor B1).
+##### wait/monitored/016 — the daemon and an independent, freshly-constructed client `AppState` converge on identical composition state (`status`, `monitored_wait_active`, `wait_synthetic_working`, `shell_descendant_busy`, `wait_deferred_revert`) after replaying the identical broadcast event sequence, across a `MonitoredWaitStart`+real-`Idle` composition and a `MonitoredWaitStart`+`ShellBusy`+`MonitoredWaitDone` composition (PRD #499 round 3, reviewer BLOCKER A / auditor B1; `wait_deferred_revert` joined the tuple round 6, MEDIUM J).
 - **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`), plus a direct subscription to the in-process daemon's `event_tx` broadcast channel (as `014`) replayed onto a second, independent bare `AppState` after every step, not just the promotion.
 - **Agent:** none (synthetic — two `cat`-stub panes).
-- **Asserts:** on pane A, after `wait start` and then a real `Idle` injected while the wait is outstanding, the client's replayed `AppState` reads `Working` (not `Idle`) exactly as the daemon's own does, because `monitored_wait_active` is set on the client's own copy of the card too; on pane B, after `wait start`, an injected `ShellBusy`, and `wait done`, both the daemon and the client stay `Working` (OR composition, Direction A) and their full composition tuples match at every step.
+- **Asserts:** on pane A, after `wait start` and then a real `Idle` injected while the wait is outstanding, the client's replayed `AppState` reads `Working` (not `Idle`) exactly as the daemon's own does, because `monitored_wait_active` is set on the client's own copy of the card too; on pane B, after `wait start`, an injected `ShellBusy`, and `wait done`, both the daemon and the client stay `Working` (OR composition, Direction A) and their full 5-field composition tuples, including `wait_deferred_revert`, match at every step.
 - **Does not assert:** the real PTY-attached TUI rendering path end to end (out of scope for this fast-tier file).
 - **Platform coverage:** mac+linux.
 
@@ -1963,6 +1963,13 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Agent:** none (a single synthetic `SessionStart` applied directly via `AppState::apply_event`).
 - **Asserts:** after `start_monitored_wait` records an entry for a pane, calling `unregister_pane` alone leaves both the pane's card and its `monitored_waits` entry in place — a regression guard for round 3's B3 narrowing, which `013` (calling both teardown methods together) cannot distinguish from the round-2 shape it replaced.
 - **Does not assert:** the combined-teardown eager-cleanup behavior (covered by `013`); the TTL sweep's own correctness (covered by `009`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/023 — the PRD's headline flow (`wait start` as a real tool call) plus a background shell descendant still busy when `wait done` lands must still be revertible once the descendant genuinely goes idle (PRD #499 round 6, reviewer BLOCKER I wedge 4a).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `019`), plus the injected `ShellBusy`/`ShellIdle` pair `020`/`021` use.
+- **Agent:** none (synthetic — a `cat`-stub pane; `ToolStart`/`ToolEnd`/`Idle` and `ShellBusy`/`ShellIdle` are injected events, not a real spawned tool or descendant).
+- **Asserts:** a real `ToolStart` sets `Working`; `wait start` declines to promote (already `Working`); an injected `ShellBusy` declines to promote too and sets `shell_descendant_busy`; the agent's own real `Idle` is suppressed (Direction C) and records `wait_deferred_revert` rather than `wait_synthetic_working`; `wait done` declines (Direction A, `shell_descendant_busy` still live) — today it unconditionally clears `wait_deferred_revert` without transferring it to shell; the paired `ShellIdle` then arrives and must revert the pane to `Idle` — today it also declines (`shell_synthetic_working` was never set), wedging the pane `Working` forever.
+- **Does not assert:** wedge variants 4b/4c (two shell busy/idle cycles spanning one wait; a stale `shell_descendant_busy` outliving `shell_synthetic_working` with no `ShellBusy` after the wait starts) — either is a reachable alternate route to the same defect, not additional coverage.
 - **Platform coverage:** mac+linux.
 
 ### Prompts
