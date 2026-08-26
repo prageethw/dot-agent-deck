@@ -218,8 +218,14 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
             .as_ref()
             .map(|s| format!("{s:?}"))
             .unwrap_or_else(|| DASH.to_string());
-        // Fork issue #21 provenance marker: flag a status that was
-        // synthesized from shell activity rather than agent-emitted.
+        // Fork issue #21 provenance marker: flag a `Working` that this
+        // mechanism currently holds shell responsible for keeping up.
+        // Originally that meant "synthesized from shell activity rather
+        // than agent-emitted" — PRD #499 round 6 widened it: the marker can
+        // now also be set by a hand-off (`MonitoredWaitDone`'s Direction A)
+        // onto a `Working` a real agent event emitted, once a monitored
+        // wait's revert becomes shell's obligation to pay. See
+        // `shell_synthetic_working`'s doc comment in `src/state.rs`.
         let status = if a.shell_synthetic_working {
             format!("{status}*")
         } else {
