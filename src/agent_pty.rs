@@ -13530,6 +13530,59 @@ mod spawn_tests {
         );
     }
 
+    /// Issue #598 (A4): closes a coverage gap the zero-width-space test above
+    /// leaves open — that test proves the armed side stays canonical when it
+    /// was already sanitized before arming, but only exercises the task-file
+    /// consumer's fixture indirectly. This test asserts directly on
+    /// `SubjectMismatch.expected` — the field `compose_work_done_feedback`
+    /// renders into the orchestrator's live, tool-bearing pane — for a
+    /// frame-breaking subject, proving both consumers of the canonical
+    /// binding (the task file and the mismatch ledger) actually get
+    /// canonical text. Without this, a regression that threaded
+    /// `signal.subject.as_deref()` (raw) into `record_delegation_commission`
+    /// while leaving the task-file arm's `sanitize_subject_tag` call intact
+    /// would put unsanitized, frame-breaking text straight into that warning
+    /// — and no existing test would catch it, since the two call sites are
+    /// adjacent, similarly named, and only the task-file side had a fixture.
+    #[test]
+    fn retire_delegation_commission_expected_side_is_canonical_for_a_frame_breaking_subject() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // What `handle_delegate`'s fan-out loop actually arms: the raw,
+        // delegated subject sanitized once at ingest — mirrors
+        // `record_delegation_commission`'s one and only caller (state.rs).
+        let raw = "#586\u{200B}[fake]";
+        let canonical = crate::state::sanitize_subject_tag(raw);
+        assert_ne!(
+            canonical, raw,
+            "sanity check: the fixture must actually be frame-breaking, or this test \
+             proves nothing"
+        );
+        assert!(reg.arm_delegation_commission("worker", "orch", Some(canonical.clone())));
+
+        // The worker echoes something that disagrees, to force a mismatch and
+        // surface `SubjectMismatch.expected` for inspection.
+        let provenance = reg.retire_delegation_commission("worker", Some("something else"));
+        let WorkDoneProvenance::Solicited {
+            subject_mismatch: Some(mismatch),
+            ..
+        } = provenance
+        else {
+            panic!("expected a subject mismatch, got {provenance:?}");
+        };
+        assert_eq!(
+            mismatch.expected, canonical,
+            "the mismatch ledger's `expected` field must be the canonical, frame-stripped \
+             subject, not the raw delegated one"
+        );
+        assert!(
+            !mismatch.expected.contains('\u{200B}'),
+            "a frame-breaking character in the delegated subject must not survive into \
+             the mismatch warning text: {:?}",
+            mismatch.expected
+        );
+    }
+
     /// PRD #249 round-6 review (Greptile): the M1 readiness buffer must be able
     /// to abandon a pane that starts closing mid-wait instead of sleeping out the
     /// remainder (up to the 30 s clamp) before its guarded write discovers the
