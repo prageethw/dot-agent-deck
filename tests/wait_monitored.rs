@@ -199,6 +199,20 @@ fn card_event(
     )
 }
 
+/// Serialize `event` and write it to `daemon`'s hook socket, panicking with
+/// `description` (e.g. `"synthetic ShellBusy event"`) on either failure —
+/// the `write_hook_line(serde_json::to_string(...).expect(...)).expect(...)`
+/// shape repeated at nearly every injected-event call site in this file,
+/// factored out here (PRD #499 round 7, SonarCloud duplication) so each call
+/// site is a one-line call naming only the event and what it represents.
+#[cfg(unix)]
+fn write_event(daemon: &common::InProcDaemon, event: &AgentEvent, description: &str) {
+    let line =
+        serde_json::to_string(event).unwrap_or_else(|e| panic!("serialize {description}: {e}"));
+    common::write_hook_line(&daemon.hook_path, &line)
+        .unwrap_or_else(|e| panic!("write {description} to the daemon hook socket: {e}"));
+}
+
 /// Register a `cat`-stub pane directly on the daemon's own live
 /// `AgentPtyRegistry` (the same one `run_shell_activity_monitor` polls),
 /// seed it to a known `Idle` session over the hook socket, and wait for
@@ -218,12 +232,11 @@ async fn setup_idle_pane(daemon: &common::InProcDaemon, cwd: &str, pane_id: &str
         .expect("spawn cat-stub pane for wait/monitored setup");
 
     let session_id = format!("{pane_id}-session");
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&idle_event(pane_id, &agent_id, &session_id))
-            .expect("serialize seed Idle event"),
-    )
-    .expect("write seed Idle event to the daemon hook socket");
+    write_event(
+        daemon,
+        &idle_event(pane_id, &agent_id, &session_id),
+        "seed Idle event",
+    );
 
     wait_for_status(
         daemon,
@@ -1015,17 +1028,16 @@ async fn wait_monitored_011_composition_is_or_not_mutual_clobber_inner() {
     // `run_shell_activity_monitor` would report it — injected directly over
     // the hook socket so this is deterministic rather than racing a real
     // spawned process.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&shell_activity_event(
+    write_event(
+        &daemon,
+        &shell_activity_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ShellBusy,
-        ))
-        .expect("serialize synthetic ShellBusy event"),
-    )
-    .expect("write synthetic ShellBusy event to the daemon hook socket");
+        ),
+        "synthetic ShellBusy event",
+    );
     assert_status_holds(
         &daemon,
         &pane.pane_id,
@@ -1566,12 +1578,11 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
     // Round 3 (Direction C): the daemon suppresses the status write because
     // `monitored_wait_active` is set on THIS card; a client that applied the
     // identical MonitoredWaitStart event above must suppress it identically.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&idle_event(&pane_a.pane_id, &pane_a.agent_id, &session_a))
-            .expect("serialize real Idle event"),
-    )
-    .expect("write real Idle event to the daemon hook socket");
+    write_event(
+        &daemon,
+        &idle_event(&pane_a.pane_id, &pane_a.agent_id, &session_a),
+        "real Idle event",
+    );
     let idle_event_seen =
         recv_matching_event(&mut events_a, &pane_a.pane_id, Duration::from_secs(3))
             .await
@@ -1675,17 +1686,16 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
         "wait/monitored/016 (case B): client/daemon must converge after MonitoredWaitStart"
     );
 
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&shell_activity_event(
+    write_event(
+        &daemon,
+        &shell_activity_event(
             &pane_b.pane_id,
             &pane_b.agent_id,
             &session_b,
             EventType::ShellBusy,
-        ))
-        .expect("serialize synthetic ShellBusy event"),
-    )
-    .expect("write synthetic ShellBusy event to the daemon hook socket");
+        ),
+        "synthetic ShellBusy event",
+    );
     let shell_busy_event =
         recv_matching_event(&mut events_b, &pane_b.pane_id, Duration::from_secs(3))
             .await
@@ -1988,18 +1998,17 @@ async fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_
 
     // 1. ToolStart (the Bash call running `wait start`) — a REAL agent
     // event, asserts Working.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&tool_event(
+    write_event(
+        &daemon,
+        &tool_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ToolStart,
             Some("Bash"),
-        ))
-        .expect("serialize ToolStart event"),
-    )
-    .expect("write ToolStart event to the daemon hook socket");
+        ),
+        "ToolStart event",
+    );
     assert_reaches_status(
         &daemon,
         &pane.pane_id,
@@ -2010,18 +2019,17 @@ async fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_
     .await;
 
     // 2. ToolEnd — declines (status != WaitingForInput); no visible change.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&tool_event(
+    write_event(
+        &daemon,
+        &tool_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ToolEnd,
             None,
-        ))
-        .expect("serialize ToolEnd event"),
-    )
-    .expect("write ToolEnd event to the daemon hook socket");
+        ),
+        "ToolEnd event",
+    );
     assert_status_holds(
         &daemon,
         &pane.pane_id,
@@ -2050,12 +2058,11 @@ async fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_
 
     // 4. The agent's own Stop-hook Idle arrives while the wait is
     // outstanding — correctly suppressed (Direction C), swallowed for good.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&idle_event(&pane.pane_id, &pane.agent_id, &session_id))
-            .expect("serialize real Idle event"),
-    )
-    .expect("write real Idle event to the daemon hook socket");
+    write_event(
+        &daemon,
+        &idle_event(&pane.pane_id, &pane.agent_id, &session_id),
+        "real Idle event",
+    );
     assert_status_holds(
         &daemon,
         &pane.pane_id,
@@ -2151,17 +2158,16 @@ async fn wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner() {
     // 2. Injected ShellBusy — declines to promote (already Working);
     // shell_descendant_busy = true unconditionally, shell_synthetic_working
     // stays false (this mechanism did not cause the current Working).
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&shell_activity_event(
+    write_event(
+        &daemon,
+        &shell_activity_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ShellBusy,
-        ))
-        .expect("serialize synthetic ShellBusy event"),
-    )
-    .expect("write synthetic ShellBusy event to the daemon hook socket");
+        ),
+        "synthetic ShellBusy event",
+    );
     assert_status_holds(
         &daemon,
         &pane.pane_id,
@@ -2200,17 +2206,16 @@ async fn wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner() {
     // H wedge 2: `was_holding` reads shell_synthetic_working == false (it
     // was never set at step 2), so this also declines, and the pane is
     // wedged Working forever with all four markers false.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&shell_activity_event(
+    write_event(
+        &daemon,
+        &shell_activity_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ShellIdle,
-        ))
-        .expect("serialize synthetic ShellIdle event"),
-    )
-    .expect("write synthetic ShellIdle event to the daemon hook socket");
+        ),
+        "synthetic ShellIdle event",
+    );
     wait_for_status(
         &daemon,
         &pane.pane_id,
@@ -2265,17 +2270,16 @@ async fn wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner() {
 
     // 1. Injected ShellBusy on the Idle pane — promotes: status = Working,
     // shell_synthetic_working = true, shell_descendant_busy = true.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&shell_activity_event(
+    write_event(
+        &daemon,
+        &shell_activity_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ShellBusy,
-        ))
-        .expect("serialize synthetic ShellBusy event"),
-    )
-    .expect("write synthetic ShellBusy event to the daemon hook socket");
+        ),
+        "synthetic ShellBusy event",
+    );
     assert_reaches_status(
         &daemon,
         &pane.pane_id,
@@ -2307,17 +2311,16 @@ async fn wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner() {
     // monitored_wait_active suppresses the revert (Direction B, correct) —
     // yet it still unconditionally clears shell_synthetic_working AND
     // shell_descendant_busy on the way out.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&shell_activity_event(
+    write_event(
+        &daemon,
+        &shell_activity_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ShellIdle,
-        ))
-        .expect("serialize synthetic ShellIdle event"),
-    )
-    .expect("write synthetic ShellIdle event to the daemon hook socket");
+        ),
+        "synthetic ShellIdle event",
+    );
     assert_status_holds(
         &daemon,
         &pane.pane_id,
@@ -2461,18 +2464,17 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
 
     // 1. ToolStart (the Bash call running `wait start`) — a REAL agent
     // event, asserts Working; the trailing block clears all four markers.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&tool_event(
+    write_event(
+        &daemon,
+        &tool_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ToolStart,
             Some("Bash"),
-        ))
-        .expect("serialize ToolStart event"),
-    )
-    .expect("write ToolStart event to the daemon hook socket");
+        ),
+        "ToolStart event",
+    );
     assert_reaches_status(
         &daemon,
         &pane.pane_id,
@@ -2483,18 +2485,17 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
     .await;
 
     // 2. ToolEnd — declines (status != WaitingForInput); no visible change.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&tool_event(
+    write_event(
+        &daemon,
+        &tool_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ToolEnd,
             None,
-        ))
-        .expect("serialize ToolEnd event"),
-    )
-    .expect("write ToolEnd event to the daemon hook socket");
+        ),
+        "ToolEnd event",
+    );
     assert_status_holds(
         &daemon,
         &pane.pane_id,
@@ -2525,17 +2526,16 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
     // declines to promote (already Working); shell_descendant_busy = true
     // unconditionally, shell_synthetic_working stays false (this mechanism
     // did not cause the current Working, so it has no claim yet).
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&shell_activity_event(
+    write_event(
+        &daemon,
+        &shell_activity_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ShellBusy,
-        ))
-        .expect("serialize synthetic ShellBusy event"),
-    )
-    .expect("write synthetic ShellBusy event to the daemon hook socket");
+        ),
+        "synthetic ShellBusy event",
+    );
     assert_status_holds(
         &daemon,
         &pane.pane_id,
@@ -2549,12 +2549,11 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
     // outstanding — suppressed (Direction C, correct), and because this
     // Working was never the wait's own promotion, the suppression records
     // wait_deferred_revert = true rather than wait_synthetic_working.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&idle_event(&pane.pane_id, &pane.agent_id, &session_id))
-            .expect("serialize real Idle event"),
-    )
-    .expect("write real Idle event to the daemon hook socket");
+    write_event(
+        &daemon,
+        &idle_event(&pane.pane_id, &pane.agent_id, &session_id),
+        "real Idle event",
+    );
     assert_status_holds(
         &daemon,
         &pane.pane_id,
@@ -2595,17 +2594,16 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
     // shell_synthetic_working == false (never set — step 6 never
     // transferred wait_deferred_revert to it), so this also declines, and
     // the pane is wedged Working forever with all four markers false.
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&shell_activity_event(
+    write_event(
+        &daemon,
+        &shell_activity_event(
             &pane.pane_id,
             &pane.agent_id,
             &session_id,
             EventType::ShellIdle,
-        ))
-        .expect("serialize synthetic ShellIdle event"),
-    )
-    .expect("write synthetic ShellIdle event to the daemon hook socket");
+        ),
+        "synthetic ShellIdle event",
+    );
     wait_for_status(
         &daemon,
         &pane.pane_id,
