@@ -28,6 +28,18 @@ pub enum EventType {
     /// gone, i.e. the previously-running foreground command has finished. See
     /// [`ShellBusy`](Self::ShellBusy).
     ShellIdle,
+    /// PRD #499 (reopened): synthesized daemon-side when a role declares a
+    /// monitored external wait (`wait start <label>`) — a second, explicit
+    /// source of `Working` alongside `ShellBusy`, routed through the same
+    /// `apply_event` precedence/composition machinery rather than mutating
+    /// `AppState` directly (PR #617 round-1 reviewer BLOCKER 1/2/3, HIGH 5).
+    /// See [`crate::state::AppState::start_monitored_wait`].
+    MonitoredWaitStart,
+    /// PRD #499 (reopened): the paired synthesized event — the wait was
+    /// cleared (`wait done`) or expired (TTL self-heal). See
+    /// [`MonitoredWaitStart`](Self::MonitoredWaitStart) and
+    /// [`crate::state::AppState::clear_monitored_wait`].
+    MonitoredWaitDone,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -734,8 +746,13 @@ impl AgentEvent {
     /// authentication marker (auditor) — a forged raw `Error` without it marks a
     /// card exactly as it did before.
     pub fn is_daemon_synthetic(&self) -> bool {
-        matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
-            || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+        matches!(
+            self.event_type,
+            EventType::ShellBusy
+                | EventType::ShellIdle
+                | EventType::MonitoredWaitStart
+                | EventType::MonitoredWaitDone
+        ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
     }
 }
 

@@ -747,16 +747,29 @@ impl Default for DaemonBootId {
 /// no explicit clear (M8). Stored in [`AppState::monitored_waits`], keyed by
 /// pane_id — see that field's doc for why this lives there rather than on
 /// [`SessionState`].
+///
+/// Round 2 (PR #617 round-1 reviewer BLOCKER 1/2/3, HIGH 5): the promotion
+/// itself is applied through [`AppState::apply_event`] (an
+/// `EventType::MonitoredWaitStart`/`MonitoredWaitDone` synthesized event),
+/// the same mechanism `ShellBusy`/`ShellIdle` use — so there is no
+/// `promoted` bookkeeping to recompute or drift here any more (round 1's
+/// BLOCKER 3: a repeated `wait start` recomputed it from the CURRENT status
+/// and silently lost the mark). Whether to revert is instead decided fresh,
+/// at clear time, from the resolved card's own `shell_synthetic_working`
+/// (composition — BLOCKER 2).
 #[derive(Debug, Clone)]
 pub struct MonitoredWait {
     pub label: String,
     pub expires_at: Instant,
-    /// `true` when declaring this wait promoted the pane's card from
-    /// `Idle`/`Unknown` to `Working` (`EventType::ShellBusy`'s exact
-    /// precedence). Mirrors `shell_synthetic_working`'s role: clearing this
-    /// wait only reverts a `Working` THIS mechanism itself set, never a
-    /// real agent-emitted one.
-    pub promoted: bool,
+    /// The CARD (`SessionState::session_id`) this wait was recorded
+    /// against, resolved via [`AppState::pane_session_id`] once at `wait
+    /// start` time and never re-resolved. HIGH 5: a respawn retires this
+    /// exact id from `AppState::sessions`, so `clear_monitored_wait` /
+    /// `sweep_expired_monitored_waits` checking whether it still exists is
+    /// what makes the wait's provenance die with the card it was declared
+    /// against, rather than silently reattaching to whatever card the pane
+    /// happens to carry when the wait is cleared or expires.
+    pub session_id: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2474,7 +2487,14 @@ fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
         // that the LLM ever saw a prompt (a human could type it by hand).
         // `Unknown` is the forward-compat catch-all — never proof by
         // construction, matching `SessionStatus::Unknown`'s neutral rendering.
-        EventType::ShellBusy | EventType::ShellIdle | EventType::Unknown => false,
+        // PRD #499 (reopened): a monitored wait is a deliberate declaration
+        // by the role, not evidence the agent itself saw a prompt — same
+        // daemon-synthesized standing as `ShellBusy`/`ShellIdle`.
+        EventType::ShellBusy
+        | EventType::ShellIdle
+        | EventType::MonitoredWaitStart
+        | EventType::MonitoredWaitDone
+        | EventType::Unknown => false,
         // A turn is underway: a submitted prompt, a tool, a subagent, a
         // compaction, or a permission request raised by a tool the agent chose.
         EventType::Thinking
@@ -5445,6 +5465,12 @@ impl AppState {
         self.orchestrator_pane_ids.remove(pane_id);
         self.pane_orchestration_map.remove(pane_id);
         self.codex_hook_trust_failed.remove(pane_id);
+        // PRD #499 (reopened) round 2 (reviewer MEDIUM 6 / auditor A4): a
+        // torn-down pane's monitored wait must not linger until the TTL
+        // sweep gets to it — this is a considered addition (unlike
+        // `pane_registration_generation`'s deliberate exception just above),
+        // since a `MonitoredWait` has no cross-teardown comparison value.
+        self.monitored_waits.remove(pane_id);
     }
 
     /// Drop EVERY session belonging to `pane_id`, returning how many went.
@@ -5474,6 +5500,11 @@ impl AppState {
         for id in doomed {
             self.sessions.remove(&id);
         }
+        // PRD #499 (reopened) round 2 (reviewer MEDIUM 6 / auditor A4): see
+        // `unregister_pane`'s identical addition — `src/ui.rs` calls both
+        // together on a real pane close, so belt-and-suspenders here costs
+        // nothing (a second `remove` on an already-absent key is a no-op).
+        self.monitored_waits.remove(pane_id);
         n
     }
 
@@ -6243,6 +6274,40 @@ impl AppState {
         }
     }
 
+    /// PRD #499 (reopened) round 2: build the synthesized `AgentEvent` for a
+    /// monitored-wait transition against the given (already-resolved) card,
+    /// mirroring exactly how the shell-activity monitor builds its
+    /// `ShellBusy`/`ShellIdle` events (`run_shell_activity_monitor_with`,
+    /// `src/daemon.rs`) — same `agent_type: AgentType::None`, same "carry
+    /// the card's own `agent_id` so an attached TUI's reuse guard remaps
+    /// onto the right card instead of minting a phantom session" reasoning
+    /// (PR #617 round-1 reviewer BLOCKER 1).
+    fn monitored_wait_event(
+        &self,
+        pane_id: &str,
+        session_id: &str,
+        event_type: EventType,
+    ) -> Option<AgentEvent> {
+        let agent_id = self.sessions.get(session_id)?.agent_id.clone();
+        Some(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::None,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        })
+    }
+
     /// PRD #499 (reopened) M3/M8: declare a monitored external wait for
     /// `pane_id` (`wait start <label>`) — a second, explicit source of
     /// [`SessionStatus::Working`] alongside the process-derived
@@ -6252,53 +6317,62 @@ impl AppState {
     /// role whose own delegated task already reported done but is still
     /// responsible for noticing an outcome.
     ///
-    /// Recorded in [`Self::monitored_waits`], keyed by `pane_id` — NOT
-    /// threaded onto [`SessionState`] itself, deliberately: that struct is
-    /// constructed as a literal at dozens of call sites across `src/ui.rs`
-    /// and the render-snapshot test suites, and this mechanism has no need
-    /// to be there. A separate map also survives the pane's card
-    /// (`session_id`) changing underneath it — e.g. a respawn — since every
-    /// operation here re-resolves the CURRENT card via
-    /// [`Self::pane_session_id`] at the time it runs, the same target the
-    /// shell-activity monitor's `ShellBusy` re-emit uses.
+    /// Round 2 (PR #617 round-1 reviewer BLOCKER 1/2/3, HIGH 5): routes the
+    /// promotion through [`Self::apply_event`] via a synthesized
+    /// `EventType::MonitoredWaitStart`, the same mechanism the shell-activity
+    /// monitor uses for `ShellBusy` — rather than mutating `status` directly.
+    /// That gets the existing composition/precedence logic for free (BLOCKER
+    /// 2), fixes the broadcast gap (BLOCKER 1 — the caller broadcasts the
+    /// returned event on `event_tx`, see `src/daemon.rs`), and removes the
+    /// separate `promoted` bookkeeping that BLOCKER 3 showed was unsafe to
+    /// recompute on a repeated `start` (a refreshing `wait start` just
+    /// re-applies the same idempotent promotion and refreshes the TTL below).
     ///
-    /// Only PROMOTES a stale/no-opinion status (`Idle`/`Unknown`), mirroring
-    /// `EventType::ShellBusy`'s precedence: a real agent-emitted
-    /// `Thinking`/`Working`/`WaitingForInput`/`Compacting`/`Error` is never
-    /// clobbered. The wait itself is recorded regardless of whether it
-    /// promoted anything, so `wait done`/TTL expiry (M7/M8) has something to
-    /// clear either way — `promoted` on the stored [`MonitoredWait`] is
-    /// what `clear_monitored_wait`/`sweep_expired_monitored_waits` check
-    /// before touching `status` at all.
+    /// The card (`session_id`) resolved *now*, at declare time, is stored on
+    /// the returned [`MonitoredWait`] and used verbatim by
+    /// [`Self::clear_monitored_wait`]/[`Self::sweep_expired_monitored_waits`]
+    /// — never re-resolved via [`Self::pane_session_id`] later, which is what
+    /// let round 1's design reattach a stale wait's provenance to a
+    /// respawned pane's NEW card (HIGH 5).
     ///
-    /// No-ops (with a warning) when `pane_id` names no known session yet —
-    /// same posture as `run_shell_activity_monitor`'s "a bare shell pane
-    /// that has never emitted a single agent event has no `SessionState` to
-    /// update at all."
-    pub fn start_monitored_wait(&mut self, pane_id: &str, label: String, ttl: Duration) {
-        let Some(card_id) = self.pane_session_id(pane_id) else {
+    /// No-ops (with a warning), recording nothing, when `pane_id` names no
+    /// known session yet — same posture as `run_shell_activity_monitor`'s "a
+    /// bare shell pane that has never emitted a single agent event has no
+    /// `SessionState` to update at all." Returns the applied event (for the
+    /// caller to broadcast) on success.
+    pub fn start_monitored_wait(
+        &mut self,
+        pane_id: &str,
+        label: String,
+        ttl: Duration,
+    ) -> Option<AgentEvent> {
+        let Some(session_id) = self.pane_session_id(pane_id) else {
             warn!(
                 pane_id = %pane_id,
                 label = %label,
                 "wait start: no known session for this pane yet"
             );
-            return;
+            return None;
         };
-        let Some(session) = self.sessions.get_mut(&card_id) else {
-            return;
-        };
-        let promoted = matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown);
-        if promoted {
-            session.status = SessionStatus::Working;
-        }
+        let event =
+            self.monitored_wait_event(pane_id, &session_id, EventType::MonitoredWaitStart)?;
+        self.apply_event(event.clone());
         self.monitored_waits.insert(
             pane_id.to_string(),
             MonitoredWait {
                 label,
-                expires_at: Instant::now() + ttl,
-                promoted,
+                // Auditor A2: `Instant::now() + ttl` panics on overflow.
+                // `daemon.rs`'s `MAX_WAIT_TTL_SECS` clamp (A1) makes this
+                // unreachable in practice, but `checked_add` with a bounded
+                // fallback avoids depending on the clamp alone to prevent a
+                // crash on this path.
+                expires_at: Instant::now()
+                    .checked_add(ttl)
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(60)),
+                session_id,
             },
         );
+        Some(event)
     }
 
     /// PRD #499 (reopened) M7: clear a previously declared monitored wait
@@ -6311,14 +6385,27 @@ impl AppState {
     /// whichever is active; `label` is compared only to warn on a mismatch,
     /// never to refuse the clear — refusing would risk exactly the
     /// stale-claim wedge (PRD #421/#464) M7/M8 exist to rule out.
-    pub fn clear_monitored_wait(&mut self, pane_id: &str, label: &str, outcome: WaitOutcome) {
+    ///
+    /// Round 2 HIGH 5: reverts against the EXACT card `start_monitored_wait`
+    /// recorded (`wait.session_id`), never re-resolving the pane's CURRENT
+    /// card — if that card no longer exists (retired by a respawn since
+    /// `wait start`), the wait's provenance dies with it: nothing is
+    /// reverted, and no phantom session is resurrected under the stale id.
+    /// Returns the applied event (for the caller to broadcast) when a live
+    /// wait was actually cleared.
+    pub fn clear_monitored_wait(
+        &mut self,
+        pane_id: &str,
+        label: &str,
+        outcome: WaitOutcome,
+    ) -> Option<AgentEvent> {
         let Some(wait) = self.monitored_waits.remove(pane_id) else {
             warn!(
                 pane_id = %pane_id,
                 label = %label,
                 "wait done: no active monitored wait for this pane"
             );
-            return;
+            return None;
         };
         if wait.label != label {
             warn!(
@@ -6329,24 +6416,25 @@ impl AppState {
                  clearing it anyway"
             );
         }
-        // Only revert a `Working` THIS wait promoted, and only if the card
-        // is still reading `Working` — a real event that took the status
-        // somewhere else since `start_monitored_wait` (e.g. a genuine
-        // `Thinking`/`WaitingForInput`) must not be clobbered back to
-        // `Idle` by a wait clearing.
-        if wait.promoted
-            && let Some(card_id) = self.pane_session_id(pane_id)
-            && let Some(session) = self.sessions.get_mut(&card_id)
-            && session.status == SessionStatus::Working
-        {
-            session.status = SessionStatus::Idle;
+        if !self.sessions.contains_key(&wait.session_id) {
+            tracing::debug!(
+                pane_id = %pane_id,
+                session_id = %wait.session_id,
+                "wait done: the card this wait was recorded against no longer exists \
+                 (respawned or retired) — nothing to revert"
+            );
+            return None;
         }
+        let event =
+            self.monitored_wait_event(pane_id, &wait.session_id, EventType::MonitoredWaitDone)?;
+        self.apply_event(event.clone());
         tracing::debug!(
             pane_id = %pane_id,
             label = %label,
             outcome = ?outcome,
             "wait done: cleared monitored wait"
         );
+        Some(event)
     }
 
     /// PRD #499 (reopened) M8: self-healing TTL sweep, called on a periodic
@@ -6356,7 +6444,14 @@ impl AppState {
     /// the mitigation the PRD's Risks table requires so this mechanism can
     /// never wedge a pane `Working` forever the way an unclearable stale
     /// claim would (PRD #421/#464).
-    pub fn sweep_expired_monitored_waits(&mut self) {
+    ///
+    /// Round 2 (HIGH 5, same fix as [`Self::clear_monitored_wait`]): reverts
+    /// against the EXACT card the wait was recorded against, and does
+    /// nothing if that card no longer exists. Returns the applied events
+    /// (for the caller to broadcast — BLOCKER 1's fix extends to the
+    /// self-heal path too, so a reconnected client's dashboard also sees a
+    /// TTL expiry, not only an explicit `wait done`).
+    pub fn sweep_expired_monitored_waits(&mut self) -> Vec<AgentEvent> {
         let now = Instant::now();
         let expired: Vec<String> = self
             .monitored_waits
@@ -6364,18 +6459,22 @@ impl AppState {
             .filter(|(_, wait)| now >= wait.expires_at)
             .map(|(pane_id, _)| pane_id.clone())
             .collect();
+        let mut events = Vec::new();
         for pane_id in expired {
             let Some(wait) = self.monitored_waits.remove(&pane_id) else {
                 continue;
             };
-            if wait.promoted
-                && let Some(card_id) = self.pane_session_id(&pane_id)
-                && let Some(session) = self.sessions.get_mut(&card_id)
-                && session.status == SessionStatus::Working
+            if !self.sessions.contains_key(&wait.session_id) {
+                continue;
+            }
+            if let Some(event) =
+                self.monitored_wait_event(&pane_id, &wait.session_id, EventType::MonitoredWaitDone)
             {
-                session.status = SessionStatus::Idle;
+                self.apply_event(event.clone());
+                events.push(event);
             }
         }
+        events
     }
 
     /// PRD #284: does `event` carry enough evidence to supersede `session`'s
@@ -7093,6 +7192,19 @@ impl AppState {
             }
         }
 
+        // PRD #499 (reopened) BLOCKER 2: whether a monitored wait is
+        // CURRENTLY live for this event's pane, read from `monitored_waits`
+        // (the daemon-authoritative record — see `AppState::monitored_waits`)
+        // BEFORE the mutable borrow of `session` below, since the two are
+        // disjoint fields of `self`. Used to compose `ShellBusy`/`ShellIdle`
+        // and the real `EventType::Idle` arm against an outstanding wait so
+        // neither signal clobbers the other (Directions A/B/C) — see those
+        // arms below.
+        let wait_active = event
+            .pane_id
+            .as_deref()
+            .is_some_and(|p| self.monitored_waits.contains_key(p));
+
         let pane_started = event
             .pane_id
             .as_ref()
@@ -7305,9 +7417,18 @@ impl AppState {
                 true
             }
             EventType::Idle => {
-                session.status = SessionStatus::Idle;
                 session.active_tool = None;
-                true
+                // PRD #499 (reopened) BLOCKER 2 Direction C: a role's own
+                // Stop-hook Idle must not undo an outstanding monitored
+                // wait — the whole point of the mechanism is a role that
+                // already reported its own delegated task done but is
+                // still responsible for noticing an external outcome.
+                if wait_active {
+                    false
+                } else {
+                    session.status = SessionStatus::Idle;
+                    true
+                }
             }
             EventType::Compacting => {
                 session.status = SessionStatus::Compacting;
@@ -7329,20 +7450,68 @@ impl AppState {
                 // is evidence the pane is busy, not evidence of what kind of
                 // busy, so it only fills the gap where nothing more specific
                 // is already known.
-                let asserted =
+                let promotable =
                     matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown);
-                if asserted {
+                if promotable {
                     session.status = SessionStatus::Working;
                     session.shell_synthetic_working = true;
+                } else if session.status == SessionStatus::Working && wait_active {
+                    // PRD #499 (reopened) BLOCKER 2 Direction A: the current
+                    // Working came from a monitored wait, not a real agent
+                    // event — shell's own provenance can still layer on top
+                    // of it so a later `wait done` doesn't clobber genuinely
+                    // live shell activity just because the wait cleared
+                    // first (composition is OR, not "whichever fired last").
+                    session.shell_synthetic_working = true;
                 }
-                asserted
+                promotable
             }
             EventType::ShellIdle => {
                 // PRD #370 M2: only revert a status THIS mechanism set — see
                 // `shell_synthetic_working`'s doc comment. If a real event
                 // already took over (marker false), the detached descendant
                 // going away is not proof the agent itself went idle.
-                let asserted = session.shell_synthetic_working;
+                //
+                // PRD #499 (reopened) BLOCKER 2 Direction B: even when this
+                // mechanism DID set it, never revert while a monitored wait
+                // is independently outstanding for this pane — OR
+                // composition means the other live signal still holds.
+                let was_holding = session.shell_synthetic_working;
+                session.shell_synthetic_working = false;
+                let asserted =
+                    was_holding && !wait_active && session.status == SessionStatus::Working;
+                if asserted {
+                    session.status = SessionStatus::Idle;
+                }
+                asserted
+            }
+            EventType::MonitoredWaitStart => {
+                // PRD #499 (reopened) M3: mirrors `ShellBusy`'s exact
+                // precedence — only promote a stale/no-opinion status, never
+                // clobber a real agent-emitted one. Ground truth for "is a
+                // wait live" lives in `AppState::monitored_waits`, updated by
+                // the caller (`AppState::start_monitored_wait`) around this
+                // call — no session-level provenance field needed (reviewer
+                // round-1 HIGH 5 judgement: routing through `apply_event`
+                // means the provenance naturally lives on whatever card this
+                // resolves to, without growing `SessionState`).
+                let promotable =
+                    matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown);
+                if promotable {
+                    session.status = SessionStatus::Working;
+                }
+                promotable
+            }
+            EventType::MonitoredWaitDone => {
+                // PRD #499 (reopened) M7: only revert a `Working` that isn't
+                // independently held by live shell activity (OR composition,
+                // Direction A's mirror). The caller (`clear_monitored_wait`/
+                // `sweep_expired_monitored_waits`) already resolved this
+                // event against the EXACT card the wait was recorded
+                // against and confirmed that card still exists (HIGH 5) —
+                // this arm only decides whether to revert its status.
+                let asserted =
+                    session.status == SessionStatus::Working && !session.shell_synthetic_working;
                 if asserted {
                     session.status = SessionStatus::Idle;
                 }
@@ -7371,7 +7540,19 @@ impl AppState {
         // and permanently strand the session at `Working` (the `ShellIdle`
         // would see the marker already false and become a no-op) — exactly
         // the silent-break `#[serde(other)]` exists to prevent.
-        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
+        //
+        // PRD #499 (reopened): `MonitoredWaitStart`/`MonitoredWaitDone` are
+        // excluded for the identical reason — they are daemon-synthesized,
+        // not agent-emitted, so they must not blow away shell's own
+        // provenance either direction (BLOCKER 2's composition requires
+        // each signal's marker to survive the OTHER signal's events).
+        if !matches!(
+            event.event_type,
+            EventType::ShellBusy
+                | EventType::Unknown
+                | EventType::MonitoredWaitStart
+                | EventType::MonitoredWaitDone
+        ) {
             session.shell_synthetic_working = false;
         }
 
