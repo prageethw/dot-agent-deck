@@ -2,7 +2,7 @@
 
 **Issue:** [prageethw/dot-agent-deck#586](https://github.com/prageethw/dot-agent-deck/issues/586)
 **Priority:** Medium
-**Status:** M1+M2 shipped (PR #589, merged `03b305a7`); M3 (design) complete below; M4-M6 pending
+**Status:** M1-M5 shipped (M1+M2: PR #589, merged `03b305a7`; M3: PR #592, merged `59f4e01a`; M4: PR #593, merged `8991caa6`; M5: PR #602, merged `41b2689c`); M6 (real-world validation) pending
 **Related:** PRD #126 (idle-worker watch, `OutstandingDelegation`), PRD #249 (delegate-silence watch, `SilenceWatchRecord`), issue #448 (`DelegationCommission`), PRD fork#465 (silent-exit signal — the closest prior art for "an existing daemon-side signal nobody surfaces"), upstream [#590](https://github.com/vfarcic/dot-agent-deck/issues/590) (`DelegationCommission` never expires — folded into this PRD's scope), upstream [#447](https://github.com/vfarcic/dot-agent-deck/issues/447) (`WaitingForInput` never routed to the orchestrator — related, explicitly not folded in)
 **Fork-only?** No — this is a general `dot-agent-deck` limitation. The daemon-side tracking this PRD exposes (PRD #126/#249, issue #448) is core, unmodified upstream infrastructure. Build here first, offer upstream once shipped, per CLAUDE.md rule 19.
 
@@ -95,8 +95,8 @@ Concretely for M4: `work-done`'s CLI payload gains a required (or defaulted-but-
 - [x] **M1** — Design the exact `StatusAgent` field additions for (A); confirm the privacy-scoping bar with a spot-check against the existing fields. Per Problem 3, design it as a **verification source** (something an orchestrator checks an arriving signal against) rather than an additional notification channel in its own right. *(Shipped in PR #589.)*
 - [x] **M2** — Implement (A) + (B), tests, ship. *(PR #589, merged `03b305a7`. Went through 3 review rounds — round 1's expiry design was found to violate upstream #590's own constraints and was redesigned to a per-arm `VecDeque<Instant>` with a fixed, config-independent window. Upstream offer tracked as fork issue #590 — note the number collision with the upstream issue this closes; always write `vfarcic/dot-agent-deck#590` in full from here on.)*
 - [x] **M3** — Design phase for (C): evaluate the candidate mechanisms above against the observed session's actual failure shape (11ish fork#544 replays); pick one. *(Decided 2026-08-24: combined worker-echo + orchestrator-check. See (C) above for the full reasoning, including why daemon-side generation matching was investigated and dropped.)*
-- [ ] **M4** — Implement (C), tests, ship.
-- [ ] **M5** — (D): update `assets/config_gen_prompt.md` and `docs/orchestration.md` with the watchdog pattern built on (A)+(C).
+- [x] **M4** — Implement (C), tests, ship. *(PR #593, merged `8991caa6`: worker-echoed subject tag via `--subject`, orchestrator-visible mismatch warning.)*
+- [x] **M5** — (D): update `assets/config_gen_prompt.md` and `docs/orchestration.md` with the watchdog pattern built on (A)+(C). *(PR #602, merged `41b2689c`.)*
 - [ ] **M6** — Validate on a real long-running orchestration session; confirm the watchdog pattern actually reduces the retry-loop cost measured in Problem 2's provenance section.
 
 ## Provenance
