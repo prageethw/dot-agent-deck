@@ -2715,6 +2715,15 @@ async fn handle_connection(
                     &AttachResponse::err(format!("orchestration name {name:?} is not valid")),
                 )
                 .await?;
+            } else if cwd
+                .as_deref()
+                .is_some_and(|c| !crate::agent_pty::is_valid_orchestration_cwd(c))
+            {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!("orchestration cwd {cwd:?} is not valid")),
+                )
+                .await?;
             } else if registry.claim_orchestration_name(&name, cwd.as_deref(), &token) {
                 write_resp(&mut stream, &AttachResponse::ok()).await?;
             } else {
