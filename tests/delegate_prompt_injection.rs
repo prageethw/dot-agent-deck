@@ -29,6 +29,7 @@ use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
+    WorkDoneProvenance,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
@@ -2046,6 +2047,111 @@ fn delegate_hostile_delegated_subject_is_sanitized_before_reaching_worker_task_f
                 subject_span.contains("FAKE-PROMPT") && subject_span.contains("script"),
                 "sanitization strips structural characters, not the surrounding words - the \
                  harmless remainder must still be visible: {subject_span:?}"
+            );
+        });
+}
+
+/// Scenario: Issue #598 fix round 2 (reviewer G1 / auditor B1) — delegate with
+/// a subject mixing a zero-width space and a frame-breaking bracket, force a
+/// mismatch with a disagreeing worker echo, and inspect
+/// `SubjectMismatch.expected` — the field `compose_work_done_feedback` renders
+/// into the orchestrator's live, tool-bearing pane — directly.
+///
+/// This replaces a unit test in `src/agent_pty.rs` that hand-computed the
+/// canonical subject and armed the registry directly, so `handle_delegate`
+/// and the real `record_delegation_commission` call in `state.rs` were never
+/// exercised — a regression that threaded `signal.subject.as_deref()` (raw)
+/// into `record_delegation_commission`, while leaving the task-file arm's
+/// `sanitize_subject_tag` call above intact, would have passed that test
+/// silently. Here the delegate call above this one is the one and only place
+/// the subject is armed: `handle_delegate`'s fan-out sanitizes it once and
+/// arms the ledger with that canonical value, exactly as production does,
+/// and `retire_delegation_commission` below is the same call
+/// `handle_work_done` makes against the same worker pane. `sanitize_subject_tag`
+/// itself is `pub(crate)` and unreachable from this integration-test crate,
+/// so the assertions are structural (no zero-width space, no frame-breaking
+/// bracket, harmless remainder intact) rather than a hand-recomputed
+/// equality — the same style the sibling test above already uses.
+#[test]
+#[cfg(unix)]
+fn delegate_mismatch_expected_side_is_canonical_for_a_frame_breaking_subject() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build mismatch-expected-canonicalization runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+
+            let raw = "#586\u{200B}[fake]";
+            harness
+                .state
+                .handle_delegate(
+                    DelegateSignal {
+                        pane_id: ORCH_PANE.to_string(),
+                        task: "Perform the delegated mismatch-canonicalization task.".to_string(),
+                        to: vec![WORKER_ROLE.to_string()],
+                        timestamp: chrono::Utc::now(),
+                        subject: Some(raw.to_string()),
+                    },
+                    &harness.registry,
+                    &harness.event_tx,
+                )
+                .await;
+            let delivered = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.worker_agent_id,
+                POINTER,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&delivered, POINTER),
+                "precondition failed: worker never received the delegate pointer: {:?}",
+                String::from_utf8_lossy(&delivered)
+            );
+
+            // Force a mismatch with a disagreeing echo, and read the real
+            // registry's ledger entry directly — the same
+            // `retire_delegation_commission` call `handle_work_done` makes,
+            // against the same worker pane `handle_delegate`'s fan-out armed
+            // above.
+            let provenance = harness
+                .registry
+                .retire_delegation_commission(WORKER_PANE, Some("something else"));
+            let WorkDoneProvenance::Solicited {
+                subject_mismatch: Some(mismatch),
+                ..
+            } = provenance
+            else {
+                panic!("expected a subject mismatch, got {provenance:?}");
+            };
+
+            assert!(
+                !mismatch.expected.contains('\u{200B}'),
+                "a zero-width space in the delegated subject must not survive into the \
+                 mismatch ledger's `expected` field: {:?}",
+                mismatch.expected
+            );
+            for forbidden in ['[', ']'] {
+                assert!(
+                    !mismatch.expected.contains(forbidden),
+                    "frame-breaking character {forbidden:?} from the delegated subject must be \
+                     stripped before reaching the mismatch ledger's `expected` field: {:?}",
+                    mismatch.expected
+                );
+            }
+            assert!(
+                mismatch.expected.contains("586") && mismatch.expected.contains("fake"),
+                "sanitization strips structural characters, not the surrounding words - the \
+                 harmless remainder must still be visible: {:?}",
+                mismatch.expected
             );
         });
 }

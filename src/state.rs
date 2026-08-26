@@ -1631,13 +1631,17 @@ const MAX_SUBJECT_CHARS: usize = 200;
 /// short inline label, not a standalone data block.
 ///
 /// Fix round 3 (A8): also called from
-/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] to
-/// sanitize BOTH sides before the equality check that decides whether a
-/// mismatch warning fires at all — not only at render time here. Comparing
-/// raw values let two subjects that render identically (one carrying an
-/// invisible frame-breaking character this function strips) trip a
-/// confusing, seemingly-false warning: `pub(crate)` so that call site can
-/// reach it, since the two modules are siblings, not parent/child.
+/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] —
+/// but only to sanitize the worker's ECHOED side there, not both (issue
+/// #598 fix round 2 corrected this comment's earlier claim that the
+/// equality check sanitizes both sides; the armed/expected side was
+/// already canonical from `handle_delegate`'s ingest-time call and is not
+/// sanitized again at the equality check). Comparing a raw echo against
+/// the canonical expected value let two subjects that render identically
+/// (one carrying an invisible frame-breaking character this function
+/// strips) trip a confusing, seemingly-false warning: `pub(crate)` so that
+/// call site can reach it, since the two modules are siblings, not
+/// parent/child.
 ///
 /// Fix round 5 (H6/A19): also strips `'` and `` ` `` here, not only at
 /// [`work_done_footer`]'s render site. This is the ONE canonicalization
@@ -1806,10 +1810,13 @@ enum WorkDoneReportChannel {
 /// fenced ([`quote_untrusted_report`]). The mismatch warning's `expected`/`echoed`
 /// subject tags need no sanitizing here — fix round 4 (S11/A16) made
 /// [`crate::agent_pty::SubjectMismatch`] hold canonical (already-sanitized)
-/// values by construction, sanitized exactly once each at
-/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] time,
-/// rather than re-sanitized here — re-sanitizing an already-canonical value is
-/// exactly the non-idempotency bug this round closed.
+/// values by construction: `echoed` is sanitized exactly once, at
+/// [`crate::agent_pty::AgentPtyRegistry::retire_delegation_commission`] time;
+/// `expected` is sanitized exactly once, earlier, at `handle_delegate`'s
+/// ingest (issue #598 fix round 2 corrected this comment's earlier claim
+/// that both were sanitized at `retire_delegation_commission` time). Neither
+/// is sanitized here, and re-sanitizing an already-canonical value is exactly
+/// the non-idempotency bug fix round 4 closed.
 fn compose_work_done_feedback(
     safe_role: &str,
     file_name: &str,
@@ -8265,8 +8272,9 @@ mod tests {
         );
 
         // A subject that also carries other shell metacharacters must reach
-        // the fence unescaped-but-quoted: single-quoting neutralizes `$` and
-        // `;` without needing to touch them. Backticks are a separate case —
+        // the fence unescaped-but-quoted: single-quoting neutralizes `$`,
+        // `(`, `|`, and `)` without needing to touch them. Backticks are a
+        // separate case —
         // `sanitize_subject_tag` actively strips them (issue #598, A18/A19)
         // rather than relying on quoting alone, so they are not exercised by
         // this assertion.
