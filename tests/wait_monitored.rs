@@ -1432,16 +1432,26 @@ async fn wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner() 
 // tests pin that convergence directly, plus the two untested directions
 // (respawn-suppression, same-card real-activity protection) coder's own
 // report named as still needing coverage.
+//
+// Round 5 added a fourth replicated composition field,
+// `wait_deferred_revert`. Round 6 (MEDIUM J) joins it to the convergence
+// tuple below, which round 5 left out — a future daemon-only write to that
+// field would otherwise pass this check silently.
 // ---------------------------------------------------------------------------
 
 /// The pane's current `(status, monitored_wait_active, wait_synthetic_working,
-/// shell_descendant_busy)` tuple, read directly off the DAEMON's own
-/// `AppState` — `None` if no session names this pane at all.
+/// shell_descendant_busy, wait_deferred_revert)` tuple, read directly off the
+/// DAEMON's own `AppState` — `None` if no session names this pane at all.
+///
+/// MEDIUM J (PRD #499 round 6): `wait_deferred_revert` was added in round 5
+/// but never joined this tuple, so a future daemon-only write to that field
+/// — precisely the defect this convergence check exists to catch — would
+/// pass silently. Extended here to close that gap.
 #[cfg(unix)]
 async fn daemon_composition_state(
     daemon: &common::InProcDaemon,
     pane_id: &str,
-) -> Option<(SessionStatus, bool, bool, bool)> {
+) -> Option<(SessionStatus, bool, bool, bool, bool)> {
     daemon
         .state
         .read()
@@ -1455,6 +1465,7 @@ async fn daemon_composition_state(
                 s.monitored_wait_active,
                 s.wait_synthetic_working,
                 s.shell_descendant_busy,
+                s.wait_deferred_revert,
             )
         })
 }
@@ -1469,7 +1480,7 @@ async fn daemon_composition_state(
 fn client_composition_state(
     client_state: &AppState,
     pane_id: &str,
-) -> Option<(SessionStatus, bool, bool, bool)> {
+) -> Option<(SessionStatus, bool, bool, bool, bool)> {
     client_state
         .sessions
         .values()
@@ -1480,6 +1491,7 @@ fn client_composition_state(
                 s.monitored_wait_active,
                 s.wait_synthetic_working,
                 s.shell_descendant_busy,
+                s.wait_deferred_revert,
             )
         })
 }
@@ -1525,12 +1537,12 @@ const LABEL_016_B: &str = "wait-monitored-label-016b-replay-shell";
 /// `wait done` while the shell signal is still live (OR composition,
 /// Direction A). After every event, assert the client's
 /// independently-replayed `(status, monitored_wait_active,
-/// wait_synthetic_working, shell_descendant_busy)` tuple is identical to the
-/// daemon's own — this is the test that would have caught round 2's
-/// BLOCKER A/B1: a daemon-only `AppState::monitored_waits` map meant an
-/// attached client never learned a wait was live at all, so its own
-/// `apply_event` had nothing to suppress the real `Idle` with and it read
-/// `Idle` while the daemon read `Working`.
+/// wait_synthetic_working, shell_descendant_busy, wait_deferred_revert)`
+/// tuple is identical to the daemon's own — this is the test that would have
+/// caught round 2's BLOCKER A/B1: a daemon-only `AppState::monitored_waits`
+/// map meant an attached client never learned a wait was live at all, so its
+/// own `apply_event` had nothing to suppress the real `Idle` with and it
+/// read `Idle` while the daemon read `Working`.
 #[spec("wait/monitored/016")]
 #[test]
 #[cfg(unix)]
@@ -2491,4 +2503,216 @@ fn wait_monitored_022_unregister_pane_alone_does_not_drop_the_wait() {
          already inside this PR (added round 2, removed round 3) and was pinned by no test — \
          `013` calls both teardown methods together and passes either way"
     );
+}
+
+const PANE_023: &str = "wait-monitored-pane-023-direction-a-deferred-tail-b7e29d";
+const LABEL_023: &str = "wait-monitored-label-023-direction-a-deferred-tail";
+
+/// Scenario: the PRD's own headline flow (an agent runs `wait start` as a
+/// tool call, so the card is `Working` from a real `ToolStart`) plus a
+/// background shell descendant that is still busy when `wait done` lands.
+/// Reviewer BLOCKER I wedge 4a: `MonitoredWaitDone`'s Direction-A decline
+/// (it declines because `shell_descendant_busy` is live, same as `020`'s
+/// precondition) unconditionally clears `wait_deferred_revert` — the marker
+/// the agent's own suppressed `Idle` set — without transferring it to shell,
+/// so the paired `ShellIdle` that follows finds nothing still holding the
+/// card and also declines. Same failure class as `019`/`020`/`021`, but via
+/// the `wait_deferred_revert` marker those three never exercise together
+/// with a live `shell_descendant_busy` at the moment `wait done` runs.
+#[spec("wait/monitored/023")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/023 runtime")
+        .block_on(wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_023).await;
+    let session_id = format!("{PANE_023}-session");
+
+    // 1. ToolStart (the Bash call running `wait start`) — a REAL agent
+    // event, asserts Working; the trailing block clears all four markers.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&tool_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ToolStart,
+            Some("Bash"),
+        ))
+        .expect("serialize ToolStart event"),
+    )
+    .expect("write ToolStart event to the daemon hook socket");
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/023 (after ToolStart): {e}"));
+
+    // 2. ToolEnd — declines (status != WaitingForInput); no visible change.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&tool_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ToolEnd,
+            None,
+        ))
+        .expect("serialize ToolEnd event"),
+    )
+    .expect("write ToolEnd event to the daemon hook socket");
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/023 (after ToolEnd)",
+    )
+    .await;
+
+    // 3. `wait start` — MonitoredWaitStart lands on an already-Working card
+    // (not Idle/Unknown), so it declines to promote and
+    // wait_synthetic_working is never set.
+    let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_023], &[]).await;
+    assert!(
+        start.status.success(),
+        "wait/monitored/023: `wait start {LABEL_023}` must succeed; status={:?} stdout={:?} \
+         stderr={:?}",
+        start.status,
+        start.stdout,
+        start.stderr
+    );
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/023 (after wait start, declined promotion since already Working)",
+    )
+    .await;
+
+    // 4. The background shell watcher observes the descendant is busy —
+    // declines to promote (already Working); shell_descendant_busy = true
+    // unconditionally, shell_synthetic_working stays false (this mechanism
+    // did not cause the current Working, so it has no claim yet).
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&shell_activity_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ShellBusy,
+        ))
+        .expect("serialize synthetic ShellBusy event"),
+    )
+    .expect("write synthetic ShellBusy event to the daemon hook socket");
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/023 (after injected ShellBusy)",
+    )
+    .await;
+
+    // 5. The agent's own Stop-hook Idle arrives while the wait is still
+    // outstanding — suppressed (Direction C, correct), and because this
+    // Working was never the wait's own promotion, the suppression records
+    // wait_deferred_revert = true rather than wait_synthetic_working.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&idle_event(&pane.pane_id, &pane.agent_id, &session_id))
+            .expect("serialize real Idle event"),
+    )
+    .expect("write real Idle event to the daemon hook socket");
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/023 (after suppressed Idle, Direction C, wait_deferred_revert set)",
+    )
+    .await;
+
+    // 6. `wait done` — declines because shell_descendant_busy still holds
+    // the card up (Direction A, correct) — but BLOCKER I:
+    // MonitoredWaitDone unconditionally clears wait_deferred_revert on the
+    // way out without transferring it to shell, exactly as `020` showed for
+    // wait_synthetic_working.
+    let done = run_wait_cli(
+        &daemon,
+        &pane.pane_id,
+        &["done", LABEL_023, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done.status.success(),
+        "wait/monitored/023: `wait done {LABEL_023} --outcome success` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        done.status,
+        done.stdout,
+        done.stderr
+    );
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(500),
+        "wait/monitored/023 (after wait done, Direction A precondition)",
+    )
+    .await;
+
+    // 7. The paired ShellIdle arrives — the descendant it represents has
+    // genuinely finished, so OR composition requires the pane to revert now
+    // that neither signal is live. BLOCKER I: was_holding reads
+    // shell_synthetic_working == false (never set — step 6 never
+    // transferred wait_deferred_revert to it), so this also declines, and
+    // the pane is wedged Working forever with all four markers false.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&shell_activity_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ShellIdle,
+        ))
+        .expect("serialize synthetic ShellIdle event"),
+    )
+    .expect("write synthetic ShellIdle event to the daemon hook socket");
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "wait/monitored/023 (BLOCKER I wedge 4a, the PRD's headline flow plus a live shell \
+             descendant): the pane must revert to Idle once the wait was the last live signal \
+             standing — the agent's own real Idle was already suppressed into \
+             wait_deferred_revert at step 5, and the shell descendant genuinely went idle at \
+             step 7 — but `MonitoredWaitDone`'s Direction-A decline at step 6 unconditionally \
+             cleared wait_deferred_revert without transferring it to shell, so nothing was left \
+             for ShellIdle to find still holding the card, and the pane stays wedged Working \
+             forever: {e}"
+        )
+    });
+
+    daemon.registry.shutdown_all();
 }
