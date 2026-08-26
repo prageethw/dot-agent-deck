@@ -1495,8 +1495,12 @@ async fn run_shell_activity_monitor_with<S, F>(
     // always that is harmless (`descendant_shell_activity` returns `None` for a
     // pid the table lacks, so the pane is skipped), but under pid reuse a new
     // pane inherits a dead process's descendants and, because `last_known` has no
-    // entry for it yet, that wrong reading emits immediately. So a table older
-    // than `MAX_TABLE_AGE` is discarded rather than trusted.
+    // entry for it yet, that wrong reading emits immediately IF it reads busy.
+    // (PRD #499 round 2: a first-ever reading of `busy=false` is intentionally
+    // suppressed below — see the `None => busy` check — so this residual is
+    // now bounded to the busy-reads-busy case; it no longer applies to the
+    // idle side at all.) So a table older than `MAX_TABLE_AGE` is discarded
+    // rather than trusted.
     // Carries the candidate set as it was when the sample STARTED alongside it,
     // so a late answer can be checked against the panes it could actually have
     // observed rather than against whatever is open when it lands — see the
@@ -2054,10 +2058,23 @@ const MAX_WAIT_TTL_SECS: u64 = 6 * 60 * 60;
 /// `ShellBusy`/`ShellIdle` use, so the existing composition/precedence logic
 /// in `apply_event` governs both signals together — see the `ShellBusy`,
 /// `ShellIdle`, `MonitoredWaitStart` and `MonitoredWaitDone` match arms
-/// there. No new field was added to `SessionState`; the sweep (like `wait
-/// done`) reverts only the EXACT card `AppState::monitored_waits` recorded
-/// the wait against, and only when that card isn't independently held
-/// `Working` by live shell activity (`shell_synthetic_working`).
+/// there.
+///
+/// Round 3 (reviewer BLOCKER A / HIGH B / auditor B1 / B2): round 2's claim
+/// just above — "no new field was added to `SessionState`" — is what made
+/// this signal daemon-only: the composition it relied on
+/// (`AppState::monitored_waits`, a pane-keyed map) is never written by
+/// `apply_event`, so an attached client's own `AppState` never populated it
+/// and computed a different status from the identical event stream. Round 3
+/// DOES add fields — `SessionState::monitored_wait_active` /
+/// `wait_synthetic_working` / `shell_descendant_busy` — set and cleared by
+/// the match arms above, so every consumer of the broadcast stream
+/// (daemon and attached/reconnecting client alike) converges on the same
+/// composition. The sweep (like `wait done`) still reverts only the EXACT
+/// card `AppState::monitored_waits` recorded the wait against, and only
+/// when that card's own `wait_synthetic_working` says the wait is what
+/// asserted its `Working` AND `shell_descendant_busy` says live shell
+/// activity isn't independently holding it up.
 ///
 /// No internal shutdown signal — like `shell_activity_handle`, this task is
 /// torn down by `.abort()` in `run_daemon_with`'s cleanup.
@@ -2070,7 +2087,14 @@ async fn run_monitored_wait_sweep(state: SharedState, event_tx: broadcast::Sende
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        let events = state.write().await.sweep_expired_monitored_waits();
+        // Round 3 (reviewer MEDIUM E): hold the write guard across BOTH the
+        // sweep and the broadcast, exactly as `ingest_event`/`ingest_event_with_hook`
+        // do for every other event producer — a guard dropped between them
+        // (round 2's shape here) lets a same-tick `wait start`/`wait done`
+        // on another pane broadcast out of order relative to this sweep's
+        // events, stranding a client on the wrong side of a transition.
+        let mut guard = state.write().await;
+        let events = guard.sweep_expired_monitored_waits();
         // BLOCKER 1's fix extends to the self-heal path too: a TTL expiry
         // must reach an attached/reconnected client's own `AppState`, not
         // only the daemon's, so a dashboard that never saw an explicit
@@ -2391,10 +2415,15 @@ async fn run_hook_loop(
                                         "Received wait-start signal"
                                     );
                                     let ttl = Duration::from_secs(ttl_secs);
-                                    let event = state
-                                        .write()
-                                        .await
-                                        .start_monitored_wait(&signal.pane_id, label, ttl);
+                                    // Round 3 (reviewer MEDIUM E): hold the
+                                    // write guard across the broadcast too —
+                                    // see `run_monitored_wait_sweep`'s
+                                    // identical fix for why a dropped-then-
+                                    // reacquired guard can invert broadcast
+                                    // order between two wait transitions.
+                                    let mut guard = state.write().await;
+                                    let event =
+                                        guard.start_monitored_wait(&signal.pane_id, label, ttl);
                                     if let Some(event) = event {
                                         let _ = event_tx.send(BroadcastMsg::Event(event));
                                     }
@@ -2408,7 +2437,10 @@ async fn run_hook_loop(
                                         outcome = ?signal.outcome,
                                         "Received wait-done signal"
                                     );
-                                    let event = state.write().await.clear_monitored_wait(
+                                    // Round 3 (reviewer MEDIUM E): same fix as
+                                    // `WaitStart` above.
+                                    let mut guard = state.write().await;
+                                    let event = guard.clear_monitored_wait(
                                         &signal.pane_id,
                                         &label,
                                         signal.outcome,

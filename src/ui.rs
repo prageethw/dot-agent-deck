@@ -26799,6 +26799,9 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
             model: None,
             expects_agent_report: false,
         };
@@ -29974,6 +29977,9 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
             model: None,
             expects_agent_report: false,
         };
@@ -31955,6 +31961,9 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
             model: None,
             expects_agent_report: false,
         }
@@ -32475,6 +32484,9 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
             model: None,
             expects_agent_report: false,
         };
@@ -32513,6 +32525,9 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
             model: None,
             expects_agent_report: false,
         };
@@ -32542,6 +32557,9 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
             model: None,
             expects_agent_report: false,
         };

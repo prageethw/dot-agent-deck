@@ -4584,6 +4584,9 @@ mod tests {
                 last_user_prompt: Some("build the feature".into()),
                 live_target: None,
                 shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
                 model: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
@@ -4620,6 +4623,9 @@ mod tests {
                 last_user_prompt: None,
                 live_target: None,
                 shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
                 model: None,
             }),
             daemon_boot_id: None,
