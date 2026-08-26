@@ -10094,6 +10094,15 @@ mod tests {
 
     /// The happy path: the task file is written, and the worker gets the short
     /// pointer to it rather than the whole body.
+    ///
+    /// Issue #613: the pointer must be an ABSOLUTE path. A relative one is
+    /// resolved by the worker against ITS OWN process cwd, which the daemon
+    /// never verifies matches the `pane_cwd_map` belief this function was
+    /// given — when they diverge, a relative pointer can silently resolve to
+    /// an unrelated, pre-existing file instead of erroring. Confirmed to
+    /// catch the defect: against the pre-fix code, which returns a relative
+    /// `.dot-agent-deck/worker-task-coder.md` sentence, this test fails on
+    /// the `is_absolute()` assertion.
     #[test]
     fn resolve_delegate_task_body_points_at_the_file_it_wrote() {
         let cwd = tempfile::tempdir().expect("tempdir");
@@ -10106,16 +10115,32 @@ mod tests {
             None,
         );
 
-        assert_eq!(
-            body, "Read .dot-agent-deck/worker-task-coder.md for your task.",
-            "a successful write must delegate the one-line pointer, not the body"
+        let prefix = "Read ";
+        let suffix = " for your task.";
+        assert!(
+            body.starts_with(prefix) && body.ends_with(suffix),
+            "a successful write must delegate the one-line pointer sentence, not the body: {body}"
         );
-        let written = std::fs::read_to_string(
-            cwd.path()
-                .join(".dot-agent-deck")
-                .join("worker-task-coder.md"),
-        )
-        .expect("the pointer names a file that must exist");
+        let pointed_path = &body[prefix.len()..body.len() - suffix.len()];
+
+        assert!(
+            std::path::Path::new(pointed_path).is_absolute(),
+            "issue #613: the pointer must be an absolute path, or a worker \
+             whose process cwd has drifted from the daemon's pane_cwd_map \
+             belief resolves it against the wrong directory: {body}"
+        );
+        let file_name = std::path::Path::new(pointed_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(
+            file_name.starts_with("worker-task-coder") && file_name.ends_with(".md"),
+            "the pointer must name the task file the daemon actually wrote \
+             for the `coder` role: {body}"
+        );
+
+        let written = std::fs::read_to_string(pointed_path)
+            .expect("the pointer names a file that must exist");
         assert!(
             written.contains("Implement the thing."),
             "the file the pointer names must carry the task: {written}"
@@ -10151,8 +10176,10 @@ mod tests {
         );
 
         assert!(
-            !body.contains("Read .dot-agent-deck/worker-task-coder.md"),
-            "a failed write must never delegate a pointer to a file that is not there: {body}"
+            !body.starts_with("Read "),
+            "a failed write must never delegate a pointer sentence to a file \
+             that is not there, whatever the pointer's format (relative or, \
+             per issue #613, absolute): {body}"
         );
         assert!(
             body.contains("Implement the thing."),
@@ -10182,12 +10209,188 @@ mod tests {
         );
 
         assert!(
-            !body.contains("Read .dot-agent-deck/"),
-            "with no cwd there is nowhere to write, so no pointer may be sent: {body}"
+            !body.starts_with("Read "),
+            "with no cwd there is nowhere to write, so no pointer sentence \
+             may be sent, whatever the pointer's format (relative or, per \
+             issue #613, absolute): {body}"
         );
         assert!(
             body.contains("Implement the thing."),
             "the task body must be inlined: {body}"
+        );
+    }
+
+    /// Issue #613: pins the regression itself. The daemon's `pane_cwd_map`
+    /// belief about a pane's cwd can diverge from the worker's actual
+    /// process cwd (e.g. a cwd-less pane spawn silently inherits the
+    /// daemon's own cwd instead of the pane's intended one). A worker
+    /// resolves the delegate pointer against ITS OWN cwd, so a relative
+    /// pointer that happens to name a path where an unrelated file already
+    /// exists is silently read as the task — this produced three real
+    /// reviewer/auditor reports on an already-merged, unrelated PRD (see
+    /// issue #613's body). This test builds exactly that mismatch by hand —
+    /// a "daemon-believed" cwd distinct from a "worker's real, drifted"
+    /// cwd carrying a decoy file — then resolves the returned pointer the
+    /// way a real file-read tool would: used as-is if absolute, joined
+    /// against the worker's own cwd if relative.
+    ///
+    /// Confirmed to catch the defect: against the pre-fix code, which
+    /// returns a relative pointer, the naive resolution below lands on the
+    /// planted decoy and this test fails.
+    #[test]
+    fn resolve_delegate_task_body_pointer_survives_a_worker_cwd_mismatch() {
+        let daemon_believed_cwd = tempfile::tempdir().expect("tempdir");
+        let worker_real_cwd = tempfile::tempdir().expect("tempdir");
+
+        // Plant a decoy exactly where a NAIVE relative resolution would land:
+        // the worker's real (drifted) cwd, not the daemon-believed one.
+        let decoy_dir = worker_real_cwd.path().join(".dot-agent-deck");
+        std::fs::create_dir_all(&decoy_dir).expect("create decoy dir");
+        std::fs::write(
+            decoy_dir.join("worker-task-reviewer.md"),
+            "STALE TASK FROM AN ALREADY-MERGED PRD — must never be read",
+        )
+        .expect("plant decoy task file");
+
+        let body = resolve_delegate_task_body(
+            Some(daemon_believed_cwd.path().to_str().expect("utf8 cwd")),
+            Some("You are reviewer."),
+            "Review PRD #613's own fix.",
+            "reviewer",
+            "pane-real-1",
+            None,
+        );
+
+        let prefix = "Read ";
+        let suffix = " for your task.";
+        assert!(
+            body.starts_with(prefix) && body.ends_with(suffix),
+            "delegate body must be the one-line pointer sentence: {body}"
+        );
+        let pointer = &body[prefix.len()..body.len() - suffix.len()];
+
+        assert!(
+            std::path::Path::new(pointer).is_absolute(),
+            "issue #613: an absolute pointer can never be naively re-resolved \
+             against the wrong (drifted) cwd, which is the whole fix — a \
+             relative pointer here is exactly what let a worker silently \
+             read the decoy: {body}"
+        );
+
+        // Simulate a worker naively resolving the pointer exactly as a real
+        // file-read tool would: absolute paths are used as-is, relative ones
+        // are joined against the worker's OWN (possibly drifted) cwd.
+        let resolved = if std::path::Path::new(pointer).is_absolute() {
+            std::path::PathBuf::from(pointer)
+        } else {
+            worker_real_cwd.path().join(pointer)
+        };
+        let content = std::fs::read_to_string(&resolved).unwrap_or_else(|e| {
+            panic!("worker's naive resolution of {pointer:?} -> {resolved:?} failed: {e}")
+        });
+
+        assert!(
+            content.contains("Review PRD #613's own fix."),
+            "the worker must read the REAL task the daemon wrote, not the \
+             stale decoy sitting in its own drifted cwd: {content}"
+        );
+        assert!(
+            !content.contains("STALE TASK FROM AN ALREADY-MERGED PRD"),
+            "the worker must never silently read the decoy: {content}"
+        );
+    }
+
+    /// Issue #613 (part 2 — not yet implemented): the delegate task filename
+    /// must be keyed by pane identity as well as role, mirroring
+    /// [`work_done_file_name`]/[`pane_digest_hex`] on the report leg —
+    /// otherwise two panes running the same role collide on the same
+    /// filename exactly as the report leg used to (upstream #331 + fork
+    /// #76) before that fix.
+    ///
+    /// Expected RED signature: a COMPILE ERROR (`delegate_task_file_name`
+    /// does not exist yet), not a runtime assertion failure. That is
+    /// correct and expected for this test until coder adds the function.
+    #[test]
+    fn delegate_task_file_name_is_keyed_by_pane_not_role_alone() {
+        let a = delegate_task_file_name("reviewer", "pane-aaaa-0");
+        let b = delegate_task_file_name("reviewer", "pane-bbbb-0");
+        assert_ne!(
+            a, b,
+            "two different panes running the same role must get two \
+             different task filenames, or a second delegate silently \
+             collides with the first pane's still-unread task file"
+        );
+    }
+
+    /// Issue #613 (part 3 — not yet implemented): two panes delegating the
+    /// SAME role in the SAME cwd (two concurrent orchestrations, or one
+    /// worker re-delegated within the same run) must not collide on the
+    /// same task file — each pane's own file must exist afterward with its
+    /// own content intact, not overwritten by the other pane's delegate.
+    ///
+    /// Depends on the not-yet-existing pane-keyed filename
+    /// ([`delegate_task_file_name`]), so — like the test above — the
+    /// expected RED signature here is a COMPILE ERROR, not a runtime
+    /// assertion failure, until coder's fix lands.
+    #[test]
+    fn resolve_delegate_task_body_two_panes_same_role_same_cwd_do_not_collide() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cwd_str = cwd.path().to_str().expect("utf8 cwd");
+
+        let body_a = resolve_delegate_task_body(
+            Some(cwd_str),
+            Some("You are reviewer."),
+            "Review PR #100.",
+            "reviewer",
+            "pane-aaaa-0",
+            None,
+        );
+        let body_b = resolve_delegate_task_body(
+            Some(cwd_str),
+            Some("You are reviewer."),
+            "Review PR #200.",
+            "reviewer",
+            "pane-bbbb-0",
+            None,
+        );
+
+        let file_a = cwd
+            .path()
+            .join(".dot-agent-deck")
+            .join(delegate_task_file_name("reviewer", "pane-aaaa-0"));
+        let file_b = cwd
+            .path()
+            .join(".dot-agent-deck")
+            .join(delegate_task_file_name("reviewer", "pane-bbbb-0"));
+
+        assert_ne!(
+            file_a, file_b,
+            "two different panes must be assigned two different task files"
+        );
+
+        let content_a =
+            std::fs::read_to_string(&file_a).expect("pane A's own task file must exist");
+        let content_b =
+            std::fs::read_to_string(&file_b).expect("pane B's own task file must exist");
+
+        assert!(
+            content_a.contains("Review PR #100.") && !content_a.contains("Review PR #200."),
+            "pane A's task file must keep pane A's own content, not be \
+             overwritten by pane B's delegate: {content_a}"
+        );
+        assert!(
+            content_b.contains("Review PR #200.") && !content_b.contains("Review PR #100."),
+            "pane B's task file must keep pane B's own content, not be \
+             overwritten by pane A's delegate: {content_b}"
+        );
+
+        assert!(
+            body_a.contains(file_a.to_str().expect("utf8 path")),
+            "pane A's pointer must name pane A's own file: {body_a}"
+        );
+        assert!(
+            body_b.contains(file_b.to_str().expect("utf8 path")),
+            "pane B's pointer must name pane B's own file: {body_b}"
         );
     }
 
