@@ -132,6 +132,38 @@ fn shell_activity_event(
     }
 }
 
+/// A synthetic `ToolStart`/`ToolEnd` `AgentEvent`, shaped the way a real
+/// agent hook would send one over the hook socket — used by the BLOCKER H
+/// wedge tests (`019`-`021`) to drive a REAL, agent-emitted assertion of
+/// `Working` ahead of the wait/shell composition under test, as opposed to
+/// `MonitoredWaitStart`'s own synthetic promotion.
+#[cfg(unix)]
+fn tool_event(
+    pane_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    event_type: EventType,
+    tool_name: Option<&str>,
+) -> AgentEvent {
+    AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type,
+        tool_name: tool_name.map(str::to_string),
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    }
+}
+
 /// A raw hook-shaped `AgentEvent` for driving `AppState::apply_event`
 /// directly (mirrors `tests/card_supersession.rs`'s own `event` helper) —
 /// used by the respawn/teardown tests below, which target `AppState`'s
@@ -1153,9 +1185,11 @@ const TEARDOWN_LABEL: &str = "wait-monitored-label-013-teardown";
 /// (`remove_sessions_for_pane` + `unregister_pane`, the same pair
 /// `src/ui.rs` calls together on a real pane close) BEFORE the wait is
 /// cleared or expires. The `monitored_waits` entry must not survive the
-/// teardown: today neither method touches it, so it persists in memory
-/// (bounded only by the TTL sweep) rather than being cleaned up eagerly at
-/// the point the pane genuinely stops existing, as both findings recommend.
+/// teardown: `remove_sessions_for_pane` provably drops it — it takes every
+/// card the pane could have carried down with it (round 3, auditor B3) —
+/// while `unregister_pane` ALONE deliberately does not, since that method's
+/// card can survive it (see `wait/monitored/022`, the sibling regression
+/// guard auditor C2 asked for).
 #[spec("wait/monitored/013")]
 #[test]
 #[cfg(unix)]
@@ -1190,9 +1224,9 @@ fn wait_monitored_013_teardown_clears_the_panes_monitored_wait() {
     assert!(
         !state.monitored_waits.contains_key(TEARDOWN_PANE_ID),
         "wait/monitored/013 (MEDIUM 6 / A4): a torn-down pane's monitored wait must not survive \
-         the teardown — neither `remove_sessions_for_pane` nor `unregister_pane` currently drops \
-         the `monitored_waits` entry, so it lingers in memory (bounded only by the TTL sweep) \
-         rather than being cleaned up at the point the pane genuinely stops existing"
+         the teardown — `remove_sessions_for_pane` provably takes every card the pane could \
+         have carried down with it, including the one this wait was recorded against, so the \
+         `monitored_waits` entry must not remain once both teardown methods have run"
     );
 }
 
@@ -1954,5 +1988,507 @@ fn wait_monitored_018_same_card_real_tool_start_survives_wait_done() {
          done` — reverting because a monitored wait was merely once involved (round 2's \
          `!shell_synthetic_working` guard) would clobber genuine, real-agent activity that has \
          nothing to do with the wait any more"
+    );
+}
+
+const PANE_019: &str = "wait-monitored-pane-019-headline-tool-52e9f4";
+const LABEL_019: &str = "wait-monitored-label-019-headline-tool";
+
+/// Scenario: run the PRD's own headline flow verbatim — an agent runs `wait
+/// start` AS A TOOL CALL, so the card is already `Working` from a real
+/// `ToolStart` (not `Idle`/`Unknown`) by the time `MonitoredWaitStart`
+/// lands; the matching `ToolEnd` follows, then the agent's own Stop-hook
+/// `Idle` arrives and is correctly suppressed while the wait is outstanding
+/// (Direction C), and finally `wait done` is called. Reviewer BLOCKER H
+/// wedge 1: `wait_synthetic_working` only gets set inside
+/// `MonitoredWaitStart`'s `promotable` branch, which never fires here — so
+/// `wait done` declines to revert and the pane is wedged `Working` forever,
+/// with the agent's own real `Idle` already swallowed by the suppression.
+#[spec("wait/monitored/019")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/019 runtime")
+        .block_on(wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_019_wait_declared_on_working_card_can_still_be_reverted_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_019).await;
+    let session_id = format!("{PANE_019}-session");
+
+    // 1. ToolStart (the Bash call running `wait start`) — a REAL agent
+    // event, asserts Working.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&tool_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ToolStart,
+            Some("Bash"),
+        ))
+        .expect("serialize ToolStart event"),
+    )
+    .expect("write ToolStart event to the daemon hook socket");
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/019 (after ToolStart): {e}"));
+
+    // 2. ToolEnd — declines (status != WaitingForInput); no visible change.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&tool_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ToolEnd,
+            None,
+        ))
+        .expect("serialize ToolEnd event"),
+    )
+    .expect("write ToolEnd event to the daemon hook socket");
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/019 (after ToolEnd)",
+    )
+    .await;
+
+    // 3. `wait start` — MonitoredWaitStart lands on an already-Working card
+    // (not Idle/Unknown), so it declines to promote and
+    // `wait_synthetic_working` is never set.
+    let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_019], &[]).await;
+    assert!(
+        start.status.success(),
+        "wait/monitored/019: `wait start {LABEL_019}` must succeed; status={:?} stdout={:?} \
+         stderr={:?}",
+        start.status,
+        start.stdout,
+        start.stderr
+    );
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/019 (after wait start, declined promotion since already Working)",
+    )
+    .await;
+
+    // 4. The agent's own Stop-hook Idle arrives while the wait is
+    // outstanding — correctly suppressed (Direction C), swallowed for good.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&idle_event(&pane.pane_id, &pane.agent_id, &session_id))
+            .expect("serialize real Idle event"),
+    )
+    .expect("write real Idle event to the daemon hook socket");
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/019 (after suppressed Idle, Direction C)",
+    )
+    .await;
+
+    // 5. `wait done` — the wait is now the ONLY live signal that was ever
+    // standing (the agent's own Idle is already gone), so the pane must
+    // revert. BLOCKER H wedge 1: it never does, because
+    // `wait_synthetic_working` was never set at step 3.
+    let done = run_wait_cli(
+        &daemon,
+        &pane.pane_id,
+        &["done", LABEL_019, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done.status.success(),
+        "wait/monitored/019: `wait done {LABEL_019} --outcome success` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        done.status,
+        done.stdout,
+        done.stderr
+    );
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "wait/monitored/019 (BLOCKER H wedge 1, the PRD's own headline flow): pane must \
+             revert to Idle after `wait done` once the wait was the last live signal standing — \
+             the agent's own real Idle was already suppressed and swallowed at step 4 — but the \
+             pane stays wedged Working forever: {e}"
+        )
+    });
+
+    daemon.registry.shutdown_all();
+}
+
+const PANE_020: &str = "wait-monitored-pane-020-direction-a-tail-6d1c83";
+const LABEL_020: &str = "wait-monitored-label-020-direction-a-tail";
+
+/// Scenario: extend `wait/monitored/011`'s own sequence past the point it
+/// stops — `wait start` promotes an idle pane to `Working`, an injected
+/// `ShellBusy` holds it up (declines to promote since already `Working`),
+/// `wait done` declines because `shell_descendant_busy` is still set
+/// (Direction A, same precondition `011` asserts) — and THEN, unlike `011`,
+/// the paired `ShellIdle` arrives. Reviewer BLOCKER H wedge 2:
+/// `MonitoredWaitDone` unconditionally clears `wait_synthetic_working` on
+/// its way out even when it declined, so by the time `ShellIdle` arrives
+/// neither marker was ever transferred to shell — `was_holding` reads
+/// `shell_synthetic_working == false` (never set, since `ShellBusy` only
+/// promotes a stale/no-opinion status) and declines too, wedging the pane
+/// `Working` forever.
+#[spec("wait/monitored/020")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_020_direction_a_tail_shell_idle_still_reverts() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/020 runtime")
+        .block_on(wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_020).await;
+    let session_id = format!("{PANE_020}-session");
+
+    // 1. `wait start` on an Idle pane — MonitoredWaitStart promotes:
+    // status = Working, wait_synthetic_working = true.
+    let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_020], &[]).await;
+    assert!(
+        start.status.success(),
+        "wait/monitored/020: `wait start {LABEL_020}` must succeed; status={:?} stdout={:?} \
+         stderr={:?}",
+        start.status,
+        start.stdout,
+        start.stderr
+    );
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/020 (after wait start): {e}"));
+
+    // 2. Injected ShellBusy — declines to promote (already Working);
+    // shell_descendant_busy = true unconditionally, shell_synthetic_working
+    // stays false (this mechanism did not cause the current Working).
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&shell_activity_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ShellBusy,
+        ))
+        .expect("serialize synthetic ShellBusy event"),
+    )
+    .expect("write synthetic ShellBusy event to the daemon hook socket");
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/020 (after injected ShellBusy)",
+    )
+    .await;
+
+    // 3. `wait done` — declines because shell_descendant_busy still holds
+    // the card up (Direction A, correct) — but unconditionally clears
+    // wait_synthetic_working on the way out, same as `011` stops at.
+    let done = run_wait_cli(
+        &daemon,
+        &pane.pane_id,
+        &["done", LABEL_020, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done.status.success(),
+        "wait/monitored/020: `wait done {LABEL_020} --outcome success` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        done.status,
+        done.stdout,
+        done.stderr
+    );
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(500),
+        "wait/monitored/020 (after wait done, Direction A precondition — matches `011`)",
+    )
+    .await;
+
+    // 4. The paired ShellIdle arrives — the event `011` never sends. The
+    // descendant it represents has genuinely finished, so OR composition
+    // requires the pane to revert now that neither signal is live. BLOCKER
+    // H wedge 2: `was_holding` reads shell_synthetic_working == false (it
+    // was never set at step 2), so this also declines, and the pane is
+    // wedged Working forever with all four markers false.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&shell_activity_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ShellIdle,
+        ))
+        .expect("serialize synthetic ShellIdle event"),
+    )
+    .expect("write synthetic ShellIdle event to the daemon hook socket");
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "wait/monitored/020 (BLOCKER H wedge 2, Direction A's tail — extends `011` past the \
+             ShellIdle it stops before): the pane must revert to Idle once the shell descendant \
+             `011` leaves busy has genuinely gone idle and the wait already cleared — but \
+             `MonitoredWaitDone`'s unconditional clear of `wait_synthetic_working` at step 3 \
+             left nothing for `ShellIdle` to find still holding the card, so it declines too and \
+             the pane stays wedged Working forever: {e}"
+        )
+    });
+
+    daemon.registry.shutdown_all();
+}
+
+const PANE_021: &str = "wait-monitored-pane-021-direction-b-tail-9a4e27";
+const LABEL_021: &str = "wait-monitored-label-021-direction-b-tail";
+
+/// Scenario: the mirror of `wait/monitored/020` — `ShellBusy` promotes an
+/// idle pane to `Working` first (`shell_synthetic_working = true`), `wait
+/// start` lands on the already-Working card and declines to promote
+/// (`wait_synthetic_working` stays false), then the paired `ShellIdle`
+/// arrives while the wait is still outstanding and correctly declines to
+/// revert (Direction B) — but reviewer BLOCKER H wedge 3: `ShellIdle`
+/// unconditionally clears `shell_synthetic_working` on its way out
+/// regardless of whether it actually reverted, so by the time `wait done`
+/// runs neither marker was ever transferred to the wait, and it declines
+/// too, wedging the pane `Working` forever.
+#[spec("wait/monitored/021")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_021_direction_b_tail_wait_done_still_reverts() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/021 runtime")
+        .block_on(wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_021).await;
+    let session_id = format!("{PANE_021}-session");
+
+    // 1. Injected ShellBusy on the Idle pane — promotes: status = Working,
+    // shell_synthetic_working = true, shell_descendant_busy = true.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&shell_activity_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ShellBusy,
+        ))
+        .expect("serialize synthetic ShellBusy event"),
+    )
+    .expect("write synthetic ShellBusy event to the daemon hook socket");
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/021 (after injected ShellBusy): {e}"));
+
+    // 2. `wait start` — MonitoredWaitStart lands on an already-Working card
+    // (not Idle/Unknown), so it declines to promote and
+    // wait_synthetic_working is never set.
+    let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_021], &[]).await;
+    assert!(
+        start.status.success(),
+        "wait/monitored/021: `wait start {LABEL_021}` must succeed; status={:?} stdout={:?} \
+         stderr={:?}",
+        start.status,
+        start.stdout,
+        start.stderr
+    );
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/021 (after wait start, declined promotion since already Working)",
+    )
+    .await;
+
+    // 3. The paired ShellIdle arrives while the wait is still outstanding —
+    // was_holding is true (shell_synthetic_working was set at step 1), but
+    // monitored_wait_active suppresses the revert (Direction B, correct) —
+    // yet it still unconditionally clears shell_synthetic_working AND
+    // shell_descendant_busy on the way out.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&shell_activity_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ShellIdle,
+        ))
+        .expect("serialize synthetic ShellIdle event"),
+    )
+    .expect("write synthetic ShellIdle event to the daemon hook socket");
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/021 (after suppressed ShellIdle, Direction B)",
+    )
+    .await;
+
+    // 4. `wait done` — the wait is now the ONLY live signal that was ever
+    // standing (shell's own claim was cleared at step 3 despite declining
+    // to revert). BLOCKER H wedge 3: it never reverts, because
+    // wait_synthetic_working was never set at step 2.
+    let done = run_wait_cli(
+        &daemon,
+        &pane.pane_id,
+        &["done", LABEL_021, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done.status.success(),
+        "wait/monitored/021: `wait done {LABEL_021} --outcome success` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        done.status,
+        done.stdout,
+        done.stderr
+    );
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "wait/monitored/021 (BLOCKER H wedge 3, Direction B's tail — the mirror of wedge 2): \
+             the pane must revert to Idle after `wait done` once the wait was the last live \
+             signal standing — but ShellIdle's unconditional clear of shell_synthetic_working at \
+             step 3 left nothing for `wait done` to find, so it declines too and the pane stays \
+             wedged Working forever: {e}"
+        )
+    });
+
+    daemon.registry.shutdown_all();
+}
+
+const UNREGISTER_ONLY_PANE_ID: &str = "wait-monitored-pane-022-unregister-only-7c2b48";
+const UNREGISTER_ONLY_LABEL: &str = "wait-monitored-label-022-unregister-only";
+
+/// Scenario: pin auditor C2 directly against `AppState`, sibling to `013`.
+/// A pane with an active monitored wait is torn down with `unregister_pane`
+/// ALONE — never `remove_sessions_for_pane` — the shape the daemon's own
+/// `StopAgent` handler actually uses, where the card can survive the call.
+/// Round 3's B3 fix (the eager `monitored_waits.remove` was pulled OUT of
+/// `unregister_pane` specifically because this method's card can survive
+/// it) is pinned by no existing test: `013` calls both teardown methods
+/// together, so it passes whether or not `unregister_pane` alone still
+/// drops the entry. Assert the card AND the `monitored_waits` entry both
+/// survive `unregister_pane` alone, so a future regression re-adding the
+/// eager removal there fails this test rather than going green.
+#[spec("wait/monitored/022")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_022_unregister_pane_alone_does_not_drop_the_wait() {
+    let t0 = chrono::Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(UNREGISTER_ONLY_PANE_ID.to_string());
+    state.apply_event(card_event(
+        UNREGISTER_ONLY_PANE_ID,
+        "unregister-only-session",
+        "unregister-only-agent",
+        EventType::SessionStart,
+        None,
+        t0,
+    ));
+    state.start_monitored_wait(
+        UNREGISTER_ONLY_PANE_ID,
+        UNREGISTER_ONLY_LABEL.to_string(),
+        Duration::from_secs(300),
+    );
+    assert!(
+        state.monitored_waits.contains_key(UNREGISTER_ONLY_PANE_ID),
+        "precondition: `wait start` records a monitored wait for the pane"
+    );
+    assert!(
+        state.sessions.contains_key("unregister-only-session"),
+        "precondition: the card exists"
+    );
+
+    // `unregister_pane` ALONE — not `remove_sessions_for_pane` — the shape
+    // that can leave the card standing.
+    state.unregister_pane(UNREGISTER_ONLY_PANE_ID);
+
+    assert!(
+        state.sessions.contains_key("unregister-only-session"),
+        "precondition check: `unregister_pane` alone must not touch `sessions` — if this fails, \
+         the test fixture itself is wrong, not the assertion below"
+    );
+    assert!(
+        state.monitored_waits.contains_key(UNREGISTER_ONLY_PANE_ID),
+        "wait/monitored/022 (auditor C2): `unregister_pane` ALONE must NOT eagerly drop the \
+         pane's `monitored_waits` entry — the card it was recorded against can survive this \
+         call (it is not paired with `remove_sessions_for_pane` at every call site, including \
+         the daemon's own `StopAgent` handler), and dropping the entry here removes the ONLY \
+         thing that could still heal that surviving card via the TTL sweep. This regressed once \
+         already inside this PR (added round 2, removed round 3) and was pinned by no test — \
+         `013` calls both teardown methods together and passes either way"
     );
 }
