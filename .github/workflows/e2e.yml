@@ -231,16 +231,22 @@ jobs:
       # them. A test that shows up in that table run after run is a test that is
       # always retrying — treat it as broken and file it.
       #
-      # Deliberately still BARE, unlike ci.yml's three jobs (fork #180): this
-      # job runs on the same Linux runner as ci.yml's `build`, which now
-      # covers the `xtask/*` workspace members with `cargo nextest run
-      # --workspace`. None of those members declare an `e2e` feature or gate
-      # any test behind one, so widening this invocation to `--workspace`
-      # would re-run the same xtask tests a second time on the same OS for no
-      # new coverage, in the one tier that is already the most expensive
-      # (9-12 min) and `continue-on-error: true`. Revisit only if a workspace
-      # member ever grows its own `e2e`-gated tests.
-      - run: cargo nextest run --features e2e --retries 2
+      # `--workspace` (issue #606): matches `.cargo/config.toml`'s `test-e2e`
+      # alias (`nextest run --workspace --features e2e`) exactly, the same
+      # flag-completeness reasoning as ci.yml's `build` job (rule 2's clippy
+      # widening, rule 5's `--workspace` on both nextest aliases). This job
+      # previously ran bare on the theory that ci.yml's `build` already covers
+      # `xtask/*` via its own `cargo nextest run --workspace` (no `e2e`
+      # feature) and no workspace member gates any test behind `e2e`, so
+      # adding it here re-runs the same xtask tests a second time for no new
+      # coverage today. That is still true — the xtask tests here are pure
+      # redundancy, and cheap: rule 5 measured the whole added set at ~0.07s
+      # wall. What bare invocation actually risked: if a workspace member ever
+      # grows its own `e2e`-gated test, this job would silently not run it
+      # unless someone remembered to come back and add the flag here — the
+      # exact kind of drift `--workspace` closes everywhere else it was added.
+      # Matching the alias means that never has to be remembered again.
+      - run: cargo nextest run --workspace --features e2e --retries 2
         env:
           # Fork issue #224: every e2e panic previously pinned the shared
           # `pane_box_left_edge` helper's line, not the call site, because
