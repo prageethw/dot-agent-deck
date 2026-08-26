@@ -1228,15 +1228,43 @@ fn cwd_matches(form_cwd: &Path, candidate: &str) -> bool {
 /// directory whenever this runs interactively, the true toplevel (when one
 /// exists) is always a plain PATH-STRING ancestor of it — nothing about
 /// `resolve_git_toplevel` ever introduces a component `form_cwd` doesn't
-/// already have (barring a symlinked ancestor, the narrower round-3/4
-/// guard gap reviewer B1 notes as not separately covered here). So rather
-/// than ask git WHICH ancestor is the toplevel, try every ancestor as a
-/// CANDIDATE toplevel and see whether it reproduces the reported
-/// `live_cwd` — this needs no subprocess and no filesystem access at all
-/// (`Path::ancestors`/`strip_prefix`/`resolve_workspace_path` are pure
-/// string/path operations), so there is nothing left to memoize per form:
-/// N4's "costs nothing, no filesystem" invariant holds outright rather
-/// than needing a cached subprocess result.
+/// already have. So rather than ask git WHICH ancestor is the toplevel, try
+/// every ancestor as a CANDIDATE toplevel and see whether it reproduces the
+/// reported `live_cwd`. The ancestor scan itself
+/// (`Path::ancestors`/`strip_prefix`/`resolve_workspace_path`) is pure
+/// string/path operations with no subprocess and no filesystem access, so
+/// there is nothing to memoize for that half.
+///
+/// PRD fork#603 reviewer N2 (doc correction): the function as a WHOLE does
+/// not hold N4's "costs nothing, no filesystem" invariant outright, as an
+/// earlier version of this comment claimed — its first line calls
+/// [`cwd_matches`], which canonicalizes up to twice per candidate, and F1's
+/// fix below adds a second, canonicalizing ancestor-scan pass of its own.
+/// The cost stays bounded rather than unbounded: [`NewPaneFormState::name_collision`]
+/// short-circuits on `name == t` before ever calling this function, and
+/// [`NewPaneFormState::suggest_orchestration_name`] runs on selection
+/// change rather than per rendered frame — so this is a doc-accuracy
+/// correction, not a perf regression.
+///
+/// PRD fork#603 reviewer F1 (fixed): a raw path-string ancestor scan alone
+/// misses two real cases, both under-refusals — a wrong "already held"
+/// error where a working second orchestration should have opened. First,
+/// git's real toplevel can be textually NOT an ancestor of `form_cwd`'s raw
+/// spelling whenever a workspace root is itself a symlink (macOS resolving
+/// `/tmp` to `/private/tmp`, `~/work -> /Volumes/data/work`) — `git
+/// rev-parse --show-toplevel` resolves symlinks, the picked directory does
+/// not. Second, the round-3/4 symlink guard's output can never be
+/// reproduced by the raw scan at all: when it fires, it drops the relative
+/// subpath entirely (`parent(toplevel)/(base(toplevel)-segment)`, no
+/// trailing component), while the raw scan always rejoins a non-empty `rel`
+/// for any proper ancestor, so its candidates always carry one path
+/// component more than what the guard actually produces. The fix re-runs
+/// the identical scan a second time over `std::fs::canonicalize(form_cwd)`
+/// when it succeeds and differs from the raw path: canonicalizing lines up
+/// `form_cwd`'s ancestor chain with git's canonical toplevel for the first
+/// case, and collapses a guard-detected symlink directory to the toplevel
+/// itself for the second (making the ancestor `form_cwd`, `rel` empty,
+/// matching the guard's own output without reimplementing it).
 ///
 /// PRD fork#603 reviewer M3 (documented, not fixed — low impact): `segment`
 /// above is `sanitize_workspace_segment(live_name)`, where `live_name` is a
@@ -1258,14 +1286,30 @@ fn live_orchestration_occupies(form_cwd: &Path, live_cwd: &str, live_name: &str)
     }
     let segment = sanitize_workspace_segment(live_name);
     let live_cwd_path = Path::new(live_cwd);
-    form_cwd.ancestors().any(|ancestor| {
-        let candidate = resolve_workspace_path(ancestor, &segment);
-        let candidate = match form_cwd.strip_prefix(ancestor) {
-            Ok(rel) if !rel.as_os_str().is_empty() => candidate.join(rel),
-            _ => candidate,
-        };
-        candidate == live_cwd_path
-    })
+    let scan = |scan_cwd: &Path| {
+        scan_cwd.ancestors().any(|ancestor| {
+            let candidate = resolve_workspace_path(ancestor, &segment);
+            let candidate = match scan_cwd.strip_prefix(ancestor) {
+                Ok(rel) if !rel.as_os_str().is_empty() => candidate.join(rel),
+                _ => candidate,
+            };
+            candidate == live_cwd_path
+        })
+    };
+    if scan(form_cwd) {
+        return true;
+    }
+    // PRD fork#603 reviewer F1: `form_cwd`'s raw spelling is not always a
+    // path-string ancestor of git's real toplevel — a resolved symlink
+    // (`/tmp` -> `/private/tmp` on macOS, a symlinked workspace root) or a
+    // picked directory the round-3/4 symlink guard collapsed to the
+    // toplevel itself both diverge from the pure string scan above. Re-run
+    // the identical scan over the canonicalized path so both cases line up
+    // with what the real spawn path (and the guard) actually produced.
+    match std::fs::canonicalize(form_cwd) {
+        Ok(canonical) if canonical != form_cwd => scan(&canonical),
+        _ => false,
+    }
 }
 
 /// PRD #140 M4.0 / fork#192 M1.0: directories that currently host a live
@@ -11733,11 +11777,28 @@ fn dispatch_action(
                     }
                     let orchestration_claim_cwd =
                         orchestration_claim_cwd_path.display().to_string();
+                    // PRD fork#603 reviewer F4: S1's daemon-side validator
+                    // (`is_valid_orchestration_cwd`) correctly refuses a
+                    // `cwd` carrying an ASCII control character — a
+                    // directory name containing e.g. a newline is legal on
+                    // Unix and this codebase already supports it elsewhere
+                    // (`resolve_git_toplevel_survives_a_newline_in_an_ancestor_directory_name`).
+                    // Sending the derived claim `cwd` unconditionally turns
+                    // that legal path into a hard refusal of the whole
+                    // open. Degrade to the pre-#603 wildcard semantics
+                    // (`cwd: None`) instead of failing outright — this can
+                    // only over-refuse a same-named claim from a genuinely
+                    // different directory, never silently corrupt anything,
+                    // and it restores the "used to work" behavior for this
+                    // directory rather than hard-failing it.
+                    let orchestration_claim_cwd_for_request =
+                        crate::agent_pty::is_valid_orchestration_cwd(&orchestration_claim_cwd)
+                            .then_some(orchestration_claim_cwd);
                     let claim_result = send_daemon_request_blocking_with_timeout(
                         &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
                             name: orchestration_claim_name.clone(),
                             token: orchestration_claim_token.clone(),
-                            cwd: Some(orchestration_claim_cwd),
+                            cwd: orchestration_claim_cwd_for_request,
                         },
                         DAEMON_REQUEST_TIMEOUT,
                     );
@@ -14514,17 +14575,16 @@ pub fn run_tui(
                                     .canonicalize()
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_else(|_| saved_pane.dir.clone());
-                                let restore_claimed = matches!(
-                                    send_daemon_request_blocking_with_timeout(
-                                        &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
-                                            name: restore_claim_name.clone(),
-                                            token: restore_claim_token.clone(),
-                                            cwd: Some(restore_claim_cwd),
-                                        },
-                                        DAEMON_REQUEST_TIMEOUT,
-                                    ),
-                                    Ok(ref resp) if resp.ok
+                                let restore_claim_result = send_daemon_request_blocking_with_timeout(
+                                    &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
+                                        name: restore_claim_name.clone(),
+                                        token: restore_claim_token.clone(),
+                                        cwd: Some(restore_claim_cwd),
+                                    },
+                                    DAEMON_REQUEST_TIMEOUT,
                                 );
+                                let restore_claimed =
+                                    matches!(restore_claim_result, Ok(ref resp) if resp.ok);
                                 if restore_claimed {
                                     let restore_confirmed = matches!(
                                         send_daemon_request_blocking_with_timeout(
@@ -14540,9 +14600,28 @@ pub fn run_tui(
                                         release_orchestration_claim_token(&restore_claim_token);
                                     }
                                 } else {
+                                    // PRD fork#603 reviewer N3: this used to
+                                    // hardcode "another live orchestration
+                                    // already holds it" for every failure,
+                                    // which overclaims the cause for F4's
+                                    // invalid-cwd rejection and for a
+                                    // transport error — neither is "another
+                                    // live orchestration". Surface the
+                                    // daemon's own reason (or the transport
+                                    // error) instead, mirroring the
+                                    // live-spawn claim's reason handling.
+                                    let reason = match restore_claim_result {
+                                        Ok(resp) => resp.error.unwrap_or_else(|| {
+                                            "another live orchestration already holds it"
+                                                .to_string()
+                                        }),
+                                        Err(e) => format!(
+                                            "could not verify orchestration name availability: {e}"
+                                        ),
+                                    };
                                     ui.session_warnings.push(format!(
                                         "Warning: could not claim orchestration name {restore_claim_name:?} \
-                                         while restoring '{}' — another live orchestration already holds it",
+                                         while restoring '{}' — {reason}",
                                         saved_pane.name
                                     ));
                                 }
