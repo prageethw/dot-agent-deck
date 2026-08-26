@@ -3294,6 +3294,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,
+        wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
     };

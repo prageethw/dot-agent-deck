@@ -2089,6 +2089,7 @@ mod tests {
                 monitored_wait_active: false,
                 wait_synthetic_working: false,
                 shell_descendant_busy: false,
+                wait_deferred_revert: false,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is

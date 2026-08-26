@@ -1891,6 +1891,23 @@ pub fn work_done_file_name(role: &str, pane_id: &str) -> String {
     format!("work-done-{safe_name}-{}.md", pane_digest_hex(pane_id))
 }
 
+/// The daemon's delegate task-file name for `role`, keyed on the target
+/// pane's `pane_id` — the delegate-leg counterpart of [`work_done_file_name`],
+/// added for issue #613. Without pane keying, two panes running the same
+/// role in the same cwd (two live orchestrations, or a worker whose process
+/// cwd has drifted from the daemon's `pane_cwd_map` belief) could collide on
+/// the same role-only-keyed path, one pane silently overwriting or reading
+/// the other's still-unread task file — exactly the failure upstream #331 +
+/// fork #76 already fixed on the report leg.
+///
+/// Public so [`resolve_delegate_task_body`] (the write site) and tests that
+/// need to assert against the exact on-disk path compute the same name
+/// instead of each guessing at the format independently.
+pub fn delegate_task_file_name(role: &str, pane_id: &str) -> String {
+    let safe_name = sanitize_role_name(role);
+    format!("worker-task-{safe_name}-{}.md", pane_digest_hex(pane_id))
+}
+
 /// Bounded attempts to claim a fresh, unique archive slot in
 /// [`archive_existing_report`] before giving up. Generous relative to any
 /// realistic collision count on one pane's output path — running out means
@@ -5229,18 +5246,24 @@ fn resolve_delegate_task_body(
         return file_content;
     };
 
-    let safe_name = sanitize_role_name(target_role);
-    let file_name = format!("worker-task-{safe_name}.md");
-    // Issue #329 §1: owner-only, directory and file. A delegated task is exactly
-    // the content #303 warns about parking on disk, and `create_dir_all` +
+    // Issue #613: PANE-keyed, not role-keyed — two roles sharing a name (or a
+    // respawned role reusing its predecessor's name) must not collide on the
+    // same task file. Issue #329 §1: owner-only, directory and file, via
+    // `write_coordination_file` — a delegated task is exactly the content
+    // #303 warns about parking on disk, and a plain `create_dir_all` +
     // `fs::write` left it at 0664 under a 002 umask for any local account to
     // read. A failure still takes the inline path, for the reason above.
+    let file_name = delegate_task_file_name(target_role, pane_id);
     match crate::orchestrator_context::write_coordination_file(
         std::path::Path::new(cwd),
         &file_name,
         &file_content,
     ) {
-        Ok(_) => format!("Read .dot-agent-deck/{file_name} for your task."),
+        // Issue #613: an ABSOLUTE path, not `.dot-agent-deck/<file_name>` —
+        // the worker's own cwd need not equal `cwd` here (a role command can
+        // `cd` before invoking the agent), so a relative pointer can resolve
+        // to nothing from the worker's actual vantage point.
+        Ok(file_path) => format!("Read {} for your task.", file_path.display()),
         Err(e) => {
             warn!(
                 file = %file_name,
