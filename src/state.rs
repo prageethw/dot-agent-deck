@@ -721,8 +721,11 @@ pub struct SessionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_ms: Option<i64>,
     /// Fork issue #21: the PRD #370 provenance marker for the `status` above —
-    /// `true` when that `Working` was synthesized from `ShellBusy` rather than
-    /// emitted by the agent. Without it a card rehydrated mid-`ShellBusy` came
+    /// `true` when shell activity is what THIS mechanism currently holds
+    /// responsible for that `Working` staying up (see the field's full doc
+    /// on [`SessionState::shell_synthetic_working`] for the three writers —
+    /// PRD #499 round 6 widened this to also fire on a `Working` a real
+    /// agent event emitted). Without it a card rehydrated mid-claim came
     /// back with the marker reset to `false`, so the daemon's paired `ShellIdle`
     /// declined to revert and the dashboard read `Working` forever. Restored by
     /// [`AppState::seed_hydrated_session`] alongside the status it qualifies.
@@ -829,12 +832,43 @@ pub struct SessionState {
     ///   `ToolStart` clears the badge only when the incoming tool name
     ///   matches.
     pub pending_permission_tool: Option<Option<String>>,
-    /// PRD #370 M2: `true` only when the CURRENT [`SessionStatus::Working`]
-    /// was set by a synthesized `ShellBusy` event (not a real agent-emitted
-    /// one). Lets the paired `ShellIdle` know it is safe to revert `status`
-    /// to `Idle` — reverting unconditionally would clobber a real
-    /// `Working`/`Thinking`/`WaitingForInput` the agent itself set after the
-    /// synthetic promotion.
+    /// PRD #370 M2: `true` when shell activity is what THIS mechanism is
+    /// currently relying on to justify the CURRENT [`SessionStatus::Working`]
+    /// — i.e. it is safe for the paired `ShellIdle` to revert `status` to
+    /// `Idle` once shell goes quiet, because nothing else independently
+    /// still needs `Working` to hold. Reverting unconditionally without this
+    /// marker would clobber a real `Working`/`Thinking`/`WaitingForInput`
+    /// the agent itself set after the synthetic promotion.
+    ///
+    /// PRD #499 round 6 widened *how* this claim is acquired — there are now
+    /// three writers, and only the first two set it on a `Working` that
+    /// `ShellBusy` itself actually promoted:
+    /// - The `ShellBusy` arm's promotable case: the original meaning — a
+    ///   synthesized `ShellBusy` event promotes `Idle`/`Unknown` straight to
+    ///   `Working` itself.
+    /// - The `ShellBusy` arm's re-acquire case (round 5, BLOCKER H wedge 2;
+    ///   round 6, BLOCKER I wedge 4): the current `Working` is owed to a
+    ///   monitored wait (`wait_synthetic_working` or `wait_deferred_revert`
+    ///   is set) and shell is independently observed busy on top of it —
+    ///   shell reclaims the wait's obligation so `MonitoredWaitDone` clearing
+    ///   the wait markers does not strand it. That `Working` came from
+    ///   `MonitoredWaitStart`'s own promotion, not from the agent.
+    /// - `MonitoredWaitDone`'s Direction-A hand-off (round 6, BLOCKER I
+    ///   wedge 4): the wait's revert is owed but not payable because
+    ///   `shell_descendant_busy` is independently true — the obligation is
+    ///   handed to shell so the paired `ShellIdle` (which reads only this
+    ///   marker) gets a second chance to pay it. Unlike the two cases above,
+    ///   the `Working` this fires on can be a REAL agent-emitted one (e.g. a
+    ///   genuine `ToolStart`): the wait promoted a status that has since
+    ///   been legitimately reasserted by the agent, and shell is now the
+    ///   only signal left that still has a claim on it.
+    ///
+    /// So `true` no longer means "this `Working` was synthesized by
+    /// `ShellBusy`" — it means "shell is what this mechanism currently holds
+    /// responsible for the `Working` staying up," which the third writer can
+    /// make true even when the `Working` itself was agent-emitted. See
+    /// `src/daemon_status.rs`'s `*` provenance marker, which reads this field
+    /// and documents the same widened meaning.
     ///
     /// Round 4 (reviewer, `wait/monitored/016` case A): cleared by any event
     /// of a type OTHER than `ShellBusy`/`Unknown`/`MonitoredWaitStart`/
@@ -9333,15 +9367,25 @@ impl AppState {
                     // are `false` there), so it cannot reintroduce HIGH B's
                     // clobber.
                     //
-                    // Round 6 (reviewer BLOCKER I, wedge 4): gating on
+                    // Round 6 (reviewer BLOCKER I): gating on
                     // `wait_synthetic_working` alone left `wait_deferred_revert`
                     // stranded — a `ShellIdle` decline (wedge 3) hands the
                     // obligation to the wait via `wait_deferred_revert`, and if
                     // the descendant then comes back busy before
-                    // `MonitoredWaitDone` fires, this branch must reclaim that
+                    // `MonitoredWaitDone` fires, this branch reclaims that
                     // hand-off too, not just the `wait_synthetic_working` half.
                     // Clear both: whichever of the two was actually set is the
                     // one that mattered, and clearing the other is a no-op.
+                    //
+                    // This widening is defensive symmetry with
+                    // `MonitoredWaitDone`'s own Direction-A hand-off, not
+                    // what closes wedge 4b (round 7, LOW N): traced both
+                    // with and without this branch, and no revert outcome
+                    // differs — `MonitoredWaitDone`'s hand-off is what
+                    // actually closes 4b, whether or not this branch fires
+                    // first. The only observable difference is presentational
+                    // (`worker-agent-deck status` prints `Working*` sooner).
+                    // Do not read this branch as load-bearing for 4b.
                     session.shell_synthetic_working = true;
                     session.wait_synthetic_working = false;
                     session.wait_deferred_revert = false;
@@ -9380,7 +9424,25 @@ impl AppState {
                     // (`wait_synthetic_working` false, having landed on an
                     // already-Working card), it otherwise has nothing to
                     // revert with once it is the last signal standing.
-                    session.wait_deferred_revert = true;
+                    //
+                    // Round 7 (reviewer LOW O): gated on `status == Working`
+                    // to match the sibling guard `Idle`'s decline branch got
+                    // in round 6 (LOW K), for the same reason — there is no
+                    // revert owed unless a `Working` is actually what's
+                    // being declined. Provably a no-op today: this field is
+                    // only ever set alongside `shell_descendant_busy`, and
+                    // only this `ShellIdle` arm clears `shell_descendant_busy`
+                    // (in the same arm that clears this field) — so nothing
+                    // can move `status` off `Working` without first asserting
+                    // through the trailing block, which clears `was_holding`'s
+                    // source. `was_holding == true` therefore already implies
+                    // `status == Working` here. Keep the guard anyway: two
+                    // sibling decline sites with different guards, one only
+                    // safe by an unwritten invariant, is exactly the
+                    // asymmetry that produced BLOCKER I.
+                    if session.status == SessionStatus::Working {
+                        session.wait_deferred_revert = true;
+                    }
                 }
                 asserted
             }
