@@ -3061,13 +3061,31 @@ pub struct AgentPtyRegistry {
     /// moment a claim is actually taken rather than against a
     /// point-in-time snapshot. Root cause this replaces: `name_collision()`
     /// (`src/ui.rs`) refuses a New-Pane form submit against
-    /// `live_orchestration_names`, a list captured ONCE at form-open via a
+    /// `live_orchestration_identities`, a list captured ONCE at form-open via a
     /// single `ListAgents` round-trip — two forms opened close together
     /// both read the same stale snapshot, so neither submit is refused even
-    /// though both would claim the same name. Keyed by name, valued by the
+    /// though both would claim the same name. Keyed by [`OrchestrationClaimKey`]
+    /// (PRD fork#603: name + directory, not name alone), valued by the
     /// owning pane id (see [`Self::claim_orchestration_name`] /
     /// [`Self::release_orchestration_name`]).
-    orchestration_name_claims: Mutex<HashMap<String, String>>,
+    orchestration_name_claims: Mutex<HashMap<OrchestrationClaimKey, String>>,
+}
+
+/// PRD fork#603: the daemon-side claim key — name scoped to the directory
+/// the orchestration runs in, rather than name alone. A dedicated type
+/// rather than a reuse of [`crate::state::OrchestrationIdentity`]: that
+/// enum's shape serves message-routing identity (a structurally separate
+/// concern from creation-time uniqueness), and reusing it here would blur
+/// the two.
+///
+/// `cwd: None` is a deliberate backward-compat wildcard (see
+/// [`AgentPtyRegistry::claim_orchestration_name`]'s doc comment) — an older
+/// client that never learned to send a directory still gets the same
+/// global-only exclusivity it always had.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OrchestrationClaimKey {
+    name: String,
+    cwd: Option<String>,
 }
 
 /// Issue #586 M1/M2: a point-in-time snapshot of all delegation-watch state
@@ -3823,12 +3841,23 @@ impl AgentPtyRegistry {
         *self.hook_socket.lock().unwrap() = Some(path);
     }
 
-    /// Issue #201 option (b): atomically claim an orchestrator pane's own
-    /// name/title. Returns `true` when `name` was unclaimed (now claimed by
-    /// `pane_id`) OR already claimed by this exact `pane_id` (idempotent
-    /// re-claim — a caller confirming its own already-held claim is not a
-    /// conflict). Returns `false` when `name` is held by a *different*
-    /// `pane_id`.
+    /// Issue #201 option (b) / PRD fork#603: atomically claim an
+    /// orchestrator pane's own name/title, scoped to `cwd`. Returns `true`
+    /// when `(name, cwd)` was unclaimed (now claimed by `pane_id`) OR
+    /// already claimed by this exact `pane_id` (idempotent re-claim — a
+    /// caller confirming its own already-held claim is not a conflict).
+    /// Returns `false` when a conflicting claim is already held by a
+    /// *different* `pane_id`.
+    ///
+    /// `cwd: None` is a global wildcard, both as the caller's own claim and
+    /// as a candidate it is compared against (PRD fork#603 backward
+    /// compatibility): an older client that doesn't yet send a directory
+    /// still gets its claim treated as exclusive against every directory,
+    /// and still conflicts with (and is conflicted with by) every
+    /// `Some(cwd)` claim of the same name — this can only ever OVER-refuse
+    /// relative to a `Some`/`Some` comparison, never let a real
+    /// same-`(dir, name)` collision through. Cannot be a plain
+    /// `get`/`insert` on the compound key because of this wildcard scan.
     ///
     /// The wire-level caller (`AttachRequest::ClaimOrchestrationName`,
     /// `src/daemon_protocol.rs`) uses the New-Pane spawn path's real,
@@ -3837,15 +3866,35 @@ impl AgentPtyRegistry {
     /// that real id is known (the daemon mints `pane_id` in `StartAgent`,
     /// so no pane id exists yet at form-submit time) and rolls the spawn
     /// back on refusal.
-    pub fn claim_orchestration_name(&self, name: &str, pane_id: &str) -> bool {
+    pub fn claim_orchestration_name(&self, name: &str, cwd: Option<&str>, pane_id: &str) -> bool {
         let mut claims = self.orchestration_name_claims.lock().unwrap();
-        match claims.get(name) {
-            Some(holder) => holder == pane_id,
-            None => {
-                claims.insert(name.to_string(), pane_id.to_string());
-                true
-            }
+        let conflict = claims.iter().any(|(k, holder)| {
+            k.name == name
+                && holder != pane_id
+                && (k.cwd.is_none() || cwd.is_none() || k.cwd.as_deref() == cwd)
+        });
+        if conflict {
+            return false;
         }
+        // PRD fork#603 fix round (reviewer N1): the conflict scan above
+        // already exempts `holder == pane_id`, so the same holder
+        // re-claiming the same name always reaches here rather than being
+        // refused — but re-claiming with a DIFFERENT `cwd` than a key it
+        // already holds used to just `insert` a second key, leaving the
+        // old one stranded under the same holder (also the only way
+        // reviewer N2's "which key gets rebound" ambiguity was reachable).
+        // Remove every existing key this pane_id holds for THIS name
+        // first, so a re-claim is genuinely idempotent across a changed
+        // cwd — one holder, one key, per name.
+        claims.retain(|k, holder| !(k.name == name && holder == pane_id));
+        claims.insert(
+            OrchestrationClaimKey {
+                name: name.to_string(),
+                cwd: cwd.map(str::to_string),
+            },
+            pane_id.to_string(),
+        );
+        true
     }
 
     /// Issue #201 option (b): release whatever orchestration-name claim (if
@@ -9367,15 +9416,17 @@ mod spawn_tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let barrier = Arc::new(std::sync::Barrier::new(2));
 
+        const DIR: &str = "/tmp/myrepo";
+
         let (registry_a, barrier_a) = (registry.clone(), barrier.clone());
         let claim_a = std::thread::spawn(move || {
             barrier_a.wait();
-            registry_a.claim_orchestration_name(NAME, "pane-a")
+            registry_a.claim_orchestration_name(NAME, Some(DIR), "pane-a")
         });
         let (registry_b, barrier_b) = (registry.clone(), barrier.clone());
         let claim_b = std::thread::spawn(move || {
             barrier_b.wait();
-            registry_b.claim_orchestration_name(NAME, "pane-b")
+            registry_b.claim_orchestration_name(NAME, Some(DIR), "pane-b")
         });
 
         let won_a = claim_a.join().expect("claiming thread a must not panic");
@@ -9392,7 +9443,7 @@ mod spawn_tests {
         registry.release_orchestration_name(winner_pane);
 
         assert!(
-            registry.claim_orchestration_name(NAME, "pane-c"),
+            registry.claim_orchestration_name(NAME, Some(DIR), "pane-c"),
             "releasing the winner's claim must free the name for a later claimant"
         );
     }
@@ -9413,32 +9464,33 @@ mod spawn_tests {
     #[spec("orchestration/identity/022")]
     #[test]
     fn identity_022_daemon_side_name_claim_distinct_names_idempotent_reclaim_and_noop_release() {
+        const DIR: &str = "/tmp/repo";
         let registry = AgentPtyRegistry::new();
 
         // (1) distinct names never cross-block.
-        assert!(registry.claim_orchestration_name("repo-orchestrator-1", "pane-x"));
-        assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-y"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-x"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-y"));
 
         // (2) idempotent re-claim by the SAME holder.
         assert!(
-            registry.claim_orchestration_name("repo-orchestrator-1", "pane-x"),
+            registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-x"),
             "a pane re-claiming its own already-held name must succeed, not be refused"
         );
         // A DIFFERENT pane is still refused after that idempotent re-claim —
         // proves the re-claim didn't accidentally release or transfer it.
-        assert!(!registry.claim_orchestration_name("repo-orchestrator-1", "pane-z"));
+        assert!(!registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-z"));
 
         // (3) releasing a pane with no claim is a no-op, and never touches
         // an unrelated pane's live claim.
         registry.release_orchestration_name("pane-never-claimed-anything");
         assert!(
-            !registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"),
+            !registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-z"),
             "an unrelated no-op release must not have freed pane-y's claim"
         );
 
         // Releasing the real holder still works after the no-op release above.
         registry.release_orchestration_name("pane-y");
-        assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-z"));
     }
 
     /// Fork issue #201 redesign (reviewer P2-2/P2-5, auditor A1): the claim
@@ -9461,13 +9513,14 @@ mod spawn_tests {
     #[test]
     fn identity_023_confirm_orchestration_claim_rebinds_token_to_real_pane_id() {
         const NAME: &str = "myrepo-orchestrator-1";
+        const DIR: &str = "/tmp/myrepo";
         const TOKEN: &str = "spawn-token-abc123";
         const REAL_PANE_ID: &str = "pane-42";
 
         let registry = AgentPtyRegistry::new();
 
         // Pre-spawn: claim by token, before any pane exists.
-        assert!(registry.claim_orchestration_name(NAME, TOKEN));
+        assert!(registry.claim_orchestration_name(NAME, Some(DIR), TOKEN));
 
         // Post-spawn: the real pane id is now known — rebind onto it.
         assert!(
@@ -9477,15 +9530,15 @@ mod spawn_tests {
 
         // The name is still held — a fresh claimant (whether it guesses the
         // old token or uses a new one) is refused.
-        assert!(!registry.claim_orchestration_name(NAME, TOKEN));
-        assert!(!registry.claim_orchestration_name(NAME, "some-other-token"));
+        assert!(!registry.claim_orchestration_name(NAME, Some(DIR), TOKEN));
+        assert!(!registry.claim_orchestration_name(NAME, Some(DIR), "some-other-token"));
 
         // `StopAgent`'s existing release-by-pane-id mechanism must still
         // work post-rebind — this is the whole point of confirming onto the
         // real id instead of leaving the claim stuck under the token.
         registry.release_orchestration_name(REAL_PANE_ID);
         assert!(
-            registry.claim_orchestration_name(NAME, "new-claimant"),
+            registry.claim_orchestration_name(NAME, Some(DIR), "new-claimant"),
             "releasing the rebound pane id must free the name for a new claimant"
         );
     }
@@ -9503,16 +9556,17 @@ mod spawn_tests {
     #[test]
     fn identity_024_confirm_with_wrong_token_is_refused_and_release_by_token_frees_the_name() {
         const NAME: &str = "myrepo-orchestrator-2";
+        const DIR: &str = "/tmp/myrepo";
         const TOKEN: &str = "spawn-token-xyz789";
 
         let registry = AgentPtyRegistry::new();
-        assert!(registry.claim_orchestration_name(NAME, TOKEN));
+        assert!(registry.claim_orchestration_name(NAME, Some(DIR), TOKEN));
 
         // A confirm naming a token that never claimed anything must be
         // refused, and must not rebind or otherwise disturb the real claim.
         assert!(!registry.confirm_orchestration_claim("wrong-token", "pane-99"));
         assert!(
-            !registry.claim_orchestration_name(NAME, "some-other-token"),
+            !registry.claim_orchestration_name(NAME, Some(DIR), "some-other-token"),
             "a rejected confirm must leave the original token's claim intact"
         );
 
@@ -9522,7 +9576,7 @@ mod spawn_tests {
         // pane that never existed times out.
         registry.release_orchestration_name(TOKEN);
         assert!(
-            registry.claim_orchestration_name(NAME, "new-claimant"),
+            registry.claim_orchestration_name(NAME, Some(DIR), "new-claimant"),
             "releasing the token-held claim after a spawn failure must free the name \
              immediately"
         );
@@ -9542,6 +9596,7 @@ mod spawn_tests {
     #[tokio::test]
     async fn identity_028_a_confirmed_claim_is_released_when_its_pane_exits_without_stop_agent() {
         const NAME: &str = "myrepo-orchestrator-3";
+        const DIR: &str = "/tmp/myrepo";
         const PANE_ID_ENV: &str = "issue-201-crash-pane";
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -9556,7 +9611,7 @@ mod spawn_tests {
         // Simulates the post-confirm state: the claim is bound to the
         // real, daemon-known pane id, exactly as `confirm_orchestration_claim`
         // leaves it — see `identity_023`.
-        assert!(registry.claim_orchestration_name(NAME, PANE_ID_ENV));
+        assert!(registry.claim_orchestration_name(NAME, Some(DIR), PANE_ID_ENV));
 
         // Wait for the reader thread to observe EOF on its own (no
         // `close_agent`/`StopAgent` call anywhere in this test) — mirrors
@@ -9581,13 +9636,114 @@ mod spawn_tests {
         );
 
         assert!(
-            registry.claim_orchestration_name(NAME, "new-claimant-after-crash"),
+            registry.claim_orchestration_name(NAME, Some(DIR), "new-claimant-after-crash"),
             "a claim confirmed onto a pane whose process then exited on its own, with no \
              StopAgent ever sent, must be released once the daemon observes the exit — \
              otherwise the name is squatted for the daemon's entire remaining lifetime"
         );
 
         registry.shutdown_all();
+    }
+
+    /// Scenario: PRD fork#603 widens the daemon-side claim key from name
+    /// alone to the compound (directory, name) pair. Claim the name `x`
+    /// from directory `/a`, then claim the SAME name `x` from a DIFFERENT
+    /// directory `/b` — both must succeed, since the two directories don't
+    /// conflict. A third claim of `x` from `/a` again, by a different pane,
+    /// must still be refused: the same name AND the same directory as an
+    /// existing holder is still a real collision.
+    #[spec("orchestration/identity/031")]
+    #[test]
+    fn identity_031_claim_scoped_to_directory_allows_same_name_in_different_dirs() {
+        let registry = AgentPtyRegistry::new();
+
+        assert!(registry.claim_orchestration_name("x", Some("/a"), "p1"));
+        assert!(
+            registry.claim_orchestration_name("x", Some("/b"), "p2"),
+            "the same name claimed from a DIFFERENT directory must not \
+             conflict with an existing claim (PRD fork#603)"
+        );
+        assert!(
+            !registry.claim_orchestration_name("x", Some("/a"), "p3"),
+            "the same name AND the same directory as an existing holder \
+             must still be refused for a different pane"
+        );
+    }
+
+    /// Scenario: PRD fork#603 backward-compat semantics — a claim with
+    /// `cwd: None` (an old-TUI claim that doesn't know its directory) is a
+    /// GLOBAL WILDCARD: it conflicts with a directory-scoped claim of the
+    /// same name regardless of order. (a) a wildcard claim made first
+    /// blocks a later directory-scoped claim of the same name. (b) a
+    /// directory-scoped claim made first also blocks a later wildcard claim
+    /// of the same name.
+    #[spec("orchestration/identity/032")]
+    #[test]
+    fn identity_032_none_cwd_is_a_global_wildcard_against_a_scoped_claim_in_either_order() {
+        // (a) wildcard first, scoped claim second.
+        let registry = AgentPtyRegistry::new();
+        assert!(registry.claim_orchestration_name("x", None, "p-old"));
+        assert!(
+            !registry.claim_orchestration_name("x", Some("/a"), "p-new"),
+            "an old-style global claim (cwd: None) must block a new \
+             directory-scoped claim of the same name (PRD fork#603)"
+        );
+
+        // (b) scoped claim first, wildcard second.
+        let registry = AgentPtyRegistry::new();
+        assert!(registry.claim_orchestration_name("y", Some("/a"), "p-new"));
+        assert!(
+            !registry.claim_orchestration_name("y", None, "p-old"),
+            "a directory-scoped claim must also block a later wildcard \
+             claim (cwd: None) of the same name, in the other order \
+             (PRD fork#603)"
+        );
+    }
+
+    /// Scenario: PRD fork#603 reviewer finding B2 — replicate what each of
+    /// the two `ClaimOrchestrationName` call sites in `src/ui.rs` actually
+    /// compute for the SAME orchestration, post-fix. Restore/reconnect
+    /// (`src/ui.rs:13787-13800`) claims with the restored pane's own cwd,
+    /// which for an orchestration pane is the PROVISIONED WORKSPACE
+    /// directory (e.g. `/tmp/myproj-proj-orchestrator-1`, the
+    /// `resolve_workspace_path` sibling). A fresh live spawn of the same
+    /// orchestration name (`src/ui.rs:10931-10947`) now resolves and claims
+    /// with that SAME workspace directory too, rather than the raw picked
+    /// source directory — both call sites send the same kind of value for
+    /// the same orchestration. Because the daemon's compound key compares
+    /// those two now-identical directory strings, the second claim is
+    /// correctly refused — the exact fork #74 condition the claim registry
+    /// exists to prevent, and the case `origin/main`'s old name-only key
+    /// caught and this compound key now catches again.
+    #[spec("orchestration/identity/036")]
+    #[test]
+    fn identity_036_restore_and_live_spawn_key_the_same_orchestration_on_the_same_resolved_dir() {
+        let registry = AgentPtyRegistry::new();
+
+        // Restore/reconnect claims with the provisioned WORKSPACE directory.
+        assert!(registry.claim_orchestration_name(
+            "proj-orchestrator-1",
+            Some("/tmp/myproj-proj-orchestrator-1"),
+            "restored-pane",
+        ));
+
+        // A fresh live-spawn open of the SAME orchestration name resolves
+        // to the SAME provisioned workspace directory post-fix (never the
+        // raw picked source directory), so it must be refused while the
+        // restored orchestration is still live.
+        assert!(
+            !registry.claim_orchestration_name(
+                "proj-orchestrator-1",
+                Some("/tmp/myproj-proj-orchestrator-1"),
+                "new-live-pane",
+            ),
+            "a fresh live-spawn open of an orchestration name already held \
+             by a restored session for the SAME orchestration must be \
+             refused — both claim call sites now key on the SAME resolved \
+             workspace directory for the same orchestration, so the \
+             daemon correctly detects the conflict (PRD fork#603 \
+             reviewer B2)"
+        );
     }
 
     #[test]

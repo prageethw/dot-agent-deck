@@ -1136,18 +1136,161 @@ const NAME_COLLISION_WARNING: [&str; 1] =
 /// [`NewPaneFormState::with_live_orchestration_cwds`] — the warning decision is
 /// read every frame, and the filesystem must not be.
 fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[String]) -> bool {
-    if live_orchestration_cwds
+    live_orchestration_cwds
         .iter()
-        .any(|c| Path::new(c) == form_cwd)
-    {
+        .any(|c| cwd_matches(form_cwd, c))
+}
+
+/// PRD fork#603: the single shared "is this the same directory" comparison,
+/// extracted from [`live_orchestration_in_same_cwd`]'s per-candidate logic so
+/// both the existing same-cwd warning and the new `(directory, name)`
+/// uniqueness filter ([`NewPaneFormState::suggest_orchestration_name`],
+/// [`NewPaneFormState::name_collision`]) use exactly one notion of "same
+/// directory" rather than letting a literal-string compare and a
+/// canonicalized one drift apart.
+///
+/// Literal-string fast path first (works even when neither side exists on
+/// disk, e.g. an L1 render seam's synthetic path), then a best-effort
+/// [`std::fs::canonicalize`] of both sides to also catch a symlinked or
+/// otherwise non-canonical alias of the same directory. Any canonicalization
+/// error just falls back to the raw verdict — never panics.
+fn cwd_matches(form_cwd: &Path, candidate: &str) -> bool {
+    if Path::new(candidate) == form_cwd {
         return true;
     }
     let Ok(form_canonical) = std::fs::canonicalize(form_cwd) else {
         return false;
     };
-    live_orchestration_cwds
-        .iter()
-        .any(|c| std::fs::canonicalize(c).is_ok_and(|live| live == form_canonical))
+    std::fs::canonicalize(candidate).is_ok_and(|live| live == form_canonical)
+}
+
+/// PRD fork#603 fix round (CI regression on `8523e3c5`): whether a live
+/// orchestration identity `(live_cwd, live_name)` belongs to `form_cwd`, for
+/// the directory-scoped suggestion/collision check
+/// ([`NewPaneFormState::suggest_orchestration_name`],
+/// [`NewPaneFormState::name_collision`]).
+///
+/// [`cwd_matches`] alone (the original fork#603 implementation) is not
+/// enough: PRD fork#544 M2b made isolated-clone provisioning UNCONDITIONAL
+/// for every orchestration, including the very first against a directory —
+/// every orchestration's role panes run in a SIBLING workspace derived from
+/// `(source directory, name)` via [`resolve_workspace_path`] /
+/// [`sanitize_workspace_segment`] (`Action::SpawnPane`, `src/ui.rs`), never
+/// in the picked source directory itself. So `live_cwd` (what `ListAgents`
+/// reports as `orchestration_cwd`, i.e. a live orchestration's ACTUAL
+/// worktree/clone path) is *never* literally or canonically equal to a
+/// second form's own `self.dir` — not even when both orchestrations were
+/// opened from the identical source directory, which is exactly the case
+/// this scoping exists to catch. Left this way, `suggest_orchestration_name`
+/// silently re-offers an already-taken name to a second same-directory open,
+/// and the daemon's compound `(name, cwd)` claim then correctly refuses it —
+/// the orchestration never opens at all (identity/013, newpane/005).
+///
+/// The fix: re-derive the sibling workspace `form_cwd` would ITSELF produce
+/// for `live_name`, using the exact same two functions the real spawn path
+/// used to compute `live_cwd` in the first place, and compare THAT against
+/// `live_cwd`. For a genuinely-same source directory the two values are
+/// byte-identical (same deterministic formula, same inputs), so this
+/// recovers the match without needing the daemon to report anything new.
+/// [`cwd_matches`] is still tried first — it remains correct (and needed)
+/// for a live entry that genuinely IS `form_cwd` itself, e.g. a future
+/// non-isolated caller or the synthetic-cwd render seam in
+/// `render_new_pane_orchestration_name_collision_to_buffer`.
+///
+/// PRD fork#603 fix round (reviewer B1/H1): the single-shot re-derivation
+/// above only reproduced the NON-nested half of `Action::SpawnPane`'s
+/// formula — for a nested pick, the real spawn path derives the sibling
+/// from the git TOPLEVEL, not from `form_cwd` directly
+/// ([`resolve_orchestration_workspace`], issue #595), and rejoins
+/// `form_cwd`'s own relative subpath underneath it. Reproducing that here
+/// via `resolve_orchestration_workspace` itself would need a `git
+/// rev-parse` subprocess on THIS, the `Ctrl+n` render path — literally
+/// per-frame while a name is typed (N4). Since `form_cwd` is a real
+/// directory whenever this runs interactively, the true toplevel (when one
+/// exists) is always a plain PATH-STRING ancestor of it — nothing about
+/// `resolve_git_toplevel` ever introduces a component `form_cwd` doesn't
+/// already have. So rather than ask git WHICH ancestor is the toplevel, try
+/// every ancestor as a CANDIDATE toplevel and see whether it reproduces the
+/// reported `live_cwd`. The ancestor scan itself
+/// (`Path::ancestors`/`strip_prefix`/`resolve_workspace_path`) is pure
+/// string/path operations with no subprocess and no filesystem access, so
+/// there is nothing to memoize for that half.
+///
+/// PRD fork#603 reviewer N2 (doc correction): the function as a WHOLE does
+/// not hold N4's "costs nothing, no filesystem" invariant outright, as an
+/// earlier version of this comment claimed — its first line calls
+/// [`cwd_matches`], which canonicalizes up to twice per candidate, and F1's
+/// fix below adds a second, canonicalizing ancestor-scan pass of its own.
+/// The cost stays bounded rather than unbounded: [`NewPaneFormState::name_collision`]
+/// short-circuits on `name == t` before ever calling this function, and
+/// [`NewPaneFormState::suggest_orchestration_name`] runs on selection
+/// change rather than per rendered frame — so this is a doc-accuracy
+/// correction, not a perf regression.
+///
+/// PRD fork#603 reviewer F1 (fixed): a raw path-string ancestor scan alone
+/// misses two real cases, both under-refusals — a wrong "already held"
+/// error where a working second orchestration should have opened. First,
+/// git's real toplevel can be textually NOT an ancestor of `form_cwd`'s raw
+/// spelling whenever a workspace root is itself a symlink (macOS resolving
+/// `/tmp` to `/private/tmp`, `~/work -> /Volumes/data/work`) — `git
+/// rev-parse --show-toplevel` resolves symlinks, the picked directory does
+/// not. Second, the round-3/4 symlink guard's output can never be
+/// reproduced by the raw scan at all: when it fires, it drops the relative
+/// subpath entirely (`parent(toplevel)/(base(toplevel)-segment)`, no
+/// trailing component), while the raw scan always rejoins a non-empty `rel`
+/// for any proper ancestor, so its candidates always carry one path
+/// component more than what the guard actually produces. The fix re-runs
+/// the identical scan a second time over `std::fs::canonicalize(form_cwd)`
+/// when it succeeds and differs from the raw path: canonicalizing lines up
+/// `form_cwd`'s ancestor chain with git's canonical toplevel for the first
+/// case, and collapses a guard-detected symlink directory to the toplevel
+/// itself for the second (making the ancestor `form_cwd`, `rel` empty,
+/// matching the guard's own output without reimplementing it).
+///
+/// PRD fork#603 reviewer M3 (documented, not fixed — low impact): `segment`
+/// above is `sanitize_workspace_segment(live_name)`, where `live_name` is a
+/// live entry's `display_title.filter(nonempty).unwrap_or(name)`
+/// ([`live_orchestration_cwds_and_titles`]). `Action::SpawnPane`'s own
+/// segment is `sanitize_workspace_segment(typed_name)`
+/// (`resolve_orchestration_workspace`'s caller), and `display_title` there
+/// is `(!typed_name.is_empty()).then(|| typed_name.clone())`. The two agree
+/// whenever a name was typed. When `typed_name` is empty they can disagree:
+/// the spawn path's segment falls back to `"issues"`
+/// (`sanitize_workspace_segment("")` → `sanitize_clone_segment` → the fixed
+/// fallback), while `live_name` here falls back to the live entry's
+/// canonical config `name` instead — reachable by clearing the Name field,
+/// or by a daemon-initiated orchestration that types no name. The form
+/// pre-fills a suggestion, so this is rarely hit in practice.
+fn live_orchestration_occupies(form_cwd: &Path, live_cwd: &str, live_name: &str) -> bool {
+    if cwd_matches(form_cwd, live_cwd) {
+        return true;
+    }
+    let segment = sanitize_workspace_segment(live_name);
+    let live_cwd_path = Path::new(live_cwd);
+    let scan = |scan_cwd: &Path| {
+        scan_cwd.ancestors().any(|ancestor| {
+            let candidate = resolve_workspace_path(ancestor, &segment);
+            let candidate = match scan_cwd.strip_prefix(ancestor) {
+                Ok(rel) if !rel.as_os_str().is_empty() => candidate.join(rel),
+                _ => candidate,
+            };
+            candidate == live_cwd_path
+        })
+    };
+    if scan(form_cwd) {
+        return true;
+    }
+    // PRD fork#603 reviewer F1: `form_cwd`'s raw spelling is not always a
+    // path-string ancestor of git's real toplevel — a resolved symlink
+    // (`/tmp` -> `/private/tmp` on macOS, a symlinked workspace root) or a
+    // picked directory the round-3/4 symlink guard collapsed to the
+    // toplevel itself both diverge from the pure string scan above. Re-run
+    // the identical scan over the canonicalized path so both cases line up
+    // with what the real spawn path (and the guard) actually produced.
+    match std::fs::canonicalize(form_cwd) {
+        Ok(canonical) if canonical != form_cwd => scan(&canonical),
+        _ => false,
+    }
 }
 
 /// PRD #140 M4.0 / fork#192 M1.0: directories that currently host a live
@@ -1204,17 +1347,32 @@ fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[St
 /// description of what stays safe, so update this invariant at the next
 /// consumer added here rather than assuming the warning above still covers
 /// every shape a future one might take.
-fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
+/// PRD fork#603 fix round (reviewer M1): `cwd` stays `Option<String>` here
+/// rather than being unwrapped or filtered out — a `None` (a peer daemon
+/// old enough to predate the `orchestration_cwd` field, backward-compat)
+/// is a WILDCARD that occupies every directory, mirroring the daemon's own
+/// `k.cwd.is_none()` conflict-scan semantics
+/// (`AgentPtyRegistry::claim_orchestration_name`). Dropping such a record
+/// entirely (the pre-fix behavior) let the client suggest/allow a name the
+/// daemon would then refuse — the same "form allows a submission the
+/// daemon then refuses anyway" contradiction this whole PRD exists to
+/// close. See [`NewPaneFormState::suggest_orchestration_name`] /
+/// [`NewPaneFormState::name_collision`] for where a `None` entry is always
+/// treated as occupying.
+fn live_orchestration_cwds_and_titles() -> Vec<(Option<String>, String)> {
     let Ok(resp) = send_daemon_request_blocking_with_timeout(
         &crate::daemon_protocol::AttachRequest::ListAgents,
         DAEMON_HINT_TIMEOUT,
     ) else {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     };
-    let mut seen_cwds: HashSet<String> = HashSet::new();
-    let mut seen_titles: HashSet<String> = HashSet::new();
-    let mut cwds = Vec::new();
-    let mut titles = Vec::new();
+    // PRD fork#603: the pairing survives all the way to `NewPaneFormState`
+    // now, so dedup on the whole `(cwd, title)` pair rather than shredding
+    // it into two independently-deduped lists — a strict generalization of
+    // the previous per-list dedup (two role panes of one orchestration still
+    // collapse to one entry).
+    let mut seen: HashSet<(Option<String>, String)> = HashSet::new();
+    let mut pairs = Vec::new();
     for r in resp.agent_records.unwrap_or_default() {
         let Some(TabMembership::Orchestration {
             name,
@@ -1225,17 +1383,12 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
         else {
             continue;
         };
-        if let Some(cwd) = orchestration_cwd
-            && seen_cwds.insert(cwd.clone())
-        {
-            cwds.push(cwd);
-        }
         let title = display_title.filter(|t| !t.is_empty()).unwrap_or(name);
-        if seen_titles.insert(title.clone()) {
-            titles.push(title);
+        if seen.insert((orchestration_cwd.clone(), title.clone())) {
+            pairs.push((orchestration_cwd, title));
         }
     }
-    (cwds, titles)
+    pairs
 }
 
 /// PRD fork#325 M3: the Nth-concurrent-orchestration GATE — does
@@ -1635,9 +1788,9 @@ struct NewPaneFormState {
     /// warning, so every other form construction site renders byte-for-byte as
     /// before.
     live_orchestration_in_same_cwd: bool,
-    /// fork#192 M1.0: the live orchestration TITLES the daemon reported (see
-    /// [`live_orchestration_cwds_and_titles`]) — the uniqueness universe both
-    /// [`NewPaneFormState::suggest_orchestration_name`] and
+    /// fork#192 M1.0: the live orchestration `(cwd, title)` pairs the daemon
+    /// reported (see [`live_orchestration_cwds_and_titles`]) — the uniqueness
+    /// universe both [`NewPaneFormState::suggest_orchestration_name`] and
     /// [`NewPaneFormState::name_collision`] check against. Unlike
     /// `live_orchestration_in_same_cwd`, kept as the raw list rather than a
     /// pre-decided verdict: the typed Name changes every keystroke, so there is
@@ -1645,7 +1798,28 @@ struct NewPaneFormState {
     /// list every frame, which costs nothing (plain string compares, no
     /// filesystem). Empty (the `new` default) means "nothing known live" — the
     /// suggestion starts at `-orchestrator-1` and nothing is ever refused.
-    live_orchestration_names: Vec<String>,
+    ///
+    /// PRD fork#603: widened from a flat `Vec<String>` of titles to
+    /// `(cwd, title)` pairs — uniqueness is scoped to `(directory, name)`, not
+    /// name alone (fork#192's global-only rejection of per-directory scoping
+    /// was about a per-cwd *suggestion counter* sitting under global-only
+    /// *uniqueness*; it does not transfer to a compound uniqueness key, and is
+    /// superseded here rather than silently ignored — see the PRD).
+    live_orchestration_identities: Vec<(String, String)>,
+    /// PRD fork#603 fix round (reviewer M1): names of live orchestrations
+    /// the daemon reported with `orchestration_cwd: None` — a backward-compat
+    /// WILDCARD (a peer old enough to predate the field) that must occupy
+    /// EVERY directory, mirroring the daemon's own `k.cwd.is_none()`
+    /// conflict-scan semantics (`AgentPtyRegistry::claim_orchestration_name`).
+    /// Kept as a SEPARATE list from `live_orchestration_identities` above
+    /// (rather than widening that field's `cwd` to `Option<String>`) so the
+    /// field's existing `Vec<(String, String)>` shape — and every existing
+    /// test fixture built against it — stays untouched; a `None`-cwd entry
+    /// simply has no directory to pair it with. Checked unconditionally by
+    /// [`Self::suggest_orchestration_name`]/[`Self::name_collision`] rather
+    /// than dropped (the pre-fix behavior), which let the client
+    /// suggest/allow a name the daemon would then refuse.
+    live_orchestration_wildcard_names: Vec<String>,
     /// fork#192 review F4 / audit F7: whether the Name field still holds a
     /// value [`Self::suggest_name_if_orchestration_selected`] itself wrote (or the
     /// untouched construction-time pre-fill), as opposed to something the
@@ -1726,11 +1900,15 @@ impl NewPaneFormState {
             // cwds via `with_live_orchestration_cwds`; unattached means no
             // warning.
             live_orchestration_in_same_cwd: false,
-            // fork#192 M1.0: the caller attaches the daemon's live-orchestration
-            // titles via `with_live_orchestration_names`; unattached means
-            // nothing is known live, so the suggestion starts at
-            // `-orchestrator-1` and nothing is ever refused.
-            live_orchestration_names: Vec::new(),
+            // fork#192 M1.0 / fork#603: the caller attaches the daemon's
+            // live-orchestration `(cwd, title)` pairs via
+            // `with_live_orchestration_identities`; unattached means nothing
+            // is known live, so the suggestion starts at `-orchestrator-1`
+            // and nothing is ever refused.
+            live_orchestration_identities: Vec::new(),
+            // PRD fork#603 fix round (reviewer M1): unattached means no
+            // wildcard is known live either.
+            live_orchestration_wildcard_names: Vec::new(),
             // fork#192 review F4 / audit F7: an untyped construction-time
             // value (the bare basename pre-fill) is fair game to overwrite
             // with the first suggestion.
@@ -1752,24 +1930,45 @@ impl NewPaneFormState {
         self
     }
 
-    /// fork#192 M1.0: attach the daemon's live-orchestration TITLES to the
-    /// form — the uniqueness universe [`Self::suggest_orchestration_name`] and
-    /// [`Self::name_collision`] check against. Mirrors
+    /// fork#192 M1.0 / fork#603: attach the daemon's live-orchestration
+    /// `(cwd, title)` pairs to the form — the uniqueness universe
+    /// [`Self::suggest_orchestration_name`] and [`Self::name_collision`]
+    /// check against, both scoped by [`cwd_matches`]. Mirrors
     /// [`Self::with_live_orchestration_cwds`]'s shape; unlike that one, the raw
     /// list is kept (not a pre-decided verdict) since the typed Name changes
     /// every keystroke — see the field doc.
-    fn with_live_orchestration_names(mut self, names: Vec<String>) -> Self {
-        self.live_orchestration_names = names;
+    fn with_live_orchestration_identities(mut self, identities: Vec<(String, String)>) -> Self {
+        self.live_orchestration_identities = identities;
         self
     }
 
-    /// fork#192 M1.0: the next free `<foldername>-orchestrator-N` for this
-    /// form's directory, skipping any `N` a live orchestration's title already
-    /// holds (see [`Self::live_orchestration_names`]). `N` is counted globally
-    /// over ALL live orchestrations, not per-directory — uniqueness is the
-    /// whole point of the name, and a per-cwd counter would offer
-    /// `-orchestrator-1` in two different directories at once (PRD decision,
-    /// not reopened here).
+    /// PRD fork#603 fix round (reviewer M1): attach the names of live
+    /// orchestrations the daemon reported with `orchestration_cwd: None` —
+    /// a backward-compat WILDCARD that must occupy every directory (see
+    /// [`live_orchestration_cwds_and_titles`] and the
+    /// `live_orchestration_wildcard_names` field doc). A separate builder,
+    /// not a widened [`Self::with_live_orchestration_identities`], so the
+    /// many existing test fixtures built against that method's original
+    /// `Vec<(String, String)>` shape need no change.
+    fn with_live_orchestration_wildcard_names(mut self, names: Vec<String>) -> Self {
+        self.live_orchestration_wildcard_names = names;
+        self
+    }
+
+    /// fork#192 M1.0 / fork#603: the next free `<foldername>-orchestrator-N`
+    /// for this form's directory, skipping any `N` a live orchestration's
+    /// title already holds IN THIS SAME DIRECTORY (see
+    /// [`Self::live_orchestration_identities`], filtered by [`cwd_matches`]).
+    /// `N` is counted per-directory, not globally: fork#192 originally
+    /// rejected a per-cwd counter because it sat under global-only *name*
+    /// uniqueness, where two directories' suggestions really could later
+    /// collide (e.g. after a rename). PRD fork#603 widens uniqueness itself
+    /// to the compound `(directory, name)` key, which supersedes that
+    /// concern rather than leaving it unaddressed — see the PRD's "Resolving
+    /// the prior rename collision decision" section. Under a per-directory
+    /// key, a global counter would be strictly worse: a brand-new directory
+    /// could be offered `-orchestrator-3` purely because an unrelated
+    /// directory happens to hold three live orchestrations.
     fn suggest_orchestration_name(&self) -> String {
         // fork#192 audit F1b: trim the basename before comparing — the sink
         // (`build_new_pane_request`) stores `form.name.trim()`, so an
@@ -1784,10 +1983,30 @@ impl NewPaneFormState {
         // fork#192 audit F5: a `HashSet` turns each membership check into
         // O(1) instead of an O(K) linear scan, making the whole suggestion
         // loop O(K) instead of O(K^2).
+        //
+        // PRD fork#603: filtered to entries whose `cwd` matches this form's
+        // directory before building the exclusion set — the suggestion
+        // counter is per-directory, matching the uniqueness key it feeds.
+        // PRD fork#603 fix round: `live_orchestration_occupies` rather than
+        // a bare `cwd_matches(&self.dir, cwd)` — see that function's doc for
+        // why a direct compare against `self.dir` alone silently excludes
+        // nothing once isolated-clone provisioning is unconditional.
+        //
+        // PRD fork#603 fix round (reviewer M1): a wildcard name (the
+        // daemon reported it with `orchestration_cwd: None`, a
+        // backward-compat peer) occupies every directory unconditionally —
+        // chained in alongside the directory-scoped names rather than
+        // filtered by `live_orchestration_occupies`.
         let live: HashSet<&str> = self
-            .live_orchestration_names
+            .live_orchestration_identities
             .iter()
-            .map(String::as_str)
+            .filter(|(cwd, name)| live_orchestration_occupies(&self.dir, cwd, name))
+            .map(|(_, name)| name.as_str())
+            .chain(
+                self.live_orchestration_wildcard_names
+                    .iter()
+                    .map(String::as_str),
+            )
             .collect();
         // fork#192 review F14: bounded to `live.len() + 1` candidates rather
         // than an open `loop` — with K distinct live titles, at most K of
@@ -1867,8 +2086,24 @@ impl NewPaneFormState {
     /// both point at is that the gate must ultimately compare
     /// POST-`sanitize_marker_creator` values, not just post-trim ones.
     fn name_collision(&self) -> bool {
-        self.resolved_title()
-            .is_some_and(|t| self.live_orchestration_names.iter().any(|l| l == t.trim()))
+        self.resolved_title().is_some_and(|t| {
+            let t = t.trim();
+            // PRD fork#603 fix round: `live_orchestration_occupies` rather
+            // than a bare `cwd_matches(&self.dir, cwd)` — see that
+            // function's doc comment.
+            //
+            // PRD fork#603 fix round (reviewer M1): a wildcard name (the
+            // daemon reported it with `orchestration_cwd: None`) collides
+            // with any matching name unconditionally, checked separately
+            // from the directory-scoped identities above.
+            self.live_orchestration_identities
+                .iter()
+                .any(|(cwd, name)| name == t && live_orchestration_occupies(&self.dir, cwd, name))
+                || self
+                    .live_orchestration_wildcard_names
+                    .iter()
+                    .any(|name| name == t)
+        })
     }
 
     /// PRD #140 M4.0: whether the form should render
@@ -1938,10 +2173,11 @@ impl NewPaneFormState {
             // PRD #140 M4.0: the locked schedule form can't select an
             // orchestration, so the same-cwd warning never applies to it.
             live_orchestration_in_same_cwd: false,
-            // fork#192 M1.0: the locked schedule form can't select an
-            // orchestration either, so there is never a name to suggest or
-            // collide.
-            live_orchestration_names: Vec::new(),
+            // fork#192 M1.0 / fork#603: the locked schedule form can't
+            // select an orchestration either, so there is never a name to
+            // suggest or collide.
+            live_orchestration_identities: Vec::new(),
+            live_orchestration_wildcard_names: Vec::new(),
             // fork#192 review F4 / audit F7: unreachable on a locked
             // schedule form (no orchestration to select), but the value
             // must still be set.
@@ -8850,14 +9086,35 @@ fn transition_after_dir_pick(ui: &mut UiState) {
             // yields no warning and suggests `-orchestrator-1`. The query is
             // skipped when the project offers no orchestration to select, so
             // the common plain-pane `Ctrl+n` costs no extra round-trip.
-            let (live_orch_cwds, live_orch_names) = if orchestrations.is_empty() {
-                (Vec::new(), Vec::new())
+            let live_orch_identities = if orchestrations.is_empty() {
+                Vec::new()
             } else {
                 live_orchestration_cwds_and_titles()
             };
+            // PRD fork#603 fix round (reviewer M1): partition into
+            // directory-scoped identities and wildcard names — a `None`
+            // cwd (a backward-compat peer) carries no directory to pair
+            // with a title (so it's also skipped from
+            // `with_live_orchestration_cwds`'s OTHER, pre-existing
+            // same-cwd warning, which is unaffected by this fix) or to
+            // compare via `live_orchestration_occupies`; it occupies every
+            // directory unconditionally instead.
+            let mut live_orch_cwds: Vec<String> = Vec::new();
+            let mut live_orch_scoped: Vec<(String, String)> = Vec::new();
+            let mut live_orch_wildcard_names: Vec<String> = Vec::new();
+            for (cwd, name) in live_orch_identities {
+                match cwd {
+                    Some(cwd) => {
+                        live_orch_cwds.push(cwd.clone());
+                        live_orch_scoped.push((cwd, name));
+                    }
+                    None => live_orch_wildcard_names.push(name),
+                }
+            }
             NewPaneFormState::new(dir, name, command, modes, orchestrations)
                 .with_live_orchestration_cwds(live_orch_cwds)
-                .with_live_orchestration_names(live_orch_names)
+                .with_live_orchestration_identities(live_orch_scoped)
+                .with_live_orchestration_wildcard_names(live_orch_wildcard_names)
         }
         // PRD #170: the picked dir is pre-seeded as the schedule's working_dir;
         // the Command field pre-fills from the resolved authoring command so a
@@ -9077,6 +9334,91 @@ fn resolve_workspace_path(dir: &Path, segment: &str) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     dir.with_file_name(format!("{dir_name}-{segment}"))
+}
+
+/// PRD fork#603 fix round (reviewer B1/H1, auditor A1/A3): the pieces
+/// [`resolve_orchestration_workspace`] derives for a pick — the actual git
+/// toplevel (or the picked directory itself, when it isn't nested inside
+/// one), the picked directory's relative subpath under that toplevel when
+/// nested, and the sibling workspace path. Joining `worktree_path` with
+/// `relative_subpath` (when present) reproduces exactly what
+/// `provision_isolated_clone_or_status`'s own `resolved_dir` closure
+/// returns on success — the same final value that becomes `dir_str` / the
+/// tab's `cwd` / `ListAgents`' `orchestration_cwd` — but callers that need
+/// that joined value BEFORE provisioning has run (the live-spawn claim,
+/// `Action::SpawnPane`) rebuild it from a CANONICALIZED `resolved_root_dir`
+/// rather than joining the raw fields directly: `worktree_path` itself
+/// doesn't exist on disk yet, so canonicalizing it always fails, while
+/// `resolved_root_dir` (the git toplevel or `req.dir` itself) always
+/// already exists.
+struct OrchestrationWorkspaceResolution {
+    resolved_root_dir: PathBuf,
+    relative_subpath: Option<PathBuf>,
+    worktree_path: PathBuf,
+}
+
+/// PRD fork#603 fix round (reviewer B1/H1, auditor A1/A3): the ONE shared
+/// derivation of where `Action::SpawnPane`'s orchestration arm will
+/// actually provision `picked_dir`'s isolated-clone workspace — extracted
+/// verbatim from that arm's own inline computation (issue #595 fix rounds
+/// 2-4: toplevel resolution, the nested-vs-root split, the round-3/4
+/// symlink guard, and the relative-subpath rejoin). Before this extraction
+/// there was no structural link between this formula and
+/// `live_orchestration_occupies`'s separate, partial re-transcription of
+/// it — that drift is what let reviewer finding B1 happen. Now both
+/// `Action::SpawnPane` (for provisioning AND, hoisted above it, for the
+/// `ClaimOrchestrationName` cwd — reviewer B2) and the live-spawn claim
+/// site call this one function.
+///
+/// Shells out to `git rev-parse` via `resolve_git_toplevel`, so a caller on
+/// a per-frame/per-keystroke path must not call this directly per call —
+/// see `live_orchestration_occupies`, which uses a git-free equivalent for
+/// exactly that reason (its own doc comment explains why that is safe).
+fn resolve_orchestration_workspace(
+    picked_dir: &Path,
+    segment: &str,
+) -> OrchestrationWorkspaceResolution {
+    let toplevel_resolution = crate::issue_dispatch_run::resolve_git_toplevel(picked_dir);
+    let nested_toplevel: Option<&Path> = toplevel_resolution
+        .as_ref()
+        .filter(|(_, prefix)| !prefix.as_os_str().is_empty())
+        .map(|(toplevel, _)| toplevel.as_path());
+    let mut resolved_root_dir: &Path = nested_toplevel.unwrap_or(picked_dir);
+    let relative_subpath: Option<PathBuf> = toplevel_resolution
+        .as_ref()
+        .map(|(_, prefix)| prefix.clone())
+        .filter(|prefix| !prefix.as_os_str().is_empty());
+    let mut worktree_path = resolve_workspace_path(resolved_root_dir, segment);
+    // Fork issue #595 fix round 3 (auditor R1) / round 4 (reviewer N7 /
+    // auditor S1): a picked directory reached via a symlinked ancestor (or
+    // an in-repo symlink pointing back at the repo's own root) can
+    // canonicalize to the toplevel while its raw spelling stays nested —
+    // check whether the DERIVED workspace path would land inside the
+    // canonicalized toplevel and, if so, re-derive from the toplevel
+    // itself. See `Action::SpawnPane`'s prior inline copy of this comment
+    // (issue #595) for the full reasoning; unchanged here beyond the
+    // rename of its inputs/outputs to this function's local names.
+    if nested_toplevel.is_none()
+        && let Some((toplevel, _)) = toplevel_resolution.as_ref()
+    {
+        let canonical_toplevel = toplevel.canonicalize().unwrap_or_else(|_| toplevel.clone());
+        let canonical_worktree_path = match (worktree_path.parent(), worktree_path.file_name()) {
+            (Some(parent), Some(file_name)) => parent
+                .canonicalize()
+                .map(|canonical_parent| canonical_parent.join(file_name))
+                .unwrap_or_else(|_| worktree_path.clone()),
+            _ => worktree_path.clone(),
+        };
+        if canonical_worktree_path.starts_with(&canonical_toplevel) {
+            resolved_root_dir = toplevel.as_path();
+            worktree_path = resolve_workspace_path(resolved_root_dir, segment);
+        }
+    }
+    OrchestrationWorkspaceResolution {
+        resolved_root_dir: resolved_root_dir.to_path_buf(),
+        relative_subpath,
+        worktree_path,
+    }
 }
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -10835,54 +11177,6 @@ fn dispatch_action(
                             &req.dir,
                         )
                     };
-                    let orchestration_claim_token = mint_orchestration_claim_token();
-                    let claim_result = send_daemon_request_blocking_with_timeout(
-                        &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
-                            name: orchestration_claim_name.clone(),
-                            token: orchestration_claim_token.clone(),
-                        },
-                        DAEMON_REQUEST_TIMEOUT,
-                    );
-                    let claimed = matches!(claim_result, Ok(ref resp) if resp.ok);
-                    if !claimed {
-                        // Nothing was created yet, so there is no half-open
-                        // state to roll back and no claim to release.
-                        let reason = match claim_result {
-                            Ok(resp) => resp.error.unwrap_or_else(|| {
-                                format!(
-                                    "orchestration name {orchestration_claim_name:?} is already held"
-                                )
-                            }),
-                            Err(e) => format!(
-                                "could not verify orchestration name availability: {e}"
-                            ),
-                        };
-                        ui.status_message = Some((
-                            format!("Orchestration failed: {reason}"),
-                            std::time::Instant::now(),
-                        ));
-                        return Flow::Continue;
-                    }
-                    // PRD fork#544 M2b: isolation is now UNCONDITIONAL —
-                    // every orchestration, including the very first against
-                    // a root checkout, provisions its own isolated, named
-                    // workspace; no orchestration ever works directly in the
-                    // root checkout. Create it now, before any tab/pane
-                    // state exists, so a failure never leaves a half-open
-                    // orchestration behind. Fail-loud: no tab, no panes, no
-                    // pane_cwd_map writes. Silently falling back to the
-                    // shared cwd here would reintroduce the multi-
-                    // orchestration collision CLAUDE.md rule 1 / fork #74
-                    // exists to prevent, while looking like it worked.
-                    //
-                    // `root_checkout_has_live_sibling`'s Nth-concurrent
-                    // liveness gate is retired from THIS call site — the
-                    // answer is now always "isolate" — but the function
-                    // itself, `SiblingScope`, and its own two dedicated
-                    // fail-closed unit tests stay: Model B (`dispatch.rs`)
-                    // still depends on it for its own, out-of-scope
-                    // Nth-concurrent gate.
-                    //
                     // fork #166 / fork #184: `typed_name` (`req.name`, the
                     // same value that becomes `display_title` below,
                     // trimmed once in `build_new_pane_request` so both
@@ -10935,107 +11229,125 @@ fn dispatch_action(
                     // assigning one).
                     let creator = orchestration_creator_string(typed_name);
                     let segment = sanitize_workspace_segment(typed_name);
-                    // Fork issue #595 fix round 2 (reviewer F1 BLOCKER):
-                    // resolve the git toplevel & `req.dir`'s relative
-                    // subpath ONCE, here, for this whole launch — and
-                    // derive the isolated-clone destination from the
-                    // TOPLEVEL, not from `req.dir` (the picked directory)
-                    // as `resolve_workspace_path` alone would. For a nested
-                    // pick (`.dot-agent-deck.toml` living at
-                    // `<repo>/baseline/intent`), keying the sibling off
-                    // `req.dir` placed a full clone of the whole repo
-                    // INSIDE the repo's own working tree
-                    // (`<repo>/baseline/intent-<segment>`) — explicitly
-                    // named as a risk in issue #595's own "Candidate
-                    // direction" section and reproduced end to end by both
-                    // the reviewer and the auditor. Keying off the toplevel
-                    // instead makes the clone a genuine sibling of the
-                    // repo, matching CLAUDE.md rule 18's `../<repo>-<suffix>`
-                    // convention everywhere else in this codebase.
-                    //
-                    // `git rev-parse --show-toplevel` also CANONICALIZES its
-                    // answer (symlinks resolved — e.g. macOS `/var` ->
-                    // `/private/var`, the very shape GitHub's macOS runners
-                    // use for their temp dir), so the toplevel is only used
-                    // as the base below when `req.dir` is a GENUINE
-                    // subdirectory of it (a non-empty relative prefix). When
-                    // `req.dir` already IS the toplevel (or isn't inside a
-                    // git repository at all), `req.dir` itself stays the
-                    // base, unchanged — otherwise a canonicalization-only
-                    // difference at the always-was-the-root case would
-                    // change the derived workspace path's spelling with no
-                    // change to which directory it names (caught in CI:
-                    // `/private/var/folders/.../repo-my-feature` vs the
-                    // expected `/var/folders/.../repo-my-feature`).
-                    let toplevel_resolution =
-                        crate::issue_dispatch_run::resolve_git_toplevel(&req.dir);
-                    let nested_toplevel: Option<&Path> = toplevel_resolution
-                        .as_ref()
-                        .filter(|(_, prefix)| !prefix.as_os_str().is_empty())
-                        .map(|(toplevel, _)| toplevel.as_path());
-                    let mut resolved_root_dir: &Path = nested_toplevel.unwrap_or(&req.dir);
-                    let relative_subpath: Option<&Path> = toplevel_resolution
-                        .as_ref()
-                        .map(|(_, prefix)| prefix.as_path())
-                        .filter(|prefix| !prefix.as_os_str().is_empty());
-                    let mut worktree_path = resolve_workspace_path(resolved_root_dir, &segment);
-                    // Fork issue #595 fix round 3 (auditor R1): the
-                    // "root case stays unchanged" carve-out above decides
-                    // "safe to use `req.dir` raw" by asking whether the
-                    // computed prefix came out empty — a proxy for "the
-                    // picked directory IS the toplevel" that a directory
-                    // reached via a symlink PLANTED INSIDE the repository
-                    // and pointing back at the repository's own root also
-                    // satisfies: it canonicalizes to the toplevel (empty
-                    // prefix) while its own raw spelling
-                    // (`<repo>/sub/rootlink`) is structurally inside the
-                    // repo. Deriving the sibling workspace from that raw
-                    // path reopens the exact "clone lands inside the
-                    // source repo" defect (F1) the carve-out exists to
-                    // protect the ordinary root case from.
-                    //
-                    // Check the actual property instead of inferring it
-                    // from the prefix: would the DERIVED workspace path
-                    // land inside the canonicalized toplevel?
-                    // `worktree_path` does not exist on disk yet, so a
-                    // direct `.canonicalize()` on it always fails. Fork
-                    // issue #595 fix round 4 (reviewer N7 / auditor S1):
-                    // round 3 fell back to `worktree_path`'s own RAW
-                    // spelling on that failure, which is symmetric with
-                    // the canonicalized toplevel only when `req.dir`
-                    // itself was reached by a physical path — a picked
-                    // directory reached through a SYMLINKED ANCESTOR (not
-                    // just the in-repo root symlink this guard already
-                    // handles) shares no textual prefix with the
-                    // canonicalized toplevel either way, so the guard
-                    // stayed silent and F1/F3 reopened for that narrower
-                    // shape. `worktree_path`'s PARENT does exist on disk
-                    // (it is the same parent `req.dir` itself lives in),
-                    // so canonicalize that instead and re-attach the
-                    // workspace's own file name — this resolves any
-                    // symlinked ancestor while still comparing two
-                    // physically-spelled paths, and it does not disturb
-                    // the ordinary root case: `<repo>-<segment>` still
-                    // does not start with `<repo>` once both are
-                    // canonicalized the same way.
-                    if nested_toplevel.is_none()
-                        && let Some((toplevel, _)) = toplevel_resolution.as_ref()
-                    {
-                        let canonical_toplevel =
-                            toplevel.canonicalize().unwrap_or_else(|_| toplevel.clone());
-                        let canonical_worktree_path =
-                            match (worktree_path.parent(), worktree_path.file_name()) {
-                                (Some(parent), Some(file_name)) => parent
-                                    .canonicalize()
-                                    .map(|canonical_parent| canonical_parent.join(file_name))
-                                    .unwrap_or_else(|_| worktree_path.clone()),
-                                _ => worktree_path.clone(),
-                            };
-                        if canonical_worktree_path.starts_with(&canonical_toplevel) {
-                            resolved_root_dir = toplevel.as_path();
-                            worktree_path = resolve_workspace_path(resolved_root_dir, &segment);
-                        }
+                    // Fork issue #201 redesign (reviewer B2 / auditor A1,
+                    // fix round PRD fork#603): resolve the FULL eventual
+                    // workspace directory — toplevel, nested-subpath
+                    // rejoin, and the round-3/4 symlink guard, exactly what
+                    // `Action::SpawnPane` will actually provision into —
+                    // BEFORE the claim, not after. Nothing in this
+                    // derivation depends on provisioning having run, and
+                    // hoisting it here lets the claim itself be scoped by
+                    // the SAME directory notion the restore/reconnect path
+                    // already claims with (`saved_pane.dir`, the
+                    // provisioned workspace) rather than the raw picked
+                    // source directory — closing reviewer B2 (the two call
+                    // sites no longer key on two different notions of
+                    // "directory") and auditor A1 (two sibling picks with
+                    // the same basename now derive genuinely different
+                    // resolved directories, so their claims correctly see
+                    // them as distinct) at once. See
+                    // `resolve_orchestration_workspace`'s own doc for the
+                    // derivation itself.
+                    let workspace_resolution = resolve_orchestration_workspace(&req.dir, &segment);
+                    let orchestration_claim_token = mint_orchestration_claim_token();
+                    // `workspace_resolution.resolved_dir()` doesn't exist on
+                    // disk yet (provisioning hasn't run), so canonicalizing
+                    // IT directly would fail every time and silently fall
+                    // back to a possibly non-canonical spelling — a mismatch
+                    // against the restore path's claim, which canonicalizes
+                    // `saved_pane.dir` once that same directory genuinely
+                    // exists, would reopen B2 for a picked directory reached
+                    // through a symlink. `resolved_root_dir` DOES already
+                    // exist (it's either the git toplevel or `req.dir`
+                    // itself), so canonicalize THAT — the same "canonicalize
+                    // the part that exists, reapply the naming formula"
+                    // technique `resolve_orchestration_workspace`'s own
+                    // round-3/4 guard uses — and rebuild the sibling path
+                    // from it.
+                    let canonical_root = workspace_resolution
+                        .resolved_root_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| workspace_resolution.resolved_root_dir.clone());
+                    let mut orchestration_claim_cwd_path =
+                        resolve_workspace_path(&canonical_root, &segment);
+                    if let Some(rel) = &workspace_resolution.relative_subpath {
+                        orchestration_claim_cwd_path = orchestration_claim_cwd_path.join(rel);
                     }
+                    let orchestration_claim_cwd =
+                        orchestration_claim_cwd_path.display().to_string();
+                    // PRD fork#603 reviewer F4: S1's daemon-side validator
+                    // (`is_valid_orchestration_cwd`) correctly refuses a
+                    // `cwd` carrying an ASCII control character — a
+                    // directory name containing e.g. a newline is legal on
+                    // Unix and this codebase already supports it elsewhere
+                    // (`resolve_git_toplevel_survives_a_newline_in_an_ancestor_directory_name`).
+                    // Sending the derived claim `cwd` unconditionally turns
+                    // that legal path into a hard refusal of the whole
+                    // open. Degrade to the pre-#603 wildcard semantics
+                    // (`cwd: None`) instead of failing outright — this can
+                    // only over-refuse a same-named claim from a genuinely
+                    // different directory, never silently corrupt anything,
+                    // and it restores the "used to work" behavior for this
+                    // directory rather than hard-failing it.
+                    let orchestration_claim_cwd_for_request =
+                        crate::agent_pty::is_valid_orchestration_cwd(&orchestration_claim_cwd)
+                            .then_some(orchestration_claim_cwd);
+                    let claim_result = send_daemon_request_blocking_with_timeout(
+                        &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
+                            name: orchestration_claim_name.clone(),
+                            token: orchestration_claim_token.clone(),
+                            cwd: orchestration_claim_cwd_for_request,
+                        },
+                        DAEMON_REQUEST_TIMEOUT,
+                    );
+                    let claimed = matches!(claim_result, Ok(ref resp) if resp.ok);
+                    if !claimed {
+                        // Nothing was created yet, so there is no half-open
+                        // state to roll back and no claim to release.
+                        let reason = match claim_result {
+                            Ok(resp) => resp.error.unwrap_or_else(|| {
+                                format!(
+                                    "orchestration name {orchestration_claim_name:?} is already held"
+                                )
+                            }),
+                            Err(e) => format!(
+                                "could not verify orchestration name availability: {e}"
+                            ),
+                        };
+                        ui.status_message = Some((
+                            format!("Orchestration failed: {reason}"),
+                            std::time::Instant::now(),
+                        ));
+                        return Flow::Continue;
+                    }
+                    // PRD fork#544 M2b: isolation is now UNCONDITIONAL —
+                    // every orchestration, including the very first against
+                    // a root checkout, provisions its own isolated, named
+                    // workspace; no orchestration ever works directly in the
+                    // root checkout. Create it now, before any tab/pane
+                    // state exists, so a failure never leaves a half-open
+                    // orchestration behind. Fail-loud: no tab, no panes, no
+                    // pane_cwd_map writes. Silently falling back to the
+                    // shared cwd here would reintroduce the multi-
+                    // orchestration collision CLAUDE.md rule 1 / fork #74
+                    // exists to prevent, while looking like it worked.
+                    //
+                    // `root_checkout_has_live_sibling`'s Nth-concurrent
+                    // liveness gate is retired from THIS call site — the
+                    // answer is now always "isolate" — but the function
+                    // itself, `SiblingScope`, and its own two dedicated
+                    // fail-closed unit tests stay: Model B (`dispatch.rs`)
+                    // still depends on it for its own, out-of-scope
+                    // Nth-concurrent gate.
+                    //
+                    // PRD fork#603 fix round: `typed_name`/`creator`/
+                    // `segment` and the toplevel/nested-subpath/symlink-guard
+                    // derivation (issue #595 fix rounds 2-4) were already
+                    // computed above, before the claim
+                    // (`resolve_orchestration_workspace`), so provisioning
+                    // below reuses `workspace_resolution` rather than
+                    // re-deriving any of it a second time.
+                    //
                     // Issue #164: `Some(raw error)` when
                     // `provision_isolated_clone_or_status` below created the
                     // worktree but its ownership marker write failed.
@@ -11056,9 +11368,9 @@ fn dispatch_action(
                     // they're kept apart from each other (see that
                     // function's doc comment).
                     let provision_result = provision_isolated_clone_or_status(
-                        resolved_root_dir,
-                        relative_subpath,
-                        &worktree_path,
+                        &workspace_resolution.resolved_root_dir,
+                        workspace_resolution.relative_subpath.as_deref(),
+                        &workspace_resolution.worktree_path,
                         &segment,
                         &creator,
                     );
@@ -11073,7 +11385,7 @@ fn dispatch_action(
                     // (`src/issue_dispatch_run.rs`) for why this is correct
                     // rather than a weakening of the race protection.
                     crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
-                        &worktree_path,
+                        &workspace_resolution.worktree_path,
                     );
                     let (
                         dir_str,
@@ -11382,12 +11694,12 @@ fn dispatch_action(
                                     // instead. One line converts that from
                                     // a silent widening into an informed
                                     // one.
-                                    if resolved_root_dir != req.dir.as_path() {
+                                    if workspace_resolution.resolved_root_dir != req.dir {
                                         warnings.push(format!(
                                             "cloned from {} (the git root of the picked \
                                              directory)",
                                             crate::terminal_sanitize::sanitize_path_for_terminal_display(
-                                                resolved_root_dir
+                                                &workspace_resolution.resolved_root_dir
                                             )
                                         ));
                                     }
@@ -13680,16 +13992,23 @@ pub fn run_tui(
                                         )
                                     });
                                 let restore_claim_token = mint_orchestration_claim_token();
-                                let restore_claimed = matches!(
-                                    send_daemon_request_blocking_with_timeout(
-                                        &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
-                                            name: restore_claim_name.clone(),
-                                            token: restore_claim_token.clone(),
-                                        },
-                                        DAEMON_REQUEST_TIMEOUT,
-                                    ),
-                                    Ok(ref resp) if resp.ok
+                                // PRD fork#603: same canonicalize-then-fallback
+                                // treatment as the live spawn path, adapted for
+                                // `saved_pane.dir`'s `String` type.
+                                let restore_claim_cwd = std::path::Path::new(&saved_pane.dir)
+                                    .canonicalize()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|_| saved_pane.dir.clone());
+                                let restore_claim_result = send_daemon_request_blocking_with_timeout(
+                                    &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
+                                        name: restore_claim_name.clone(),
+                                        token: restore_claim_token.clone(),
+                                        cwd: Some(restore_claim_cwd),
+                                    },
+                                    DAEMON_REQUEST_TIMEOUT,
                                 );
+                                let restore_claimed =
+                                    matches!(restore_claim_result, Ok(ref resp) if resp.ok);
                                 if restore_claimed {
                                     let restore_confirmed = matches!(
                                         send_daemon_request_blocking_with_timeout(
@@ -13705,9 +14024,28 @@ pub fn run_tui(
                                         release_orchestration_claim_token(&restore_claim_token);
                                     }
                                 } else {
+                                    // PRD fork#603 reviewer N3: this used to
+                                    // hardcode "another live orchestration
+                                    // already holds it" for every failure,
+                                    // which overclaims the cause for F4's
+                                    // invalid-cwd rejection and for a
+                                    // transport error — neither is "another
+                                    // live orchestration". Surface the
+                                    // daemon's own reason (or the transport
+                                    // error) instead, mirroring the
+                                    // live-spawn claim's reason handling.
+                                    let reason = match restore_claim_result {
+                                        Ok(resp) => resp.error.unwrap_or_else(|| {
+                                            "another live orchestration already holds it"
+                                                .to_string()
+                                        }),
+                                        Err(e) => format!(
+                                            "could not verify orchestration name availability: {e}"
+                                        ),
+                                    };
                                     ui.session_warnings.push(format!(
                                         "Warning: could not claim orchestration name {restore_claim_name:?} \
-                                         while restoring '{}' — another live orchestration already holds it",
+                                         while restoring '{}' — {reason}",
                                         saved_pane.name
                                     ));
                                 }
@@ -23428,10 +23766,10 @@ pub fn render_new_pane_orchestration_name_collision_to_buffer(
         Vec::new(),
         orchestrations,
     )
-    .with_live_orchestration_names(
+    .with_live_orchestration_identities(
         live_orchestration_names
             .iter()
-            .map(|n| (*n).to_string())
+            .map(|n| ("/work/collision-check".to_string(), (*n).to_string()))
             .collect(),
     );
     // Select the single orchestration option directly (bypassing
@@ -34755,8 +35093,8 @@ mod tests {
     }
 
     /// Scenario: With `myproj-orchestrator-1` already live (a name a running
-    /// orchestration in the same folder currently holds, injected via the
-    /// test-only `with_live_orchestration_names` builder that mirrors
+    /// orchestration in the SAME directory currently holds, injected via the
+    /// test-only `with_live_orchestration_identities` builder that mirrors
     /// `with_live_orchestration_cwds`), selecting the form's orchestration
     /// must suggest `myproj-orchestrator-2`, skipping the taken slot
     /// (fork#192 M1.0). Then simulate a stale/resubmitted taken name still
@@ -34776,7 +35114,10 @@ mod tests {
                 vec![],
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+            .with_live_orchestration_identities(vec![(
+                "/tmp/myproj".to_string(),
+                "myproj-orchestrator-1".to_string(),
+            )]),
         );
 
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -34930,7 +35271,10 @@ mod tests {
                 vec![],
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(vec!["review".to_string()]),
+            .with_live_orchestration_identities(vec![(
+                "/tmp/myproj".to_string(),
+                "review".to_string(),
+            )]),
         );
 
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -35063,8 +35407,8 @@ mod tests {
         ui.new_pane_form
             .as_mut()
             .unwrap()
-            .live_orchestration_names
-            .push(name.clone());
+            .live_orchestration_identities
+            .push(("/tmp/myproj".to_string(), name.clone()));
         // Select the orchestration directly (bypassing the arrow-key path,
         // which would overwrite `name` with a fresh suggestion) so
         // `name_collision()` — which requires a selected orchestration —
@@ -35102,7 +35446,10 @@ mod tests {
                 vec![],
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+            .with_live_orchestration_identities(vec![(
+                "/tmp/myproj".to_string(),
+                "myproj-orchestrator-1".to_string(),
+            )]),
         );
         ui.new_pane_form.as_mut().unwrap().selection_index = 1;
 
@@ -35133,7 +35480,10 @@ mod tests {
         )
         // The trimmed identity a previous open from this same directory
         // already recorded.
-        .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]);
+        .with_live_orchestration_identities(vec![(
+            "/tmp/ myproj".to_string(),
+            "myproj-orchestrator-1".to_string(),
+        )]);
 
         assert_eq!(
             padded_dir_form.suggest_orchestration_name(),
@@ -35226,7 +35576,10 @@ mod tests {
                 vec![],
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+            .with_live_orchestration_identities(vec![(
+                "/tmp/myproj".to_string(),
+                "myproj-orchestrator-1".to_string(),
+            )]),
         );
         handle_new_pane_form_key(right, &mut ui2); // select -> suggestion skips the taken slot
         assert_eq!(
@@ -35242,8 +35595,11 @@ mod tests {
         ui2.new_pane_form
             .as_mut()
             .unwrap()
-            .live_orchestration_names
-            .push("myproj-orchestrator-2".to_string());
+            .live_orchestration_identities
+            .push((
+                "/tmp/myproj".to_string(),
+                "myproj-orchestrator-2".to_string(),
+            ));
         handle_new_pane_form_key(left, &mut ui2); // -> "No mode"
         handle_new_pane_form_key(right, &mut ui2); // -> orchestration reselected
 
@@ -35253,6 +35609,141 @@ mod tests {
             "an untouched suggestion must still be replaced on a later \
              selection landing, skipping the now-taken slot — the fix for \
              the typed-name case above must not freeze the field outright"
+        );
+    }
+
+    /// Scenario: PRD fork#603 widens orchestration-name uniqueness from name
+    /// alone to the compound (directory, name) pair. Build a new-pane form
+    /// for `/tmp/proj` whose only live orchestration identity is reported
+    /// for a DIFFERENT directory (`/tmp/proj-b`) that already holds the
+    /// name `proj-orchestrator-1` — the exact name this form's own
+    /// directory would also suggest. Assert the form's own suggestion is
+    /// NOT bumped to `-2` because of that entry, and that typing the
+    /// identical name does not register as a collision, since the live
+    /// entry belongs to an unrelated directory.
+    #[spec("orchestration/identity/030")]
+    #[test]
+    fn identity_030_different_directories_suggesting_the_same_name_do_not_collide() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            "proj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_identities(vec![(
+            "/tmp/proj-b".to_string(),
+            "proj-orchestrator-1".to_string(),
+        )]);
+
+        assert_eq!(
+            form.suggest_orchestration_name(),
+            "proj-orchestrator-1",
+            "a live orchestration named `proj-orchestrator-1` in a DIFFERENT \
+             directory must not bump this form's own suggestion to -2 — \
+             uniqueness is scoped to (directory, name), not name alone \
+             (PRD fork#603)"
+        );
+
+        form.selection_index = 1; // the only orchestration
+        form.name = "proj-orchestrator-1".to_string();
+        assert!(
+            !form.name_collision(),
+            "a name held by a live orchestration in a DIFFERENT directory \
+             must not be treated as a collision here (PRD fork#603)"
+        );
+    }
+
+    /// Scenario: Build a new-pane form for `/tmp/myproj` whose only live
+    /// orchestration identity carries the PRODUCTION shape — a sibling
+    /// workspace path (`/tmp/myproj-myproj-orchestrator-1`), not the picked
+    /// directory itself — since PRD fork#544 M2b made isolated-clone
+    /// provisioning unconditional, `orchestration_cwd` is never literally
+    /// `form.dir`. Assert `suggest_orchestration_name()` correctly skips the
+    /// taken slot (`-orchestrator-2`) and `name_collision()` is `true` for
+    /// the taken name — the exact re-derivation `live_orchestration_occupies`
+    /// exists to perform (reviewer finding H2's suggested minimum, PRD
+    /// fork#603).
+    #[spec("orchestration/identity/034")]
+    #[test]
+    fn identity_034_production_shaped_sibling_live_cwd_is_recognized_non_nested() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_identities(vec![(
+            "/tmp/myproj-myproj-orchestrator-1".to_string(),
+            "myproj-orchestrator-1".to_string(),
+        )]);
+
+        assert_eq!(
+            form.suggest_orchestration_name(),
+            "myproj-orchestrator-2",
+            "a live orchestration reported under its ACTUAL sibling-workspace \
+             cwd (never the picked directory itself, post-fork#544 M2b) must \
+             still be recognized as occupying this form's directory, bumping \
+             the suggestion to -2 (PRD fork#603 / reviewer H2)"
+        );
+
+        form.selection_index = 1; // the only orchestration
+        form.name = "myproj-orchestrator-1".to_string();
+        assert!(
+            form.name_collision(),
+            "a name held by a live orchestration whose reported cwd is the \
+             production sibling-workspace shape must register as a collision \
+             (PRD fork#603 / reviewer H2)"
+        );
+    }
+
+    /// Scenario: PRD fork#603 reviewer finding B1 — build a new-pane form for
+    /// a NESTED pick (`/tmp/myrepo/team-a/proj`, a subdirectory of the git
+    /// repo rooted at `/tmp/myrepo`) whose only live orchestration identity
+    /// carries the real nested-pick provisioning shape issue #595 produces:
+    /// `<toplevel>-<segment>/<relative-subpath>`, i.e.
+    /// `/tmp/myrepo-proj-orchestrator-1/team-a/proj` — the isolated clone
+    /// sibling of the TOPLEVEL, with the picked directory's own relative
+    /// path rejoined underneath, not `resolve_workspace_path` applied to the
+    /// picked directory directly. `live_orchestration_occupies` re-derives
+    /// only the latter (missing the toplevel/rejoin layer entirely), so it
+    /// can never match this shape — the suggestion and collision check must
+    /// still recognize the live orchestration as occupying this directory,
+    /// exactly as `identity_034` pins for the non-nested case.
+    #[spec("orchestration/identity/035")]
+    #[test]
+    fn identity_035_production_shaped_sibling_live_cwd_is_recognized_nested() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/myrepo/team-a/proj"),
+            "proj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_identities(vec![(
+            "/tmp/myrepo-proj-orchestrator-1/team-a/proj".to_string(),
+            "proj-orchestrator-1".to_string(),
+        )]);
+
+        assert_eq!(
+            form.suggest_orchestration_name(),
+            "proj-orchestrator-2",
+            "a live orchestration reported under the real NESTED-pick \
+             provisioning shape (toplevel sibling + rejoined relative \
+             subpath, issue #595) must still be recognized as occupying \
+             this form's directory, bumping the suggestion to -2 — \
+             `live_orchestration_occupies` re-derives only the non-nested \
+             half of the spawn path's formula (PRD fork#603 reviewer B1)"
+        );
+
+        form.selection_index = 1; // the only orchestration
+        form.name = "proj-orchestrator-1".to_string();
+        assert!(
+            form.name_collision(),
+            "a name held by a live orchestration under the real nested-pick \
+             provisioning shape must register as a collision — the same gap \
+             as the suggestion above (PRD fork#603 reviewer B1)"
         );
     }
 
@@ -35290,7 +35781,11 @@ mod tests {
                 Vec::new(),
                 vec![make_orchestration("review")],
             )
-            .with_live_orchestration_names(live.iter().map(|s| s.to_string()).collect());
+            .with_live_orchestration_identities(
+                live.iter()
+                    .map(|s| ("/work/collision-check".to_string(), s.to_string()))
+                    .collect(),
+            );
             form.selection_index = 1; // the only orchestration
 
             let backend = TestBackend::new(100, 28);
@@ -35404,7 +35899,10 @@ mod tests {
             vec![],
             vec![make_orchestration("review")],
         )
-        .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]);
+        .with_live_orchestration_identities(vec![(
+            "/tmp/myproj".to_string(),
+            "myproj-orchestrator-1".to_string(),
+        )]);
         form.selection_index = 1; // the only orchestration, already selected
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -36273,6 +36771,106 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("stub ordering-probe daemon must report readiness within 10s")
             .expect("stub ordering-probe daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
+    /// PRD fork#603 reviewer F2: like [`with_recording_daemon`], but records
+    /// the `cwd` field of every `claim-orchestration-name` request into
+    /// `captured_cwds` (in arrival order) instead of just the bare `op`
+    /// string. `with_recording_daemon`'s log can only ever prove a claim was
+    /// SENT, never what directory it was scoped to — which is exactly the
+    /// gap that let `identity_036` pass while mirroring both `src/ui.rs`
+    /// call sites' derivation in its own body rather than reading back what
+    /// either one actually computed and sent. Still answers every request
+    /// with `AttachResponse::ok()` (an always-available daemon), so this
+    /// only ever OBSERVES the real call site's payload; it never influences
+    /// which branch the code under test takes.
+    fn with_recording_daemon_capturing_claim_cwd(
+        unique_dir: &std::path::Path,
+        captured_cwds: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "build stub claim-cwd-capturing recording-daemon runtime: {e}"
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "bind stub claim-cwd-capturing recording listener: {e}"
+                            )));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let ok_payload = serde_json::to_vec(&crate::daemon_protocol::AttachResponse::ok())
+                    .expect("serialize AttachResponse::ok()");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(Some((_, payload))) =
+                        crate::daemon_protocol::read_frame(&mut stream).await
+                    else {
+                        continue;
+                    };
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload)
+                        && v.get("op").and_then(|o| o.as_str()) == Some("claim-orchestration-name")
+                    {
+                        let cwd = v.get("cwd").and_then(|c| c.as_str()).map(str::to_string);
+                        captured_cwds.lock().unwrap().push(cwd);
+                    }
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &ok_payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub claim-cwd-capturing recording daemon must report readiness within 10s")
+            .expect("stub claim-cwd-capturing recording daemon must bind successfully");
 
         // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
         unsafe {
@@ -38007,6 +38605,135 @@ mod tests {
                  spelled physically -- got {canonical_cwd:?} under {canonical_repo:?}"
             );
         }
+    }
+
+    /// Scenario: PRD fork#603 reviewer finding F2. `identity_036`
+    /// (`src/agent_pty.rs`) replicates what each of the two
+    /// `ClaimOrchestrationName` call sites is SUPPOSED to compute post-fix,
+    /// directly inside the test body — it says nothing about whether
+    /// `Action::SpawnPane`'s live-spawn call site (`src/ui.rs`, the hoisted
+    /// `resolve_orchestration_workspace` call feeding the pre-spawn claim)
+    /// actually computes and sends that value, rather than the raw picked
+    /// `req.dir`. Reverting that hoisted call back to `req.dir` leaves
+    /// `identity_036` and every other gate green, because nothing exercises
+    /// the real call site. This test does: same nested-pick fixture shape
+    /// as `workspace_035` (a real git repo, a project directory two levels
+    /// down), driven through the real `dispatch_action`/`Action::SpawnPane`
+    /// path exactly as `workspace_035`/`identity_029` do, against a daemon
+    /// stub (`with_recording_daemon_capturing_claim_cwd`) that records the
+    /// actual `cwd` field of the `claim-orchestration-name` request as it
+    /// arrives on the wire — not a value this test independently computes
+    /// by transcribing the derivation formula (which could silently drift
+    /// from the real one, `workspace_035`'s own doc comment explains this
+    /// same trap), but the real call site's own resolved-root-dir
+    /// (`resolve_orchestration_workspace`, canonicalized, per
+    /// `Action::SpawnPane`'s own comment on why it canonicalizes
+    /// `resolved_root_dir` rather than the not-yet-provisioned
+    /// `worktree_path`) rejoined with `resolve_workspace_path` and the
+    /// relative subpath — the exact shared primitives `Action::SpawnPane`
+    /// itself calls, read back rather than reimplemented.
+    #[spec("orchestration/identity/038")]
+    #[test]
+    fn identity_038_live_spawn_claim_sends_the_real_resolved_workspace_cwd_for_a_nested_pick() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+        let nested = repo.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested project",
+        ]);
+
+        let captured_cwds = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let _daemon = with_recording_daemon_capturing_claim_cwd(tmp.path(), captured_cwds.clone());
+
+        let config = make_orchestration("review");
+        let pc = Arc::new(CapturingPaneController::new());
+        let req = NewPaneRequest {
+            dir: nested.clone(),
+            name: "features".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+        };
+
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert_eq!(
+            tm.tab_count(),
+            2,
+            "setup: the nested-pick launch must actually succeed (Dashboard + Orchestration \
+             tab) for this test to exercise anything -- got {} tab(s), status: {:?}",
+            tm.tab_count(),
+            ui.status_message.as_ref().map(|(m, _)| m.clone())
+        );
+
+        // Read back what the real call site's own shared primitives compute
+        // for this fixture -- NOT a hand-transcribed copy of the formula.
+        let segment = sanitize_workspace_segment("features");
+        let resolution = resolve_orchestration_workspace(&nested, &segment);
+        let canonical_root = resolution
+            .resolved_root_dir
+            .canonicalize()
+            .expect("resolved_root_dir already exists on disk (it's the git toplevel)");
+        let mut expected_cwd = resolve_workspace_path(&canonical_root, &segment);
+        if let Some(rel) = &resolution.relative_subpath {
+            expected_cwd = expected_cwd.join(rel);
+        }
+        let expected_cwd = expected_cwd.display().to_string();
+
+        let captured = captured_cwds.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one claim-orchestration-name request must have been sent; got {captured:?}"
+        );
+        assert_eq!(
+            captured[0].as_deref(),
+            Some(expected_cwd.as_str()),
+            "reviewer F2: `Action::SpawnPane`'s own pre-spawn claim (not a mirrored derivation) \
+             must send the REAL resolved workspace directory as `cwd` -- got {:?}, expected \
+             {expected_cwd:?}. Reverting the hoisted `resolve_orchestration_workspace` call back \
+             to sending raw `req.dir` would send {:?} instead, and this assertion would catch \
+             that even though `identity_036` stays green.",
+            captured[0],
+            nested.display().to_string()
+        );
     }
 
     /// Fork #122: a real `.dot-agent-deck.toml` at `dir` defining one
