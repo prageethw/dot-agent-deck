@@ -1716,10 +1716,13 @@ fn work_done_footer(role: &str, subject: Option<&str>) -> String {
     // Issue #586 M4 fix round 5 (H6/A19): `.replace('\'', "")` below is now
     // a documented no-op on the production path — `sanitize_subject_tag`
     // already strips `'` (and `` ` ``) at the canonicalization point, so
-    // `subject` never carries one by the time it gets here. Left in place as
-    // cheap defense-in-depth rather than removed, unlike the render-side
-    // sanitize round 4 removed elsewhere: keeping it costs nothing and
-    // guards against a future caller that bypasses `sanitize_subject_tag`.
+    // `subject` never carries one by the time it gets here. Issue #598
+    // (A18), below, adds a direct `sanitize_subject_tag` call at this same
+    // site, so `.replace` is now dead for every input, not only the
+    // production one — nothing can reach it with a quote left in the value.
+    // Left in place anyway as a belt-and-suspenders marker at the shell
+    // sink itself: it costs nothing, and it survives a future edit that
+    // narrows `sanitize_subject_tag`'s own filter.
     //
     // Issue #598 (A18): `sanitize_subject_tag` itself is applied here too,
     // not only the `'`/`` ` `` strip — `compose_worker_task_file` requires a
@@ -7179,15 +7182,20 @@ impl AppState {
             let orchestrator_pane_id = signal.pane_id.clone();
             let task = signal.task.clone();
             // Issue #586 M4 fix round 4 (S11/A16): sanitize the subject
-            // exactly once, HERE, at the point it first enters the system —
-            // not at render time (`work_done_footer`) and not again when
-            // comparing against the worker's echo (`retire_delegation_commission`).
-            // Sanitize exactly once, at the point of ingest: `sanitize_subject_tag`
-            // is the single source of truth for what "canonical" means, and
-            // every downstream consumer must treat its output as already
-            // canonical rather than re-deriving it independently. This
-            // canonical value is threaded to both consumers below instead of
-            // the raw one.
+            // exactly once, HERE, at the point it first enters the system.
+            // `sanitize_subject_tag` is the single source of truth for what
+            // "canonical" means, and every downstream consumer must treat
+            // its output as already canonical rather than re-deriving it
+            // independently. This canonical value is threaded to both
+            // consumers below instead of the raw one.
+            //
+            // Issue #598 (A18) added a defensive re-application of
+            // `sanitize_subject_tag` at the render site (`work_done_footer`)
+            // and at the echo-comparison site (`retire_delegation_commission`).
+            // Both are safe only because the function is idempotent (see
+            // `sanitize_subject_tag_is_idempotent`), not because they are a
+            // second canonicalization point — this ingest site remains the
+            // one place canonical status is established.
             let subject = signal.subject.as_deref().map(sanitize_subject_tag);
             let cwd = self.pane_cwd_map.get(&pane_id).cloned();
 
@@ -9719,7 +9727,12 @@ mod tests {
     /// The value must be single-quoted and any embedded `'` stripped (a
     /// single-quoted shell string cannot be escaped from inside), so a
     /// hostile subject can neither unbalance the argument nor break out of
-    /// it into a second command.
+    /// it into a second command. Issue #598 (A18): the quote strip is now
+    /// done by `sanitize_subject_tag` itself, applied at the footer's render
+    /// site, not by the trailing `.replace('\'', "")` alone — and its
+    /// whitespace re-collapse also removes this hostile input's trailing
+    /// whitespace, which is why the expected string below has no trailing
+    /// space before the closing quote.
     #[test]
     fn work_done_footer_subject_flag_is_shell_quotable() {
         let hostile = "#586' ; id ; echo '";
@@ -9730,7 +9743,7 @@ mod tests {
         // argument by checking the argument closes exactly where expected
         // with no quote left over to close it early.
         assert!(
-            footer.contains("--subject '#586 ; id ; echo '"),
+            footer.contains("--subject '#586 ; id ; echo'"),
             "the embedded single quotes must be stripped from the rendered subject, \
              leaving the surrounding quoting intact: {footer:?}"
         );
@@ -10241,14 +10254,20 @@ mod tests {
         );
     }
 
-    /// Issue #586 M4 fix round 5: what a worker sees and would retype after
-    /// [`work_done_footer`] renders `s` into its `--subject '...'` example —
-    /// mirrors the one transformation the footer still applies to the value,
+    /// Issue #586 M4 fix round 5, updated by issue #598 (M3/A2): what a
+    /// worker sees and would retype after [`work_done_footer`] renders `s`
+    /// into its `--subject '...'` example — mirrors the two transformations
+    /// the footer now applies to the value, in order: `sanitize_subject_tag`
+    /// (added by #598/A18, canonicalizing whatever was passed in) and then
     /// stripping a literal `'` so a hostile string can't reopen the shell
-    /// argument (round 4's fix, now redundant with `sanitize_subject_tag`
-    /// per H6/A19 but kept as defense-in-depth; see `work_done_footer`).
+    /// argument (round 4's fix, redundant with `sanitize_subject_tag` per
+    /// H6/A19 but kept as defense-in-depth; see `work_done_footer`). Must
+    /// track both, not just one — a helper that only mirrors the `'` strip
+    /// silently diverges from the real footer for any non-canonical input,
+    /// which is exactly the "two places transform one value" shape that
+    /// produced S11/H6/S13.
     fn footer_argument_of(s: &str) -> String {
-        s.replace('\'', "")
+        sanitize_subject_tag(s).replace('\'', "")
     }
 
     /// Issue #586 M4 fix round 5 (H6/A19, S13/A17): the actual invariant both
