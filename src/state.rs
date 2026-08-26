@@ -7709,7 +7709,14 @@ impl AppState {
                     // false and `MonitoredWaitDone` would otherwise have
                     // nothing left to revert. Hand the obligation to the
                     // wait: it is now the last live signal standing.
-                    session.wait_deferred_revert = true;
+                    //
+                    // Round 6 (reviewer LOW K): gated on `status == Working`
+                    // to match the field's own doc — there is no revert owed
+                    // here at all unless a `Working` is actually what this
+                    // swallowed `Idle` is standing in for.
+                    if session.status == SessionStatus::Working {
+                        session.wait_deferred_revert = true;
+                    }
                     false
                 } else {
                     session.status = SessionStatus::Idle;
@@ -7753,7 +7760,8 @@ impl AppState {
                 if promotable {
                     session.status = SessionStatus::Working;
                     session.shell_synthetic_working = true;
-                } else if session.status == SessionStatus::Working && session.wait_synthetic_working
+                } else if session.status == SessionStatus::Working
+                    && (session.wait_synthetic_working || session.wait_deferred_revert)
                 {
                     // Round 5 (reviewer BLOCKER H, wedge 2): the wait
                     // promoted this `Working`, and shell is now ALSO
@@ -7763,12 +7771,25 @@ impl AppState {
                     // reverting (Direction A). Safe in a way round 2's
                     // unconditional `shell_synthetic_working = true` was not:
                     // this fires only when the current `Working` is provably
-                    // the WAIT's own promotion, never on a real
-                    // agent-emitted `Working` (`wait_synthetic_working` is
-                    // `false` there), so it cannot reintroduce HIGH B's
+                    // owed to the wait — either `wait_synthetic_working`
+                    // (the wait promoted it) or `wait_deferred_revert` (an
+                    // `Idle`/`ShellIdle` already handed the wait a revert it
+                    // owed) — never on a real agent-emitted `Working` (both
+                    // are `false` there), so it cannot reintroduce HIGH B's
                     // clobber.
+                    //
+                    // Round 6 (reviewer BLOCKER I, wedge 4): gating on
+                    // `wait_synthetic_working` alone left `wait_deferred_revert`
+                    // stranded — a `ShellIdle` decline (wedge 3) hands the
+                    // obligation to the wait via `wait_deferred_revert`, and if
+                    // the descendant then comes back busy before
+                    // `MonitoredWaitDone` fires, this branch must reclaim that
+                    // hand-off too, not just the `wait_synthetic_working` half.
+                    // Clear both: whichever of the two was actually set is the
+                    // one that mattered, and clearing the other is a no-op.
                     session.shell_synthetic_working = true;
                     session.wait_synthetic_working = false;
+                    session.wait_deferred_revert = false;
                 }
                 promotable
             }
@@ -7889,11 +7910,27 @@ impl AppState {
                 // `wait_synthetic_working`), so that case still correctly
                 // declines.
                 session.monitored_wait_active = false;
-                let asserted = session.status == SessionStatus::Working
-                    && (session.wait_synthetic_working || session.wait_deferred_revert)
-                    && !session.shell_descendant_busy;
+                let owed = session.wait_synthetic_working || session.wait_deferred_revert;
+                let owed_on_working = session.status == SessionStatus::Working && owed;
+                let asserted = owed_on_working && !session.shell_descendant_busy;
                 if asserted {
                     session.status = SessionStatus::Idle;
+                } else if owed_on_working {
+                    // Round 6 (reviewer BLOCKER I, wedge 4): `owed_on_working`
+                    // is true here only because `shell_descendant_busy` is
+                    // what's blocking `asserted` (Direction A's own decline
+                    // reason) — the wait's revert obligation is real, just
+                    // not payable yet. Clearing `wait_deferred_revert`/
+                    // `wait_synthetic_working` unconditionally below would
+                    // drop that obligation with nothing left to pay it: the
+                    // paired `ShellIdle` reads `shell_synthetic_working` for
+                    // `was_holding`, not either wait marker, and by the time
+                    // it arrives `monitored_wait_active` is already false, so
+                    // it has no second chance to re-derive the obligation.
+                    // Hand it to shell now, exactly like `ShellBusy`'s
+                    // re-acquire branch does when the order runs the other
+                    // way (wait marker set before shell re-observes busy).
+                    session.shell_synthetic_working = true;
                 }
                 session.wait_synthetic_working = false;
                 session.wait_deferred_revert = false;
