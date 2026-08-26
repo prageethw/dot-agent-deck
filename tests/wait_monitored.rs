@@ -1547,25 +1547,37 @@ async fn wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner() 
 // `wait_deferred_revert`. Round 6 (MEDIUM J) joins it to the convergence
 // tuple below, which round 5 left out — a future daemon-only write to that
 // field would otherwise pass this check silently.
+//
+// Round 8 (LOW P) adds a sixth field, `shell_synthetic_working`. It used to
+// be PRD #370's field that #499 merely read, so it was never plausible as a
+// daemon-only write; round 6 turned it into a field #499's own code writes
+// from a decline path, which is exactly the class of defect this
+// convergence check exists to catch.
 // ---------------------------------------------------------------------------
 
 /// The `(status, monitored_wait_active, wait_synthetic_working,
-/// shell_descendant_busy, wait_deferred_revert)` tuple for `pane_id` inside
-/// `state` — `None` if no session names this pane at all. Shared by
-/// [`daemon_composition_state`] and [`client_composition_state`] (PRD #499
-/// round 7, SonarCloud duplication), which differ only in where `state`
-/// comes from — the daemon's own live `AppState` behind a lock, versus an
-/// independent client `AppState` built by replaying broadcast events.
+/// shell_descendant_busy, wait_deferred_revert, shell_synthetic_working)`
+/// tuple for `pane_id` inside `state` — `None` if no session names this pane
+/// at all. Shared by [`daemon_composition_state`] and
+/// [`client_composition_state`] (PRD #499 round 7, SonarCloud duplication),
+/// which differ only in where `state` comes from — the daemon's own live
+/// `AppState` behind a lock, versus an independent client `AppState` built
+/// by replaying broadcast events.
 ///
 /// MEDIUM J (PRD #499 round 6): `wait_deferred_revert` was added in round 5
 /// but never joined this tuple, so a future daemon-only write to that field
 /// — precisely the defect this convergence check exists to catch — would
 /// pass silently. Extended here to close that gap.
+///
+/// LOW P (PRD #499 round 8): `shell_synthetic_working` joined this tuple for
+/// the same reason — round 6 gave it a writer inside this PRD's own decline
+/// path (`ShellIdle`'s decline, `state.rs`), so it is now a field a future
+/// daemon-only write could silently diverge on too.
 #[cfg(unix)]
 fn composition_state_tuple(
     state: &AppState,
     pane_id: &str,
-) -> Option<(SessionStatus, bool, bool, bool, bool)> {
+) -> Option<(SessionStatus, bool, bool, bool, bool, bool)> {
     state
         .sessions
         .values()
@@ -1577,6 +1589,7 @@ fn composition_state_tuple(
                 s.wait_synthetic_working,
                 s.shell_descendant_busy,
                 s.wait_deferred_revert,
+                s.shell_synthetic_working,
             )
         })
 }
@@ -1587,7 +1600,7 @@ fn composition_state_tuple(
 async fn daemon_composition_state(
     daemon: &common::InProcDaemon,
     pane_id: &str,
-) -> Option<(SessionStatus, bool, bool, bool, bool)> {
+) -> Option<(SessionStatus, bool, bool, bool, bool, bool)> {
     let state = daemon.state.read().await;
     composition_state_tuple(&state, pane_id)
 }
@@ -1601,7 +1614,7 @@ async fn daemon_composition_state(
 fn client_composition_state(
     client_state: &AppState,
     pane_id: &str,
-) -> Option<(SessionStatus, bool, bool, bool, bool)> {
+) -> Option<(SessionStatus, bool, bool, bool, bool, bool)> {
     composition_state_tuple(client_state, pane_id)
 }
 
@@ -1646,12 +1659,12 @@ const LABEL_016_B: &str = "wait-monitored-label-016b-replay-shell";
 /// `wait done` while the shell signal is still live (OR composition,
 /// Direction A). After every event, assert the client's
 /// independently-replayed `(status, monitored_wait_active,
-/// wait_synthetic_working, shell_descendant_busy, wait_deferred_revert)`
-/// tuple is identical to the daemon's own — this is the test that would have
-/// caught round 2's BLOCKER A/B1: a daemon-only `AppState::monitored_waits`
-/// map meant an attached client never learned a wait was live at all, so its
-/// own `apply_event` had nothing to suppress the real `Idle` with and it
-/// read `Idle` while the daemon read `Working`.
+/// wait_synthetic_working, shell_descendant_busy, wait_deferred_revert,
+/// shell_synthetic_working)` tuple is identical to the daemon's own — this
+/// is the test that would have caught round 2's BLOCKER A/B1: a daemon-only
+/// `AppState::monitored_waits` map meant an attached client never learned a
+/// wait was live at all, so its own `apply_event` had nothing to suppress
+/// the real `Idle` with and it read `Idle` while the daemon read `Working`.
 #[spec("wait/monitored/016")]
 #[test]
 #[cfg(unix)]
