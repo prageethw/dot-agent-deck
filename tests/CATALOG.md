@@ -1935,6 +1935,34 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the cross-card version (already covered by `012`).
 - **Platform coverage:** mac+linux.
 
+##### wait/monitored/019 — a monitored wait declared on a card that is already `Working` from a real `ToolStart` (the PRD's own headline flow) must still be revertible by `wait done` once the agent's own `Idle` has been suppressed while the wait was outstanding (PRD #499 round 4, reviewer BLOCKER H wedge 1).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`, plus a synthetic `ToolStart`/`ToolEnd` `AgentEvent` injected directly over the hook socket to establish a REAL, agent-emitted `Working` ahead of `wait start`).
+- **Agent:** none (synthetic — a `cat`-stub pane; `ToolStart`/`ToolEnd`/`Idle` are injected events, not a real spawned tool).
+- **Asserts:** `ToolStart` sets `Working`; `ToolEnd` is a no-op; `wait start` lands on the already-`Working` card and declines to promote (`wait_synthetic_working` never set); a real `Idle` arrives and is suppressed (Direction C, correct); `wait done` must then revert the pane to `Idle` since the wait was the last live signal standing — today it declines because `wait_synthetic_working` was never set, wedging the pane `Working` forever.
+- **Does not assert:** the Direction A/B shell-composition wedges (`020`/`021`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/020 — `wait/monitored/011`'s own sequence, extended past the `ShellIdle` it stops before: the descendant `011` leaves busy must still be able to revert the pane once it genuinely goes idle (PRD #499 round 4, reviewer BLOCKER H wedge 2, Direction A's tail).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `011`), plus the paired synthetic `ShellIdle` `AgentEvent` `011` never sends.
+- **Agent:** none (synthetic — a `cat`-stub pane; the shell descendant is a synthetic `ShellBusy`/`ShellIdle` pair, no real foreground process spawned).
+- **Asserts:** `wait start` promotes to `Working`; an injected `ShellBusy` holds it up; `wait done` declines (Direction A, matches `011`) but unconditionally clears `wait_synthetic_working`; the paired `ShellIdle` then arrives and must revert the pane to `Idle` — today it also declines (`shell_synthetic_working` was never set), wedging the pane `Working` forever.
+- **Does not assert:** the Direction B mirror (`021`) or the headline flow (`019`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/021 — the mirror of `020`: a monitored wait outstanding when a shell descendant's `ShellIdle` is suppressed must still be revertible by the wait's own later `wait done` (PRD #499 round 4, reviewer BLOCKER H wedge 3, Direction B's tail).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `011`).
+- **Agent:** none (synthetic — a `cat`-stub pane; the shell descendant is a synthetic `ShellBusy`/`ShellIdle` pair, no real foreground process spawned).
+- **Asserts:** an injected `ShellBusy` promotes to `Working`; `wait start` lands on the already-`Working` card and declines to promote (`wait_synthetic_working` never set); the paired `ShellIdle` arrives and is suppressed (Direction B, correct) but unconditionally clears `shell_synthetic_working`; `wait done` must then revert the pane to `Idle` — today it also declines, wedging the pane `Working` forever.
+- **Does not assert:** the Direction A tail (`020`) or the headline flow (`019`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/022 — `unregister_pane` ALONE (never paired with `remove_sessions_for_pane`) must not eagerly drop a pane's `monitored_waits` entry, since that method's own card can survive it (PRD #499 round 4, auditor C2).
+- **Layer:** bare-`AppState` direct-method test — no daemon, no CLI subprocess.
+- **Agent:** none (a single synthetic `SessionStart` applied directly via `AppState::apply_event`).
+- **Asserts:** after `start_monitored_wait` records an entry for a pane, calling `unregister_pane` alone leaves both the pane's card and its `monitored_waits` entry in place — a regression guard for round 3's B3 narrowing, which `013` (calling both teardown methods together) cannot distinguish from the round-2 shape it replaced.
+- **Does not assert:** the combined-teardown eager-cleanup behavior (covered by `013`); the TTL sweep's own correctness (covered by `009`).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
