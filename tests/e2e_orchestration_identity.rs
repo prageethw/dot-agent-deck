@@ -239,13 +239,36 @@ fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1()
     // incidental occurrence of the label (a pane title, a status line) fails
     // there with a clear assertion message instead of stalling this wait to
     // a bare 30s timeout.
+    //
+    // PRD fork#603 reviewer F5: a whole-grid `g.matches(LABEL).count() >= 2`
+    // here is the exact same vacuity `identity_037` had (see `tab_bar_line`'s
+    // own doc comment above) — it is satisfiable by tab 1's real tab-bar
+    // label plus tab 2's still-open New Pane form, whose Name field
+    // pre-fills the identical `LABEL` text the moment the Orchestration mode
+    // chip is selected, well before the submit keystroke above is even
+    // processed, let alone before the daemon has decided whether to grant or
+    // refuse the second claim. Scoping the match to `tab_bar_line` (row 0
+    // only) closes that gap exactly as it does there: the form's popup
+    // starts at row 10, so a match on row 0 can only come from a real
+    // tab-bar entry, and a silently refused second claim leaves row 0
+    // showing exactly ONE `LABEL` occurrence forever, timing this wait out
+    // instead of passing vacuously.
     deck.wait_until_grid("both orchestration tabs labeled -orchestrator-1", |g| {
-        g.matches(LABEL).count() >= 2
+        tab_bar_line(g).matches(LABEL).count() >= 2
     });
 
+    // Scoped to the tab-bar row for the same reason as the wait above: by
+    // this point the wait has already proven row 0 carries two real
+    // `LABEL` occurrences, so re-checking the WHOLE grid here would let an
+    // incidental third occurrence elsewhere (a pane title, a status line)
+    // fail this assertion for a reason unrelated to what it claims to test
+    // — tab labeling, not arbitrary grid content. Keeping the exact-count
+    // check on the same row it was proven on is what makes the `== 2`
+    // guarantee (reviewer N6's own reasoning above) actually about the tab
+    // bar rather than the grid at large.
     let grid = deck.snapshot_grid();
     assert_eq!(
-        grid.matches(LABEL).count(),
+        tab_bar_line(&grid).matches(LABEL).count(),
         2,
         "both `team-a/proj` and `team-b/proj` must land as their own, un-refused, live \
          orchestration tab titled exactly {LABEL:?} — two directories with the same basename \
@@ -325,12 +348,15 @@ fn wait_for_sibling_workspace_count(
 /// reserves the tab bar as a fixed `Constraint::Length(1)` at the very top
 /// of the frame). Restricting a `LABEL` search to this one line, rather than
 /// the whole grid, is what turns a wait on it into a genuine barrier in
-/// `identity_037` below: the New Pane form's own pre-filled Name field
-/// supplies the SAME `LABEL` text the moment the Orchestration mode chip is
-/// selected — well before the submit keystroke is even processed, let alone
-/// before the daemon has decided whether to grant or refuse the claim — but
-/// that field lives inside the popup and can never reach row 0. A match here
-/// can only come from a real tab.
+/// `identity_033` above and `identity_037` below: the New Pane form's own
+/// pre-filled Name field supplies the SAME `LABEL` text the moment the
+/// Orchestration mode chip is selected — well before the submit keystroke is
+/// even processed, let alone before the daemon has decided whether to grant
+/// or refuse the claim — but that field lives inside the popup and can
+/// never reach row 0. A match here can only come from a real tab. (PRD
+/// fork#603 reviewer F5: `identity_033` originally matched against the
+/// whole grid, the same vacuity this function was written to close in
+/// `identity_037`.)
 fn tab_bar_line(grid: &str) -> &str {
     grid.lines().next().unwrap_or("")
 }
