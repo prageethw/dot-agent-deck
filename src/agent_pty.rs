@@ -166,6 +166,35 @@ pub fn seed_fallback_grace() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(15))
 }
 
+/// PRD #499 M8: overrides the monitored-wait self-healing TTL (see
+/// [`wait_ttl_secs`]). Read by the `wait start` CLI subprocess itself, from
+/// its own environment — the resolved value is carried into the daemon-side
+/// record on the wire (`WaitStartSignal::ttl_secs`) rather than re-resolved
+/// daemon-side, so a caller (or a test) overriding this on just the `wait
+/// start` invocation controls the value that actually lands, independent of
+/// whatever the daemon process's own environment happens to hold.
+pub const DOT_AGENT_DECK_WAIT_TTL_SECS: &str = "DOT_AGENT_DECK_WAIT_TTL_SECS";
+
+/// PRD #499 M8: production default for a monitored wait's self-healing TTL —
+/// 30 minutes. Long enough to comfortably outlast a real CI round trip
+/// (rule 5: ~9-12 minutes for the e2e tier, plus retries/flakiness margin),
+/// short enough that a wait abandoned by a crashed or forgotten caller stops
+/// wedging the pane `Working` well within the same working session rather
+/// than for hours. Only the override path (`DOT_AGENT_DECK_WAIT_TTL_SECS`) is
+/// exercised by tests; this default is otherwise unvalidated by them.
+const DEFAULT_WAIT_TTL_SECS: u64 = 30 * 60;
+
+/// Resolve the monitored-wait self-healing TTL, in seconds (see
+/// [`DOT_AGENT_DECK_WAIT_TTL_SECS`]). Falls back to
+/// [`DEFAULT_WAIT_TTL_SECS`] when unset or unparseable — same shape as
+/// [`seed_fallback_grace`].
+pub fn wait_ttl_secs() -> u64 {
+    std::env::var(DOT_AGENT_DECK_WAIT_TTL_SECS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WAIT_TTL_SECS)
+}
+
 /// PRD #201: arm the PTY-injection SAFETY NET for a pane the daemon just
 /// stashed a native seed for. Spawns a background task that waits `grace` (see
 /// [`seed_fallback_grace`]) then — only if the seed was NOT already consumed by

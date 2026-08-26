@@ -28,6 +28,18 @@ pub enum EventType {
     /// gone, i.e. the previously-running foreground command has finished. See
     /// [`ShellBusy`](Self::ShellBusy).
     ShellIdle,
+    /// PRD #499 (reopened): synthesized daemon-side when a role declares a
+    /// monitored external wait (`wait start <label>`) — a second, explicit
+    /// source of `Working` alongside `ShellBusy`, routed through the same
+    /// `apply_event` precedence/composition machinery rather than mutating
+    /// `AppState` directly (PR #617 round-1 reviewer BLOCKER 1/2/3, HIGH 5).
+    /// See [`crate::state::AppState::start_monitored_wait`].
+    MonitoredWaitStart,
+    /// PRD #499 (reopened): the paired synthesized event — the wait was
+    /// cleared (`wait done`) or expired (TTL self-heal). See
+    /// [`MonitoredWaitStart`](Self::MonitoredWaitStart) and
+    /// [`crate::state::AppState::clear_monitored_wait`].
+    MonitoredWaitDone,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -734,8 +746,13 @@ impl AgentEvent {
     /// authentication marker (auditor) — a forged raw `Error` without it marks a
     /// card exactly as it did before.
     pub fn is_daemon_synthetic(&self) -> bool {
-        matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
-            || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+        matches!(
+            self.event_type,
+            EventType::ShellBusy
+                | EventType::ShellIdle
+                | EventType::MonitoredWaitStart
+                | EventType::MonitoredWaitDone
+        ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
     }
 }
 
@@ -786,6 +803,15 @@ pub enum DaemonMessage {
     /// daemon simply never replies, which the CLI degrades on.
     #[serde(rename = "list_targets")]
     ListTargets(ListTargetsRequest),
+    /// PRD #499 (reopened): declare a monitored external wait for the
+    /// calling pane — see [`WaitStartSignal`]. Fire-and-forget, like
+    /// `Dispatch`/`WorkDone`.
+    #[serde(rename = "wait_start")]
+    WaitStart(WaitStartSignal),
+    /// PRD #499 (reopened): clear a previously declared monitored wait —
+    /// see [`WaitDoneSignal`]. Fire-and-forget.
+    #[serde(rename = "wait_done")]
+    WaitDone(WaitDoneSignal),
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -1203,6 +1229,49 @@ pub struct WorkDoneSignal {
     /// `None` — additive, never rejects, no `PROTOCOL_VERSION` bump.
     #[serde(default)]
     pub subject: Option<String>,
+}
+
+/// PRD #499 (reopened): the terminal outcome of an external dependency a
+/// role declared a monitored wait for. All four clear the wait identically
+/// (M7) — a role's own bookkeeping is the only place the distinction
+/// matters, not the daemon's status computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitOutcome {
+    Success,
+    Failure,
+    Cancelled,
+    Timeout,
+}
+
+/// Signal sent by `dot-agent-deck wait start <label>` (PRD #499). A second,
+/// explicit source of `SessionStatus::Working` alongside the existing
+/// `descendant_shell_activity` signal — declared deliberately rather than
+/// inferred from a live foreground process, so it covers work that outlives
+/// the declaring pane's own delegated task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitStartSignal {
+    pub pane_id: String,
+    pub label: String,
+    /// Resolved by the `wait start` CLI subprocess itself from
+    /// `DOT_AGENT_DECK_WAIT_TTL_SECS` (or the production default) — see
+    /// `crate::agent_pty::wait_ttl_secs`. Carried down to the daemon rather
+    /// than re-resolved there, so a test (or a caller) overriding the env
+    /// var on the CLI's own environment controls the value the daemon
+    /// actually records.
+    pub ttl_secs: u64,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Signal sent by `dot-agent-deck wait done <label> --outcome <...>`
+/// (PRD #499). Clears a previously declared monitored wait; every
+/// [`WaitOutcome`] clears it identically (M7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitDoneSignal {
+    pub pane_id: String,
+    pub label: String,
+    pub outcome: WaitOutcome,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[cfg(test)]

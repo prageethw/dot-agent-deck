@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{RwLock, broadcast};
@@ -9,7 +10,7 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, GuardedSendDetail};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, WorkDoneSignal, WorktreeKeptNotice, Writable,
+    LiveTarget, OrchestrationSurface, WaitOutcome, WorkDoneSignal, WorktreeKeptNotice, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -323,8 +324,11 @@ pub struct SessionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
     /// Fork issue #21: the PRD #370 provenance marker for the `status` above —
-    /// `true` when that `Working` was synthesized from `ShellBusy` rather than
-    /// emitted by the agent. Without it a card rehydrated mid-`ShellBusy` came
+    /// `true` when shell activity is what THIS mechanism currently holds
+    /// responsible for that `Working` staying up (see the field's full doc
+    /// on [`SessionState::shell_synthetic_working`] for the three writers —
+    /// PRD #499 round 6 widened this to also fire on a `Working` a real
+    /// agent event emitted). Without it a card rehydrated mid-claim came
     /// back with the marker reset to `false`, so the daemon's paired `ShellIdle`
     /// declined to revert and the dashboard read `Working` forever. Restored by
     /// [`AppState::seed_hydrated_session`] alongside the status it qualifies.
@@ -349,6 +353,39 @@ pub struct SessionSnapshot {
     /// bump. Restored by [`AppState::seed_hydrated_session`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// PRD #499 (reopened) round 3 (reviewer BLOCKER A / auditor B1): whether
+    /// a monitored wait is CURRENTLY live for this card. Mirrors
+    /// [`SessionState::monitored_wait_active`] — see that field's doc.
+    /// Additive optional under the same convention as `shell_synthetic_working`
+    /// above: an older daemon sends nothing, which decodes to `false`, and
+    /// needs no `PROTOCOL_VERSION` bump. Restored by
+    /// [`AppState::seed_hydrated_session`]/[`AppState::resync_hydrated_sessions`]
+    /// unconditionally (unlike the two provenance flags below, it is not
+    /// gated on `status == Working` — a wait can be active while the card
+    /// sits at `Thinking`/`WaitingForInput`/etc., having declined to
+    /// promote).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub monitored_wait_active: bool,
+    /// PRD #499 (reopened) round 3: mirrors
+    /// [`SessionState::wait_synthetic_working`] — see that field's doc.
+    /// Restored gated on `status == Working`, same as
+    /// `shell_synthetic_working`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wait_synthetic_working: bool,
+    /// PRD #499 (reopened) round 3: mirrors
+    /// [`SessionState::shell_descendant_busy`] — see that field's doc. Not
+    /// gated on `status`, for the same reason `monitored_wait_active` isn't:
+    /// it tracks a live OS-level fact (a foreground shell descendant is
+    /// currently running), independent of what the card's composed status
+    /// currently reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shell_descendant_busy: bool,
+    /// PRD #499 (reopened) round 5 (reviewer BLOCKER H): mirrors
+    /// [`SessionState::wait_deferred_revert`] — see that field's doc. Restored
+    /// gated on `status == Working`, same as `wait_synthetic_working`: it is
+    /// provenance for whether that exact `Working` still owes a revert.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wait_deferred_revert: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -398,14 +435,54 @@ pub struct SessionState {
     ///   `ToolStart` clears the badge only when the incoming tool name
     ///   matches.
     pub pending_permission_tool: Option<Option<String>>,
-    /// PRD #370 M2: `true` only when the CURRENT [`SessionStatus::Working`]
-    /// was set by a synthesized `ShellBusy` event (not a real agent-emitted
-    /// one). Lets the paired `ShellIdle` know it is safe to revert `status`
-    /// to `Idle` — reverting unconditionally would clobber a real
-    /// `Working`/`Thinking`/`WaitingForInput` the agent itself set after the
-    /// synthetic promotion. Cleared by ANY other event type, real or
-    /// synthetic (see the bottom of `apply_event`), so a real event always
-    /// wins the "what set this status" question.
+    /// PRD #370 M2: `true` when shell activity is what THIS mechanism is
+    /// currently relying on to justify the CURRENT [`SessionStatus::Working`]
+    /// — i.e. it is safe for the paired `ShellIdle` to revert `status` to
+    /// `Idle` once shell goes quiet, because nothing else independently
+    /// still needs `Working` to hold. Reverting unconditionally without this
+    /// marker would clobber a real `Working`/`Thinking`/`WaitingForInput`
+    /// the agent itself set after the synthetic promotion.
+    ///
+    /// PRD #499 round 6 widened *how* this claim is acquired — there are now
+    /// three writers, and only the first two set it on a `Working` that
+    /// `ShellBusy` itself actually promoted:
+    /// - The `ShellBusy` arm's promotable case: the original meaning — a
+    ///   synthesized `ShellBusy` event promotes `Idle`/`Unknown` straight to
+    ///   `Working` itself.
+    /// - The `ShellBusy` arm's re-acquire case (round 5, BLOCKER H wedge 2;
+    ///   round 6, BLOCKER I wedge 4): the current `Working` is owed to a
+    ///   monitored wait (`wait_synthetic_working` or `wait_deferred_revert`
+    ///   is set) and shell is independently observed busy on top of it —
+    ///   shell reclaims the wait's obligation so `MonitoredWaitDone` clearing
+    ///   the wait markers does not strand it. That `Working` came from
+    ///   `MonitoredWaitStart`'s own promotion, not from the agent.
+    /// - `MonitoredWaitDone`'s Direction-A hand-off (round 6, BLOCKER I
+    ///   wedge 4): the wait's revert is owed but not payable because
+    ///   `shell_descendant_busy` is independently true — the obligation is
+    ///   handed to shell so the paired `ShellIdle` (which reads only this
+    ///   marker) gets a second chance to pay it. Unlike the two cases above,
+    ///   the `Working` this fires on can be a REAL agent-emitted one (e.g. a
+    ///   genuine `ToolStart`): the wait promoted a status that has since
+    ///   been legitimately reasserted by the agent, and shell is now the
+    ///   only signal left that still has a claim on it.
+    ///
+    /// So `true` no longer means "this `Working` was synthesized by
+    /// `ShellBusy`" — it means "shell is what this mechanism currently holds
+    /// responsible for the `Working` staying up," which the third writer can
+    /// make true even when the `Working` itself was agent-emitted. See
+    /// `src/daemon_status.rs`'s `*` provenance marker, which reads this field
+    /// and documents the same widened meaning.
+    ///
+    /// Round 4 (reviewer, `wait/monitored/016` case A): cleared by any event
+    /// of a type OTHER than `ShellBusy`/`Unknown`/`MonitoredWaitStart`/
+    /// `MonitoredWaitDone` that ALSO actually asserted a new status (see the
+    /// `asserted_status`-gated trailing block at the bottom of
+    /// `apply_event`) — not, as originally written, by any other event type
+    /// unconditionally. A suppressed, no-op event (e.g. an `Idle` declining
+    /// under `monitored_wait_active`) changed nothing about the current
+    /// status and so has no basis for revoking this mechanism's claim on it —
+    /// clearing on it anyway used to strand a REAL claim on `Working` that
+    /// arrived later, since the intervening no-op had already wiped it.
     ///
     /// Fork issue #21: this travels across a detach/reconnect on
     /// [`SessionSnapshot::shell_synthetic_working`]. It has to — restoring the
@@ -413,6 +490,113 @@ pub struct SessionState {
     /// card permanently unrevertible, because the paired `ShellIdle` reads the
     /// marker, not the status.
     pub shell_synthetic_working: bool,
+    /// PRD #499 (reopened) round 3 (reviewer BLOCKER A / auditor B1): `true`
+    /// while a monitored wait (`wait start <label>`) is outstanding for THIS
+    /// card. Set by the `MonitoredWaitStart` arm in `apply_event`, cleared by
+    /// `MonitoredWaitDone` — both daemon-synthesized, so both the daemon and
+    /// every attached/reconnecting client compute the identical value from
+    /// the same event stream, unlike the round-2 design this replaces (a
+    /// daemon-only `AppState::monitored_waits` map keyed by `pane_id`, which
+    /// an attached client's own `AppState` never populated at all).
+    ///
+    /// Deliberately NOT gated on `status == Working`: a wait started while
+    /// the card is `Thinking`/`WaitingForInput`/etc. still declines to
+    /// promote (see `MonitoredWaitStart`'s `promotable` check) but the wait
+    /// is still genuinely live, and `EventType::Idle`/`ShellIdle` must still
+    /// decline to revert/assert while it is — that's Directions B/C, and
+    /// they don't require `Working` to already hold.
+    ///
+    /// Card-scoped by construction (fixes HIGH C): this lives on the
+    /// SPECIFIC session the event resolves to, not on the pane, so a
+    /// respawn that retires the card the wait was declared against takes
+    /// this flag with it — a successor card's own real events are never
+    /// suppressed by a stale wait recorded against its predecessor.
+    ///
+    /// Travels across a detach/reconnect on
+    /// [`SessionSnapshot::monitored_wait_active`], the same precedent as
+    /// `shell_synthetic_working` (fork issue #21).
+    pub monitored_wait_active: bool,
+    /// PRD #499 (reopened) round 3 (reviewer HIGH B / auditor B2): `true`
+    /// only when the CURRENT [`SessionStatus::Working`] was set by the
+    /// `MonitoredWaitStart` arm's own promotion — the wait's exact analogue
+    /// of `shell_synthetic_working`, kept as a SEPARATE field rather than
+    /// reusing that one because the two mechanisms must be able to tell
+    /// "shell caused this" apart from "the wait caused this": conflating them
+    /// (round 2's `!shell_synthetic_working` revert guard) let `wait done`/
+    /// the TTL sweep revert a real, agent-emitted `Working` it never set
+    /// (MEDIUM F / B2), and let a `ShellBusy` arriving on a wait-held
+    /// `Working` corrupt `shell_synthetic_working`'s own meaning for
+    /// `ShellIdle` (HIGH B).
+    ///
+    /// Round 4 (reviewer, `wait/monitored/016` case A): cleared by any event
+    /// of a type OTHER than `ShellBusy`/`Unknown`/`MonitoredWaitStart`/
+    /// `MonitoredWaitDone` that ALSO actually asserted a new status (the same
+    /// `asserted_status`-gated trailing block that clears
+    /// `shell_synthetic_working`) — not unconditionally on any other type, as
+    /// originally written. So a real event that re-asserts `Working` after a
+    /// wait started (a `ToolStart` mid-wait) drops this mark, and a later
+    /// `wait done`/TTL expiry correctly declines to revert it; a suppressed,
+    /// no-op event does not, since it changed nothing about the current
+    /// status. Also explicitly cleared by `MonitoredWaitDone` itself.
+    ///
+    /// Round 5 (reviewer BLOCKER H): this field alone is NOT sufficient to
+    /// decide whether `MonitoredWaitDone` should revert — it only answers
+    /// "did the wait promote the CURRENT `Working`", which is `false`
+    /// whenever the wait landed on an already-`Working` card. See
+    /// [`SessionState::wait_deferred_revert`] for the complementary signal
+    /// that covers that case, and `MonitoredWaitDone`'s own guard for how the
+    /// two combine.
+    ///
+    /// Travels across a detach/reconnect on
+    /// [`SessionSnapshot::wait_synthetic_working`], gated on
+    /// `status == Working` exactly like `shell_synthetic_working`.
+    pub wait_synthetic_working: bool,
+    /// PRD #499 (reopened) round 3 (reviewer HIGH B, "give shell its own
+    /// descendant-is-currently-busy level state"): `true` while the
+    /// shell-activity monitor's last observation for this pane's descendant
+    /// was busy — set unconditionally by `ShellBusy` (whether or not it
+    /// promoted `status`) and cleared unconditionally by `ShellIdle`.
+    /// Independent of `shell_synthetic_working`/`wait_synthetic_working`,
+    /// which track WHO CAUSED the current `Working`, not whether a shell
+    /// descendant is currently alive.
+    ///
+    /// This is what lets `MonitoredWaitDone` correctly decline to revert a
+    /// wait-held `Working` when a shell descendant became busy on top of it
+    /// (Direction A) WITHOUT touching `shell_synthetic_working` — round 2's
+    /// bug was doing exactly that, which broke `ShellIdle`'s own contract
+    /// ("only revert a status THIS mechanism set").
+    ///
+    /// Travels across a detach/reconnect on
+    /// [`SessionSnapshot::shell_descendant_busy`]; not gated on `status`,
+    /// since it describes a live OS-level fact rather than the provenance of
+    /// a particular status value.
+    pub shell_descendant_busy: bool,
+    /// PRD #499 (reopened) round 5 (reviewer BLOCKER H): `true` when a
+    /// suppressed real signal — the `Idle` arm declining under
+    /// `monitored_wait_active` (Direction C), or `ShellIdle` declining while
+    /// `was_holding` was true (Direction B) — leaves the wait as the only
+    /// live claim standing on a `Working` this mechanism did NOT itself
+    /// promote (`wait_synthetic_working` is `false` because the wait landed
+    /// on an already-`Working` card). Round 3's `MonitoredWaitDone` guard
+    /// (`wait_synthetic_working`) answers "did the wait promote the CURRENT
+    /// `Working`", which is `false` in exactly this shape even though the
+    /// wait is now the last thing that could ever revert it — every other
+    /// signal that could have declined ownership too. This field is the
+    /// hand-off: the declining arm records "a real revert was owed here and
+    /// nothing is left to pay it but the wait", and `MonitoredWaitDone`
+    /// consults it as an alternative to `wait_synthetic_working` rather than
+    /// a replacement for it, so `018`'s "a real event re-asserted `Working`"
+    /// case (which never sets this field) still correctly declines.
+    ///
+    /// Cleared by `MonitoredWaitDone` itself (having consumed it) and by the
+    /// same trailing-block clear that resets `wait_synthetic_working` — a
+    /// real event that re-asserts a status makes the deferred revert moot,
+    /// same reasoning as that field's own doc.
+    ///
+    /// Travels across a detach/reconnect on
+    /// [`SessionSnapshot::wait_deferred_revert`], gated on
+    /// `status == Working` exactly like `wait_synthetic_working`.
+    pub wait_deferred_revert: bool,
     /// PRD fork#378: the agent's self-reported active model, mirrored from
     /// [`AgentEvent::model`]. An event carrying `Some(m)` sets it (a later,
     /// different `m` overwrites — the runtime-change path); an event
@@ -460,6 +644,16 @@ impl SessionState {
             // reconnecting TUI's copy of this card stays revertible by the
             // paired `ShellIdle`.
             shell_synthetic_working: self.shell_synthetic_working,
+            // PRD #499 (reopened) round 3 (reviewer BLOCKER A / auditor B1):
+            // carry the monitored-wait composition state so a reconnecting
+            // client converges on the same Directions A/B/C the daemon does,
+            // the same precedent as `shell_synthetic_working` just above.
+            monitored_wait_active: self.monitored_wait_active,
+            wait_synthetic_working: self.wait_synthetic_working,
+            shell_descendant_busy: self.shell_descendant_busy,
+            // PRD #499 (reopened) round 5 (reviewer BLOCKER H): carry the
+            // deferred-revert hand-off alongside `wait_synthetic_working`.
+            wait_deferred_revert: self.wait_deferred_revert,
             // PRD fork#378 reviewer/audit round 2 (HIGH 1 / F8): carry the
             // known model so a reconnect doesn't silently degrade the badge.
             model: self.model.clone(),
@@ -737,9 +931,82 @@ impl Default for DaemonBootId {
     }
 }
 
+/// PRD #499 (reopened): a role's active declaration that it is still
+/// responsible for noticing an external dependency resolve (`wait start
+/// <label>`) — a second, explicit source of [`SessionStatus::Working`]
+/// alongside the process-derived `shell_synthetic_working` signal. Cleared
+/// by `wait done <label> --outcome ...` (any outcome — M7) or by
+/// [`AppState::sweep_expired_monitored_waits`] once `expires_at` passes with
+/// no explicit clear (M8). Stored in [`AppState::monitored_waits`], keyed by
+/// pane_id — see that field's doc for what it carries and why (label, TTL,
+/// the exact card) versus what round 3 moved onto [`SessionState`] instead
+/// (the composition state itself).
+///
+/// Round 2 (PR #617 round-1 reviewer BLOCKER 1/2/3, HIGH 5): the promotion
+/// itself is applied through [`AppState::apply_event`] (an
+/// `EventType::MonitoredWaitStart`/`MonitoredWaitDone` synthesized event),
+/// the same mechanism `ShellBusy`/`ShellIdle` use — so there is no
+/// `promoted` bookkeeping to recompute or drift here any more (round 1's
+/// BLOCKER 3: a repeated `wait start` recomputed it from the CURRENT status
+/// and silently lost the mark).
+///
+/// Round 3 (reviewer MEDIUM F / auditor B2): whether to revert is decided
+/// fresh, at clear time, from the resolved card's own
+/// [`SessionState::wait_synthetic_working`] (did THIS wait actually assert
+/// the `Working` that's still there, as opposed to a real event
+/// re-asserting it afterwards) composed OR with
+/// [`SessionState::shell_descendant_busy`] (is live shell activity
+/// independently holding the card up — Direction A). Round 2's guard here
+/// was `!shell_synthetic_working`, which reverted any `Working` that merely
+/// wasn't shell-caused, including one a real `ToolStart` asserted after the
+/// wait started — this doc previously claimed the opposite as a settled
+/// property ("a real event that took the status somewhere else … must not
+/// be clobbered"), which was only true for a real event that moved status
+/// AWAY from `Working`, not one that re-asserted it.
+#[derive(Debug, Clone)]
+pub struct MonitoredWait {
+    pub label: String,
+    pub expires_at: Instant,
+    /// The CARD (`SessionState::session_id`) this wait was recorded
+    /// against, resolved via [`AppState::pane_session_id`] once at `wait
+    /// start` time and never re-resolved. HIGH 5: a respawn retires this
+    /// exact id from `AppState::sessions`, so `clear_monitored_wait` /
+    /// `sweep_expired_monitored_waits` checking whether it still exists is
+    /// what makes the wait's provenance die with the card it was declared
+    /// against, rather than silently reattaching to whatever card the pane
+    /// happens to carry when the wait is cleared or expires.
+    pub session_id: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
+    /// PRD #499 (reopened) M3/M5: active monitored waits, keyed by pane_id.
+    ///
+    /// Round 2 review (reviewer BLOCKER A / auditor B1): this map is
+    /// DAEMON-ONLY — nothing in `apply_event` writes it, so an attached
+    /// client's own `AppState` (fed exclusively from the broadcast event
+    /// stream) never learns a wait is live, and the composition rules in
+    /// `apply_event` that read it produced daemon-side-only correctness.
+    /// This doc previously argued that was deliberate, to avoid growing
+    /// [`SessionState`] (whose literal-construction call sites span
+    /// `src/ui.rs` and the render-snapshot test suites) — but that is
+    /// exactly backwards: the client-visibility gap it traded for is the
+    /// bug. `SessionState::monitored_wait_active` (set/cleared by the
+    /// `MonitoredWaitStart`/`MonitoredWaitDone` arms in `apply_event`
+    /// itself) is now the actual composition switch, replicated for free to
+    /// every consumer of the event stream — daemon and attached client
+    /// alike — and card-scoped by construction (fixes HIGH C's respawn
+    /// wedge too, since it lives on the session the event resolves to, not
+    /// on the pane).
+    ///
+    /// This map still exists for what it alone can answer: the label (for
+    /// the mismatch warning), the TTL (`expires_at`, for the sweep), and the
+    /// EXACT card the wait was declared against (`MonitoredWait::session_id`,
+    /// for the HIGH 5 liveness check) — none of which needs to travel to a
+    /// client, since only the daemon ever decides when a wait starts,
+    /// clears, or expires.
+    pub monitored_waits: HashMap<String, MonitoredWait>,
     /// PRD #254: pane ids whose Codex native hook install/trust
     /// (`codex_spawn_prep` in `src/wrap.rs`) is KNOWN to have failed for that
     /// specific pane. Populated in [`Self::apply_event`] from the wrapper-fork
@@ -2469,7 +2736,14 @@ fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
         // that the LLM ever saw a prompt (a human could type it by hand).
         // `Unknown` is the forward-compat catch-all — never proof by
         // construction, matching `SessionStatus::Unknown`'s neutral rendering.
-        EventType::ShellBusy | EventType::ShellIdle | EventType::Unknown => false,
+        // PRD #499 (reopened): a monitored wait is a deliberate declaration
+        // by the role, not evidence the agent itself saw a prompt — same
+        // daemon-synthesized standing as `ShellBusy`/`ShellIdle`.
+        EventType::ShellBusy
+        | EventType::ShellIdle
+        | EventType::MonitoredWaitStart
+        | EventType::MonitoredWaitDone
+        | EventType::Unknown => false,
         // A turn is underway: a submitted prompt, a tool, a subagent, a
         // compaction, or a permission request raised by a tool the agent chose.
         EventType::Thinking
@@ -5059,6 +5333,10 @@ impl AppState {
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
+                wait_deferred_revert: false,
                 model: None,
                 expects_agent_report,
             },
@@ -5141,6 +5419,25 @@ impl AppState {
                 // today's behavior.
                 session.shell_synthetic_working =
                     snap.shell_synthetic_working && session.status == SessionStatus::Working;
+                // PRD #499 (reopened) round 3 (reviewer BLOCKER A / auditor
+                // B1): restore the monitored-wait composition state the same
+                // way — `monitored_wait_active` is NOT gated on `Working`
+                // (see its doc: a wait can be live over Thinking/
+                // WaitingForInput too), while `wait_synthetic_working`
+                // mirrors `shell_synthetic_working`'s gate exactly, since
+                // both are provenance for the SAME status field.
+                // `shell_descendant_busy` is a live OS-level fact, not a
+                // provenance flag, so it is restored unconditionally too.
+                session.monitored_wait_active = snap.monitored_wait_active;
+                session.wait_synthetic_working =
+                    snap.wait_synthetic_working && session.status == SessionStatus::Working;
+                session.shell_descendant_busy = snap.shell_descendant_busy;
+                // PRD #499 (reopened) round 5 (reviewer BLOCKER H): restore
+                // the deferred-revert hand-off gated identically to
+                // `wait_synthetic_working` — it is provenance for the same
+                // `Working` value.
+                session.wait_deferred_revert =
+                    snap.wait_deferred_revert && session.status == SessionStatus::Working;
                 // PRD #20 blocker-4: restore the durable live-target so a
                 // history-only / view-only card keeps refusing input right
                 // after reconnect, before any new event re-declares it. The
@@ -5358,6 +5655,19 @@ impl AppState {
             // `seed_hydrated_session` applies: it may only qualify a `Working`.
             session.shell_synthetic_working =
                 snap.shell_synthetic_working && session.status == SessionStatus::Working;
+            // PRD #499 (reopened) round 3: same treatment for the
+            // monitored-wait composition state — see
+            // `seed_hydrated_session`'s identical block for why each field's
+            // gate differs.
+            session.monitored_wait_active = snap.monitored_wait_active;
+            session.wait_synthetic_working =
+                snap.wait_synthetic_working && session.status == SessionStatus::Working;
+            session.shell_descendant_busy = snap.shell_descendant_busy;
+            // PRD #499 (reopened) round 5: same treatment for the
+            // deferred-revert hand-off — see `seed_hydrated_session`'s
+            // identical block.
+            session.wait_deferred_revert =
+                snap.wait_deferred_revert && session.status == SessionStatus::Working;
             // PRD #20 blocker-4: the durable live-target lives in
             // `recent_events`, so restamp it ONLY when it actually differs —
             // re-pushing an identical carrier on every reconnect would evict
@@ -5445,6 +5755,25 @@ impl AppState {
         self.orchestrator_pane_ids.remove(pane_id);
         self.pane_orchestration_map.remove(pane_id);
         self.codex_hook_trust_failed.remove(pane_id);
+        // PRD #499 (reopened) round 3 (reviewer B3 / auditor B3): round 2
+        // added an eager `self.monitored_waits.remove(pane_id)` here (see the
+        // superseded comment this replaces), reasoning that a torn-down
+        // pane's wait must not linger until the TTL sweep. That reasoning
+        // does not hold for THIS method specifically: `unregister_pane` is
+        // called WITHOUT `remove_sessions_for_pane` at most of its call
+        // sites (including the daemon-side `StopAgent` handler), so the
+        // card the wait was declared against can survive this call — and a
+        // lost `SessionEnd` (a documented real occurrence, see
+        // `src/agent_pty.rs`) means nothing else ever removes it either.
+        // Eagerly dropping the `monitored_waits` entry here removed the
+        // ONLY thing that could still heal that surviving card: the TTL
+        // sweep's own HIGH-5 guard checks `self.sessions.contains_key(&wait.session_id)`,
+        // which is true precisely when the card survives — so leaving the
+        // entry in place is what lets the sweep revert it correctly instead
+        // of the card wedging `Working` forever with no wait left to expire
+        // it. `remove_sessions_for_pane` below is the one that provably
+        // takes the card down WITH the wait, so the eager removal stays
+        // there.
     }
 
     /// Drop EVERY session belonging to `pane_id`, returning how many went.
@@ -5474,6 +5803,16 @@ impl AppState {
         for id in doomed {
             self.sessions.remove(&id);
         }
+        // PRD #499 (reopened) round 2 (reviewer MEDIUM 6 / auditor A4),
+        // narrowed in round 3 (auditor B3): unlike `unregister_pane`, THIS
+        // method provably removes every card the pane could have carried —
+        // so a monitored wait recorded against any of them has no card left
+        // to survive it, and dropping the entry here eagerly cannot strand
+        // a still-live card the way doing it in `unregister_pane` did (see
+        // that method's doc). Idempotent either way: a second `remove` on
+        // an already-absent key (e.g. `src/ui.rs`'s real close, which calls
+        // this alongside `unregister_pane`) is a no-op.
+        self.monitored_waits.remove(pane_id);
         n
     }
 
@@ -6251,6 +6590,230 @@ impl AppState {
         }
     }
 
+    /// PRD #499 (reopened) round 2: build the synthesized `AgentEvent` for a
+    /// monitored-wait transition against the given (already-resolved) card,
+    /// mirroring exactly how the shell-activity monitor builds its
+    /// `ShellBusy`/`ShellIdle` events (`run_shell_activity_monitor_with`,
+    /// `src/daemon.rs`) — same `agent_type: AgentType::None`, same "carry
+    /// the card's own `agent_id` so an attached TUI's reuse guard remaps
+    /// onto the right card instead of minting a phantom session" reasoning
+    /// (PR #617 round-1 reviewer BLOCKER 1).
+    ///
+    /// Round 3 (reviewer HIGH D): `card_session_id` (the CARD id, e.g. from
+    /// [`Self::pane_session_id`] or [`MonitoredWait::session_id`]) is used
+    /// ONLY to look up the card's `agent_id` — the emitted event's own
+    /// `AgentEvent.session_id` is resolved via [`Self::pane_hook_session_id`]
+    /// instead, exactly as `run_shell_activity_monitor_with` resolves it for
+    /// `ShellBusy`/`ShellIdle`. The two diverge after a same-agent `/clear`:
+    /// the card id is deliberately kept STABLE across it for UI continuity,
+    /// while `pane_hook_session_id` is the pane's latest hook GENERATION and
+    /// the authoritative value the write-and-submit guard's monotonic
+    /// invariant compares against (`apply_event`'s generation-advance
+    /// block). Stamping the card id there let a `wait start` issued after a
+    /// `/clear` move that generation BACKWARDS onto the superseded
+    /// conversation. Falls back to the card id only in the (today
+    /// unreachable) case where no hook generation is recorded at all — the
+    /// same qualifying event that resolves `card_session_id` via
+    /// `pane_session_id` also establishes `pane_hook_session_id`, so this is
+    /// a safety net, not the common path.
+    fn monitored_wait_event(
+        &self,
+        pane_id: &str,
+        card_session_id: &str,
+        event_type: EventType,
+    ) -> Option<AgentEvent> {
+        let agent_id = self.sessions.get(card_session_id)?.agent_id.clone();
+        let session_id = self
+            .pane_hook_session_id(pane_id)
+            .unwrap_or_else(|| card_session_id.to_string());
+        Some(AgentEvent {
+            session_id,
+            agent_type: AgentType::None,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        })
+    }
+
+    /// PRD #499 (reopened) M3/M8: declare a monitored external wait for
+    /// `pane_id` (`wait start <label>`) — a second, explicit source of
+    /// [`SessionStatus::Working`] alongside the process-derived
+    /// `shell_synthetic_working` signal (PRD fork#370/#386), so a role that
+    /// is polling an external dependency in discrete steps (not one
+    /// sustained foreground call) reads `Working` throughout, and so does a
+    /// role whose own delegated task already reported done but is still
+    /// responsible for noticing an outcome.
+    ///
+    /// Round 2 (PR #617 round-1 reviewer BLOCKER 1/2/3, HIGH 5): routes the
+    /// promotion through [`Self::apply_event`] via a synthesized
+    /// `EventType::MonitoredWaitStart`, the same mechanism the shell-activity
+    /// monitor uses for `ShellBusy` — rather than mutating `status` directly.
+    /// That gets the existing composition/precedence logic for free (BLOCKER
+    /// 2), fixes the broadcast gap (BLOCKER 1 — the caller broadcasts the
+    /// returned event on `event_tx`, see `src/daemon.rs`), and removes the
+    /// separate `promoted` bookkeeping that BLOCKER 3 showed was unsafe to
+    /// recompute on a repeated `start` (a refreshing `wait start` just
+    /// re-applies the same idempotent promotion and refreshes the TTL below).
+    ///
+    /// The card (`session_id`) resolved *now*, at declare time, is stored on
+    /// the returned [`MonitoredWait`] and used verbatim by
+    /// [`Self::clear_monitored_wait`]/[`Self::sweep_expired_monitored_waits`]
+    /// — never re-resolved via [`Self::pane_session_id`] later, which is what
+    /// let round 1's design reattach a stale wait's provenance to a
+    /// respawned pane's NEW card (HIGH 5).
+    ///
+    /// No-ops (with a warning), recording nothing, when `pane_id` names no
+    /// known session yet — same posture as `run_shell_activity_monitor`'s "a
+    /// bare shell pane that has never emitted a single agent event has no
+    /// `SessionState` to update at all." Returns the applied event (for the
+    /// caller to broadcast) on success.
+    pub fn start_monitored_wait(
+        &mut self,
+        pane_id: &str,
+        label: String,
+        ttl: Duration,
+    ) -> Option<AgentEvent> {
+        let Some(session_id) = self.pane_session_id(pane_id) else {
+            warn!(
+                pane_id = %pane_id,
+                label = %label,
+                "wait start: no known session for this pane yet"
+            );
+            return None;
+        };
+        let event =
+            self.monitored_wait_event(pane_id, &session_id, EventType::MonitoredWaitStart)?;
+        self.apply_event(event.clone());
+        self.monitored_waits.insert(
+            pane_id.to_string(),
+            MonitoredWait {
+                label,
+                // Auditor A2: `Instant::now() + ttl` panics on overflow.
+                // `daemon.rs`'s `MAX_WAIT_TTL_SECS` clamp (A1) makes this
+                // unreachable in practice, but `checked_add` with a bounded
+                // fallback avoids depending on the clamp alone to prevent a
+                // crash on this path.
+                expires_at: Instant::now()
+                    .checked_add(ttl)
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(60)),
+                session_id,
+            },
+        );
+        Some(event)
+    }
+
+    /// PRD #499 (reopened) M7: clear a previously declared monitored wait
+    /// (`wait done <label> --outcome ...`). Every terminal outcome clears it
+    /// identically — the daemon's status computation draws no distinction
+    /// between success/failure/cancelled/timeout, only the caller's own
+    /// bookkeeping does, so `outcome` is accepted for logging only.
+    ///
+    /// A pane carries at most one monitored wait at a time, so this clears
+    /// whichever is active; `label` is compared only to warn on a mismatch,
+    /// never to refuse the clear — refusing would risk exactly the
+    /// stale-claim wedge (PRD #421/#464) M7/M8 exist to rule out.
+    ///
+    /// Round 2 HIGH 5: reverts against the EXACT card `start_monitored_wait`
+    /// recorded (`wait.session_id`), never re-resolving the pane's CURRENT
+    /// card — if that card no longer exists (retired by a respawn since
+    /// `wait start`), the wait's provenance dies with it: nothing is
+    /// reverted, and no phantom session is resurrected under the stale id.
+    /// Returns the applied event (for the caller to broadcast) when a live
+    /// wait was actually cleared.
+    pub fn clear_monitored_wait(
+        &mut self,
+        pane_id: &str,
+        label: &str,
+        outcome: WaitOutcome,
+    ) -> Option<AgentEvent> {
+        let Some(wait) = self.monitored_waits.remove(pane_id) else {
+            warn!(
+                pane_id = %pane_id,
+                label = %label,
+                "wait done: no active monitored wait for this pane"
+            );
+            return None;
+        };
+        if wait.label != label {
+            warn!(
+                pane_id = %pane_id,
+                active_label = %wait.label,
+                done_label = %label,
+                "wait done: label does not match the pane's active monitored wait; \
+                 clearing it anyway"
+            );
+        }
+        if !self.sessions.contains_key(&wait.session_id) {
+            tracing::debug!(
+                pane_id = %pane_id,
+                session_id = %wait.session_id,
+                "wait done: the card this wait was recorded against no longer exists \
+                 (respawned or retired) — nothing to revert"
+            );
+            return None;
+        }
+        let event =
+            self.monitored_wait_event(pane_id, &wait.session_id, EventType::MonitoredWaitDone)?;
+        self.apply_event(event.clone());
+        tracing::debug!(
+            pane_id = %pane_id,
+            label = %label,
+            outcome = ?outcome,
+            "wait done: cleared monitored wait"
+        );
+        Some(event)
+    }
+
+    /// PRD #499 (reopened) M8: self-healing TTL sweep, called on a periodic
+    /// tick by the daemon's monitored-wait poll loop
+    /// (`run_monitored_wait_sweep` in `src/daemon.rs`). A wait past its TTL
+    /// stops contributing to `Working` without an explicit `wait done` —
+    /// the mitigation the PRD's Risks table requires so this mechanism can
+    /// never wedge a pane `Working` forever the way an unclearable stale
+    /// claim would (PRD #421/#464).
+    ///
+    /// Round 2 (HIGH 5, same fix as [`Self::clear_monitored_wait`]): reverts
+    /// against the EXACT card the wait was recorded against, and does
+    /// nothing if that card no longer exists. Returns the applied events
+    /// (for the caller to broadcast — BLOCKER 1's fix extends to the
+    /// self-heal path too, so a reconnected client's dashboard also sees a
+    /// TTL expiry, not only an explicit `wait done`).
+    pub fn sweep_expired_monitored_waits(&mut self) -> Vec<AgentEvent> {
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .monitored_waits
+            .iter()
+            .filter(|(_, wait)| now >= wait.expires_at)
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect();
+        let mut events = Vec::new();
+        for pane_id in expired {
+            let Some(wait) = self.monitored_waits.remove(&pane_id) else {
+                continue;
+            };
+            if !self.sessions.contains_key(&wait.session_id) {
+                continue;
+            }
+            if let Some(event) =
+                self.monitored_wait_event(&pane_id, &wait.session_id, EventType::MonitoredWaitDone)
+            {
+                self.apply_event(event.clone());
+                events.push(event);
+            }
+        }
+        events
+    }
+
     /// PRD #284: does `event` carry enough evidence to supersede `session`'s
     /// generation on the pane they share?
     ///
@@ -6999,6 +7562,10 @@ impl AppState {
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
+                wait_deferred_revert: false,
                 model: event.model.clone(),
                 expects_agent_report: false,
             });
@@ -7111,6 +7678,15 @@ impl AppState {
         // arm reports for itself rather than being classified from outside,
         // because "does this event type write a status" is a property of the
         // arm's own conditional and drifts the moment one is edited.
+        //
+        // PRD #499 (reopened) round 3 (reviewer LOW G): Direction C's `Idle`
+        // arm below declines to ASSERT a status while a wait is active, but a
+        // real, identified `Idle` still proves the producer's identity — so
+        // it must still be allowed to clear `untagged_status_panes` (issues
+        // #262/#398) even though it isn't the frame that wrote the current
+        // status. Set only by that arm; consulted alongside `asserted_status`
+        // in the provenance bookkeeping at the bottom of this function.
+        let mut force_clear_untagged_provenance = false;
         let asserted_status = match event.event_type {
             EventType::SessionStart => {
                 session.status = SessionStatus::Idle;
@@ -7178,9 +7754,45 @@ impl AppState {
                 true
             }
             EventType::Idle => {
-                session.status = SessionStatus::Idle;
                 session.active_tool = None;
-                true
+                // PRD #499 (reopened) BLOCKER 2 Direction C: a role's own
+                // Stop-hook Idle must not undo an outstanding monitored
+                // wait — the whole point of the mechanism is a role that
+                // already reported its own delegated task done but is
+                // still responsible for noticing an external outcome.
+                //
+                // Round 3 (reviewer BLOCKER A / auditor B1): read from the
+                // CARD this event resolves to, not a daemon-only pane-keyed
+                // map — see `SessionState::monitored_wait_active`'s doc.
+                if session.monitored_wait_active {
+                    // LOW G: the status write is suppressed, but a real,
+                    // identified `Idle` still proves this producer's
+                    // identity, so let it clear the untagged-provenance mark
+                    // even though it isn't asserting a new status.
+                    if !provenance_untagged {
+                        force_clear_untagged_provenance = true;
+                    }
+                    // Round 5 (reviewer BLOCKER H, wedge 1): this real Idle
+                    // is being swallowed for good — the agent will not emit
+                    // another one for this turn. If the wait itself never
+                    // promoted the current `Working` (it landed on an
+                    // already-Working card), `wait_synthetic_working` is
+                    // false and `MonitoredWaitDone` would otherwise have
+                    // nothing left to revert. Hand the obligation to the
+                    // wait: it is now the last live signal standing.
+                    //
+                    // Round 6 (reviewer LOW K): gated on `status == Working`
+                    // to match the field's own doc — there is no revert owed
+                    // here at all unless a `Working` is actually what this
+                    // swallowed `Idle` is standing in for.
+                    if session.status == SessionStatus::Working {
+                        session.wait_deferred_revert = true;
+                    }
+                    false
+                } else {
+                    session.status = SessionStatus::Idle;
+                    true
+                }
             }
             EventType::Compacting => {
                 session.status = SessionStatus::Compacting;
@@ -7202,23 +7814,225 @@ impl AppState {
                 // is evidence the pane is busy, not evidence of what kind of
                 // busy, so it only fills the gap where nothing more specific
                 // is already known.
-                let asserted =
+                //
+                // Round 3 (reviewer HIGH B): record "a shell descendant is
+                // currently observed busy" UNCONDITIONALLY, whether or not it
+                // promotes `status` — this is a level-state fact about the
+                // OS-level scan, not provenance of a status write, and
+                // `MonitoredWaitDone` below needs it to know a wait-held
+                // `Working` is independently still live without corrupting
+                // `shell_synthetic_working`'s own meaning (round 2's bug: it
+                // set that marker here even when shell did not cause the
+                // current `Working`, which broke `ShellIdle`'s "only revert
+                // what THIS mechanism set" contract — HIGH B / B2).
+                session.shell_descendant_busy = true;
+                let promotable =
                     matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown);
-                if asserted {
+                if promotable {
                     session.status = SessionStatus::Working;
                     session.shell_synthetic_working = true;
+                } else if session.status == SessionStatus::Working
+                    && (session.wait_synthetic_working || session.wait_deferred_revert)
+                {
+                    // Round 5 (reviewer BLOCKER H, wedge 2): the wait
+                    // promoted this `Working`, and shell is now ALSO
+                    // observed busy on top of it — re-acquire the claim
+                    // rather than let it sit stranded on the wait, which is
+                    // about to be cleared by `wait done` without ever
+                    // reverting (Direction A). Safe in a way round 2's
+                    // unconditional `shell_synthetic_working = true` was not:
+                    // this fires only when the current `Working` is provably
+                    // owed to the wait — either `wait_synthetic_working`
+                    // (the wait promoted it) or `wait_deferred_revert` (an
+                    // `Idle`/`ShellIdle` already handed the wait a revert it
+                    // owed) — never on a real agent-emitted `Working` (both
+                    // are `false` there), so it cannot reintroduce HIGH B's
+                    // clobber.
+                    //
+                    // Round 6 (reviewer BLOCKER I): gating on
+                    // `wait_synthetic_working` alone left `wait_deferred_revert`
+                    // stranded — a `ShellIdle` decline (wedge 3) hands the
+                    // obligation to the wait via `wait_deferred_revert`, and if
+                    // the descendant then comes back busy before
+                    // `MonitoredWaitDone` fires, this branch reclaims that
+                    // hand-off too, not just the `wait_synthetic_working` half.
+                    // Clear both: whichever of the two was actually set is the
+                    // one that mattered, and clearing the other is a no-op.
+                    //
+                    // This widening is defensive symmetry with
+                    // `MonitoredWaitDone`'s own Direction-A hand-off, not
+                    // what closes wedge 4b (round 7, LOW N): traced both
+                    // with and without this branch, and no revert outcome
+                    // differs — `MonitoredWaitDone`'s hand-off is what
+                    // actually closes 4b, whether or not this branch fires
+                    // first. The only observable difference is presentational
+                    // (`worker-agent-deck status` prints `Working*` sooner).
+                    // Do not read this branch as load-bearing for 4b.
+                    session.shell_synthetic_working = true;
+                    session.wait_synthetic_working = false;
+                    session.wait_deferred_revert = false;
                 }
-                asserted
+                promotable
             }
             EventType::ShellIdle => {
                 // PRD #370 M2: only revert a status THIS mechanism set — see
                 // `shell_synthetic_working`'s doc comment. If a real event
                 // already took over (marker false), the detached descendant
                 // going away is not proof the agent itself went idle.
-                let asserted = session.shell_synthetic_working;
+                //
+                // PRD #499 (reopened) BLOCKER 2 Direction B: even when this
+                // mechanism DID set it, never revert while a monitored wait
+                // is independently outstanding for this CARD — OR
+                // composition means the other live signal still holds.
+                // Round 3 (reviewer BLOCKER A / auditor B1): card-scoped via
+                // `SessionState::monitored_wait_active`, not the old
+                // daemon-only pane-keyed map.
+                let was_holding = session.shell_synthetic_working;
+                session.shell_synthetic_working = false;
+                session.shell_descendant_busy = false;
+                let asserted = was_holding
+                    && !session.monitored_wait_active
+                    && session.status == SessionStatus::Working;
                 if asserted {
                     session.status = SessionStatus::Idle;
+                } else if was_holding && session.monitored_wait_active {
+                    // Round 5 (reviewer BLOCKER H, wedge 3): shell WAS the one
+                    // holding this `Working` up, but declines to revert
+                    // because the wait is independently outstanding
+                    // (Direction B) — and the unconditional clear just above
+                    // destroys shell's own claim on its way out. Hand the
+                    // obligation to the wait: it is next in line and, if it
+                    // never promoted this `Working` itself
+                    // (`wait_synthetic_working` false, having landed on an
+                    // already-Working card), it otherwise has nothing to
+                    // revert with once it is the last signal standing.
+                    //
+                    // Round 7 (reviewer LOW O): gated on `status == Working`
+                    // to match the sibling guard `Idle`'s decline branch got
+                    // in round 6 (LOW K), for the same reason — there is no
+                    // revert owed unless a `Working` is actually what's
+                    // being declined. Provably a no-op today: this field is
+                    // only ever set alongside `shell_descendant_busy`, and
+                    // only this `ShellIdle` arm clears `shell_descendant_busy`
+                    // (in the same arm that clears this field) — so nothing
+                    // can move `status` off `Working` without first asserting
+                    // through the trailing block, which clears `was_holding`'s
+                    // source. `was_holding == true` therefore already implies
+                    // `status == Working` here. Keep the guard anyway: two
+                    // sibling decline sites with different guards, one only
+                    // safe by an unwritten invariant, is exactly the
+                    // asymmetry that produced BLOCKER I.
+                    if session.status == SessionStatus::Working {
+                        session.wait_deferred_revert = true;
+                    }
                 }
+                asserted
+            }
+            EventType::MonitoredWaitStart => {
+                // PRD #499 (reopened) M3: mirrors `ShellBusy`'s exact
+                // precedence — only promote a stale/no-opinion status, never
+                // clobber a real agent-emitted one.
+                //
+                // Round 3 (reviewer BLOCKER A / auditor B1): the wait is now
+                // live for THIS card via `monitored_wait_active`, set
+                // unconditionally (whether or not this promotes `status`,
+                // mirroring `shell_descendant_busy` above) — replicated to
+                // every consumer of the event stream since this arm runs
+                // identically wherever the event is applied, not only on the
+                // daemon that decided to start the wait.
+                //
+                // Auditor round 4 (C1, accepted trade-off): this write is
+                // reachable from any well-formed `AgentEvent` on the same-uid
+                // hook socket, including a forged `monitored_wait_start` that
+                // creates no `monitored_waits` entry — so the resulting
+                // `Idle`/`ShellIdle` veto is bounded by the card's lifetime
+                // rather than by the TTL sweep. Deliberately accepted rather
+                // than re-gated server-side (that reopens BLOCKER A): the
+                // same-uid trust boundary is unchanged, nothing
+                // security-relevant keys on `SessionStatus::Idle`, and the
+                // card's own role can heal it with a real `wait start`
+                // followed by `wait done`. See PRD #499's PR discussion
+                // (round 4 auditor findings) for the full analysis.
+                session.monitored_wait_active = true;
+                let promotable =
+                    matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown);
+                if promotable {
+                    session.status = SessionStatus::Working;
+                    // Round 3 (reviewer HIGH B / MEDIUM F / auditor B2): record
+                    // that THIS mechanism is what asserted the current
+                    // `Working`, mirroring `shell_synthetic_working` — so a
+                    // later `wait done`/TTL expiry can tell "the wait's own
+                    // promotion" apart from "a real event re-asserted Working
+                    // after the wait started" and never revert the latter.
+                    session.wait_synthetic_working = true;
+                }
+                promotable
+            }
+            EventType::MonitoredWaitDone => {
+                // PRD #499 (reopened) M7: only revert a `Working` this wait
+                // itself asserted, and only when live shell activity isn't
+                // independently holding it up (OR composition, Direction A).
+                // The caller (`clear_monitored_wait`/
+                // `sweep_expired_monitored_waits`) already resolved this
+                // event against the EXACT card the wait was recorded
+                // against and confirmed that card still exists (HIGH 5) —
+                // this arm only decides whether to revert its status.
+                //
+                // Round 3 (reviewer HIGH B / MEDIUM F / auditor B2):
+                // `wait_synthetic_working`, not `!shell_synthetic_working` —
+                // the old guard reverted ANY `Working` that wasn't
+                // shell-caused, including one a real `ToolStart` asserted
+                // after the wait started. `wait_synthetic_working` is
+                // cleared by any real event in between (see the trailing
+                // block below), so it accurately answers "did THIS wait
+                // write the Working that's still there".
+                //
+                // `!session.shell_descendant_busy` closes Direction A
+                // without touching `shell_synthetic_working`: a shell
+                // descendant that became busy while the wait held `Working`
+                // keeps the card up after the wait clears, and does so via
+                // its own independent level-state rather than by
+                // misattributing the `Working` to shell.
+                //
+                // Round 5 (reviewer BLOCKER H): `wait_synthetic_working` only
+                // answers "did the wait promote the CURRENT Working" — it is
+                // `false` when the wait landed on an already-Working card, so
+                // relying on it alone left three sequences (wedges 1-3)
+                // wedged forever once the wait becomes the last live signal
+                // standing. `wait_deferred_revert` is the hand-off the
+                // `Idle`/`ShellIdle` decline branches set for exactly that
+                // case: "a real revert was owed here and nothing is left to
+                // pay it but the wait". Consulted as an ALTERNATIVE to
+                // `wait_synthetic_working`, not a replacement — `018`'s "a
+                // real event re-asserted Working" case never sets it (the
+                // trailing block clears it there, same as
+                // `wait_synthetic_working`), so that case still correctly
+                // declines.
+                session.monitored_wait_active = false;
+                let owed = session.wait_synthetic_working || session.wait_deferred_revert;
+                let owed_on_working = session.status == SessionStatus::Working && owed;
+                let asserted = owed_on_working && !session.shell_descendant_busy;
+                if asserted {
+                    session.status = SessionStatus::Idle;
+                } else if owed_on_working {
+                    // Round 6 (reviewer BLOCKER I, wedge 4): `owed_on_working`
+                    // is true here only because `shell_descendant_busy` is
+                    // what's blocking `asserted` (Direction A's own decline
+                    // reason) — the wait's revert obligation is real, just
+                    // not payable yet. Clearing `wait_deferred_revert`/
+                    // `wait_synthetic_working` unconditionally below would
+                    // drop that obligation with nothing left to pay it: the
+                    // paired `ShellIdle` reads `shell_synthetic_working` for
+                    // `was_holding`, not either wait marker, and by the time
+                    // it arrives `monitored_wait_active` is already false, so
+                    // it has no second chance to re-derive the obligation.
+                    // Hand it to shell now, exactly like `ShellBusy`'s
+                    // re-acquire branch does when the order runs the other
+                    // way (wait marker set before shell re-observes busy).
+                    session.shell_synthetic_working = true;
+                }
+                session.wait_synthetic_working = false;
+                session.wait_deferred_revert = false;
                 asserted
             }
             EventType::Unknown => {
@@ -7229,12 +8043,13 @@ impl AppState {
             EventType::SessionEnd => unreachable!(),
         };
 
-        // PRD #370 M2: any REAL event other than `ShellBusy` clears the
-        // synthetic marker — a real, agent-emitted event (or a completed
-        // `ShellIdle` revert) means the CURRENT status is no longer "the
-        // daemon guessed Working from the OS-level descendant scan alone," so a
-        // later out-of-order/duplicate `ShellIdle` must not revert a real
-        // status back to `Idle`.
+        // PRD #370 M2, superseded by round 4 below: an event that actually
+        // asserted a new status (`asserted_status`), and whose type isn't one
+        // of the four synthetic/informational exclusions, clears the
+        // synthetic markers — such an event means the CURRENT status is no
+        // longer "the daemon guessed Working from the OS-level descendant
+        // scan alone," so a later out-of-order/duplicate `ShellIdle` must not
+        // revert a real status back to `Idle`.
         //
         // Greptile review: `Unknown` must be excluded from the clear, same
         // as `ShellBusy` — it is the `#[serde(other)]` catch-all for a
@@ -7244,8 +8059,56 @@ impl AppState {
         // and permanently strand the session at `Working` (the `ShellIdle`
         // would see the marker already false and become a no-op) — exactly
         // the silent-break `#[serde(other)]` exists to prevent.
-        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
+        //
+        // PRD #499 (reopened): `MonitoredWaitStart`/`MonitoredWaitDone` are
+        // excluded for the identical reason — they are daemon-synthesized,
+        // not agent-emitted, so they must not blow away shell's own
+        // provenance either direction (BLOCKER 2's composition requires
+        // each signal's marker to survive the OTHER signal's events).
+        //
+        // Round 3 (reviewer HIGH B / MEDIUM F / auditor B2): `wait_synthetic_working`
+        // gets the identical clear, under the identical exclusion set — a
+        // real event between a `wait start` and its `wait done`/TTL expiry
+        // (a `ToolStart` re-asserting `Working`) must drop the wait's claim
+        // on the CURRENT `Working` exactly as it drops shell's, so neither
+        // mechanism can later revert a status a real event has since
+        // reasserted.
+        //
+        // Round 4 (tester `wait/monitored/016` case A): the type exclusion
+        // above is necessary but not sufficient. It stops `ShellBusy` and
+        // `MonitoredWaitStart` from wiping the marker THEY just set one arm
+        // up, but every other type cleared unconditionally regardless of
+        // whether its own match arm actually changed anything — so a
+        // SUPPRESSED, no-op `Idle` (Direction C declines to write status
+        // while `monitored_wait_active` is true) still wiped
+        // `wait_synthetic_working`, and a later `wait done` then read that
+        // marker as already-false and declined to revert, leaving the pane
+        // wedged `Working` forever with `monitored_wait_active` cleared too
+        // (nothing left standing that could ever revert it). `ShellIdle` has
+        // the identical gap via its own `was_holding` decline. Gate on
+        // `asserted_status` (this arm's own already-computed verdict) as
+        // well as the type: an event that changed nothing about the CURRENT
+        // status has no basis for revoking another mechanism's claim on it.
+        //
+        // Round 5 (reviewer BLOCKER H): `wait_deferred_revert` gets the
+        // identical clear, under the identical exclusion set and gate — a
+        // real event that re-asserts `Working` after the `Idle`/`ShellIdle`
+        // decline set the deferred-revert hand-off must drop it exactly as
+        // it drops `wait_synthetic_working`, or a later `wait done` would
+        // revert a `Working` a real event has since reasserted (the same
+        // failure MEDIUM F/B2 fixed for `wait_synthetic_working` itself).
+        if asserted_status
+            && !matches!(
+                event.event_type,
+                EventType::ShellBusy
+                    | EventType::Unknown
+                    | EventType::MonitoredWaitStart
+                    | EventType::MonitoredWaitDone
+            )
+        {
             session.shell_synthetic_working = false;
+            session.wait_synthetic_working = false;
+            session.wait_deferred_revert = false;
         }
 
         // PRD #361 Item 1: the marker is only meaningful while WaitingForInput
@@ -7284,7 +8147,15 @@ impl AppState {
         // frame. A frame that asserted nothing changes nothing here, so it can
         // neither launder an untagged status into a trusted one nor cast doubt
         // on a status it did not write.
-        if asserted_status && let Some(pane_id) = provenance_pane {
+        //
+        // Round 3 (reviewer LOW G): `force_clear_untagged_provenance` widens
+        // this to a real, identified `Idle` that Direction C suppressed —
+        // see the `Idle` arm above. It is only ever set together with
+        // `!provenance_untagged`, so it can only ever take the `remove`
+        // branch below, never the `insert` one.
+        if (asserted_status || force_clear_untagged_provenance)
+            && let Some(pane_id) = provenance_pane
+        {
             if provenance_untagged {
                 self.untagged_status_panes.insert(pane_id);
             } else {
@@ -11015,6 +11886,10 @@ clear = false
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
+                wait_deferred_revert: false,
                 model: None,
                 expects_agent_report: false,
             },
@@ -12015,6 +12890,10 @@ clear = false
             last_user_prompt: None,
             live_target: None,
             shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
+            wait_deferred_revert: false,
             model: None,
         };
         let mut state = AppState::default();

@@ -814,6 +814,18 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #499 (reopened) M8: unconditional, like the shell-activity monitor
+    // above — every daemon needs the self-healing sweep regardless of
+    // idle-shutdown config, since an abandoned `wait start` has to expire
+    // even on a daemon nobody is attached to.
+    let monitored_wait_sweep_handle = {
+        let sweep_state = state.clone();
+        let sweep_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            run_monitored_wait_sweep(sweep_state, sweep_event_tx).await;
+        })
+    };
+
     let result = run_hook_loop(
         listener,
         state,
@@ -831,6 +843,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     shell_activity_handle.abort();
+    monitored_wait_sweep_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -1482,8 +1495,12 @@ async fn run_shell_activity_monitor_with<S, F>(
     // always that is harmless (`descendant_shell_activity` returns `None` for a
     // pid the table lacks, so the pane is skipped), but under pid reuse a new
     // pane inherits a dead process's descendants and, because `last_known` has no
-    // entry for it yet, that wrong reading emits immediately. So a table older
-    // than `MAX_TABLE_AGE` is discarded rather than trusted.
+    // entry for it yet, that wrong reading emits immediately IF it reads busy.
+    // (PRD #499 round 2: a first-ever reading of `busy=false` is intentionally
+    // suppressed below — see the `None => busy` check — so this residual is
+    // now bounded to the busy-reads-busy case; it no longer applies to the
+    // idle side at all.) So a table older than `MAX_TABLE_AGE` is discarded
+    // rather than trusted.
     // Carries the candidate set as it was when the sample STARTED alongside it,
     // so a late answer can be checked against the panes it could actually have
     // observed rather than against whatever is open when it lands — see the
@@ -1818,7 +1835,28 @@ async fn run_shell_activity_monitor_with<S, F>(
         last_known.retain(|pane_id, _| live_candidates.contains(pane_id.as_str()));
 
         for (pane_id, busy) in snapshot.statuses {
-            let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);
+            let previous = last_known.insert(pane_id.clone(), busy);
+            // PRD #499 (reopened) round 2: a pane's FIRST-EVER scan (no
+            // `last_known` entry yet) reading `busy=false` is not a
+            // transition worth reporting — the pane was never observed
+            // busy, so there is nothing for a `ShellIdle` to correct. Only
+            // suppress the `false` half: a pane that is ALREADY busy on its
+            // very first scan still needs the rising-edge `ShellBusy` (the
+            // whole PRD #386 M6b point), so `None` only reads as "unchanged"
+            // when the new reading agrees with the implicit prior "not
+            // busy" baseline. Before this, every newly-registered pane's
+            // first tick unconditionally emitted a `ShellIdle` — cosmetic
+            // noise for a pane that never ran anything, and (found via
+            // `wait/monitored/011`) a genuine race against a monitored
+            // wait's composition: that spurious real `ShellIdle` could land
+            // between a `ShellBusy` and a later `wait done`, clearing
+            // `shell_synthetic_working` out from under BLOCKER 2 Direction
+            // A's OR composition for reasons that had nothing to do with
+            // the pane's actual shell activity.
+            let changed = match previous {
+                Some(prev) => prev != busy,
+                None => busy,
+            };
 
             // Cheap path, and the overwhelmingly common one: a pane whose scan
             // reads idle and whose reading did not just change has nothing to
@@ -1974,6 +2012,95 @@ async fn run_shell_activity_monitor_with<S, F>(
             // write-lock hold), exactly as the hook loop below does it — see
             // `ingest_event` for the interleaving this closes.
             ingest_event(&state, &event_tx, event).await;
+        }
+    }
+}
+
+/// PRD #499 (reopened) round 2 (auditor A1): the daemon-enforced ceiling on
+/// a `wait start`'s TTL, applied at the `DaemonMessage::WaitStart` ingest
+/// arm regardless of what `DOT_AGENT_DECK_WAIT_TTL_SECS` resolved to
+/// CLI-side. Without this, M8's "can never wedge a pane `Working` forever"
+/// guarantee is only as strong as whatever the untrusted caller's
+/// environment happens to say — a same-uid role, script, or a future
+/// `.dot-agent-deck.toml` exporting an over-large value reaches the same
+/// wedge by accident. A few hours comfortably exceeds any real external
+/// wait this mechanism is for (rule 5 puts the e2e tier at ~9-12 minutes),
+/// while still bounding the worst case to well within one working session.
+/// Also makes the `Instant::now() + Duration::from_secs(..)` overflow panic
+/// (auditor A2) unreachable, though `MonitoredWait::expires_at`'s own
+/// computation additionally uses `checked_add` rather than relying on the
+/// clamp alone.
+const MAX_WAIT_TTL_SECS: u64 = 6 * 60 * 60;
+
+/// PRD #499 (reopened) M8: periodically sweeps every session for an expired
+/// `monitored_wait` (`AppState::sweep_expired_monitored_waits`), so a `wait
+/// start` that is never followed by an explicit `wait done` self-heals
+/// rather than wedging its pane `Working` forever — the same self-healing
+/// requirement the shell-activity signal gets for free from watching a real
+/// process (it goes away on its own), which a declared-but-never-cleared
+/// wait has no equivalent for.
+///
+/// Deliberately a SEPARATE, much simpler poll loop from
+/// [`run_shell_activity_monitor_with`] rather than folded into its tick: that
+/// loop's cadence is built around an expensive, conditional process-table
+/// sample (skipped entirely with zero candidates, retained across a slow
+/// tick, aged out past `MAX_TABLE_AGE`, ...) that a plain in-memory scan over
+/// `AppState.sessions` has no need to share.
+///
+/// Round 2 (PR #617 round-1 reviewer HIGH 4): this doc previously claimed a
+/// `monitored_wait_synthetic_working` provenance marker on `SessionState`
+/// that was never implemented, and asserted a "can never revert a `Working`
+/// the other signal set" safety property composition round 1 did not
+/// actually have. Both are fixed now, by a different mechanism than the one
+/// this comment used to describe: `wait start`/`wait done`/this sweep route
+/// through `AppState::apply_event` via a synthesized
+/// `EventType::MonitoredWaitStart`/`MonitoredWaitDone`, the same mechanism
+/// `ShellBusy`/`ShellIdle` use, so the existing composition/precedence logic
+/// in `apply_event` governs both signals together — see the `ShellBusy`,
+/// `ShellIdle`, `MonitoredWaitStart` and `MonitoredWaitDone` match arms
+/// there.
+///
+/// Round 3 (reviewer BLOCKER A / HIGH B / auditor B1 / B2): round 2's claim
+/// just above — "no new field was added to `SessionState`" — is what made
+/// this signal daemon-only: the composition it relied on
+/// (`AppState::monitored_waits`, a pane-keyed map) is never written by
+/// `apply_event`, so an attached client's own `AppState` never populated it
+/// and computed a different status from the identical event stream. Round 3
+/// DOES add fields — `SessionState::monitored_wait_active` /
+/// `wait_synthetic_working` / `shell_descendant_busy` — set and cleared by
+/// the match arms above, so every consumer of the broadcast stream
+/// (daemon and attached/reconnecting client alike) converges on the same
+/// composition. The sweep (like `wait done`) still reverts only the EXACT
+/// card `AppState::monitored_waits` recorded the wait against, and only
+/// when that card's own `wait_synthetic_working` says the wait is what
+/// asserted its `Working` AND `shell_descendant_busy` says live shell
+/// activity isn't independently holding it up.
+///
+/// No internal shutdown signal — like `shell_activity_handle`, this task is
+/// torn down by `.abort()` in `run_daemon_with`'s cleanup.
+async fn run_monitored_wait_sweep(state: SharedState, event_tx: broadcast::Sender<BroadcastMsg>) {
+    // Same cadence as the shell-activity poll (PRD #370 M2) — frequent
+    // enough that a TTL's expiry is noticed promptly (`wait/monitored/009`
+    // sleeps only 1s past its 2s TTL before requiring the self-heal to have
+    // landed), cheap enough that a bare HashMap scan with no process-table
+    // sampling costs nothing running twice a second.
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        // Round 3 (reviewer MEDIUM E): hold the write guard across BOTH the
+        // sweep and the broadcast, exactly as `ingest_event`/`ingest_event_with_hook`
+        // do for every other event producer — a guard dropped between them
+        // (round 2's shape here) lets a same-tick `wait start`/`wait done`
+        // on another pane broadcast out of order relative to this sweep's
+        // events, stranding a client on the wrong side of a transition.
+        let mut guard = state.write().await;
+        let events = guard.sweep_expired_monitored_waits();
+        // BLOCKER 1's fix extends to the self-heal path too: a TTL expiry
+        // must reach an attached/reconnected client's own `AppState`, not
+        // only the daemon's, so a dashboard that never saw an explicit
+        // `wait done` still recovers.
+        for event in events {
+            let _ = event_tx.send(BroadcastMsg::Event(event));
         }
     }
 }
@@ -2260,6 +2387,67 @@ async fn run_hook_loop(
                                         "Received work-done signal"
                                     );
                                     state.read().await.handle_work_done(signal, &pty_registry).await;
+                                }
+                                DaemonMessage::WaitStart(signal) => {
+                                    // Auditor A3: sanitize + cap BEFORE
+                                    // logging or storing — the same
+                                    // discipline `sanitize_subject_tag`
+                                    // already applies to `--subject`, and
+                                    // `label` is documented as exactly that
+                                    // shape ("a short opaque token, e.g.
+                                    // `ci-check`").
+                                    let label = crate::state::sanitize_subject_tag(&signal.label);
+                                    // Auditor A1: clamp daemon-side rather
+                                    // than trusting the caller's TTL
+                                    // verbatim — otherwise M8's "can never
+                                    // wedge a pane `Working` forever"
+                                    // guarantee is advisory, not enforced.
+                                    // A1/A2 share this one fix: clamping
+                                    // also makes the `Instant::now() +
+                                    // Duration` below unreachable-overflow
+                                    // safe without relying on that alone
+                                    // (`checked_add` fallback just below).
+                                    let ttl_secs = signal.ttl_secs.min(MAX_WAIT_TTL_SECS);
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        label = %label,
+                                        ttl_secs = ttl_secs,
+                                        "Received wait-start signal"
+                                    );
+                                    let ttl = Duration::from_secs(ttl_secs);
+                                    // Round 3 (reviewer MEDIUM E): hold the
+                                    // write guard across the broadcast too —
+                                    // see `run_monitored_wait_sweep`'s
+                                    // identical fix for why a dropped-then-
+                                    // reacquired guard can invert broadcast
+                                    // order between two wait transitions.
+                                    let mut guard = state.write().await;
+                                    let event =
+                                        guard.start_monitored_wait(&signal.pane_id, label, ttl);
+                                    if let Some(event) = event {
+                                        let _ = event_tx.send(BroadcastMsg::Event(event));
+                                    }
+                                }
+                                DaemonMessage::WaitDone(signal) => {
+                                    // Auditor A3, same as `WaitStart` above.
+                                    let label = crate::state::sanitize_subject_tag(&signal.label);
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        label = %label,
+                                        outcome = ?signal.outcome,
+                                        "Received wait-done signal"
+                                    );
+                                    // Round 3 (reviewer MEDIUM E): same fix as
+                                    // `WaitStart` above.
+                                    let mut guard = state.write().await;
+                                    let event = guard.clear_monitored_wait(
+                                        &signal.pane_id,
+                                        &label,
+                                        signal.outcome,
+                                    );
+                                    if let Some(event) = event {
+                                        let _ = event_tx.send(BroadcastMsg::Event(event));
+                                    }
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the
