@@ -1815,6 +1815,48 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the production TTL's default duration (only that an override is honored and expiry self-heals); any of the four terminal outcomes (`005`-`008` cover explicit clearing).
 - **Platform coverage:** mac+linux.
 
+##### wait/monitored/010 — a repeated `wait start` refresh (the documented TTL-refresh usage pattern) must not lose the promotion's provenance, or `wait done` can never clear it (PRD #499 round 2, reviewer BLOCKER 3).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`).
+- **Agent:** none (synthetic — a `cat`-stub pane seeded `Idle`).
+- **Asserts:** `wait start <label>` run twice in a row with no intervening `wait done` leaves the pane `Working` after the second call, and a subsequent `wait done <label> --outcome success` still reverts it to `Idle`.
+- **Does not assert:** TTL expiry (`009`); composition with `descendant_shell_activity` (`011`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/011 — composition with `descendant_shell_activity` is a true OR, not mutual clobber: a `wait done` must not revert `Working` while an injected `ShellBusy` signal is still active (PRD #499 round 2, reviewer BLOCKER 2 Direction A).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`, plus a synthetic `ShellBusy` `AgentEvent` injected directly over the hook socket, shaped the way `run_shell_activity_monitor` builds one).
+- **Agent:** none (synthetic — a `cat`-stub pane; the shell descendant is a synthetic `ShellBusy` event, no real foreground process spawned).
+- **Asserts:** after `wait start` promotes the pane to `Working`, an injected `ShellBusy` event for the same pane holds it `Working`; `wait done --outcome success` then clears the monitored wait but the pane must STAY `Working` because the injected `ShellBusy` never received a paired `ShellIdle`.
+- **Does not assert:** the other two composition failure directions reviewer traced (B and C); a real spawned foreground descendant.
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/012 — a monitored wait's promoted provenance must not follow a pane onto a respawned card (PRD #499 round 2, reviewer HIGH 5).
+- **Layer:** bare-`AppState` direct-method test (mirrors `tests/card_supersession.rs`'s style) — no daemon, no CLI subprocess.
+- **Agent:** none (synthetic `AgentEvent`s applied directly via `AppState::apply_event`).
+- **Asserts:** card A is promoted `Working` by `start_monitored_wait`; the pane respawns (card A retired, card B created via a fresh `SessionStart` under a different session/agent id); card B genuinely becomes `Working` via a real `ToolStart`; `clear_monitored_wait` for the pane's original wait must not revert card B's genuine `Working` just because `pane_session_id` re-resolves to whichever card is current.
+- **Does not assert:** the real daemon/registry respawn machinery end to end (out of scope — this targets `AppState`'s pane-card resolution directly).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/013 — a torn-down pane's monitored wait must not survive the teardown (PRD #499 round 2, reviewer MEDIUM 6 / auditor A4).
+- **Layer:** bare-`AppState` direct-method test — no daemon, no CLI subprocess.
+- **Agent:** none (a single synthetic `SessionStart` applied directly via `AppState::apply_event`).
+- **Asserts:** after `start_monitored_wait` records an entry for a pane, tearing the pane down (`remove_sessions_for_pane` + `unregister_pane`, the same pair `src/ui.rs` calls together on a real pane close) removes the pane's `monitored_waits` entry immediately, rather than leaving it to the TTL sweep.
+- **Does not assert:** the TTL sweep's own correctness (covered by `009`'s self-heal and reviewer's own analysis) — this asserts eager cleanup specifically.
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/014 — the monitored-wait promotion reaches an attached client via the daemon's broadcast event stream, not only the daemon's own internal `AppState` (PRD #499 round 2, reviewer BLOCKER 1 / CLAUDE.md rule 4).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`), plus a direct subscription to the in-process daemon's `event_tx` broadcast channel (the same one `src/reconnect.rs` reads) and a second, independent bare `AppState` the observed event is applied to — mirroring exactly what a real reconnecting/attached TUI does.
+- **Agent:** none (synthetic — a `cat`-stub pane).
+- **Asserts:** after `wait start` reaches `Working` on the daemon's own `AppState` (the precondition round 1 already covered), a `BroadcastMsg::Event` naming the pane arrives on `event_tx` within 3s, and applying that exact event to an independent client-side `AppState` (via `apply_event`, never touching the daemon's own state) also reads `Working`.
+- **Does not assert:** the real PTY-attached TUI rendering path end to end (out of scope for this fast-tier file; this proves the broadcast event itself carries the promotion, which is the gap BLOCKER 1 identifies).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/015 — `wait done` naming a label that does not match the pane's active wait still clears it (clear-anyway-with-warning), rather than refusing or silently no-op'ing (PRD #499 round 2, reviewer MEDIUM 9 partial).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`).
+- **Agent:** none (synthetic — a `cat`-stub pane seeded `Idle`).
+- **Asserts:** `wait start <label-a>` reaches `Working`; `wait done <label-b> --outcome success` (a different, mismatched label) exits successfully and still reverts the pane to `Idle`.
+- **Does not assert:** the warning log line's exact content (out of scope for this harness).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
