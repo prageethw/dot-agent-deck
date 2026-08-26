@@ -81,6 +81,8 @@ This is a **semantic contract change behind a stable wire** per CLAUDE.md rule 1
 
 Captured so the analysis is not lost. If the issue thread establishes that same-directory concurrency is genuinely needed (rather than "worktrees would serve"), the additional build is: namespace the coordination files by instance id — `.dot-agent-deck/<orchestration_id>/worker-task-<role>.md` and `.../work-done-<role>.md` — threaded through both write sites (`src/state.rs:446`, `src/state.rs:967`) and the injected pane pointers (`src/state.rs:457`, `src/state.rs:1002`), plus a compaction/cleanup story for the per-instance subdirectories on tab close. Even with this, layer 3 (shared working tree) remains unsafe, so the guard/warning from prong 2 stays. This is why the default recommendation is worktrees, not namespacing.
 
+**Update (issue #613):** the worker-task half of this gap is now partially closed the same way upstream #331 + fork #76 closed it on the work-done leg — `worker-task-<role>.md` is now `worker-task-<role>-<pane digest>.md`, keyed on the target pane as well as role name, so two same-cwd orchestrations no longer clobber each other's task file. This PRD's own deferred scope — full per-instance subdirectory namespacing (`<orchestration_id>/…`) — is unaffected and still not built; pane-keying is a narrower fix for a narrower failure (file clobber / stale-pointer resolution), not instance-level isolation.
+
 ## Success Criteria
 
 - Two tabs of the same orchestration in the same directory no longer cross-deliver: each orchestrator's delegate reaches only its own workers, and each worker's work-done reaches only its own orchestrator — deterministically, across repeated runs.

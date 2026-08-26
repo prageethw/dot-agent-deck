@@ -1716,6 +1716,23 @@ pub fn work_done_file_name(role: &str, pane_id: &str) -> String {
     format!("work-done-{safe_name}-{}.md", pane_digest_hex(pane_id))
 }
 
+/// The daemon's delegate task-file name for `role`, keyed on the target
+/// pane's `pane_id` — the delegate-leg counterpart of [`work_done_file_name`],
+/// added for issue #613. Without pane keying, two panes running the same
+/// role in the same cwd (two live orchestrations, or a worker whose process
+/// cwd has drifted from the daemon's `pane_cwd_map` belief) could collide on
+/// the same role-only-keyed path, one pane silently overwriting or reading
+/// the other's still-unread task file — exactly the failure upstream #331 +
+/// fork #76 already fixed on the report leg.
+///
+/// Public so [`resolve_delegate_task_body`] (the write site) and tests that
+/// need to assert against the exact on-disk path compute the same name
+/// instead of each guessing at the format independently.
+pub fn delegate_task_file_name(role: &str, pane_id: &str) -> String {
+    let safe_name = sanitize_role_name(role);
+    format!("worker-task-{safe_name}-{}.md", pane_digest_hex(pane_id))
+}
+
 /// Bounded attempts to claim a fresh, unique archive slot in
 /// [`archive_existing_report`] before giving up. Generous relative to any
 /// realistic collision count on one pane's output path — running out means
@@ -4827,7 +4844,6 @@ fn resolve_delegate_task_body(
         return file_content;
     };
 
-    let safe_name = sanitize_role_name(target_role);
     let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
     // Not fatal on its own: the directory may already exist, and if it genuinely
     // cannot be created the `write` below fails too and takes the inline path.
@@ -4840,9 +4856,9 @@ fn resolve_delegate_task_body(
             "delegate: failed to create task directory"
         );
     }
-    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
+    let file_path = dir.join(delegate_task_file_name(target_role, pane_id));
     match std::fs::write(&file_path, &file_content) {
-        Ok(()) => format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task."),
+        Ok(()) => format!("Read {} for your task.", file_path.display()),
         Err(e) => {
             warn!(
                 path = %file_path.display(),
