@@ -7929,6 +7929,24 @@ pub async fn find_work_done_file_async(
     }
 }
 
+/// The exact delegate pointer sentence the daemon writes for `role`/`pane_id`
+/// under `cwd` — issue #613: the pointer is now an absolute path built from
+/// `cwd`, and the filename is pane-keyed
+/// (`dot_agent_deck::state::delegate_task_file_name`), mirroring
+/// [`find_work_done_file_async`]'s doc comment on the report leg. Tests that
+/// know their worker's exact `cwd`/`role`/`pane_id` (every synthetic-pane
+/// test in this harness does) should compute the expected pointer with this
+/// rather than hardcoding the old relative, role-only-keyed literal.
+#[allow(dead_code)]
+pub fn expected_delegate_pointer(cwd: &Path, role: &str, pane_id: &str) -> Vec<u8> {
+    let file_path =
+        cwd.join(".dot-agent-deck")
+            .join(dot_agent_deck::state::delegate_task_file_name(
+                role, pane_id,
+            ));
+    format!("Read {} for your task.", file_path.display()).into_bytes()
+}
+
 /// Poll a spawned agent's PTY snapshot until the *rendered* screen contains
 /// `needle`, returning `(found, rendered_screen)`. The raw PTY byte stream is
 /// replayed through a `vt100` grid first, so a streamed/redrawn reply (an agent
