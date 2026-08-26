@@ -617,8 +617,9 @@ This works immediately after a daemon restart: ownership is matched by comparing
 
 Opening a second orchestration in a directory that already runs one is usually still allowed, and routing stays correct — but two resources cannot be partitioned, no matter what the deck does:
 
-- **The coordination files.** `.dot-agent-deck/worker-task-<role>.md` is keyed by role name within the directory. Two orchestrations that both have a `coder` role write the same file, so the second brief overwrites the first before the first worker has necessarily read it. (`.dot-agent-deck/work-done-<role>-<pane digest>.md` is additionally keyed on the reporting pane, so two orchestrations' `coder` roles no longer clobber each other's report — a stale one is archived alongside the new report rather than silently overwritten, and the archive is announced in the orchestrator's feedback.)
 - **The working tree.** Both sets of workers edit the same files, stage into the same git index, and build into the same target directory. This is the same hazard as two people working in one checkout, and no amount of file namespacing fixes it.
+
+(As of issue #613, `.dot-agent-deck/worker-task-<role>-<pane digest>.md` is keyed on the target pane as well as role name — mirroring `work-done-<role>-<pane digest>.md` below — so two orchestrations that both have a `coder` role no longer clobber each other's task file; each pane gets its own. The pointer the worker receives is also now an absolute path, so it resolves correctly even if the worker's own process cwd has drifted from the daemon's belief about it.)
 
 So when you select an orchestration whose directory already hosts a live one, the new-pane form shows a warning:
 
