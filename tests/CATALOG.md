@@ -1857,6 +1857,27 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the warning log line's exact content (out of scope for this harness).
 - **Platform coverage:** mac+linux.
 
+##### wait/monitored/016 — the daemon and an independent, freshly-constructed client `AppState` converge on identical composition state (`status`, `monitored_wait_active`, `wait_synthetic_working`, `shell_descendant_busy`) after replaying the identical broadcast event sequence, across a `MonitoredWaitStart`+real-`Idle` composition and a `MonitoredWaitStart`+`ShellBusy`+`MonitoredWaitDone` composition (PRD #499 round 3, reviewer BLOCKER A / auditor B1).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`), plus a direct subscription to the in-process daemon's `event_tx` broadcast channel (as `014`) replayed onto a second, independent bare `AppState` after every step, not just the promotion.
+- **Agent:** none (synthetic — two `cat`-stub panes).
+- **Asserts:** on pane A, after `wait start` and then a real `Idle` injected while the wait is outstanding, the client's replayed `AppState` reads `Working` (not `Idle`) exactly as the daemon's own does, because `monitored_wait_active` is set on the client's own copy of the card too; on pane B, after `wait start`, an injected `ShellBusy`, and `wait done`, both the daemon and the client stay `Working` (OR composition, Direction A) and their full composition tuples match at every step.
+- **Does not assert:** the real PTY-attached TUI rendering path end to end (out of scope for this fast-tier file).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/017 — a monitored wait recorded against a retired card (the pane respawned before `wait done` was ever called) must not suppress a real `Idle` on the pane's new card (PRD #499 round 3, reviewer HIGH C, untested direction).
+- **Layer:** bare-state (`AppState::apply_event` driven directly), same style as `012`/`013`.
+- **Agent:** none (synthetic events via `AppState::apply_event`).
+- **Asserts:** card A's wait is left uncleared; the pane respawns to card B; card B does real work via `ToolStart` then genuinely finishes via a real `Idle`; card B's status reads `Idle` afterward, despite `AppState::monitored_waits` still naming the pane against the retired card A.
+- **Does not assert:** the cross-card `wait done`-does-not-clobber direction (already covered by `012`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/018 — a real `ToolStart` that re-asserts `Working` on the SAME card after a monitored wait started must survive that wait's later `wait done` (PRD #499 round 3, reviewer HIGH B / B2, untested same-card direction).
+- **Layer:** bare-state (`AppState::apply_event` driven directly), same style as `012`/`013`.
+- **Agent:** none (synthetic events via `AppState::apply_event`).
+- **Asserts:** `wait start` promotes a single card to `Working` (`wait_synthetic_working` true); a real `ToolStart` re-asserts `Working` and clears `wait_synthetic_working`; `clear_monitored_wait` (`wait done`) afterward leaves the card `Working`, not reverted.
+- **Does not assert:** the cross-card version (already covered by `012`).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
