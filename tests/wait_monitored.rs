@@ -55,8 +55,8 @@ mod common;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
-use dot_agent_deck::state::SessionStatus;
+use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType, WaitOutcome};
+use dot_agent_deck::state::{AppState, SessionStatus};
 #[cfg(unix)]
 use spec::spec;
 
@@ -88,6 +88,72 @@ fn idle_event(pane_id: &str, agent_id: &str, session_id: &str) -> AgentEvent {
         tool_detail: None,
         cwd: None,
         timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    }
+}
+
+/// A synthetic `ShellBusy`/`ShellIdle` `AgentEvent`, shaped the way the
+/// daemon's own `run_shell_activity_monitor` builds one (`AgentType::None`,
+/// no tool/session metadata — mirrors `shell_event` in
+/// `tests/rehydration.rs`) — used to drive the existing
+/// `descendant_shell_activity` signal directly over the hook socket without
+/// needing a real foreground descendant process, so composition with the new
+/// monitored-wait signal can be tested deterministically.
+#[cfg(unix)]
+fn shell_activity_event(
+    pane_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    event_type: EventType,
+) -> AgentEvent {
+    AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::None,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    }
+}
+
+/// A raw hook-shaped `AgentEvent` for driving `AppState::apply_event`
+/// directly (mirrors `tests/card_supersession.rs`'s own `event` helper) —
+/// used by the respawn/teardown tests below, which target `AppState`'s
+/// pane-card resolution directly rather than going through the real CLI
+/// subprocess.
+#[cfg(unix)]
+fn card_event(
+    pane_id: &str,
+    session_id: &str,
+    agent_id: &str,
+    event_type: EventType,
+    tool_name: Option<&str>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> AgentEvent {
+    AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type,
+        tool_name: tool_name.map(str::to_string),
+        tool_detail: None,
+        cwd: None,
+        timestamp,
         user_prompt: None,
         metadata: std::collections::HashMap::new(),
         pane_id: Some(pane_id.to_string()),
@@ -761,6 +827,560 @@ async fn wait_monitored_009_ttl_self_heals_without_explicit_done_inner() {
     )
     .await
     .unwrap_or_else(|e| panic!("wait/monitored/009 (TTL self-heal): {e}"));
+
+    daemon.registry.shutdown_all();
+}
+
+// ---------------------------------------------------------------------------
+// Round 2 (PRD #499, PR #617 round-1 reviewer/auditor findings) — closing the
+// gap that let a happy-path-only test suite miss BLOCKERs 1-3 and HIGH 5.
+// ---------------------------------------------------------------------------
+
+const PANE_010: &str = "wait-monitored-pane-010-repeated-start-6e1f9a";
+const LABEL_010: &str = "wait-monitored-label-010-ttl-refresh";
+
+/// Scenario: run the real `wait start <label>` CLI twice in a row for the
+/// same pane/label with no intervening `wait done` — the documented
+/// TTL-refresh usage pattern (`src/main.rs`'s own doc comment: "re-running
+/// `start` before a matching `done` just resets the TTL clock and
+/// re-records the label"). Assert the pane is still `Working` after the
+/// second call, then confirm a subsequent `wait done <label> --outcome
+/// success` still reverts it to `Idle`. Reviewer BLOCKER 3: today the
+/// second `start_monitored_wait` call recomputes `promoted` from the
+/// CURRENT status (already `Working`), so it overwrites the stored entry
+/// with `promoted: false`, and `wait done` then skips its revert branch
+/// entirely — wedging the pane `Working` with no monitored wait left to
+/// expire it.
+#[spec("wait/monitored/010")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_010_repeated_start_refresh_still_lets_done_clear() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/010 runtime")
+        .block_on(wait_monitored_010_repeated_start_refresh_still_lets_done_clear_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_010_repeated_start_refresh_still_lets_done_clear_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_010).await;
+
+    let start1 = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_010], &[]).await;
+    assert!(
+        start1.status.success(),
+        "wait/monitored/010: first `wait start {LABEL_010}` must succeed; status={:?} \
+         stdout={:?} stderr={:?}",
+        start1.status,
+        start1.stdout,
+        start1.stderr
+    );
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/010 (after first start): {e}"));
+
+    let start2 = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_010], &[]).await;
+    assert!(
+        start2.status.success(),
+        "wait/monitored/010: second (refreshing) `wait start {LABEL_010}` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        start2.status,
+        start2.stdout,
+        start2.stderr
+    );
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(300),
+        "wait/monitored/010 (after second/refreshing start)",
+    )
+    .await;
+
+    let done = run_wait_cli(
+        &daemon,
+        &pane.pane_id,
+        &["done", LABEL_010, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done.status.success(),
+        "wait/monitored/010: `wait done {LABEL_010} --outcome success` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        done.status,
+        done.stdout,
+        done.stderr
+    );
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "wait/monitored/010 (BLOCKER 3): after a repeated `wait start` refresh, `wait done` \
+             must still revert the pane to Idle — {e}. If this times out, the second `start` \
+             overwrote the monitored-wait entry with `promoted: false` (recomputed from the \
+             already-Working status) and `wait done` skipped its revert branch, wedging the \
+             pane Working with no wait left to expire it (reviewer BLOCKER 3)."
+        )
+    });
+
+    daemon.registry.shutdown_all();
+}
+
+const PANE_011: &str = "wait-monitored-pane-011-composition-or-8b3d64";
+const LABEL_011: &str = "wait-monitored-label-011-composition-or";
+
+/// Scenario: after `wait start <label>` promotes an idle pane to `Working`,
+/// inject a synthetic `ShellBusy` event (the shape `run_shell_activity_monitor`
+/// itself would send for a real foreground descendant) for the SAME pane,
+/// then run `wait done <label> --outcome success`. Per the PRD's composition
+/// commitment ("a pane is `Working` if EITHER signal is active"), the pane
+/// must STAY `Working` — the shell descendant this `ShellBusy` represents is
+/// still running and never got a paired `ShellIdle`. Reviewer BLOCKER 2
+/// Direction A: today `wait done` reverts unconditionally whenever its OWN
+/// `promoted` bookkeeping says it should, without consulting whether a live
+/// shell signal is still asserting `Working` independently — clobbering it.
+#[spec("wait/monitored/011")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_011_composition_is_or_not_mutual_clobber() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/011 runtime")
+        .block_on(wait_monitored_011_composition_is_or_not_mutual_clobber_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_011_composition_is_or_not_mutual_clobber_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_011).await;
+    let session_id = format!("{PANE_011}-session");
+
+    let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_011], &[]).await;
+    assert!(
+        start.status.success(),
+        "wait/monitored/011: `wait start {LABEL_011}` must succeed; status={:?} stdout={:?} \
+         stderr={:?}",
+        start.status,
+        start.stdout,
+        start.stderr
+    );
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/011 (after start): {e}"));
+
+    // A real foreground descendant starts on the SAME pane, the way
+    // `run_shell_activity_monitor` would report it — injected directly over
+    // the hook socket so this is deterministic rather than racing a real
+    // spawned process.
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&shell_activity_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ShellBusy,
+        ))
+        .expect("serialize synthetic ShellBusy event"),
+    )
+    .expect("write synthetic ShellBusy event to the daemon hook socket");
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(200),
+        "wait/monitored/011 (after injected ShellBusy)",
+    )
+    .await;
+
+    let done = run_wait_cli(
+        &daemon,
+        &pane.pane_id,
+        &["done", LABEL_011, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done.status.success(),
+        "wait/monitored/011: `wait done {LABEL_011} --outcome success` must succeed; \
+         status={:?} stdout={:?} stderr={:?}",
+        done.status,
+        done.stdout,
+        done.stderr
+    );
+
+    // The descendant this ShellBusy represents never went idle, so
+    // composition (OR, not clobber) requires the pane to STAY Working.
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(500),
+        "wait/monitored/011 (BLOCKER 2 Direction A): `wait done` cleared the monitored wait but \
+         the pane's own ShellBusy signal is still active and never got a paired ShellIdle — OR \
+         composition requires the pane to stay Working, not revert to Idle just because this \
+         one signal cleared",
+    )
+    .await;
+
+    daemon.registry.shutdown_all();
+}
+
+const RESPAWN_PANE_ID: &str = "wait-monitored-pane-012-respawn-4c7e91";
+const RESPAWN_LABEL: &str = "wait-monitored-label-012-respawn";
+
+/// Scenario: pin reviewer HIGH 5 directly against `AppState` (mirrors
+/// `tests/card_supersession.rs`'s bare-state style, since this targets the
+/// exact `pane_session_id` re-resolution `src/state.rs`'s `clear_monitored_wait`
+/// does). A pane's card A is `Idle`; `start_monitored_wait` promotes it to
+/// `Working`. The pane then respawns: card A is retired and a new card B is
+/// created on the same pane (a fresh `SessionStart` under a different
+/// session/agent id), and card B genuinely starts working via a real
+/// `ToolStart` — a real agent is now running, unrelated to the old wait.
+/// `clear_monitored_wait` must not apply card A's stale `promoted`
+/// provenance to card B: today it re-resolves the pane's CURRENT card via
+/// `pane_session_id` and reverts whatever it finds reading `Working`, which
+/// clobbers card B's genuine work.
+#[spec("wait/monitored/012")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_012_promoted_provenance_does_not_follow_pane_to_new_card() {
+    let t0 = chrono::Utc::now();
+    let t1 = t0 + chrono::Duration::seconds(1);
+    let t2 = t1 + chrono::Duration::seconds(1);
+
+    let mut state = AppState::default();
+    state.register_pane(RESPAWN_PANE_ID.to_string());
+
+    // Card A: an idle agent.
+    state.apply_event(card_event(
+        RESPAWN_PANE_ID,
+        "card-a-session",
+        "agent-a",
+        EventType::SessionStart,
+        None,
+        t0,
+    ));
+    assert_eq!(
+        state.sessions["card-a-session"].status,
+        SessionStatus::Idle,
+        "precondition: card A starts Idle"
+    );
+
+    // A monitored wait promotes card A to Working.
+    state.start_monitored_wait(
+        RESPAWN_PANE_ID,
+        RESPAWN_LABEL.to_string(),
+        Duration::from_secs(300),
+    );
+    assert_eq!(
+        state.sessions["card-a-session"].status,
+        SessionStatus::Working,
+        "precondition: `wait start` promotes card A to Working"
+    );
+
+    // The pane respawns: card A is retired, card B is created (a different
+    // session/agent id claiming the same pane via SessionStart).
+    state.apply_event(card_event(
+        RESPAWN_PANE_ID,
+        "card-b-session",
+        "agent-b",
+        EventType::SessionStart,
+        None,
+        t1,
+    ));
+    assert!(
+        !state.sessions.contains_key("card-a-session"),
+        "precondition: the respawn's SessionStart must retire card A"
+    );
+
+    // Card B genuinely starts working — a real agent, unrelated to the old
+    // wait.
+    state.apply_event(card_event(
+        RESPAWN_PANE_ID,
+        "card-b-session",
+        "agent-b",
+        EventType::ToolStart,
+        Some("Bash"),
+        t2,
+    ));
+    assert_eq!(
+        state.sessions["card-b-session"].status,
+        SessionStatus::Working,
+        "precondition: card B is genuinely Working via a real ToolStart"
+    );
+
+    state.clear_monitored_wait(RESPAWN_PANE_ID, RESPAWN_LABEL, WaitOutcome::Success);
+
+    assert_eq!(
+        state.sessions["card-b-session"].status,
+        SessionStatus::Working,
+        "wait/monitored/012 (HIGH 5): clearing card A's wait must not revert card B's genuine, \
+         real-agent Working just because `pane_session_id` re-resolved to whatever card is \
+         current on the pane now — a monitored wait's promoted provenance must die with the \
+         card it was recorded against, not follow the pane onto its successor"
+    );
+}
+
+const TEARDOWN_PANE_ID: &str = "wait-monitored-pane-013-teardown-2a9f6c";
+const TEARDOWN_LABEL: &str = "wait-monitored-label-013-teardown";
+
+/// Scenario: pin reviewer MEDIUM 6 / auditor A4 directly against
+/// `AppState`. A pane with an active monitored wait is torn down
+/// (`remove_sessions_for_pane` + `unregister_pane`, the same pair
+/// `src/ui.rs` calls together on a real pane close) BEFORE the wait is
+/// cleared or expires. The `monitored_waits` entry must not survive the
+/// teardown: today neither method touches it, so it persists in memory
+/// (bounded only by the TTL sweep) rather than being cleaned up eagerly at
+/// the point the pane genuinely stops existing, as both findings recommend.
+#[spec("wait/monitored/013")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_013_teardown_clears_the_panes_monitored_wait() {
+    let t0 = chrono::Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(TEARDOWN_PANE_ID.to_string());
+    state.apply_event(card_event(
+        TEARDOWN_PANE_ID,
+        "teardown-session",
+        "teardown-agent",
+        EventType::SessionStart,
+        None,
+        t0,
+    ));
+    state.start_monitored_wait(
+        TEARDOWN_PANE_ID,
+        TEARDOWN_LABEL.to_string(),
+        Duration::from_secs(300),
+    );
+    assert!(
+        state.monitored_waits.contains_key(TEARDOWN_PANE_ID),
+        "precondition: `wait start` records a monitored wait for the pane"
+    );
+
+    // Pane teardown, the same pair `src/ui.rs` calls together on a real
+    // pane close.
+    state.remove_sessions_for_pane(TEARDOWN_PANE_ID);
+    state.unregister_pane(TEARDOWN_PANE_ID);
+
+    assert!(
+        !state.monitored_waits.contains_key(TEARDOWN_PANE_ID),
+        "wait/monitored/013 (MEDIUM 6 / A4): a torn-down pane's monitored wait must not survive \
+         the teardown — neither `remove_sessions_for_pane` nor `unregister_pane` currently drops \
+         the `monitored_waits` entry, so it lingers in memory (bounded only by the TTL sweep) \
+         rather than being cleaned up at the point the pane genuinely stops existing"
+    );
+}
+
+const PANE_014: &str = "wait-monitored-pane-014-broadcast-9f4a27";
+const LABEL_014: &str = "wait-monitored-label-014-broadcast";
+
+/// Scenario: subscribe to the daemon's own broadcast stream
+/// (`daemon.event_tx`, the SAME channel `src/reconnect.rs:463` reads to
+/// rebuild an attached/reconnecting TUI's own `AppState`) before running
+/// `wait start <label>`. Assert a `BroadcastMsg::Event` naming this pane
+/// actually arrives, then apply that exact event to a fresh, independent
+/// `AppState` the way a real reconnecting client would — proving the
+/// promotion reaches an attached client, not just the daemon's own internal
+/// state. Reviewer BLOCKER 1: today `start_monitored_wait` mutates only the
+/// daemon's own `AppState` directly and sends nothing on `event_tx`, so a
+/// real attached TUI's dashboard never learns the pane went `Working` at
+/// all — this is CLAUDE.md rule 4's bar ("at least one test... AS A USER
+/// ACTUALLY USES AND SEES IT") landing on precisely the gap round 1's nine
+/// tests (all reading `AppState.sessions` directly on the daemon side)
+/// could not catch.
+#[spec("wait/monitored/014")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_014_promotion_reaches_an_attached_client_via_broadcast() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/014 runtime")
+        .block_on(wait_monitored_014_promotion_reaches_an_attached_client_via_broadcast_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_014_promotion_reaches_an_attached_client_via_broadcast_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_014).await;
+
+    let mut events = daemon.event_tx.subscribe();
+
+    let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_014], &[]).await;
+    assert!(
+        start.status.success(),
+        "wait/monitored/014: `wait start {LABEL_014}` must succeed; status={:?} stdout={:?} \
+         stderr={:?}",
+        start.status,
+        start.stdout,
+        start.stderr
+    );
+    // Precondition, matching round 1's own daemon-side read: the daemon's
+    // OWN AppState does reach Working.
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/014 (daemon-side precondition): {e}"));
+
+    let pane_id = pane.pane_id.clone();
+    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Ok(BroadcastMsg::Event(event)) if event.pane_id.as_deref() == Some(&pane_id) => {
+                    break Some(event);
+                }
+                Ok(_) => continue,
+                Err(_) => break None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let event = observed.unwrap_or_else(|| {
+        panic!(
+            "wait/monitored/014 (BLOCKER 1): `wait start` must broadcast a `BroadcastMsg::Event` \
+             naming pane {pane_id:?} on `event_tx` so an attached TUI's own AppState can learn \
+             the promotion via `apply_event` (`src/reconnect.rs:463`) — the same path every \
+             other status-producing signal goes through via `ingest_event`. No such event \
+             arrived within 3s, meaning `start_monitored_wait` mutated only the daemon's own \
+             AppState directly with nothing sent on the broadcast channel; a real attached \
+             dashboard would keep showing this pane as Idle."
+        )
+    });
+
+    // Apply the observed event exactly the way a real reconnecting/attached
+    // TUI's own independent AppState would.
+    let mut client_state = AppState::default();
+    client_state.register_pane(pane_id.clone());
+    client_state.apply_event(event);
+    let client_status = client_state
+        .sessions
+        .values()
+        .find(|s| s.pane_id.as_deref() == Some(pane_id.as_str()))
+        .map(|s| s.status.clone());
+    assert_eq!(
+        client_status,
+        Some(SessionStatus::Working),
+        "wait/monitored/014 (BLOCKER 1): the broadcast event a client would apply must itself \
+         carry the Working promotion; got {client_status:?}"
+    );
+
+    daemon.registry.shutdown_all();
+}
+
+const PANE_015: &str = "wait-monitored-pane-015-label-mismatch-5d2c83";
+const LABEL_015_ACTIVE: &str = "wait-monitored-label-015-active-check";
+const LABEL_015_WRONG: &str = "wait-monitored-label-015-different-check";
+
+/// Scenario: declare a monitored wait under one label, then run `wait done`
+/// naming a DIFFERENT label for the same pane. Reviewer confirmed (question
+/// 4) the coder's "clear anyway with a warning" design is the right
+/// trade-off, since a pane carries at most one wait — but no test currently
+/// pins it (MEDIUM 9). Assert the mismatched `wait done` still exits
+/// successfully and still clears the pane's one active wait back to
+/// `Idle`, rather than refusing or silently no-op'ing and leaving the pane
+/// wedged `Working`.
+#[spec("wait/monitored/015")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_015_label_mismatch_still_clears_the_active_wait() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wait/monitored/015 runtime")
+        .block_on(wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner());
+}
+
+#[cfg(unix)]
+async fn wait_monitored_015_label_mismatch_still_clears_the_active_wait_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_015).await;
+
+    let start = run_wait_cli(&daemon, &pane.pane_id, &["start", LABEL_015_ACTIVE], &[]).await;
+    assert!(
+        start.status.success(),
+        "wait/monitored/015: `wait start {LABEL_015_ACTIVE}` must succeed; status={:?} \
+         stdout={:?} stderr={:?}",
+        start.status,
+        start.stdout,
+        start.stderr
+    );
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Working,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("wait/monitored/015 (after start): {e}"));
+
+    let done = run_wait_cli(
+        &daemon,
+        &pane.pane_id,
+        &["done", LABEL_015_WRONG, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert!(
+        done.status.success(),
+        "wait/monitored/015 (MEDIUM 9): `wait done` naming a DIFFERENT label than the pane's \
+         active wait must still exit successfully (clear-anyway-with-warning, not refuse) — \
+         status={:?} stdout={:?} stderr={:?}",
+        done.status,
+        done.stdout,
+        done.stderr
+    );
+    wait_for_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "wait/monitored/015 (MEDIUM 9): a mismatched-label `wait done` must still clear the \
+             pane's one active monitored wait back to Idle rather than leaving it wedged \
+             Working — {e}"
+        )
+    });
 
     daemon.registry.shutdown_all();
 }
