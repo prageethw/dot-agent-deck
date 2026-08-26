@@ -1831,7 +1831,28 @@ async fn run_shell_activity_monitor_with<S, F>(
         last_known.retain(|pane_id, _| live_candidates.contains(pane_id.as_str()));
 
         for (pane_id, busy) in snapshot.statuses {
-            let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);
+            let previous = last_known.insert(pane_id.clone(), busy);
+            // PRD #499 (reopened) round 2: a pane's FIRST-EVER scan (no
+            // `last_known` entry yet) reading `busy=false` is not a
+            // transition worth reporting — the pane was never observed
+            // busy, so there is nothing for a `ShellIdle` to correct. Only
+            // suppress the `false` half: a pane that is ALREADY busy on its
+            // very first scan still needs the rising-edge `ShellBusy` (the
+            // whole PRD #386 M6b point), so `None` only reads as "unchanged"
+            // when the new reading agrees with the implicit prior "not
+            // busy" baseline. Before this, every newly-registered pane's
+            // first tick unconditionally emitted a `ShellIdle` — cosmetic
+            // noise for a pane that never ran anything, and (found via
+            // `wait/monitored/011`) a genuine race against a monitored
+            // wait's composition: that spurious real `ShellIdle` could land
+            // between a `ShellBusy` and a later `wait done`, clearing
+            // `shell_synthetic_working` out from under BLOCKER 2 Direction
+            // A's OR composition for reasons that had nothing to do with
+            // the pane's actual shell activity.
+            let changed = match previous {
+                Some(prev) => prev != busy,
+                None => busy,
+            };
 
             // Cheap path, and the overwhelmingly common one: a pane whose scan
             // reads idle and whose reading did not just change has nothing to
