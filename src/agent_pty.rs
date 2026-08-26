@@ -4271,12 +4271,19 @@ impl AgentPtyRegistry {
         // Fix round 4 (S11/A16): sanitize-once-at-ingest. `popped.subject`
         // (the armed/expected side) was already sanitized by
         // `handle_delegate`'s fan-out loop before it was ever armed — it is
-        // canonical here and must NOT be sanitized again, because
-        // `sanitize_subject_tag` is not idempotent for every input, and a
-        // second pass over an already-canonical value can produce a
-        // different string than the first pass did. The echoed side is fresh
-        // off the worker's `work-done --subject` CLI call and has never been
-        // sanitized before, so it gets exactly one pass, here. Both fields of
+        // canonical here and is not sanitized again on this comparison path.
+        // `sanitize_subject_tag` is the single source of truth for
+        // canonicalization: ingest is the one place canonical status is
+        // established, and every downstream consumer (including this one)
+        // must treat its output as already canonical rather than
+        // re-deriving it independently. Issue #598 (A18) added a defensive
+        // re-application of `sanitize_subject_tag` at `work_done_footer`'s
+        // render site — safe only because the function is idempotent, not
+        // because it is a second canonicalization point; the invariant here
+        // is "idempotent re-application at a public boundary is fine", not
+        // "never sanitize twice". The echoed side is fresh off the worker's
+        // `work-done --subject` CLI call and has never been sanitized
+        // before, so it gets exactly one pass, here. Both fields of
         // `SubjectMismatch` therefore hold canonical (sanitized) values by
         // construction, addressing A16.
         let subject_mismatch = match (popped.subject.as_deref(), echoed_subject) {
