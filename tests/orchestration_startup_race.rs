@@ -73,7 +73,6 @@ const ORCHESTRATION_NAME: &str = "startup-race";
 /// test exists to pin.
 const WORKER_ROLE_INDEX: usize = 1;
 const SEED_TEXT: &str = "orchestration-startup-race-seed";
-const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
 /// How long the gate holds the worker's registration open, giving the pi
 /// shim's real child process ample wall-clock time to race ahead if
@@ -506,15 +505,22 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
         Duration::from_secs(5),
     )
     .await;
+    let pointer = common::expected_delegate_pointer(
+        cwd.path(),
+        WORKER_ROLE,
+        &role_pane_ids[WORKER_ROLE_INDEX],
+    );
     let first_sighting = wait_for_snapshot_needle(
         &daemon.pty_registry,
         &worker_agent_id,
-        POINTER,
+        &pointer,
         Duration::from_secs(5),
     )
     .await;
     assert!(
-        first_sighting.windows(POINTER.len()).any(|w| w == POINTER),
+        first_sighting
+            .windows(pointer.len())
+            .any(|w| w == pointer.as_slice()),
         "the worker's `cat` PTY never showed the delegate pointer within 5s of the gate \
          releasing — the delegate that fork #92 P1 causes to race ahead and be dropped never \
          arrived, even after the worker was safely registered; snapshot = {:?}",
@@ -525,7 +531,7 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
         .pty_registry
         .snapshot(&worker_agent_id)
         .unwrap_or_default();
-    let pointer_count = count_needle(&settled, POINTER);
+    let pointer_count = count_needle(&settled, &pointer);
     assert_eq!(
         pointer_count,
         1,

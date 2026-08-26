@@ -47,7 +47,6 @@ const WORKER_PANE: &str = "recovery-coder";
 const WORKER_ROLE: &str = "coder";
 const ORCHESTRATION: &str = "recovery-orchestration";
 const ORCHESTRATION_ID: &str = "recovery-instance-1";
-const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
 /// Issue #709: what the SIGTERM-ignoring stand-in prints once — and only once —
 /// its `trap '' TERM` is installed, so `delegate/022` can wait for the state its
@@ -402,15 +401,17 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
+    let pointer =
+        common::expected_delegate_pointer(std::path::Path::new(&fx.cwd), WORKER_ROLE, WORKER_PANE);
     let snapshot = wait_for_pane_needle(
         &fx.daemon.registry,
         WORKER_PANE,
-        POINTER,
+        &pointer,
         Duration::from_secs(20),
     )
     .await;
     assert!(
-        snapshot_contains(&snapshot, POINTER),
+        snapshot_contains(&snapshot, &pointer),
         "the recovered worker never received the task pointer; snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
     );
@@ -519,6 +520,8 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    let pointer =
+        common::expected_delegate_pointer(std::path::Path::new(&fx.cwd), WORKER_ROLE, WORKER_PANE);
     let worker_snapshot = fx
         .daemon
         .registry
@@ -526,7 +529,7 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         .and_then(|id| fx.daemon.registry.snapshot(&id).ok())
         .unwrap_or_default();
     assert!(
-        !snapshot_contains(&worker_snapshot, POINTER),
+        !snapshot_contains(&worker_snapshot, &pointer),
         "nothing may be written into a pane whose agent is not live"
     );
     // PRD #249 finding B3's precedent: this notice family interpolates the
@@ -723,28 +726,35 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     .expect("deliver the control replacement's SessionStart");
 
     // --- both workers actually receive the pointer.
+    let dispatched_pointer =
+        common::expected_delegate_pointer(dispatch_dir.path(), WORKER_ROLE, &dispatched_worker);
     let dispatched_snapshot = wait_for_pane_needle(
         &daemon.registry,
         &dispatched_worker,
-        POINTER,
+        &dispatched_pointer,
         Duration::from_secs(20),
     )
     .await;
     assert!(
-        snapshot_contains(&dispatched_snapshot, POINTER),
+        snapshot_contains(&dispatched_snapshot, &dispatched_pointer),
         "the DISPATCHED orchestration's respawned worker never received the task pointer — the \
          user-visible half of #584; snapshot = {:?}",
         String::from_utf8_lossy(&dispatched_snapshot)
     );
+    let control_pointer = common::expected_delegate_pointer(
+        std::path::Path::new(&control.cwd),
+        WORKER_ROLE,
+        WORKER_PANE,
+    );
     let control_snapshot = wait_for_pane_needle(
         &control.daemon.registry,
         WORKER_PANE,
-        POINTER,
+        &control_pointer,
         Duration::from_secs(20),
     )
     .await;
     assert!(
-        snapshot_contains(&control_snapshot, POINTER),
+        snapshot_contains(&control_snapshot, &control_pointer),
         "the CONTROL orchestration's respawned worker never received the task pointer — a broken \
          control means the harness is wrong and the dispatched result above proves nothing; \
          snapshot = {:?}",

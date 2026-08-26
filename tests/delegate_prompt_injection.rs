@@ -47,7 +47,6 @@ mod common;
 const ORCH_PANE: &str = "orchestrator-pane";
 const WORKER_PANE: &str = "worker-pane";
 const WORKER_ROLE: &str = "coder";
-const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
 const DELEGATE_READINESS_BUFFER_ENV: &str = "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS";
@@ -416,6 +415,7 @@ async fn wait_for_silence_notice(
 struct SlowReadinessResult {
     snapshot: Vec<u8>,
     measured_readiness_window: Duration,
+    pointer: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -506,7 +506,8 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
         String::from_utf8_lossy(&cat_ready)
     );
 
-    let mut submitted_pointer = POINTER.to_vec();
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
+    let mut submitted_pointer = pointer.clone();
     submitted_pointer.push(b'\r');
     // Issue #709: the delegate's own delivery, and the one wait in this fixture
     // whose length is part of what the caller asserts — so the two arms are
@@ -534,6 +535,7 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     SlowReadinessResult {
         snapshot,
         measured_readiness_window,
+        pointer,
     }
 }
 
@@ -728,12 +730,17 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     state.handle_delegate(signal, &registry, &event_tx).await;
 
     // 1) The injected pane prompt must be the single-line file pointer.
-    let snap =
-        wait_for_snapshot_needle(&registry, &worker_agent_id, POINTER, Duration::from_secs(5))
-            .await;
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
+    let snap = wait_for_snapshot_needle(
+        &registry,
+        &worker_agent_id,
+        &pointer,
+        Duration::from_secs(5),
+    )
+    .await;
     let snap_str = String::from_utf8_lossy(&snap);
     assert!(
-        snap.windows(POINTER.len()).any(|w| w == POINTER),
+        snap.windows(pointer.len()).any(|w| w == pointer.as_slice()),
         "worker pane never received the single-line file pointer; snapshot = {snap_str:?}"
     );
 
@@ -751,10 +758,13 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     );
 
     // 3) The footer (and the task body) must live in the worker task file.
-    let task_file = cwd
-        .path()
-        .join(".dot-agent-deck")
-        .join("worker-task-coder.md");
+    let task_file =
+        cwd.path()
+            .join(".dot-agent-deck")
+            .join(dot_agent_deck::state::delegate_task_file_name(
+                WORKER_ROLE,
+                WORKER_PANE,
+            ));
     let mut file_body = String::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -861,15 +871,18 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     let new_agent_id =
         wait_for_replacement_agent(&daemon.registry, WORKER_PANE, &old_agent_id).await;
 
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     let before_native = wait_for_snapshot_needle(
         &daemon.registry,
         &new_agent_id,
-        POINTER,
+        &pointer,
         Duration::from_secs(2),
     )
     .await;
     assert!(
-        !before_native.windows(POINTER.len()).any(|w| w == POINTER),
+        !before_native
+            .windows(pointer.len())
+            .any(|w| w == pointer.as_slice()),
         "wrapper fork-time SessionStart released the readiness gate before native Codex was ready; prompt reached replacement PTY early: {:?}",
         String::from_utf8_lossy(&before_native)
     );
@@ -883,12 +896,14 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     let after_native = wait_for_snapshot_needle(
         &daemon.registry,
         &new_agent_id,
-        POINTER,
+        &pointer,
         Duration::from_secs(5),
     )
     .await;
     assert!(
-        after_native.windows(POINTER.len()).any(|w| w == POINTER),
+        after_native
+            .windows(pointer.len())
+            .any(|w| w == pointer.as_slice()),
         "prompt was not delivered after native Codex SessionStart; snapshot = {:?}",
         String::from_utf8_lossy(&after_native)
     );
@@ -958,10 +973,13 @@ async fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt_inner() 
             true,
         )))
         .expect("dispatch task subscribes before respawn");
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     let snapshot =
-        wait_for_snapshot_needle(&registry, &new_agent_id, POINTER, Duration::from_secs(2)).await;
+        wait_for_snapshot_needle(&registry, &new_agent_id, &pointer, Duration::from_secs(2)).await;
     assert!(
-        snapshot.windows(POINTER.len()).any(|w| w == POINTER),
+        snapshot
+            .windows(pointer.len())
+            .any(|w| w == pointer.as_slice()),
         "hookless wrapper's sole fork-time SessionStart must release prompt delivery promptly; snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
     );
@@ -1063,16 +1081,17 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     // this 1000 ms floor, a 40x margin. So the property is now pinned across the
     // WHOLE buffer rather than its first 350 ms, and no amount of load can turn
     // it red.
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     let delivered = wait_for_snapshot_needle(
         &daemon.registry,
         &new_agent_id,
-        POINTER,
+        &pointer,
         OBSERVED_READINESS_DELIVERY_CEILING,
     )
     .await;
     let held = session_start_at.elapsed();
     assert!(
-        snapshot_contains(&delivered, POINTER),
+        snapshot_contains(&delivered, &pointer),
         "delegate pointer was not delivered within {OBSERVED_READINESS_DELIVERY_CEILING:?} of the \
          replacement worker's matching SessionStart, so the observed-readiness branch released \
          nothing at all; snapshot = {:?}",
@@ -1154,11 +1173,12 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
     // the daemon task arming that timeout and the `pause()` above — see
     // `TIMER_TICK_SLACK` (#402). Every advance below is relative to the instant
     // the readiness-buffer sleep is armed, which is this one.
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
     std::thread::sleep(Duration::from_millis(100));
     let after_timeout = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
-        !snapshot_contains(&after_timeout, POINTER),
+        !snapshot_contains(&after_timeout, &pointer),
         "timeout fallback wrote the delegate pointer immediately after its SessionStart wait instead of honoring the additional 1000 ms readiness buffer; snapshot = {:?}",
         String::from_utf8_lossy(&after_timeout)
     );
@@ -1167,7 +1187,7 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
     std::thread::sleep(Duration::from_millis(100));
     let just_before_buffer = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
-        !snapshot_contains(&just_before_buffer, POINTER),
+        !snapshot_contains(&just_before_buffer, &pointer),
         "timeout fallback released delegate delivery just short of the configured 1000 ms readiness buffer; snapshot = {:?}",
         String::from_utf8_lossy(&just_before_buffer)
     );
@@ -1176,13 +1196,13 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
     poll_until_after_time_advance(Duration::from_secs(2), || {
         snapshot_contains(
             &registry.snapshot(&new_agent_id).unwrap_or_default(),
-            POINTER,
+            &pointer,
         )
     })
     .await;
     let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
-        snapshot_contains(&delivered, POINTER),
+        snapshot_contains(&delivered, &pointer),
         "delegate pointer was not delivered after the timeout-fallback readiness buffer elapsed; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
     );
@@ -1228,11 +1248,12 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
 
     // `TIMER_TICK_SLACK` (#402): same fallback crossing as the scenario above,
     // and the 1 ms buffer armed here leaves even less room to absorb a miss.
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
     std::thread::sleep(Duration::from_millis(50));
     let at_fallback = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
-        !snapshot_contains(&at_fallback, POINTER),
+        !snapshot_contains(&at_fallback, &pointer),
         "BUFFER_MS=1 collapsed to a zero wait at the timeout fallback; snapshot = {:?}",
         String::from_utf8_lossy(&at_fallback)
     );
@@ -1241,13 +1262,13 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
     poll_until_after_time_advance(Duration::from_secs(2), || {
         snapshot_contains(
             &registry.snapshot(&new_agent_id).unwrap_or_default(),
-            POINTER,
+            &pointer,
         )
     })
     .await;
     let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
-        snapshot_contains(&delivered, POINTER),
+        snapshot_contains(&delivered, &pointer),
         "the one-millisecond readiness buffer never released after virtual time crossed its rounded deadline; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
     );
@@ -1294,12 +1315,13 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
     // `TIMER_TICK_SLACK` (#402): the fallback crossing again. The 1001 ms step
     // below still straddles the 1000 ms default it must NOT have fallen back
     // to, because it is measured from the instant this advance arms the buffer.
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
     advance_and_run(Duration::from_millis(1001)).await;
     std::thread::sleep(Duration::from_millis(50));
     let after_default = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
-        !snapshot_contains(&after_default, POINTER),
+        !snapshot_contains(&after_default, &pointer),
         "an above-u64 readiness value fell back to the 1000 ms default instead of clamping to 30 s; snapshot = {:?}",
         String::from_utf8_lossy(&after_default)
     );
@@ -1308,13 +1330,13 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
     poll_until_after_time_advance(Duration::from_secs(2), || {
         snapshot_contains(
             &registry.snapshot(&new_agent_id).unwrap_or_default(),
-            POINTER,
+            &pointer,
         )
     })
     .await;
     let delivered = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
-        snapshot_contains(&delivered, POINTER),
+        snapshot_contains(&delivered, &pointer),
         "the clamped 30-second readiness buffer never released after its rounded deadline; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
     );
@@ -1341,7 +1363,7 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
         .block_on(async {
             let zero = run_slow_readiness_delegate(0).await;
             assert!(
-                !snapshot_contains(&zero.snapshot, POINTER),
+                !snapshot_contains(&zero.snapshot, &zero.pointer),
                 "the zero-buffer control unexpectedly delivered the pointer outside the stub's discard window; snapshot = {:?}",
                 String::from_utf8_lossy(&zero.snapshot)
             );
@@ -1363,10 +1385,10 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
                 "the synthetic readiness window drifted outside its intended measurement band: {:?}",
                 buffered.measured_readiness_window
             );
-            let mut submitted_pointer = POINTER.to_vec();
+            let mut submitted_pointer = buffered.pointer.clone();
             submitted_pointer.push(b'\r');
             assert!(
-                snapshot_contains(&buffered.snapshot, POINTER),
+                snapshot_contains(&buffered.snapshot, &buffered.pointer),
                 "the 1000 ms readiness buffer did not deliver the delegate pointer after the measured {:?} input-readiness window; snapshot = {:?}",
                 buffered.measured_readiness_window,
                 String::from_utf8_lossy(&buffered.snapshot)
@@ -1572,25 +1594,26 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
     );
     let ready_at = Instant::now();
 
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     let delivered = wait_for_snapshot_needle(
         &daemon.registry,
         &new_agent_id,
-        POINTER,
+        &pointer,
         READY_TO_POINTER_BUDGET,
     )
     .await;
-    if !snapshot_contains(&delivered, POINTER) {
+    if !snapshot_contains(&delivered, &pointer) {
         // Failed already; keep looking only to turn "missed the budget" into a
         // number the fix can be measured against. See `MEASURED_LATENCY_CEILING`.
         let eventual = wait_for_snapshot_needle(
             &daemon.registry,
             &new_agent_id,
-            POINTER,
+            &pointer,
             MEASURED_LATENCY_CEILING,
         )
         .await;
         let measured = ready_at.elapsed();
-        let arrived = snapshot_contains(&eventual, POINTER);
+        let arrived = snapshot_contains(&eventual, &pointer);
         panic!(
             "a wrapped worker sitting VISIBLY at its ready prompt did not receive its delegated \
              task pointer within {READY_TO_POINTER_BUDGET:?}: it {} after {measured:?} measured \
@@ -2142,10 +2165,11 @@ async fn delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_r
         run.interface_event.timestamp
     );
 
+    let pointer = common::expected_delegate_pointer(run._cwd.path(), WORKER_ROLE, WORKER_PANE);
     let delivered = wait_for_snapshot_needle(
         &run.daemon.registry,
         &run.new_agent_id,
-        POINTER,
+        &pointer,
         HELD_POINTER_DELIVERY_CEILING,
     )
     .await;
@@ -2162,7 +2186,7 @@ async fn delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_r
         .to_std()
         .unwrap_or(Duration::ZERO);
     assert!(
-        snapshot_contains(&delivered, POINTER),
+        snapshot_contains(&delivered, &pointer),
         "the delegate pointer never arrived within {HELD_POINTER_DELIVERY_CEILING:?} of the \
          wrapper's STRONG interface event, so nothing released it at all; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
@@ -2298,10 +2322,11 @@ async fn delegate_027_raw_input_fact_pays_the_interface_buffer_inner(script: &st
     let run = run_wrapped_interface_delegate(script, RAW_INPUT_READY_BANNER).await;
     assert_raw_input_fact(&run);
 
+    let pointer = common::expected_delegate_pointer(run._cwd.path(), WORKER_ROLE, WORKER_PANE);
     let delivered = wait_for_snapshot_needle(
         &run.daemon.registry,
         &run.new_agent_id,
-        POINTER,
+        &pointer,
         HELD_POINTER_DELIVERY_CEILING,
     )
     .await;
@@ -2315,7 +2340,7 @@ async fn delegate_027_raw_input_fact_pays_the_interface_buffer_inner(script: &st
     // `orchestration/delegate/026`'s — because the strong fact releases the gate
     // in the instant it arrives rather than at window expiry.
     assert!(
-        snapshot_contains(&delivered, POINTER),
+        snapshot_contains(&delivered, &pointer),
         "the delegate pointer never arrived at all within {HELD_POINTER_DELIVERY_CEILING:?} of \
          the wrapper's raw-input interface event; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
@@ -2355,10 +2380,11 @@ async fn delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner
     let run = run_wrapped_interface_delegate(script, RAW_INPUT_READY_BANNER).await;
     assert_raw_input_fact(&run);
 
+    let pointer = common::expected_delegate_pointer(run._cwd.path(), WORKER_ROLE, WORKER_PANE);
     let delivered = wait_for_snapshot_needle(
         &run.daemon.registry,
         &run.new_agent_id,
-        POINTER,
+        &pointer,
         HELD_POINTER_DELIVERY_CEILING,
     )
     .await;
@@ -2366,7 +2392,7 @@ async fn delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner
         .to_std()
         .unwrap_or(Duration::ZERO);
     assert!(
-        snapshot_contains(&delivered, POINTER),
+        snapshot_contains(&delivered, &pointer),
         "the delegate pointer never arrived within {HELD_POINTER_DELIVERY_CEILING:?} of the \
          wrapper's raw-input interface event while an operator buffer was pinned; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
@@ -2499,10 +2525,11 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     )
     .expect("write forged interface SessionStart");
 
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     let delivered = wait_for_snapshot_needle(
         &daemon.registry,
         &new_agent_id,
-        POINTER,
+        &pointer,
         HELD_POINTER_DELIVERY_CEILING,
     )
     .await;
@@ -2512,7 +2539,7 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     // `SessionStart` does it — and still is, which is why the pointer is
     // expected to ARRIVE rather than be withheld.
     assert!(
-        snapshot_contains(&delivered, POINTER),
+        snapshot_contains(&delivered, &pointer),
         "the forged marker should still RELEASE the gate — that was always forgeable and is not \
          what guard 2 defends — but no pointer arrived within \
          {HELD_POINTER_DELIVERY_CEILING:?}; snapshot = {:?}",
@@ -2685,13 +2712,14 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
     // one jump would report a false red for a correct two-stage fix. Each step
     // overshoots by `TIMER_TICK_SLACK` (#402) so crossing a deadline never
     // depends on where its arming instant fell inside a millisecond.
+    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     let step = Duration::from_secs(1);
     let mut virtual_elapsed = Duration::ZERO;
     let delivered = loop {
         if poll_until_after_time_advance(Duration::from_millis(60), || {
             snapshot_contains(
                 &registry.snapshot(&new_agent_id).unwrap_or_default(),
-                POINTER,
+                &pointer,
             )
         })
         .await
@@ -3001,10 +3029,13 @@ impl SilentWorkerArm {
                 &self.event_tx,
             )
             .await;
+        let pointer = common::expected_delegate_pointer(self._cwd.path(), WORKER_ROLE, WORKER_PANE);
         let delivered =
-            wait_for_file_needle(&self.delivery_log, POINTER, Duration::from_secs(2)).await;
+            wait_for_file_needle(&self.delivery_log, &pointer, Duration::from_secs(2)).await;
         assert!(
-            delivered.windows(POINTER.len()).any(|w| w == POINTER),
+            delivered
+                .windows(pointer.len())
+                .any(|w| w == pointer.as_slice()),
             "silent-worker visibility control failed: the worker never received the delegate \
              pointer; delivered = {:?}",
             String::from_utf8_lossy(&delivered)
@@ -3252,15 +3283,16 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                     false,
                 )))
                 .expect("generation A dispatch subscribes before respawn");
+            let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
             let generation_a_delivered = wait_for_snapshot_needle(
                 &registry,
                 &generation_a,
-                POINTER,
+                &pointer,
                 Duration::from_secs(2),
             )
             .await;
             assert!(
-                snapshot_contains(&generation_a_delivered, POINTER),
+                snapshot_contains(&generation_a_delivered, &pointer),
                 "generation A did not receive its payload, so its silence watch was not \
                  observably armed; snapshot = {:?}",
                 String::from_utf8_lossy(&generation_a_delivered)
@@ -3303,7 +3335,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 String::from_utf8_lossy(&generation_b_pane)
             );
             assert!(
-                !snapshot_contains(&generation_b_pane, POINTER),
+                !snapshot_contains(&generation_b_pane, &pointer),
                 "generation B's payload arrived before the test could exercise A's expiry \
                  inside B's readiness wait; snapshot = {:?}",
                 String::from_utf8_lossy(&generation_b_pane)
@@ -3317,7 +3349,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
             .await;
             let generation_b_still_waiting = registry.snapshot(&generation_b).unwrap_or_default();
             assert!(
-                !snapshot_contains(&generation_b_still_waiting, POINTER),
+                !snapshot_contains(&generation_b_still_waiting, &pointer),
                 "generation B's payload arrived before A's 500 ms window expired, so the \
                  supersession race was not reproduced; snapshot = {:?}",
                 String::from_utf8_lossy(&generation_b_still_waiting)
@@ -3337,12 +3369,12 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
             let generation_b_delivered = wait_for_snapshot_needle(
                 &registry,
                 &generation_b,
-                POINTER,
+                &pointer,
                 Duration::from_secs(2),
             )
             .await;
             assert!(
-                snapshot_contains(&generation_b_delivered, POINTER),
+                snapshot_contains(&generation_b_delivered, &pointer),
                 "generation B never received its own payload after the readiness wait; snapshot = {:?}",
                 String::from_utf8_lossy(&generation_b_delivered)
             );
@@ -3384,6 +3416,7 @@ struct SilenceHarness {
     event_tx: broadcast::Sender<BroadcastMsg>,
     orchestrator_agent_id: String,
     worker_agent_id: String,
+    pointer: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -3432,6 +3465,7 @@ impl SilenceHarness {
             .pane_cwd_map
             .insert(ORCH_PANE.to_string(), cwd_str.clone());
         let (event_tx, _rx) = broadcast::channel(channel_capacity);
+        let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
         Self {
             _cwd: cwd,
             cwd_str,
@@ -3440,6 +3474,7 @@ impl SilenceHarness {
             event_tx,
             orchestrator_agent_id,
             worker_agent_id,
+            pointer,
         }
     }
 
@@ -3460,12 +3495,12 @@ impl SilenceHarness {
         let delivered = wait_for_snapshot_needle(
             &self.registry,
             &self.worker_agent_id,
-            POINTER,
+            &self.pointer,
             Duration::from_secs(2),
         )
         .await;
         assert!(
-            snapshot_contains(&delivered, POINTER),
+            snapshot_contains(&delivered, &self.pointer),
             "silence-watch precondition failed: worker never received pointer; snapshot = {:?}",
             String::from_utf8_lossy(&delivered)
         );
@@ -3477,8 +3512,8 @@ impl SilenceHarness {
             .snapshot(&self.worker_agent_id)
             .unwrap_or_default();
         let previous_count = before
-            .windows(POINTER.len())
-            .filter(|w| *w == POINTER)
+            .windows(self.pointer.len())
+            .filter(|w| *w == self.pointer.as_slice())
             .count();
         assert!(
             previous_count > 0,
@@ -3507,8 +3542,8 @@ impl SilenceHarness {
                 .snapshot(&self.worker_agent_id)
                 .unwrap_or_default();
             let current_count = snapshot
-                .windows(POINTER.len())
-                .filter(|w| *w == POINTER)
+                .windows(self.pointer.len())
+                .filter(|w| *w == self.pointer.as_slice())
                 .count();
             if current_count > previous_count {
                 break;
@@ -3860,12 +3895,12 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                 let delivered = wait_for_snapshot_needle(
                     &harness.registry,
                     &harness.worker_agent_id,
-                    POINTER,
+                    &harness.pointer,
                     Duration::from_secs(2),
                 )
                 .await;
                 assert!(
-                    snapshot_contains(&delivered, POINTER),
+                    snapshot_contains(&delivered, &harness.pointer),
                     "precondition failed: worker never received the delegate pointer: {:?}",
                     String::from_utf8_lossy(&delivered)
                 );
@@ -3961,12 +3996,12 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                 let delivered = wait_for_snapshot_needle(
                     &harness.registry,
                     &harness.worker_agent_id,
-                    POINTER,
+                    &harness.pointer,
                     Duration::from_secs(2),
                 )
                 .await;
                 assert!(
-                    snapshot_contains(&delivered, POINTER),
+                    snapshot_contains(&delivered, &harness.pointer),
                     "precondition failed: worker never received the delegate pointer: {:?}",
                     String::from_utf8_lossy(&delivered)
                 );
@@ -4076,12 +4111,12 @@ fn delegate_hostile_delegated_subject_is_sanitized_before_reaching_worker_task_f
             let delivered = wait_for_snapshot_needle(
                 &harness.registry,
                 &harness.worker_agent_id,
-                POINTER,
+                &harness.pointer,
                 Duration::from_secs(2),
             )
             .await;
             assert!(
-                snapshot_contains(&delivered, POINTER),
+                snapshot_contains(&delivered, &harness.pointer),
                 "precondition failed: worker never received the delegate pointer: {:?}",
                 String::from_utf8_lossy(&delivered)
             );
@@ -4091,7 +4126,10 @@ fn delegate_hostile_delegated_subject_is_sanitized_before_reaching_worker_task_f
             // it is already on disk.
             let task_file = std::path::Path::new(&harness.cwd_str)
                 .join(".dot-agent-deck")
-                .join("worker-task-coder.md");
+                .join(dot_agent_deck::state::delegate_task_file_name(
+                    WORKER_ROLE,
+                    WORKER_PANE,
+                ));
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let file_body = loop {
                 if let Ok(s) = std::fs::read_to_string(&task_file)
@@ -4197,12 +4235,12 @@ fn delegate_mismatch_expected_side_is_canonical_for_a_frame_breaking_subject() {
             let delivered = wait_for_snapshot_needle(
                 &harness.registry,
                 &harness.worker_agent_id,
-                POINTER,
+                &harness.pointer,
                 Duration::from_secs(2),
             )
             .await;
             assert!(
-                snapshot_contains(&delivered, POINTER),
+                snapshot_contains(&delivered, &harness.pointer),
                 "precondition failed: worker never received the delegate pointer: {:?}",
                 String::from_utf8_lossy(&delivered)
             );
