@@ -1,10 +1,10 @@
 ---
 name: implement-prd
-description: Work through the entire open high-priority PRD/enhancement queue — inventory, scope, implement via the full PRD workflow, review, and auto-merge each item without pausing for the test-plan or merge gate, except where CLAUDE.md rule 25 requires it. Use when the user asks to clear the PRD backlog, implement all high-priority PRDs, or run an unattended feature-implementation sweep. Does not pick up bugs, chores, refactors, or unrelated cleanup.
+description: Work through the entire open high-priority PRD/enhancement queue — inventory, scope, implement via the full PRD workflow, review, and merge each item without pausing for the test-plan gate, applying CLAUDE.md rule 25's merge checklist like any other flow. Use when the user asks to clear the PRD backlog, implement all high-priority PRDs, or run an unattended feature-implementation sweep. Does not pick up bugs, chores, refactors, or unrelated cleanup.
 user-invocable: true
 ---
 
-# Implement all high-priority PRDs and enhancements, unattended through merge
+# Implement all high-priority PRDs and enhancements, unattended through the test-plan gate
 
 Clears the open `PRD`/`enhancement` + `priority-high` queue on `prageethw/dot-agent-deck`, end to end — without pausing at the gates `orchestrator-context.md`'s ordinary PRD workflow otherwise stops at. Read that deliberate deviation carefully below before invoking this: it is a real change in how much gets built and merged without a human looking, and it is not free.
 
@@ -12,9 +12,9 @@ Clears the open `PRD`/`enhancement` + `priority-high` queue on `prageethw/dot-ag
 
 ## The deliberate deviation from the standing workflow, stated plainly
 
-`.dot-agent-deck.toml`'s orchestrator role and `orchestrator-context.md` establish the **test-plan approval** (before any implementation starts) as a standing user gate for ordinary PRD work, plus a **merge confirmation** (before the PR lands) that CLAUDE.md rule 25 makes conditional — a gate only when its checklist fails or its always-ask exclusion applies, not unconditionally. This skill exists specifically to run **unattended through the test-plan gate, and through the merge gate whenever rule 25's checklist would otherwise let it proceed unattended anyway**, because "do not stop after the first PRD" and "merge each completed PRD as soon as it is ready" are the whole point of invoking it by name.
+`.dot-agent-deck.toml`'s orchestrator role and `orchestrator-context.md` establish the **test-plan approval** (before any implementation starts) as a standing user gate for ordinary PRD work, plus a **merge confirmation** (before the PR lands) that CLAUDE.md rule 25 makes conditional — a gate only when its checklist fails or its always-ask exclusion applies, not unconditionally. This skill's deviation is the test-plan gate: it runs straight through it without stopping, because "do not stop after the first PRD" is the whole point of invoking it by name. At the merge gate it applies rule 25 exactly like any other flow — since [#368](https://github.com/prageethw/dot-agent-deck/issues/368) that rule already permits an unattended merge whenever its checklist holds, so this skill adds no separate merge-gate deviation; it merges each completed PRD as soon as rule 25's own conditions are satisfied.
 
-That is an explicit, scoped opt-in — the user invoking `/implement-prd` is the approval that would otherwise be sought interactively per PRD. It is not a standing change to how PRD work happens outside this skill; a PRD started any other way still gets both gates.
+That is an explicit, scoped opt-in — the user invoking `/implement-prd` is the approval that would otherwise be sought interactively per PRD. It is not a standing change to how PRD work happens outside this skill; a PRD started any other way still gets the test-plan gate unconditionally, and the merge gate whenever rule 25's checklist or its always-ask exclusion calls for it.
 
 **What still stops you, even here**: CLAUDE.md rule 25's always-ask exclusion is not waived by this skill. If a PRD's diff touches a rule-12 protocol change, needs a `.breaking.md` fragment, cuts a release/tag, or edits CLAUDE.md/`.github/workflows/**`/the release flow, **stop and ask the user for that one PRD's merge specifically** — do not fold it into "merge automatically." Keep working the rest of the queue while that one waits. Expect this to trigger often: a "high-priority" PRD is disproportionately likely to be exactly the kind of substantive, protocol-touching change rule 25 singles out (this happened on the very first PRD run through this repo's normal flow — a routine daemon-authoritative-id PRD turned out to bump `PROTOCOL_VERSION` and needed the exclusion).
 
