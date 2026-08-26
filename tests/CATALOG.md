@@ -1809,6 +1809,71 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** non-reuse across a daemon restart (`mint_pane_id`'s nonce is per-process, not persisted — a restart gets a fresh nonce so collision with a pre-restart id is astronomically unlikely rather than structurally impossible; PRD #365's M3 checklist has exactly three items, all of which land here or in the rule-12 manual record, and none of them is restart non-reuse); the exact `{nonce}-{seq}` id shape (`daemon/pane-id/001` already covers "present, non-empty, unique").
 - **Platform coverage:** mac+linux.
 
+#### wait/monitored
+
+##### wait/monitored/001 — `dot-agent-deck wait start <label>` sets a pane `Working` with no shell descendant running; `wait done <label> --outcome success` clears it back to `Idle` (PRD #499, reopened).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck wait start`/`wait done` CLI as a subprocess + an in-process daemon's hook socket, `common::spawn_inprocess_daemon` — which runs the genuine `run_shell_activity_monitor` poll loop — + a `cat`-stub pane registered directly on the daemon's own `AgentPtyRegistry`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub pane seeded to a known `Idle` session over the hook socket before the CLI runs).
+- **Asserts:** `wait start <label>` exits successfully and the pane's `SessionStatus` (read directly off `AppState.sessions`) reaches `Working` with no descendant process of any kind spawned inside the pane; `wait done <label> --outcome success` then exits successfully and the same session reverts to `Idle`.
+- **Does not assert:** persistence across multiple poll ticks (`002`); per-pane attribution against a second pane (`003`); the three other terminal outcomes (`005`-`008`); TTL self-healing (`009`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/002 — the monitored wait persists across real polling gaps with no live descendant at all, unlike the pre-#499-reopen `descendant_shell_activity`-only mechanism (PRD #499).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`).
+- **Agent:** none (synthetic — a `cat`-stub pane, no descendant process ever spawned).
+- **Asserts:** after `wait start <label>`, the pane's status is sampled repeatedly across a ~2.2s window (~4 real 500ms `run_shell_activity_monitor` poll ticks) with genuine gaps and zero shell activity in between, and reads `Working` on every sample — the existing `descendant_shell_activity` signal alone has nothing to observe here (no descendant exists), so a `Working` reading can only come from the new monitored-wait signal. `wait done --outcome success` then clears it to `Idle`.
+- **Does not assert:** per-pane attribution (`003`); any interaction with a REAL live descendant process (out of scope — this test's whole point is proving the signal works with none).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/003 — attribution is per-pane, never a global flag: only the pane that declared the wait reads `Working` (PRD #499).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`, with two independently registered `cat`-stub panes).
+- **Agent:** none (synthetic — two `cat`-stub panes, both seeded `Idle`; only pane A ever calls `wait start`).
+- **Asserts:** pane A reads and holds `Working` across a sustained sampling window after its own `wait start`, while pane B — untouched, never called into `wait` at all — holds `Idle` for the exact same window, sampled concurrently. `wait done` on A then clears only A.
+- **Does not assert:** TTL expiry; any of the four terminal outcomes beyond `success`.
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/004 — a pane with no monitored wait declared and no shell descendant reads `Idle` (regression guard, PRD #499).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`; this test never invokes the `wait` CLI at all).
+- **Agent:** none (synthetic — a single `cat`-stub pane seeded `Idle`, left untouched).
+- **Asserts:** the pane's status holds `Idle` across a sustained sampling window with no `wait` call ever made. Expected to already be green before M3-M8 land, since nothing here exercises the new mechanism; captured as a permanent guard the implementation must not regress.
+- **Does not assert:** anything about the monitored-wait mechanism itself, by design — this is the "untouched panes are unaffected" baseline the other eight tests are contrasted against.
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/005 — `wait done <label> --outcome success` clears `Working` back to `Idle` (PRD #499).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`).
+- **Agent:** none (synthetic — a `cat`-stub pane seeded `Idle`).
+- **Asserts:** `wait start` reaches `Working`; `wait done --outcome success` exits successfully and clears the session back to `Idle`.
+- **Does not assert:** the other three terminal outcomes (each has its own test, `006`-`008`, sharing this test's body via a common async helper parameterized by outcome).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/006 — `wait done <label> --outcome failure` clears `Working` back to `Idle` (PRD #499).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `005`).
+- **Agent:** none (synthetic — a `cat`-stub pane seeded `Idle`).
+- **Asserts:** `wait start` reaches `Working`; `wait done --outcome failure` exits successfully and clears the session back to `Idle` — a failed external outcome must not wedge the pane `Working` forever.
+- **Does not assert:** the other three terminal outcomes (`005`, `007`, `008`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/007 — `wait done <label> --outcome cancelled` clears `Working` back to `Idle` (PRD #499).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `005`).
+- **Agent:** none (synthetic — a `cat`-stub pane seeded `Idle`).
+- **Asserts:** `wait start` reaches `Working`; `wait done --outcome cancelled` exits successfully and clears the session back to `Idle`.
+- **Does not assert:** the other three terminal outcomes (`005`, `006`, `008`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/008 — `wait done <label> --outcome timeout` clears `Working` back to `Idle` (PRD #499).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `005`).
+- **Agent:** none (synthetic — a `cat`-stub pane seeded `Idle`).
+- **Asserts:** `wait start` reaches `Working`; `wait done --outcome timeout` exits successfully and clears the session back to `Idle`.
+- **Does not assert:** the other three terminal outcomes (`005`-`007`).
+- **Platform coverage:** mac+linux.
+
+##### wait/monitored/009 — a monitored wait that is never explicitly cleared self-heals via TTL rather than wedging the pane `Working` forever (PRD #499).
+- **Layer:** fast synthetic real-binary-subprocess integration (same shape as `001`).
+- **Agent:** none (synthetic — a `cat`-stub pane seeded `Idle`).
+- **Asserts:** `wait start <label>` run with a test-only `DOT_AGENT_DECK_WAIT_TTL_SECS=2` override set on the CLI subprocess's own environment reaches `Working`; with `wait done` deliberately never called, after sleeping past the 2s TTL plus poll-cadence margin the session has reverted to `Idle` on its own.
+- **Does not assert:** the production TTL's default duration (only that an override is honored and expiry self-heals); any of the four terminal outcomes (`005`-`008` cover explicit clearing).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
