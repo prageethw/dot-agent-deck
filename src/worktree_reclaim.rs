@@ -8230,10 +8230,18 @@ mod tests {
             let wt = scratch.path().join("wt-pinned-field-parity");
             add_worktree(&repo, &wt, "pinned-field-parity-branch");
 
+            // Matched by `kind` alone, not by path: on macOS `real_path`
+            // comes back through git's own realpath resolution
+            // (`/private/var/...`) while `wt` is the plain, unresolved
+            // tempdir join, so a path-equality match is a false negative
+            // there (see `discover_isolated_clones`'s own doc comment for
+            // the same class of mismatch). The main working tree is
+            // excluded from `list_linked_worktrees` by design, so this
+            // added worktree is the only `KIND_LINKED` row that can exist.
             let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
             let linked_report = reports
                 .iter()
-                .find(|r| r.kind == KIND_LINKED && r.real_path == wt)
+                .find(|r| r.kind == KIND_LINKED)
                 .expect("the added worktree must report as a linked row");
             assert!(
                 !linked_report.pinned,
