@@ -11006,4 +11006,32 @@ exit 0
         assert!(abs.is_absolute());
         assert_eq!(abs, PathBuf::from(abs_root));
     }
+
+    // --- issue #597: isolated-clone pin/unpin CLI wiring ---
+
+    /// Scenario: `set_isolated_clone_pinned`'s temp-file suffix today is
+    /// `std::process::id()` alone (fork issue #597 hazard 3) -- two calls
+    /// from the SAME process collide on the identical temp path, which is
+    /// exactly what a concurrent pin+unpin against the same isolated clone
+    /// would do. This calls the not-yet-existing `pin_temp_disambiguator()`
+    /// (the fix: reuses `agent_pty::mint_nonce_seq`'s per-process
+    /// nonce+monotonic-sequence idiom, the same recipe `spawn.rs::next_pane_id`
+    /// and `ui.rs::mint_orchestration_claim_token` already use for this exact
+    /// shape) twice in a row and asserts the two returned strings differ --
+    /// pinning that the disambiguator, once it exists, can never repeat
+    /// within one process the way a bare PID does.
+    #[spec("worktree/reclaim/080")]
+    #[test]
+    fn worktree_reclaim_080_pin_temp_disambiguator_differs_across_same_process_calls() {
+        let first = pin_temp_disambiguator();
+        let second = pin_temp_disambiguator();
+        assert_ne!(
+            first, second,
+            "two calls to pin_temp_disambiguator() from the same process must never produce \
+             the same string -- the PID-only tmp-path suffix set_isolated_clone_pinned used \
+             before this helper existed collided on exactly this shape (fork issue #597): a \
+             concurrent pin+unpin against the same clone within one process would write to an \
+             identical temp path, publishing a torn write. Got the same value {first:?} twice."
+        );
+    }
 }

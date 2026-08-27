@@ -8016,4 +8016,191 @@ mod tests {
              (forget_isolated_workspace's stale-evidence guard), got:\n{final_content}"
         );
     }
+
+    /// Scenario: fork issue #597 wires a `pinned` field onto `WorktreeReport`
+    /// so pin state is discoverable through `worktree list --json` without
+    /// substring-matching the human-readable `reason` string. Chosen shape:
+    /// an always-present plain `bool` (not `Option<bool>`), mirroring
+    /// `owned`/`clean` rather than `owner` -- because this field's
+    /// "unresolvable" case already has an established, unambiguous meaning
+    /// in this codebase (`isolated_clone_report`'s own doc comment: an
+    /// unreadable pin signal "fails closed, treated as pinned", fork issue
+    /// #546 hazard 2) rather than the genuinely-unknown meaning `owner`'s
+    /// `None` carries, so collapsing it to a bare `true` loses no
+    /// information `Option<bool>` would have preserved. Four fixtures, one
+    /// per state: an isolated clone explicitly pinned (`true`); one
+    /// explicitly unpinned via `unpin_isolated_clone` (`false`); one whose
+    /// provenance artifact exists but cannot be read, `worktree_reclaim_078`'s
+    /// own fixture shape (`true` -- fails closed); and an ordinary `"linked"`
+    /// row, the repo's own main worktree with no isolated clone involved at
+    /// all (`false` -- not applicable). References `WorktreeReport.pinned`
+    /// directly, which does not exist yet, so this is a compile-error RED.
+    #[spec("worktree/reclaim/081")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_081_pinned_field_reflects_pin_state_and_fails_closed_when_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // (a) Explicitly pinned isolated clone -> pinned == true.
+        {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            init_repo_with_origin(&repo);
+
+            let clone_dir = scratch.path().join("repo-isolated-pinned-field");
+            let creator = "issue-dispatch:pinned-field#597";
+            crate::issue_dispatch_run::provision_isolated_clone_sync(
+                &repo,
+                &clone_dir,
+                "pinned-field-branch",
+                creator,
+            )
+            .expect("provision_isolated_clone_sync must succeed against a real source repo");
+            crate::issue_dispatch_run::pin_isolated_clone(&clone_dir)
+                .expect("pin_isolated_clone must succeed against a real, just-provisioned clone");
+
+            let clone_head_sha = git_rev_parse_head(&clone_dir);
+            let bindir = scratch.path().join("bin");
+            write_merged_gh_stub_with_head_ref_oid(&bindir, "pinned-field-branch", &clone_head_sha);
+            let _path_guard = PathEnvGuard::prepend(&bindir);
+
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+            let clone_report = reports
+                .iter()
+                .find(|r| r.real_path == clone_dir)
+                .expect("the isolated clone must be present in the report at all");
+            assert!(
+                clone_report.pinned,
+                "an explicitly-pinned isolated clone must report pinned: true, got {:?}",
+                clone_report.pinned
+            );
+        }
+
+        // (b) Explicitly unpinned (schema=3, pinned=false) isolated clone,
+        // never previously pinned -- mirrors worktree_reclaim_076's own
+        // fixture shape -- -> pinned == false.
+        {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            init_repo_with_origin(&repo);
+
+            let clone_dir = scratch.path().join("repo-isolated-unpinned-field");
+            let creator = "issue-dispatch:unpinned-field#597";
+            crate::issue_dispatch_run::provision_isolated_clone_sync(
+                &repo,
+                &clone_dir,
+                "unpinned-field-branch",
+                creator,
+            )
+            .expect("provision_isolated_clone_sync must succeed against a real source repo");
+            crate::issue_dispatch_run::unpin_isolated_clone(&clone_dir).expect(
+                "unpin_isolated_clone must succeed even against a clone that was never pinned",
+            );
+
+            let clone_head_sha = git_rev_parse_head(&clone_dir);
+            let bindir = scratch.path().join("bin");
+            write_merged_gh_stub_with_head_ref_oid(
+                &bindir,
+                "unpinned-field-branch",
+                &clone_head_sha,
+            );
+            let _path_guard = PathEnvGuard::prepend(&bindir);
+
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+            let clone_report = reports
+                .iter()
+                .find(|r| r.real_path == clone_dir)
+                .expect("the isolated clone must be present in the report at all");
+            assert!(
+                !clone_report.pinned,
+                "an explicitly-unpinned isolated clone must report pinned: false, got {:?}",
+                clone_report.pinned
+            );
+        }
+
+        // (c) Provenance artifact exists but is unreadable (chmod 0o000) --
+        // worktree_reclaim_078's own fixture -- fails closed -> pinned ==
+        // true, matching isolated_clone_report's own "treated as pinned"
+        // language for this exact signal.
+        {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            init_repo_with_origin(&repo);
+
+            let clone_dir = scratch.path().join("repo-isolated-unreadable-field");
+            let creator = "issue-dispatch:unreadable-field#597";
+            crate::issue_dispatch_run::provision_isolated_clone_sync(
+                &repo,
+                &clone_dir,
+                "unreadable-field-branch",
+                creator,
+            )
+            .expect("provision_isolated_clone_sync must succeed against a real source repo");
+
+            let clone_head_sha = git_rev_parse_head(&clone_dir);
+            let provenance_path =
+                crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
+            assert!(
+                provenance_path.is_file(),
+                "sanity: the real provisioner must have written a provenance artifact at {} \
+                 before its read permission is stripped below",
+                provenance_path.display()
+            );
+            std::fs::set_permissions(&provenance_path, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+
+            let bindir = scratch.path().join("bin");
+            write_merged_gh_stub_with_head_ref_oid(
+                &bindir,
+                "unreadable-field-branch",
+                &clone_head_sha,
+            );
+            let _path_guard = PathEnvGuard::prepend(&bindir);
+
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+
+            // Restore read permission before any assertion, mirroring
+            // worktree_reclaim_078, so a failure here doesn't leave an
+            // unreadable artifact behind for a later test's cleanup.
+            std::fs::set_permissions(&provenance_path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+
+            let clone_report = reports
+                .iter()
+                .find(|r| r.real_path == clone_dir)
+                .expect("the isolated clone must be present in the report at all");
+            assert!(
+                clone_report.pinned,
+                "an isolated clone whose provenance artifact cannot be read must fail closed \
+                 and report pinned: true, exactly like isolated_clone_report's own eligibility \
+                 gate already treats this signal, got {:?}",
+                clone_report.pinned
+            );
+        }
+
+        // (d) Parity: an ordinary "linked" row (the repo's own main
+        // worktree, no isolated clone involved at all) -> pinned == false,
+        // never applicable. `set_non_github_origin` keeps `resolve_pr_state`
+        // from spawning the real, ambient `gh` (reviewer F6's precedent).
+        {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            init_repo_with_origin(&repo);
+            set_non_github_origin(&repo);
+
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+            let main_report = reports
+                .iter()
+                .find(|r| r.kind == KIND_LINKED)
+                .expect("the repo's own main worktree must report as a linked row");
+            assert!(
+                !main_report.pinned,
+                "an ordinary linked-worktree row must report pinned: false -- pinning is not \
+                 applicable to it at all, got {:?}",
+                main_report.pinned
+            );
+        }
+    }
 }
