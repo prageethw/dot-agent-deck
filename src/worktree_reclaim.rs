@@ -574,6 +574,18 @@ pub struct WorktreeReport {
     /// isn't as strong as the linked case's `owned_git_dir` containment
     /// check.
     pub kind: String,
+    /// Fork issue #597: whether this isolated clone is explicitly pinned
+    /// against fork#325 M4c's automatic reclaim (fork issue #546 hazard 2)
+    /// — `is_pinned || pin_unresolvable` from [`isolated_clone_report`]'s
+    /// own eligibility gate, so an unreadable pin signal reports `true`
+    /// here too, fails closed exactly like every other unresolvable signal
+    /// this heuristic treats. Always present, no
+    /// `#[serde(skip_serializing_if)]`: the unresolvable-provenance case
+    /// already fails closed to "treated as pinned" everywhere else in this
+    /// file, so collapsing it to `true` here is consistent, not a loss of
+    /// information. `false` for a `kind == "linked"` row — not applicable
+    /// to an ordinary worktree.
+    pub pinned: bool,
     /// Why `owner_kind` is `"unknown"` (review F3 / audit F2) — `None` for
     /// `Agent`/`Human`, which need no explaining. Additive (same
     /// justification as `owner_kind`; no `SCHEMA_VERSION` bump needed for
@@ -1637,6 +1649,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             owner_reason,
             real_path,
             removed_by: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
         });
     }
@@ -2442,6 +2455,7 @@ fn isolated_clone_report(
         real_path,
         removed_by: None,
         kind: KIND_ISOLATED_CLONE.to_string(),
+        pinned: is_pinned || pin_unresolvable,
     }
 }
 
@@ -3174,6 +3188,7 @@ mod tests {
             // reasoning as `owner`/`owner_kind` above, updated only so this
             // pre-existing test keeps compiling; not itself coverage for
             // the field (see `worktree_reclaim_049`-`052` for that).
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-a"),
             removed_by: None,
@@ -4189,6 +4204,7 @@ mod tests {
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
+                pinned: false,
                 kind: KIND_LINKED.to_string(),
                 real_path: PathBuf::from("/repo/wt-owned"),
                 removed_by: None,
@@ -4204,6 +4220,7 @@ mod tests {
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
+                pinned: false,
                 kind: KIND_LINKED.to_string(),
                 real_path: PathBuf::from("/repo/wt-legacy"),
                 removed_by: None,
@@ -4275,6 +4292,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-disagree"),
             removed_by: None,
@@ -4290,6 +4308,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-owned"),
             removed_by: None,
@@ -4305,6 +4324,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-other"),
             removed_by: None,
@@ -4326,6 +4346,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-foreign-marked"),
             removed_by: None,
@@ -4341,6 +4362,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-unmarked"),
             removed_by: None,
@@ -4519,6 +4541,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4569,6 +4592,7 @@ mod tests {
                  it created this worktree"
                     .to_string(),
             ),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4614,6 +4638,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4663,6 +4688,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: Some(remover),
@@ -4712,6 +4738,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason.to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4765,6 +4792,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path.clone(),
             removed_by: None,
@@ -4905,6 +4933,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4955,6 +4984,7 @@ mod tests {
             pr_state: "unresolvable".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -5027,6 +5057,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
