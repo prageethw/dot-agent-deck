@@ -59,6 +59,8 @@ use crate::prompt_delivery::{
     log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
     mint_delivery_id, unconfirmed_retry_delay,
 };
+#[cfg(test)]
+use crate::prompt_delivery::{UNCONFIRMED_RETRY_BASE_ENV_LOCK, UnconfirmedRetryBaseEnvGuard};
 use crate::scheduler::{Notifier, NotifyEvent};
 
 /// The `path` field every delivery log line from this module carries, so a
@@ -3937,12 +3939,61 @@ mod tests {
         // byte targets pin an unreachable endpoint of their own for the rest.
         crate::test_isolation::detach_from_any_live_deck();
         cancel_all_prompt_confirmations();
+
+        // Issue #531: this test's whole point is exercising real retry
+        // windows without paying issue #422 item 2's production 10 s/15 s
+        // schedule in wall-clock time. Every sub-case below either resolves
+        // on an immediate event/cancellation (window-independent) or is one
+        // of the three that genuinely waits out `unconfirmed_retry_delay(1)`,
+        // which this override shrinks from 10 s to 300 ms for the whole
+        // test. `UnconfirmedRetryBaseEnvGuard` restores whatever was in
+        // effect on drop, including on panic; it holds no lock itself, so
+        // keeping it alive across this `#[tokio::test]`'s `.await` points is
+        // fine — only the plain `std::sync::Mutex` guard below cannot cross
+        // one (`clippy::await_holding_lock`), so it is scoped to just the
+        // `set_var` call.
+        let _unconfirmed_retry_restore = UnconfirmedRetryBaseEnvGuard::capture();
+        {
+            let _unconfirmed_retry_lock = UNCONFIRMED_RETRY_BASE_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // SAFETY: lock held for this `set_var` call;
+            // `_unconfirmed_retry_restore`'s Drop restores the captured
+            // pre-test value at the end of the test.
+            unsafe {
+                std::env::set_var(UnconfirmedRetryBaseEnvGuard::VAR, "300");
+            }
+        }
+
         const PROMPT: &str = "DETACHED-STALE-PROMPT-MARKER";
         const PANE_ID: &str = "detached-retry-rebind";
 
         let registry = Arc::new(AgentPtyRegistry::new());
         let original_id = spawn_shell_target(&registry, PANE_ID);
         let (event_tx, event_rx) = broadcast::channel(8);
+        // Reviewer B1/S1: captured before the task starts so we can assert
+        // its observed lifetime directly below, instead of relying on a
+        // rebind-timing margin or an outer timeout that sits at/above the
+        // task's own deadline (either of which lets a broken
+        // replacement-identity guard pass silently by running out the clock
+        // rather than being caught refusing the retry).
+        //
+        // Measured on CI (`cargo nextest run --workspace`, full-suite
+        // parallel load): the synchronous `close_agent` + `spawn_shell_target`
+        // pair below runs on this `#[tokio::test]`'s single-threaded
+        // executor with no `.await` between them, so nothing — including
+        // this confirmation task's own timers — can be polled until they
+        // both return. That pair alone was observed to cost >2s of wall time
+        // (elapsed=3.1s against what was then a 2s deadline), unrelated to
+        // the guard's own correctness — not CI contention: `close_agent`
+        // waits out the full `AGENT_TERMINATE_GRACE` (3s, `src/agent_pty.rs`)
+        // because the bare interactive `/bin/sh` on this test's PTY ignores
+        // SIGTERM, confirmed by a local pty experiment (`STILL ALIVE 3.02s
+        // after SIGTERM`) and three CI measurements clustered within 100ms
+        // across Linux/macOS/Windows. The deadline/timeout/threshold below
+        // carry real margin above that measurement rather than the
+        // workload's nominal ~300ms window.
+        let confirmation_started = Instant::now();
         let confirmation = tokio::spawn(confirm_prompt_delivery(
             registry.clone(),
             event_rx,
@@ -3954,36 +4005,63 @@ mod tests {
                 generation: Some(("original-generation".into(), Utc::now())),
                 can_report_prompts: true,
                 codex_hook_trust_failed: false,
-                // Reviewer S1: a 3 s deadline clamps `window =
-                // unconfirmed_retry_delay(1).min(remaining)` to ~2.9 s, so the
+                // Reviewer S1: a too-short deadline clamps `window =
+                // unconfirmed_retry_delay(1).min(remaining)` short, so the
                 // loop abandons at the deadline instead of ever reaching the
                 // `guarded_submit` call this sub-case exists to guard — the
-                // replacement-identity refusal was never exercised. Extended
-                // to 15 s, mirroring the #570 sub-case's bump below, so the
-                // full 10 s first window elapses and the loop actually
-                // attempts (and this guard actually refuses) the retry.
-                deadline: Instant::now() + Duration::from_secs(15),
+                // replacement-identity refusal was never exercised. 10s
+                // stays comfortably above both the 300 ms overridden first
+                // window and the measured multi-second real cost of the
+                // synchronous rebind below, so the loop actually attempts
+                // (and this guard actually refuses) the retry instead of
+                // exiting via deadline-abandonment before ever reaching it.
+                deadline: Instant::now() + Duration::from_secs(10),
             },
         ));
 
         // The first confirmation window is the deterministic blocked retry.
         // Rebind while it is waiting, before the retry is resolved. With the
-        // 15 s deadline above, `window = min(10s, remaining≈15s) = 10s`, so
-        // the confirmation task blocks on that window (no matching event is
-        // ever sent on `event_tx` in this sub-case) before it reaches
-        // `guarded_submit` and the replacement-identity mismatch refuses the
-        // retry — total task lifetime is ~10 s, not the ~2.9 s the old 3 s
-        // deadline clamped it to. The outer wait below must stay comfortably
-        // above that 10 s window.
+        // 10s deadline above and the 300 ms overridden floor, `window =
+        // min(300ms, remaining≈10s) = 300ms`, so the confirmation task blocks
+        // on that window (no matching event is ever sent on `event_tx` in
+        // this sub-case) before it reaches `guarded_submit` and the
+        // replacement-identity mismatch refuses the retry. The rebind below
+        // is guaranteed to complete before the confirmation task can run
+        // again regardless of its own duration (single-threaded executor,
+        // no `.await` in between), so the 100 ms sleep is not a race margin
+        // — the `elapsed()` assertion after the task terminates below is
+        // what actually pins the guard's behavior.
         tokio::time::sleep(Duration::from_millis(100)).await;
         registry
             .close_agent(&original_id)
             .expect("close original target");
         let replacement_id = spawn_shell_target(&registry, PANE_ID);
-        tokio::time::timeout(Duration::from_secs(13), confirmation)
+        // Reviewer B1: this outer timeout is a hang backstop only, not the
+        // thing that catches a broken guard — it must still stay below the
+        // task's own 10s deadline so a hang fails loudly here rather than
+        // silently reaching the deadline first (see `git log -S
+        // 'timeout(Duration::from_secs(13), confirmation)' -- src/spawn.rs`
+        // for why prior revisions of this line always kept it below the
+        // deadline).
+        tokio::time::timeout(Duration::from_secs(5), confirmation)
             .await
             .expect("replacement must terminate confirmation task")
             .expect("confirmation task must not panic");
+        // Reviewer S1 (direct-assertion resolution): pins the guard's actual
+        // behavior instead of relying on the rebind landing inside a timing
+        // window. A working guard resolves shortly after the overridden
+        // window plus the synchronous rebind's `AGENT_TERMINATE_GRACE` cost
+        // (measured ~3.1s, see the comment above `confirmation_started`); a
+        // regressed guard runs all the way to the task's 10s deadline. 6s
+        // leaves ~2.9s of margin over that measured cost while still failing
+        // well short of the deadline on a genuine regression.
+        assert!(
+            confirmation_started.elapsed() < Duration::from_secs(6),
+            "confirmation task must terminate promptly once the replacement is rebound \
+             (broken replacement-identity guard would instead idle out to the 10s deadline); \
+             elapsed={:?}",
+            confirmation_started.elapsed()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         let replacement_output = registry
             .snapshot(&replacement_id)
@@ -4041,8 +4119,9 @@ mod tests {
         clear_registry.shutdown_all();
 
         // A lagged stream may have dropped the real confirmation; a closed
-        // stream can never report one. Both are terminal and neither permits a
-        // retry after the ordinary 500 ms first window.
+        // stream can never report one. Both are terminal and neither permits
+        // a retry, regardless of the first window's duration (10 s in
+        // production; overridden to 300 ms for this test, issue #531).
         let stream_registry = Arc::new(AgentPtyRegistry::new());
         let lagged_pane = "detached-retry-lagged";
         let lagged_agent = spawn_byte_target(&stream_registry, lagged_pane);
@@ -4247,17 +4326,18 @@ mod tests {
                 generation: None,
                 can_report_prompts: false,
                 codex_hook_trust_failed: false,
-                // Reviewer B3: with the old 3 s deadline, `window =
-                // unconfirmed_retry_delay(1).min(remaining)` clamped to the
-                // whole ~3 s remaining, so the window expired with
+                // Reviewer B3: with a too-short deadline, `window =
+                // unconfirmed_retry_delay(1).min(remaining)` clamps to
+                // whatever remains, so the window expires with
                 // `remaining_before(deadline).is_zero()` true and the loop
-                // returned WITHOUT EVER REACHING the write this sub-case
+                // returns WITHOUT EVER REACHING the write this sub-case
                 // guards — even a wrongly-armed claim could not have failed
-                // the assertion below. Extended to 15 s, mirroring the #570
-                // sub-case, so the full 10 s first window elapses and a
+                // the assertion below. 2 s stays comfortably above the
+                // 300 ms overridden first window (set at the top of this
+                // test, issue #531) so the full window elapses and a
                 // regression that wrongly arms on this forged claim would
                 // actually reach the write.
-                deadline: Instant::now() + Duration::from_secs(15),
+                deadline: Instant::now() + Duration::from_secs(2),
             },
         ));
         forged_tx
@@ -4268,10 +4348,13 @@ mod tests {
                 EventType::SessionStart,
             )))
             .expect("send unmarked forged capability claim");
-        // Must clear the new 10 s first-window delay before a wrongly-armed
-        // write could have landed (was 750ms against the old 500ms window) —
-        // same reasoning as the #570 sub-case's identical bump below.
-        tokio::time::sleep(Duration::from_millis(10_500)).await;
+        // Reviewer S2: must clear the 300 ms overridden first-window delay
+        // before a wrongly-armed write could have landed — same reasoning
+        // as the #570 sub-case's identical wait below. 1000 ms keeps 700 ms
+        // of absolute slack over the 300 ms window on a `retries = 0` tier
+        // (a timing miss here is a hard failure, not a retry), while
+        // staying well under the 2 s deadline above.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         let forged_output = forged_registry
             .snapshot(&forged_agent)
             .expect("forged capability target snapshot");
@@ -4315,11 +4398,13 @@ mod tests {
                 generation: None,
                 can_report_prompts: false,
                 codex_hook_trust_failed: false,
-                // Issue #422 item 2: the late arm only becomes a write once the
-                // FIRST unconfirmed-retry window (now 10 s, up from 500 ms) has
-                // fully elapsed, so the deadline here must stay comfortably
-                // above that window rather than clamping it short.
-                deadline: Instant::now() + Duration::from_secs(15),
+                // Issue #422 item 2: the late arm only becomes a write once
+                // the FIRST unconfirmed-retry window has fully elapsed, so
+                // the deadline here must stay comfortably above that window
+                // rather than clamping it short. 2 s is comfortably above
+                // the 300 ms overridden window set at the top of this test
+                // (issue #531).
+                deadline: Instant::now() + Duration::from_secs(2),
             },
         ));
         spawned_tx
@@ -4330,9 +4415,12 @@ mod tests {
                 EventType::SessionStart,
             )))
             .expect("send late native capability claim");
-        // Issue #422 item 2: must clear the new 10 s first-window delay before
-        // the arm-then-write can happen (was 750ms against the old 500ms window).
-        tokio::time::sleep(Duration::from_millis(10_500)).await;
+        // Issue #422 item 2 / #531: must clear the 300 ms overridden
+        // first-window delay before the arm-then-write can happen. Reviewer
+        // S2: 1000 ms keeps 700 ms of absolute slack over the 300 ms window
+        // on a `retries = 0` tier (a timing miss here is a hard failure,
+        // not a retry), while staying well under the 2 s deadline above.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         let spawned_output = spawned_registry
             .snapshot(&spawned_agent)
             .expect("deck-spawned target snapshot");
