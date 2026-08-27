@@ -117,6 +117,7 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 | `527c5c03` | `spawn_rollback`'s shared-checkout arm drops the worktree registry entry when force-removal fails (fork #473) — the isolated-clone arm has the same gap, tracked separately as fork #563 |
 | `d3920439` | `ensure_owner_only_dir` (Unix) must not follow a symlink at the target path (fork #491) — verified identical on `upstream/main`'s `src/platform/fsperm/unix.rs`, which has no symlink guard at all |
 | `1929d5e8` | `apply_event` ingests `display_name` with only an `is_empty()` filter — no sanitize, no length clamp (fork #410) — verified identical on `upstream/main`'s `state.rs` |
+| `03b305a7` | `DelegationCommission` (shared ancestor `3ae6f2bf`, upstream PR vfarcic#501) never expires, so a worker delegated to but never reporting keeps unbounded standing debt (fork #586, closes upstream vfarcic#590 by its own title) — bounded per-arm aging (`arm_times`, `COMMISSION_MAX_AGE`) fixes it; tracked as fork issue #590, not yet offered |
 
 ### Test and CI determinism
 
