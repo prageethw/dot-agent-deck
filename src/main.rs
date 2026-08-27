@@ -503,6 +503,20 @@ enum WorktreeCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Pin an isolated clone against `reclaim`'s automatic removal (fork
+    /// issue #546 hazard 2, #597): once pinned, `reclaim` treats it exactly
+    /// like a dirty/unmerged worktree — reported, never removed, `--yes` or
+    /// not — until explicitly unpinned.
+    Pin {
+        /// Path to the isolated clone to pin.
+        path: std::path::PathBuf,
+    },
+    /// Clear a pin set by `worktree pin` (fork issue #597), or explicitly
+    /// record "not pinned" on a clone that was never pinned — both succeed.
+    Unpin {
+        /// Path to the isolated clone to unpin.
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1869,6 +1883,8 @@ fn main() -> ExitCode {
         Some(Commands::Worktree { cmd }) => match cmd {
             WorktreeCmd::List { json, mine } => run_worktree_list_cli(json, mine),
             WorktreeCmd::Reclaim { yes } => run_worktree_reclaim_cli(yes),
+            WorktreeCmd::Pin { path } => run_worktree_pin_cli(path),
+            WorktreeCmd::Unpin { path } => run_worktree_unpin_cli(path),
         },
         Some(Commands::Issue { cmd }) => match cmd {
             IssueCmd::Claim {
@@ -2775,6 +2791,43 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
         }
         Err(e) => {
             eprintln!("{}", format_reclaim_error_for_cli(&e));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `dot-agent-deck worktree pin <path>` (fork issue #597) — pin an isolated
+/// clone against `worktree reclaim`'s automatic removal. Synchronous, no
+/// daemon socket involved, same shape as [`run_worktree_reclaim_cli`] above.
+fn run_worktree_pin_cli(path: std::path::PathBuf) -> ExitCode {
+    use dot_agent_deck::issue_dispatch_run::pin_isolated_clone;
+    use dot_agent_deck::terminal_sanitize::sanitize_path_for_terminal_display;
+
+    match pin_isolated_clone(&path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "worktree pin: failed to pin {}: {e}",
+                sanitize_path_for_terminal_display(&path)
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `dot-agent-deck worktree unpin <path>` (fork issue #597) — clear a pin
+/// set by `worktree pin`. Same shape as [`run_worktree_pin_cli`] above.
+fn run_worktree_unpin_cli(path: std::path::PathBuf) -> ExitCode {
+    use dot_agent_deck::issue_dispatch_run::unpin_isolated_clone;
+    use dot_agent_deck::terminal_sanitize::sanitize_path_for_terminal_display;
+
+    match unpin_isolated_clone(&path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "worktree unpin: failed to unpin {}: {e}",
+                sanitize_path_for_terminal_display(&path)
+            );
             ExitCode::FAILURE
         }
     }
