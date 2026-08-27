@@ -1788,11 +1788,17 @@ fn idle_worker_019_respawn_carries_forward_armed_delegation_and_silence_watch() 
         // and armed a real watch task does the test drive the respawn it
         // means to isolate.
         // `resolve_delegate_task_body` writes the raw task text to
-        // `.dot-agent-deck/worker-task-<role>.md` and delegates only the
-        // one-line pointer to it (`compose_delegate_prompt`), so the pane
-        // itself never sees "Perform the delegated test task." literally —
-        // it sees this fixed pointer line instead.
-        let pointer = "Read .dot-agent-deck/worker-task-respawning-worker.md for your task.";
+        // `.dot-agent-deck/worker-task-<role>-<pane digest>.md` (issue #613)
+        // and delegates only the one-line absolute pointer to it
+        // (`compose_delegate_prompt`), so the pane itself never sees "Perform
+        // the delegated test task." literally — it sees this pointer line
+        // instead.
+        let pointer_bytes = common::expected_delegate_pointer(
+            harness.cwd.path(),
+            "respawning-worker",
+            &worker_pane_id,
+        );
+        let pointer = std::str::from_utf8(&pointer_bytes).expect("delegate pointer is valid UTF-8");
         let delivered = harness
             .wait_for_snapshot_of(
                 &pre_respawn_agent_id,
