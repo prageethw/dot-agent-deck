@@ -3274,11 +3274,16 @@ mod tests {
         // pair below runs on this `#[tokio::test]`'s single-threaded
         // executor with no `.await` between them, so nothing — including
         // this confirmation task's own timers — can be polled until they
-        // both return. Under full-workspace contention that pair alone was
-        // observed to cost >2s of wall time (elapsed=3.1s against what was
-        // then a 2s deadline), unrelated to the guard's own correctness. The
-        // deadline/timeout/threshold below carry real margin above that
-        // measurement rather than the workload's nominal ~300ms window.
+        // both return. That pair alone was observed to cost >2s of wall time
+        // (elapsed=3.1s against what was then a 2s deadline), unrelated to
+        // the guard's own correctness — not CI contention: `close_agent`
+        // waits out the full `AGENT_TERMINATE_GRACE` (3s, `src/agent_pty.rs`)
+        // because the bare interactive `/bin/sh` on this test's PTY ignores
+        // SIGTERM, confirmed by a local pty experiment (`STILL ALIVE 3.02s
+        // after SIGTERM`) and three CI measurements clustered within 100ms
+        // across Linux/macOS/Windows. The deadline/timeout/threshold below
+        // carry real margin above that measurement rather than the
+        // workload's nominal ~300ms window.
         let confirmation_started = Instant::now();
         let confirmation = tokio::spawn(confirm_prompt_delivery(
             registry.clone(),
@@ -3329,17 +3334,17 @@ mod tests {
         // 'timeout(Duration::from_secs(13), confirmation)' -- src/spawn.rs`
         // for why prior revisions of this line always kept it below the
         // deadline).
-        tokio::time::timeout(Duration::from_secs(8), confirmation)
+        tokio::time::timeout(Duration::from_secs(5), confirmation)
             .await
             .expect("replacement must terminate confirmation task")
             .expect("confirmation task must not panic");
         // Reviewer S1 (direct-assertion resolution): pins the guard's actual
         // behavior instead of relying on the rebind landing inside a timing
         // window. A working guard resolves shortly after the overridden
-        // window plus whatever the synchronous rebind's real PTY spawn/close
-        // cost was (measured up to ~3.1s under full-workspace CI load); a
+        // window plus the synchronous rebind's `AGENT_TERMINATE_GRACE` cost
+        // (measured ~3.1s, see the comment above `confirmation_started`); a
         // regressed guard runs all the way to the task's 10s deadline. 6s
-        // gives roughly 2x margin over the measured cost while still failing
+        // leaves ~2.9s of margin over that measured cost while still failing
         // well short of the deadline on a genuine regression.
         assert!(
             confirmation_started.elapsed() < Duration::from_secs(6),
