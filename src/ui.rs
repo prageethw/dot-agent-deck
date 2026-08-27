@@ -1094,19 +1094,20 @@ fn live_schedule_names() -> HashSet<String> {
 /// PRD #140 M4.0: the non-blocking warning shown in the new-pane form when the
 /// picked directory ALREADY hosts a live orchestration. Two orchestrations in
 /// one directory are legal — the daemon routes them as separate groups since
-/// M2.0 — but they still share the two resources the daemon can't partition:
-/// the `.dot-agent-deck/*-{role}.md` coordination files (one file per role, so a
-/// second orchestration's orchestrator writes over the first's brief) and the
-/// working tree itself (both sets of workers edit the same checkout).
-/// `/worktree-prd` is the isolated alternative.
+/// M2.0 — but they still share the one resource the daemon can't partition:
+/// the working tree itself (both sets of workers edit the same checkout).
+/// As of issue #613 the `.dot-agent-deck/*-{role}-<pane digest>.md`
+/// coordination files are keyed on the target pane as well as role, so they
+/// no longer collide between same-directory orchestrations and are not part
+/// of this warning. `/worktree-prd` is the isolated alternative.
 ///
 /// Every line is kept inside the form's 52-column base inner width so the copy
 /// survives un-clipped even on a narrow terminal; the render also grows the
 /// modal to fit it (see [`render_new_pane_form`]).
 const SAME_CWD_ORCHESTRATION_WARNING: [&str; 3] = [
     "  ! This directory already runs an orchestration.",
-    "    Both share .dot-agent-deck/*-{role}.md files",
-    "    and one working tree; /worktree-prd isolates.",
+    "    Both share one working tree; /worktree-prd",
+    "    isolates it.",
 ];
 
 /// fork#192 M1.0: the BLOCKING refusal shown on the same guard seam as

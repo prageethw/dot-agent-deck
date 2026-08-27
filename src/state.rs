@@ -2030,7 +2030,7 @@ fn work_done_footer(role: &str, subject: Option<&str>) -> String {
 
 /// Compose the prompt that the daemon writes into a worker pane on
 /// delegation. In the normal file-backed path this is intentionally only
-/// the one-line pointer to `.dot-agent-deck/worker-task-{role}.md`.
+/// the one-line pointer to `.dot-agent-deck/worker-task-<role>-<pane digest>.md`.
 /// Keeping every injected PTY prompt single-line avoids bracketed paste
 /// and lets the synthetic CR follow the same reliable path as ordinary
 /// typed prompts.
@@ -3677,7 +3677,7 @@ fn settle_silence_report_payload_record(
 }
 
 /// CodeRabbit (PRD #93 round-9): build the file contents written to
-/// `.dot-agent-deck/worker-task-{role}.md` for a delegation. When the
+/// `.dot-agent-deck/worker-task-<role>-<pane digest>.md` for a delegation. When the
 /// role config supplies a `prompt_template`, wrap the task under a
 /// `## Task` header beneath the template — mirrors the pre-Round-5 TUI
 /// dispatch path that Round 5 lost when it moved orchestration onto
@@ -4802,7 +4802,7 @@ pub(crate) fn latch_generation(
 }
 
 /// Resolve what a delegated worker is actually told to act on: the one-line
-/// pointer to its `.dot-agent-deck/worker-task-<role>.md`, or the task body
+/// pointer to its `.dot-agent-deck/worker-task-<role>-<pane digest>.md`, or the task body
 /// INLINED when no such file could be written.
 ///
 /// The pointer is only safe to send once the file it names exists. Emitting it
@@ -5181,7 +5181,7 @@ async fn dispatch_one_owned(
         subject.as_deref(),
     );
     // The single-line pointer the worker receives ("Read
-    // .dot-agent-deck/worker-task-<role>.md for your task."). Computed here so
+    // .dot-agent-deck/worker-task-<role>-<pane digest>.md for your task."). Computed here so
     // the PRD #201 pi-native path below can stash it as the pane's seed before
     // the respawned pi boots.
     let one_liner = compose_delegate_prompt(&task_body);
