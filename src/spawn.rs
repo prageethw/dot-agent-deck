@@ -3262,6 +3262,13 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let original_id = spawn_shell_target(&registry, PANE_ID);
         let (event_tx, event_rx) = broadcast::channel(8);
+        // Reviewer B1/S1: captured before the task starts so we can assert
+        // its observed lifetime directly below, instead of relying on a
+        // rebind-timing margin or an outer timeout that sits at/above the
+        // task's own deadline (either of which lets a broken
+        // replacement-identity guard pass silently by running out the clock
+        // rather than being caught refusing the retry).
+        let confirmation_started = Instant::now();
         let confirmation = tokio::spawn(confirm_prompt_delivery(
             registry.clone(),
             event_rx,
@@ -3292,18 +3299,40 @@ mod tests {
         // on that window (no matching event is ever sent on `event_tx` in
         // this sub-case) before it reaches `guarded_submit` and the
         // replacement-identity mismatch refuses the retry — total task
-        // lifetime is ~300 ms. The 100 ms rebind delay below must stay
-        // comfortably under that window so the rebind still lands mid-wait,
-        // and the outer wait must stay comfortably above it.
+        // lifetime is ~300 ms. The 100 ms rebind delay below is best-effort
+        // (it doesn't need to land inside the window with certainty): the
+        // `elapsed()` assertion after the task terminates below is what
+        // actually pins the guard's behavior, not this margin.
         tokio::time::sleep(Duration::from_millis(100)).await;
         registry
             .close_agent(&original_id)
             .expect("close original target");
         let replacement_id = spawn_shell_target(&registry, PANE_ID);
-        tokio::time::timeout(Duration::from_secs(2), confirmation)
+        // Reviewer B1: this outer timeout is a hang backstop only, not the
+        // thing that catches a broken guard — it must still stay below the
+        // task's own 2 s deadline so a hang fails loudly here rather than
+        // silently reaching the deadline first (see `git log -S
+        // 'timeout(Duration::from_secs(13), confirmation)' -- src/spawn.rs`
+        // for why prior revisions of this line always kept it below the
+        // deadline).
+        tokio::time::timeout(Duration::from_secs(1), confirmation)
             .await
             .expect("replacement must terminate confirmation task")
             .expect("confirmation task must not panic");
+        // Reviewer S1 (direct-assertion resolution): pins the guard's actual
+        // behavior instead of relying on the rebind landing inside a timing
+        // window. A working guard resolves at ~300 ms (the overridden first
+        // window); a regressed guard runs to the task's 2 s deadline. This
+        // assertion fails on the latter regardless of how the rebind above
+        // was scheduled, which is what makes the outer timeout above purely
+        // a hang backstop.
+        assert!(
+            confirmation_started.elapsed() < Duration::from_secs(1),
+            "confirmation task must terminate promptly once the replacement is rebound \
+             (broken replacement-identity guard would instead idle out to the 2s deadline); \
+             elapsed={:?}",
+            confirmation_started.elapsed()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         let replacement_output = registry
             .snapshot(&replacement_id)
@@ -3361,8 +3390,9 @@ mod tests {
         clear_registry.shutdown_all();
 
         // A lagged stream may have dropped the real confirmation; a closed
-        // stream can never report one. Both are terminal and neither permits a
-        // retry after the ordinary 500 ms first window.
+        // stream can never report one. Both are terminal and neither permits
+        // a retry, regardless of the first window's duration (10 s in
+        // production; overridden to 300 ms for this test, issue #531).
         let stream_registry = Arc::new(AgentPtyRegistry::new());
         let lagged_pane = "detached-retry-lagged";
         let lagged_agent = spawn_byte_target(&stream_registry, lagged_pane);
@@ -3589,10 +3619,13 @@ mod tests {
                 EventType::SessionStart,
             )))
             .expect("send unmarked forged capability claim");
-        // Must clear the 300 ms overridden first-window delay before a
-        // wrongly-armed write could have landed — same reasoning as the
-        // #570 sub-case's identical wait below.
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        // Reviewer S2: must clear the 300 ms overridden first-window delay
+        // before a wrongly-armed write could have landed — same reasoning
+        // as the #570 sub-case's identical wait below. 1000 ms keeps 700 ms
+        // of absolute slack over the 300 ms window on a `retries = 0` tier
+        // (a timing miss here is a hard failure, not a retry), while
+        // staying well under the 2 s deadline above.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         let forged_output = forged_registry
             .snapshot(&forged_agent)
             .expect("forged capability target snapshot");
@@ -3654,8 +3687,11 @@ mod tests {
             )))
             .expect("send late native capability claim");
         // Issue #422 item 2 / #531: must clear the 300 ms overridden
-        // first-window delay before the arm-then-write can happen.
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        // first-window delay before the arm-then-write can happen. Reviewer
+        // S2: 1000 ms keeps 700 ms of absolute slack over the 300 ms window
+        // on a `retries = 0` tier (a timing miss here is a hard failure,
+        // not a retry), while staying well under the 2 s deadline above.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         let spawned_output = spawned_registry
             .snapshot(&spawned_agent)
             .expect("deck-spawned target snapshot");

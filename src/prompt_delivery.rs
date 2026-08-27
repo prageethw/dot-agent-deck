@@ -520,19 +520,25 @@ const UNCONFIRMED_RETRY_CAP: std::time::Duration = std::time::Duration::from_sec
 /// milliseconds via `DOT_AGENT_DECK_TEST_UNCONFIRMED_RETRY_BASE_MS`. Pinned
 /// to [`UNCONFIRMED_RETRY_CAP`]: an overridden first-retry floor above the
 /// cap would make the "first delay, then cap" schedule non-monotonic, so the
-/// largest sane override value is the cap itself — mirrors
-/// `crate::ui::SEND_RETRY_BASE_MAX`'s identical reasoning for the sibling
-/// seam.
+/// largest sane override value is the cap itself. Mirrors
+/// `crate::ui::SEND_RETRY_BASE_MAX`'s shape (a MAX pinned to the sibling's
+/// cap) but not its reasoning — see the accessor below for why this seam's
+/// rationale for asserting the clamp directly differs from the sibling's.
 #[cfg(any(test, debug_assertions))]
 const UNCONFIRMED_RETRY_BASE_MAX: std::time::Duration = UNCONFIRMED_RETRY_CAP;
 
 /// Issue #531: `#[cfg(any(test, debug_assertions))]` override for
 /// [`unconfirmed_retry_delay`]'s first-retry floor, mirroring
-/// `crate::ui::send_retry_base` exactly. Extracted as its own directly
-/// callable accessor rather than inlined, for the same reason as the
-/// sibling: `unconfirmed_retry_delay` never re-applies a ceiling to the
-/// `attempts <= 1` branch, so calling this accessor directly is what makes a
-/// broken or missing clamp observable.
+/// `crate::ui::send_retry_base`'s shape (env-var override, clamp, warn-once)
+/// exactly. Extracted as its own directly callable accessor rather than
+/// inlined, but not for the same reason as the sibling: `send_retry_base`
+/// needs a direct-call assertion because `send_retry_delay` applies
+/// `.min(SEND_RETRY_BACKOFF_CAP)` downstream, masking a broken clamp there.
+/// Here there is no downstream `min` — a broken or missing clamp is already
+/// observable through `unconfirmed_retry_delay(1)` directly. The direct
+/// assertion on this accessor instead pins schedule monotonicity: it guards
+/// the clamp's behavior in case the `attempts <= 1` branch ever grows a
+/// ceiling of its own.
 #[cfg(any(test, debug_assertions))]
 fn unconfirmed_retry_base() -> std::time::Duration {
     static OUT_OF_RANGE_WARNED: std::sync::atomic::AtomicBool =
@@ -562,11 +568,15 @@ fn unconfirmed_retry_base() -> std::time::Duration {
     std::time::Duration::from_millis(UNCONFIRMED_RETRY_BASE_MS)
 }
 
-/// Issue #531: serializes any test mutating
+/// Issue #531: serializes any test *mutating*
 /// `DOT_AGENT_DECK_TEST_UNCONFIRMED_RETRY_BASE_MS` against each other — this
 /// module's own unit test plus [`crate::spawn`]'s `dispatch_016`, its only
-/// two consumers. `pub(crate)` so both can share the one lock/guard pair
-/// instead of each growing its own. Mirrors `crate::ui`'s
+/// two mutators. (There is a third party that *reads* the var's effect
+/// without mutating it: [`crate::ui`]'s `next_attempt_at` computation and its
+/// issue-#422 TUI regression guard, whose premise depends on the production
+/// 10s window — see [`UnconfirmedRetryBaseEnvGuard`]'s doc for why that
+/// reader matters here.) `pub(crate)` so both mutators can share the one
+/// lock/guard pair instead of each growing its own. Mirrors `crate::ui`'s
 /// `SEND_RETRY_BASE_ENV_LOCK` / `SendRetryBaseEnvGuard` split-lock idiom for
 /// the sibling var.
 #[cfg(test)]
@@ -575,10 +585,26 @@ pub(crate) static UNCONFIRMED_RETRY_BASE_ENV_LOCK: std::sync::Mutex<()> = std::s
 /// RAII guard for `DOT_AGENT_DECK_TEST_UNCONFIRMED_RETRY_BASE_MS`: captures
 /// whatever value is in effect when constructed and restores exactly that
 /// value on drop — including on unwind, so a test that panics mid-assertion
-/// cannot leave the variable set for its neighbour. Callers must hold
-/// [`UNCONFIRMED_RETRY_BASE_ENV_LOCK`] for this guard's entire lifetime; the
-/// guard itself only captures/restores — callers make their own
-/// `std::env::set_var` calls under the held lock.
+/// cannot leave the variable set for its neighbour.
+///
+/// The invariant actually in force is narrower than "hold the lock for the
+/// guard's entire lifetime": each *mutation* of the var (this guard's
+/// `Drop`, and any caller's own `set_var`) must happen under
+/// [`UNCONFIRMED_RETRY_BASE_ENV_LOCK`], but a caller is not required to hold
+/// the lock across the guard's whole lifetime. `dispatch_016`
+/// (`crate::spawn`) is exactly such a caller: it scopes the lock to just its
+/// `set_var` call, because a `std::sync::MutexGuard` cannot cross an
+/// `.await` point (`clippy::await_holding_lock`), so the guard's
+/// `capture()`, the test body, and the `Drop`-time restore all run with no
+/// lock held. That is safe today only because this repo's test/e2e gates
+/// run `cargo nextest run`, which gives every test its own process — nothing
+/// here would be safe under plain `cargo test`'s single-process threading.
+/// This matters beyond the two mutators above because [`crate::ui`] reads
+/// this var's effect (via `unconfirmed_retry_delay`) in production dispatch
+/// scheduling and in an issue-#422 regression guard pinned to the
+/// production 10s window (`tests/CATALOG.md`'s `prompt/pane-input/035`
+/// entry) — a cross-test data race here wouldn't just corrupt this module's
+/// own tests.
 #[cfg(test)]
 pub(crate) struct UnconfirmedRetryBaseEnvGuard {
     prev: Option<String>,
@@ -598,8 +624,13 @@ impl UnconfirmedRetryBaseEnvGuard {
 #[cfg(test)]
 impl Drop for UnconfirmedRetryBaseEnvGuard {
     fn drop(&mut self) {
-        // SAFETY: callers hold UNCONFIRMED_RETRY_BASE_ENV_LOCK for this
-        // guard's entire lifetime, serializing access to the process-global var.
+        // SAFETY: this restore is itself a mutation and should be made
+        // under UNCONFIRMED_RETRY_BASE_ENV_LOCK, but an async caller like
+        // `dispatch_016` (crate::spawn) cannot hold a std::sync::MutexGuard
+        // across this guard's lifetime (clippy::await_holding_lock), so this
+        // restore can run unlocked. Cross-test safety in that case comes
+        // from cargo nextest's process-per-test isolation, not from this
+        // lock — see UnconfirmedRetryBaseEnvGuard's doc comment.
         unsafe {
             match self.prev.take() {
                 Some(v) => std::env::set_var(Self::VAR, v),
@@ -1036,17 +1067,18 @@ mod tests {
         );
     }
 
-    /// Scenario: with `DOT_AGENT_DECK_TEST_UNCONFIRMED_RETRY_BASE_MS` unset,
+    /// With `DOT_AGENT_DECK_TEST_UNCONFIRMED_RETRY_BASE_MS` unset,
     /// `unconfirmed_retry_delay(1)` returns today's fixed 10 s floor
     /// unchanged. Set to a valid low value, the floor honors it exactly —
     /// including zero — while the cap (`attempts > 1`) stays fixed, since
     /// nothing that needs this seam ever reaches a second attempt. Set to a
     /// non-numeric string, it falls back to the fixed floor rather than
-    /// panicking. Set to an absurdly large value, the override's own
-    /// ceiling clamp is asserted directly against `unconfirmed_retry_base()`
-    /// — not only through `unconfirmed_retry_delay`, which never re-applies
-    /// a ceiling to the `attempts <= 1` branch and so cannot tell a broken
-    /// clamp from a correct one. Issue #531: mirrors
+    /// panicking. Set to an absurdly large value, `unconfirmed_retry_delay`
+    /// alone already shows a broken clamp (there is no downstream `min` to
+    /// mask one); the override's ceiling clamp is *also* asserted directly
+    /// against `unconfirmed_retry_base()` to pin schedule monotonicity in
+    /// case the `attempts <= 1` branch ever grows a ceiling of its own.
+    /// Issue #531: mirrors
     /// `crate::ui`'s `orchestration_seed_017_send_retry_delay_honors_test_base_override`
     /// for this seam's own accessor.
     #[test]
