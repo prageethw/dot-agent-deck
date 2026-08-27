@@ -615,21 +615,19 @@ This works immediately after a daemon restart: ownership is matched by comparing
 
 ### Same-directory orchestrations are discouraged
 
-Opening a second orchestration in a directory that already runs one is usually still allowed, and routing stays correct — but two resources cannot be partitioned, no matter what the deck does:
+Opening a second orchestration in a directory that already runs one is usually still allowed, and routing stays correct — but one resource cannot be partitioned, no matter what the deck does:
 
-- **The working tree.** Both sets of workers edit the same files, stage into the same git index, and build into the same target directory. This is the same hazard as two people working in one checkout, and no amount of file namespacing fixes it.
-
-(As of issue #613, `.dot-agent-deck/worker-task-<role>-<pane digest>.md` is keyed on the target pane as well as role name — mirroring `work-done-<role>-<pane digest>.md` below — so two orchestrations that both have a `coder` role no longer clobber each other's task file; each pane gets its own. The pointer the worker receives is also now an absolute path, so it resolves correctly even if the worker's own process cwd has drifted from the daemon's belief about it.)
+- **The working tree.** Both sets of workers edit the same files, stage into the same git index, and build into the same target directory. This is the same hazard as two people working in one checkout, and no amount of file namespacing fixes it. (As of issue #613, `.dot-agent-deck/worker-task-<role>-<pane digest>.md` is keyed on the target pane as well as role name — mirroring `work-done-<role>-<pane digest>.md` below — so two orchestrations that both have a `coder` role no longer clobber each other's task file; each pane gets its own. The pointer the worker receives is also now an absolute path, so it resolves correctly even if the worker's own process cwd has drifted from the daemon's belief about it. The coordination files are therefore no longer a shared resource — only the working tree above is.)
 
 So when you select an orchestration whose directory already hosts a live one, the new-pane form shows a warning:
 
 ```
   ! This directory already runs an orchestration.
-    Both share .dot-agent-deck/*-{role}.md files
-    and one working tree; /worktree-prd isolates.
+    Both share one working tree; /worktree-prd
+    isolates it.
 ```
 
-The warning is non-blocking in every case except one: pressing `Enter` normally opens the tab as usual, and it exists to make the shared files and the shared tree explicit at the moment they start to matter, so proceeding is a deliberate choice rather than a surprise. The one exception (issue #489) is a **blank** Worktree field submitted against a directory that **exactly matches** — same working directory, not a worktree carved off it — a live orchestration's own directory: that specific submission is refused outright, and the tab does not open. A **typed** Worktree slug is unaffected by this exception and still isolates into its own worktree (or, if a live orchestration already shares that root checkout's object store, an isolated clone) as before. If the two orchestrations genuinely need to run at once, type a Worktree slug rather than leaving it blank.
+The warning is non-blocking in every case except one: pressing `Enter` normally opens the tab as usual, and it exists to make the shared working tree explicit at the moment it starts to matter, so proceeding is a deliberate choice rather than a surprise. The one exception (issue #489) is a **blank** Worktree field submitted against a directory that **exactly matches** — same working directory, not a worktree carved off it — a live orchestration's own directory: that specific submission is refused outright, and the tab does not open. A **typed** Worktree slug is unaffected by this exception and still isolates into its own worktree (or, if a live orchestration already shares that root checkout's object store, an isolated clone) as before. If the two orchestrations genuinely need to run at once, type a Worktree slug rather than leaving it blank.
 
 ## Troubleshooting
 
