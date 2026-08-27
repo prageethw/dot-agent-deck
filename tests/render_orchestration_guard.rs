@@ -22,9 +22,8 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 
 /// Scenario: Render the new-pane form with an orchestration selected, first
 /// for a cwd absent from the daemon's live orchestration records and then for
-/// a matching cwd. Only the collision warns that `.dot-agent-deck`
-/// coordination files and the working tree are shared and points the user at
-/// a worktree, without blocking the form.
+/// a matching cwd. Only the collision warns that the working tree is shared
+/// and points the user at a worktree, without blocking the form.
 #[spec("orchestration/guard/001")]
 #[test]
 fn guard_001_warns_for_same_cwd_live_orchestration_only() {
@@ -50,8 +49,8 @@ fn guard_001_warns_for_same_cwd_live_orchestration_only() {
         28,
     ));
     assert!(
-        collision.contains(".dot-agent-deck"),
-        "same-cwd orchestration warning must name the shared .dot-agent-deck coordination files, got:\n{collision}"
+        collision.contains("working tree"),
+        "same-cwd orchestration warning must name the shared working tree, got:\n{collision}"
     );
     assert!(
         collision.to_lowercase().contains("worktree"),
