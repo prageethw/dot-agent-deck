@@ -121,7 +121,7 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 
 ### Test and CI determinism
 
-`9dd02ee` (delegate_011 clock-independence), `4b35b48` (fixed-budget PTY/grid flake class), `fa038c1` (manager_016 side-pane settle), `70b3eca` (ingest_event broadcast/apply atomicity), `3ced4ba` and `ad9c20c` (idle_worker_011), `8841019` (lint the e2e-gated test files instead of compiling them away — upstream's CI has the same blind spot), `7ec64fe8` (lock_017 paste-gate assertion determinism, fork #390), `fc2b0fde` (lock_017 Part 2 scroll-reset flake, fork #414).
+`9dd02ee` (delegate_011 clock-independence), `4b35b48` (fixed-budget PTY/grid flake class), `fa038c1` (manager_016 side-pane settle), `70b3eca` (ingest_event broadcast/apply atomicity), `3ced4ba` and `ad9c20c` (idle_worker_011), `8841019` (lint the e2e-gated test files instead of compiling them away — upstream's CI has the same blind spot), `7ec64fe8` (lock_017 paste-gate assertion determinism, fork #390), `fc2b0fde` (lock_017 Part 2 scroll-reset flake, fork #414), `62b15a0a` (test-only override seam for `unconfirmed_retry_delay`, cutting ~30s real wall-clock from `dispatch_016`; fork #531 — `unconfirmed_retry_delay` itself is inherited shared code, present identically on `upstream/main`, which has no equivalent seam).
 
 ### Docs
 
