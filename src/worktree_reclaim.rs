@@ -7904,8 +7904,10 @@ mod tests {
     /// explicitly unpinned via `unpin_isolated_clone` (`false`); one whose
     /// provenance artifact exists but cannot be read, `worktree_reclaim_078`'s
     /// own fixture shape (`true` -- fails closed); and an ordinary `"linked"`
-    /// row, the repo's own main worktree with no isolated clone involved at
-    /// all (`false` -- not applicable). References `WorktreeReport.pinned`
+    /// row, a real `git worktree add` with no isolated clone involved at all
+    /// (`false` -- not applicable; the repo's own main worktree is excluded
+    /// from `list_linked_worktrees` by design, so it can never produce a
+    /// `KIND_LINKED` row to assert on). References `WorktreeReport.pinned`
     /// directly, which does not exist yet, so this is a compile-error RED.
     #[spec("worktree/reclaim/081")]
     #[test]
@@ -8052,26 +8054,33 @@ mod tests {
             );
         }
 
-        // (d) Parity: an ordinary "linked" row (the repo's own main
-        // worktree, no isolated clone involved at all) -> pinned == false,
-        // never applicable. `set_non_github_origin` keeps `resolve_pr_state`
-        // from spawning the real, ambient `gh` (reviewer F6's precedent).
+        // (d) Parity: an ordinary "linked" row (a real `git worktree add`,
+        // no isolated clone involved at all) -> pinned == false, never
+        // applicable. `list_linked_worktrees` deliberately excludes the
+        // repo's own main working tree (`all.remove(0)`), so a linked row
+        // only ever exists for an additional worktree -- hence
+        // `add_worktree` here rather than asserting on the main checkout.
+        // `set_non_github_origin` keeps `resolve_pr_state` from spawning
+        // the real, ambient `gh` (reviewer F6's precedent).
         {
             let scratch = tempfile::tempdir().unwrap();
             let repo = scratch.path().join("repo");
             init_repo_with_origin(&repo);
             set_non_github_origin(&repo);
 
+            let wt = scratch.path().join("wt-pinned-field-parity");
+            add_worktree(&repo, &wt, "pinned-field-parity-branch");
+
             let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
-            let main_report = reports
+            let linked_report = reports
                 .iter()
-                .find(|r| r.kind == KIND_LINKED)
-                .expect("the repo's own main worktree must report as a linked row");
+                .find(|r| r.kind == KIND_LINKED && r.real_path == wt)
+                .expect("the added worktree must report as a linked row");
             assert!(
-                !main_report.pinned,
+                !linked_report.pinned,
                 "an ordinary linked-worktree row must report pinned: false -- pinning is not \
                  applicable to it at all, got {:?}",
-                main_report.pinned
+                linked_report.pinned
             );
         }
     }

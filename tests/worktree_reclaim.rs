@@ -589,6 +589,18 @@ impl Fixture {
         );
         git(&clone_dir, &["checkout", "--quiet", "-b", branch]);
 
+        // `discover_isolated_clones` only treats a sibling directory as an
+        // isolated-clone candidate if `<candidate>/.git/dot-agent-deck-owner`
+        // exists as a file (`OWNER_MARKER_FILENAME`,
+        // `src/worktree_reclaim.rs`) -- without it the clone is silently
+        // skipped, independent of pin state. Mirrors `Fixture::mark_owned`'s
+        // content convention above.
+        std::fs::write(
+            clone_dir.join(".git").join("dot-agent-deck-owner"),
+            "deck\n",
+        )
+        .expect("write owner marker");
+
         let canonical_repo = self.repo.canonicalize().expect("canonicalize repo");
         let canonical_clone = clone_dir.canonicalize().expect("canonicalize clone dir");
         let root_hash = fnv1a64(canonical_repo.to_string_lossy().as_bytes());
