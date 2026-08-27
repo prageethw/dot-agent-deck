@@ -2799,16 +2799,60 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
 /// `dot-agent-deck worktree pin <path>` (fork issue #597) — pin an isolated
 /// clone against `worktree reclaim`'s automatic removal. Synchronous, no
 /// daemon socket involved, same shape as [`run_worktree_reclaim_cli`] above.
+///
+/// Review-findings fix round (F1): `path` is absolutized here, at the CLI
+/// boundary, before it ever reaches [`pin_isolated_clone`] --
+/// `canonicalize_best_effort` (`issue_dispatch_run.rs`) only canonicalizes a
+/// path's *parent* and rejoins the raw final component, which is correct for
+/// its own callers (all of which construct an already-absolute path
+/// internally) but leaves a bare relative name's parent as `""`, whose
+/// `canonicalize()` fails -- so the raw relative string gets hashed instead
+/// of the resolved path, and `worktree pin <bare-name>` (the everyday
+/// invocation, and what shell tab-completion produces as `<bare-name>/`)
+/// missed the provenance artifact entirely. Resolving the whole path here
+/// with a real `canonicalize()` sidesteps that: every component, including
+/// the last, is followed, so the result agrees with whatever
+/// `canonicalize_best_effort` would derive from it (re-canonicalizing an
+/// already-canonical parent is a no-op).
 fn run_worktree_pin_cli(path: std::path::PathBuf) -> ExitCode {
     use dot_agent_deck::issue_dispatch_run::pin_isolated_clone;
-    use dot_agent_deck::terminal_sanitize::sanitize_path_for_terminal_display;
+    use dot_agent_deck::terminal_sanitize::{
+        sanitize_for_terminal_display, sanitize_path_for_terminal_display,
+    };
+
+    let path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "worktree pin: {} does not resolve to an existing path: {}",
+                sanitize_path_for_terminal_display(&path),
+                sanitize_for_terminal_display(&e.to_string())
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     match pin_isolated_clone(&path) {
         Ok(()) => ExitCode::SUCCESS,
+        // Review-findings fix round (F2): the only realistic failure past
+        // the resolution above is "this is not an isolated clone this deck
+        // provisioned", which surfaces as a bare `read_to_string` NotFound
+        // naming nothing the caller can act on. Say so explicitly instead
+        // of echoing the raw IO error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "worktree pin: {} is not an isolated clone provisioned by this deck (no pin/\
+                 provenance record exists for it) -- `worktree pin` applies only to isolated \
+                 clones, not to linked worktrees",
+                sanitize_path_for_terminal_display(&path)
+            );
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!(
-                "worktree pin: failed to pin {}: {e}",
-                sanitize_path_for_terminal_display(&path)
+                "worktree pin: failed to pin {}: {}",
+                sanitize_path_for_terminal_display(&path),
+                sanitize_for_terminal_display(&e.to_string())
             );
             ExitCode::FAILURE
         }
@@ -2816,17 +2860,42 @@ fn run_worktree_pin_cli(path: std::path::PathBuf) -> ExitCode {
 }
 
 /// `dot-agent-deck worktree unpin <path>` (fork issue #597) — clear a pin
-/// set by `worktree pin`. Same shape as [`run_worktree_pin_cli`] above.
+/// set by `worktree pin`. Same shape as [`run_worktree_pin_cli`] above,
+/// including its F1/F2 handling.
 fn run_worktree_unpin_cli(path: std::path::PathBuf) -> ExitCode {
     use dot_agent_deck::issue_dispatch_run::unpin_isolated_clone;
-    use dot_agent_deck::terminal_sanitize::sanitize_path_for_terminal_display;
+    use dot_agent_deck::terminal_sanitize::{
+        sanitize_for_terminal_display, sanitize_path_for_terminal_display,
+    };
+
+    let path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "worktree unpin: {} does not resolve to an existing path: {}",
+                sanitize_path_for_terminal_display(&path),
+                sanitize_for_terminal_display(&e.to_string())
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     match unpin_isolated_clone(&path) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "worktree unpin: {} is not an isolated clone provisioned by this deck (no pin/\
+                 provenance record exists for it) -- `worktree unpin` applies only to isolated \
+                 clones, not to linked worktrees",
+                sanitize_path_for_terminal_display(&path)
+            );
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!(
-                "worktree unpin: failed to unpin {}: {e}",
-                sanitize_path_for_terminal_display(&path)
+                "worktree unpin: failed to unpin {}: {}",
+                sanitize_path_for_terminal_display(&path),
+                sanitize_for_terminal_display(&e.to_string())
             );
             ExitCode::FAILURE
         }
