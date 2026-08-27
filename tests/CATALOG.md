@@ -1439,6 +1439,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** any reclaim-eligibility verdict (covered by `075`/`076`); the ordering of `pinned=` relative to `path=` in the rewritten content; concurrent/racing pin calls.
 - **Platform coverage:** mac+linux (creator-identity fixture, `#[cfg(unix)]`, matching `075`/`076`).
 
+##### worktree/reclaim/080 — fork issue #597 (RED — compile error, new API surface). `set_isolated_clone_pinned`'s temp-file suffix is `std::process::id()` alone — two calls from the SAME process collide on the identical temp path, exactly what a concurrent pin+unpin against the same isolated clone would do. Calls the not-yet-existing `pin_temp_disambiguator()` (the fix: reuses `agent_pty::mint_nonce_seq`'s per-process nonce+monotonic-sequence idiom, the same recipe `spawn.rs::next_pane_id`/`ui.rs::mint_orchestration_claim_token` already use) twice in a row and asserts the two returned strings differ.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/issue_dispatch_run.rs`'s own `#[cfg(test)] mod tests` (physically a different file than `worktree/reclaim`'s other entries, but continuing that sub-area's numbering per the function under test's own lineage — `set_isolated_clone_pinned` lives in `issue_dispatch_run.rs`).
+- **Agent:** none.
+- **Asserts:** two same-process calls to `pin_temp_disambiguator()` never produce the same string.
+- **Does not assert:** cross-process uniqueness (the nonce half of `mint_nonce_seq`'s recipe already covers that, unpinned here); that `set_isolated_clone_pinned` itself has been updated to use the new helper (that's the GREEN round).
+- **Platform coverage:** mac+linux+windows (pure in-memory logic, no filesystem or subprocess).
+
+##### worktree/reclaim/081 — fork issue #597 (RED — compile error, new struct field). Wires a `pinned` field onto `WorktreeReport`: an always-present plain `bool` (not `Option<bool>`), mirroring `owned`/`clean` rather than `owner` — chosen because an unreadable pin signal already has an established, unambiguous meaning in this codebase (`isolated_clone_report`'s own doc comment: "fails closed, treated as pinned", fork issue #546 hazard 2), so collapsing it to a bare `true` loses no information `Option<bool>` would have preserved. Four fixtures in one test: an explicitly-pinned isolated clone (`true`); an explicitly-unpinned one via `unpin_isolated_clone` (`false`); one whose provenance artifact exists but cannot be read, `worktree_reclaim_078`'s own fixture shape (`true` — fails closed); and an ordinary `"linked"` row, the repo's own main worktree with no isolated clone involved (`false` — not applicable).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (chmod 0o000 fixture, matching `078`) — built through the real provisioner, reading `WorktreeReport.pinned` directly via `examine_worktrees`.
+- **Agent:** none.
+- **Asserts:** `pinned` reads `true`/`false`/`true`/`false` for the pinned / explicitly-unpinned / unreadable-provenance / linked-row cases respectively.
+- **Does not assert:** the CLI surface that sets pin state (`worktree/pin/001`-`003`); the reclaim-eligibility verdict itself (already covered by `075`/`076`/`078`); the JSON serialization key name (that's `worktree/pin/001`/`002`'s job, driven through the real binary).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `078`).
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.
@@ -1447,6 +1461,32 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a **fixture precondition** that the clone genuinely carries `.git/shallow`, so the test provably exercises a shallow repo; then that the shallow repo's combined stdout+stderr contains the repair phrase "fetch --unshallow" (case-insensitive) — not a bare "shallow" substring, since both linked worktrees are deliberately named `wt-a`/`wt-b` so no fixture path, branch, or directory name can satisfy that needle by accident — and that the same command against the full-history seed repo does not contain "shallow" at all.
 - **Does not assert:** the exact wording of the detection message beyond naming the repair — only that shallowness is surfaced, and its repair named, today it is not, for any repo.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other creator-identity tests).
+
+#### worktree/pin
+
+Fork issue #597 wires PR #594's `pin_isolated_clone`/`unpin_isolated_clone` (`pub(crate)`, `#[allow(dead_code)]`, exercised only by `src/worktree_reclaim.rs`'s own unit tests) up to a real `worktree pin <path>` / `worktree unpin <path>` CLI surface. `provision_isolated_clone_sync` is unreachable from this external integration-test crate, so `Fixture::provision_isolated_clone` builds a real `git clone` sibling plus a hand-written M4b provenance artifact matching the production on-disk format byte-for-byte, mirroring `Fixture::mark_owned_with_creator`'s own established precedent for the ownership marker. All three tests are RED today since `worktree pin`/`worktree unpin` do not exist as CLI subcommands at all.
+
+##### worktree/pin/001 — `dot-agent-deck worktree pin <path>` against a real, on-disk isolated clone exits 0, rewrites the provenance artifact's `pinned=` line to `true`, and makes `worktree list --json` report `"pinned":true` for that row (fork issue #597).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), against a real isolated-clone fixture built by hand (see this sub-area's own intro) rather than through the crate-internal provisioner.
+- **Agent:** none.
+- **Asserts:** exit code 0; the provenance artifact carries a `pinned=true` line; the `worktree list --json` entry for the clone's path carries `pinned: true`.
+- **Does not assert:** the `unpin` round trip (`002`); the negative non-isolated-clone case (`003`); the internal `WorktreeReport.pinned` field's shape in isolation (`worktree/reclaim/081` covers that at the unit layer).
+- **Platform coverage:** mac+linux.
+
+##### worktree/pin/002 — `dot-agent-deck worktree unpin <path>` against a real, previously-pinned isolated clone exits 0, rewrites `pinned=` to `false`, and makes `worktree list --json` report `"pinned":false` for that row (fork issue #597).
+- **Layer:** fast synthetic real-binary-subprocess integration, same fixture shape as `worktree/pin/001` — pins first (reusing `001`'s own round trip as setup), then unpins.
+- **Agent:** none.
+- **Asserts:** exit code 0 on `unpin`; the provenance artifact carries a `pinned=false` line afterward; the `worktree list --json` entry carries `pinned: false`.
+- **Does not assert:** unpinning a clone that was never pinned to begin with (already covered at the unit layer by `worktree_reclaim_076`); the pin round trip itself (`001`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/pin/003 — `dot-agent-deck worktree pin <path>` against a LINKED worktree (no provenance artifact exists for it at all) fails cleanly — non-zero exit, non-empty stderr — rather than crashing or fabricating a provenance artifact for a path the pin mechanism was never meant to cover (fork issue #597).
+- **Layer:** fast synthetic real-binary-subprocess integration, a real linked worktree (`Fixture::add_worktree_with_commit`) in place of an isolated clone.
+- **Agent:** none.
+- **Asserts:** non-zero exit code; non-empty stderr; no provenance artifact is created at the path a genuine isolated clone at that location would have used.
+- **Does not assert:** the exact wording of the error message; the isolated-clone-and-not-provisioned case (a directory that IS a real `.git` clone sibling but was never provisioned by this deck at all — not fixtured here).
+- **Platform coverage:** mac+linux.
+
 #### issue/claim
 
 Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's WORKTREE — its absolute path plus its git branch (CLAUDE.md rule 23) — never a `DOT_AGENT_DECK_PANE_ID` value (round 2, dropped: those ids recycle across a daemon restart, fork #160/#163/#166) and never the worktree ownership marker (round 1, dropped: the marker is almost never present under CLAUDE.md rule 1's mandated hand-made `git worktree add`). Both the path and the branch are derivable straight from `git`, so no marker is required at all — the marker, when present, supplies human-readable DECORATION only and is never part of the compared identity. A human claiming outside any worktree still resolves as `human:<login>@<host>` — that half is unchanged since round 1. `issue claim` is a real, already-wired subcommand (`src/issue_claim.rs`); what these tests pin is round 3's identity, which `src/issue_claim.rs`'s `resolve_caller_identity` does not yet implement (still pane-id-based), so a failure here is a genuine behavioral mismatch, not a missing-subcommand error.
