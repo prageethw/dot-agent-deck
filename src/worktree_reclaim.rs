@@ -3212,6 +3212,7 @@ mod tests {
             owner_reason: None,
             removed_by: None,
             kind: KIND_LINKED.to_string(),
+            pinned: false,
         }
     }
 
