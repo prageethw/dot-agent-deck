@@ -3268,6 +3268,17 @@ mod tests {
         // task's own deadline (either of which lets a broken
         // replacement-identity guard pass silently by running out the clock
         // rather than being caught refusing the retry).
+        //
+        // Measured on CI (`cargo nextest run --workspace`, full-suite
+        // parallel load): the synchronous `close_agent` + `spawn_shell_target`
+        // pair below runs on this `#[tokio::test]`'s single-threaded
+        // executor with no `.await` between them, so nothing — including
+        // this confirmation task's own timers — can be polled until they
+        // both return. Under full-workspace contention that pair alone was
+        // observed to cost >2s of wall time (elapsed=3.1s against what was
+        // then a 2s deadline), unrelated to the guard's own correctness. The
+        // deadline/timeout/threshold below carry real margin above that
+        // measurement rather than the workload's nominal ~300ms window.
         let confirmation_started = Instant::now();
         let confirmation = tokio::spawn(confirm_prompt_delivery(
             registry.clone(),
@@ -3284,25 +3295,28 @@ mod tests {
                 // unconfirmed_retry_delay(1).min(remaining)` short, so the
                 // loop abandons at the deadline instead of ever reaching the
                 // `guarded_submit` call this sub-case exists to guard — the
-                // replacement-identity refusal was never exercised. 2 s
-                // stays comfortably above the 300 ms overridden first
-                // window (set above) so the loop actually attempts (and
-                // this guard actually refuses) the retry.
-                deadline: Instant::now() + Duration::from_secs(2),
+                // replacement-identity refusal was never exercised. 10s
+                // stays comfortably above both the 300 ms overridden first
+                // window and the measured multi-second real cost of the
+                // synchronous rebind below, so the loop actually attempts
+                // (and this guard actually refuses) the retry instead of
+                // exiting via deadline-abandonment before ever reaching it.
+                deadline: Instant::now() + Duration::from_secs(10),
             },
         ));
 
         // The first confirmation window is the deterministic blocked retry.
         // Rebind while it is waiting, before the retry is resolved. With the
-        // 2 s deadline above and the 300 ms overridden floor, `window =
-        // min(300ms, remaining≈2s) = 300ms`, so the confirmation task blocks
+        // 10s deadline above and the 300 ms overridden floor, `window =
+        // min(300ms, remaining≈10s) = 300ms`, so the confirmation task blocks
         // on that window (no matching event is ever sent on `event_tx` in
         // this sub-case) before it reaches `guarded_submit` and the
-        // replacement-identity mismatch refuses the retry — total task
-        // lifetime is ~300 ms. The 100 ms rebind delay below is best-effort
-        // (it doesn't need to land inside the window with certainty): the
-        // `elapsed()` assertion after the task terminates below is what
-        // actually pins the guard's behavior, not this margin.
+        // replacement-identity mismatch refuses the retry. The rebind below
+        // is guaranteed to complete before the confirmation task can run
+        // again regardless of its own duration (single-threaded executor,
+        // no `.await` in between), so the 100 ms sleep is not a race margin
+        // — the `elapsed()` assertion after the task terminates below is
+        // what actually pins the guard's behavior.
         tokio::time::sleep(Duration::from_millis(100)).await;
         registry
             .close_agent(&original_id)
@@ -3310,26 +3324,27 @@ mod tests {
         let replacement_id = spawn_shell_target(&registry, PANE_ID);
         // Reviewer B1: this outer timeout is a hang backstop only, not the
         // thing that catches a broken guard — it must still stay below the
-        // task's own 2 s deadline so a hang fails loudly here rather than
+        // task's own 10s deadline so a hang fails loudly here rather than
         // silently reaching the deadline first (see `git log -S
         // 'timeout(Duration::from_secs(13), confirmation)' -- src/spawn.rs`
         // for why prior revisions of this line always kept it below the
         // deadline).
-        tokio::time::timeout(Duration::from_secs(1), confirmation)
+        tokio::time::timeout(Duration::from_secs(8), confirmation)
             .await
             .expect("replacement must terminate confirmation task")
             .expect("confirmation task must not panic");
         // Reviewer S1 (direct-assertion resolution): pins the guard's actual
         // behavior instead of relying on the rebind landing inside a timing
-        // window. A working guard resolves at ~300 ms (the overridden first
-        // window); a regressed guard runs to the task's 2 s deadline. This
-        // assertion fails on the latter regardless of how the rebind above
-        // was scheduled, which is what makes the outer timeout above purely
-        // a hang backstop.
+        // window. A working guard resolves shortly after the overridden
+        // window plus whatever the synchronous rebind's real PTY spawn/close
+        // cost was (measured up to ~3.1s under full-workspace CI load); a
+        // regressed guard runs all the way to the task's 10s deadline. 6s
+        // gives roughly 2x margin over the measured cost while still failing
+        // well short of the deadline on a genuine regression.
         assert!(
-            confirmation_started.elapsed() < Duration::from_secs(1),
+            confirmation_started.elapsed() < Duration::from_secs(6),
             "confirmation task must terminate promptly once the replacement is rebound \
-             (broken replacement-identity guard would instead idle out to the 2s deadline); \
+             (broken replacement-identity guard would instead idle out to the 10s deadline); \
              elapsed={:?}",
             confirmation_started.elapsed()
         );
