@@ -504,6 +504,38 @@ pub fn unconfirmed_retry_delay(attempts: u32) -> std::time::Duration {
     }
 }
 
+/// Issue #529: how long the **unarmed** half of `confirm_prompt_delivery`'s
+/// loop (`src/spawn.rs`) waits between checks for a producer to identify
+/// itself at all, before this delivery has ever become armable.
+///
+/// Deliberately a DIFFERENT wait from [`unconfirmed_retry_delay`], not a
+/// shared one. Issue #525 raised that function's first-retry floor from
+/// 500 ms to 10 s so an already-ARMED delivery would not race a genuine late
+/// confirmation — a margin that only makes sense once there is a confirmation
+/// that could be in flight to race. While unarmed, nothing has been
+/// confirmed-or-confirmable yet, so there is nothing to race: the wait here
+/// exists only to avoid busy-polling the event stream, not to protect a
+/// pending confirmation. Sharing #525's 10 s floor here was an unintended
+/// side effect, not a deliberate trade (#525's own review called it "probably
+/// the right trade" but accidental) — issue #570 documented the cost: a
+/// producer arming ~500 ms late took up to 10 s to recover instead of
+/// near-instant, because the unarmed loop was waiting out the ARMED backoff
+/// schedule for a case that schedule was never tuned for.
+///
+/// Fixed, not escalating — there is no schedule to escalate, since arming
+/// permanently switches this delivery over to [`unconfirmed_retry_delay`]'s
+/// schedule and this function is never consulted again for it. Not
+/// overridable for tests the way [`unconfirmed_retry_base`] is: at 500 ms —
+/// the same order of magnitude as the pre-#525 window — it is already short
+/// enough for real-time test waits (issue #531's concern for the armed
+/// schedule) without needing an env-var seam of its own.
+pub fn unarmed_poll_interval() -> std::time::Duration {
+    UNARMED_POLL_INTERVAL
+}
+
+/// Issue #529: the fixed interval [`unarmed_poll_interval`] returns.
+const UNARMED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Issue #422 item 2: the first-retry floor [`unconfirmed_retry_delay`] reads
 /// when nothing overrides it. Shared by both [`unconfirmed_retry_base`]
 /// variants below so the release build's unmovable value and the test

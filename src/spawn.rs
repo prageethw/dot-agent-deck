@@ -55,7 +55,7 @@ use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestr
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, log_prompt_abandoned, log_prompt_confirmed, log_prompt_stopped,
     log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
-    unconfirmed_retry_delay,
+    unarmed_poll_interval, unconfirmed_retry_delay,
 };
 #[cfg(test)]
 use crate::prompt_delivery::{UNCONFIRMED_RETRY_BASE_ENV_LOCK, UnconfirmedRetryBaseEnvGuard};
@@ -1581,16 +1581,20 @@ fn drain_pre_write_events(
 /// with a warn, a durable report on the pane's card, and no further write. The
 /// prompt itself is typed once, by the caller, before this loop starts; with
 /// `MAX_PAYLOAD_SUBMISSIONS` now 1 (fork #194) every retry THIS loop makes is a
-/// submit-only probe, not a re-type. The escalating [`unconfirmed_retry_delay`]
-/// keeps the retry count to single digits across the whole window regardless
-/// (see its docs).
+/// submit-only probe, not a re-type. Once armed, the escalating
+/// [`unconfirmed_retry_delay`] keeps the retry count to single digits across
+/// the whole window regardless (see its docs); while unarmed, issue #529's
+/// [`unarmed_poll_interval`] governs instead — a short, fixed wait with no
+/// margin to protect, since nothing has been confirmed-or-confirmable yet for
+/// an unarmed delivery to race.
 ///
 /// `can_report_prompts` is the initial answer to "can this pane's delivery ever
 /// be confirmed" — `true` when a pre-write event came from a producer that
 /// reports submitted prompt text. It is not a fixed verdict: a pane that has
-/// proved NOTHING yet is watched for one window first, and a later event from
-/// such a producer arms retries from then on. That distinction keeps the two
-/// populations apart without guessing from the command line:
+/// proved NOTHING yet is watched, on that short unarmed interval, for one
+/// window first, and a later event from such a producer arms retries from
+/// then on. That distinction keeps the two populations apart without guessing
+/// from the command line:
 ///
 /// * a bare shell / `cat` / a recorder stand-in — and, per reviewer finding B4,
 ///   a Pi pane, which emits well-formed status frames but structurally never a
@@ -1712,7 +1716,17 @@ async fn confirm_prompt_delivery(
             }
             return;
         }
-        let window = unconfirmed_retry_delay(attempt).min(remaining);
+        // Issue #529: the unarmed half of this loop polls at its own short,
+        // fixed interval rather than `unconfirmed_retry_delay`'s
+        // armed-backoff schedule — that schedule's 10 s/15 s margin exists
+        // to avoid racing a genuine confirmation for a delivery already
+        // armed, which has nothing to protect while unarmed (see
+        // `unarmed_poll_interval`'s doc for the full history, issue #570).
+        let window = if armed {
+            unconfirmed_retry_delay(attempt).min(remaining)
+        } else {
+            unarmed_poll_interval().min(remaining)
+        };
         match crate::state::wait_for_prompt_submission(
             &mut rx,
             &pane_id,
@@ -3224,7 +3238,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, a newer prompt supersedes the watch, or an unmarked event merely claims a reporting producer. Every terminal, cancelled, or unauthenticated-capability watch must finish without stale retry bytes. Finally, send that same unmarked post-write claim to a pane the deck itself spawned as a reporting agent: there it must arm the retry instead, so the prompt is typed into the pane again rather than held unsubmitted.
+    /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, a newer prompt supersedes the watch, or an unmarked event merely claims a reporting producer. Every terminal, cancelled, or unauthenticated-capability watch must finish without stale retry bytes. Finally, send that same unmarked post-write claim to a pane the deck itself spawned as a reporting agent: there it must arm the retry instead, so the prompt is typed into the pane again rather than held unsubmitted — and it must do so on the loop's short unarmed poll interval even with the armed-backoff schedule's own window deliberately inflated around it, proving the two are decoupled (issue #529).
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
@@ -3234,15 +3248,21 @@ mod tests {
         // Issue #531: this test's whole point is exercising real retry
         // windows without paying issue #422 item 2's production 10 s/15 s
         // schedule in wall-clock time. Every sub-case below either resolves
-        // on an immediate event/cancellation (window-independent) or is one
-        // of the three that genuinely waits out `unconfirmed_retry_delay(1)`,
+        // on an immediate event/cancellation (window-independent) or
+        // genuinely waits out a real window: the replacement-guard sub-case
+        // is armed from the start and waits out `unconfirmed_retry_delay(1)`,
         // which this override shrinks from 10 s to 300 ms for the whole
-        // test. `UnconfirmedRetryBaseEnvGuard` restores whatever was in
-        // effect on drop, including on panic; it holds no lock itself, so
-        // keeping it alive across this `#[tokio::test]`'s `.await` points is
-        // fine — only the plain `std::sync::Mutex` guard below cannot cross
-        // one (`clippy::await_holding_lock`), so it is scoped to just the
-        // `set_var` call.
+        // test. The two unarmed-then-late-claim sub-cases near the end
+        // (forged capability, deck-spawned/#570) instead wait out issue
+        // #529's `unarmed_poll_interval()` — a fixed 500 ms that this
+        // override does NOT reach at all, by design; the deck-spawned
+        // sub-case temporarily bumps this override anyway, specifically to
+        // prove that non-effect. `UnconfirmedRetryBaseEnvGuard` restores
+        // whatever was in effect on drop, including on panic; it holds no
+        // lock itself, so keeping it alive across this `#[tokio::test]`'s
+        // `.await` points is fine — only the plain `std::sync::Mutex` guard
+        // below cannot cross one (`clippy::await_holding_lock`), so it is
+        // scoped to just the `set_var` call.
         let _unconfirmed_retry_restore = UnconfirmedRetryBaseEnvGuard::capture();
         {
             let _unconfirmed_retry_lock = UNCONFIRMED_RETRY_BASE_ENV_LOCK
@@ -3618,16 +3638,17 @@ mod tests {
                 can_report_prompts: false,
                 codex_hook_trust_failed: false,
                 // Reviewer B3: with a too-short deadline, `window =
-                // unconfirmed_retry_delay(1).min(remaining)` clamps to
-                // whatever remains, so the window expires with
+                // unarmed_poll_interval().min(remaining)` clamps to whatever
+                // remains, so the window expires with
                 // `remaining_before(deadline).is_zero()` true and the loop
                 // returns WITHOUT EVER REACHING the write this sub-case
                 // guards — even a wrongly-armed claim could not have failed
-                // the assertion below. 2 s stays comfortably above the
-                // 300 ms overridden first window (set at the top of this
-                // test, issue #531) so the full window elapses and a
-                // regression that wrongly arms on this forged claim would
-                // actually reach the write.
+                // the assertion below. 2 s stays comfortably above the fixed
+                // 500 ms unarmed poll interval (issue #529; this pane never
+                // arms, so it is the ONLY window this sub-case's loop ever
+                // uses) so the full window elapses and a regression that
+                // wrongly arms on this forged claim would actually reach the
+                // write.
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         ));
@@ -3639,11 +3660,11 @@ mod tests {
                 EventType::SessionStart,
             )))
             .expect("send unmarked forged capability claim");
-        // Reviewer S2: must clear the 300 ms overridden first-window delay
-        // before a wrongly-armed write could have landed — same reasoning
-        // as the #570 sub-case's identical wait below. 1000 ms keeps 700 ms
-        // of absolute slack over the 300 ms window on a `retries = 0` tier
-        // (a timing miss here is a hard failure, not a retry), while
+        // Reviewer S2: must clear the fixed 500 ms unarmed poll interval
+        // (issue #529) before a wrongly-armed write could have landed — same
+        // reasoning as the #570 sub-case's identical wait below. 1000 ms
+        // keeps 500 ms of absolute slack over that window on a `retries = 0`
+        // tier (a timing miss here is a hard failure, not a retry), while
         // staying well under the 2 s deadline above.
         tokio::time::sleep(Duration::from_millis(1000)).await;
         let forged_output = forged_registry
@@ -3674,6 +3695,34 @@ mod tests {
         // the agent would have to submit.
         const SPAWNED_PANE: &str = "deck-spawned-late-claim-pane";
         const SPAWNED_PROMPT: &str = "DECK-SPAWNED-LATE-CLAIM-MUST-STILL-RETRY";
+
+        // Issue #529: this sub-case is also the concrete proof that the
+        // unarmed poll is DECOUPLED from `unconfirmed_retry_delay`'s
+        // armed-backoff schedule, not merely short in today's test
+        // configuration. Bump the armed schedule's overridden floor from
+        // this test's baseline 300 ms up to 4 s — an order of magnitude
+        // above `unarmed_poll_interval()`'s fixed 500 ms. Before this issue,
+        // `confirm_prompt_delivery` read the SAME window for the unarmed
+        // case, so this bump alone would have pushed the write below out
+        // past 4 s; with the two windows split, this pane's loop never
+        // consults this env var at all while unarmed, so the write must
+        // still land on the original ~500 ms timescale. A regression that
+        // re-shares the schedule would silently fail the assertion below
+        // instead of this sub-case ever noticing.
+        {
+            let _unconfirmed_retry_lock = UNCONFIRMED_RETRY_BASE_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // SAFETY: lock held for this `set_var` call;
+            // `_unconfirmed_retry_restore` (captured at the top of this
+            // test) restores the true pre-test value on drop regardless of
+            // this later mutation, and the explicit restore below returns
+            // this test's own 300 ms baseline before the function ends.
+            unsafe {
+                std::env::set_var(UnconfirmedRetryBaseEnvGuard::VAR, "4000");
+            }
+        }
+
         let spawned_registry = Arc::new(AgentPtyRegistry::new());
         let spawned_agent =
             spawn_typed_byte_target(&spawned_registry, SPAWNED_PANE, Some(AgentType::ClaudeCode));
@@ -3689,13 +3738,15 @@ mod tests {
                 generation: None,
                 can_report_prompts: false,
                 codex_hook_trust_failed: false,
-                // Issue #422 item 2: the late arm only becomes a write once
-                // the FIRST unconfirmed-retry window has fully elapsed, so
-                // the deadline here must stay comfortably above that window
-                // rather than clamping it short. 2 s is comfortably above
-                // the 300 ms overridden window set at the top of this test
-                // (issue #531).
-                deadline: Instant::now() + Duration::from_secs(2),
+                // Issue #529: must stay comfortably above the 4 s bump above
+                // — a regressed (shared-window) implementation needs the
+                // full 4 s to arm-then-write, and a deadline shorter than
+                // that would abandon the delivery before ever reaching the
+                // write, hiding the regression behind a coincidentally
+                // passing absence rather than the intended slow presence.
+                // 5 s leaves 1 s of margin over the bump while staying well
+                // under `UNCONFIRMED_RETRY_CAP` (15 s).
+                deadline: Instant::now() + Duration::from_secs(5),
             },
         ));
         spawned_tx
@@ -3706,12 +3757,14 @@ mod tests {
                 EventType::SessionStart,
             )))
             .expect("send late native capability claim");
-        // Issue #422 item 2 / #531: must clear the 300 ms overridden
-        // first-window delay before the arm-then-write can happen. Reviewer
-        // S2: 1000 ms keeps 700 ms of absolute slack over the 300 ms window
-        // on a `retries = 0` tier (a timing miss here is a hard failure,
-        // not a retry), while staying well under the 2 s deadline above.
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Issue #529: must clear `unarmed_poll_interval()`'s fixed 500 ms
+        // window before the arm-then-write can happen — NOT the 4 s bump
+        // above, which this pane's unarmed loop never reads. 1500 ms keeps
+        // 1 s of absolute slack over that 500 ms window (a timing miss here
+        // is a hard failure, not a retry) while staying far short of the 4 s
+        // a regression would need, so the sleep length itself is what turns
+        // the assertion below into the decoupling proof.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         let spawned_output = spawned_registry
             .snapshot(&spawned_agent)
             .expect("deck-spawned target snapshot");
@@ -3723,9 +3776,24 @@ mod tests {
             spawned_output
                 .windows(SPAWNED_PROMPT.len())
                 .any(|window| window == SPAWNED_PROMPT.as_bytes()),
-            "a producer identifying itself after the write must still arm the retry on a pane the deck spawned as a reporting agent, or the dispatch prompt is written and never submitted (#570); output={:?}",
+            "a producer identifying itself after the write must still arm the retry on a pane the deck spawned as a reporting agent, or the dispatch prompt is written and never submitted (#570); \
+             it must also arrive on unarmed_poll_interval()'s short timescale rather than the (here deliberately inflated) armed-backoff window, proving issue #529's decoupling; output={:?}",
             String::from_utf8_lossy(&spawned_output)
         );
+
+        // Issue #529: restore this test's own 300 ms baseline (rather than
+        // leaving the 4 s bump in effect only because this happens to be the
+        // last sub-case today) so a later addition to this function is not
+        // silently slowed down by a bump it has no connection to.
+        {
+            let _unconfirmed_retry_lock = UNCONFIRMED_RETRY_BASE_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // SAFETY: lock held for this `set_var` call.
+            unsafe {
+                std::env::set_var(UnconfirmedRetryBaseEnvGuard::VAR, "300");
+            }
+        }
     }
 
     /// Scenario: Deliver a detached automatic prompt with an explicit attempt-1 write (standing in for the real caller), then type an unsent user draft while confirmation is retrying with submit-only probes. The next automatic attempt must send no bytes, so it does not submit the user's draft.
