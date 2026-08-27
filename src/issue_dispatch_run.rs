@@ -3022,6 +3022,22 @@ fn write_isolated_clone_provenance(
     })
 }
 
+/// Per-process disambiguator for [`set_isolated_clone_pinned`]'s temp-file
+/// suffix (fork issue #597): before this helper existed that suffix was
+/// `std::process::id()` alone, which two concurrent pin/unpin calls against
+/// the same clone within one process collide on identically, writing to the
+/// same temp path and publishing a torn write. Shares
+/// [`crate::agent_pty::mint_nonce_seq`]'s recipe but keeps its own
+/// `NONCE`/`SEQ` statics, never shared with any other call site's pair
+/// (`spawn.rs::PANE_NONCE`/`PANE_SEQ`, `ui.rs::ORCHESTRATION_CLAIM_TOKEN_*`),
+/// per that function's own doc comment on why each id space stays separate.
+fn pin_temp_disambiguator() -> String {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (nonce, seq) = crate::agent_pty::mint_nonce_seq(&NONCE, &SEQ);
+    format!("{nonce:016x}-{seq}")
+}
+
 /// Fork issue #546 hazard 2 (maintainer-decided design): rewrite an
 /// isolated clone's existing M4b provenance artifact in place as
 /// `schema=3`, preserving its `root-hash=`/`name=`/`creator=`/`path=`
@@ -3101,7 +3117,7 @@ fn set_isolated_clone_pinned(clone_dir: &Path, pinned: bool) -> std::io::Result<
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("provenance");
-    let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+    let tmp_path = parent.join(format!("{file_name}.{}.tmp", pin_temp_disambiguator()));
     let new_content = format!(
         "schema=3\nroot-hash={root_hash}\nname={name}\ncreator={creator}\npinned={pinned}\npath={path}\n"
     );
@@ -3119,15 +3135,8 @@ fn set_isolated_clone_pinned(clone_dir: &Path, pinned: bool) -> std::io::Result<
 /// with `pinned=true`, which [`crate::worktree_reclaim::isolated_clone_report`]
 /// then AND's into its reclaim-eligibility check alongside the five
 /// existing gates. See [`set_isolated_clone_pinned`] for the rewrite
-/// itself.
-///
-/// `#[allow(dead_code)]`: fork issue #546 deliberately ships no CLI wiring
-/// yet (that is a fast-follow-up) — this function is exercised directly by
-/// `worktree_reclaim_075` and nothing else calls it today, the same honest
-/// state [`forget_isolated_workspace`]'s own `#[allow(dead_code)]`
-/// documents rather than papering over with a synthetic caller.
-#[allow(dead_code)]
-pub(crate) fn pin_isolated_clone(clone_dir: &Path) -> std::io::Result<()> {
+/// itself. Wired to `worktree pin <path>` (fork issue #597, `src/main.rs`).
+pub fn pin_isolated_clone(clone_dir: &Path) -> std::io::Result<()> {
     set_isolated_clone_pinned(clone_dir, true)
 }
 
@@ -3138,15 +3147,9 @@ pub(crate) fn pin_isolated_clone(clone_dir: &Path) -> std::io::Result<()> {
 /// rather than requiring a prior pin call first. See
 /// [`set_isolated_clone_pinned`] for the rewrite itself, and that
 /// function's own doc comment for why a clone with no existing provenance
-/// artifact is refused rather than given a fresh one here.
-///
-/// `#[allow(dead_code)]`: fork issue #546 deliberately ships no CLI wiring
-/// yet (that is a fast-follow-up) — this function is exercised directly by
-/// `worktree_reclaim_076` and nothing else calls it today, the same honest
-/// state [`forget_isolated_workspace`]'s own `#[allow(dead_code)]`
-/// documents rather than papering over with a synthetic caller.
-#[allow(dead_code)]
-pub(crate) fn unpin_isolated_clone(clone_dir: &Path) -> std::io::Result<()> {
+/// artifact is refused rather than given a fresh one here. Wired to
+/// `worktree unpin <path>` (fork issue #597, `src/main.rs`).
+pub fn unpin_isolated_clone(clone_dir: &Path) -> std::io::Result<()> {
     set_isolated_clone_pinned(clone_dir, false)
 }
 
