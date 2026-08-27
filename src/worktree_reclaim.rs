@@ -575,6 +575,18 @@ pub struct WorktreeReport {
     /// isn't as strong as the linked case's `owned_git_dir` containment
     /// check.
     pub kind: String,
+    /// Fork issue #597: whether this isolated clone is explicitly pinned
+    /// against fork#325 M4c's automatic reclaim (fork issue #546 hazard 2)
+    /// — `is_pinned || pin_unresolvable` from [`isolated_clone_report`]'s
+    /// own eligibility gate, so an unreadable pin signal reports `true`
+    /// here too, fails closed exactly like every other unresolvable signal
+    /// this heuristic treats. Always present, no
+    /// `#[serde(skip_serializing_if)]`: the unresolvable-provenance case
+    /// already fails closed to "treated as pinned" everywhere else in this
+    /// file, so collapsing it to `true` here is consistent, not a loss of
+    /// information. `false` for a `kind == "linked"` row — not applicable
+    /// to an ordinary worktree.
+    pub pinned: bool,
     /// Why `owner_kind` is `"unknown"` (review F3 / audit F2) — `None` for
     /// `Agent`/`Human`, which need no explaining. Additive (same
     /// justification as `owner_kind`; no `SCHEMA_VERSION` bump needed for
@@ -1664,6 +1676,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             owner_reason,
             real_path,
             removed_by: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
         });
     }
@@ -2426,6 +2439,7 @@ fn isolated_clone_report(
         real_path,
         removed_by: None,
         kind: KIND_ISOLATED_CLONE.to_string(),
+        pinned: is_pinned || pin_unresolvable,
     }
 }
 
@@ -3158,6 +3172,7 @@ mod tests {
             // reasoning as `owner`/`owner_kind` above, updated only so this
             // pre-existing test keeps compiling; not itself coverage for
             // the field (see `worktree_reclaim_049`-`052` for that).
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-a"),
             removed_by: None,
@@ -4020,6 +4035,7 @@ mod tests {
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
+                pinned: false,
                 kind: KIND_LINKED.to_string(),
                 real_path: PathBuf::from("/repo/wt-owned"),
                 removed_by: None,
@@ -4035,6 +4051,7 @@ mod tests {
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
+                pinned: false,
                 kind: KIND_LINKED.to_string(),
                 real_path: PathBuf::from("/repo/wt-legacy"),
                 removed_by: None,
@@ -4106,6 +4123,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-disagree"),
             removed_by: None,
@@ -4121,6 +4139,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-owned"),
             removed_by: None,
@@ -4136,6 +4155,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-other"),
             removed_by: None,
@@ -4157,6 +4177,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-foreign-marked"),
             removed_by: None,
@@ -4172,6 +4193,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-unmarked"),
             removed_by: None,
@@ -4350,6 +4372,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4400,6 +4423,7 @@ mod tests {
                  it created this worktree"
                     .to_string(),
             ),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4445,6 +4469,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4494,6 +4519,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: Some(remover),
@@ -4543,6 +4569,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason.to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4596,6 +4623,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path.clone(),
             removed_by: None,
@@ -4736,6 +4764,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4786,6 +4815,7 @@ mod tests {
             pr_state: "unresolvable".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -4858,6 +4888,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            pinned: false,
             kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
@@ -7856,5 +7887,209 @@ mod tests {
              -- a corrupted path= would make this clone permanently un-forgettable \
              (forget_isolated_workspace's stale-evidence guard), got:\n{final_content}"
         );
+    }
+
+    /// Scenario: fork issue #597 wires a `pinned` field onto `WorktreeReport`
+    /// so pin state is discoverable through `worktree list --json` without
+    /// substring-matching the human-readable `reason` string. Chosen shape:
+    /// an always-present plain `bool` (not `Option<bool>`), mirroring
+    /// `owned`/`clean` rather than `owner` -- because this field's
+    /// "unresolvable" case already has an established, unambiguous meaning
+    /// in this codebase (`isolated_clone_report`'s own doc comment: an
+    /// unreadable pin signal "fails closed, treated as pinned", fork issue
+    /// #546 hazard 2) rather than the genuinely-unknown meaning `owner`'s
+    /// `None` carries, so collapsing it to a bare `true` loses no
+    /// information `Option<bool>` would have preserved. Four fixtures, one
+    /// per state: an isolated clone explicitly pinned (`true`); one
+    /// explicitly unpinned via `unpin_isolated_clone` (`false`); one whose
+    /// provenance artifact exists but cannot be read, `worktree_reclaim_078`'s
+    /// own fixture shape (`true` -- fails closed); and an ordinary `"linked"`
+    /// row, a real `git worktree add` with no isolated clone involved at all
+    /// (`false` -- not applicable; the repo's own main worktree is excluded
+    /// from `list_linked_worktrees` by design, so it can never produce a
+    /// `KIND_LINKED` row to assert on). References `WorktreeReport.pinned`
+    /// directly, which does not exist yet, so this is a compile-error RED.
+    #[spec("worktree/reclaim/081")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_081_pinned_field_reflects_pin_state_and_fails_closed_when_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // (a) Explicitly pinned isolated clone -> pinned == true.
+        {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            init_repo_with_origin(&repo);
+
+            let clone_dir = scratch.path().join("repo-isolated-pinned-field");
+            let creator = "issue-dispatch:pinned-field#597";
+            crate::issue_dispatch_run::provision_isolated_clone_sync(
+                &repo,
+                &clone_dir,
+                "pinned-field-branch",
+                creator,
+            )
+            .expect("provision_isolated_clone_sync must succeed against a real source repo");
+            crate::issue_dispatch_run::pin_isolated_clone(&clone_dir)
+                .expect("pin_isolated_clone must succeed against a real, just-provisioned clone");
+
+            let clone_head_sha = git_rev_parse_head(&clone_dir);
+            let bindir = scratch.path().join("bin");
+            write_merged_gh_stub_with_head_ref_oid(&bindir, "pinned-field-branch", &clone_head_sha);
+            let _path_guard = PathEnvGuard::prepend(&bindir);
+
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+            let clone_report = reports
+                .iter()
+                .find(|r| r.real_path == clone_dir)
+                .expect("the isolated clone must be present in the report at all");
+            assert!(
+                clone_report.pinned,
+                "an explicitly-pinned isolated clone must report pinned: true, got {:?}",
+                clone_report.pinned
+            );
+        }
+
+        // (b) Explicitly unpinned (schema=3, pinned=false) isolated clone,
+        // never previously pinned -- mirrors worktree_reclaim_076's own
+        // fixture shape -- -> pinned == false.
+        {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            init_repo_with_origin(&repo);
+
+            let clone_dir = scratch.path().join("repo-isolated-unpinned-field");
+            let creator = "issue-dispatch:unpinned-field#597";
+            crate::issue_dispatch_run::provision_isolated_clone_sync(
+                &repo,
+                &clone_dir,
+                "unpinned-field-branch",
+                creator,
+            )
+            .expect("provision_isolated_clone_sync must succeed against a real source repo");
+            crate::issue_dispatch_run::unpin_isolated_clone(&clone_dir).expect(
+                "unpin_isolated_clone must succeed even against a clone that was never pinned",
+            );
+
+            let clone_head_sha = git_rev_parse_head(&clone_dir);
+            let bindir = scratch.path().join("bin");
+            write_merged_gh_stub_with_head_ref_oid(
+                &bindir,
+                "unpinned-field-branch",
+                &clone_head_sha,
+            );
+            let _path_guard = PathEnvGuard::prepend(&bindir);
+
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+            let clone_report = reports
+                .iter()
+                .find(|r| r.real_path == clone_dir)
+                .expect("the isolated clone must be present in the report at all");
+            assert!(
+                !clone_report.pinned,
+                "an explicitly-unpinned isolated clone must report pinned: false, got {:?}",
+                clone_report.pinned
+            );
+        }
+
+        // (c) Provenance artifact exists but is unreadable (chmod 0o000) --
+        // worktree_reclaim_078's own fixture -- fails closed -> pinned ==
+        // true, matching isolated_clone_report's own "treated as pinned"
+        // language for this exact signal.
+        {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            init_repo_with_origin(&repo);
+
+            let clone_dir = scratch.path().join("repo-isolated-unreadable-field");
+            let creator = "issue-dispatch:unreadable-field#597";
+            crate::issue_dispatch_run::provision_isolated_clone_sync(
+                &repo,
+                &clone_dir,
+                "unreadable-field-branch",
+                creator,
+            )
+            .expect("provision_isolated_clone_sync must succeed against a real source repo");
+
+            let clone_head_sha = git_rev_parse_head(&clone_dir);
+            let provenance_path =
+                crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
+            assert!(
+                provenance_path.is_file(),
+                "sanity: the real provisioner must have written a provenance artifact at {} \
+                 before its read permission is stripped below",
+                provenance_path.display()
+            );
+            std::fs::set_permissions(&provenance_path, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+
+            let bindir = scratch.path().join("bin");
+            write_merged_gh_stub_with_head_ref_oid(
+                &bindir,
+                "unreadable-field-branch",
+                &clone_head_sha,
+            );
+            let _path_guard = PathEnvGuard::prepend(&bindir);
+
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+
+            // Restore read permission before any assertion, mirroring
+            // worktree_reclaim_078, so a failure here doesn't leave an
+            // unreadable artifact behind for a later test's cleanup.
+            std::fs::set_permissions(&provenance_path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+
+            let clone_report = reports
+                .iter()
+                .find(|r| r.real_path == clone_dir)
+                .expect("the isolated clone must be present in the report at all");
+            assert!(
+                clone_report.pinned,
+                "an isolated clone whose provenance artifact cannot be read must fail closed \
+                 and report pinned: true, exactly like isolated_clone_report's own eligibility \
+                 gate already treats this signal, got {:?}",
+                clone_report.pinned
+            );
+        }
+
+        // (d) Parity: an ordinary "linked" row (a real `git worktree add`,
+        // no isolated clone involved at all) -> pinned == false, never
+        // applicable. `list_linked_worktrees` deliberately excludes the
+        // repo's own main working tree (`all.remove(0)`), so a linked row
+        // only ever exists for an additional worktree -- hence
+        // `add_worktree` here rather than asserting on the main checkout.
+        // `set_non_github_origin` keeps `resolve_pr_state` from spawning
+        // the real, ambient `gh` (reviewer F6's precedent).
+        {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = scratch.path().join("repo");
+            init_repo_with_origin(&repo);
+            set_non_github_origin(&repo);
+
+            let wt = scratch.path().join("wt-pinned-field-parity");
+            add_worktree(&repo, &wt, "pinned-field-parity-branch");
+
+            // Matched by `kind` alone, not by path: on macOS `real_path`
+            // comes back through git's own realpath resolution
+            // (`/private/var/...`) while `wt` is the plain, unresolved
+            // tempdir join, so a path-equality match is a false negative
+            // there (see `discover_isolated_clones`'s own doc comment for
+            // the same class of mismatch). The main working tree is
+            // excluded from `list_linked_worktrees` by design, so this
+            // added worktree is the only `KIND_LINKED` row that can exist.
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+            let linked_report = reports
+                .iter()
+                .find(|r| r.kind == KIND_LINKED)
+                .expect("the added worktree must report as a linked row");
+            assert!(
+                !linked_report.pinned,
+                "an ordinary linked-worktree row must report pinned: false -- pinning is not \
+                 applicable to it at all, got {:?}",
+                linked_report.pinned
+            );
+        }
     }
 }
