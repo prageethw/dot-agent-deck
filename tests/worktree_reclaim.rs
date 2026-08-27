@@ -2755,9 +2755,10 @@ fn pin_002_unpin_clears_pinned_state() {
 /// Scenario: `dot-agent-deck worktree pin <path>` against a path that is a
 /// LINKED worktree, not an isolated clone (no provenance artifact exists
 /// for it at all) must fail cleanly -- non-zero exit and a non-empty
-/// stderr message -- rather than crashing or silently fabricating a
-/// provenance artifact for a path the pin mechanism was never meant to
-/// cover (fork issue #597).
+/// stderr message that actually explains why, not merely a raw IO error --
+/// rather than crashing or silently fabricating a provenance artifact for a
+/// path the pin mechanism was never meant to cover (fork issue #597,
+/// reviewer F2).
 #[spec("worktree/pin/003")]
 #[test]
 fn pin_003_pin_a_linked_worktree_fails_cleanly() {
@@ -2772,11 +2773,21 @@ fn pin_003_pin_a_linked_worktree_fails_cleanly() {
         out.status,
         combined(&out)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
     assert!(
-        !String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        !stderr.trim().is_empty(),
         "a failed `worktree pin` must explain itself on stderr rather than failing silently, \
          got out={}",
         combined(&out)
+    );
+    // Reviewer F2: the bare `read_to_string` NotFound this used to surface
+    // verbatim (`No such file or directory (os error 2)`) names a path that
+    // plainly exists and gives the caller nothing to act on -- the message
+    // must instead say this isn't an isolated clone this deck can pin.
+    assert!(
+        stderr.contains("not an isolated clone") && stderr.contains("provenance"),
+        "a failed `worktree pin` against a non-isolated-clone path must explain the actual \
+         reason (no provenance record), not just echo the raw IO error, got stderr={stderr:?}"
     );
 
     let canonical_linked = linked.canonicalize().expect("canonicalize linked worktree");
@@ -2786,5 +2797,68 @@ fn pin_003_pin_a_linked_worktree_fails_cleanly() {
         "a failed pin against a non-isolated-clone path must never fabricate a provenance \
          artifact for it, found one at {}",
         provenance_path.display()
+    );
+}
+
+/// Scenario: `dot-agent-deck worktree pin <bare-relative-name>` -- no `./`
+/// prefix, no trailing slash, no absolute path -- against a real isolated
+/// clone must still succeed. `canonicalize_best_effort`
+/// (`issue_dispatch_run.rs`) canonicalizes a path's *parent* and rejoins the
+/// raw final component; a bare relative name's parent is `""`, whose
+/// `canonicalize()` fails, so before this fix the raw relative string was
+/// hashed instead of the resolved absolute path and the provenance lookup
+/// missed -- exactly the everyday `cd ~/workspaces && worktree pin
+/// dot-agent-deck-isolated-foo` invocation, and what shell tab-completion
+/// produces as `dot-agent-deck-isolated-foo/` (fork issue #597, reviewer
+/// F1). Runs the binary directly (rather than through `Fixture::run`, which
+/// hardcodes `current_dir` to the seed repo) with its cwd set to the
+/// isolated clone's own PARENT directory, so `path` genuinely has no `/` in
+/// it at all.
+#[spec("worktree/pin/004")]
+#[test]
+fn pin_004_pin_a_bare_relative_name_resolves_like_an_absolute_path() {
+    let fx = Fixture::new();
+    let clone_dir = fx.provision_isolated_clone(
+        "repo-isolated-cli-pin-bare",
+        "cli-pin-bare-branch",
+        "cli-test#597",
+    );
+    let clone_parent = clone_dir
+        .parent()
+        .expect("provisioned clone always has a parent")
+        .to_path_buf();
+    let bare_name = clone_dir
+        .file_name()
+        .expect("provisioned clone always has a file name")
+        .to_owned();
+
+    let path = format!(
+        "{}:{}",
+        fx.bindir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .current_dir(&clone_parent)
+        .args(["worktree", "pin"])
+        .arg(&bare_name)
+        .env("PATH", path)
+        .env("GHSTUB_DIR", &fx.ghstub)
+        .env("DOT_AGENT_DECK_STATE_DIR", &fx.state_dir)
+        .output()
+        .expect("run dot-agent-deck");
+
+    assert!(
+        out.status.success(),
+        "`worktree pin <bare-relative-name>` against a real isolated clone must succeed just \
+         like the absolute-path form, got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+
+    let content = fx.read_isolated_clone_provenance(&clone_dir);
+    assert!(
+        content.lines().any(|l| l.trim() == "pinned=true"),
+        "the provenance artifact must carry `pinned=true` after a bare-relative-name pin, got:\n\
+         {content}"
     );
 }
