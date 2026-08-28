@@ -1147,6 +1147,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none.
 - **Asserts:** `mark_worktree_owned(wt_a, "orchestration:review-orchestrator-1")` and `mark_worktree_owned(wt_b, "orchestration:review-orchestrator-2")` on two worktrees of the same repo each round-trip through `owner_of` to their own exact string, and the two owners are `assert_ne!`.
 - **Does not assert:** the interactive `SpawnPane` handler that derives these owner strings from the typed Name (covered end-to-end by `worktree/reclaim/022`, `src/ui.rs`); `mark_worktree_owned`/`owner_of` themselves, which are unchanged by fork#192 and already covered by `017`/`020`.
+- **Platform coverage:** mac+linux.
 
 ##### worktree/reclaim/030 — `format_list_human` renders an OWNER column: the marker identity for an owned worktree, and the existing `DASH` placeholder for one whose marker carries no `created-by:` line (fork #166 M2.3, the human-table half).
 - **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — no fixture repo needed, two `WorktreeReport` literals constructed directly.
