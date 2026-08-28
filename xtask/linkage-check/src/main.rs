@@ -64,27 +64,27 @@
 //!      re-deriving the diff. See
 //!      [`work_type::check_resurrected_fragments`].
 //!  13. No catalog ID this branch adds has DIFFERENT content than an
-//!       entry already on `origin/main`'s current tip, unless the id
-//!       was already present at the merge-base (inherited, not newly
-//!       added) — fork #281. Two concurrent PRs each adding a test
-//!       under the same catalog ID pass this tool individually (each
-//!       sees only its own tree); the collision exists only once both
-//!       merge, and nothing catches it there either — not this tool
-//!       (one tree at a time), not git (the two entries land in
-//!       different files/locations, so the merge itself is clean).
-//!       Compares branch tip against `origin/main` directly rather
-//!       than through a merge-base — on a GitHub `pull_request`
-//!       checkout HEAD is a merge commit whose first parent already
-//!       IS `origin/main`'s tip, so a naive merge-base comparison is
-//!       always empty there by construction (fix round: fork #281's
-//!       B1/A1 fail-green). Compares CONTENT, not just id presence,
-//!       so a rewritten `origin/main` (this fork's own sync workflow)
-//!       does not turn every inherited id into a false collision (fix
-//!       round: B2/A2). Best-effort: skipped, not failed, whenever
-//!       `origin/main` cannot be resolved (local dev without the
-//!       remote, a shallow/PR clone) — see
-//!       [`check_cross_branch_catalog_collisions`] for the full
-//!       design.
+//!      entry already on `origin/main`'s current tip, unless the id
+//!      was already present at the merge-base (inherited, not newly
+//!      added) — fork #281. Two concurrent PRs each adding a test
+//!      under the same catalog ID pass this tool individually (each
+//!      sees only its own tree); the collision exists only once both
+//!      merge, and nothing catches it there either — not this tool
+//!      (one tree at a time), not git (the two entries land in
+//!      different files/locations, so the merge itself is clean).
+//!      Compares branch tip against `origin/main` directly rather
+//!      than through a merge-base — on a GitHub `pull_request`
+//!      checkout HEAD is a merge commit whose first parent already
+//!      IS `origin/main`'s tip, so a naive merge-base comparison is
+//!      always empty there by construction (fix round: fork #281's
+//!      B1/A1 fail-green). Compares CONTENT, not just id presence,
+//!      so a rewritten `origin/main` (this fork's own sync workflow)
+//!      does not turn every inherited id into a false collision (fix
+//!      round: B2/A2). Best-effort: skipped, not failed, whenever
+//!      `origin/main` cannot be resolved (local dev without the
+//!      remote, a shallow/PR clone) — see
+//!      [`check_cross_branch_catalog_collisions`] for the full
+//!      design.
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses

@@ -231,6 +231,7 @@ fn validate_structure(root: &Value) -> io::Result<()> {
 /// The temp name is derived from `dest`'s file name (`.<name>.tmp.<pid>`) so the
 /// same publish discipline covers both `hooks.json` and — for scoped trust
 /// (§4.1.2) — the user's `config.toml`, without two files racing on one temp path.
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = dest
         .file_name()
