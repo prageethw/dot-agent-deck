@@ -223,7 +223,14 @@ fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
     let launched = wait_for_declared_launcher(&record);
     deck.send_bytes(b"\x04");
     deck.wait_for_string("[New Pane Ctrl+N]");
-    let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
+    // Fork #339 turned the agent-type badge off by default (deck-global
+    // `m` toggle) — PRD fork#405 also moved identity off the title onto its
+    // own body row, so the combined `Codex · <name>` shape this assertion
+    // originally checked is gone either way. Enable the badge the same way
+    // `agent_badge_003` does before looking for the bare type text.
+    deck.send_keys(b"m");
+    deck.wait_for_string("Agent badge: shown");
+    let codex_badge = deck.wait_for_grid_string_within("Codex", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
 
     assert!(
@@ -269,7 +276,14 @@ fn spawn_011_declared_mode_launcher_wraps_and_badges_codex() {
     deck.send_bytes(b"\x04");
     deck.send_bytes(b"\x1b[D");
     deck.wait_for_string("session(s)");
-    let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
+    // Fork #339 turned the agent-type badge off by default (deck-global
+    // `m` toggle) — PRD fork#405 also moved identity off the title onto its
+    // own body row, so the combined `Codex · <name>` shape this assertion
+    // originally checked is gone either way. Enable the badge the same way
+    // `agent_badge_003` does before looking for the bare type text.
+    deck.send_keys(b"m");
+    deck.wait_for_string("Agent badge: shown");
+    let codex_badge = deck.wait_for_grid_string_within("Codex", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
 
     assert!(
@@ -338,7 +352,14 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
 
     deck.send_bytes(b"\x04");
     deck.wait_for_string("[New Pane Ctrl+N]");
-    let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
+    // Fork #339 turned the agent-type badge off by default (deck-global
+    // `m` toggle) — PRD fork#405 also moved identity off the title onto its
+    // own body row, so the combined `Codex · <name>` shape this assertion
+    // originally checked is gone either way. Enable the badge the same way
+    // `agent_badge_003` does before looking for the bare type text.
+    deck.send_keys(b"m");
+    deck.wait_for_string("Agent badge: shown");
+    let codex_badge = deck.wait_for_grid_string_within("Codex", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
     let real_launch =
         std::fs::read_to_string(&launch_record).expect("read bespoke real-Codex launch record");

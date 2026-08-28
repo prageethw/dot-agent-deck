@@ -248,8 +248,25 @@ fn role_diagnostics(deck: &TuiDeck, orch: &str, expected: &[&str]) -> String {
 /// trip — but the initiating half is a plain CLI invocation the test can make
 /// itself (see [`run_delegate`]), and `cat` echoes whatever is written to it. The
 /// receiving half is therefore fully observable without spending a token.
+///
+/// Issue #613 made the pointer absolute and pane-keyed
+/// (`dot_agent_deck::state::delegate_task_file_name`), so unlike before, this
+/// is no longer a pure function of `role` alone — it also needs the worker
+/// pane's cwd and pane id. This helper is display-only now (panic messages
+/// naming which role's pointer never arrived); [`wait_for_delegate_pointer`]
+/// computes the real, exact needle itself once it has resolved both.
 fn worker_pointer(role: &str) -> String {
-    format!("Read .dot-agent-deck/worker-task-{role}.md for your task.")
+    format!("Read .dot-agent-deck/worker-task-{role}-<pane digest>.md for your task.")
+}
+
+/// `cwd` of the live pane carrying `pane_id`, straight from the daemon's own
+/// attach records — the same source [`role_panes_in`] reads, so the two never
+/// disagree about which pane they mean.
+fn cwd_for_pane(socket: &Path, pane_id: &str) -> Option<String> {
+    common::agent_records_on(socket)
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+        .and_then(|r| r.cwd)
 }
 
 /// Every live role pane of orchestration `orch` whose cwd's basename satisfies
@@ -384,11 +401,19 @@ fn wait_for_delegate_pointer(
     timeout: Duration,
 ) -> bool {
     let socket = deck.attach_socket_path();
-    let needle = common::search_key(&worker_pointer(role));
     common::wait_until(timeout, || {
         let Some(pane_id) = role_panes_in(socket, orch, dir_is).get(role).cloned() else {
             return false;
         };
+        // Issue #613: the pointer is absolute and pane-keyed, so it depends
+        // on the worker's cwd as well as its role — re-resolved on every
+        // poll alongside `pane_id` for the same reason `pane_id` itself is
+        // (a respawn can change either).
+        let Some(cwd) = cwd_for_pane(socket, &pane_id) else {
+            return false;
+        };
+        let pointer = common::expected_delegate_pointer(Path::new(&cwd), role, &pane_id);
+        let needle = common::search_key(&String::from_utf8_lossy(&pointer));
         common::agent_records_on(socket)
             .into_iter()
             .filter(|r| r.pane_id_env.as_deref() == Some(pane_id.as_str()))
