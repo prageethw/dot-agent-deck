@@ -35,23 +35,37 @@
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
 use crate::prompt_delivery::truncate_on_char_boundary;
+use regex::Regex;
+use std::sync::OnceLock;
 
-/// Returns `true` for Unicode bidirectional formatting / override codepoints.
+/// Compiled once: matches any single char in Unicode general category `Cf`
+/// (format characters). See [`is_bidi_format_char`] for why category
+/// classification, not an enumerated codepoint list, is what this module
+/// checks against.
+fn cf_category_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\p{Cf}").expect("static Cf category regex compiles"))
+}
+
+/// Returns `true` for a Unicode format-character (general category `Cf`) —
+/// bidirectional formatting/override controls, zero-width space/non-joiner/
+/// joiner, the BOM, WORD JOINER, SOFT HYPHEN, the tag-format block, and more.
 ///
-/// [`char::is_control`] does **not** catch these — they are general category
-/// `Cf`, not `Cc` — but a terminal honours them, so a `U+202E`
+/// [`char::is_control`] does **not** catch these — they are category `Cf`,
+/// not `Cc` — but a terminal honours them, so a `U+202E`
 /// (RIGHT-TO-LEFT OVERRIDE) planted in an untrusted string visually reverses
-/// the characters after it. That is enough to make a name read as something it
-/// is not, or to swallow the text that follows it on the same line.
+/// the characters after it, and an invisible one (`U+2060` WORD JOINER,
+/// `U+200B` ZWSP, the `U+E0000..=U+E007F` tag block used for invisible-text
+/// smuggling) can hide or spoof content with no visible trace at all.
+/// Classified by category via `regex`'s `\p{Cf}` Unicode property support
+/// (the same mechanism [`crate::terminal_sanitize`] uses), not by an
+/// enumerated list of codepoints: fork issue #232 round 2 found a prior
+/// hand-picked list here silently missing WORD JOINER and others it claimed
+/// to cover — the same "list of the ones we thought of" shape that misses
+/// whatever nobody thought of, and never updates itself as Unicode adds more.
 pub fn is_bidi_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO
-            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
-            | '\u{200E}'              // LRM
-            | '\u{200F}'              // RLM
-            | '\u{061C}'              // ALM
-    )
+    let mut buf = [0u8; 4];
+    cf_category_regex().is_match(c.encode_utf8(&mut buf))
 }
 
 /// Drop every character from `s` that could perturb or spoof the terminal it is
@@ -113,23 +127,25 @@ pub fn escape_control_and_bidi(s: &str) -> String {
 /// Sanitize a producer-supplied display name into something safe to store and
 /// render, or `None` when nothing usable survives.
 ///
-/// Strips control and bidi characters, trims surrounding whitespace, then
-/// clamps to [`DISPLAY_NAME_MAX_LEN`] bytes on a character boundary via
-/// [`truncate_on_char_boundary`] — the same truncator
-/// `ui::render_session_card` already applies to the equally producer-controlled
-/// `session_id`, so a clamped name is marked with the same trailing `…` the
-/// user sees on a shortened id. `None` means "no usable name": the caller
-/// should leave whatever name it already had in place rather than store an
-/// empty title.
+/// Strips control and bidi characters, trims surrounding whitespace, then —
+/// only when the result is over [`DISPLAY_NAME_MAX_LEN`] bytes — clamps it on
+/// a character boundary via [`truncate_on_char_boundary`], leaving room for
+/// the trailing `…` that truncator appends so the **final** output never
+/// exceeds [`DISPLAY_NAME_MAX_LEN`] bytes either way. That marker matches the
+/// one `ui::render_session_card` already puts on a shortened
+/// `session_id`. `None` means "no usable name": the caller should leave
+/// whatever name it already had in place rather than store an empty title.
 ///
 /// The byte ceiling is deliberately the daemon's own
 /// [`DISPLAY_NAME_MAX_LEN`], so a name that reaches a card through the hook
 /// socket cannot be longer than one that reaches it through
-/// `agent_pty::is_valid_display_name` on the attach socket. The two differ in
-/// what they do about a bad value — the daemon **rejects** the whole name,
-/// this **repairs** it — because the daemon is validating a request a user just
-/// typed and can retype, while this is scrubbing a field on an event whose
-/// other contents we still want to apply.
+/// `agent_pty::is_valid_display_name` on the attach socket — that function
+/// enforces the cap strictly (`<= DISPLAY_NAME_MAX_LEN`), which is why the
+/// ellipsis has to come out of the same budget rather than being added on
+/// top of it. The two differ in what they do about a bad value — the daemon
+/// **rejects** the whole name, this **repairs** it — because the daemon is
+/// validating a request a user just typed and can retype, while this is
+/// scrubbing a field on an event whose other contents we still want to apply.
 ///
 /// Note the clamp counts BYTES, not display columns. That matches every other
 /// length bound in this project and is not the render budget: the title's own
@@ -141,7 +157,13 @@ pub fn sanitize_display_name(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(truncate_on_char_boundary(trimmed, DISPLAY_NAME_MAX_LEN))
+    if trimmed.len() <= DISPLAY_NAME_MAX_LEN {
+        return Some(trimmed.to_string());
+    }
+    // Truncate to leave room for the ellipsis truncate_on_char_boundary is
+    // about to append, so the total never exceeds DISPLAY_NAME_MAX_LEN.
+    let budget = DISPLAY_NAME_MAX_LEN.saturating_sub("…".len());
+    Some(truncate_on_char_boundary(trimmed, budget))
 }
 
 #[cfg(test)]
@@ -180,6 +202,36 @@ mod tests {
             assert!(
                 is_bidi_format_char(c),
                 "U+{:04X} must be recognised",
+                c as u32
+            );
+            let input = format!("a{c}b");
+            assert_eq!(
+                strip_control_and_bidi(&input, false),
+                "ab",
+                "U+{:04X} survived the filter",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn strip_control_and_bidi_covers_the_cf_category_gaps_an_enumerated_list_missed() {
+        // These are all general category `Cf` but outside any bidi-specific
+        // range — an enumerated bidi codepoint list (this module's own prior
+        // shape, and fork issue #232 round 2's original gap) misses every one
+        // of them. U+2060 WORD JOINER is the exact codepoint that issue named.
+        for c in [
+            '\u{2060}',  // WORD JOINER
+            '\u{200B}',  // ZERO WIDTH SPACE
+            '\u{200C}',  // ZERO WIDTH NON-JOINER
+            '\u{200D}',  // ZERO WIDTH JOINER
+            '\u{FEFF}',  // ZERO WIDTH NO-BREAK SPACE / BOM
+            '\u{00AD}',  // SOFT HYPHEN
+            '\u{E0001}', // tag block (invisible-text smuggling)
+        ] {
+            assert!(
+                is_bidi_format_char(c),
+                "U+{:04X} is category Cf and must be recognised",
                 c as u32
             );
             let input = format!("a{c}b");
@@ -255,12 +307,20 @@ mod tests {
     #[test]
     fn sanitize_display_name_clamps_on_a_char_boundary() {
         // ASCII: exactly at the ceiling passes through untouched, one over is
-        // cut and marked.
+        // cut (leaving room for the ellipsis) and marked.
         let at_cap = "a".repeat(DISPLAY_NAME_MAX_LEN);
         assert_eq!(sanitize_display_name(&at_cap), Some(at_cap.clone()));
         let over = "a".repeat(DISPLAY_NAME_MAX_LEN + 1);
         let clamped = sanitize_display_name(&over).expect("a long name is repaired, not dropped");
-        assert_eq!(clamped, format!("{at_cap}…"));
+        assert_eq!(
+            clamped.len(),
+            DISPLAY_NAME_MAX_LEN,
+            "clamped + ellipsis must fill exactly the cap, not overshoot it"
+        );
+        assert_eq!(
+            clamped,
+            format!("{}…", "a".repeat(DISPLAY_NAME_MAX_LEN - "…".len()))
+        );
 
         // Multi-byte: the cut must snap DOWN to a boundary rather than split a
         // character. Swept across widths and offsets because the surviving byte
@@ -270,18 +330,36 @@ mod tests {
             for pad in 0..4usize {
                 let raw = "x".repeat(pad) + &filler.to_string().repeat(DISPLAY_NAME_MAX_LEN);
                 let out = sanitize_display_name(&raw).expect("non-empty input yields a name");
-                let body = out.strip_suffix('…').expect("an over-long name is marked");
                 assert!(
-                    body.len() <= DISPLAY_NAME_MAX_LEN,
-                    "clamp overshot the ceiling: {} bytes for filler {filler:?} pad {pad}",
-                    body.len()
+                    out.len() <= DISPLAY_NAME_MAX_LEN,
+                    "the FINAL output (including the ellipsis) must never exceed the cap: {} bytes for filler {filler:?} pad {pad}",
+                    out.len()
                 );
+                let body = out.strip_suffix('…').expect("an over-long name is marked");
                 assert!(
                     body.ends_with(filler),
                     "the cut split a character for filler {filler:?} pad {pad}: {body:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn sanitize_display_name_strips_word_joiner_u2060() {
+        // Auditor F1: this seam previously classified by an enumerated bidi
+        // codepoint list rather than Unicode category `Cf`, silently
+        // reintroducing the exact gap fork issue #232 round 2 closed on the
+        // `terminal_sanitize` path — U+2060 WORD JOINER (and its invisible
+        // siblings) reached a card's `display_name` unsanitized. There is no
+        // render-seam sanitizer behind this ingest path, so this is the only
+        // guard.
+        let hostile = "evil\u{2060}\u{200B}name";
+        let out = sanitize_display_name(hostile).expect("visible content survives sanitization");
+        assert!(
+            !out.contains('\u{2060}') && !out.contains('\u{200B}'),
+            "WORD JOINER / ZWSP must not reach the stored display_name, got {out:?}"
+        );
+        assert_eq!(out, "evilname");
     }
 
     #[test]
