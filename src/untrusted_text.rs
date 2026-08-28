@@ -50,23 +50,37 @@
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
 use crate::prompt_delivery::truncate_on_char_boundary;
+use regex::Regex;
+use std::sync::OnceLock;
 
-/// Returns `true` for Unicode bidirectional formatting / override codepoints.
+/// Compiled once: matches any single char in Unicode general category `Cf`
+/// (format characters). See [`is_bidi_format_char`] for why category
+/// classification, not an enumerated codepoint list, is what this module
+/// checks against.
+fn cf_category_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\p{Cf}").expect("static Cf category regex compiles"))
+}
+
+/// Returns `true` for a Unicode format-character (general category `Cf`) —
+/// bidirectional formatting/override controls, zero-width space/non-joiner/
+/// joiner, the BOM, WORD JOINER, SOFT HYPHEN, the tag-format block, and more.
 ///
-/// [`char::is_control`] does **not** catch these — they are general category
-/// `Cf`, not `Cc` — but a terminal honours them, so a `U+202E`
+/// [`char::is_control`] does **not** catch these — they are category `Cf`,
+/// not `Cc` — but a terminal honours them, so a `U+202E`
 /// (RIGHT-TO-LEFT OVERRIDE) planted in an untrusted string visually reverses
-/// the characters after it. That is enough to make a name read as something it
-/// is not, or to swallow the text that follows it on the same line.
+/// the characters after it, and an invisible one (`U+2060` WORD JOINER,
+/// `U+200B` ZWSP, the `U+E0000..=U+E007F` tag block used for invisible-text
+/// smuggling) can hide or spoof content with no visible trace at all.
+/// Classified by category via `regex`'s `\p{Cf}` Unicode property support
+/// (the same mechanism [`crate::terminal_sanitize`] uses), not by an
+/// enumerated list of codepoints: fork issue #232 round 2 found a prior
+/// hand-picked list here silently missing WORD JOINER and others it claimed
+/// to cover — the same "list of the ones we thought of" shape that misses
+/// whatever nobody thought of, and never updates itself as Unicode adds more.
 pub fn is_bidi_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO
-            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
-            | '\u{200E}'              // LRM
-            | '\u{200F}'              // RLM
-            | '\u{061C}'              // ALM
-    )
+    let mut buf = [0u8; 4];
+    cf_category_regex().is_match(c.encode_utf8(&mut buf))
 }
 
 /// Drop every character from `s` that could perturb or spoof the terminal it is
@@ -287,6 +301,36 @@ mod tests {
     }
 
     #[test]
+    fn strip_control_and_bidi_covers_the_cf_category_gaps_an_enumerated_list_missed() {
+        // These are all general category `Cf` but outside any bidi-specific
+        // range — an enumerated bidi codepoint list (this module's own prior
+        // shape, and fork issue #232 round 2's original gap) misses every one
+        // of them. U+2060 WORD JOINER is the exact codepoint that issue named.
+        for c in [
+            '\u{2060}',  // WORD JOINER
+            '\u{200B}',  // ZERO WIDTH SPACE
+            '\u{200C}',  // ZERO WIDTH NON-JOINER
+            '\u{200D}',  // ZERO WIDTH JOINER
+            '\u{FEFF}',  // ZERO WIDTH NO-BREAK SPACE / BOM
+            '\u{00AD}',  // SOFT HYPHEN
+            '\u{E0001}', // tag block (invisible-text smuggling)
+        ] {
+            assert!(
+                is_bidi_format_char(c),
+                "U+{:04X} is category Cf and must be recognised",
+                c as u32
+            );
+            let input = format!("a{c}b");
+            assert_eq!(
+                strip_control_and_bidi(&input, false),
+                "ab",
+                "U+{:04X} survived the filter",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
     fn escape_control_and_bidi_shows_what_was_sent_instead_of_hiding_it() {
         // The same fixture the stripping test uses, so the two policies are
         // directly comparable: every class survives as visible evidence.
@@ -349,7 +393,7 @@ mod tests {
     #[test]
     fn sanitize_display_name_clamps_on_a_char_boundary() {
         // ASCII: exactly at the ceiling passes through untouched, one over is
-        // cut and marked.
+        // cut (leaving room for the ellipsis) and marked.
         let at_cap = "a".repeat(DISPLAY_NAME_MAX_LEN);
         assert_eq!(sanitize_display_name(&at_cap), Some(at_cap.clone()));
         let over = "a".repeat(DISPLAY_NAME_MAX_LEN + 1);
@@ -439,6 +483,24 @@ mod tests {
         // 64 KiB of padding cut down and then scrubbed to nothing.
         let padded = format!("{}{}", "\u{1b}".repeat(MAX_TOOL_TEXT_BYTES + 10), "Bash");
         assert_eq!(sanitize_tool_text(&padded), "Bash");
+    }
+
+    #[test]
+    fn sanitize_display_name_strips_word_joiner_u2060() {
+        // Auditor F1: this seam previously classified by an enumerated bidi
+        // codepoint list rather than Unicode category `Cf`, silently
+        // reintroducing the exact gap fork issue #232 round 2 closed on the
+        // `terminal_sanitize` path — U+2060 WORD JOINER (and its invisible
+        // siblings) reached a card's `display_name` unsanitized. There is no
+        // render-seam sanitizer behind this ingest path, so this is the only
+        // guard.
+        let hostile = "evil\u{2060}\u{200B}name";
+        let out = sanitize_display_name(hostile).expect("visible content survives sanitization");
+        assert!(
+            !out.contains('\u{2060}') && !out.contains('\u{200B}'),
+            "WORD JOINER / ZWSP must not reach the stored display_name, got {out:?}"
+        );
+        assert_eq!(out, "evilname");
     }
 
     #[test]
