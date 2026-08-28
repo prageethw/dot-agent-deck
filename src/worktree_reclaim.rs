@@ -1702,6 +1702,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
 /// function's purpose, and it does not close the separate question of
 /// terminal-rewriting characters in this output — a different mechanism
 /// (bytes that pass through and rewrite the display) needing its own answer.
+#[cfg_attr(not(test), allow(dead_code))]
 fn display_path(path: &Path) -> String {
     format!("{path:?}")
 }
