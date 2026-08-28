@@ -317,7 +317,23 @@ impl AgentStartRearm {
     /// belief. A declaration that disagrees refuses; a declaration that agrees
     /// adds nothing the belief did not already carry. See the type-level table
     /// for the cases this decides.
-    pub fn observe_agent_start(&mut self, at: std::time::Instant, declared: &AgentType) {
+    ///
+    /// `codex_hook_trust_failed` is the caller's own accumulated
+    /// `codex_hook_trust_failed` (issue #459/#468) as of this observation. This
+    /// grant is a SECOND, independent write authorization on top of the
+    /// ordinary `armed` flag that veto suppresses — without this check, a
+    /// delivery that armed pre-write and only afterward learns the hook-trust
+    /// install failed could still earn and later spend a rearm payload write
+    /// into a pane the veto has concluded can never confirm.
+    pub fn observe_agent_start(
+        &mut self,
+        at: std::time::Instant,
+        declared: &AgentType,
+        codex_hook_trust_failed: bool,
+    ) {
+        if codex_hook_trust_failed {
+            return;
+        }
         if self.spent || self.observed_at.is_some() {
             return;
         }
@@ -1276,7 +1292,7 @@ mod tests {
     fn armed_at(t0: Instant) -> AgentStartRearm {
         let mut rearm = AgentStartRearm::new(Some(AgentType::ClaudeCode));
         rearm.note_payload_write(true);
-        rearm.observe_agent_start(t0, &AgentType::ClaudeCode);
+        rearm.observe_agent_start(t0, &AgentType::ClaudeCode, false);
         rearm
     }
 
@@ -1353,7 +1369,7 @@ mod tests {
         }
 
         // A spent rearm cannot be re-armed by a later qualifying start either.
-        rearm.observe_agent_start(armed_now, &AgentType::ClaudeCode);
+        rearm.observe_agent_start(armed_now, &AgentType::ClaudeCode, false);
         assert!(!attempt_writes_payload(
             3,
             &rearm,
@@ -1398,7 +1414,7 @@ mod tests {
         // case B pins.
         let mut no_standing = AgentStartRearm::new(None);
         no_standing.note_payload_write(true);
-        no_standing.observe_agent_start(t0, &AgentType::ClaudeCode);
+        no_standing.observe_agent_start(t0, &AgentType::ClaudeCode, false);
         assert!(
             !attempt_writes_payload(3, &no_standing, armed_now),
             "S: a pane the deck cannot vouch for may not authorize a payload rewrite"
@@ -1409,7 +1425,7 @@ mod tests {
         // fast path and it must never arm.
         let mut bound_at_write = AgentStartRearm::new(Some(AgentType::ClaudeCode));
         bound_at_write.note_payload_write(false);
-        bound_at_write.observe_agent_start(t0, &AgentType::ClaudeCode);
+        bound_at_write.observe_agent_start(t0, &AgentType::ClaudeCode, false);
         assert!(
             !attempt_writes_payload(3, &bound_at_write, armed_now),
             "U: a delivery whose agent had already announced a conversation when we wrote \
@@ -1430,7 +1446,7 @@ mod tests {
         ] {
             let mut wrong_producer = AgentStartRearm::new(Some(declared.clone()));
             wrong_producer.note_payload_write(true);
-            wrong_producer.observe_agent_start(t0, &declared);
+            wrong_producer.observe_agent_start(t0, &declared, false);
             assert!(
                 !attempt_writes_payload(3, &wrong_producer, armed_now),
                 "T: {declared:?}'s post-write start is caused by our own delivery, so arming \
@@ -1447,7 +1463,20 @@ mod tests {
              evidence they authorize nothing"
         );
 
-        // ...and the full conjunction does arm, so the five negatives above are
+        // Auditor F2 (issue #459/#666 merge gap): a `codex_hook_trust_failed`
+        // veto already in effect at the moment of observation must refuse the
+        // rearm exactly as it refuses `armed` — otherwise a pane the veto has
+        // concluded can never confirm could still earn a rearm payload write.
+        let mut hook_trust_failed = AgentStartRearm::new(Some(AgentType::ClaudeCode));
+        hook_trust_failed.note_payload_write(true);
+        hook_trust_failed.observe_agent_start(t0, &AgentType::ClaudeCode, true);
+        assert!(
+            !attempt_writes_payload(3, &hook_trust_failed, armed_now),
+            "a codex_hook_trust_failed veto in effect at observation time must refuse the \
+             rearm, not merely `armed`"
+        );
+
+        // ...and the full conjunction does arm, so the six negatives above are
         // each the ONLY difference.
         assert!(attempt_writes_payload(3, &armed_at(t0), armed_now));
     }
@@ -1475,7 +1504,7 @@ mod tests {
         let observed = |believed: Option<AgentType>, declared: &AgentType| {
             let mut rearm = AgentStartRearm::new(believed);
             rearm.note_payload_write(true);
-            rearm.observe_agent_start(t0, declared);
+            rearm.observe_agent_start(t0, declared, false);
             attempt_writes_payload(3, &rearm, armed_now)
         };
 
@@ -1514,7 +1543,7 @@ mod tests {
         let t0 = Instant::now();
         let mut rearm = AgentStartRearm::new(Some(AgentType::ClaudeCode));
         rearm.note_payload_write(true);
-        rearm.observe_agent_start(t0, &AgentType::ClaudeCode);
+        rearm.observe_agent_start(t0, &AgentType::ClaudeCode, false);
         assert!(attempt_writes_payload(
             3,
             &rearm,

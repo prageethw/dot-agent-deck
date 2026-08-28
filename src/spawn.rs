@@ -1968,9 +1968,11 @@ async fn confirm_prompt_delivery(
                 // post-write `SessionStart`. That is facts G ∧ I ∧ W; the rearm
                 // adds S (standing, above), U (unbound at the last payload write)
                 // and T (this producer's start precedes its first prompt), and
-                // refuses unless all six hold.
+                // refuses unless all six hold. `codex_hook_trust_failed` is
+                // passed through too (auditor F2): it vetoes earning a rearm the
+                // same way it vetoes `armed` above.
                 if let Some((observed_at, declared)) = agent_start {
-                    rearm.observe_agent_start(observed_at, &declared);
+                    rearm.observe_agent_start(observed_at, &declared, codex_hook_trust_failed);
                 }
                 // Issue #570: a delivery that starts UNARMED writes nothing at
                 // all on every prior iteration (`if !armed { continue; }`
@@ -2111,9 +2113,11 @@ async fn confirm_prompt_delivery(
         // Issue #666: the gap between a window expiring and the write below is
         // post-write too, so a start landing in it is the same evidence the
         // window's is. Observed under the same rule rather than waiting a whole
-        // backoff step for the next window to see it.
+        // backoff step for the next window to see it. `codex_hook_trust_failed`
+        // is passed through too (auditor F2), for the same reason as the
+        // `Elapsed` arm above.
         if let Some((observed_at, declared)) = gap_agent_start {
-            rearm.observe_agent_start(observed_at, &declared);
+            rearm.observe_agent_start(observed_at, &declared, codex_hook_trust_failed);
         }
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);

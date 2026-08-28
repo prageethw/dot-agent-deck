@@ -1801,9 +1801,9 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
         "session.display_name must equal sanitize_display_name's own output for the same input"
     );
     assert!(
-        display_name.len() <= dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN + "…".len(),
-        "clamped display_name must not exceed the {}-byte cap plus the trailing ellipsis, got \
-         {} bytes:\n{display_name}",
+        display_name.len() <= dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN,
+        "clamped display_name (including any trailing ellipsis) must not exceed the {}-byte \
+         cap agent_pty::is_valid_display_name also enforces, got {} bytes:\n{display_name}",
         dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN,
         display_name.len()
     );
