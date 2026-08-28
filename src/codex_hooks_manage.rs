@@ -306,7 +306,16 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
 
     validate_structure(&root)?;
 
-    let command = crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX);
+    // `codex_home()` deliberately resolves on Windows too (fork #238) — unlike
+    // Devin, Codex has a genuine native-Windows story, so its hook command is
+    // parsed by the real target shell: `cmd.exe` there, POSIX everywhere else.
+    let shell_target = if cfg!(windows) {
+        crate::agent_hook_config::ShellTarget::CmdExe
+    } else {
+        crate::agent_hook_config::ShellTarget::Posix
+    };
+    let command =
+        crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX, shell_target);
     install_impl(&mut root, &command);
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
@@ -1156,6 +1165,7 @@ mod tests {
         let command = crate::agent_hook_config::build_command(
             stub.to_str().expect("utf8 stub path"),
             HOOK_COMMAND_SUFFIX,
+            crate::agent_hook_config::ShellTarget::CmdExe,
         );
 
         let output = std::process::Command::new("cmd.exe")
