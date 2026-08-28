@@ -1711,7 +1711,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
 // `git show 54abe08b -- src/worktree_reclaim.rs` that the original commit
 // this rebase is replaying left this function and its tests in place too,
 // so this is not a caller a merge silently dropped.
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn display_path(path: &Path) -> String {
     format!("{path:?}")
 }
