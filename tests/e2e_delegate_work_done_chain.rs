@@ -441,10 +441,16 @@ async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inne
         .handle_delegate(signal, &daemon.registry, &daemon.event_tx)
         .await;
 
-    let task_file = cwd
-        .path()
-        .join(".dot-agent-deck")
-        .join("worker-task-coder.md");
+    // Issue #613: the task-file name is pane-keyed, not role-only
+    // (`worker-task-<role>-<pane digest>.md`) — compute it the same way the
+    // daemon does rather than hardcoding the pre-#613 bare literal.
+    let task_file =
+        cwd.path()
+            .join(".dot-agent-deck")
+            .join(dot_agent_deck::state::delegate_task_file_name(
+                WORKER_ROLE,
+                WORKER_PANE,
+            ));
     let ok = common::wait_for_path_async(&task_file, Duration::from_secs(5)).await;
     assert!(ok, "worker task file was never written at {task_file:?}");
     let body = std::fs::read_to_string(&task_file).expect("read worker task file");

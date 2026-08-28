@@ -22431,7 +22431,7 @@ fn render_session_card(
         // registry badge colour. A friendly `display_name` renders
         // ALONGSIDE the badge (`<type> · <name>`) rather than replacing it.
         let badge_style = Style::default()
-            .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+            .fg(crate::agent_registry::spec(&shown_agent_type).badge_color)
             .add_modifier(Modifier::BOLD);
         // PRD fork#378: a known active model grows the badge text to
         // `<type> (<model>)`, still one registry-coloured, bold segment.
@@ -22450,8 +22450,8 @@ fn render_session_card(
             .map(str::trim)
             .filter(|m| !m.is_empty())
         {
-            Some(model) => format!("{} ({})", session.agent_type, normalize_model_label(model)),
-            None => format!("{}", session.agent_type),
+            Some(model) => format!("{} ({})", shown_agent_type, normalize_model_label(model)),
+            None => format!("{}", shown_agent_type),
         };
         // PRD fork#405 M1: identity (name/id) moved off the title and onto
         // its own body row — see the `ROLE_NAME`-styled line pushed below.
@@ -38794,8 +38794,14 @@ mod tests {
         // Issue #589: the FOOTER must keep the same promise the action row
         // does. Rendered from the form these keystrokes actually produced —
         // not the seam above, which opens focused on Mode where `Enter: next`
-        // is honest. Focus is on Name here, the one state where Enter reaches
-        // the refusal.
+        // is honest. Move focus to Name here, the one state where Enter
+        // reaches the refusal, *before* rendering the footer below —
+        // otherwise the assertion would pass vacuously against the
+        // Mode-focused seam's own honest `Enter: next` footer, never
+        // exercising the collision guard at all.
+        if let Some(form) = ui.new_pane_form.as_mut() {
+            form.focused = FormField::Name;
+        }
         let collided = {
             let form = ui.new_pane_form.as_ref().expect("form still open");
             buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
@@ -38811,7 +38817,11 @@ mod tests {
         // Control: one keystroke away from the collision. Typing a free name
         // restores BOTH [Submit] and the `Enter: submit` promise, so the
         // assertion above is attributable to the collision state and not to
-        // the hint having been dropped wholesale.
+        // the hint having been dropped wholesale. Focus is already on Name
+        // from the footer check above — `handle_new_pane_form_key`'s
+        // `KeyCode::Char` arm only writes into `form.name` while focus is on
+        // `FormField::Name`, so these keystrokes land as expected without
+        // moving focus again.
         for ch in "review-2".chars() {
             handle_new_pane_form_key(
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),

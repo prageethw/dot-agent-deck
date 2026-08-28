@@ -3857,8 +3857,12 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
 
     let declared = render(&session, Some(&AgentType::Codex));
     assert!(
-        declared.contains("Codex · reviewer"),
+        declared.contains("Codex"),
         "an unidentified session must render its declared Codex badge:\n{declared}"
+    );
+    assert!(
+        declared.contains("reviewer"),
+        "the declared card must still show its role name (on its own row, PRD fork#405):\n{declared}"
     );
     assert!(
         !declared.contains("No agent"),
@@ -3868,8 +3872,12 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
     session.agent_type = AgentType::ClaudeCode;
     let observed = render(&session, Some(&AgentType::Codex));
     assert!(
-        observed.contains("ClaudeCode · reviewer"),
+        observed.contains("ClaudeCode"),
         "an observed ClaudeCode identity must override the Codex declaration:\n{observed}"
+    );
+    assert!(
+        observed.contains("reviewer"),
+        "the observed card must still show its role name (on its own row, PRD fork#405):\n{observed}"
     );
     assert!(
         !observed.contains("Codex"),

@@ -48,7 +48,24 @@
       ],
       "codex-devbox": [
         "codex-devbox \"$@\""
-      ]
+      ],
+      "claude-sonnet-devbox-plan": [
+        "claude-sonnet-devbox --permission-mode plan \"$@\""
+      ],
+      "agent-orchestrator": [
+        "claude --permission-mode plan \"$@\""
+      ],
+      "agent-coder": ["claude \"$@\""],
+      "agent-reviewer": ["claude --model opus \"$@\""],
+      "agent-auditor": ["claude --model opus \"$@\""],
+      "agent-tester": ["claude \"$@\""],
+      "agent-release": ["claude \"$@\""],
+      "agent-orchestrator-oc": ["opencode \"$@\""],
+      "agent-coder-oc": ["opencode \"$@\""],
+      "agent-reviewer-oc": ["opencode \"$@\""],
+      "agent-auditor-oc": ["opencode \"$@\""],
+      "agent-tester-oc": ["opencode \"$@\""],
+      "oc-release": ["opencode \"$@\""]
     }
   }
 }
