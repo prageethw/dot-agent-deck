@@ -21644,7 +21644,7 @@ fn render_session_card(
         // registry badge colour. A friendly `display_name` renders
         // ALONGSIDE the badge (`<type> · <name>`) rather than replacing it.
         let badge_style = Style::default()
-            .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+            .fg(crate::agent_registry::spec(&shown_agent_type).badge_color)
             .add_modifier(Modifier::BOLD);
         // PRD fork#378: a known active model grows the badge text to
         // `<type> (<model>)`, still one registry-coloured, bold segment.
@@ -21663,8 +21663,8 @@ fn render_session_card(
             .map(str::trim)
             .filter(|m| !m.is_empty())
         {
-            Some(model) => format!("{} ({})", session.agent_type, normalize_model_label(model)),
-            None => format!("{}", session.agent_type),
+            Some(model) => format!("{} ({})", shown_agent_type, normalize_model_label(model)),
+            None => format!("{}", shown_agent_type),
         };
         // PRD fork#405 M1: identity (name/id) moved off the title and onto
         // its own body row — see the `ROLE_NAME`-styled line pushed below.
@@ -36377,6 +36377,14 @@ mod tests {
         // restores BOTH [Submit] and the `Enter: submit` promise, so the
         // assertion above is attributable to the collision state and not to
         // the hint having been dropped wholesale.
+        //
+        // `handle_new_pane_form_key`'s `KeyCode::Char` arm only writes into
+        // `form.name` while focus is on `FormField::Name` — the seam above
+        // opens focused on `FormField::Mode`, so focus must move explicitly
+        // before these keystrokes can land anywhere.
+        if let Some(form) = ui.new_pane_form.as_mut() {
+            form.focused = FormField::Name;
+        }
         for ch in "review-2".chars() {
             handle_new_pane_form_key(
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
