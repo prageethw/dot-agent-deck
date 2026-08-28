@@ -3306,7 +3306,7 @@ mod tests {
     /// `worktree list` is where the operator reads the verdicts before running
     /// `reclaim`, so its PATH column must be as attributable as the ask surface's
     /// -- otherwise the two halves of the same decision cannot be matched up.
-    /// Also pins that escaping adds no tab, so the row stays seven fields.
+    /// Also pins that escaping adds no tab, so the row stays eight fields.
     #[cfg(unix)]
     #[test]
     fn list_human_path_column_distinguishes_invalid_byte_paths_and_stays_one_field() {
@@ -3323,7 +3323,7 @@ mod tests {
         for row in &rows {
             assert_eq!(
                 row.split('\t').count(),
-                7,
+                8,
                 "the escaped path must stay a single tab-separated field; got {row:?}"
             );
         }
@@ -4701,7 +4701,7 @@ mod tests {
             .nth(1)
             .expect("format_reclaim_human must emit a removed bullet as the second line");
         let cell = bullet
-            .strip_prefix("  - /repo/wt-normal (removed by ")
+            .strip_prefix("  - \"/repo/wt-normal\" (removed by ")
             .and_then(|s| s.strip_suffix(')'))
             .unwrap_or_else(|| {
                 panic!("removed bullet must be `<path> (removed by <remover>)`, got {bullet:?}")
