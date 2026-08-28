@@ -20,26 +20,51 @@
 use std::io::{self, Write as _};
 use std::path::Path;
 
+/// Which shell will actually parse a hook command this crate builds — the
+/// question [`build_command`]'s quoting must answer, and deliberately NOT the
+/// same question as "which OS is this binary built for".
+///
+/// Most callers' target shell tracks the build OS (a native Windows install
+/// shells hook commands through `cmd.exe`), but not all of them: an adapter
+/// whose third-party tool has no native-Windows story at all (see
+/// [`crate::devin_hooks_manage::devin_config_dir`]) always runs under a POSIX
+/// shell — WSL today — regardless of what OS this binary itself was compiled
+/// for. Baking `cfg!(windows)` into `build_command` directly conflated those
+/// two questions and silently changed that adapter's Windows-CI behavior from
+/// always-POSIX to build-OS-dependent (the sync regression this type fixes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellTarget {
+    /// POSIX single-quoting ([`crate::platform::paths::shell_quote_if_needed`]).
+    Posix,
+    /// `cmd.exe`-safe caret-escaping
+    /// ([`crate::platform::shell::escape_cmd_exe_program`] — fork issue #238).
+    CmdExe,
+}
+
 /// Build the deck's hook command for `binary_path`, robustly quoting the
 /// executable path so a path containing whitespace or shell metacharacters still
 /// produces a valid command that the agent parses to the intended argv. A "safe"
 /// path (only path-typical characters) is emitted verbatim so the common case
 /// stays human-readable and stable; anything else is quoted.
 ///
-/// These hook commands are shelled through the platform's native shell, so the
-/// quoting rule differs by platform: POSIX single-quoting on Unix
-/// ([`crate::platform::paths::shell_quote_if_needed`]), `cmd.exe`-safe
-/// caret-escaping on Windows ([`crate::platform::shell::escape_cmd_exe_program`]
-/// — fork issue #238).
+/// These hook commands are shelled through whatever shell `target` names, an
+/// EXPLICIT choice the caller makes rather than one inferred from the build
+/// OS — see [`ShellTarget`] for why that distinction is load-bearing.
 ///
 /// `suffix` is the caller's `HOOK_COMMAND_SUFFIX` — the fixed
 /// `hook --agent <agent>` signature that also identifies the resulting command
 /// as deck-owned on the way back in, so the two must stay the same string.
-pub(crate) fn build_command(binary_path: &str, suffix: &str) -> String {
-    #[cfg(unix)]
-    let quoted = crate::platform::paths::shell_quote_if_needed(binary_path);
-    #[cfg(windows)]
-    let quoted = crate::platform::shell::escape_cmd_exe_program(binary_path);
+pub(crate) fn build_command(binary_path: &str, suffix: &str, target: ShellTarget) -> String {
+    let quoted = match target {
+        ShellTarget::Posix => crate::platform::paths::shell_quote_if_needed(binary_path),
+        #[cfg(windows)]
+        ShellTarget::CmdExe => crate::platform::shell::escape_cmd_exe_program(binary_path),
+        // `escape_cmd_exe_program` only exists on Windows; every caller only
+        // ever requests `CmdExe` when itself `cfg!(windows)`, so this arm is
+        // unreachable on every other target rather than absent from it.
+        #[cfg(not(windows))]
+        ShellTarget::CmdExe => unreachable!("ShellTarget::CmdExe is only requested on Windows"),
+    };
 
     format!("{quoted} {suffix}")
 }
@@ -100,11 +125,19 @@ mod tests {
     #[test]
     fn build_command_appends_the_agent_suffix_and_quotes_only_when_needed() {
         assert_eq!(
-            build_command("/abs/dot-agent-deck", "hook --agent codex"),
+            build_command(
+                "/abs/dot-agent-deck",
+                "hook --agent codex",
+                ShellTarget::Posix
+            ),
             "/abs/dot-agent-deck hook --agent codex"
         );
         assert_eq!(
-            build_command("/with space/dot-agent-deck", "hook --agent devin"),
+            build_command(
+                "/with space/dot-agent-deck",
+                "hook --agent devin",
+                ShellTarget::Posix
+            ),
             "'/with space/dot-agent-deck' hook --agent devin"
         );
     }

@@ -172,18 +172,23 @@ pub const REARM_READINESS_BUFFER: std::time::Duration = std::time::Duration::fro
 ///
 /// # What it is for
 ///
-/// The two blind payload writes ([`MAX_PAYLOAD_SUBMISSIONS`]) are written into a
-/// pane whose agent may not exist yet. When a launcher consumes both — it reads
+/// The blind payload write(s) ([`MAX_PAYLOAD_SUBMISSIONS`]) are written into a
+/// pane whose agent may not exist yet. When a launcher consumes them — it reads
 /// the bytes itself and only then `exec`s the real agent, or the agent's own
 /// raw-mode transition flushes the tty — the delivery has spent every payload it
 /// is allowed and every remaining attempt is a submit-only probe with nothing to
-/// submit. That is issue #666's measured `alpha`: written at 23.5 s and 25.2 s,
-/// probed at 26.2/28.3/32.5/…/70.9 s, abandoned at `attempts=8`.
+/// submit. That is issue #666's measured `alpha`, upstream, where
+/// `MAX_PAYLOAD_SUBMISSIONS` was 2: written at 23.5 s and 25.2 s, probed at
+/// 26.2/28.3/32.5/…/70.9 s, abandoned at `attempts=8`. On this fork,
+/// `MAX_PAYLOAD_SUBMISSIONS` is permanently 1 (fork #194 — see
+/// `docs/develop/fork-sync-workflow.md`'s permanent-divergence row), so there is
+/// only ONE blind write, and the evidence-armed write this type adds is
+/// attempt 2, not attempt 3.
 ///
-/// A *blind* third rewrite stays refused forever — it is what produced the
-/// `seedseed` accumulation of #424/#570. What this type adds is a third write
-/// authorized by EVIDENCE: positive evidence that our bytes are NOT sitting in
-/// the agent's input box.
+/// A *blind* rewrite past [`MAX_PAYLOAD_SUBMISSIONS`] stays refused forever — it
+/// is what produced the `seedseed` accumulation of #424/#570. What this type
+/// adds is the one FURTHER write authorized by EVIDENCE: positive evidence that
+/// our bytes are NOT sitting in the agent's input box.
 ///
 /// # The six facts, all necessary
 ///
@@ -1377,21 +1382,33 @@ mod tests {
         ));
     }
 
-    /// Issue #666: the two BLIND payload attempts write for their own reasons
-    /// (the delivery itself, and the one bounded replacement), so neither may
-    /// burn the one armed write a delivery might still need.
+    /// Issue #666, on this fork's permanent `MAX_PAYLOAD_SUBMISSIONS = 1`
+    /// (fork #194 — see `docs/develop/fork-sync-workflow.md`'s
+    /// permanent-divergence row): only the delivery's own first write is
+    /// blind and owes the rearm nothing. Upstream's original design (where
+    /// `MAX_PAYLOAD_SUBMISSIONS` was 2) had a SECOND blind write — "the one
+    /// bounded replacement" — ahead of the evidence-armed write; this fork
+    /// gave that up deliberately, so attempt 2 is not a second blind write,
+    /// it IS the one evidence-armed write a delivery might still need, and it
+    /// must consume the rearm it spends.
     #[test]
-    fn the_two_blind_payload_attempts_never_consume_the_rearm() {
+    fn only_the_first_attempt_is_blind_and_the_next_spends_the_rearm() {
         let t0 = Instant::now();
         let rearm = armed_at(t0);
         let now = t0 + REARM_READINESS_BUFFER;
-        for attempt in [1, 2] {
-            assert!(attempt_writes_payload(attempt, &rearm, now));
-            assert!(
-                !attempt_spends_rearm(attempt, &rearm, now),
-                "attempt {attempt} writes its payload blindly and owes the rearm nothing"
-            );
-        }
+
+        assert!(attempt_writes_payload(1, &rearm, now));
+        assert!(
+            !attempt_spends_rearm(1, &rearm, now),
+            "attempt 1 writes its payload blindly and owes the rearm nothing"
+        );
+
+        assert!(attempt_writes_payload(2, &rearm, now));
+        assert!(
+            attempt_spends_rearm(2, &rearm, now),
+            "attempt 2 is the one armed write this delivery may still need, and must \
+             consume the rearm it spends"
+        );
     }
 
     /// Issue #666: all six arming facts are necessary — no five of them suffice.

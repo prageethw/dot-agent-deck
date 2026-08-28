@@ -370,7 +370,15 @@ pub fn install_to(config_dir: &Path, binary_path: &str) -> io::Result<()> {
     let mut root = read_config(&path)?;
     validate_structure(&root)?;
 
-    let command = crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX);
+    // Devin has no native-Windows story at all (`devin_config_dir` is
+    // `#[cfg(not(unix))] { None }`) — its hook command is always parsed by a
+    // POSIX shell (WSL today), regardless of the OS this binary was built
+    // for. Unlike Codex, this is not `cfg!(windows)`-dependent.
+    let command = crate::agent_hook_config::build_command(
+        binary_path,
+        HOOK_COMMAND_SUFFIX,
+        crate::agent_hook_config::ShellTarget::Posix,
+    );
     install_impl(&mut root, &command);
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(config_dir, &path, contents.as_bytes())

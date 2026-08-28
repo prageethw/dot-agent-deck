@@ -3240,7 +3240,19 @@ mod tests {
         agent_id: &str,
         attempt: usize,
     ) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        // Issue #666 follow-up (fork #194, MAX_PAYLOAD_SUBMISSIONS == 1): a
+        // caller waiting for attempt 3 (or 4) is waiting out a real
+        // `unconfirmed_retry_delay(2)` (or `(3)`) window first —
+        // `UNCONFIRMED_RETRY_CAP`, a fixed 15 s, NOT overridable by this
+        // test's `DOT_AGENT_DECK_TEST_UNCONFIRMED_RETRY_BASE_MS` guard (that
+        // guard only shrinks `unconfirmed_retry_delay(1)`, the very first
+        // window). An 8 s deadline here fires mid-window on every such call
+        // and fails this helper's own assertion before the attempt it is
+        // waiting for could ever land. 30 s clears one full 15 s CAP window
+        // with 2x margin — each call gets its OWN fresh deadline from
+        // wherever it is invoked, so this only ever has to outlast ONE such
+        // window, never their sum.
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
             if completed_lines(&snapshot) >= 2 * attempt.saturating_sub(1) {
@@ -3249,35 +3261,6 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for attempt {attempt} to land in full; snapshot={:?}",
-                String::from_utf8_lossy(&snapshot)
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    /// Block until `payload`'s own echo is visible on the target, i.e. until the
-    /// delivery's bytes are demonstrably out of the deck and into the PTY.
-    ///
-    /// Content-keyed for the same reason as the helpers above: the caller needs
-    /// an instant that is provably AFTER a specific write, and "the buffer grew"
-    /// only proves that if nothing else can put a byte there.
-    async fn wait_for_detached_payload_echo(
-        registry: &AgentPtyRegistry,
-        agent_id: &str,
-        payload: &str,
-    ) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
-            if snapshot
-                .windows(payload.len())
-                .any(|window| window == payload.as_bytes())
-            {
-                return snapshot;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {payload} to reach the target; snapshot={:?}",
                 String::from_utf8_lossy(&snapshot)
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3371,17 +3354,56 @@ mod tests {
                 // start may authorize a payload rather than the ordinary probe.
                 can_report_prompts: true,
                 codex_hook_trust_failed: false,
-                deadline: Instant::now() + Duration::from_secs(12),
+                // Issue #422 item 2 / fork #194: reaching attempt 3 means
+                // surviving one full `unconfirmed_retry_delay(2)` window —
+                // `UNCONFIRMED_RETRY_CAP`, a fixed, non-overridable 15 s — on
+                // top of this test's overridden 300 ms first window,
+                // ~15.3 s. `observe_fourth` cases go on to survive a SECOND
+                // such window to reach attempt 4, ~30.3 s. 45 s clears the
+                // worst case (attempt 4) with ~15 s of margin; it is not a
+                // per-case deadline, so every case pays it even though only
+                // `observe_fourth`/`replay` cases need the full budget.
+                deadline: Instant::now() + Duration::from_secs(45),
             },
         ));
 
-        // Attempt 2's payload write has reached the target. Announce the genuine
-        // post-write `SessionStart` HERE, on the payload's own echo rather than
-        // once the attempt has fully landed: the bytes are demonstrably out, so
-        // the event is post-write by construction, and sending it now keeps
-        // `REARM_READINESS_BUFFER`'s 500 ms margin against attempt 3 independent
-        // of how long the rest of this attempt's output takes to arrive.
-        wait_for_detached_payload_echo(&registry, &agent_id, PROMPT).await;
+        // Issue #666 / fork #194 (MAX_PAYLOAD_SUBMISSIONS == 1): the loop's own
+        // FIRST internal write is fixture attempt 2 — attempt 1 is the
+        // spawn-time write this fixture deliberately does not make, see
+        // `attempt_slice`'s doc. It lands after `unconfirmed_retry_delay(1)`,
+        // this test's overridden 300 ms floor, which is nowhere near
+        // `REARM_READINESS_BUFFER`'s 500 ms — so attempt 2 is UNCONDITIONALLY
+        // a bare probe: `blind_payload(2)` is false under this fork's
+        // permanent MAX=1, and no rearm write can be 500 ms old at T+300 ms
+        // even for an arming `SessionStart` sent the instant this task was
+        // spawned. There is no sequencing that makes attempt 2 the armed one.
+        //
+        // Waiting for attempt 2 to land IN FULL — instead of for the PROMPT's
+        // own echo, which cannot appear until a payload write actually
+        // carries it — is this fixture's deterministic anchor: once attempt 2
+        // has landed, `unconfirmed_retry_delay(1)`'s window and its
+        // gap-drain have both already run to completion, so the genuine
+        // post-write `SessionStart` sent from here is guaranteed to be
+        // observed somewhere inside window 2 —
+        // `unconfirmed_retry_delay(2)`, fixed at `UNCONFIRMED_RETRY_CAP`
+        // (15 s, not overridable) — with the full 15 s to spare against
+        // `REARM_READINESS_BUFFER`'s 500 ms floor before attempt 3 is
+        // written.
+        let after_attempt_two = wait_for_detached_delivery_attempt(&registry, &agent_id, 2).await;
+        let attempt_two = attempt_slice(&after_attempt_two, 2);
+        assert!(
+            !attempt_two
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "case {case}: attempt 2 must be a bare submit — MAX_PAYLOAD_SUBMISSIONS==1 \
+             (fork #194) makes `blind_payload(2)` false, and no arming SessionStart has \
+             been sent yet at this point; {:?}",
+            String::from_utf8_lossy(&attempt_two)
+        );
+
+        // Attempt 2 has landed, so the arming `SessionStart` sent here is
+        // guaranteed post-write and will be observed well inside window 2 —
+        // see the comment above.
         event_tx
             .send(BroadcastMsg::Event(typed_prompt_watch_event(
                 &pane_id,
