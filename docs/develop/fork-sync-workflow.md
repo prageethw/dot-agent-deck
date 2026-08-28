@@ -93,6 +93,12 @@ Capture `<fork-only-pre-rebase-sha>` with `git rev-parse fork-only` *before* the
 
 **A resolution is not a place to redesign.** If honouring the fork's side looks wrong — the feature is obsolete, upstream's approach is better — raise it with the maintainer and handle it as its own change. A sync PR should read as "upstream's changes, plus the fork's features intact"; anything else in it is a defect, and a rebase is the worst possible place to review a design decision.
 
+### An `allow(dead_code)` landing on a function during a rebase is a dropped caller, not a genuinely unused function
+
+**Fork PR #634.** A Stage B conflict resolution kept the fork's lossy `sanitize_path_for_terminal_display()` over upstream's injective `display_path()` fix — the wrong side of CLAUDE.md rule 24 case 1 (a genuine bug fix, not eligible for "the fork wins"). The giveaway was already sitting in the diff for anyone to see: `eb8126b7` added `#[cfg_attr(not(test), allow(dead_code))]` to `display_path` rather than anyone asking why a function upstream still calls in production suddenly had zero callers on this side. The annotation was necessary to keep `clippy` quiet, and it did its job — the rebase went green with nothing to notice.
+
+**The lesson generalizes: an `allow(dead_code)` appearing on a function during a Stage B rebase is worth a second look before accepting it.** It usually means a caller was dropped during conflict resolution, not that the function became genuinely unused — check what called it pre-rebase (`git log -p` on the function across the sync) before treating the annotation as routine cleanup.
+
 ### A fork test bundled with its implementation must survive that implementation being dropped
 
 **Fork issue #344.** A PERMANENT row below is usually one commit — test and implementation together, since most fork PRDs land as a single squashed commit. That is fine as long as the commit stays PERMANENT forever. It stops being fine the moment a future rebase decides the *implementation half* is superseded by upstream's own reimplementation (case 1/3 above, or the supersession paragraph in the immediately preceding section) — because dropping "the commit" drops the test with it, and that drop is silent: CI stays green on a smaller population, since upstream never had a test for a feature it never had either.

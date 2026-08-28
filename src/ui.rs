@@ -36359,8 +36359,14 @@ mod tests {
         // Issue #589: the FOOTER must keep the same promise the action row
         // does. Rendered from the form these keystrokes actually produced —
         // not the seam above, which opens focused on Mode where `Enter: next`
-        // is honest. Focus is on Name here, the one state where Enter reaches
-        // the refusal.
+        // is honest. Move focus to Name here, the one state where Enter
+        // reaches the refusal, *before* rendering the footer below —
+        // otherwise the assertion would pass vacuously against the
+        // Mode-focused seam's own honest `Enter: next` footer, never
+        // exercising the collision guard at all.
+        if let Some(form) = ui.new_pane_form.as_mut() {
+            form.focused = FormField::Name;
+        }
         let collided = {
             let form = ui.new_pane_form.as_ref().expect("form still open");
             buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
@@ -36376,15 +36382,11 @@ mod tests {
         // Control: one keystroke away from the collision. Typing a free name
         // restores BOTH [Submit] and the `Enter: submit` promise, so the
         // assertion above is attributable to the collision state and not to
-        // the hint having been dropped wholesale.
-        //
-        // `handle_new_pane_form_key`'s `KeyCode::Char` arm only writes into
-        // `form.name` while focus is on `FormField::Name` — the seam above
-        // opens focused on `FormField::Mode`, so focus must move explicitly
-        // before these keystrokes can land anywhere.
-        if let Some(form) = ui.new_pane_form.as_mut() {
-            form.focused = FormField::Name;
-        }
+        // the hint having been dropped wholesale. Focus is already on Name
+        // from the footer check above — `handle_new_pane_form_key`'s
+        // `KeyCode::Char` arm only writes into `form.name` while focus is on
+        // `FormField::Name`, so these keystrokes land as expected without
+        // moving focus again.
         for ch in "review-2".chars() {
             handle_new_pane_form_key(
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
