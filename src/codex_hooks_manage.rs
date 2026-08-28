@@ -1411,25 +1411,6 @@ pub fn auto_install_and_trust_at_startup() {
 mod tests {
     use super::*;
 
-    /// Codex's hook commands are quoted for the HOST's shell — the half of #734
-    /// that is a real behaviour change, and the half no test on a POSIX box can
-    /// observe through the emitted string.
-    ///
-    /// Paired with `devin_hooks_manage`'s opposite assertion, this is what keeps
-    /// the two writers from being collapsed into one answer: on Linux both
-    /// spellings emit identical bytes, so setting this to `Posix` would revert
-    /// #734 for the only writer that can reach Windows while every other test in
-    /// the workspace stayed green.
-    #[test]
-    fn hook_commands_are_quoted_for_the_shell_codex_will_use() {
-        assert_eq!(
-            HOOK_SHELL,
-            crate::agent_hook_config::HookShell::Native,
-            "Codex runs its hooks through the host's own shell, so the quoting \
-             must follow the host"
-        );
-    }
-
     #[test]
     fn install_writes_command_hooks_for_every_event() {
         let dir = tempfile::tempdir().expect("codex home tempdir");

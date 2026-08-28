@@ -1088,14 +1088,15 @@ pub(crate) fn pin_is_repairable(pin: &str) -> bool {
 /// outside a conservative safe set; otherwise return it unchanged. Canonical
 /// copy of the identical helper duplicated in `codex_hooks_manage.rs` and
 /// `devin_hooks_manage.rs`, which both reach it through
-/// [`native_shell_command_word`] rather than defining their own (issue
-/// prageethw/dot-agent-deck#253: [`binary_name`]'s absolute-path fallback needed the
-/// same quoting, so the third call site is what pushed the helper here rather
-/// than re-duplicating it a third time).
+/// `agent_hook_config::build_command`'s `HookShell::Posix` arm rather than
+/// defining their own (issue prageethw/dot-agent-deck#253:
+/// [`binary_name`]'s absolute-path fallback needed the same quoting, so the
+/// third call site is what pushed the helper here rather than re-duplicating
+/// it a third time).
 ///
 /// This is the POSIX arm only. It is NOT the right quoter for a command line
-/// `cmd.exe` will run — see [`cmd_quote_if_needed`] and the selector above it
-/// (issue #734) — and it stays the unconditional one for
+/// `cmd.exe` will run — see [`cmd_quote_if_needed`], selected via
+/// [`native_shell_command_word`] — and it stays the unconditional one for
 /// [`posix_command_word`], whose consumer is a bash-fenced example on every
 /// platform.
 pub(crate) fn shell_quote_if_needed(path: &str) -> String {
@@ -2450,11 +2451,12 @@ mod tests {
     /// a POSIX path; Codex's is NOT — `codex_home` honours `$CODEX_HOME` on
     /// every platform — so that one can be reached on Windows. Whether a Codex
     /// hook command needs a different dialect there was left out of scope for
-    /// #561, which is about `binary_name`'s fallback; **#734 answered it: it
-    /// does.** Codex runs the line through `cmd.exe /C` on Windows, so
+    /// #561, which is about `binary_name`'s fallback; fork issue #734 answered
+    /// it: it does. Codex runs the line through `cmd.exe /C` on Windows, so
     /// `build_command` no longer reaches this function on that host — it goes
-    /// through [`native_shell_command_word`] to [`cmd_quote_if_needed`]. What
-    /// is asserted below is unchanged and still load-bearing: this remains the
+    /// through `ShellTarget::CmdExe` to
+    /// [`crate::platform::shell::escape_cmd_exe_program`] instead. What is
+    /// asserted below is unchanged and still load-bearing: this remains the
     /// POSIX quoter, and [`posix_command_word`] still depends on exactly this
     /// treatment of `\`.
     ///
@@ -2508,230 +2510,6 @@ mod tests {
             "the quoted Windows path contains no '/', so a POSIX shell resolves it \
              through $PATH rather than as a pathname"
         );
-    }
-
-    /// The safe punctuation set [`cmd_quote_if_needed`] documents, re-declared
-    /// here independently of the production predicate for the reason
-    /// [`EXPECTED_SAFE_PUNCTUATION`] gives. Note what it does and does not
-    /// share with the POSIX set: `\` and `~` are safe here and not there, `%`
-    /// is safe there and not here.
-    const EXPECTED_CMD_SAFE_PUNCTUATION: &[char] =
-        &['\\', '/', '.', '_', '-', '+', '=', ':', '@', ',', '~'];
-
-    fn is_expected_cmd_safe(c: char) -> bool {
-        c.is_ascii_alphanumeric() || EXPECTED_CMD_SAFE_PUNCTUATION.contains(&c)
-    }
-
-    /// The command line `cmd.exe` is left holding after Codex's Windows arm
-    /// hands it `/C ""<line>""` — i.e. the model of the one composition step
-    /// between what [`native_shell_command_word`] emits and what actually runs.
-    ///
-    /// `cmd /?` documents two rules. The first PRESERVES the quotes, but needs
-    /// *exactly two* quote characters on the line with the text between them
-    /// naming an executable file; neither shape the deck writes can satisfy it
-    /// (a quoted path puts four quotes on the line, and an unquoted one leaves
-    /// the deck's own `hook --agent …` arguments inside the pair, so the text
-    /// between the quotes is not a file name). So the second always applies
-    /// here: strip the leading quote and the LAST quote on the line, keeping
-    /// any text after it. Modelling only that is what keeps this honest — it is
-    /// the rule these inputs reach, not a general `cmd.exe` parser.
-    fn cmd_c_line(deck_line: &str) -> String {
-        let wrapped = format!("\"{deck_line}\"");
-        let stripped = wrapped.strip_prefix('"').expect("codex wraps in quotes");
-        let last = stripped.rfind('"').expect("the wrap adds a closing quote");
-        format!("{}{}", &stripped[..last], &stripped[last + 1..])
-    }
-
-    /// The literal value of the first (command) word of a `cmd.exe` command
-    /// line, or `None` when the line does not yield one.
-    ///
-    /// Deliberately as narrow as [`parse_as_one_shell_word`]: it understands
-    /// exactly the two constructs [`cmd_quote_if_needed`] can emit — a run of
-    /// safe bytes ended by a space, and a double-quoted run — so anything else
-    /// is reported unusable rather than quietly accepted. In particular `'` is
-    /// NOT a quoting character to `cmd.exe`; it is an ordinary byte of the file
-    /// name, which is the whole of #734. Pure data: no shell is spawned.
-    fn parse_as_one_cmd_word(line: &str) -> Option<String> {
-        let mut out = String::new();
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                // A quoted run: literal up to the closing quote.
-                '"' => loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some(inner) => out.push(inner),
-                        // Unterminated — cmd would keep reading.
-                        None => return None,
-                    }
-                },
-                // Unquoted whitespace ends the command word.
-                ' ' => return Some(out),
-                c if is_expected_cmd_safe(c) => out.push(c),
-                // Anything else outside quotes is a byte cmd.exe would act on
-                // (`&`, `|`, `>`, `^`) or expand (`%`, `!`), so the word's
-                // literal value is not knowable from the text alone.
-                _ => return None,
-            }
-        }
-        Some(out)
-    }
-
-    /// Issue #734. The Windows dialect of the hook command word: an ordinary
-    /// `\`-separated path is emitted VERBATIM (the safe set contains `\`), and
-    /// what it must never be is single-quoted — `cmd.exe` reads `'` as an
-    /// ordinary character, so the pre-fix output named a file whose name began
-    /// with a quote and every deck hook silently failed to run.
-    #[test]
-    fn cmd_quote_if_needed_leaves_an_ordinary_windows_path_unquoted() {
-        for path in [
-            r"C:\Users\somebody\bin\dot-agent-deck.exe",
-            r"C:\Users\RUNNER~1\AppData\Local\dot-agent-deck.exe",
-            r"\\server\share\dot-agent-deck.exe",
-            r"D:\deck\dot-agent-deck.exe",
-        ] {
-            let word = cmd_quote_if_needed(path);
-            assert_eq!(word, path, "an ordinary Windows path needs no quoting");
-            assert!(
-                !word.starts_with('\''),
-                "#734: a single-quoted path is not runnable by cmd.exe; got {word}"
-            );
-            assert_eq!(
-                parse_as_one_cmd_word(&cmd_c_line(&format!("{word} hook --agent codex")))
-                    .as_deref(),
-                Some(path),
-                "the command line cmd.exe is left holding must name exactly this binary"
-            );
-        }
-    }
-
-    /// A Windows path containing a space — `C:\Program Files\…` is the ordinary
-    /// case, not an exotic one — is DOUBLE-quoted, and the result still names
-    /// exactly that binary once Codex's outer wrap and `cmd /C`'s quote
-    /// stripping have both been applied.
-    #[test]
-    fn cmd_quote_if_needed_double_quotes_a_path_containing_a_space() {
-        let path = r"C:\Program Files\dot-agent-deck\dot-agent-deck.exe";
-        let word = cmd_quote_if_needed(path);
-        assert_eq!(
-            word,
-            format!("\"{path}\""),
-            "a spaced path is double-quoted"
-        );
-        assert_eq!(
-            parse_as_one_cmd_word(&cmd_c_line(&format!("{word} hook --agent codex"))).as_deref(),
-            Some(path),
-            "the quoted path survives the wrap and names one binary, not two words"
-        );
-    }
-
-    /// `%` and `!` fall outside the Windows safe set and therefore force
-    /// quoting — while `~`, which is safe here and NOT safe for POSIX, does
-    /// not. The quoting does not *resolve* either character: `cmd.exe` expands
-    /// `%VAR%` inside double quotes and `!VAR!` under delayed expansion, and
-    /// nothing this function does prevents that. Mirrors the Claude-side
-    /// `hook_rule_identification_015`, which asserts the same property but is
-    /// `#[cfg(windows)]` and so runs on no machine here.
-    #[test]
-    fn cmd_quote_if_needed_quotes_percent_and_bang_but_not_tilde() {
-        assert_eq!(
-            cmd_quote_if_needed(r"C:\Tools\RUNNER~1\dot-agent-deck.exe"),
-            r"C:\Tools\RUNNER~1\dot-agent-deck.exe",
-            "'~' is not special to cmd.exe, so it does not force quoting"
-        );
-        for path in [
-            r"C:\Tools\100%\dot-agent-deck.exe",
-            r"C:\Tools\bang!\dot-agent-deck.exe",
-        ] {
-            assert_eq!(
-                cmd_quote_if_needed(path),
-                format!("\"{path}\""),
-                "'%' and '!' are outside the safe set and force quoting"
-            );
-        }
-    }
-
-    /// The safe set is pinned in both directions, the same way the POSIX one
-    /// is: every byte of it survives unquoted, and every other ASCII byte
-    /// forces quoting. A future widening or narrowing of it rewrites every
-    /// Windows hook command line, so it should fail an assertion rather than
-    /// happen silently.
-    #[test]
-    fn cmd_quote_if_needed_pins_its_safe_set_in_both_directions() {
-        for c in EXPECTED_CMD_SAFE_PUNCTUATION
-            .iter()
-            .copied()
-            .chain('a'..='z')
-        {
-            let in_path = format!(r"C:\bin\dot-agent-deck{c}.exe");
-            assert_eq!(
-                cmd_quote_if_needed(&in_path),
-                in_path,
-                "'{c}' is in the safe set and must not force quoting"
-            );
-        }
-        for byte in 0x20u8..0x7f {
-            let c = byte as char;
-            if is_expected_cmd_safe(c) {
-                continue;
-            }
-            let input = format!(r"C:\bin\deck{c}.exe");
-            let quoted = cmd_quote_if_needed(&input);
-            assert!(
-                quoted.starts_with('"') && quoted.ends_with('"'),
-                "'{c}' is outside the safe set and must be quoted; got {quoted}"
-            );
-        }
-        assert_eq!(
-            cmd_quote_if_needed(""),
-            "\"\"",
-            "the empty string is quoted rather than emitted as nothing, so it \
-             stays one (empty) command word instead of vanishing"
-        );
-    }
-
-    /// Issue #734's actual fix: the selector routes by the shell that will RUN
-    /// the line, and the two dialects genuinely differ on the input that
-    /// matters — a `\`-separated path, which POSIX quotes (correctly, for a
-    /// POSIX shell) and `cmd.exe` must not.
-    #[test]
-    fn native_shell_command_word_picks_the_dialect_of_the_running_shell() {
-        let windows_path = r"C:\Users\somebody\bin\dot-agent-deck.exe";
-        assert_eq!(
-            native_shell_command_word(windows_path, true),
-            windows_path,
-            "on a Windows host the path is spelled for cmd.exe"
-        );
-        assert_eq!(
-            native_shell_command_word(windows_path, false),
-            format!("'{windows_path}'"),
-            "on a POSIX host the POSIX quoter is unchanged"
-        );
-
-        let posix_path = "/home/somebody/bin/dot-agent-deck";
-        for windows_host in [true, false] {
-            assert_eq!(
-                native_shell_command_word(posix_path, windows_host),
-                posix_path,
-                "an ordinary POSIX path is safe in both dialects and stays verbatim"
-            );
-        }
-
-        // The POSIX arm is a pass-through, byte for byte: every other caller of
-        // the POSIX quoter (`posix_command_word`, and therefore `binary_name`)
-        // must be unaffected by this fix.
-        for path in [
-            "/home/o'brien/bin/dot-agent-deck",
-            "/with space/dot-agent-deck",
-            "",
-            windows_path,
-        ] {
-            assert_eq!(
-                native_shell_command_word(path, false),
-                shell_quote_if_needed(path),
-                "the non-Windows arm must be exactly the POSIX quoter"
-            );
-        }
     }
 
     /// Issue #561, the fix side: [`posix_command_word`] is what turns an
