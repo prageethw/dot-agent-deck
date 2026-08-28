@@ -210,7 +210,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
         with:
-          tool: cargo-nextest@0.9.140
+          tool: cargo-nextest@0.9.143
       # Issue #33: this job was failing on most runs, with a DIFFERENT random
       # subset of tests each time — including on a PR that changed only prose.
       # The failures are all the L2 harness's fixed wall-clock deadlines firing
