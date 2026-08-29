@@ -2709,6 +2709,84 @@ mod tests {
         );
     }
 
+    /// Issue #638: an interactive `codex` TUI's startup redraw is plain
+    /// text, not JSONL — `classify_codex_line`'s non-JSON fallback routes it
+    /// through the substring `CODEX` ruleset, whose only idle marker is the
+    /// literal `"type":"turn.completed"` substring that plain redraw text can
+    /// never contain. The very first startup line wedges the card at
+    /// `Working` and no amount of further plausible non-task output (more
+    /// redraw frames, prompts, prose) can ever release it back to `Idle` —
+    /// reproducing the permanently-stuck-at-Thinking symptom reported before
+    /// any task is ever delegated to the pane.
+    #[test]
+    fn interactive_codex_startup_lines_wedge_at_working_forever() {
+        let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
+
+        // Plausible interactive-TUI startup redraw lines: plain prose /
+        // box-drawing text, never single-line JSON, and none containing an
+        // idle or error marker.
+        let startup_lines = [
+            "╭─────────────────────────────────────────╮",
+            "│ >_ OpenAI Codex (research preview)        │",
+            "╰─────────────────────────────────────────╯",
+            "Connecting to model...",
+        ];
+
+        let mut saw_working = false;
+        for line in startup_lines {
+            if let Some(ev) = d.observe_detected(classify_codex_line(line)) {
+                assert_eq!(
+                    ev,
+                    DetectedEvent::Working,
+                    "non-JSON startup line {line:?} classified as {ev:?}, expected Working"
+                );
+                saw_working = true;
+            }
+        }
+        assert!(
+            saw_working,
+            "expected at least one Working transition from startup output"
+        );
+
+        // No further plausible non-task output ever resolves the wedge back
+        // to Idle: none of it is JSON, and the CODEX ruleset's only idle
+        // marker is a JSON-shaped substring interactive text never contains.
+        let more_plausible_output = [
+            "Ready.",
+            "Type your message and press Enter to send.",
+            "Waiting for input...",
+            "",
+            "  ",
+        ];
+        for line in more_plausible_output {
+            let ev = d.observe_detected(classify_codex_line(line));
+            assert_ne!(
+                ev,
+                Some(DetectedEvent::Idle),
+                "line {line:?} incorrectly resolved the wedge back to Idle"
+            );
+        }
+    }
+
+    /// Control (reproduce-first): the JSONL path the `CODEX` ruleset was
+    /// actually built for still classifies correctly — `codex exec --json`'s
+    /// `turn.started` record is `Working` and `turn.completed` resolves to
+    /// `Idle`. This isolates the wedge above to "non-JSON interactive lines
+    /// shouldn't drive this state machine", without implicating the JSONL
+    /// path a fix must not break.
+    #[test]
+    fn codex_jsonl_turn_lifecycle_still_classifies_correctly() {
+        let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
+        assert_eq!(
+            d.observe_detected(classify_codex_line(r#"{"type":"turn.started"}"#)),
+            Some(DetectedEvent::Working)
+        );
+        assert_eq!(
+            d.observe_detected(classify_codex_line(r#"{"type":"turn.completed"}"#)),
+            Some(DetectedEvent::Idle)
+        );
+    }
+
     /// `tee` passes bytes through verbatim (including a trailing newline-less
     /// prompt) and classifies each completed line plus a trailing partial line.
     #[test]
