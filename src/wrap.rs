@@ -103,8 +103,21 @@ pub struct RuleSet {
     /// Case-insensitive substrings that mark a line as an error/failure.
     /// Checked first, so an error line is never misread as generic activity.
     pub error_markers: &'static [&'static str],
+    /// Case-insensitive substrings that mark a *segment* as unambiguously
+    /// mid-activity, checked after `error_markers` but **before**
+    /// `idle_markers` (issue #638 round 3). A classification unit here is not
+    /// necessarily one visual line — `tee` flushes on `\n`/`\r`/the 64 KiB cap,
+    /// and a full-screen TUI repaint batch (cursor-addressed, not
+    /// newline-delimited) can land as one segment carrying both an
+    /// active-turn signal and an idle marker together. Without this
+    /// precedence, `idle_markers`' plain `contains()` would win on such a
+    /// segment and falsely report the agent idle mid-turn. Empty for the
+    /// generic set (no agent-specific active-turn hint to key off); a
+    /// per-agent set may populate it.
+    pub active_markers: &'static [&'static str],
     /// Case-insensitive substrings that mark a line as an explicit
-    /// idle/completion signal. Empty for the generic set (which relies on
+    /// idle/completion signal. Only consulted when no `active_markers` entry
+    /// matches the same segment. Empty for the generic set (which relies on
     /// process-exit quiescence instead); a per-agent set may populate it.
     pub idle_markers: &'static [&'static str],
 }
@@ -116,6 +129,7 @@ pub struct RuleSet {
 /// quiescence rather than guessed from a single line.
 pub static GENERIC: RuleSet = RuleSet {
     error_markers: &["error", "panic", "traceback", "exception", "fatal"],
+    active_markers: &[],
     idle_markers: &[],
 };
 
@@ -137,34 +151,70 @@ pub static GENERIC: RuleSet = RuleSet {
 /// above — and plain text can never contain the JSON-shaped idle marker.
 /// Without a real idle signal in the fallback, the card enters `Working` on
 /// the first redraw line and can never leave it, wedging at "Thinking"
-/// forever even once the session has gone quiet. The extra markers below give
-/// the fallback its own route back to `Idle`: the composer's own idle
-/// placeholder text, distinct enough from ordinary reasoning/command output
-/// that it doesn't fire mid-turn.
+/// forever even once the session has gone quiet. `idle_markers` gives the
+/// fallback its own route back to `Idle`: the composer's own idle placeholder
+/// text.
 ///
 /// Round 2 correction (issue #638): round 1 shipped `"waiting for input"` and
 /// `"press enter to send"`, guessed rather than confirmed against the real
 /// binary — `strings` on the installed `codex-cli` native binary shows
 /// neither exists anywhere in it, so they never matched real interactive
 /// output and the wedge they were meant to fix was still live. Replaced with
-/// `"ask codex to do anything"` and `"ask a follow-up question"`, the actual
-/// composer placeholders recovered via `strings` from `codex-cli 0.150.1`.
-/// The old pair is dropped rather than kept alongside the verified ones:
-/// besides doing nothing today, a phrase like "waiting for input" is
-/// plausible generic reasoning/log text an agent could legitimately emit
-/// mid-turn (e.g. narrating that a command is itself waiting for input),
-/// which would flip the card to `Idle` while real work is still in flight —
-/// dead weight with a latent false-idle risk, not a harmless extra.
+/// `"ask codex to do anything"`, the composer's before-first-turn placeholder
+/// recovered via `strings` from `codex-cli 0.150.1`.
+///
+/// Round 3 correction (issue #638): round 2 also shipped `"ask a follow-up
+/// question"` and gave `idle_markers` no precedence against co-resident
+/// active-turn evidence. Both were wrong, independently:
+///
+/// - **`"ask a follow-up question"` is dropped.** A live capture against the
+///   real `codex-cli 0.150.1` TUI (`tmux` + `pipe-pane`, raw bytes, two full
+///   turns) never once rendered it — the composer read `"Ask Codex to do
+///   anything"` both before the first turn *and* after a turn completed. It
+///   is present in the binary's string table but unreachable in practice, the
+///   same category round 1's dropped pair was in — dead weight with a latent
+///   false-idle risk (it also reads as ordinary agent narration, "I'll ask a
+///   follow-up question about…"), not a harmless extra.
+/// - **The composer placeholder is not an at-rest signal — it is rendered on
+///   every frame the input buffer is empty, including throughout an active
+///   turn** (the buffer clears on submit). The same live capture measured a
+///   single `tee` classification segment (`tee` flushes on `\n`/`\r`/the
+///   64 KiB cap; a ratatui repaint batch is cursor-addressed, not
+///   newline-delimited, so one segment commonly spans an entire frame) that
+///   was 65,455 bytes and contained *both* the active-turn spinner
+///   (`"Working (0s • esc to interrupt)"`) and the idle composer placeholder
+///   together. `classify_line_with` used to have no precedence for that case
+///   — `idle_markers`' plain `contains()` won, so the card read `Idle` while
+///   Codex was actively mid-turn: a fail-open regression strictly worse than
+///   the original fail-safe wedge this fix set out to close. `active_markers`
+///   fixes this: `"esc to interrupt"` — Codex's own UI hint for interrupting
+///   a running task, rendered as part of the same spinner line as the
+///   `Working (Ns • …)` status throughout a turn's entire duration, and
+///   present in *every* co-resident segment the live capture produced —
+///   is checked in [`classify_line_with`] before `idle_markers`, so a segment
+///   carrying both classifies `Working`, not `Idle`. It does not appear in
+///   the binary's static string table (`strings` on `codex-cli` returns zero
+///   hits — the composer's individual `Span`s are separate string constants,
+///   joined only at render time) even though it renders reliably; the live
+///   capture is the only way to confirm it, which is why this correction
+///   leans on one rather than `strings` alone.
+///
+/// Accepted risk (not new, see issue #638 round-3 audit finding F5): the
+/// wrapped process already fully controls its own status signal (same-uid,
+/// no privilege boundary crossed — pane status is advisory display only, it
+/// gates no permission or credential decision). Using plain English prose as
+/// markers rather than a JSON discriminator widens the *accidental* trigger
+/// surface, not a new risk class: a Codex pane that runs `git grep`/`cat` on
+/// this very source file, or renders this issue's own PR diff, would see its
+/// own marker strings in its output and could misclassify. Documented here
+/// as a known, accepted tradeoff rather than left implicit.
 ///
 /// Selected by [`ruleset_for`] when the resolved agent is [`AgentType::Codex`];
-/// no change to [`classify_line_with`] or the runtime.
+/// no change to the wrapper runtime.
 pub static CODEX: RuleSet = RuleSet {
     error_markers: &["\"type\":\"error\""],
-    idle_markers: &[
-        "\"type\":\"turn.completed\"",
-        "ask codex to do anything",
-        "ask a follow-up question",
-    ],
+    active_markers: &["esc to interrupt"],
+    idle_markers: &["\"type\":\"turn.completed\"", "ask codex to do anything"],
 };
 
 /// Select the line-classification [`RuleSet`] for a resolved agent type. Codex
@@ -191,7 +241,24 @@ pub fn classify_line(line: &str) -> Option<DetectedEvent> {
 /// Classify a single line against an explicit [`RuleSet`]. [`classify_line`]
 /// is the generic-ruleset shorthand; M7's Codex path calls this directly with
 /// its own rules. Matching is case-insensitive substring containment.
+///
+/// Precedence (issue #638 round 3): `error_markers` > `active_markers` >
+/// `idle_markers` > the generic non-blank fallback. `active_markers` is
+/// checked, and wins outright, before `idle_markers` is ever consulted — a
+/// segment carrying both an active-turn signal and an idle marker together
+/// (a real possibility: the classification unit is a `tee`-flushed segment,
+/// not necessarily one visual line) must resolve `Working`, not `Idle`. See
+/// [`CODEX`]'s doc comment for the real-world case this precedence exists
+/// for.
 pub fn classify_line_with(line: &str, rules: &RuleSet) -> Option<DetectedEvent> {
+    debug_assert!(
+        markers_are_lowercase_ascii(rules.error_markers)
+            && markers_are_lowercase_ascii(rules.active_markers)
+            && markers_are_lowercase_ascii(rules.idle_markers),
+        "RuleSet markers must be pre-lowercased ASCII: matching lowercases the \
+         input with to_ascii_lowercase() and does a plain contains(), so an \
+         accidentally-uppercase marker silently never matches"
+    );
     let trimmed = line.trim();
     if trimmed.is_empty() {
         // Blank line: pure whitespace / spacing. No state change.
@@ -201,11 +268,23 @@ pub fn classify_line_with(line: &str, rules: &RuleSet) -> Option<DetectedEvent> 
     if rules.error_markers.iter().any(|m| lower.contains(m)) {
         return Some(DetectedEvent::Error);
     }
+    if rules.active_markers.iter().any(|m| lower.contains(m)) {
+        return Some(DetectedEvent::Working);
+    }
     if rules.idle_markers.iter().any(|m| lower.contains(m)) {
         return Some(DetectedEvent::Idle);
     }
     // Any other non-blank output is substantive activity.
     Some(DetectedEvent::Working)
+}
+
+/// `debug_assert!` helper for [`classify_line_with`]: every marker must
+/// already be lowercase ASCII, since matching lowercases the input and does a
+/// plain `contains()` — an uppercase marker would silently never match.
+fn markers_are_lowercase_ascii(markers: &[&str]) -> bool {
+    markers
+        .iter()
+        .all(|m| m.is_ascii() && m.chars().all(|c| !c.is_ascii_uppercase()))
 }
 
 /// Line-classification state machine that debounces a stream of classifications
@@ -267,6 +346,11 @@ impl Detector {
 /// activity instead of staying stuck until process exit — and (issue #638)
 /// can also resolve back to `Idle` from [`CODEX`]'s verified composer-idle
 /// markers, since plain redraw text can never contain the JSON idle marker.
+/// That fallback goes through [`classify_line_with`], whose
+/// error > active-override > idle > generic-fallback precedence (issue #638
+/// round 3) keeps a segment that carries both an active-turn signal and an
+/// idle marker — a real case for a whole repaint batch, not just a
+/// hypothetical one — classified `Working`, not `Idle`.
 pub fn classify_codex_line(line: &str) -> Option<DetectedEvent> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -2698,6 +2782,7 @@ mod tests {
     fn explicit_ruleset_detects_idle_marker() {
         static CUSTOM: RuleSet = RuleSet {
             error_markers: &["boom"],
+            active_markers: &[],
             idle_markers: &["done", "waiting for input"],
         };
         assert_eq!(
