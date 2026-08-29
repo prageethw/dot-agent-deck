@@ -2075,7 +2075,7 @@ struct PromptDelivery {
 /// PROMPTLY once the target transitions, rather than languishing behind a
 /// minutes-long exponential delay. The cap is the "wait for a matching target
 /// transition" bound from the finding: it keeps the catch-up latency small.
-fn send_retry_delay(attempts: u32) -> std::time::Duration {
+pub fn send_retry_delay(attempts: u32) -> std::time::Duration {
     const BASE_MS: u64 = 500;
     const CAP: std::time::Duration = std::time::Duration::from_secs(2);
     let shift = attempts.saturating_sub(1).min(6);
@@ -4418,7 +4418,7 @@ fn schedule_unconfirmed_retry(
 ///   partial write — a retry could duplicate the input).
 /// * RETRYABLE: `HistoryOnly` / `Stale` / `NoLiveTarget` (the target may become
 ///   live / re-settle). `Applied` / `Queued` never reach this helper.
-fn is_terminal_send_result(result: SendResult) -> bool {
+pub fn is_terminal_send_result(result: SendResult) -> bool {
     matches!(
         result,
         SendResult::WrongSession | SendResult::Unknown | SendResult::Ambiguous
@@ -4879,7 +4879,7 @@ fn wrap_agent_command(command: &str, declared: Option<AgentType>) -> String {
 /// PRD #20 blocker-5: a short human-readable reason a [`SendResult`] was not
 /// delivered, for the status-bar feedback shown when a seed / orchestrator
 /// prompt could not reach a live target.
-fn describe_send_result(result: SendResult) -> &'static str {
+pub fn describe_send_result(result: SendResult) -> &'static str {
     match result {
         SendResult::Applied => "applied",
         SendResult::Queued => "queued",

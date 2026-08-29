@@ -18,7 +18,9 @@
     "jq@1.8.2",
     "curl@8.17.0",
     "ripgrep@15.2.0",
-    "python314Packages.pyte@0.8.2"
+    "python314Packages.pyte@0.8.2",
+    "nodejs@24.12.0",
+    "pnpm_10@10.34.5"
   ],
   "shell": {
     "init_hook": [
