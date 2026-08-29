@@ -2580,10 +2580,14 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     // Pure-data pattern-detection tests — plain `#[test]` unit tests (no
     // `#[spec]` / CATALOG reproducer needed: these assert a pure function, not
-    // runtime TUI behaviour).
+    // runtime TUI behaviour). Exception: `codex/wrap/007` and `/008` below
+    // are still pure-data tests but carry `#[spec]` anyway, since they pin a
+    // reported bug (issue #638) and CLAUDE.md rule 3/R3 requires a pinning
+    // test for a bug fix.
 
     /// The forked reaper's fallback close loop counts to a real limit, but a
     /// bounded one: never below the old fixed 1024 (so it can only improve on
@@ -2742,6 +2746,13 @@ mod tests {
         );
     }
 
+    /// Scenario: an interactive `codex` TUI's plain-text startup and idle
+    /// redraw lines never drive the card back to `Idle`, because
+    /// `classify_codex_line`'s non-JSON fallback only recognizes the literal
+    /// `"type":"turn.completed"` substring that plain redraw text can never
+    /// contain — so the card wedges at Working/Thinking forever, even before
+    /// any task is ever delegated to the pane (issue #638).
+    ///
     /// Issue #638: an interactive `codex` TUI's startup redraw is plain
     /// text, not JSONL — `classify_codex_line`'s non-JSON fallback routes it
     /// through the substring `CODEX` ruleset, whose only idle marker is the
@@ -2759,8 +2770,9 @@ mod tests {
     /// before any task) and `"Ask a follow-up question"` (idle after a turn),
     /// each rendered inside an incidental box-drawing frame the way the real
     /// TUI redraws its composer.
+    #[spec("codex/wrap/007")]
     #[test]
-    fn interactive_codex_startup_lines_wedge_at_working_forever() {
+    fn wrap_007_interactive_codex_startup_lines_wedge_at_working_forever() {
         let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
 
         // Plausible interactive-TUI startup redraw lines: plain prose /
@@ -2812,14 +2824,21 @@ mod tests {
         );
     }
 
+    /// Scenario: the JSONL path the `CODEX` ruleset was actually built for
+    /// still classifies correctly — `codex exec --json`'s `turn.started`
+    /// record is `Working` and `turn.completed` resolves to `Idle` — so the
+    /// wedge pinned by `codex/wrap/007` is isolated to non-JSON interactive
+    /// lines and a fix must not break this path (issue #638).
+    ///
     /// Control (reproduce-first): the JSONL path the `CODEX` ruleset was
     /// actually built for still classifies correctly — `codex exec --json`'s
     /// `turn.started` record is `Working` and `turn.completed` resolves to
     /// `Idle`. This isolates the wedge above to "non-JSON interactive lines
     /// shouldn't drive this state machine", without implicating the JSONL
     /// path a fix must not break.
+    #[spec("codex/wrap/008")]
     #[test]
-    fn codex_jsonl_turn_lifecycle_still_classifies_correctly() {
+    fn wrap_008_codex_jsonl_turn_lifecycle_still_classifies_correctly() {
         let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
         assert_eq!(
             d.observe_detected(classify_codex_line(r#"{"type":"turn.started"}"#)),

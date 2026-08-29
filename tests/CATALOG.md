@@ -5575,6 +5575,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** what the delegate gate then does with the signal (`orchestration/delegate/029`); the fork-time event's own card-surfacing role (`orchestration/delegate/007`); real codex-cli boot output (`codex/live/001`).
 - **Platform coverage:** mac+linux (unix-only — `openpty` and a POSIX shell stand-in).
 
+##### codex/wrap/007 — An interactive Codex TUI's plain-text startup and idle redraw lines wedge the card at Working/Thinking forever, since the non-JSON fallback can never see its only idle marker (issue #638).
+- **Layer:** L1 (pure in-process pattern-detection unit test, `src/wrap.rs`'s `#[cfg(test)] mod tests`; no subprocess, no PTY, no daemon).
+- **Agent:** none — synthetic Codex-shaped text lines fed directly to `classify_codex_line`/`Detector`, no wrapped process.
+- **Asserts:** a plausible interactive-TUI startup redraw (box-drawing banner, "Connecting to model...") drives the card to `Working`, then the verified real Codex composer placeholder text ("Ask Codex to do anything", "Ask a follow-up question" — recovered via `strings` from the actual `codex-cli 0.150.1` native binary) fails to resolve the card back to `Idle`, because `classify_codex_line`'s non-JSON fallback (the `CODEX` ruleset) only recognizes the literal `"type":"turn.completed"` substring, which none of this plain text can ever contain.
+- **Does not assert:** the JSONL path the `CODEX` ruleset was built for, which still classifies correctly (`codex/wrap/008`); real Codex CLI execution or PTY/daemon delivery (`codex/wrap/001`).
+- **Platform coverage:** mac+linux (pure function, no OS dependency).
+
+##### codex/wrap/008 — The JSONL turn-lifecycle path the `CODEX` ruleset was built for still classifies `turn.started`/`turn.completed` correctly (issue #638 control).
+- **Layer:** L1 (pure in-process pattern-detection unit test, `src/wrap.rs`'s `#[cfg(test)] mod tests`; no subprocess, no PTY, no daemon).
+- **Agent:** none — synthetic `codex exec --json`-shaped JSONL records fed directly to `classify_codex_line`/`Detector`, no wrapped process.
+- **Asserts:** `{"type":"turn.started"}` classifies as `Working` and `{"type":"turn.completed"}` classifies as `Idle`, isolating the wedge pinned by `codex/wrap/007` to non-JSON interactive lines rather than a regression in the JSONL path a fix must not break.
+- **Does not assert:** the non-JSON interactive-line wedge itself (`codex/wrap/007`); real Codex CLI execution or PTY/daemon delivery (`codex/wrap/001`).
+- **Platform coverage:** mac+linux (pure function, no OS dependency).
+
 #### codex/trust
 
 ##### codex/trust/001 — No Codex launch form receives an invocation-global hook-trust bypass (PRD #20 Greptile P1 close-by-deletion).
