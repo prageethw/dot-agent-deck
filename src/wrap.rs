@@ -138,9 +138,23 @@ pub static GENERIC: RuleSet = RuleSet {
 /// Without a real idle signal in the fallback, the card enters `Working` on
 /// the first redraw line and can never leave it, wedging at "Thinking"
 /// forever even once the session has gone quiet. The extra markers below give
-/// the fallback its own route back to `Idle`: phrases an interactive prompt
-/// uses to say it is waiting on the user, distinct enough from ordinary
-/// reasoning/command output that they don't fire mid-turn.
+/// the fallback its own route back to `Idle`: the composer's own idle
+/// placeholder text, distinct enough from ordinary reasoning/command output
+/// that it doesn't fire mid-turn.
+///
+/// Round 2 correction (issue #638): round 1 shipped `"waiting for input"` and
+/// `"press enter to send"`, guessed rather than confirmed against the real
+/// binary — `strings` on the installed `codex-cli` native binary shows
+/// neither exists anywhere in it, so they never matched real interactive
+/// output and the wedge they were meant to fix was still live. Replaced with
+/// `"ask codex to do anything"` and `"ask a follow-up question"`, the actual
+/// composer placeholders recovered via `strings` from `codex-cli 0.150.1`.
+/// The old pair is dropped rather than kept alongside the verified ones:
+/// besides doing nothing today, a phrase like "waiting for input" is
+/// plausible generic reasoning/log text an agent could legitimately emit
+/// mid-turn (e.g. narrating that a command is itself waiting for input),
+/// which would flip the card to `Idle` while real work is still in flight —
+/// dead weight with a latent false-idle risk, not a harmless extra.
 ///
 /// Selected by [`ruleset_for`] when the resolved agent is [`AgentType::Codex`];
 /// no change to [`classify_line_with`] or the runtime.
@@ -148,8 +162,8 @@ pub static CODEX: RuleSet = RuleSet {
     error_markers: &["\"type\":\"error\""],
     idle_markers: &[
         "\"type\":\"turn.completed\"",
-        "waiting for input",
-        "press enter to send",
+        "ask codex to do anything",
+        "ask a follow-up question",
     ],
 };
 
@@ -251,7 +265,7 @@ impl Detector {
 /// …) → `Working`. A non-JSON line (the interactive channel's plain text)
 /// falls back to the substring [`CODEX`] rules, so bare `codex` still surfaces
 /// activity instead of staying stuck until process exit — and (issue #638)
-/// can also resolve back to `Idle` from [`CODEX`]'s "waiting for input" style
+/// can also resolve back to `Idle` from [`CODEX`]'s verified composer-idle
 /// markers, since plain redraw text can never contain the JSON idle marker.
 pub fn classify_codex_line(line: &str) -> Option<DetectedEvent> {
     let trimmed = line.trim();
