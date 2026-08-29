@@ -2584,9 +2584,9 @@ mod tests {
 
     // Pure-data pattern-detection tests — plain `#[test]` unit tests (no
     // `#[spec]` / CATALOG reproducer needed: these assert a pure function, not
-    // runtime TUI behaviour). Exception: `codex/wrap/007` and `/008` below
-    // are still pure-data tests but carry `#[spec]` anyway, since they pin a
-    // reported bug (issue #638) and CLAUDE.md rule 3/R3 requires a pinning
+    // runtime TUI behaviour). Exception: `codex/wrap/007`, `/008` and `/009`
+    // below are still pure-data tests but carry `#[spec]` anyway, since they
+    // pin a reported bug (issue #638) and CLAUDE.md rule 4 requires a pinning
     // test for a bug fix.
 
     /// The forked reaper's fallback close loop counts to a real limit, but a
@@ -2746,33 +2746,28 @@ mod tests {
         );
     }
 
-    /// Scenario: an interactive `codex` TUI's plain-text startup and idle
-    /// redraw lines never drive the card back to `Idle`, because
-    /// `classify_codex_line`'s non-JSON fallback only recognizes the literal
-    /// `"type":"turn.completed"` substring that plain redraw text can never
-    /// contain — so the card wedges at Working/Thinking forever, even before
-    /// any task is ever delegated to the pane (issue #638).
+    /// Scenario: an interactive `codex` TUI's plain-text idle redraw line —
+    /// the composer's own verified placeholder — drives the card back to
+    /// `Idle`, resolving the wedge where `classify_codex_line`'s non-JSON
+    /// fallback used to only recognize the literal `"type":"turn.completed"`
+    /// substring that plain redraw text can never contain (issue #638).
     ///
     /// Issue #638: an interactive `codex` TUI's startup redraw is plain
     /// text, not JSONL — `classify_codex_line`'s non-JSON fallback routes it
-    /// through the substring `CODEX` ruleset, whose only idle marker is the
-    /// literal `"type":"turn.completed"` substring that plain redraw text can
-    /// never contain. The very first startup line correctly drives the card
-    /// to `Working`, but once the interactive session has gone quiet again
-    /// (redrawn its normal prompt, no further real task/error output), the
-    /// card should eventually be able to settle back to `Idle` — it never
-    /// can, because nothing in plain interactive output can ever contain
-    /// that JSON-shaped substring. This reproduces the permanently-stuck-at-
-    /// Thinking symptom reported before any task is ever delegated to the
-    /// pane. Post-turn lines are the **verified real composer placeholder
-    /// text** recovered via `strings` from the actual `codex-cli 0.150.1`
-    /// native binary (not a guess) — `"Ask Codex to do anything"` (idle
-    /// before any task) and `"Ask a follow-up question"` (idle after a turn),
-    /// each rendered inside an incidental box-drawing frame the way the real
-    /// TUI redraws its composer.
+    /// through the substring `CODEX` ruleset. The very first startup line
+    /// correctly drives the card to `Working`; once the interactive session
+    /// has gone quiet again (redrawn its composer, no further real
+    /// task/error output), the card must be able to settle back to `Idle`.
+    /// This pins the fix for the permanently-stuck-at-Thinking symptom
+    /// reported before any task is ever delegated to the pane. The idle
+    /// line is the **verified real composer placeholder text** recovered
+    /// via `strings` from the actual `codex-cli 0.150.1` native binary (not
+    /// a guess) — `"Ask Codex to do anything"` — rendered inside an
+    /// incidental box-drawing frame the way the real TUI redraws its
+    /// composer.
     #[spec("codex/wrap/007")]
     #[test]
-    fn wrap_007_interactive_codex_startup_lines_wedge_at_working_forever() {
+    fn wrap_007_interactive_codex_idle_lines_recover_to_idle() {
         let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
 
         // Plausible interactive-TUI startup redraw lines: plain prose /
@@ -2799,43 +2794,43 @@ mod tests {
         // The session goes quiet again: verified real Codex composer
         // placeholder text (recovered via `strings` on the actual
         // codex-cli 0.150.1 native binary — not invented), still plain
-        // text, still no idle/error marker. A healthy card should be able
-        // to resolve back to Idle at some point here — it never does,
-        // because the CODEX ruleset's only idle marker is a literal JSON
-        // substring that none of this text can ever contain.
-        let post_turn_lines = [
-            "│ Ask Codex to do anything                  │",
-            "│ Ask a follow-up question                  │",
-        ];
-        let mut resolved_idle = false;
-        for line in post_turn_lines {
-            if d.observe_detected(classify_codex_line(line)) == Some(DetectedEvent::Idle) {
-                resolved_idle = true;
-            }
-        }
-
-        assert!(
-            resolved_idle,
-            "issue #638: interactive codex output never contains the \
-             literal `\"type\":\"turn.completed\"` substring, so \
-             classify_codex_line's non-JSON fallback (the CODEX ruleset) can \
-             never resolve the card back to Idle — it stays wedged at \
-             Working/Thinking forever, even once the session has gone quiet"
+        // text, still no idle/error marker. Asserted directly against
+        // `classify_codex_line` rather than through the `d` `Detector`
+        // above: `Detector` debounces and only reports a *change*, so
+        // routing this through it would hide a wrong-but-different
+        // classification, and routing more than one line through it would
+        // silently leave every line but the first untested (`observe`
+        // returns `None` once the state stops changing). The direct
+        // assertion pins the exact classification of this one line.
+        assert_eq!(
+            classify_codex_line("│ Ask Codex to do anything                  │"),
+            Some(DetectedEvent::Idle),
+            "issue #638: the verified real Codex composer placeholder text \
+             must resolve the card back to Idle, not stay wedged at \
+             Working/Thinking forever"
         );
     }
 
     /// Scenario: the JSONL path the `CODEX` ruleset was actually built for
     /// still classifies correctly — `codex exec --json`'s `turn.started`
     /// record is `Working` and `turn.completed` resolves to `Idle` — so the
-    /// wedge pinned by `codex/wrap/007` is isolated to non-JSON interactive
-    /// lines and a fix must not break this path (issue #638).
+    /// recovery pinned by `codex/wrap/007` is isolated to non-JSON
+    /// interactive lines and a fix must not break this path. Also proves a
+    /// JSON record whose payload TEXT (not its `type` field) contains a
+    /// marker phrase still classifies via the `type` discriminator, not the
+    /// substring markers (issue #638).
     ///
     /// Control (reproduce-first): the JSONL path the `CODEX` ruleset was
     /// actually built for still classifies correctly — `codex exec --json`'s
     /// `turn.started` record is `Working` and `turn.completed` resolves to
-    /// `Idle`. This isolates the wedge above to "non-JSON interactive lines
-    /// shouldn't drive this state machine", without implicating the JSONL
-    /// path a fix must not break.
+    /// `Idle`. This isolates the recovery above to "non-JSON interactive
+    /// lines drive this state machine through the substring markers",
+    /// without implicating the JSONL path a fix must not break. A third case
+    /// adds a JSON record whose `type` is not a completion signal but whose
+    /// payload TEXT contains an idle marker phrase — it must still resolve
+    /// via the `type` discriminator (`Working`), proving `classify_codex_line`'s
+    /// `serde_json` early-return shields `idle_markers` from payload text,
+    /// not just from the top-level `type` field.
     #[spec("codex/wrap/008")]
     #[test]
     fn wrap_008_codex_jsonl_turn_lifecycle_still_classifies_correctly() {
@@ -2847,6 +2842,59 @@ mod tests {
         assert_eq!(
             d.observe_detected(classify_codex_line(r#"{"type":"turn.completed"}"#)),
             Some(DetectedEvent::Idle)
+        );
+
+        // A JSON record whose `type` is not a completion signal, but whose
+        // payload TEXT happens to contain an idle marker phrase, must still
+        // classify via the `type` discriminator — the marker phrase never
+        // reaches `idle_markers` at all.
+        assert_eq!(
+            classify_codex_line(
+                r#"{"type":"item.completed","item":{"text":"go ahead and ask codex to do anything else"}}"#
+            ),
+            Some(DetectedEvent::Working)
+        );
+    }
+
+    /// Scenario: a single repaint batch carrying BOTH the active-turn
+    /// spinner and the idle composer placeholder must classify as `Working`,
+    /// not `Idle` — Codex is still actively running the turn (issue #638
+    /// round 3).
+    ///
+    /// Round 3 (issue #638): live capture against the real `codex-cli
+    /// 0.150.1` TUI proved the composer placeholder `"Ask Codex to do
+    /// anything"` is on screen for the ENTIRE duration of an active turn (it
+    /// tracks an empty input box, not turn completion), and `tee`'s
+    /// classification unit is a whole repaint batch (split on `\n`/`\r`/the
+    /// 64 KiB cap), not a visual line — ratatui repaints via cursor
+    /// positioning, not newlines. A real 65,455-byte segment from one active
+    /// turn was measured containing BOTH `"Working (0s • esc to interrupt)"`
+    /// (the active-turn spinner) and `"Ask Codex to do anything"` (the
+    /// composer placeholder) together. `classify_line_with` does a plain
+    /// first-match `contains()` scan over `idle_markers` with no precedence
+    /// against active-turn evidence co-resident in the same segment, so this
+    /// segment resolves `Idle` today — a fail-open regression that falsely
+    /// reports the pane idle/available while Codex is actively working,
+    /// which is worse than the original fail-safe wedge (`codex/wrap/007`)
+    /// this fix set out to close. This test joins the two verified real
+    /// phrases the way one `tee` segment actually joins them in practice —
+    /// via a cursor-position escape sequence, not `\n`/`\r`, since those are
+    /// rare in a ratatui repaint stream.
+    #[spec("codex/wrap/009")]
+    #[test]
+    fn wrap_009_mixed_active_and_idle_segment_stays_working() {
+        // One realistic `tee` classification segment: the verified real
+        // active-turn spinner text and the verified real idle composer
+        // placeholder, joined by an ANSI cursor-position escape the way a
+        // real ratatui repaint batch joins rows — not by `\n`/`\r`.
+        let segment = "Working (17s \u{2022} esc to interrupt)\x1b[14;1HAsk Codex to do anything";
+        assert_eq!(
+            classify_codex_line(segment),
+            Some(DetectedEvent::Working),
+            "issue #638 round 3: a segment carrying both the active-turn \
+             spinner and the idle composer placeholder must classify as \
+             Working — an active-turn signal co-resident in the same \
+             segment must override an idle marker, not lose to it"
         );
     }
 
