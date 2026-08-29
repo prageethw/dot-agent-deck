@@ -2739,7 +2739,12 @@ mod tests {
     /// can, because nothing in plain interactive output can ever contain
     /// that JSON-shaped substring. This reproduces the permanently-stuck-at-
     /// Thinking symptom reported before any task is ever delegated to the
-    /// pane.
+    /// pane. Post-turn lines are the **verified real composer placeholder
+    /// text** recovered via `strings` from the actual `codex-cli 0.150.1`
+    /// native binary (not a guess) — `"Ask Codex to do anything"` (idle
+    /// before any task) and `"Ask a follow-up question"` (idle after a turn),
+    /// each rendered inside an incidental box-drawing frame the way the real
+    /// TUI redraws its composer.
     #[test]
     fn interactive_codex_startup_lines_wedge_at_working_forever() {
         let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
@@ -2765,15 +2770,16 @@ mod tests {
              card to Working at all"
         );
 
-        // The session goes quiet again: plausible post-turn / idle-prompt
-        // output, still plain text, still no idle/error marker. A healthy
-        // card should be able to resolve back to Idle at some point here —
-        // it never does, because the CODEX ruleset's only idle marker is a
-        // literal JSON substring that none of this text can ever contain.
+        // The session goes quiet again: verified real Codex composer
+        // placeholder text (recovered via `strings` on the actual
+        // codex-cli 0.150.1 native binary — not invented), still plain
+        // text, still no idle/error marker. A healthy card should be able
+        // to resolve back to Idle at some point here — it never does,
+        // because the CODEX ruleset's only idle marker is a literal JSON
+        // substring that none of this text can ever contain.
         let post_turn_lines = [
-            "Ready.",
-            "Type your message and press Enter to send.",
-            "Waiting for input...",
+            "│ Ask Codex to do anything                  │",
+            "│ Ask a follow-up question                  │",
         ];
         let mut resolved_idle = false;
         for line in post_turn_lines {
