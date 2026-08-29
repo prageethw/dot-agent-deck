@@ -20,6 +20,7 @@ use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType, OrchestrationSurface, SendResult};
 use crate::features::Features;
+use crate::issue_dispatch_run::KeptWorktree;
 // PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
 // `KeyResult`), which collides with the keybinding-action enum. Import the
 // latter under an alias so both coexist: `Action` = the UI dispatch action,
@@ -5976,7 +5977,7 @@ fn gate_pane_input_key(
 /// [`UiState::close_confirm_target`] as a [`CloseTarget`]. See its docs for why
 /// the two are separate. `scope` is not identity — it is the one bit of the
 /// resolved close the dialog has to be able to say out loud.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseConfirmState {
     /// 0 = Cancel (default), 1 = Close.
     pub selected: usize,
@@ -5984,6 +5985,23 @@ pub struct CloseConfirmState {
     /// [`resolve_close_plan`] — the same function the confirmed close itself
     /// branches on. Defaults to [`CloseScope::Pane`], the narrower claim.
     pub scope: CloseScope,
+    /// Issue #717: the dispatched worktree this close would LEAVE BEHIND,
+    /// holding uncommitted work — `None` when it leaves nothing.
+    ///
+    /// The second thing (after `scope`) the dialog has to be able to say out
+    /// loud, and the reason this type is no longer `Copy`: it carries a path,
+    /// because recovering the work means going to it. Resolved once at arm time
+    /// by [`kept_worktree_for_plan`] — the dialog describes what was armed, and
+    /// re-probing every frame would put a `git status` in the render loop.
+    ///
+    /// It is a PREDICTION, and deliberately used only where a prediction is the
+    /// only thing available: the agent is still running while the dialog is
+    /// open, so it can commit the work or dirty a clean tree before the close
+    /// lands. That is what a confirmation dialog is for — it arrives while the
+    /// user can still cancel — but it must not be reused afterwards as a claim
+    /// about what happened. The post-close report comes from the daemon's own
+    /// verdict instead; see [`drain_worktree_kept`].
+    pub kept_worktree: Option<KeptWorktree>,
 }
 
 /// PRD #241 fact-check follow-up: how much a confirmed close destroys, and
@@ -6120,8 +6138,13 @@ fn arm_close_confirmation(
     prompt: CloseConfirmState,
     target: CloseTarget,
     scope: CloseScope,
+    kept_worktree: Option<KeptWorktree>,
 ) {
-    ui.close_confirm = CloseConfirmState { scope, ..prompt };
+    ui.close_confirm = CloseConfirmState {
+        scope,
+        kept_worktree,
+        ..prompt
+    };
     ui.close_confirm_target = Some(target);
     ui.close_confirm_displayed = false;
     ui.mode = UiMode::CloseConfirm;
@@ -6175,6 +6198,148 @@ fn resolve_close_plan(
                 }),
             }
         }
+    }
+}
+
+/// Issue #717: the close-confirmation dialog's budget for asking the daemon
+/// what a confirmed close would leave behind.
+///
+/// Larger than [`DAEMON_HINT_TIMEOUT`] on purpose. That constant sizes a hint
+/// whose answer is a pure registry read; this one waits on a `git status`
+/// behind it, and it must exceed the daemon's own
+/// `CLOSE_PREVIEW_PROBE_TIMEOUT` or the client would always give up first and
+/// the daemon's graceful degradation would never be reachable. Still an
+/// interactive key path, so it fails OPEN like every other hint here: a slow or
+/// down daemon means no warning, never a frozen `Ctrl+W`.
+const CLOSE_PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Every pane a confirmed `plan` would tear down.
+///
+/// One for a plain dashboard card; for a Mode/Orchestration tab, the agent pane
+/// plus every side or role pane it owns — because a multi-role orchestration
+/// shares ONE dispatched worktree across its role panes, and the daemon
+/// resolves that worktree from whichever of them it recognises. Dead-slot
+/// sentinels are skipped for the same reason [`TabManager::all_managed_pane_ids`]
+/// skips them: they are placeholder sessions, not panes.
+fn close_plan_pane_ids(plan: &ClosePlan, tab_manager: &TabManager) -> Vec<String> {
+    match plan {
+        ClosePlan::Pane { pane_id, .. } => vec![pane_id.clone()],
+        ClosePlan::Tab { index } => match tab_manager.tabs().get(*index) {
+            Some(Tab::Mode {
+                agent_pane_id,
+                mode_manager,
+                ..
+            }) => std::iter::once(agent_pane_id.clone())
+                .chain(mode_manager.managed_pane_ids())
+                .collect(),
+            Some(Tab::Orchestration { role_pane_ids, .. }) => role_pane_ids
+                .iter()
+                .filter(|id| !id.is_empty() && !is_dead_slot_pane_id(id))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        },
+    }
+}
+
+/// Issue #717: ask the daemon whether confirming `plan` would leave a
+/// dispatched worktree on disk holding uncommitted work.
+///
+/// The daemon is asked rather than the local filesystem because it owns both
+/// halves of the answer: the removal POLICY lives only in its in-memory
+/// worktree registry, and under a remote deck the worktree is not on this
+/// machine at all. Best-effort throughout — a down daemon, a blown deadline or
+/// an older daemon that does not know the request all resolve to `None`, and
+/// the dialog then reads exactly as it did before this existed.
+fn kept_worktree_for_plan(plan: &ClosePlan, tab_manager: &TabManager) -> Option<KeptWorktree> {
+    let pane_ids = close_plan_pane_ids(plan, tab_manager);
+    if pane_ids.is_empty() {
+        return None;
+    }
+    send_daemon_request_blocking_with_timeout(
+        &crate::daemon_protocol::AttachRequest::DispatchWorktreeClosePreview { pane_ids },
+        CLOSE_PREVIEW_TIMEOUT,
+    )
+    .ok()?
+    .kept_worktree
+}
+
+/// Issue #717: fit a filesystem path into `max_width` columns by dropping
+/// leading characters, not trailing ones.
+///
+/// The opposite of [`truncate_with_ellipsis`], and deliberately so: for a
+/// sentence the beginning carries the meaning, but for a path the TAIL is what
+/// distinguishes `…/deck-dispatch-issue-717` from its dozen siblings, and a
+/// path clipped to `/home/vfarcic/code/dot-agent-…` names nothing at all. Only
+/// reachable when the terminal is too narrow for the popup to widen to fit —
+/// see [`render_close_confirm`].
+fn truncate_path_head(path: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let cell_width = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
+    if max_width == 0 {
+        return String::new();
+    }
+    if path.chars().map(cell_width).sum::<usize>() <= max_width {
+        return path.to_string();
+    }
+    // Overflow confirmed, so one column now belongs to the leading `…`.
+    let budget = max_width - 1;
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0usize;
+    for c in path.chars().rev() {
+        let w = cell_width(c);
+        if used + w > budget {
+            break;
+        }
+        tail.push(c);
+        used += w;
+    }
+    let mut out = String::from("\u{2026}");
+    out.extend(tail.into_iter().rev());
+    out
+}
+
+/// Issue #717: put the daemon's post-cleanup verdict on the status line.
+///
+/// The dialog is gone the instant the user answers it, and the path is the one
+/// part they may still need — so the existing status line (15 s, already written
+/// on exactly this path) carries it. What it carries is the FACT, not the
+/// dialog's prediction: the daemon measures dirtiness after `close_agent` has
+/// reaped the agent, so nothing can still be writing to the tree, and it
+/// broadcasts the result because by then there is no card left to put it on.
+///
+/// Drained on the render loop rather than applied by the event subscriber for
+/// the same reason `pending_orchestration_surfaces` is: `UiState` lives here.
+fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
+    // Same cheap READ-lock peek `process_pending_orchestration_surfaces` uses,
+    // and for the same reason: this runs every frame, and the steady state is an
+    // empty slot. Taking the exclusive write lock unconditionally would put a
+    // per-frame writer in the way of the event subscriber for nothing.
+    if state.blocking_read().pending_worktree_kept.is_none() {
+        return;
+    }
+    let Some(kept) = state.blocking_write().take_worktree_kept() else {
+        return; // a concurrent path took it between the peek and here
+    };
+    ui.status_message = Some((
+        format!(
+            "{} {}",
+            kept_worktree_headline(&kept).trim_start_matches("! "),
+            kept.path
+        ),
+        std::time::Instant::now(),
+    ));
+}
+
+/// Issue #717: what the dialog (and, after the close, the status line) says
+/// about a worktree that will be kept. Two sentences, because the probe has two
+/// honest outcomes — see [`KeptWorktree::confirmed_dirty`].
+fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
+    if kept.confirmed_dirty {
+        "! Uncommitted work here is KEPT, not deleted:"
+    } else {
+        "! Uncommitted work here, if any, is KEPT:"
     }
 }
 
@@ -9014,9 +9179,15 @@ fn dispatch_action(
                 // PRD #241: the dialog's wording comes from the SAME resolution
                 // `ConfirmCloseSelected` runs below, so it can never promise a
                 // pane and take a tab.
-                let scope = resolve_close_plan(&target, tab_manager, snapshot)
-                    .map_or(CloseScope::Pane, |plan| plan.scope());
-                arm_close_confirmation(ui, prompt, target, scope);
+                let plan = resolve_close_plan(&target, tab_manager, snapshot);
+                let scope = plan.as_ref().map_or(CloseScope::Pane, ClosePlan::scope);
+                // Issue #717: and the SAME plan decides whether this close
+                // would leave a dispatched worktree behind, so the sentence and
+                // the warning describe one resolution rather than two.
+                let kept = plan
+                    .as_ref()
+                    .and_then(|plan| kept_worktree_for_plan(plan, tab_manager));
+                arm_close_confirmation(ui, prompt, target, scope, kept);
             }
             // No target (PRD #113 finding 2: an inactive dashboard selection
             // means nothing is armed) — stay exactly as silent as before, and
@@ -9036,6 +9207,16 @@ fn dispatch_action(
             ui.mode = UiMode::Normal;
             ui.close_confirm_displayed = false;
             let target = ui.close_confirm_target.take();
+            // Issue #717: the ARM-TIME preview is deliberately NOT carried out
+            // of the dialog and reused as the post-close report. The agent is
+            // still alive while the dialog is open, so that answer is a
+            // prediction — it can commit the work (making a "kept at <path>"
+            // claim false, about a directory that was removed) or dirty a clean
+            // tree (making a silent close wrong). The authoritative answer is
+            // the daemon's own post-cleanup verdict, measured with the agent
+            // reaped, and it arrives as `BroadcastMsg::WorktreeKept`; see
+            // `drain_worktree_kept`.
+            ui.close_confirm.kept_worktree = None;
             // PRD #241: re-resolve the ARMED target through the same function
             // that decided the dialog's wording. Whatever it says here is what
             // the user was shown, because the two share this call.
@@ -9185,9 +9366,12 @@ fn dispatch_action(
                 // so — through the same `resolve_close_plan` seam as every other
                 // door rather than a second hand-written answer.
                 let target = CloseTarget::Tab(id);
-                let scope = resolve_close_plan(&target, tab_manager, snapshot)
-                    .map_or(CloseScope::Pane, |plan| plan.scope());
-                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope);
+                let plan = resolve_close_plan(&target, tab_manager, snapshot);
+                let scope = plan.as_ref().map_or(CloseScope::Pane, ClosePlan::scope);
+                let kept = plan
+                    .as_ref()
+                    .and_then(|plan| kept_worktree_for_plan(plan, tab_manager));
+                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope, kept);
             }
         }
         // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
@@ -12193,6 +12377,10 @@ pub fn run_tui(
         // mid-session (issue dispatch). Done before the snapshot clone + tab
         // derivation below so a freshly-surfaced tab paints this same frame.
         process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager);
+        // Issue #717: report a dispatched worktree the daemon actually left
+        // on disk. Queued by the event subscriber, drained here because the
+        // status line is `UiState`.
+        drain_worktree_kept(&state, &mut ui);
 
         let snapshot = state.blocking_read().clone();
 
@@ -16763,8 +16951,22 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)
 fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Action, Rect)> {
     let selected = state.selected;
     let area = frame.area();
-    let popup_width = 64u16.min(area.width.saturating_sub(4));
-    let popup_height = 9u16.min(area.height.saturating_sub(4));
+    // Issue #717: the kept-worktree warning adds a headline and a path line.
+    // The path is the actionable half — the user has to `cd` to it — so the
+    // popup WIDENS to fit it rather than truncating by default, and only falls
+    // back to a head-truncation when the terminal itself is too narrow.
+    let kept_lines = if state.kept_worktree.is_some() { 3 } else { 0 };
+    // Saturating rather than `as u16`: the path arrives over the wire, and a
+    // wrapping cast would turn an absurd length into a tiny popup instead of a
+    // wide one clamped to the terminal.
+    let want_width: u16 = state
+        .kept_worktree
+        .as_ref()
+        .map_or(0, |kept| kept.path.chars().count().saturating_add(8))
+        .try_into()
+        .unwrap_or(u16::MAX);
+    let popup_width = want_width.max(64).min(area.width.saturating_sub(4));
+    let popup_height = (9u16 + kept_lines).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -16781,6 +16983,25 @@ fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Ac
         ),
         Line::from(""),
     ];
+
+    // Issue #717: BEFORE the options, because it changes what the answer means
+    // — a close that keeps a directory full of uncommitted work is a different
+    // decision from one that cleans up after itself, and the user is about to
+    // press Enter.
+    if let Some(kept) = state.kept_worktree.as_ref() {
+        let inner_width = popup_width.saturating_sub(6) as usize;
+        text.push(Line::styled(
+            format!("  {}", kept_worktree_headline(kept)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        text.push(Line::styled(
+            format!("    {}", truncate_path_head(&kept.path, inner_width)),
+            text_primary(),
+        ));
+        text.push(Line::from(""));
+    }
 
     for (i, (label, desc)) in close_confirm_options(state.scope).iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
@@ -21648,6 +21869,88 @@ mod tests {
             (25, 75),
             "a toggled orchestration tab must use the narrower-sidebar 25/75 split"
         );
+    }
+
+    /// Issue #717: the close-confirmation preview asks the daemon about EVERY
+    /// pane a confirmed close would tear down, because a multi-role
+    /// orchestration shares one dispatched worktree across its role panes and
+    /// the daemon resolves that worktree from whichever of them it recognises.
+    /// A tab close that handed over an empty list would silently lose the
+    /// kept-worktree warning for exactly the dispatched TEAMS it matters most
+    /// for, with nothing else failing.
+    #[test]
+    fn close_plan_pane_ids_covers_every_role_pane_of_an_orchestration_tab() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+        tm.open_orchestration_tab(
+            &cfg,
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+
+        let ids = close_plan_pane_ids(&ClosePlan::Tab { index: 1 }, &tm);
+        let expected = match &tm.tabs()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+        assert_eq!(ids, expected, "every role pane must reach the daemon");
+        assert_eq!(ids.len(), 2, "both roles, not just the start role");
+
+        // A dead slot is a placeholder session, not a pane — asking the daemon
+        // about it is noise, and the empty-string sentinel is worse: it would
+        // match nothing while looking like a real id.
+        match &mut tm.tabs_mut()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => {
+                role_pane_ids[1] = format!("{DEAD_SLOT_PREFIX}team-1");
+                role_pane_ids.push(String::new());
+            }
+            _ => panic!("tab 1 should be an orchestration tab"),
+        }
+        let ids = close_plan_pane_ids(&ClosePlan::Tab { index: 1 }, &tm);
+        assert_eq!(
+            ids.len(),
+            1,
+            "the dead slot and the empty sentinel must both be dropped, leaving \
+             only the real pane: {ids:?}"
+        );
+        assert!(
+            !ids[0].is_empty() && !is_dead_slot_pane_id(&ids[0]),
+            "{ids:?}"
+        );
+
+        // The Dashboard is never closable, so a plan pointing at it yields
+        // nothing to ask about rather than a panic.
+        assert!(close_plan_pane_ids(&ClosePlan::Tab { index: 0 }, &tm).is_empty());
+        assert!(close_plan_pane_ids(&ClosePlan::Tab { index: 99 }, &tm).is_empty());
     }
 
     /// Scenario: PRD #336 (post-review inversion) — the split is GLOBAL, not
