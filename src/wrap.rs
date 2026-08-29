@@ -127,13 +127,30 @@ pub static GENERIC: RuleSet = RuleSet {
 /// (Idle) while the process is still alive, an `error` record is a failure, and
 /// every other record (`turn.started`, `item.started` reasoning /
 /// `command_execution`, …) is active work via the generic non-blank fallback.
-/// Markers match the compact `"type":"…"` discriminator specifically so
-/// incidental occurrences of the word "error" inside reasoning/command text
-/// never flip the card. Selected by [`ruleset_for`] when the resolved agent is
-/// [`AgentType::Codex`]; no change to [`classify_line_with`] or the runtime.
+/// The JSON-discriminator marker matches the compact `"type":"…"` shape
+/// specifically so incidental occurrences of the word "error" inside
+/// reasoning/command text never flip the card.
+///
+/// Issue #638: the interactive `codex` TUI mixes in plain redraw text that is
+/// never valid single-line JSON, so [`classify_codex_line`]'s non-JSON
+/// fallback lands here via [`classify_line_with`] instead of the JSON branch
+/// above — and plain text can never contain the JSON-shaped idle marker.
+/// Without a real idle signal in the fallback, the card enters `Working` on
+/// the first redraw line and can never leave it, wedging at "Thinking"
+/// forever even once the session has gone quiet. The extra markers below give
+/// the fallback its own route back to `Idle`: phrases an interactive prompt
+/// uses to say it is waiting on the user, distinct enough from ordinary
+/// reasoning/command output that they don't fire mid-turn.
+///
+/// Selected by [`ruleset_for`] when the resolved agent is [`AgentType::Codex`];
+/// no change to [`classify_line_with`] or the runtime.
 pub static CODEX: RuleSet = RuleSet {
     error_markers: &["\"type\":\"error\""],
-    idle_markers: &["\"type\":\"turn.completed\""],
+    idle_markers: &[
+        "\"type\":\"turn.completed\"",
+        "waiting for input",
+        "press enter to send",
+    ],
 };
 
 /// Select the line-classification [`RuleSet`] for a resolved agent type. Codex
@@ -233,7 +250,9 @@ impl Detector {
 /// other record (`turn.started`, `item.started` reasoning / command execution,
 /// …) → `Working`. A non-JSON line (the interactive channel's plain text)
 /// falls back to the substring [`CODEX`] rules, so bare `codex` still surfaces
-/// activity instead of staying stuck until process exit.
+/// activity instead of staying stuck until process exit — and (issue #638)
+/// can also resolve back to `Idle` from [`CODEX`]'s "waiting for input" style
+/// markers, since plain redraw text can never contain the JSON idle marker.
 pub fn classify_codex_line(line: &str) -> Option<DetectedEvent> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
