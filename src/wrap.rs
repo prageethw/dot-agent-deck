@@ -2713,11 +2713,14 @@ mod tests {
     /// text, not JSONL — `classify_codex_line`'s non-JSON fallback routes it
     /// through the substring `CODEX` ruleset, whose only idle marker is the
     /// literal `"type":"turn.completed"` substring that plain redraw text can
-    /// never contain. The very first startup line wedges the card at
-    /// `Working` and no amount of further plausible non-task output (more
-    /// redraw frames, prompts, prose) can ever release it back to `Idle` —
-    /// reproducing the permanently-stuck-at-Thinking symptom reported before
-    /// any task is ever delegated to the pane.
+    /// never contain. The very first startup line correctly drives the card
+    /// to `Working`, but once the interactive session has gone quiet again
+    /// (redrawn its normal prompt, no further real task/error output), the
+    /// card should eventually be able to settle back to `Idle` — it never
+    /// can, because nothing in plain interactive output can ever contain
+    /// that JSON-shaped substring. This reproduces the permanently-stuck-at-
+    /// Thinking symptom reported before any task is ever delegated to the
+    /// pane.
     #[test]
     fn interactive_codex_startup_lines_wedge_at_working_forever() {
         let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
@@ -2731,41 +2734,43 @@ mod tests {
             "╰─────────────────────────────────────────╯",
             "Connecting to model...",
         ];
-
         let mut saw_working = false;
         for line in startup_lines {
-            if let Some(ev) = d.observe_detected(classify_codex_line(line)) {
-                assert_eq!(
-                    ev,
-                    DetectedEvent::Working,
-                    "non-JSON startup line {line:?} classified as {ev:?}, expected Working"
-                );
+            if d.observe_detected(classify_codex_line(line)) == Some(DetectedEvent::Working) {
                 saw_working = true;
             }
         }
         assert!(
             saw_working,
-            "expected at least one Working transition from startup output"
+            "precondition failed: expected the startup redraw to drive the \
+             card to Working at all"
         );
 
-        // No further plausible non-task output ever resolves the wedge back
-        // to Idle: none of it is JSON, and the CODEX ruleset's only idle
-        // marker is a JSON-shaped substring interactive text never contains.
-        let more_plausible_output = [
+        // The session goes quiet again: plausible post-turn / idle-prompt
+        // output, still plain text, still no idle/error marker. A healthy
+        // card should be able to resolve back to Idle at some point here —
+        // it never does, because the CODEX ruleset's only idle marker is a
+        // literal JSON substring that none of this text can ever contain.
+        let post_turn_lines = [
             "Ready.",
             "Type your message and press Enter to send.",
             "Waiting for input...",
-            "",
-            "  ",
         ];
-        for line in more_plausible_output {
-            let ev = d.observe_detected(classify_codex_line(line));
-            assert_ne!(
-                ev,
-                Some(DetectedEvent::Idle),
-                "line {line:?} incorrectly resolved the wedge back to Idle"
-            );
+        let mut resolved_idle = false;
+        for line in post_turn_lines {
+            if d.observe_detected(classify_codex_line(line)) == Some(DetectedEvent::Idle) {
+                resolved_idle = true;
+            }
         }
+
+        assert!(
+            resolved_idle,
+            "issue #638: interactive codex output never contains the \
+             literal `\"type\":\"turn.completed\"` substring, so \
+             classify_codex_line's non-JSON fallback (the CODEX ruleset) can \
+             never resolve the card back to Idle — it stays wedged at \
+             Working/Thinking forever, even once the session has gone quiet"
+        );
     }
 
     /// Control (reproduce-first): the JSONL path the `CODEX` ruleset was
