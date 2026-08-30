@@ -2528,6 +2528,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         shell_descendant_busy: false,
         wait_deferred_revert: false,
         model: None,
+        agent_report_activity_seen: false,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -2667,6 +2668,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         shell_descendant_busy: false,
                         wait_deferred_revert: false,
                         model: None,
+                        agent_report_activity_seen: false,
                     }),
                     daemon_boot_id: None,
                     registration_generation: None,
@@ -3377,6 +3379,7 @@ async fn live_014_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
             shell_descendant_busy: false,
             wait_deferred_revert: false,
             model: None,
+            agent_report_activity_seen: false,
         }),
         daemon_boot_id: None,
         registration_generation: None,
@@ -3680,6 +3683,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
             shell_descendant_busy: false,
             wait_deferred_revert: false,
             model: None,
+            agent_report_activity_seen: false,
         }),
         daemon_boot_id: None,
         registration_generation: None,

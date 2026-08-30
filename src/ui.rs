@@ -21588,9 +21588,18 @@ fn render_session_card(
     // real work" from "this placeholder was never pending", so a resolved
     // one falls through to the real `status_style` instead of the
     // genuinely-empty copy.
+    //
+    // Fix round (reviewer F8): the OTHER `is_placeholder` uses further below
+    // (the body-line branch and the border) must gate on this same
+    // distinction, not the raw flag — otherwise a resolved placeholder
+    // renders a self-contradiction: this status label correctly reads e.g.
+    // "Thinking" while the body line beneath it still reads "Launch an
+    // agent to get started" and the border stays dimmed. `show_badge`
+    // (below) is the one deliberate exception — see its own comment (D4).
+    let is_empty_placeholder = is_placeholder && !session.agent_report_activity_seen;
     let (status_label, status_style) = if is_pending {
         ("Starting…", text_primary())
-    } else if is_placeholder && !session.agent_report_activity_seen {
+    } else if is_empty_placeholder {
         ("No agent", text_primary())
     } else {
         status_style(&session.status)
@@ -21720,11 +21729,14 @@ fn render_session_card(
     // selection on its own. Status is not lost: the badge still reports it.
     let base_border_style = if is_selected {
         Style::default().fg(palette::SELECTED)
-    } else if is_placeholder {
+    } else if is_empty_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
         // own foreground (matching the prior DarkGray intent) so the empty slot
         // doesn't draw a full-strength border like a live agent. Selecting one
         // takes the branch above, so an empty slot is never dim while selected.
+        // Fix round (reviewer F8): gated on `is_empty_placeholder`, not raw
+        // `is_placeholder` — a resolved placeholder is actively working and
+        // must not draw a dimmed border.
         text_dim()
     } else {
         Style::default().fg(status_color)
@@ -21907,7 +21919,11 @@ fn render_session_card(
             "Waiting for agent to report in…",
             text_primary(),
         )));
-    } else if is_placeholder {
+    } else if is_empty_placeholder {
+        // Fix round (reviewer F8): gated on `is_empty_placeholder`, not raw
+        // `is_placeholder` — a resolved placeholder falls through to the
+        // recent-prompts branch below instead of this copy, and stops
+        // suppressing the `Prmt:` lines a visibly working agent has posted.
         lines.push(Line::from(Span::styled(
             "Launch an agent to get started",
             text_primary(),
@@ -28201,6 +28217,12 @@ mod tests {
              placeholder must clear, even though agent_type is still None; \
              got:\n{after_activity}"
         );
+        assert!(
+            !after_activity.contains("Launch an agent to get started"),
+            "fix round (reviewer F8): a resolved placeholder's body line must \
+             not still read the genuinely-empty-placeholder copy, or the card \
+             self-contradicts its own status label; got:\n{after_activity}"
+        );
 
         state.apply_event(untagged_event_for("1", "hook-report-2", EventType::Idle));
 
@@ -28214,6 +28236,13 @@ mod tests {
             !after_idle.contains("Starting…"),
             "once real activity has cleared the placeholder it must never \
              revert to 'Starting…' again, even after returning to Idle; \
+             got:\n{after_idle}"
+        );
+        assert!(
+            !after_idle.contains("No agent"),
+            "reviewer F11: anchor against the F8 coherence bug more precisely \
+             than the 'Starting…' check alone — a resolved placeholder must \
+             not fall back to the genuinely-empty-placeholder label either; \
              got:\n{after_idle}"
         );
     }
