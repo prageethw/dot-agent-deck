@@ -797,7 +797,14 @@ fn usable_wrap_binary(path: &std::path::Path) -> Option<String> {
 /// a guard keyed on the literal alone stopped recognising its own output,
 /// producing a double-wrapped command (`src/agent_pty.rs`'s second
 /// `wrap_launch_command` call, R20-009).
-fn is_wrap_invocation(command: &str) -> bool {
+///
+/// `pub(crate)` (issue #644 round 2, reviewer F3 / auditor F2): also the
+/// basename check `crate::platform::proc::scan::descendant_shell_activity`
+/// uses to decide whether a candidate process is genuinely a `wrap`
+/// invocation rather than an unrelated command that merely carries the
+/// literal token `wrap` in the same position — one check, not two
+/// independently-maintained copies that could drift.
+pub(crate) fn is_wrap_invocation(command: &str) -> bool {
     let mut tokens = command.split_whitespace();
     let (Some(program), Some(subcommand)) = (tokens.next(), tokens.next()) else {
         return false;
