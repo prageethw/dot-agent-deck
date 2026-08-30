@@ -694,12 +694,28 @@ pub const DOT_AGENT_DECK_WRAP_BIN: &str = "DOT_AGENT_DECK_WRAP_BIN";
 ///   `<path> (deleted)`, routine while rebuilding during development;
 /// - a path containing whitespace, which the shell would re-split (nothing
 ///   quotes this command string).
+///
+/// Filename-agnostic (issue #642): this fork's installed binary is named
+/// `worker-agent-deck`, not `dot-agent-deck` (CLAUDE.md rule 21) — requiring
+/// an exact filename match here meant `current_exe()` was *never* accepted on
+/// a stock fork install, so every wrap rewrite silently fell through to the
+/// bare-name `$PATH` lookup and picked up whatever `dot-agent-deck` happened
+/// to be installed (in the reported case, six releases of upstream drift).
+/// The test-harness exclusion above still has to hold by directory, not name,
+/// since the harness binary is now just as "usable" by content as the real
+/// build — see the `deps`/`examples` check below.
 fn deck_binary_for_wrap() -> String {
-    const BARE: &str = "dot-agent-deck";
-    fn usable(path: &std::path::Path) -> Option<String> {
-        let text = path.to_str()?;
-        (path.file_name()? == BARE && !text.chars().any(char::is_whitespace) && path.is_file())
-            .then(|| text.to_string())
+    // The one remaining route to issue #642's original defect: silent because
+    // nothing else on this path logs. Warn so a future occurrence is a log
+    // line, not a six-release mystery.
+    fn bare_fallback() -> String {
+        tracing::warn!(
+            "deck_binary_for_wrap: could not resolve this build's own binary; \
+             falling back to the bare name {} for a login shell's $PATH to \
+             resolve, which may silently pick up a different install (issue #642)",
+            crate::platform::paths::DEFAULT_BINARY_NAME
+        );
+        crate::platform::paths::DEFAULT_BINARY_NAME.to_string()
     }
 
     // Explicit override, consulted first. Resolving the co-located build is what
@@ -715,40 +731,91 @@ fn deck_binary_for_wrap() -> String {
     }
 
     let Ok(exe) = std::env::current_exe() else {
-        return BARE.to_string();
+        return bare_fallback();
     };
-    if let Some(found) = usable(&exe) {
+    let Some(dir) = exe.parent() else {
+        return bare_fallback();
+    };
+    // A `cargo test`/nextest harness binary lives directly in
+    // `target/<profile>/deps/`, and `cargo run --example <name>` builds to
+    // `target/<profile>/examples/<name>` — both are real, usable files by
+    // content, but wrapping through either would be meaningless, so both are
+    // excluded by location rather than by name and the sibling product build
+    // one level up is preferred instead, exactly as before this fix.
+    let in_harness_dir = matches!(
+        dir.file_name().and_then(std::ffi::OsStr::to_str),
+        Some("deps" | "examples")
+    );
+    if !in_harness_dir && let Some(found) = usable_wrap_binary(&exe) {
         return found;
     }
-    let Some(dir) = exe.parent() else {
-        return BARE.to_string();
-    };
-    usable(&dir.join(BARE))
+    usable_wrap_binary(&dir.join(crate::platform::paths::DEFAULT_BINARY_NAME))
         .or_else(|| {
-            (dir.file_name() == Some(std::ffi::OsStr::new("deps")))
-                .then(|| dir.parent().map(|up| up.join(BARE)))
+            in_harness_dir
+                .then(|| {
+                    dir.parent()
+                        .map(|up| up.join(crate::platform::paths::DEFAULT_BINARY_NAME))
+                })
                 .flatten()
                 .as_deref()
-                .and_then(usable)
+                .and_then(usable_wrap_binary)
         })
-        .unwrap_or_else(|| BARE.to_string())
+        .unwrap_or_else(bare_fallback)
+}
+
+/// Whether `path` is a regular file the wrap rewrite can name verbatim: it
+/// exists, is a regular file, and its text form has no whitespace (nothing
+/// quotes the rewritten command string, so the shell would re-split it).
+/// Deliberately does **not** check the executable bit — same gap the old
+/// nested `usable()` this was extracted from had — so a resolved-but-not-
+/// executable file of that name is still accepted and fails at spawn time
+/// with "Permission denied" rather than being rejected here. Deliberately
+/// filename-agnostic (issue #642) — a free function rather than nested in
+/// [`deck_binary_for_wrap`] so a test can probe it directly against a
+/// synthetic path, since `current_exe()` inside a `cargo test` process is
+/// always the test harness binary and can't be renamed mid-test.
+fn usable_wrap_binary(path: &std::path::Path) -> Option<String> {
+    let text = path.to_str()?;
+    (!text.chars().any(char::is_whitespace) && path.is_file()).then(|| text.to_string())
 }
 
 /// Whether `command` is already a `dot-agent-deck wrap …` invocation — the
 /// idempotency guard for [`wrap_launch_command`]. Tolerant of a leading path on
 /// the binary (`/usr/local/bin/dot-agent-deck wrap …`).
+///
+/// Matches on two names, not one: the literal
+/// [`crate::platform::paths::DEFAULT_BINARY_NAME`] (`"dot-agent-deck"`), for a
+/// hand-written role/mode command such as `src/agent_pty.rs`'s documented
+/// `dot-agent-deck wrap --agent codex -- …` shape, which names the binary by
+/// its cargo package name regardless of what this build is actually installed
+/// as; and separately, whatever [`deck_binary_for_wrap`] would itself resolve
+/// to right now, so the guard always recognises `wrap_launch_command`'s OWN
+/// output. Before issue #642 both names always coincided — `deck_binary_for_wrap`
+/// could only ever emit something named `dot-agent-deck` — so a single literal
+/// check was enough; making that resolution filename-agnostic broke that
+/// coincidence on a fork install (`worker-agent-deck`, CLAUDE.md rule 21) and
+/// a guard keyed on the literal alone stopped recognising its own output,
+/// producing a double-wrapped command (`src/agent_pty.rs`'s second
+/// `wrap_launch_command` call, R20-009).
 fn is_wrap_invocation(command: &str) -> bool {
     let mut tokens = command.split_whitespace();
-    match (tokens.next(), tokens.next()) {
-        (Some(program), Some(subcommand)) => {
-            std::path::Path::new(program)
-                .file_name()
-                .and_then(|s| s.to_str())
-                == Some("dot-agent-deck")
-                && subcommand == "wrap"
-        }
-        _ => false,
+    let (Some(program), Some(subcommand)) = (tokens.next(), tokens.next()) else {
+        return false;
+    };
+    if subcommand != "wrap" {
+        return false;
     }
+    let Some(name) = std::path::Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+    else {
+        return false;
+    };
+    name == crate::platform::paths::DEFAULT_BINARY_NAME
+        || std::path::Path::new(&deck_binary_for_wrap())
+            .file_name()
+            .and_then(|s| s.to_str())
+            == Some(name)
 }
 
 /// Resolve the agent identity emitted events should carry.
@@ -3741,10 +3808,15 @@ mod tests {
     /// the registry detection basename as the `--agent` alias.
     #[test]
     fn wrap_launch_command_wraps_wrapper_strategy() {
-        // The binary is resolved, not hardcoded (see `deck_binary_for_wrap`), so
-        // assert the shape: some `dot-agent-deck` followed by the exact wrap
-        // invocation. Under `cargo test` the resolved binary is the sibling the
-        // build just produced, so this is usually an absolute path.
+        // The binary is resolved by content, not by name (see
+        // `deck_binary_for_wrap` / `usable_wrap_binary` — issue #642 removed
+        // the filename requirement), so this pins the `cargo test` shape
+        // specifically: under `cargo test` the test-harness binary is excluded
+        // by directory (it lives in `target/<profile>/deps/`), and the sibling
+        // product build the test harness resolves to really is named
+        // `dot-agent-deck` there (the cargo package/bin-target name is
+        // unchanged — only an *installed, renamed* copy is `worker-agent-deck`),
+        // so this is usually an absolute path.
         let rewritten = wrap_launch_command("codex", &AgentType::Codex);
         let (program, rest) = rewritten
             .split_once(' ')
@@ -3762,7 +3834,12 @@ mod tests {
     /// The rewrite must name THIS build, not whatever `$PATH` resolves to — the
     /// command is run through a login shell that re-reads the user's profile, so
     /// a bare name silently picks up an installed release. Pin that the resolved
-    /// program is the binary sitting next to the test harness.
+    /// program is the binary sitting next to the test harness. This mirrors
+    /// `deck_binary_for_wrap`'s own sibling lookup, which under `cargo test` is
+    /// the `cargo test`-shape resolution path (the test-harness binary is
+    /// excluded by directory, not filename — see issue #642 / the test above);
+    /// it does not assert that a resolved binary must be literally named
+    /// `dot-agent-deck` in general.
     #[test]
     fn wrap_launch_command_names_this_build_not_path() {
         let rewritten = wrap_launch_command("codex", &AgentType::Codex);
@@ -3788,6 +3865,34 @@ mod tests {
             // the bin target) — falling back to the bare name is the contract.
             None => assert_eq!(program, "dot-agent-deck"),
         }
+    }
+
+    /// Scenario: a real, resolvable binary must be accepted by name
+    /// resolution regardless of its filename, not only one literally named
+    /// `dot-agent-deck`.
+    ///
+    /// The old check hardcoded a literal `"dot-agent-deck"` filename match,
+    /// so this fork's installed `worker-agent-deck` build (CLAUDE.md rule 21)
+    /// was never accepted and every wrap rewrite silently fell back to a bare
+    /// `$PATH` lookup — resolving to whatever `dot-agent-deck` happened to be
+    /// installed instead of the running build (issue #642). Probes the
+    /// extracted function directly with a synthetic non-`dot-agent-deck`-named
+    /// file, since `current_exe()` inside a `cargo test` process is always
+    /// the test harness binary and can't be renamed mid-test.
+    #[spec("codex/wrap/014")]
+    #[test]
+    fn wrap_014_usable_wrap_binary_accepts_any_filename() {
+        let dir = tempfile::tempdir().expect("tempdir for synthetic binary");
+        let renamed = dir.path().join("worker-agent-deck");
+        std::fs::write(&renamed, b"").expect("create synthetic binary file");
+
+        assert_eq!(
+            usable_wrap_binary(&renamed).as_deref(),
+            renamed.to_str(),
+            "a real, whitespace-free, existing file must be accepted \
+             regardless of filename, not just one literally named \
+             \"dot-agent-deck\""
+        );
     }
 
     /// Non-Wrapper agents (and the neutral unknown type) launch bare — the
@@ -3838,6 +3943,73 @@ mod tests {
         assert!(!is_wrap_invocation("codex"));
         assert!(!is_wrap_invocation("dot-agent-deck daemon serve"));
         assert!(!is_wrap_invocation(""));
+    }
+
+    /// Serializes tests in this module that set [`DOT_AGENT_DECK_WRAP_BIN`] —
+    /// process-global, so unserialized tests running as threads of one
+    /// process (CI's `build` job uses plain `cargo test`, not only nextest;
+    /// see `tests/agent_detection.rs`'s `WRAP_BIN_LOCK` for the same
+    /// reasoning) could otherwise observe each other's override.
+    static WRAP_BIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII: points [`DOT_AGENT_DECK_WRAP_BIN`] at `bin` for as long as the
+    /// guard lives, removing it on drop, even on panic. Caller must hold
+    /// `WRAP_BIN_TEST_LOCK` for the guard's entire lifetime.
+    struct WrapBinTestOverride;
+
+    impl WrapBinTestOverride {
+        fn pointing_at(bin: &str) -> Self {
+            // SAFETY: WRAP_BIN_TEST_LOCK excludes every other test in this
+            // module that touches this env var for this guard's entire
+            // lifetime.
+            unsafe {
+                std::env::set_var(DOT_AGENT_DECK_WRAP_BIN, bin);
+            }
+            Self
+        }
+    }
+
+    impl Drop for WrapBinTestOverride {
+        fn drop(&mut self) {
+            // SAFETY: see `pointing_at`.
+            unsafe {
+                std::env::remove_var(DOT_AGENT_DECK_WRAP_BIN);
+            }
+        }
+    }
+
+    /// Reviewer F2 / auditor B1: pins the round-trip invariant that F1's fix
+    /// to [`is_wrap_invocation`] restores — wrapping an already-wrapped
+    /// command is a no-op, regardless of what file name this build resolves
+    /// to. Points [`DOT_AGENT_DECK_WRAP_BIN`] at a synthetic binary named
+    /// `worker-agent-deck` (this fork's installed name, CLAUDE.md rule 21;
+    /// deliberately not `dot-agent-deck`, or the pre-fix literal-only check
+    /// would already have passed this trivially) so the assertion is
+    /// deterministic regardless of the test process's own `current_exe()` —
+    /// which is always the test harness binary and can't be renamed
+    /// mid-test. RED before F1 (the second `wrap_launch_command` call did not
+    /// recognise the first call's `worker-agent-deck …` output as already
+    /// wrapped and wrapped it again); GREEN after.
+    #[test]
+    fn wrap_launch_command_round_trip_is_idempotent_for_this_build_name() {
+        let _lock = WRAP_BIN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir for synthetic binary");
+        let bin = dir.path().join("worker-agent-deck");
+        std::fs::write(&bin, b"").expect("create synthetic binary file");
+        let bin_str = bin.to_str().expect("temp path is UTF-8");
+        let _override = WrapBinTestOverride::pointing_at(bin_str);
+
+        let once = wrap_launch_command("codex", &AgentType::Codex);
+        assert!(
+            once.starts_with(bin_str),
+            "first wrap must name the synthetic binary: {once}"
+        );
+        let twice = wrap_launch_command(&once, &AgentType::Codex);
+        assert_eq!(
+            twice, once,
+            "wrapping an already-wrapped command must be a no-op"
+        );
     }
 
     // PRD #20 finding #12 targeted coverage for the edges the subprocess harness
