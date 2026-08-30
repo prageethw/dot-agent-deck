@@ -363,19 +363,43 @@ impl Detector {
     }
 }
 
+/// The JSON-only half of [`classify_codex_line`]: parse `line` as a JSON
+/// object and map its top-level `type` discriminator, returning `None` when
+/// the line is blank, isn't valid JSON, or has no string `type` field (the
+/// caller then falls back to substring classification). Split out (issue
+/// #638 round 5) so [`classify_and_emit`] can gate suppression on only the
+/// non-JSON fallback — this branch survives `suppress_text_status`
+/// unconditionally, because it's the one channel that reports a turn ending
+/// Codex's own hooks don't cover (a server-side-error turn fires no `Stop`
+/// hook — `.dot-agent-deck/638-audit-findings-r4.md` R4-F1, measured live)
+/// and because it classifies correctly regardless of whether the byte stream
+/// arrived via an interactive PTY or a redirected `codex exec --json` pipe
+/// (round-4 review F2).
+fn classify_codex_json(line: &str) -> Option<DetectedEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    let kind = value.get("type").and_then(|t| t.as_str())?;
+    Some(match kind {
+        "turn.completed" | "task.completed" => DetectedEvent::Idle,
+        "turn.failed" | "task.failed" | "error" => DetectedEvent::Error,
+        _ => DetectedEvent::Working,
+    })
+}
+
 /// PRD #20 finding #11: classify one line of Codex output. Codex emits JSONL
 /// (`codex exec --json` writes one compact JSON object per line) and the
-/// interactive `codex` TUI mixes JSON events with plain redraw text. Parse the
-/// top-level `type` discriminator with `serde_json` (robust to insignificant
-/// whitespace and field reordering, unlike a raw substring match), mapping:
-/// `turn.completed` → `Idle`, `turn.failed` / `error` → `Error`, and every
-/// other record (`turn.started`, `item.started` reasoning / command execution,
-/// …) → `Working`. A non-JSON line (the interactive channel's plain text)
-/// falls back to the substring [`CODEX`] rules, so bare `codex` still surfaces
-/// activity instead of staying stuck until process exit — and (issue #638)
-/// can also resolve back to `Idle` from [`CODEX`]'s verified composer-idle
-/// markers, since plain redraw text can never contain the JSON idle marker.
-/// That fallback goes through [`classify_line_with`], whose
+/// interactive `codex` TUI mixes JSON events with plain redraw text. Try the
+/// JSON `type`-discriminator branch first ([`classify_codex_json`] — robust
+/// to insignificant whitespace and field reordering, unlike a raw substring
+/// match). A non-JSON line (the interactive channel's plain text) falls back
+/// to the substring [`CODEX`] rules, so bare `codex` still surfaces activity
+/// instead of staying stuck until process exit — and (issue #638) can also
+/// resolve back to `Idle` from [`CODEX`]'s verified composer-idle markers,
+/// since plain redraw text can never contain the JSON idle marker. That
+/// fallback goes through [`classify_line_with`], whose
 /// error > active-override > idle > generic-fallback precedence (issue #638
 /// round 3) keeps a segment that carries both an active-turn signal and an
 /// idle marker — a real case for a whole repaint batch, not just a
@@ -385,14 +409,8 @@ pub fn classify_codex_line(line: &str) -> Option<DetectedEvent> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
-        && let Some(kind) = value.get("type").and_then(|t| t.as_str())
-    {
-        return Some(match kind {
-            "turn.completed" | "task.completed" => DetectedEvent::Idle,
-            "turn.failed" | "task.failed" | "error" => DetectedEvent::Error,
-            _ => DetectedEvent::Working,
-        });
+    if let Some(ev) = classify_codex_json(trimmed) {
+        return Some(ev);
     }
     classify_line_with(trimmed, &CODEX)
 }
@@ -1982,13 +2000,27 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// session there is no need to guess: Codex's own `UserPromptSubmit`/`Stop`
 /// hooks (`src/hook.rs`'s `map_event_type`) already fire on the real turn
 /// boundary and ride the SAME `AgentEvent` pipeline via a different code path
-/// (`src/hook.rs`'s `handle_hook`), so this function returns before touching
-/// `detector` or `emitter` at all — the shared `Detector`'s state is left
-/// exactly as the hook channel last observed it, and no text-derived
-/// `Working`/`Idle`/`Error` is ever emitted for this session. The
-/// `active_markers`/`idle_markers` heuristic below still runs, unchanged, for
-/// the narrower case where hook trust is NOT confirmed (see [`CODEX`]'s doc
-/// comment for that path's accepted residual limitation).
+/// (`src/hook.rs`'s `handle_hook`).
+///
+/// Round 5 (`.dot-agent-deck/638-audit-findings-r4.md` R4-F1;
+/// `638-review-findings-r4.md` F2): the suppression is narrower than "return
+/// before touching anything" — it only skips the non-JSON, plain-text
+/// substring fallback ([`classify_line_with`] via [`CODEX`]), the actual
+/// unreliable TUI-redraw-guessing mechanism rounds 1–3 were built around. For
+/// `is_codex`, the JSON `type`-discriminator branch
+/// ([`classify_codex_json`]) always runs and emits first, regardless of
+/// `suppress_text_status`: it's the one channel that reports the error
+/// boundary Codex's own hooks don't cover at all (a turn that ends in a
+/// server-side error fires no `Stop` hook — measured live, three times, on
+/// two Codex versions), and it classifies a redirected `codex exec --json`
+/// JSONL stream correctly whether or not it happens to be tee'd from a path
+/// that also carries suppression (`run_wrap_pty`'s redirected-descriptor
+/// tees). Only when a line does NOT parse as JSON with a string `type` field
+/// does `suppress_text_status` skip the substring fallback — leaving the
+/// shared `Detector`'s plain-text-derived state exactly as the hook channel
+/// last observed it. The `active_markers`/`idle_markers` heuristic still runs,
+/// unchanged, for the narrower case where hook trust is NOT confirmed (see
+/// [`CODEX`]'s doc comment for that path's accepted residual limitation).
 fn classify_and_emit(
     line: &str,
     detector: &Arc<Mutex<Detector>>,
@@ -1996,12 +2028,21 @@ fn classify_and_emit(
     is_codex: bool,
     suppress_text_status: bool,
 ) {
+    if is_codex && let Some(json_ev) = classify_codex_json(line) {
+        let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+        let ev = det.observe_detected(Some(json_ev));
+        drop(det);
+        if let Some(ev) = ev {
+            emitter.emit(ev.event_type());
+        }
+        return;
+    }
     if suppress_text_status {
         return;
     }
     let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
     let ev = if is_codex {
-        det.observe_detected(classify_codex_line(line))
+        det.observe_detected(classify_line_with(line.trim(), &CODEX))
     } else {
         det.observe(line)
     };
@@ -2610,8 +2651,12 @@ fn run_wrap_pipe(
     // descriptor is a real terminal), where the JSONL `type`-discriminator
     // branch of `classify_codex_line` already classifies correctly and the
     // round-1–3 heuristic's residual limitations don't apply (they are
-    // specific to the interactive TUI's plain-text redraw stream). Scope kept
-    // to `run_wrap_pty` deliberately, matching the round-4 task's framing.
+    // specific to the interactive TUI's plain-text redraw stream). Round 5
+    // (review round-4 F2) made this choice of `false` moot either way:
+    // `classify_and_emit`'s JSON-discriminator branch now runs regardless of
+    // `suppress_text_status`, so a redirected `codex exec --json` stream tee'd
+    // through `run_wrap_pty`'s `spawn_pipe_tee` calls (a PTY-host invocation
+    // with one redirected descriptor) classifies identically to this path.
     let out_thread = spawn_pipe_tee(
         child_stdout,
         libc::STDOUT_FILENO,
