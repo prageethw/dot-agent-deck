@@ -9577,18 +9577,34 @@ impl AppState {
         // it drops `wait_synthetic_working`, or a later `wait done` would
         // revert a `Working` a real event has since reasserted (the same
         // failure MEDIUM F/B2 fixed for `wait_synthetic_working` itself).
-        if asserted_status
+        let real_status_assertion = asserted_status
             && !matches!(
                 event.event_type,
                 EventType::ShellBusy
                     | EventType::Unknown
                     | EventType::MonitoredWaitStart
                     | EventType::MonitoredWaitDone
-            )
-        {
+            );
+        if real_status_assertion {
             session.shell_synthetic_working = false;
             session.wait_synthetic_working = false;
             session.wait_deferred_revert = false;
+        }
+
+        // Issue #549: a placeholder spawned for a recognized agent CLI
+        // (`expects_agent_report`) is meant to show "Starting..." only until
+        // the CLI has done real work — not forever, which is what happened
+        // to Codex, which posts no `SessionStart` hook (and so never sets
+        // `agent_type`) until its first turn completes. Latch it off the
+        // first time this session gets a real, non-synthetic status
+        // assertion (`real_status_assertion`, same distinction the
+        // synthetic-marker clear above already draws) — deliberately NOT
+        // gated on `agent_type` being set, since the whole point is this
+        // must fire while the producer is still untagged. Once cleared it
+        // stays cleared: nothing ever sets `expects_agent_report` back to
+        // `true` on an existing session.
+        if real_status_assertion {
+            session.expects_agent_report = false;
         }
 
         // PRD #361 Item 1: the marker is only meaningful while WaitingForInput
