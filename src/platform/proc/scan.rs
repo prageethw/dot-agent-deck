@@ -169,9 +169,28 @@ pub fn descendants(table: &[ProcessInfo], root_pid: i32) -> Vec<&ProcessInfo> {
 /// sampled process table, or `None` when the table cannot answer.
 ///
 /// A pane is **busy** iff `root_pid` has a transitive descendant that is in a
-/// different POSIX session than `root_pid` itself — the load-bearing condition,
-/// one `getsid` comparison per candidate, immune to any change in what an agent
-/// puts on its command line.
+/// different POSIX session than the session it inherited — the load-bearing
+/// condition, one `getsid` comparison per candidate, immune to any change in
+/// what an agent puts on its command line.
+///
+/// One structural exemption (issue #644): `root_pid`'s own **direct** child —
+/// the primary process `wrap` spawned — is not evidence of a detached command
+/// merely for leading a session of its own. `wrap` always allocates a fresh
+/// PTY for the interactive child it launches, and that child becomes the
+/// leader of *that* PTY's session as an ordinary consequence of spawning it,
+/// not because it backgrounded itself (this is true of every agent `wrap`
+/// launches interactively, not just Claude Code, which is why this is a
+/// structural exemption rather than an addition to the argv-shape catalog).
+/// The exemption is narrow: it fires only for a **direct child of `root_pid`**
+/// that is itself a **session leader** (`session_id == pid`) — a direct child
+/// merely sitting in some *other* pre-existing session (not its own) is still
+/// exactly the detached-background-job pattern the structural test exists to
+/// catch, and is not exempted. Once exempted, that child's own session
+/// becomes the new baseline its descendants are compared against, so the rest
+/// of the agent's ordinary process tree (still living in the freshly
+/// allocated PTY session) is not penalized for the same, already-excused,
+/// hop — but a *further* divergence anywhere below that (a genuinely detached
+/// descendant one or more session changes deeper) still reads as busy.
 ///
 /// `shapes` is the optional argv cross-check. When it is empty the structural
 /// test stands alone (which is what the measurement says already excludes every
@@ -207,26 +226,64 @@ pub fn descendant_shell_activity(
         return None;
     }
 
+    let mut children: HashMap<i32, Vec<&ProcessInfo>> = HashMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row);
+    }
+
     let mut had_unreadable_candidate = false;
-    for candidate in descendants(table, root_pid) {
-        // A row whose session id could not be read is unclassifiable, not
-        // "different" — counting it as different would turn an exit racing the
-        // sample into a false `Working`. It is tracked separately from "same
-        // session" so a set where every candidate is unreadable reports
-        // unknown rather than a confident idle (fork issue #160's per-row
-        // fail-safe) — a confirmed-busy candidate elsewhere in the set still
-        // wins immediately via the `return Some(true)` below, untouched.
-        if candidate.session_id <= 0 {
-            had_unreadable_candidate = true;
+    let mut visited: HashSet<i32> = HashSet::new();
+    visited.insert(root_pid);
+
+    // Each queued node carries the session id its own children must be
+    // compared against — normally inherited unchanged, but rebased once at
+    // the root's own direct child when the #644 exemption fires.
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    queue.push_back((root_pid, root.session_id));
+
+    while let Some((parent_pid, baseline_session_id)) = queue.pop_front() {
+        let Some(kids) = children.get(&parent_pid) else {
             continue;
+        };
+        let parent_is_root = parent_pid == root_pid;
+        for candidate in kids {
+            if !visited.insert(candidate.pid) {
+                continue;
+            }
+            // A row whose session id could not be read is unclassifiable,
+            // not "different" — counting it as different would turn an exit
+            // racing the sample into a false `Working`. It is tracked
+            // separately from "same session" so a set where every candidate
+            // is unreadable reports unknown rather than a confident idle
+            // (fork issue #160's per-row fail-safe) — a confirmed-busy
+            // candidate elsewhere in the set still wins immediately via the
+            // `return Some(true)` below, untouched. Its own (unreadable)
+            // session id cannot seed a baseline, so descendants keep
+            // inheriting the parent's.
+            if candidate.session_id <= 0 {
+                had_unreadable_candidate = true;
+                queue.push_back((candidate.pid, baseline_session_id));
+                continue;
+            }
+            if candidate.session_id == baseline_session_id {
+                queue.push_back((candidate.pid, baseline_session_id));
+                continue;
+            }
+            if parent_is_root && candidate.session_id == candidate.pid {
+                // Issue #644: the wrapper's own primary child re-leading the
+                // fresh PTY session it was spawned into — not evidence of a
+                // detached foreground command. Rebase its subtree onto its
+                // own session rather than penalizing the same hop again for
+                // every descendant that inherits it.
+                queue.push_back((candidate.pid, candidate.session_id));
+                continue;
+            }
+            if !shapes.is_empty() && !shapes.iter().any(|shape| shape.matches(&candidate.argv)) {
+                queue.push_back((candidate.pid, baseline_session_id));
+                continue;
+            }
+            return Some(true);
         }
-        if candidate.session_id == root.session_id {
-            continue;
-        }
-        if !shapes.is_empty() && !shapes.iter().any(|shape| shape.matches(&candidate.argv)) {
-            continue;
-        }
-        return Some(true);
     }
     if had_unreadable_candidate {
         return None;
