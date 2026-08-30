@@ -130,6 +130,23 @@ pub const CLAUDE_BASH_TOOL_SHAPE: ShellToolShape = ShellToolShape {
 /// against a live agent of that kind, not that it looks plausible.
 pub const MEASURED_SHELL_TOOL_SHAPES: &[ShellToolShape] = &[CLAUDE_BASH_TOOL_SHAPE];
 
+/// Whether `argv` (a whole command line, never tokenised) is a
+/// `dot-agent-deck wrap` invocation — its second whitespace-separated token
+/// is literally `wrap`, mirroring `wrap.rs`'s own `is_wrap_invocation` token
+/// check but, deliberately, without that function's binary-basename
+/// validation: this only ever runs against a row [`descendant_shell_activity`]
+/// already knows is `root_pid` — the process the daemon itself launched into
+/// this pane's PTY — so re-verifying which binary it is would be checking a
+/// fact already established, not new evidence. Binary-name-agnostic by
+/// construction (`{deck} wrap --agent {name} -- {command}`, `wrap.rs:660`
+/// puts `wrap` at that position regardless of `{deck}`), so it matches
+/// identically whether `{deck}` is `dot-agent-deck` or a fork's renamed
+/// binary (CLAUDE.md rule 21).
+fn argv_is_wrap_invocation(argv: &str) -> bool {
+    let mut tokens = argv.split_whitespace();
+    tokens.next().is_some() && tokens.next() == Some("wrap")
+}
+
 /// Every transitive descendant of `root_pid` in `table`, each reported exactly
 /// once and never including `root_pid` itself.
 ///
@@ -173,24 +190,35 @@ pub fn descendants(table: &[ProcessInfo], root_pid: i32) -> Vec<&ProcessInfo> {
 /// condition, one `getsid` comparison per candidate, immune to any change in
 /// what an agent puts on its command line.
 ///
-/// One structural exemption (issue #644): `root_pid`'s own **direct** child —
-/// the primary process `wrap` spawned — is not evidence of a detached command
-/// merely for leading a session of its own. `wrap` always allocates a fresh
-/// PTY for the interactive child it launches, and that child becomes the
-/// leader of *that* PTY's session as an ordinary consequence of spawning it,
-/// not because it backgrounded itself (this is true of every agent `wrap`
-/// launches interactively, not just Claude Code, which is why this is a
-/// structural exemption rather than an addition to the argv-shape catalog).
-/// The exemption is narrow: it fires only for a **direct child of `root_pid`**
-/// that is itself a **session leader** (`session_id == pid`) — a direct child
-/// merely sitting in some *other* pre-existing session (not its own) is still
-/// exactly the detached-background-job pattern the structural test exists to
-/// catch, and is not exempted. Once exempted, that child's own session
-/// becomes the new baseline its descendants are compared against, so the rest
-/// of the agent's ordinary process tree (still living in the freshly
-/// allocated PTY session) is not penalized for the same, already-excused,
-/// hop — but a *further* divergence anywhere below that (a genuinely detached
-/// descendant one or more session changes deeper) still reads as busy.
+/// One structural exemption (issue #644): when `root_pid` is itself a
+/// `dot-agent-deck wrap` invocation (its own argv's second whitespace token
+/// is `wrap`, e.g. `dot-agent-deck wrap --agent codex -- codex …`), its
+/// **direct** child — the interactive process `wrap` spawned — is not
+/// evidence of a detached command merely for leading a session of its own.
+/// `wrap` always allocates a fresh PTY for the interactive child it
+/// launches, and that child becomes the leader of *that* PTY's session as an
+/// ordinary consequence of spawning it, not because it backgrounded itself
+/// (true of every agent `wrap` launches interactively, not just Codex).
+///
+/// This has to be conditioned on `root_pid` actually being `wrap` and cannot
+/// be a bare "direct child, self-led session" rule: that exact shape is also
+/// what Claude Code's own genuinely-detached Bash-tool child looks like —
+/// `root_pid` there is the `claude` process itself (Claude Code is not a
+/// `wrap`-launched, [`IntegrationStrategy::Wrapper`](crate::agent_registry::IntegrationStrategy::Wrapper)
+/// agent), and its Bash-tool child is a **direct** child of it, `setsid`-ed
+/// into a session it leads itself — structurally identical to `wrap`'s
+/// primary child, and it is exactly the case
+/// [`CLAUDE_BASH_TOOL_SHAPE`]'s argv cross-check exists to confirm as busy.
+/// A blanket structural exemption at that shape would have silently
+/// re-introduced PRD #370's original defect for the one agent this signal
+/// was measured against.
+///
+/// Once exempted, `wrap`'s child's own session becomes the new baseline its
+/// descendants are compared against, so the rest of the agent's ordinary
+/// process tree (still living in the freshly allocated PTY session) is not
+/// penalized for the same, already-excused, hop — but a *further* divergence
+/// anywhere below that (a genuinely detached descendant one or more session
+/// changes deeper) still reads as busy.
 ///
 /// `shapes` is the optional argv cross-check. When it is empty the structural
 /// test stands alone (which is what the measurement says already excludes every
@@ -225,6 +253,7 @@ pub fn descendant_shell_activity(
     if root.session_id <= 0 {
         return None;
     }
+    let root_is_wrap = argv_is_wrap_invocation(&root.argv);
 
     let mut children: HashMap<i32, Vec<&ProcessInfo>> = HashMap::new();
     for row in table {
@@ -269,12 +298,14 @@ pub fn descendant_shell_activity(
                 queue.push_back((candidate.pid, baseline_session_id));
                 continue;
             }
-            if parent_is_root && candidate.session_id == candidate.pid {
-                // Issue #644: the wrapper's own primary child re-leading the
+            if parent_is_root && root_is_wrap && candidate.session_id == candidate.pid {
+                // Issue #644: `wrap`'s own primary child re-leading the
                 // fresh PTY session it was spawned into — not evidence of a
                 // detached foreground command. Rebase its subtree onto its
                 // own session rather than penalizing the same hop again for
-                // every descendant that inherits it.
+                // every descendant that inherits it. Gated on `root_is_wrap`
+                // — see this function's doc comment for why a bare
+                // "direct child, self-led session" match is not enough.
                 queue.push_back((candidate.pid, candidate.session_id));
                 continue;
             }
