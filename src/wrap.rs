@@ -3102,11 +3102,110 @@ mod tests {
         );
     }
 
-    /// Scenario: for a hook-trusted interactive Codex session,
-    /// `classify_and_emit` must not touch the shared `Detector` state at all
-    /// — no text-derived `Working`/`Idle` may be emitted, because the native
-    /// `UserPromptSubmit`/`Stop` hooks are the sole source of turn-boundary
-    /// status for such a session (issue #638 round 4).
+    /// (Issue #638 round 6, auditor round-5 R5-F1) A throwaway daemon-socket
+    /// stand-in for `codex/wrap/010`–`013`. Round 6 makes "the shared
+    /// `Detector`'s state changed" and "`classify_and_emit` reached the
+    /// daemon" two different facts: raw classification now always runs (so
+    /// `Detector.last` moves regardless of suppression), and only an `Error`
+    /// classification is let through the emit gate under suppression — so
+    /// `.last` moving is no longer proof that anything reached the daemon
+    /// (see `wrap_010`'s doc comment for the full trace). Points
+    /// `DOT_AGENT_DECK_SOCKET` at a temp Unix socket, serialized against
+    /// other env-var-mutating tests via the same `STATE_DIR_ENV_LOCK`
+    /// convention `config.rs` already uses for this exact env var, and
+    /// collects every line a real `Emitter::emit` call writes. `cfg(unix)`
+    /// only, matching the established convention for every other
+    /// real-socket-level test in this codebase (`hook.rs`'s `socket_003`
+    /// through `socket_010`) — there is no portable substitute for observing
+    /// an unmockable `Emitter::emit` short of standing up a real listener.
+    #[cfg(unix)]
+    struct CapturedSocket {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        listener: std::os::unix::net::UnixListener,
+        prev_sock: Option<String>,
+    }
+
+    #[cfg(unix)]
+    impl CapturedSocket {
+        fn bind() -> Self {
+            let lock = crate::config::STATE_DIR_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().expect("create temp dir for capture socket");
+            let sock_path = tmp.path().join("wrap-capture.sock");
+            let listener =
+                std::os::unix::net::UnixListener::bind(&sock_path).expect("bind capture socket");
+            listener
+                .set_nonblocking(true)
+                .expect("set capture socket nonblocking");
+            let prev_sock = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
+            // SAFETY: STATE_DIR_ENV_LOCK held for this guard's entire lifetime
+            // (the lock lives in `_lock` and is only released by `Drop`,
+            // after the env var has been restored below).
+            unsafe {
+                std::env::set_var("DOT_AGENT_DECK_SOCKET", &sock_path);
+            }
+            Self {
+                _lock: lock,
+                _tmp: tmp,
+                listener,
+                prev_sock,
+            }
+        }
+
+        /// Drain every line received so far. `Emitter::emit`'s socket I/O
+        /// (`hook::send_to_socket`) connects, writes and flushes
+        /// synchronously on the caller's own thread, so by the time
+        /// `classify_and_emit` returns, any real emission has already been
+        /// written into the kernel's socket buffer — this only needs to wait
+        /// out scheduling slack for `accept()` to see the already-queued
+        /// connection, not for the emit itself. Bounded so a call that
+        /// legitimately emitted nothing returns promptly instead of hanging.
+        fn drain(&self) -> Vec<String> {
+            let mut lines = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while std::time::Instant::now() < deadline {
+                match self.listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                        let mut reader = std::io::BufReader::new(stream);
+                        let mut line = String::new();
+                        if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) > 0 {
+                            lines.push(line.trim_end().to_string());
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            lines
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CapturedSocket {
+        fn drop(&mut self) {
+            // SAFETY: same STATE_DIR_ENV_LOCK guard, held since `bind()`.
+            unsafe {
+                match self.prev_sock.take() {
+                    Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                    None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+                }
+            }
+        }
+    }
+
+    /// Scenario: for a hook-trusted interactive Codex session, raw
+    /// classification always runs against the shared `Detector` — `.last`
+    /// moves for every line, suppression or not — but only an `Error`
+    /// classification may reach the daemon; `Working`/`Idle` classify (state
+    /// moves) yet are discarded before `emitter.emit()`, because the native
+    /// `UserPromptSubmit`/`Stop` hooks are the sole source of `Thinking`/
+    /// `Idle` for such a session (issue #638 round 4/6).
     ///
     /// Both control lines reproduce round 3's own residual defects (round-3
     /// review/audit, `.dot-agent-deck/638-audit-findings-r3.md` F1/F2), so
@@ -3119,12 +3218,36 @@ mod tests {
     ///   the generic non-blank fallback (`Working`), the exact shape of the
     ///   end-of-turn wedge — also reproduced as a precondition.
     ///
-    /// With `suppress_text_status = true` neither line may change the
-    /// detector's state from its initial `None` — proving the text heuristic
-    /// is bypassed entirely, not merely happening to agree with the hook
-    /// channel on these inputs.
+    /// Round 6 correction (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1,
+    /// `638-review-findings-r5.md` F1): this test previously asserted that
+    /// with `suppress_text_status = true` neither line may change the
+    /// detector's state from its initial `None` at all. That assertion is no
+    /// longer true, on purpose, and the reason is measured, not stylistic.
+    /// Round 5 tried to keep that "untouched" property by special-casing the
+    /// JSON discriminator branch (`classify_codex_json`) to survive
+    /// suppression unconditionally, on the theory that it was the one branch
+    /// that mattered — but round 5's own capture replay showed 0 of 214 real
+    /// interactive segments ever reach that branch (ANSI decoration always
+    /// breaks the strict `serde_json::from_str` parse), so the real
+    /// error-turn wedge R4-F1 was about stayed live. The fix that actually
+    /// resolves on real bytes (`codex/wrap/012`) keeps `classify_codex_line`
+    /// (JSON-then-substring-fallback) feeding the shared `Detector`
+    /// UNCONDITIONALLY via `observe_detected`, so `.last` always tracks the
+    /// true raw classification — suppression or not. That is load-bearing,
+    /// not incidental: it is what lets a *second* consecutive error turn
+    /// still register as a state *change* and re-emit (`codex/wrap/013`)
+    /// instead of being silently swallowed because `.last` never left
+    /// `Some(Error)`. What suppression narrows is only the final
+    /// `emitter.emit()` call: under suppression, an `Error` classification is
+    /// still let through; a `Working`/`Idle` classification updates `.last`
+    /// but is discarded, never emitted. Because `.last` moving is no longer
+    /// proof that anything reached the daemon, this test now asserts the
+    /// no-emission property directly against a throwaway capture socket
+    /// (`CapturedSocket`, above) instead of reading `.last` as a stand-in for
+    /// it.
     #[spec("codex/wrap/010")]
     #[test]
+    #[cfg(unix)]
     fn wrap_010_hook_trusted_codex_suppresses_text_derived_status() {
         let emitter = Emitter {
             agent_type: AgentType::Codex,
@@ -3181,56 +3304,79 @@ mod tests {
              test is not exercising the real defect"
         );
 
-        // The round-4 fix: with hook trust confirmed, NEITHER line may touch
-        // the shared Detector at all.
+        // The round-6 fix: with hook trust confirmed, raw classification
+        // still updates the shared Detector for both lines (round 5's
+        // "untouched" property is gone — see the doc comment above for why),
+        // but NEITHER line's Working/Idle classification may reach the
+        // daemon.
+        let capture = CapturedSocket::bind();
         let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
             &AgentType::Codex,
         ))));
         classify_and_emit(mid_turn_composer_only, &trusted, &emitter, true, true);
         assert_eq!(
             trusted.lock().unwrap().last,
-            None,
-            "issue #638 round 4: a hook-trusted Codex session must not emit \
-             a text-derived Idle for a composer-only repaint mid-turn — the \
-             native Stop hook is the sole source of Idle for this session"
+            Some(DetectedEvent::Idle),
+            "issue #638 round 6: raw classification must still update the shared \
+             Detector's state under suppression (this composer-only line \
+             classifies Idle, per codex/wrap/007) — round 6 gates the emit, not \
+             the classify"
         );
         classify_and_emit(end_of_turn_footer, &trusted, &emitter, true, true);
         assert_eq!(
             trusted.lock().unwrap().last,
-            None,
-            "issue #638 round 4: a hook-trusted Codex session must not emit \
-             a text-derived Working for a turn-completion footer — the \
-             native Stop hook, not this text heuristic, is what settles the \
-             card back to Idle at genuine turn end"
+            Some(DetectedEvent::Working),
+            "issue #638 round 6: raw classification must still update the shared \
+             Detector's state under suppression (this completion footer \
+             classifies Working via the generic fallback) — round 6 gates the \
+             emit, not the classify"
+        );
+        let emitted = capture.drain();
+        assert!(
+            emitted.is_empty(),
+            "issue #638 round 4/6: a hook-trusted Codex session must not let a \
+             text-derived Working/Idle classification reach the daemon — the \
+             native Stop/UserPromptSubmit hooks are the sole source of \
+             Thinking/Idle for this session; got {emitted:?}"
         );
     }
 
-    /// Scenario: for a hook-trusted interactive Codex session, the JSON
-    /// `type`-discriminator branch of `classify_codex_line` must still
-    /// classify and emit even though `suppress_text_status` is `true` — only
-    /// the non-JSON plain-text fallback (the unreliable redraw-guessing
-    /// heuristic rounds 1–3 were built around) should be suppressed.
+    /// Scenario: a bare (non-ANSI-decorated) JSON error record still
+    /// classifies `Error` and reaches the daemon under suppression, and a
+    /// normal JSON turn-lifecycle pair still updates the shared `Detector`'s
+    /// state under suppression even though — as of round 6 — it is no longer
+    /// emitted. This is the control that isolates "the JSON discriminator
+    /// classifies correctly on the shape it CAN parse" from "the interactive
+    /// TUI's real bytes ever reach it" (they don't — `codex/wrap/012` covers
+    /// the real ANSI-decorated shape and is RED at head `1724f138`, where
+    /// this test is already GREEN).
     ///
-    /// Round-4 audit (`.dot-agent-deck/638-audit-findings-r4.md` R4-F1,
-    /// measured live against real `codex-cli` 0.150.1/0.151.0): a turn that
-    /// ends in a server-side error (HTTP 400) fires NO `Stop` hook at all,
-    /// confirmed three times and still absent minutes later. Under round 4's
-    /// current blanket gate (`classify_and_emit` returns before ever calling
-    /// `classify_codex_line`), a hook-trusted pane that hits this case gets
-    /// `Thinking` at prompt submit and never recovers — issue #638's own
-    /// symptom, reopened through the mechanism that replaced it, and a
-    /// regression against this branch's own prior head, where the JSON error
-    /// discriminator resolved the same turn to `Error`. Separately, review
-    /// round 4 F2 found the JSONL `type`-discriminator path is the one
-    /// `run_wrap_pipe`'s own design rationale says must stay classified
-    /// regardless of suppression, since it survives ANSI rendering and isn't
-    /// what any round's residual findings were ever about — only the
-    /// substring-based `CODEX` `RuleSet` fallback is. This test proves
-    /// today's blanket `if suppress_text_status { return; }` gate is wrong:
-    /// it must fail today, before the gate is narrowed to spare the JSON
-    /// branch.
+    /// Round-6 corrections to this test's own prose
+    /// (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1's table, measured):
+    /// this doc comment previously credited the JSON discriminator branch
+    /// with "surviving ANSI rendering" and called round 4's fix "a regression
+    /// against this branch's own prior head, where the JSON error
+    /// discriminator resolved the same turn to Error." Both were wrong. The
+    /// pre-round-4 head resolved that turn via the SUBSTRING
+    /// `CODEX.error_markers` rule (`classify_line_with`), which is what
+    /// tolerates ANSI decoration — a strict `serde_json::from_str` never has.
+    ///
+    /// Round-6 correction to this test's assertions
+    /// (`638-audit-findings-r5.md` R5-F1, "forgo one round-5 property"):
+    /// round 4/5 asserted a `{"type":"turn.started"}`/`{"type":"turn.completed"}`
+    /// pair "must still classify AND EMIT" under suppression, "proving the
+    /// JSON discriminator branch as a whole survives the gate, not just the
+    /// error case." That is no longer the design — round 6 narrows the emit
+    /// gate itself (not just the non-JSON fallback) to `Error` only under
+    /// suppression, so `turn.started`/`turn.completed` still classify (the
+    /// `Detector`'s internal state moves, asserted below via `.last`) but are
+    /// no longer emitted. This test now asserts that split explicitly at the
+    /// emission level (`CapturedSocket`, defined above `codex/wrap/010`)
+    /// rather than repeating the stale "still emits" claim: exactly one event
+    /// — the `Error` record — may reach the daemon across this whole test.
     #[spec("codex/wrap/011")]
     #[test]
+    #[cfg(unix)]
     fn wrap_011_json_discriminator_survives_suppression() {
         let emitter = Emitter {
             agent_type: AgentType::Codex,
@@ -3244,12 +3390,14 @@ mod tests {
             },
         };
 
+        let capture = CapturedSocket::bind();
+
         // A realistic error-turn JSON record (issue #638 round-4 audit:
         // shape of the real HTTP 400 payload Codex emits for a
-        // server-rejected turn). Even with hook trust confirmed
-        // (`suppress_text_status = true`), this must still resolve to
-        // `Error` — it is the one channel that reports a turn ending Codex's
-        // own hooks never cover.
+        // server-rejected turn) — bare and undecorated, the one shape
+        // `classify_codex_json`'s strict parse CAN see. Even with hook trust
+        // confirmed (`suppress_text_status = true`), this must still resolve
+        // to `Error` and reach the daemon.
         let error_turn = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
             &AgentType::Codex,
         ))));
@@ -3270,9 +3418,12 @@ mod tests {
              Thinking forever, reproducing #638's own symptom"
         );
 
-        // Reinforcement (reviewer round-4 F2): a normal JSON turn-lifecycle
-        // record must also still classify under suppression — the fix is
-        // "spare the whole JSON branch", not just the error case.
+        // Reinforcement: a normal JSON turn-lifecycle record still
+        // CLASSIFIES under suppression (round 6: raw classification always
+        // runs, so the Detector's internal state keeps tracking reality),
+        // but — unlike round 4/5's design — must NOT itself reach the
+        // daemon: only Error is let through the round-6 emit gate under
+        // suppression.
         let lifecycle = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
             &AgentType::Codex,
         ))));
@@ -3286,10 +3437,9 @@ mod tests {
         assert_eq!(
             lifecycle.lock().unwrap().last,
             Some(DetectedEvent::Working),
-            "issue #638 round 4 review F2: a JSON turn.started record must \
-             still classify under suppression, proving the JSON \
-             discriminator branch as a whole survives the gate, not just \
-             the error case"
+            "issue #638 round 6: a JSON turn.started record must still classify \
+             under suppression (internal Detector state keeps tracking reality) \
+             even though — unlike round 4/5 — it is no longer itself emitted"
         );
         classify_and_emit(
             r#"{"type":"turn.completed"}"#,
@@ -3301,8 +3451,224 @@ mod tests {
         assert_eq!(
             lifecycle.lock().unwrap().last,
             Some(DetectedEvent::Idle),
-            "issue #638 round 4 review F2: a JSON turn.completed record must \
-             still classify under suppression"
+            "issue #638 round 6: a JSON turn.completed record must still classify \
+             under suppression, same reasoning as turn.started above"
+        );
+
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "exactly one event may reach the daemon across this whole test: the \
+             Error record. turn.started/turn.completed must classify (proven \
+             above via Detector.last) but never emit under suppression — round \
+             6 narrows the emit gate to Error only; got {emitted:?}"
+        );
+        assert!(
+            emitted[0].contains("\"event_type\":\"error\""),
+            "the one event that reached the daemon must be the Error record, \
+             got {:?}",
+            emitted[0]
+        );
+    }
+
+    /// Scenario: a hook-trusted interactive Codex session that hits a
+    /// server-side error must still surface `Error` — not stay wedged at
+    /// `Thinking` — even though the real TUI never delivers that error as a
+    /// bare JSON line the way `codex/wrap/011`'s fixture does.
+    ///
+    /// Round 6 (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1,
+    /// `638-review-findings-r5.md` F1/F3, both independently measured against
+    /// the same preserved capture): round 5's fix spared only
+    /// `classify_codex_json`'s strict `serde_json::from_str`, but the real
+    /// interactive TUI never emits a bare JSON line — the error record
+    /// arrives embedded in an ANSI-decorated repaint segment (SGR color
+    /// codes, a `■ ` bullet, then ~500 bytes of cursor-addressing/composer
+    /// repaint after the JSON payload). `from_str` fails on byte 0 of that
+    /// segment, every time — a census across all four preserved real
+    /// captures found 0 of 214 segments parse as bare JSON-with-`type`
+    /// (`638-audit-findings-r5.md`). The fixture below is the exact byte
+    /// sequence — segment 20, 699 bytes, split the same way `tee` (`:585`)
+    /// splits on `\n`/`\r` — of a real HTTP-400-terminated interactive turn
+    /// captured live against `codex-cli` 0.150.1
+    /// (`.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`), not
+    /// a hand-written approximation. It also carries the composer's idle
+    /// placeholder (`"Ask Codex to do anything"`) in the SAME segment as the
+    /// error marker, so this doubles as a regression pin for round 3's
+    /// error-over-idle precedence (`classify_line_with`) surviving into the
+    /// suppressed path.
+    ///
+    /// RED at head `1724f138` (round 5): the JSON branch fails to parse, and
+    /// round 5's blanket `if suppress_text_status { return; }` for the
+    /// non-JSON fallback means NOTHING classifies this segment at all — the
+    /// shared `Detector` never moves off its initial `None`, and nothing
+    /// reaches the daemon. That is issue #638's own symptom (wedged at
+    /// `Thinking` forever), reopened through the mechanism round 5 shipped as
+    /// its fix.
+    #[spec("codex/wrap/012")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_012_ansi_decorated_error_segment_survives_suppression() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Verbatim segment 20 (699 bytes) of
+        // `.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin` — a
+        // real HTTP-400 error-turn repaint from an interactive `codex-cli
+        // 0.150.1` TUI, not a hand-written approximation. ANSI SGR-decorated,
+        // never valid bare JSON.
+        let decorated_error_segment = "\x1b[39;49m\x1b[K\x1b[38;5;1;49m\u{25a0} {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.1-codex-mini' model is not supported when using Codex with a ChatGPT account.\"}}\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[23;3H\x1b[21;2H\x1b[0m\x1b[49m\x1b[K\x1b[22;2H\x1b[0m\x1b[49m\x1b[K\x1b[23;27H\x1b[0m\x1b[49m\x1b[K\x1b[24;2H\x1b[0m\x1b[49m\x1b[K\x1b[25;146H\x1b[0m\x1b[49m\x1b[K\x1b[21;1H \x1b[22;1H \x1b[23;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[24;1H\x1b[22m \x1b[25;1H  \x1b[38;2;246;226;183;49mgpt-5.1-codex-mini low\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;171;223;167;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/45e45f1a-4a0d-4f8f-ba83-27ee7d6ea88b/scratchpad/r4/work\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l";
+        assert_eq!(
+            decorated_error_segment.len(),
+            699,
+            "fixture drift: this must stay byte-for-byte the captured segment \
+             (`.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`, \
+             segment 20)"
+        );
+
+        let capture = CapturedSocket::bind();
+        let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
+        assert_eq!(
+            trusted.lock().unwrap().last,
+            Some(DetectedEvent::Error),
+            "issue #638 round 6 (audit R5-F1 / review F1): a hook-trusted \
+             session's real ANSI-decorated error segment must still classify \
+             Error under suppression — round 5's strict JSON parse never \
+             matches this shape (0/214 real segments do), so only the \
+             substring error_markers rule (which survives ANSI decoration) can \
+             see it"
+        );
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "the Error classification must actually reach the daemon, not just \
+             update internal Detector state — got {emitted:?}"
+        );
+        assert!(
+            emitted[0].contains("\"event_type\":\"error\""),
+            "expected an Error event on the wire, got {:?}",
+            emitted[0]
+        );
+    }
+
+    /// Scenario: a SECOND consecutive error turn, separated by a real
+    /// captured non-error segment, must also resolve to `Error` and reach the
+    /// daemon — not be silently swallowed by the shared `Detector`'s
+    /// debounce.
+    ///
+    /// This is the exact class of bug reviewer's round-5 simpler proposed fix
+    /// (`.dot-agent-deck/638-review-findings-r5.md` F1: feed ONLY the `Error`
+    /// classification into the `Detector` under suppression, filtering
+    /// everything else before it ever reaches `observe_detected`) would NOT
+    /// catch: if nothing but `Error` ever touches `Detector.last` under
+    /// suppression, the first error sets `last = Some(Error)` and it never
+    /// leaves that state while suppression holds — a second, later error turn
+    /// then classifies to `Error` again, but `observe_detected` sees no state
+    /// CHANGE (`self.last == Some(detected)` already), returns `None`, and
+    /// the second error is silently debounced away. The auditor's round-5 fix
+    /// (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1) avoids this by
+    /// keeping raw classification running unconditionally (gating only the
+    /// final `emitter.emit()` call), so a real intervening turn's
+    /// Working/Idle classification moves `last` away from `Some(Error)` even
+    /// though it is itself never emitted, and the second error is seen as a
+    /// genuine state change again.
+    ///
+    /// The intervening segment is segment 13 (25 bytes) of the SAME preserved
+    /// real capture the error segment comes from — the actual real segment
+    /// `tee` classified shortly before the error turn, not an invented shape
+    /// (`.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`, per
+    /// the round-5 audit's own segment-by-segment replay). It carries no
+    /// error/active/idle marker and resolves via the generic non-blank
+    /// fallback to `Working`.
+    #[spec("codex/wrap/013")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_013_second_consecutive_error_turn_still_emits() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Verbatim segment 20 (699 bytes), same fixture as `codex/wrap/012`.
+        let decorated_error_segment = "\x1b[39;49m\x1b[K\x1b[38;5;1;49m\u{25a0} {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.1-codex-mini' model is not supported when using Codex with a ChatGPT account.\"}}\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[23;3H\x1b[21;2H\x1b[0m\x1b[49m\x1b[K\x1b[22;2H\x1b[0m\x1b[49m\x1b[K\x1b[23;27H\x1b[0m\x1b[49m\x1b[K\x1b[24;2H\x1b[0m\x1b[49m\x1b[K\x1b[25;146H\x1b[0m\x1b[49m\x1b[K\x1b[21;1H \x1b[22;1H \x1b[23;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[24;1H\x1b[22m \x1b[25;1H  \x1b[38;2;246;226;183;49mgpt-5.1-codex-mini low\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;171;223;167;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/45e45f1a-4a0d-4f8f-ba83-27ee7d6ea88b/scratchpad/r4/work\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l";
+        // Segment 13 of the same preserved capture — the real, non-error
+        // segment `tee` classified shortly before the error turn.
+        let real_intervening_segment = "\x1b[39;49m\x1b[K\x1b[39m\x1b[49m\x1b[0m";
+
+        let capture = CapturedSocket::bind();
+        let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+
+        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
+        assert_eq!(
+            trusted.lock().unwrap().last,
+            Some(DetectedEvent::Error),
+            "precondition: the first error must classify Error"
+        );
+
+        classify_and_emit(real_intervening_segment, &trusted, &emitter, true, true);
+        assert_eq!(
+            trusted.lock().unwrap().last,
+            Some(DetectedEvent::Working),
+            "issue #638 round 6 (audit R5-F1): a real intervening non-error \
+             segment must move the Detector's internal state away from Error \
+             even though it is never itself emitted under suppression — this \
+             is what lets a SECOND error turn register as a genuine state \
+             change rather than being debounced away. Under reviewer's \
+             round-5 simpler proposal (only Error classifications ever touch \
+             the Detector under suppression), this assertion would fail: \
+             `last` would still read Error here"
+        );
+
+        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
+        assert_eq!(
+            trusted.lock().unwrap().last,
+            Some(DetectedEvent::Error),
+            "the second error turn must also classify Error"
+        );
+
+        let emitted = capture.drain();
+        let error_count = emitted
+            .iter()
+            .filter(|l| l.contains("\"event_type\":\"error\""))
+            .count();
+        assert_eq!(
+            error_count, 2,
+            "issue #638 round 6: BOTH the first and second error turn must \
+             reach the daemon as separate Error events — a design that only \
+             feeds Error classifications into the Detector's debounce would \
+             silently swallow the second one (last never having left \
+             Some(Error)), reproducing the wedge on a second consecutive \
+             error turn; got {emitted:?}"
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|l| l.contains("\"event_type\":\"thinking\"")
+                    || l.contains("\"event_type\":\"idle\"")),
+            "the real intervening segment must never itself reach the daemon \
+             under suppression, only move internal state; got {emitted:?}"
         );
     }
 
