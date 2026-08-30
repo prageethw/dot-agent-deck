@@ -531,6 +531,120 @@ mod tests {
         );
     }
 
+    /// Scenario: issue #644 round 2 (reviewer/auditor finding F1) — in
+    /// production `wrap_launch_command`'s output is always multi-word, so
+    /// `agent_pty::spawn` always routes it through `$SHELL -c '<wrap
+    /// invocation>'` (`command_needs_shell_wrap`, `platform/shell.rs`), never
+    /// the `wrap` binary directly. Whether that shell exec-replaces itself
+    /// and hands `root_pid` the `wrap` argv, or survives as its own process
+    /// with `wrap` one hop further down, depends on the shell and the exact
+    /// command shape (dash never exec-optimizes; bash's behavior varies by
+    /// command shape — both reviewer and auditor measured real cases where
+    /// the shell survives). When the shell survives: `root_pid` is the
+    /// shell itself (`-c` as its second whitespace token, so
+    /// `argv_is_wrap_invocation` returns false), `wrap` is root's direct
+    /// child and stays in root's session (a plain non-exec'd `-c`
+    /// invocation doesn't allocate a new session — only `wrap` itself does
+    /// that, for the child *it* spawns), and the agent's primary child sits
+    /// two hops below root, in the fresh session `wrap` allocated for it.
+    /// The #644 exemption is keyed on `parent_is_root`, so it never fires on
+    /// this shape and the pane sticks at `Working` exactly as before the
+    /// round-1 fix — silently. (`src/spawn.rs:1105` pins `SHELL=/bin/sh` for
+    /// every multi-word scheduler/issue-dispatch/orchestration-role command,
+    /// so this is not a hypothetical topology.)
+    #[test]
+    fn wrap_spawned_via_a_surviving_shell_grandchild_session_change_is_not_busy_but_a_deeper_detached_descendant_still_is()
+     {
+        let shell = 800100;
+        let wrap = 800101;
+        let node_codex = 800163;
+        let codex_bin = 800172;
+
+        let healthy_codex_pane_behind_a_surviving_shell = vec![
+            row(
+                shell,
+                1,
+                shell,
+                "/bin/sh -c dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                wrap,
+                shell,
+                shell,
+                "dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                node_codex,
+                wrap,
+                node_codex,
+                "node /home/linuxbrew/.linuxbrew/bin/codex --model gpt-5.6-terra",
+            ),
+            row(
+                codex_bin,
+                node_codex,
+                node_codex,
+                "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex --model gpt-5.6-terra",
+            ),
+        ];
+        assert_eq!(
+            descendant_shell_activity(&healthy_codex_pane_behind_a_surviving_shell, shell, &[]),
+            Some(false),
+            "wrap's primary child re-leading the new pty session it was spawned into is not \
+             evidence of a detached foreground command even when the pane's `$SHELL -c` \
+             invocation survives instead of exec-replacing itself — currently this reads busy \
+             because the #644 exemption only ever checks root_pid's own argv, and root_pid here \
+             is the shell, not wrap (issue #644 round 2, reviewer/auditor finding F1)"
+        );
+
+        // A genuinely detached descendant one session-id divergence further
+        // down must still read busy, so a fix that relaxes the depth
+        // restriction cannot simply exempt everything under a wrap-rooted
+        // tree regardless of how deep it goes.
+        let mut with_detached_grandchild = healthy_codex_pane_behind_a_surviving_shell;
+        with_detached_grandchild.push(row(800200, codex_bin, 800200, "ping -c 200 127.0.0.1"));
+        assert_eq!(
+            descendant_shell_activity(&with_detached_grandchild, shell, &[]),
+            Some(true),
+            "a genuinely detached descendant further down the tree must still be reported busy \
+             even once the shell-wrapped topology is exempted"
+        );
+    }
+
+    /// Scenario: issue #644 round 2 (reviewer F3 / auditor F2) —
+    /// `argv_is_wrap_invocation` only checks that a command line's second
+    /// whitespace token is literally `wrap`; unlike `wrap.rs::is_wrap_invocation`
+    /// it does not validate that the first token is actually this deck's own
+    /// binary. A pane whose user-configured command happens to carry `wrap`
+    /// as its second word for an unrelated reason must not get the #644
+    /// exemption for its direct children.
+    #[test]
+    fn an_argv_that_merely_contains_wrap_as_its_second_token_must_not_exempt_a_detached_child() {
+        let root = 800300;
+        let detached_child = 800301;
+        let lookalike_pane = vec![
+            row(
+                root,
+                1,
+                root,
+                "git wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                detached_child,
+                root,
+                detached_child,
+                "codex --model gpt-5.6-terra",
+            ),
+        ];
+        assert_eq!(
+            descendant_shell_activity(&lookalike_pane, root, &[]),
+            Some(true),
+            "root's argv is not actually a dot-agent-deck wrap invocation — it merely has the \
+             literal token 'wrap' in the second position — so its direct child re-leading a new \
+             session is genuine evidence of a detached foreground command, not the #644 \
+             exemption's targeted shape (issue #644 round 2, reviewer F3 / auditor F2)"
+        );
+    }
+
     /// The two measured Claude Bash-tool variants: the usual one carrying the
     /// shell-snapshot `source` prologue, and the no-snapshot one where that
     /// segment is absent from the command string entirely.
