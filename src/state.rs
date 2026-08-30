@@ -9659,20 +9659,28 @@ impl AppState {
         // stays cleared: nothing ever sets `expects_agent_report` back to
         // `true` on an existing session.
         //
-        // `agent_report_activity_seen` is latched on `real_status_assertion`
-        // alone, NOT gated on `expects_agent_report` having been true at this
-        // moment (reviewer F9): the hydration/reconnect path
-        // (`seed_hydrated_session`, documented at `tests/CATALOG.md:291`)
-        // already forces `expects_agent_report` to `false` on restore, so a
-        // gate on "was expecting" would make a still-untagged pane that
-        // resolved before a detach/reconnect unable to ever re-latch after
-        // reconnecting — stuck rendering "No agent" forever despite real
-        // activity. Latching on `real_status_assertion` alone is safe: the
-        // excluded event set (`ShellBusy`, `Unknown`, `MonitoredWaitStart`,
-        // `MonitoredWaitDone`) is exactly what a genuinely-empty placeholder
-        // (bare shell, unrecognized command) produces, so the flag still only
-        // ever gets set for sessions that have had real agent activity.
-        if real_status_assertion {
+        // `agent_report_activity_seen` is latched on a real status assertion,
+        // NOT gated on `expects_agent_report` having been true at this moment
+        // (reviewer F9): the hydration/reconnect path (`seed_hydrated_session`,
+        // documented at `tests/CATALOG.md:291`) already forces
+        // `expects_agent_report` to `false` on restore, so a gate on "was
+        // expecting" would make a still-untagged pane that resolved before a
+        // detach/reconnect unable to ever re-latch after reconnecting — stuck
+        // rendering "No agent" forever despite real activity.
+        //
+        // Issue #549 fix round 2 (reviewer H1): this must NOT reuse
+        // `real_status_assertion` — that predicate's exclusion set
+        // (`ShellBusy`, `Unknown`, `MonitoredWaitStart`, `MonitoredWaitDone`)
+        // omits `ShellIdle`, which DOES assert a status (it reverts a
+        // shell-promoted `Working` back to `Idle`) and is emitted for every
+        // pane, agent or not. Latching on it made a bare-shell / `cat` /
+        // `sleep` card stop reading "No agent" the first time a foreground
+        // command finished in it. `is_daemon_synthetic()` is the existing
+        // canonical answer to "is this producer evidence?" (see its doc) and
+        // also covers the delivery-notice `Error`, so use it here instead —
+        // `real_status_assertion` itself stays untouched; it's still correct
+        // for the synthetic-marker clear above.
+        if asserted_status && !event.is_daemon_synthetic() {
             session.expects_agent_report = false;
             session.agent_report_activity_seen = true;
         }

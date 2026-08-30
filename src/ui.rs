@@ -28247,6 +28247,136 @@ mod tests {
         );
     }
 
+    /// Scenario: A genuinely-empty placeholder (bare shell, `cat`, `sleep` —
+    /// inserted via the plain `insert_placeholder_session` constructor, never
+    /// `..._awaiting_report`) receives the daemon's own shell-activity pair,
+    /// `ShellBusy` then `ShellIdle`, and nothing else — the only events a
+    /// non-agent pane can ever produce. The card must still show "No agent"
+    /// and "Launch an agent to get started" afterwards, and
+    /// `agent_report_activity_seen` must still be `false`. Does not assert:
+    /// the untagged-hook-event path, which is `dashboard/placeholder/004`'s.
+    #[spec("dashboard/placeholder/005")]
+    #[test]
+    fn dashboard_placeholder_005_daemon_synthetic_shell_activity_never_resolves_empty_placeholder()
+    {
+        // Issue #549 fix round 2 (reviewer H1): `ShellIdle` asserts a status
+        // (it reverts a shell-promoted `Working` back to `Idle`) and is
+        // emitted for every pane, agent or not. A latch keyed on
+        // `real_status_assertion` alone — that predicate excludes `ShellBusy`,
+        // `Unknown`, `MonitoredWaitStart`, `MonitoredWaitDone`, but NOT
+        // `ShellIdle` — let a bare-shell/`cat`/`sleep` pane permanently lose
+        // its empty-slot presentation the first time a foreground command
+        // finished in it. The fix keys the latch on `is_daemon_synthetic()`
+        // instead, which does cover `ShellIdle`; this pins that a
+        // daemon-synthetic shell-activity pair alone can never resolve a
+        // genuinely-empty placeholder.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+        );
+
+        fn daemon_synthetic_event_for(
+            pane_id: &str,
+            session_id: &str,
+            event_type: EventType,
+        ) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        state.apply_event(daemon_synthetic_event_for(
+            "1",
+            "shell-activity-1",
+            EventType::ShellBusy,
+        ));
+        state.apply_event(daemon_synthetic_event_for(
+            "1",
+            "shell-activity-2",
+            EventType::ShellIdle,
+        ));
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("pane 1's placeholder session must still exist");
+        assert!(
+            !session.agent_report_activity_seen,
+            "a daemon-synthetic ShellBusy/ShellIdle pair must never latch \
+             agent_report_activity_seen on a genuinely-empty placeholder; \
+             got {session:?}"
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("No agent"),
+            "a bare-shell/cat/sleep placeholder must still show the \
+             genuinely-empty 'No agent' status after a ShellBusy/ShellIdle \
+             pair; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "a bare-shell/cat/sleep placeholder must still show the \
+             genuinely-empty body line after a ShellBusy/ShellIdle pair; \
+             got:\n{rendered}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
