@@ -2026,9 +2026,11 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// **substring** `error_markers` rule (via [`classify_line_with`]), not the
 /// JSON discriminator, that resolves the real ANSI-decorated interactive
 /// error case — the JSON branch never sees it. The
-/// `active_markers`/`idle_markers` heuristic still runs, unchanged, for the
-/// narrower case where hook trust is NOT confirmed (see [`CODEX`]'s doc
-/// comment for that path's accepted residual limitation).
+/// `active_markers`/`idle_markers` heuristic itself always runs, unchanged;
+/// it only still has effect — its results still reach the daemon — for the
+/// narrower case where hook trust is NOT confirmed, or when it classifies as
+/// `Error` regardless of trust state (see [`CODEX`]'s doc comment for that
+/// path's accepted residual limitation).
 fn classify_and_emit(
     line: &str,
     detector: &Arc<Mutex<Detector>>,
@@ -2341,9 +2343,11 @@ fn run_wrap_pty(
     // real interactive terminal (the non-interactive `run_wrap_pipe` path never
     // sets this). When Codex's own hooks are confirmed installed and trusted,
     // they are the authoritative turn-boundary signal (see
-    // `classify_and_emit`'s doc comment) — the text heuristic below becomes
-    // dead weight AND a source of false transitions for this session, so it is
-    // suppressed entirely rather than raced against the hook channel.
+    // `classify_and_emit`'s doc comment) — the text heuristic below would be
+    // dead weight AND a source of false transitions for this session, so
+    // (round 6) every text-derived classification except `Error` is discarded
+    // at the emit gate rather than raced against the hook channel; see
+    // `classify_and_emit`.
     let suppress_text_status = is_codex && codex_hook_trust_confirmed;
 
     // Terminal-output pump: the inner master carries whatever the child wrote to
@@ -2650,12 +2654,14 @@ fn run_wrap_pipe(
     // descriptor is a real terminal), where the JSONL `type`-discriminator
     // branch of `classify_codex_line` already classifies correctly and the
     // round-1–3 heuristic's residual limitations don't apply (they are
-    // specific to the interactive TUI's plain-text redraw stream). Round 5
-    // (review round-4 F2) made this choice of `false` moot either way:
-    // `classify_and_emit`'s JSON-discriminator branch now runs regardless of
-    // `suppress_text_status`, so a redirected `codex exec --json` stream tee'd
-    // through `run_wrap_pty`'s `spawn_pipe_tee` calls (a PTY-host invocation
-    // with one redirected descriptor) classifies identically to this path.
+    // specific to the interactive TUI's plain-text redraw stream).
+    // Classification itself is identical either way — `classify_and_emit`'s
+    // JSON-discriminator branch runs regardless of `suppress_text_status` —
+    // but round 6 makes the hardcoded `false` load-bearing again for
+    // *emission*: on the PTY-host path with hook trust confirmed, a
+    // `{"type":"turn.completed"}` record classifies `Idle` and is discarded
+    // at the emit gate, whereas this path (where the gate is always open)
+    // emits it. `codex/wrap/011` pins exactly that difference.
     let out_thread = spawn_pipe_tee(
         child_stdout,
         libc::STDOUT_FILENO,
