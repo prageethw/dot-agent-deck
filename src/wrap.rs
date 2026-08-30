@@ -367,14 +367,13 @@ impl Detector {
 /// object and map its top-level `type` discriminator, returning `None` when
 /// the line is blank, isn't valid JSON, or has no string `type` field (the
 /// caller then falls back to substring classification). Split out (issue
-/// #638 round 5) so [`classify_and_emit`] can gate suppression on only the
-/// non-JSON fallback — this branch survives `suppress_text_status`
-/// unconditionally, because it's the one channel that reports a turn ending
-/// Codex's own hooks don't cover (a server-side-error turn fires no `Stop`
-/// hook — `.dot-agent-deck/638-audit-findings-r4.md` R4-F1, measured live)
-/// and because it classifies correctly regardless of whether the byte stream
-/// arrived via an interactive PTY or a redirected `codex exec --json` pipe
-/// (round-4 review F2).
+/// #638 round 5) so the two branches can be tested independently — but as of
+/// round 6 (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1) this branch is
+/// no longer specially exempted from suppression: it's just the first half of
+/// [`classify_codex_line`]'s JSON-first-then-substring-fallback flow, called
+/// unconditionally like every other branch. The real suppression logic lives
+/// entirely in [`classify_and_emit`]'s final `emitter.emit()` gate — see its
+/// doc comment for the round-6 design.
 fn classify_codex_json(line: &str) -> Option<DetectedEvent> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -2003,24 +2002,33 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// (`src/hook.rs`'s `handle_hook`).
 ///
 /// Round 5 (`.dot-agent-deck/638-audit-findings-r4.md` R4-F1;
-/// `638-review-findings-r4.md` F2): the suppression is narrower than "return
-/// before touching anything" — it only skips the non-JSON, plain-text
-/// substring fallback ([`classify_line_with`] via [`CODEX`]), the actual
-/// unreliable TUI-redraw-guessing mechanism rounds 1–3 were built around. For
-/// `is_codex`, the JSON `type`-discriminator branch
-/// ([`classify_codex_json`]) always runs and emits first, regardless of
-/// `suppress_text_status`: it's the one channel that reports the error
-/// boundary Codex's own hooks don't cover at all (a turn that ends in a
-/// server-side error fires no `Stop` hook — measured live, three times, on
-/// two Codex versions), and it classifies a redirected `codex exec --json`
-/// JSONL stream correctly whether or not it happens to be tee'd from a path
-/// that also carries suppression (`run_wrap_pty`'s redirected-descriptor
-/// tees). Only when a line does NOT parse as JSON with a string `type` field
-/// does `suppress_text_status` skip the substring fallback — leaving the
-/// shared `Detector`'s plain-text-derived state exactly as the hook channel
-/// last observed it. The `active_markers`/`idle_markers` heuristic still runs,
-/// unchanged, for the narrower case where hook trust is NOT confirmed (see
-/// [`CODEX`]'s doc comment for that path's accepted residual limitation).
+/// `638-review-findings-r4.md` F2) tried narrowing the suppression to skip
+/// only the non-JSON, plain-text substring fallback, keeping the JSON
+/// `type`-discriminator branch ([`classify_codex_json`]) exempt from
+/// suppression unconditionally. That design regressed on real bytes: the
+/// interactive TUI's error turn arrives ANSI-decorated, and a strict
+/// `serde_json::from_str` never parses it (0 of 214 real captured segments
+/// did — `.dot-agent-deck/638-audit-findings-r5.md` R5-F1), so the exempted
+/// JSON branch was exempting a channel real traffic never reaches.
+///
+/// Round 6 (`638-audit-findings-r5.md` R5-F1; `638-review-findings-r5.md`
+/// F1/F3) moves the suppression entirely off the classification path: raw
+/// classification via [`classify_codex_line`] (both its JSON and substring
+/// branches) now runs unconditionally, so the shared `Detector`'s internal
+/// debounce state always tracks reality — including a state change that is
+/// itself never emitted, which is what lets a *later* state change (e.g. a
+/// second, separate error turn) correctly register as a change and re-emit
+/// instead of being silently swallowed because `.last` never left
+/// `Some(Error)`. The suppression gate moves entirely to the final
+/// `emitter.emit()` call: under `suppress_text_status`, only an
+/// `Error`-classified event is actually sent to the daemon; everything else
+/// is classified (for bookkeeping) but discarded. It is specifically the
+/// **substring** `error_markers` rule (via [`classify_line_with`]), not the
+/// JSON discriminator, that resolves the real ANSI-decorated interactive
+/// error case — the JSON branch never sees it. The
+/// `active_markers`/`idle_markers` heuristic still runs, unchanged, for the
+/// narrower case where hook trust is NOT confirmed (see [`CODEX`]'s doc
+/// comment for that path's accepted residual limitation).
 fn classify_and_emit(
     line: &str,
     detector: &Arc<Mutex<Detector>>,
@@ -2028,26 +2036,17 @@ fn classify_and_emit(
     is_codex: bool,
     suppress_text_status: bool,
 ) {
-    if is_codex && let Some(json_ev) = classify_codex_json(line) {
-        let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-        let ev = det.observe_detected(Some(json_ev));
-        drop(det);
-        if let Some(ev) = ev {
-            emitter.emit(ev.event_type());
-        }
-        return;
-    }
-    if suppress_text_status {
-        return;
-    }
     let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
     let ev = if is_codex {
-        det.observe_detected(classify_line_with(line.trim(), &CODEX))
+        det.observe_detected(classify_codex_line(line))
     } else {
         det.observe(line)
     };
     drop(det);
     if let Some(ev) = ev {
+        if suppress_text_status && ev != DetectedEvent::Error {
+            return;
+        }
         emitter.emit(ev.event_type());
     }
 }
