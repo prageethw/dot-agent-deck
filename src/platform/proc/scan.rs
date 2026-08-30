@@ -5,7 +5,11 @@
 //! Everything here is pure data and compiles on every platform. Only the act of
 //! *sampling* the machine is platform code: [`super::process_table`] is
 //! implemented in `unix.rs` and is an unconditional `None` in `windows.rs`,
-//! matching `foreground_pgid`'s existing contract.
+//! matching `foreground_pgid`'s existing contract. One narrow exception:
+//! [`descendant_shell_activity`]'s #644 `wrap`-detection reads this build's
+//! own binary identity (`crate::wrap::is_wrap_invocation`) to validate a
+//! candidate's argv, which does real I/O (`current_exe()`) rather than
+//! working purely off the sampled table — see that function's doc comment.
 //!
 //! ## Why the discriminator is structural
 //!
@@ -130,6 +134,24 @@ pub const CLAUDE_BASH_TOOL_SHAPE: ShellToolShape = ShellToolShape {
 /// against a live agent of that kind, not that it looks plausible.
 pub const MEASURED_SHELL_TOOL_SHAPES: &[ShellToolShape] = &[CLAUDE_BASH_TOOL_SHAPE];
 
+/// Whether `argv` (a whole command line, never tokenised) is a genuine
+/// `dot-agent-deck wrap` invocation. Delegates to [`crate::wrap::is_wrap_invocation`]
+/// rather than duplicating its token check, so there is exactly one place
+/// that decides this — round 1 of issue #644 kept a laxer local copy that
+/// checked only "is the second whitespace token literally `wrap`", with no
+/// validation of the first token at all, which any pane command shaped
+/// `<anything> wrap …` (`git wrap …`, `npm wrap …`) satisfied for reasons
+/// having nothing to do with this deck (round 2, reviewer F3 / auditor F2).
+/// `wrap.rs`'s own check validates that the first token's basename is
+/// actually this deck's binary — either the literal
+/// [`crate::platform::paths::DEFAULT_BINARY_NAME`] or whatever
+/// `deck_binary_for_wrap()` resolves this build's own binary to, which is
+/// what keeps this matching a fork's renamed install (`worker-agent-deck`,
+/// CLAUDE.md rule 21) as well as an unrenamed one.
+fn argv_is_wrap_invocation(argv: &str) -> bool {
+    crate::wrap::is_wrap_invocation(argv)
+}
+
 /// Every transitive descendant of `root_pid` in `table`, each reported exactly
 /// once and never including `root_pid` itself.
 ///
@@ -169,9 +191,64 @@ pub fn descendants(table: &[ProcessInfo], root_pid: i32) -> Vec<&ProcessInfo> {
 /// sampled process table, or `None` when the table cannot answer.
 ///
 /// A pane is **busy** iff `root_pid` has a transitive descendant that is in a
-/// different POSIX session than `root_pid` itself — the load-bearing condition,
-/// one `getsid` comparison per candidate, immune to any change in what an agent
-/// puts on its command line.
+/// different POSIX session than the session it inherited — the load-bearing
+/// condition, one `getsid` comparison per candidate, immune to any change in
+/// what an agent puts on its command line.
+///
+/// One structural exemption (issue #644): when some node on the path from
+/// `root_pid` down to a candidate is itself a `dot-agent-deck wrap`
+/// invocation (verified via [`argv_is_wrap_invocation`]) and is still
+/// running in the baseline session at the point that node's own direct
+/// child diverges, that child — the interactive process `wrap` spawned — is
+/// not evidence of a detached command merely for leading a session of its
+/// own. `wrap` always allocates a fresh PTY for the interactive child it
+/// launches, and that child becomes the leader of *that* PTY's session as an
+/// ordinary consequence of spawning it, not because it backgrounded itself
+/// (true of every agent `wrap` launches interactively, not just Codex).
+///
+/// **This is not restricted to `root_pid` itself being `wrap` (round 1's
+/// original shape) or to depth 1** (round 2, reviewer/auditor finding F1):
+/// `wrap_launch_command`'s output is always multi-word, so
+/// `agent_pty::spawn` always routes it through `$SHELL -c '<wrap
+/// invocation>'`, never execs `wrap` directly. When that shell exec-replaces
+/// itself (bash/zsh, most of the time), `root_pid` ends up being `wrap`
+/// itself and the exemption fires at depth 1, same as round 1. When the
+/// shell *survives* instead — dash never exec-optimizes, and any shell
+/// leaves a surviving process for a `-c` string ending in a pipeline, list,
+/// or redirection, and `src/spawn.rs` pins `SHELL=/bin/sh` for every
+/// multi-word scheduler/issue-dispatch/orchestration-role command, so this
+/// is not a hypothetical topology — `root_pid` is the shell, `wrap` is its
+/// direct child (still in the shell's session, since a plain non-exec'd
+/// `-c` invocation allocates no new session of its own), and the agent's
+/// primary child sits one hop further down, in the fresh session `wrap`
+/// allocated for it. The walk therefore tracks, per queued node, whether
+/// *that* node's own process is a `wrap` invocation, and reads it from
+/// whichever node is the immediate parent of the diverging candidate — not
+/// only from `root_pid`.
+///
+/// This has to be conditioned on the parent actually being `wrap` and
+/// cannot be a bare "direct child, self-led session" rule: that exact shape
+/// is also what Claude Code's own genuinely-detached Bash-tool child looks
+/// like — its `root_pid` is the `claude` process itself (Claude Code is not
+/// a `wrap`-launched, [`IntegrationStrategy::Wrapper`](crate::agent_registry::IntegrationStrategy::Wrapper)
+/// agent, so neither `claude` nor its `$SHELL -c` wrapper, if any, is ever a
+/// `wrap` invocation), and its Bash-tool child is a **direct** child of it,
+/// `setsid`-ed into a session it leads itself — structurally identical to
+/// `wrap`'s primary child, and it is exactly the case
+/// [`CLAUDE_BASH_TOOL_SHAPE`]'s argv cross-check exists to confirm as busy.
+/// A blanket structural exemption at that shape would have silently
+/// re-introduced PRD #370's original defect for the one agent this signal
+/// was measured against.
+///
+/// Once exempted, `wrap`'s child's own session becomes the new baseline its
+/// descendants are compared against, so the rest of the agent's ordinary
+/// process tree (still living in the freshly allocated PTY session) is not
+/// penalized for the same, already-excused, hop — but a *further* divergence
+/// anywhere below that (a genuinely detached descendant one or more session
+/// changes deeper) still reads as busy. The exemption is also capped at
+/// **one rebase per root-to-leaf path**, tracked per queued node, so a
+/// pathological multi-hop `wrap`-launching-`wrap` chain cannot exempt more
+/// than the first hop on any single path.
 ///
 /// `shapes` is the optional argv cross-check. When it is empty the structural
 /// test stands alone (which is what the measurement says already excludes every
@@ -206,27 +283,104 @@ pub fn descendant_shell_activity(
     if root.session_id <= 0 {
         return None;
     }
+    let root_is_wrap = argv_is_wrap_invocation(&root.argv);
+
+    let mut children: HashMap<i32, Vec<&ProcessInfo>> = HashMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row);
+    }
 
     let mut had_unreadable_candidate = false;
-    for candidate in descendants(table, root_pid) {
-        // A row whose session id could not be read is unclassifiable, not
-        // "different" — counting it as different would turn an exit racing the
-        // sample into a false `Working`. It is tracked separately from "same
-        // session" so a set where every candidate is unreadable reports
-        // unknown rather than a confident idle (fork issue #160's per-row
-        // fail-safe) — a confirmed-busy candidate elsewhere in the set still
-        // wins immediately via the `return Some(true)` below, untouched.
-        if candidate.session_id <= 0 {
-            had_unreadable_candidate = true;
+    let mut visited: HashSet<i32> = HashSet::new();
+    visited.insert(root_pid);
+
+    // Each queued node carries: the session id its own children must be
+    // compared against; whether the process AT this node is a `wrap`
+    // invocation still running in that same baseline session (so its own
+    // direct child re-leading a session is the #644 shape, wherever in the
+    // tree this node sits — round 2, F1); and whether the #644 exemption has
+    // already fired once on the path leading here, so a pathological
+    // multi-hop `wrap`-launching-`wrap` chain cannot rebase more than once
+    // per root-to-leaf path.
+    let mut queue: VecDeque<(i32, i32, bool, bool)> = VecDeque::new();
+    queue.push_back((root_pid, root.session_id, root_is_wrap, false));
+
+    while let Some((parent_pid, baseline_session_id, parent_is_wrap, already_rebased)) =
+        queue.pop_front()
+    {
+        let Some(kids) = children.get(&parent_pid) else {
             continue;
+        };
+        for candidate in kids {
+            if !visited.insert(candidate.pid) {
+                continue;
+            }
+            // Only worth checking a candidate's own argv for being a further
+            // `wrap` hop when it could actually matter: either it is a
+            // direct child of `root_pid` (root itself may not be `wrap` —
+            // the surviving-shell shape, F1 — so every direct child has to
+            // be checked regardless of `root_is_wrap`), or its parent is
+            // already a confirmed `wrap` node (a multi-hop chain). Every
+            // other branch of the tree — Claude's long-lived MCP children,
+            // an agent's ordinary descendants — never pays for this check.
+            let candidate_is_wrap = if parent_pid == root_pid || parent_is_wrap {
+                argv_is_wrap_invocation(&candidate.argv)
+            } else {
+                false
+            };
+            // A row whose session id could not be read is unclassifiable,
+            // not "different" — counting it as different would turn an exit
+            // racing the sample into a false `Working`. It is tracked
+            // separately from "same session" so a set where every candidate
+            // is unreadable reports unknown rather than a confident idle
+            // (fork issue #160's per-row fail-safe) — a confirmed-busy
+            // candidate elsewhere in the set still wins immediately via the
+            // `return Some(true)` below, untouched. Its own (unreadable)
+            // session id cannot seed a baseline, so descendants keep
+            // inheriting the parent's.
+            if candidate.session_id <= 0 {
+                had_unreadable_candidate = true;
+                queue.push_back((
+                    candidate.pid,
+                    baseline_session_id,
+                    candidate_is_wrap,
+                    already_rebased,
+                ));
+                continue;
+            }
+            if candidate.session_id == baseline_session_id {
+                queue.push_back((
+                    candidate.pid,
+                    baseline_session_id,
+                    candidate_is_wrap,
+                    already_rebased,
+                ));
+                continue;
+            }
+            if !already_rebased && parent_is_wrap && candidate.session_id == candidate.pid {
+                // Issue #644: `wrap`'s own primary child re-leading the
+                // fresh PTY session it was spawned into — not evidence of a
+                // detached foreground command. Rebase its subtree onto its
+                // own session rather than penalizing the same hop again for
+                // every descendant that inherits it. Gated on `parent_is_wrap`
+                // — see this function's doc comment for why a bare
+                // "direct child, self-led session" match is not enough —
+                // and on `!already_rebased` so this can fire at most once
+                // per path.
+                queue.push_back((candidate.pid, candidate.session_id, candidate_is_wrap, true));
+                continue;
+            }
+            if !shapes.is_empty() && !shapes.iter().any(|shape| shape.matches(&candidate.argv)) {
+                queue.push_back((
+                    candidate.pid,
+                    baseline_session_id,
+                    candidate_is_wrap,
+                    already_rebased,
+                ));
+                continue;
+            }
+            return Some(true);
         }
-        if candidate.session_id == root.session_id {
-            continue;
-        }
-        if !shapes.is_empty() && !shapes.iter().any(|shape| shape.matches(&candidate.argv)) {
-            continue;
-        }
-        return Some(true);
     }
     if had_unreadable_candidate {
         return None;
@@ -382,6 +536,178 @@ mod tests {
             descendant_shell_activity(&table, 100, &[CLAUDE_BASH_TOOL_SHAPE]),
             Some(false),
             "a supplied shape the descendant does not carry must veto the structural match"
+        );
+    }
+
+    /// Scenario: issue #644 — a `wrap`-spawned agent whose primary child
+    /// gets its own fresh PTY session must not be classified as "busy" by
+    /// that fact alone, but a genuinely detached descendant further down
+    /// the tree must still read busy. Mirrors the real `ps -e -o
+    /// pid,ppid,sid,tty,args` capture in `.dot-agent-deck/644-diagnosis.md`
+    /// against a live, healthy (never actually busy) Codex pane: `wrap` is
+    /// its own session leader; its primary child — the `node`/`codex`
+    /// process — leads the NEW pty session `wrap` allocated for it (an
+    /// ordinary consequence of how `wrap` spawns any interactive child, not
+    /// evidence of a detached foreground command); the codex binary child
+    /// stays in that same session. No shape is supplied (`&[]`), matching
+    /// production: Codex has no entry in `MEASURED_SHELL_TOOL_SHAPES`, so
+    /// `shell_tool_shape_key` hands the daemon an empty shape list and the
+    /// argv veto never engages for this agent kind.
+    #[test]
+    fn wrap_primary_child_session_change_is_not_busy_but_a_deeper_detached_descendant_still_is() {
+        let healthy_codex_pane = vec![
+            row(
+                707387,
+                1,
+                707387,
+                "dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                707563,
+                707387,
+                707563,
+                "node /home/linuxbrew/.linuxbrew/bin/codex --model gpt-5.6-terra",
+            ),
+            row(
+                707572,
+                707563,
+                707563,
+                "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex --model gpt-5.6-terra",
+            ),
+        ];
+        assert_eq!(
+            descendant_shell_activity(&healthy_codex_pane, 707387, &[]),
+            Some(false),
+            "wrap's own primary child re-leading the new pty session it was spawned into is not \
+             evidence of a detached foreground command (issue #644) — this is the false-positive \
+             that permanently stuck a healthy Codex pane at Working"
+        );
+
+        // Same tree, plus a genuinely detached descendant one session-id
+        // divergence further down — what an actually backgrounded command
+        // looks like. This must still read busy, or a fix would have blinded
+        // the discriminator to every session-id mismatch rather than just
+        // the primary-child one.
+        let mut with_detached_grandchild = healthy_codex_pane;
+        with_detached_grandchild.push(row(707600, 707572, 707600, "ping -c 200 127.0.0.1"));
+        assert_eq!(
+            descendant_shell_activity(&with_detached_grandchild, 707387, &[]),
+            Some(true),
+            "a genuinely detached descendant further down the tree must still be reported busy"
+        );
+    }
+
+    /// Scenario: issue #644 round 2 (reviewer/auditor finding F1) — in
+    /// production `wrap_launch_command`'s output is always multi-word, so
+    /// `agent_pty::spawn` always routes it through `$SHELL -c '<wrap
+    /// invocation>'` (`command_needs_shell_wrap`, `platform/shell.rs`), never
+    /// the `wrap` binary directly. Whether that shell exec-replaces itself
+    /// and hands `root_pid` the `wrap` argv, or survives as its own process
+    /// with `wrap` one hop further down, depends on the shell and the exact
+    /// command shape (dash never exec-optimizes; bash's behavior varies by
+    /// command shape — both reviewer and auditor measured real cases where
+    /// the shell survives). When the shell survives: `root_pid` is the
+    /// shell itself (`-c` as its second whitespace token, so
+    /// `argv_is_wrap_invocation` returns false), `wrap` is root's direct
+    /// child and stays in root's session (a plain non-exec'd `-c`
+    /// invocation doesn't allocate a new session — only `wrap` itself does
+    /// that, for the child *it* spawns), and the agent's primary child sits
+    /// two hops below root, in the fresh session `wrap` allocated for it.
+    /// The #644 exemption is keyed on `parent_is_root`, so it never fires on
+    /// this shape and the pane sticks at `Working` exactly as before the
+    /// round-1 fix — silently. (`src/spawn.rs:1105` pins `SHELL=/bin/sh` for
+    /// every multi-word scheduler/issue-dispatch/orchestration-role command,
+    /// so this is not a hypothetical topology.)
+    #[test]
+    fn wrap_spawned_via_a_surviving_shell_grandchild_session_change_is_not_busy_but_a_deeper_detached_descendant_still_is()
+     {
+        let shell = 800100;
+        let wrap = 800101;
+        let node_codex = 800163;
+        let codex_bin = 800172;
+
+        let healthy_codex_pane_behind_a_surviving_shell = vec![
+            row(
+                shell,
+                1,
+                shell,
+                "/bin/sh -c dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                wrap,
+                shell,
+                shell,
+                "dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                node_codex,
+                wrap,
+                node_codex,
+                "node /home/linuxbrew/.linuxbrew/bin/codex --model gpt-5.6-terra",
+            ),
+            row(
+                codex_bin,
+                node_codex,
+                node_codex,
+                "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex --model gpt-5.6-terra",
+            ),
+        ];
+        assert_eq!(
+            descendant_shell_activity(&healthy_codex_pane_behind_a_surviving_shell, shell, &[]),
+            Some(false),
+            "wrap's primary child re-leading the new pty session it was spawned into is not \
+             evidence of a detached foreground command even when the pane's `$SHELL -c` \
+             invocation survives instead of exec-replacing itself — currently this reads busy \
+             because the #644 exemption only ever checks root_pid's own argv, and root_pid here \
+             is the shell, not wrap (issue #644 round 2, reviewer/auditor finding F1)"
+        );
+
+        // A genuinely detached descendant one session-id divergence further
+        // down must still read busy, so a fix that relaxes the depth
+        // restriction cannot simply exempt everything under a wrap-rooted
+        // tree regardless of how deep it goes.
+        let mut with_detached_grandchild = healthy_codex_pane_behind_a_surviving_shell;
+        with_detached_grandchild.push(row(800200, codex_bin, 800200, "ping -c 200 127.0.0.1"));
+        assert_eq!(
+            descendant_shell_activity(&with_detached_grandchild, shell, &[]),
+            Some(true),
+            "a genuinely detached descendant further down the tree must still be reported busy \
+             even once the shell-wrapped topology is exempted"
+        );
+    }
+
+    /// Scenario: issue #644 round 2 (reviewer F3 / auditor F2) —
+    /// `argv_is_wrap_invocation` only checks that a command line's second
+    /// whitespace token is literally `wrap`; unlike `wrap.rs::is_wrap_invocation`
+    /// it does not validate that the first token is actually this deck's own
+    /// binary. A pane whose user-configured command happens to carry `wrap`
+    /// as its second word for an unrelated reason must not get the #644
+    /// exemption for its direct children.
+    #[test]
+    fn an_argv_that_merely_contains_wrap_as_its_second_token_must_not_exempt_a_detached_child() {
+        let root = 800300;
+        let detached_child = 800301;
+        let lookalike_pane = vec![
+            row(
+                root,
+                1,
+                root,
+                "git wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                detached_child,
+                root,
+                detached_child,
+                "codex --model gpt-5.6-terra",
+            ),
+        ];
+        assert_eq!(
+            descendant_shell_activity(&lookalike_pane, root, &[]),
+            Some(true),
+            "root's argv is not actually a dot-agent-deck wrap invocation — it merely has the \
+             literal token 'wrap' in the second position — so its direct child re-leading a new \
+             session is genuine evidence of a detached foreground command, not the #644 \
+             exemption's targeted shape (issue #644 round 2, reviewer F3 / auditor F2)"
         );
     }
 
