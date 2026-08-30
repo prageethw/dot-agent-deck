@@ -5391,6 +5391,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** the wire-boundary scrub/clamp (`session/live/007`); a real socket reconnect (`session/live/006`); the synthetic-`Working` provenance story (`session/live/011`); model-label normalization, truncation, or `Cf` sanitization at render time (`dashboard/agent-badge/001`, `/005`, `/006`).
 - **Platform coverage:** mac+linux (file is `#![cfg(unix)]` throughout — see the file's own doc comment).
 
+##### session/live/018 — A resync from a stale/lagging daemon snapshot must never clear an already-latched `agent_report_activity_seen` (issue #549 fix round 4, auditor A14).
+- **Layer:** L1 pure state (one `AppState`, a real `ToolStart` event to latch the flag, then a direct `AppState::resync_hydrated_sessions` call — no wire round-trip, mirroring the `seed_hydrated_session` unit tests `session/live/005`/`008` but for the resync path instead).
+- **Agent:** none (a synthetic `ToolStart` to latch the flag, then a hand-built `AgentRecord` modelling the stale snapshot).
+- **Asserts:** after a real, non-synthetic status assertion latches `agent_report_activity_seen` to `true` on an existing session, resyncing that same session against an `AgentRecord` whose live `SessionSnapshot` carries `agent_report_activity_seen: false` leaves the field `true` — the field's own doc says it never reverts once set for the lifetime of the `SessionState`, so the resync must OR the incoming value in rather than overwrite. Before the round-4 fix, an unconditional assign let a stale snapshot's `false` clear a locally-latched `true`, so an idle pane between turns could read "No agent" again for as long as it stayed quiet after a resync.
+- **Does not assert:** the `seed_hydrated_session` (fresh-hydration) path, which already restores the field unconditionally because a fresh placeholder always starts `false` (`session/live/005`, `dashboard/placeholder/003` per `tests/CATALOG.md:312`); a real socket-level resync round-trip (`resync_after_reconnect` itself, `src/reconnect.rs`); the status-recovery half of `resync_hydrated_sessions` (fork issues #49/#28, untested by name elsewhere but not this test's job).
+- **Platform coverage:** mac+linux (file is `#![cfg(unix)]` throughout — see the file's own doc comment).
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.

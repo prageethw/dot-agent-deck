@@ -2886,6 +2886,87 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
     );
 }
 
+/// Scenario: A session that has already latched `agent_report_activity_seen`
+/// (a real, non-synthetic status assertion happened before the outage) goes
+/// through `AppState::resync_hydrated_sessions` with an `AgentRecord` whose
+/// live `SessionSnapshot` carries `agent_report_activity_seen: false` — the
+/// shape a stale/lagging daemon snapshot can have (auditor A14, round 4).
+/// Per the field's own doc, it must never revert once set for the lifetime of
+/// the `SessionState`: the resync must OR the incoming value in rather than
+/// overwrite, so the local `true` survives.
+#[spec("session/live/018")]
+#[test]
+fn live_018_resync_never_reverts_agent_report_activity_seen() {
+    let pane = "pane-resync-latch";
+    let agent_id = "agent-resync-latch";
+
+    let mut state = AppState::default();
+    state.register_pane(pane.to_string());
+    state.apply_event(AgentEvent {
+        session_id: format!("sess-{pane}"),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::ToolStart,
+        tool_name: Some("Read".into()),
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(pane.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
+    let session_id = format!("sess-{pane}");
+    assert!(
+        state.sessions[&session_id].agent_report_activity_seen,
+        "precondition: a real ToolStart assertion must latch the flag"
+    );
+
+    // A stale/lagging daemon snapshot for the SAME agent, carrying `false`.
+    let record = AgentRecord {
+        id: agent_id.to_string(),
+        pane_id_env: Some(pane.to_string()),
+        display_name: None,
+        cwd: None,
+        tab_membership: None,
+        agent_type: Some(AgentType::ClaudeCode),
+        rows: 0,
+        cols: 0,
+        live: Some(SessionSnapshot {
+            status: state.sessions[&session_id].status.clone(),
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 0,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
+            wait_deferred_revert: false,
+            model: None,
+            agent_report_activity_seen: false,
+        }),
+        daemon_boot_id: None,
+        registration_generation: None,
+        outstanding_delegation: None,
+        silence_watch: None,
+        delegation_commission: None,
+    };
+
+    state.resync_hydrated_sessions(&[record]);
+
+    assert!(
+        state.sessions[&session_id].agent_report_activity_seen,
+        "a stale snapshot's `false` must not clear a locally-latched `true` — \
+         the field never reverts once set"
+    );
+}
+
 /// Scenario: Rehydrate one history-only Codex card and one view-only Codex card
 /// from daemon `SessionSnapshot` JSON after a detach/reconnect. Each rebuilt
 /// session must retain its non-live writability so input remains refused rather

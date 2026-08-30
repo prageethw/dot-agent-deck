@@ -7149,10 +7149,16 @@ impl AppState {
             // identical block.
             session.wait_deferred_revert =
                 snap.wait_deferred_revert && session.status == SessionStatus::Working;
-            // Issue #549 fix round (reviewer F9 / auditor A1): same
-            // unconditional treatment as `monitored_wait_active` — see
-            // `seed_hydrated_session`'s identical block.
-            session.agent_report_activity_seen = snap.agent_report_activity_seen;
+            // Issue #549 fix round (reviewer F9 / auditor A1), narrowed by
+            // round 4 (auditor A14): unlike `monitored_wait_active`, this
+            // field's own doc says it never reverts once set for the
+            // lifetime of this `SessionState`. An unconditional assign here
+            // let an older/stale snapshot carrying `false` clear a locally
+            // `true` flag on resync — an idle pane between turns could then
+            // read "No agent" again for as long as it stayed quiet. OR the
+            // incoming snapshot in instead of replacing, so a local `true`
+            // is preserved.
+            session.agent_report_activity_seen |= snap.agent_report_activity_seen;
             // PRD #20 blocker-4: the durable live-target lives in
             // `recent_events`, so restamp it ONLY when it actually differs —
             // re-pushing an identical carrier on every reconnect would evict

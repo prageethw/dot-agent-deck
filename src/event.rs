@@ -913,14 +913,25 @@ impl AgentEvent {
     /// [`EventType::Error`] (issue #424), and the flat live-surface
     /// `SessionStart` [`crate::spawn`]'s `surface_spawned_pane` forges to paint
     /// an already-attached TUI's card for a freshly-spawned scheduled pane
-    /// (issue #549 fix round 2, reviewer H1 follow-up). They carry the pane's
-    /// registry `agent_id` because that is how they land on the right card, and
-    /// that is exactly what made them indistinguishable from producer evidence
-    /// to `crate::ui::evidence_channel_is_unidentified`: one of them arriving
-    /// was enough to conclude the pane has a tagged reporting channel, when it
-    /// proves only that the DAEMON can tag its own events. A pane behind a
-    /// legacy untagged hook then resumed retyping through a channel that still
-    /// could not confirm anything.
+    /// (issue #549 fix round 2, reviewer H1 follow-up). Each hazards
+    /// `crate::ui::evidence_channel_is_unidentified` a different way, so
+    /// excluding all of them closes two distinct gaps rather than one:
+    ///
+    /// The shell-activity, monitored-wait, and delivery-notice members carry
+    /// the pane's registry `agent_id` because that is how they land on the
+    /// right card, and that is exactly what made them indistinguishable from
+    /// producer evidence: one of them arriving was enough to conclude the
+    /// pane has a tagged reporting channel, when it proves only that the
+    /// DAEMON can tag its own events. A pane behind a legacy untagged hook
+    /// then resumed retyping through a channel that still could not confirm
+    /// anything.
+    ///
+    /// The live-surface `SessionStart` member has the mirror-image shape:
+    /// `surface_spawned_pane` sets `agent_id: None` deliberately and adopts
+    /// its card by pane id instead, so it looks like *untagged* evidence, not
+    /// identified producer evidence. Left uncounted, its arrival could read
+    /// as the pane's channel confirming itself unidentified when the pane in
+    /// fact has never reported at all.
     ///
     /// The delivery-notice and live-surface halves are each recognized by their
     /// own metadata key ([`DELIVERY_NOTICE_METADATA_KEY`] /
