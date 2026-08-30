@@ -291,6 +291,7 @@ mod tests {
             shell_descendant_busy: false,
             wait_deferred_revert: false,
             model: None,
+            agent_report_activity_seen: false,
         }
     }
 

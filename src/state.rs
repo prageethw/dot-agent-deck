@@ -783,6 +783,21 @@ pub struct SessionSnapshot {
     /// provenance for whether that exact `Working` still owes a revert.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wait_deferred_revert: bool,
+    /// Issue #549 fix round (reviewer F9 / auditor A1): mirrors
+    /// [`SessionState::agent_report_activity_seen`] — see that field's doc.
+    /// Without this a session that had already resolved its placeholder
+    /// before a disconnect rendered "No agent" again immediately after
+    /// reconnect (before any new event arrived), because hydration had
+    /// nothing to restore it from — same failure class as
+    /// `shell_synthetic_working` (fork issue #21). Restored unconditionally,
+    /// like `monitored_wait_active` above: it is not provenance for one
+    /// particular `Working`, so the `status == Working` gate the two
+    /// `wait_*` flags use does not apply. Additive optional under the same
+    /// convention: an older daemon sends nothing, which decodes to `false`
+    /// — exactly today's behavior — so this needs no `PROTOCOL_VERSION`
+    /// bump.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_report_activity_seen: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1009,6 +1024,26 @@ pub struct SessionState {
     /// forward only for the reuse guard. `false` for every other
     /// placeholder.
     pub expects_agent_report: bool,
+    /// Issue #549: latched `true` by `AppState::apply_event` the first time
+    /// a genuine, non-synthetic status assertion resolves an
+    /// `expects_agent_report` placeholder — i.e. real, visible activity
+    /// happened before the producer ever identified itself (Codex's shape:
+    /// no `SessionStart` hook, so `agent_type` stays `AgentType::None`,
+    /// until its first turn completes).
+    ///
+    /// `expects_agent_report` alone can't drive `render_session_card`'s
+    /// "No agent" vs. real-status branching here, because it reads `false`
+    /// for TWO different histories that must render differently: a
+    /// placeholder that was never awaiting a report at all (a bare shell or
+    /// unrecognized command — must keep showing "No agent"), and one that
+    /// WAS awaiting and has since resolved via real activity (must show
+    /// `status_style(&session.status)` like any other card, never
+    /// "Starting…" again). This field is what tells those two apart. Never
+    /// reverts once set for the lifetime of this `SessionState`; a
+    /// `SessionEnd` restoration mints a fresh placeholder with this field
+    /// reset to `false`, which is correct — the pane really has no agent
+    /// again.
+    pub agent_report_activity_seen: bool,
 }
 
 impl SessionState {
@@ -1058,6 +1093,10 @@ impl SessionState {
             // PRD fork#378 reviewer/audit round 2 (HIGH 1 / F8): carry the
             // known model so a reconnect doesn't silently degrade the badge.
             model: self.model.clone(),
+            // Issue #549 fix round (reviewer F9 / auditor A1): carry the
+            // resolved-placeholder provenance so a reconnecting TUI doesn't
+            // render "No agent" again for a card that already resolved.
+            agent_report_activity_seen: self.agent_report_activity_seen,
         }
     }
 
@@ -6823,6 +6862,7 @@ impl AppState {
                 wait_deferred_revert: false,
                 model: None,
                 expects_agent_report,
+                agent_report_activity_seen: false,
             },
         );
         session_id
@@ -6923,6 +6963,16 @@ impl AppState {
                 // `Working` value.
                 session.wait_deferred_revert =
                     snap.wait_deferred_revert && session.status == SessionStatus::Working;
+                // Issue #549 fix round (reviewer F9 / auditor A1): restore
+                // the resolved-placeholder provenance unconditionally, like
+                // `monitored_wait_active` — it is not provenance for one
+                // particular `Working`, so no `status == Working` gate
+                // applies. Without this, a session that had already
+                // resolved before disconnect rendered "No agent" again
+                // immediately after reconnect, before any new event
+                // arrived, because `insert_placeholder_session` above always
+                // seeds it `false`.
+                session.agent_report_activity_seen = snap.agent_report_activity_seen;
                 // PRD #20 blocker-4: restore the durable live-target so a
                 // history-only / view-only card keeps refusing input right
                 // after reconnect, before any new event re-declares it. The
@@ -7153,6 +7203,16 @@ impl AppState {
             // identical block.
             session.wait_deferred_revert =
                 snap.wait_deferred_revert && session.status == SessionStatus::Working;
+            // Issue #549 fix round (reviewer F9 / auditor A1), narrowed by
+            // round 4 (auditor A14): unlike `monitored_wait_active`, this
+            // field's own doc says it never reverts once set for the
+            // lifetime of this `SessionState`. An unconditional assign here
+            // let an older/stale snapshot carrying `false` clear a locally
+            // `true` flag on resync — an idle pane between turns could then
+            // read "No agent" again for as long as it stayed quiet. OR the
+            // incoming snapshot in instead of replacing, so a local `true`
+            // is preserved.
+            session.agent_report_activity_seen |= snap.agent_report_activity_seen;
             // PRD #20 blocker-4: the durable live-target lives in
             // `recent_events`, so restamp it ONLY when it actually differs —
             // re-pushing an identical carrier on every reconnect would evict
@@ -9089,6 +9149,7 @@ impl AppState {
                 wait_deferred_revert: false,
                 model: event.model.clone(),
                 expects_agent_report: false,
+                agent_report_activity_seen: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -9631,18 +9692,57 @@ impl AppState {
         // it drops `wait_synthetic_working`, or a later `wait done` would
         // revert a `Working` a real event has since reasserted (the same
         // failure MEDIUM F/B2 fixed for `wait_synthetic_working` itself).
-        if asserted_status
+        let real_status_assertion = asserted_status
             && !matches!(
                 event.event_type,
                 EventType::ShellBusy
                     | EventType::Unknown
                     | EventType::MonitoredWaitStart
                     | EventType::MonitoredWaitDone
-            )
-        {
+            );
+        if real_status_assertion {
             session.shell_synthetic_working = false;
             session.wait_synthetic_working = false;
             session.wait_deferred_revert = false;
+        }
+
+        // Issue #549: a placeholder spawned for a recognized agent CLI
+        // (`expects_agent_report`) is meant to show "Starting..." only until
+        // the CLI has done real work — not forever, which is what happened
+        // to Codex, which posts no `SessionStart` hook (and so never sets
+        // `agent_type`) until its first turn completes. Latch it off the
+        // first time this session gets a real, non-synthetic status
+        // assertion (`real_status_assertion`, same distinction the
+        // synthetic-marker clear above already draws) — deliberately NOT
+        // gated on `agent_type` being set, since the whole point is this
+        // must fire while the producer is still untagged. Once cleared it
+        // stays cleared: nothing ever sets `expects_agent_report` back to
+        // `true` on an existing session.
+        //
+        // `agent_report_activity_seen` is latched on a real status assertion,
+        // NOT gated on `expects_agent_report` having been true at this moment
+        // (reviewer F9): the hydration/reconnect path (`seed_hydrated_session`,
+        // documented at `tests/CATALOG.md:291`) already forces
+        // `expects_agent_report` to `false` on restore, so a gate on "was
+        // expecting" would make a still-untagged pane that resolved before a
+        // detach/reconnect unable to ever re-latch after reconnecting — stuck
+        // rendering "No agent" forever despite real activity.
+        //
+        // Issue #549 fix round 2 (reviewer H1): this must NOT reuse
+        // `real_status_assertion` — that predicate's exclusion set
+        // (`ShellBusy`, `Unknown`, `MonitoredWaitStart`, `MonitoredWaitDone`)
+        // omits `ShellIdle`, which DOES assert a status (it reverts a
+        // shell-promoted `Working` back to `Idle`) and is emitted for every
+        // pane, agent or not. Latching on it made a bare-shell / `cat` /
+        // `sleep` card stop reading "No agent" the first time a foreground
+        // command finished in it. `is_daemon_synthetic()` is the existing
+        // canonical answer to "is this producer evidence?" (see its doc) and
+        // also covers the delivery-notice `Error`, so use it here instead —
+        // `real_status_assertion` itself stays untouched; it's still correct
+        // for the synthetic-marker clear above.
+        if asserted_status && !event.is_daemon_synthetic() {
+            session.expects_agent_report = false;
+            session.agent_report_activity_seen = true;
         }
 
         // PRD #361 Item 1: the marker is only meaningful while WaitingForInput
@@ -14188,6 +14288,7 @@ clear = false
                 wait_deferred_revert: false,
                 model: None,
                 expects_agent_report: false,
+                agent_report_activity_seen: false,
             },
         );
 
@@ -15192,6 +15293,7 @@ clear = false
             wait_deferred_revert: false,
             model: None,
             last_activity_ms: None,
+            agent_report_activity_seen: false,
         };
         let mut state = AppState::default();
         state.register_pane(minted_pane_id.to_string());

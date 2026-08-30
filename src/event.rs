@@ -934,22 +934,39 @@ impl AgentEvent {
     ///
     /// The daemon emits identified events of its own through the same pipeline
     /// real hook events take — [`EventType::ShellBusy`]/[`EventType::ShellIdle`]
-    /// from the shell-activity monitor (PRD #370/#386), and the delivery-notice
-    /// [`EventType::Error`] (issue #424). They carry the pane's registry
-    /// `agent_id` because that is how they land on the right card, and that is
-    /// exactly what made them indistinguishable from producer evidence to
-    /// `crate::ui::evidence_channel_is_unidentified`: one of them arriving was
-    /// enough to conclude the pane has a tagged reporting channel, when it proves
-    /// only that the DAEMON can tag its own events. A pane behind a legacy
-    /// untagged hook then resumed retyping through a channel that still could not
-    /// confirm anything.
+    /// from the shell-activity monitor (PRD #370/#386), the delivery-notice
+    /// [`EventType::Error`] (issue #424), and the flat live-surface
+    /// `SessionStart` [`crate::spawn`]'s `surface_spawned_pane` forges to paint
+    /// an already-attached TUI's card for a freshly-spawned scheduled pane
+    /// (issue #549 fix round 2, reviewer H1 follow-up). Each hazards
+    /// `crate::ui::evidence_channel_is_unidentified` a different way, so
+    /// excluding all of them closes two distinct gaps rather than one:
     ///
-    /// The delivery-notice half is recognized by its metadata key, and that is
-    /// safe in the only direction it can be abused: a forged event claiming the
-    /// key is EXCLUDED from the evidence channel, i.e. it loses standing rather
-    /// than gaining any. The key is not, and must not be treated as, an
-    /// authentication marker (auditor) — a forged raw `Error` without it marks a
-    /// card exactly as it did before.
+    /// The shell-activity, monitored-wait, and delivery-notice members carry
+    /// the pane's registry `agent_id` because that is how they land on the
+    /// right card, and that is exactly what made them indistinguishable from
+    /// producer evidence: one of them arriving was enough to conclude the
+    /// pane has a tagged reporting channel, when it proves only that the
+    /// DAEMON can tag its own events. A pane behind a legacy untagged hook
+    /// then resumed retyping through a channel that still could not confirm
+    /// anything.
+    ///
+    /// The live-surface `SessionStart` member has the mirror-image shape:
+    /// `surface_spawned_pane` sets `agent_id: None` deliberately and adopts
+    /// its card by pane id instead, so it looks like *untagged* evidence, not
+    /// identified producer evidence. Left uncounted, its arrival could read
+    /// as the pane's channel confirming itself unidentified when the pane in
+    /// fact has never reported at all.
+    ///
+    /// The delivery-notice and live-surface halves are each recognized by their
+    /// own metadata key ([`DELIVERY_NOTICE_METADATA_KEY`] /
+    /// [`DISPLAY_NAME_METADATA_KEY`] — real agent hooks never emit either, per
+    /// each constant's own doc), and that is safe in the only direction it can
+    /// be abused: a forged event claiming one of the keys is EXCLUDED from the
+    /// evidence channel, i.e. it loses standing rather than gaining any. Neither
+    /// key is, or must be treated as, an authentication marker (auditor) — a
+    /// forged raw `Error`/`SessionStart` without its key marks a card exactly
+    /// as it did before.
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(
             self.event_type,
@@ -958,6 +975,8 @@ impl AgentEvent {
                 | EventType::MonitoredWaitStart
                 | EventType::MonitoredWaitDone
         ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+            || (self.event_type == EventType::SessionStart
+                && self.metadata.contains_key(DISPLAY_NAME_METADATA_KEY))
     }
 }
 
