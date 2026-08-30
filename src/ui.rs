@@ -21579,9 +21579,27 @@ fn render_session_card(
     };
     let is_placeholder = shown_agent_type == crate::event::AgentType::None;
     let is_pending = is_placeholder && session.expects_agent_report;
+    // Issue #549: `is_placeholder` alone can't gate "No agent" here once a
+    // pending placeholder has resolved via real activity — it stays true
+    // for as long as the producer stays untagged (`shown_agent_type` is
+    // still `AgentType::None`), which for Codex can be indefinitely.
+    // `agent_report_activity_seen` (set by `AppState::apply_event` — see its
+    // doc) distinguishes "this placeholder was pending and has since done
+    // real work" from "this placeholder was never pending", so a resolved
+    // one falls through to the real `status_style` instead of the
+    // genuinely-empty copy.
+    //
+    // Fix round (reviewer F8): the OTHER `is_placeholder` uses further below
+    // (the body-line branch and the border) must gate on this same
+    // distinction, not the raw flag — otherwise a resolved placeholder
+    // renders a self-contradiction: this status label correctly reads e.g.
+    // "Thinking" while the body line beneath it still reads "Launch an
+    // agent to get started" and the border stays dimmed. `show_badge`
+    // (below) is the one deliberate exception — see its own comment (D4).
+    let is_empty_placeholder = is_placeholder && !session.agent_report_activity_seen;
     let (status_label, status_style) = if is_pending {
         ("Starting…", text_primary())
-    } else if is_placeholder {
+    } else if is_empty_placeholder {
         ("No agent", text_primary())
     } else {
         status_style(&session.status)
@@ -21711,11 +21729,14 @@ fn render_session_card(
     // selection on its own. Status is not lost: the badge still reports it.
     let base_border_style = if is_selected {
         Style::default().fg(palette::SELECTED)
-    } else if is_placeholder {
+    } else if is_empty_placeholder {
         // Placeholder ("No agent") cards read as secondary: dim the terminal's
         // own foreground (matching the prior DarkGray intent) so the empty slot
         // doesn't draw a full-strength border like a live agent. Selecting one
         // takes the branch above, so an empty slot is never dim while selected.
+        // Fix round (reviewer F8): gated on `is_empty_placeholder`, not raw
+        // `is_placeholder` — a resolved placeholder is actively working and
+        // must not draw a dimmed border.
         text_dim()
     } else {
         Style::default().fg(status_color)
@@ -21898,7 +21919,11 @@ fn render_session_card(
             "Waiting for agent to report in…",
             text_primary(),
         )));
-    } else if is_placeholder {
+    } else if is_empty_placeholder {
+        // Fix round (reviewer F8): gated on `is_empty_placeholder`, not raw
+        // `is_placeholder` — a resolved placeholder falls through to the
+        // recent-prompts branch below instead of this copy, and stops
+        // suppressing the `Prmt:` lines a visibly working agent has posted.
         lines.push(Line::from(Span::styled(
             "Launch an agent to get started",
             text_primary(),
@@ -26806,6 +26831,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -28070,6 +28096,401 @@ mod tests {
             !non_agent_session.expects_agent_report,
             "a role launched via a plain non-agent command (`cat`) must seed \
              expects_agent_report=false; got {non_agent_session:?}"
+        );
+    }
+
+    /// Scenario: A placeholder session inserted via
+    /// `insert_placeholder_session_awaiting_report` (agent_type still `None`,
+    /// `expects_agent_report = true` — the shape a spawned-but-not-yet-
+    /// reporting Codex pane has) receives a real, untagged status-asserting
+    /// event, matching Codex's own shape of doing real work before it ever
+    /// reports an agent type. The card must switch from "Starting…" to the
+    /// real asserted status, and once it has done so it must never fall back
+    /// to "Starting…" again, even after the session later goes back to Idle.
+    #[spec("dashboard/placeholder/004")]
+    #[test]
+    fn dashboard_placeholder_004_real_activity_clears_starting_and_never_reverts() {
+        // Issue #549: `expects_agent_report` is only ever set true at spawn
+        // time (`insert_placeholder_session_inner`) and nothing clears it, so
+        // `is_pending` in `render_session_card` stays true forever once set —
+        // even once the session has done real, visible work and
+        // `session.status` genuinely reflects it. This pins the maintainer's
+        // stated fix: the first genuine status-asserting event (an untagged
+        // `Thinking`, matching Codex's own "no SessionStart until the first
+        // turn completes" shape — `agent_type` stays `None` on the event, the
+        // same way the untagged-provenance machinery around
+        // `pane_status_untagged` in `state.rs` treats a producer that hasn't
+        // identified itself) must permanently clear the stuck placeholder,
+        // and a later `Idle` must not resurrect it.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        fn untagged_event_for(
+            pane_id: &str,
+            session_id: &str,
+            event_type: EventType,
+        ) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                // No agent_type reported yet — exactly Codex's shape before its
+                // first turn completes, which is issue #549's own trigger.
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        fn render(state: &AppState) -> String {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut ui = default_ui();
+            let filtered = filter_sessions(state, &ui);
+            terminal
+                .draw(|frame| {
+                    let noop =
+                        crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                    let tab_view = ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    };
+                    let tab_bar =
+                        TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                    let layout = compute_frame_layout(
+                        frame.area(),
+                        &tab_view,
+                        &tab_bar,
+                        &[],
+                        PaneLayout::Stacked,
+                        None,
+                        1,
+                    );
+                    render_frame(
+                        frame,
+                        state,
+                        &mut ui,
+                        &filtered,
+                        0,
+                        false,
+                        &noop,
+                        PaneLayout::Stacked,
+                        &tab_view,
+                        &tab_bar,
+                        &layout,
+                    )
+                })
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+        }
+
+        state.apply_event(untagged_event_for(
+            "1",
+            "hook-report-1",
+            EventType::Thinking,
+        ));
+
+        let after_activity = render(&state);
+        assert!(
+            after_activity.contains("Thinking"),
+            "a session that has had real, untagged status-asserting activity \
+             must show its real status; got:\n{after_activity}"
+        );
+        assert!(
+            !after_activity.contains("Starting…"),
+            "once real activity has occurred the stuck 'Starting…' \
+             placeholder must clear, even though agent_type is still None; \
+             got:\n{after_activity}"
+        );
+        assert!(
+            !after_activity.contains("Launch an agent to get started"),
+            "fix round (reviewer F8): a resolved placeholder's body line must \
+             not still read the genuinely-empty-placeholder copy, or the card \
+             self-contradicts its own status label; got:\n{after_activity}"
+        );
+
+        state.apply_event(untagged_event_for("1", "hook-report-2", EventType::Idle));
+
+        let after_idle = render(&state);
+        assert!(
+            after_idle.contains("Idle"),
+            "back at Idle, the card must show the normal Idle status label; \
+             got:\n{after_idle}"
+        );
+        assert!(
+            !after_idle.contains("Starting…"),
+            "once real activity has cleared the placeholder it must never \
+             revert to 'Starting…' again, even after returning to Idle; \
+             got:\n{after_idle}"
+        );
+        assert!(
+            !after_idle.contains("No agent"),
+            "reviewer F11: anchor against the F8 coherence bug more precisely \
+             than the 'Starting…' check alone — a resolved placeholder must \
+             not fall back to the genuinely-empty-placeholder label either; \
+             got:\n{after_idle}"
+        );
+    }
+
+    /// Scenario: A genuinely-empty placeholder (bare shell, `cat`, `sleep` —
+    /// inserted via the plain `insert_placeholder_session` constructor, never
+    /// `..._awaiting_report`) receives the daemon's own shell-activity pair,
+    /// `ShellBusy` then `ShellIdle`, and nothing else — the only events a
+    /// non-agent pane can ever produce. The card must still show "No agent"
+    /// and "Launch an agent to get started" afterwards, and
+    /// `agent_report_activity_seen` must still be `false`. Does not assert:
+    /// the untagged-hook-event path, which is `dashboard/placeholder/004`'s.
+    #[spec("dashboard/placeholder/005")]
+    #[test]
+    fn dashboard_placeholder_005_daemon_synthetic_shell_activity_never_resolves_empty_placeholder()
+    {
+        // Issue #549 fix round 2 (reviewer H1): `ShellIdle` asserts a status
+        // (it reverts a shell-promoted `Working` back to `Idle`) and is
+        // emitted for every pane, agent or not. A latch keyed on
+        // `real_status_assertion` alone — that predicate excludes `ShellBusy`,
+        // `Unknown`, `MonitoredWaitStart`, `MonitoredWaitDone`, but NOT
+        // `ShellIdle` — let a bare-shell/`cat`/`sleep` pane permanently lose
+        // its empty-slot presentation the first time a foreground command
+        // finished in it. The fix keys the latch on `is_daemon_synthetic()`
+        // instead, which does cover `ShellIdle`; this pins that a
+        // daemon-synthetic shell-activity pair alone can never resolve a
+        // genuinely-empty placeholder.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+        );
+
+        fn daemon_synthetic_event_for(
+            pane_id: &str,
+            session_id: &str,
+            event_type: EventType,
+        ) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        state.apply_event(daemon_synthetic_event_for(
+            "1",
+            "shell-activity-1",
+            EventType::ShellBusy,
+        ));
+        state.apply_event(daemon_synthetic_event_for(
+            "1",
+            "shell-activity-2",
+            EventType::ShellIdle,
+        ));
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("pane 1's placeholder session must still exist");
+        assert!(
+            !session.agent_report_activity_seen,
+            "a daemon-synthetic ShellBusy/ShellIdle pair must never latch \
+             agent_report_activity_seen on a genuinely-empty placeholder; \
+             got {session:?}"
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("No agent"),
+            "a bare-shell/cat/sleep placeholder must still show the \
+             genuinely-empty 'No agent' status after a ShellBusy/ShellIdle \
+             pair; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "a bare-shell/cat/sleep placeholder must still show the \
+             genuinely-empty body line after a ShellBusy/ShellIdle pair; \
+             got:\n{rendered}"
+        );
+    }
+
+    /// Scenario: Apply, via `AppState::apply_event` directly (no prior
+    /// `insert_placeholder_session*` call — this is the ONLY event the session
+    /// ever sees, matching how `spawn::surface_spawned_pane` actually reaches an
+    /// already-attached TUI for a freshly-fired scheduled pane), the exact flat
+    /// `SessionStart` shape that function forges: `agent_type: AgentType::None`
+    /// (an unrecognized command like `cat`), `agent_id: None`, and a
+    /// `display_name` metadata entry. The resulting placeholder must still show
+    /// "No agent" / "Launch an agent to get started", and
+    /// `agent_report_activity_seen` must still be `false`.
+    #[spec("dashboard/placeholder/006")]
+    #[test]
+    fn dashboard_placeholder_006_live_surface_session_start_never_resolves_empty_placeholder() {
+        // Issue #549 fix round 2 (reviewer H1 follow-up): `is_daemon_synthetic()`
+        // originally covered only `ShellBusy`/`ShellIdle`/`MonitoredWaitStart`/
+        // `MonitoredWaitDone` plus the delivery-notice `Error`, so H1's latch fix
+        // (keying on `is_daemon_synthetic()`) still let THIS event through —
+        // `surface_spawned_pane`'s forged `SessionStart` asserts a status
+        // (`EventType::SessionStart`'s arm sets `SessionStatus::Idle` and
+        // returns `asserted_status == true`) and isn't `ShellBusy`/`ShellIdle`/
+        // etc., so the latch fired on it immediately, at session-creation time,
+        // for every scheduler-spawned non-agent pane — before any real hook or
+        // shell activity ever occurred. This is what kept
+        // `live_004_real_hook_supersession_keeps_friendly_title` red even after
+        // the ShellIdle exclusion landed. Fix: `is_daemon_synthetic()` also
+        // recognizes a `SessionStart` carrying the `display_name` metadata key
+        // (`DISPLAY_NAME_METADATA_KEY`) — real agent hooks never emit that key
+        // (see its own doc comment), so this is exactly as safe a discriminator
+        // as the existing delivery-notice key.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::DISPLAY_NAME_METADATA_KEY.to_string(),
+            "morning-digest".to_string(),
+        );
+        state.apply_event(AgentEvent {
+            session_id: "1".to_string(),
+            agent_type: AgentType::None,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("1".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("the live-surface SessionStart must have created a session");
+        assert!(
+            !session.agent_report_activity_seen,
+            "a live-surface SessionStart (daemon-forged, display_name metadata \
+             present) must never latch agent_report_activity_seen on a \
+             genuinely-empty placeholder; got {session:?}"
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("No agent"),
+            "a scheduler-spawned non-agent placeholder must still show the \
+             genuinely-empty 'No agent' status right after the daemon's own \
+             live-surface SessionStart; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "a scheduler-spawned non-agent placeholder must still show the \
+             genuinely-empty body line right after the daemon's own \
+             live-surface SessionStart; got:\n{rendered}"
         );
     }
 
@@ -29985,6 +30406,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -31970,6 +32392,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         }
     }
 
@@ -32494,6 +32917,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
 
         // Spacious: get all 3
@@ -32536,6 +32960,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32569,6 +32994,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

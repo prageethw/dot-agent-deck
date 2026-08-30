@@ -4589,6 +4589,7 @@ mod tests {
                 shell_descendant_busy: false,
                 wait_deferred_revert: false,
                 model: None,
+                agent_report_activity_seen: false,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -4629,6 +4630,7 @@ mod tests {
                 shell_descendant_busy: false,
                 wait_deferred_revert: false,
                 model: None,
+                agent_report_activity_seen: false,
             }),
             daemon_boot_id: None,
             registration_generation: None,
