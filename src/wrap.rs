@@ -209,6 +209,35 @@ pub static GENERIC: RuleSet = RuleSet {
 /// own marker strings in its output and could misclassify. Documented here
 /// as a known, accepted tradeoff rather than left implicit.
 ///
+/// **Round 4 (issue #638): this ruleset is no longer the primary source of
+/// interactive Codex status.** Rounds 1–3 kept trying to make `active_markers`
+/// / `idle_markers` reliable in both directions and could not: round 3's own
+/// review and audit passes independently replayed real captured turns and
+/// found (a) a segment carrying ONLY the composer placeholder — no co-resident
+/// spinner text, because a repaint batch commonly repaints the composer rows
+/// without the spinner row — still classifies `Idle` mid-turn, and (b) a
+/// turn's closing footer (e.g. `Worked for 1m 03s`) carries neither marker, so
+/// a session that goes quiet right after it stays wedged at `Working` forever
+/// — issue #638's own original symptom, recurring at the other end of a turn.
+/// Both are the same root cause: there is no reliable TEXT signal for "the
+/// turn is genuinely, stably over" in a full-screen TUI's raw redraw stream —
+/// only for "some activity happened."
+///
+/// The real fix is to stop guessing: Codex's own native hooks
+/// (`UserPromptSubmit` → [`EventType::Thinking`], `Stop` → [`EventType::Idle`]
+/// in `src/hook.rs`'s `map_event_type`) are unconditionally installed for
+/// exactly this scenario (`codex_spawn_prep`, `src/wrap.rs`) and fire on REAL
+/// turn boundaries at the Codex engine level, not on redraw noise. When
+/// `CodexSpawnPrep::hook_trust_confirmed` is `true` for an interactive session
+/// (the common/default case), [`classify_and_emit`] suppresses this ruleset's
+/// `Working`/`Idle` output entirely and lets the hook channel be the sole
+/// source of truth — see its doc comment for the exact mechanism. This
+/// ruleset (and its `active_markers` precedence guard) remains live ONLY as
+/// the best-effort fallback for the narrower case where hook trust could not
+/// be confirmed; that fallback still carries the residual mid-turn-flicker and
+/// end-of-turn-wedge limitations described above, accepted and tracked in
+/// issue #640.
+///
 /// Selected by [`ruleset_for`] when the resolved agent is [`AgentType::Codex`];
 /// no change to the wrapper runtime.
 pub static CODEX: RuleSet = RuleSet {
@@ -1939,12 +1968,37 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// resulting card event, if the state changed. Shared by every wrap tee (the PTY
 /// master pump and the redirected-descriptor pipe pumps) so one coherent session
 /// state drives the card.
+///
+/// Issue #638 round 4: `suppress_text_status` is `true` for an interactive Codex
+/// session whose native hooks are confirmed installed AND trusted
+/// (`CodexSpawnPrep::hook_trust_confirmed`). Rounds 1–3 tried to make the raw
+/// redraw-stream text heuristic reliable in both directions and could not: a
+/// full-screen TUI repaint has no text signal for "the turn is genuinely,
+/// stably over" (round 3's audit found both a mid-turn false `Idle`, when a
+/// repaint batch carries the composer placeholder without the co-resident
+/// spinner text, and an end-of-turn wedge at `Working`, when the final segment
+/// is a completion footer with no marker at all — see
+/// `.dot-agent-deck/638-audit-findings-r3.md` F1/F2). For a hook-trusted
+/// session there is no need to guess: Codex's own `UserPromptSubmit`/`Stop`
+/// hooks (`src/hook.rs`'s `map_event_type`) already fire on the real turn
+/// boundary and ride the SAME `AgentEvent` pipeline via a different code path
+/// (`src/hook.rs`'s `handle_hook`), so this function returns before touching
+/// `detector` or `emitter` at all — the shared `Detector`'s state is left
+/// exactly as the hook channel last observed it, and no text-derived
+/// `Working`/`Idle`/`Error` is ever emitted for this session. The
+/// `active_markers`/`idle_markers` heuristic below still runs, unchanged, for
+/// the narrower case where hook trust is NOT confirmed (see [`CODEX`]'s doc
+/// comment for that path's accepted residual limitation).
 fn classify_and_emit(
     line: &str,
     detector: &Arc<Mutex<Detector>>,
     emitter: &Emitter,
     is_codex: bool,
+    suppress_text_status: bool,
 ) {
+    if suppress_text_status {
+        return;
+    }
     let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
     let ev = if is_codex {
         det.observe_detected(classify_codex_line(line))
@@ -2243,6 +2297,14 @@ fn run_wrap_pty(
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
+    // Issue #638 round 4: this is the ONLY path a wrapped agent's stdio is a
+    // real interactive terminal (the non-interactive `run_wrap_pipe` path never
+    // sets this). When Codex's own hooks are confirmed installed and trusted,
+    // they are the authoritative turn-boundary signal (see
+    // `classify_and_emit`'s doc comment) — the text heuristic below becomes
+    // dead weight AND a source of false transitions for this session, so it is
+    // suppressed entirely rather than raced against the hook channel.
+    let suppress_text_status = is_codex && codex_hook_trust_confirmed;
 
     // Terminal-output pump: the inner master carries whatever the child wrote to
     // the slave. Copy it to the real terminal fd (prefer stdout, else stderr),
@@ -2280,7 +2342,7 @@ fn run_wrap_pty(
                     watch,
                 },
                 |line| {
-                    classify_and_emit(line, &detector, &emitter, is_codex);
+                    classify_and_emit(line, &detector, &emitter, is_codex, suppress_text_status);
                 },
             );
             output_done.store(true, Ordering::SeqCst);
@@ -2297,6 +2359,7 @@ fn run_wrap_pty(
             emitter,
             &detector,
             is_codex,
+            suppress_text_status,
             Some(&interface),
         )
     });
@@ -2307,6 +2370,7 @@ fn run_wrap_pty(
             emitter,
             &detector,
             is_codex,
+            suppress_text_status,
             Some(&interface),
         )
     });
@@ -2541,12 +2605,20 @@ fn run_wrap_pipe(
         &emitter.agent_type,
     ))));
 
+    // Issue #638 round 4: `suppress_text_status` is always `false` here — this
+    // is the non-interactive path (`codex exec --json` and friends; no
+    // descriptor is a real terminal), where the JSONL `type`-discriminator
+    // branch of `classify_codex_line` already classifies correctly and the
+    // round-1–3 heuristic's residual limitations don't apply (they are
+    // specific to the interactive TUI's plain-text redraw stream). Scope kept
+    // to `run_wrap_pty` deliberately, matching the round-4 task's framing.
     let out_thread = spawn_pipe_tee(
         child_stdout,
         libc::STDOUT_FILENO,
         emitter,
         &detector,
         is_codex,
+        false,
         None,
     );
     let err_thread = spawn_pipe_tee(
@@ -2555,6 +2627,7 @@ fn run_wrap_pipe(
         emitter,
         &detector,
         is_codex,
+        false,
         None,
     );
 
@@ -2634,6 +2707,7 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
     emitter: &Arc<Emitter>,
     detector: &Arc<Mutex<Detector>>,
     is_codex: bool,
+    suppress_text_status: bool,
     interface: Option<&Arc<InterfaceWatch>>,
 ) -> std::thread::JoinHandle<()> {
     let emitter = Arc::clone(emitter);
@@ -2652,11 +2726,11 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
                 watch,
             },
             |line| {
-                classify_and_emit(line, &detector, &emitter, is_codex);
+                classify_and_emit(line, &detector, &emitter, is_codex, suppress_text_status);
             },
         ),
         None => tee(reader, FdWriter(out_fd), |line| {
-            classify_and_emit(line, &detector, &emitter, is_codex);
+            classify_and_emit(line, &detector, &emitter, is_codex, suppress_text_status);
         }),
     })
 }
@@ -2980,6 +3054,109 @@ mod tests {
              spinner and the idle composer placeholder must classify as \
              Working — an active-turn signal co-resident in the same \
              segment must override an idle marker, not lose to it"
+        );
+    }
+
+    /// Scenario: for a hook-trusted interactive Codex session,
+    /// `classify_and_emit` must not touch the shared `Detector` state at all
+    /// — no text-derived `Working`/`Idle` may be emitted, because the native
+    /// `UserPromptSubmit`/`Stop` hooks are the sole source of turn-boundary
+    /// status for such a session (issue #638 round 4).
+    ///
+    /// Both control lines reproduce round 3's own residual defects (round-3
+    /// review/audit, `.dot-agent-deck/638-audit-findings-r3.md` F1/F2), so
+    /// this test exercises the real failure modes the round-4 fix exists for,
+    /// not lines the round-3 heuristic already handled correctly:
+    /// - a composer-repaint segment carrying ONLY the idle placeholder (no
+    ///   co-resident spinner text) still misclassifies `Idle` mid-turn under
+    ///   the untrusted-hook fallback — reproduced here as a precondition;
+    /// - a turn-completion footer carries neither marker and falls through to
+    ///   the generic non-blank fallback (`Working`), the exact shape of the
+    ///   end-of-turn wedge — also reproduced as a precondition.
+    ///
+    /// With `suppress_text_status = true` neither line may change the
+    /// detector's state from its initial `None` — proving the text heuristic
+    /// is bypassed entirely, not merely happening to agree with the hook
+    /// channel on these inputs.
+    #[spec("codex/wrap/010")]
+    #[test]
+    fn wrap_010_hook_trusted_codex_suppresses_text_derived_status() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Round 3's residual mid-turn false-idle shape (audit F1): the
+        // composer placeholder alone, with no co-resident spinner text.
+        let mid_turn_composer_only = "Ask Codex to do anything";
+        // Round 3's residual end-of-turn wedge shape (audit F2): a completion
+        // footer carrying neither marker.
+        let end_of_turn_footer = "─ Worked for 1m 03s ───────────────────────────────────";
+
+        // Precondition (audit F1): with hook trust NOT confirmed, the
+        // untrusted-hook fallback still exhibits the known residual — a
+        // composer-only repaint mid-turn classifies Idle.
+        let fallback_mid_turn = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(
+            mid_turn_composer_only,
+            &fallback_mid_turn,
+            &emitter,
+            true,
+            false,
+        );
+        assert_eq!(
+            fallback_mid_turn.lock().unwrap().last,
+            Some(DetectedEvent::Idle),
+            "precondition failed: the untrusted-hook fallback must still \
+             exhibit round 3's known mid-turn false-Idle residual, or this \
+             test is not exercising the real defect"
+        );
+
+        // Precondition (audit F2): with hook trust NOT confirmed, a
+        // turn-completion footer classifies Working (the generic non-blank
+        // fallback), not Idle — the end-of-turn wedge shape.
+        let fallback_footer = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(end_of_turn_footer, &fallback_footer, &emitter, true, false);
+        assert_eq!(
+            fallback_footer.lock().unwrap().last,
+            Some(DetectedEvent::Working),
+            "precondition failed: the untrusted-hook fallback must still \
+             exhibit round 3's known end-of-turn wedge residual, or this \
+             test is not exercising the real defect"
+        );
+
+        // The round-4 fix: with hook trust confirmed, NEITHER line may touch
+        // the shared Detector at all.
+        let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(mid_turn_composer_only, &trusted, &emitter, true, true);
+        assert_eq!(
+            trusted.lock().unwrap().last,
+            None,
+            "issue #638 round 4: a hook-trusted Codex session must not emit \
+             a text-derived Idle for a composer-only repaint mid-turn — the \
+             native Stop hook is the sole source of Idle for this session"
+        );
+        classify_and_emit(end_of_turn_footer, &trusted, &emitter, true, true);
+        assert_eq!(
+            trusted.lock().unwrap().last,
+            None,
+            "issue #638 round 4: a hook-trusted Codex session must not emit \
+             a text-derived Working for a turn-completion footer — the \
+             native Stop hook, not this text heuristic, is what settles the \
+             card back to Idle at genuine turn end"
         );
     }
 
