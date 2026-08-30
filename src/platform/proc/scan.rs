@@ -385,6 +385,64 @@ mod tests {
         );
     }
 
+    /// Scenario: issue #644 — a `wrap`-spawned agent whose primary child
+    /// gets its own fresh PTY session must not be classified as "busy" by
+    /// that fact alone, but a genuinely detached descendant further down
+    /// the tree must still read busy. Mirrors the real `ps -e -o
+    /// pid,ppid,sid,tty,args` capture in `.dot-agent-deck/644-diagnosis.md`
+    /// against a live, healthy (never actually busy) Codex pane: `wrap` is
+    /// its own session leader; its primary child — the `node`/`codex`
+    /// process — leads the NEW pty session `wrap` allocated for it (an
+    /// ordinary consequence of how `wrap` spawns any interactive child, not
+    /// evidence of a detached foreground command); the codex binary child
+    /// stays in that same session. No shape is supplied (`&[]`), matching
+    /// production: Codex has no entry in `MEASURED_SHELL_TOOL_SHAPES`, so
+    /// `shell_tool_shape_key` hands the daemon an empty shape list and the
+    /// argv veto never engages for this agent kind.
+    #[test]
+    fn wrap_primary_child_session_change_is_not_busy_but_a_deeper_detached_descendant_still_is() {
+        let healthy_codex_pane = vec![
+            row(
+                707387,
+                1,
+                707387,
+                "dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                707563,
+                707387,
+                707563,
+                "node /home/linuxbrew/.linuxbrew/bin/codex --model gpt-5.6-terra",
+            ),
+            row(
+                707572,
+                707563,
+                707563,
+                "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex --model gpt-5.6-terra",
+            ),
+        ];
+        assert_eq!(
+            descendant_shell_activity(&healthy_codex_pane, 707387, &[]),
+            Some(false),
+            "wrap's own primary child re-leading the new pty session it was spawned into is not \
+             evidence of a detached foreground command (issue #644) — this is the false-positive \
+             that permanently stuck a healthy Codex pane at Working"
+        );
+
+        // Same tree, plus a genuinely detached descendant one session-id
+        // divergence further down — what an actually backgrounded command
+        // looks like. This must still read busy, or a fix would have blinded
+        // the discriminator to every session-id mismatch rather than just
+        // the primary-child one.
+        let mut with_detached_grandchild = healthy_codex_pane;
+        with_detached_grandchild.push(row(707600, 707572, 707600, "ping -c 200 127.0.0.1"));
+        assert_eq!(
+            descendant_shell_activity(&with_detached_grandchild, 707387, &[]),
+            Some(true),
+            "a genuinely detached descendant further down the tree must still be reported busy"
+        );
+    }
+
     /// The two measured Claude Bash-tool variants: the usual one carrying the
     /// shell-snapshot `source` prologue, and the no-snapshot one where that
     /// segment is absent from the command string entirely.
