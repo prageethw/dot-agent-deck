@@ -3160,6 +3160,107 @@ mod tests {
         );
     }
 
+    /// Scenario: for a hook-trusted interactive Codex session, the JSON
+    /// `type`-discriminator branch of `classify_codex_line` must still
+    /// classify and emit even though `suppress_text_status` is `true` — only
+    /// the non-JSON plain-text fallback (the unreliable redraw-guessing
+    /// heuristic rounds 1–3 were built around) should be suppressed.
+    ///
+    /// Round-4 audit (`.dot-agent-deck/638-audit-findings-r4.md` R4-F1,
+    /// measured live against real `codex-cli` 0.150.1/0.151.0): a turn that
+    /// ends in a server-side error (HTTP 400) fires NO `Stop` hook at all,
+    /// confirmed three times and still absent minutes later. Under round 4's
+    /// current blanket gate (`classify_and_emit` returns before ever calling
+    /// `classify_codex_line`), a hook-trusted pane that hits this case gets
+    /// `Thinking` at prompt submit and never recovers — issue #638's own
+    /// symptom, reopened through the mechanism that replaced it, and a
+    /// regression against this branch's own prior head, where the JSON error
+    /// discriminator resolved the same turn to `Error`. Separately, review
+    /// round 4 F2 found the JSONL `type`-discriminator path is the one
+    /// `run_wrap_pipe`'s own design rationale says must stay classified
+    /// regardless of suppression, since it survives ANSI rendering and isn't
+    /// what any round's residual findings were ever about — only the
+    /// substring-based `CODEX` `RuleSet` fallback is. This test proves
+    /// today's blanket `if suppress_text_status { return; }` gate is wrong:
+    /// it must fail today, before the gate is narrowed to spare the JSON
+    /// branch.
+    #[spec("codex/wrap/011")]
+    #[test]
+    fn wrap_011_json_discriminator_survives_suppression() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // A realistic error-turn JSON record (issue #638 round-4 audit:
+        // shape of the real HTTP 400 payload Codex emits for a
+        // server-rejected turn). Even with hook trust confirmed
+        // (`suppress_text_status = true`), this must still resolve to
+        // `Error` — it is the one channel that reports a turn ending Codex's
+        // own hooks never cover.
+        let error_turn = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(
+            r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"boom"}}"#,
+            &error_turn,
+            &emitter,
+            true,
+            true,
+        );
+        assert_eq!(
+            error_turn.lock().unwrap().last,
+            Some(DetectedEvent::Error),
+            "issue #638 round 4 audit R4-F1: a JSON error-turn record must \
+             still classify and emit as Error under suppression — Codex \
+             fires no Stop hook for a server-side-error turn ending, so \
+             suppressing this channel too leaves the card wedged at \
+             Thinking forever, reproducing #638's own symptom"
+        );
+
+        // Reinforcement (reviewer round-4 F2): a normal JSON turn-lifecycle
+        // record must also still classify under suppression — the fix is
+        // "spare the whole JSON branch", not just the error case.
+        let lifecycle = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(
+            r#"{"type":"turn.started"}"#,
+            &lifecycle,
+            &emitter,
+            true,
+            true,
+        );
+        assert_eq!(
+            lifecycle.lock().unwrap().last,
+            Some(DetectedEvent::Working),
+            "issue #638 round 4 review F2: a JSON turn.started record must \
+             still classify under suppression, proving the JSON \
+             discriminator branch as a whole survives the gate, not just \
+             the error case"
+        );
+        classify_and_emit(
+            r#"{"type":"turn.completed"}"#,
+            &lifecycle,
+            &emitter,
+            true,
+            true,
+        );
+        assert_eq!(
+            lifecycle.lock().unwrap().last,
+            Some(DetectedEvent::Idle),
+            "issue #638 round 4 review F2: a JSON turn.completed record must \
+             still classify under suppression"
+        );
+    }
+
     /// `tee` passes bytes through verbatim (including a trailing newline-less
     /// prompt) and classifies each completed line plus a trailing partial line.
     #[test]
