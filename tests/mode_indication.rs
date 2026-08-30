@@ -145,6 +145,7 @@ fn selected_card_fixture() -> SessionState {
         wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
+        agent_report_activity_seen: false,
     }
 }
 

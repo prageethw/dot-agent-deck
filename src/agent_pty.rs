@@ -13825,6 +13825,7 @@ mod spawn_tests {
                 monitored_wait_active: false,
                 wait_synthetic_working: false,
                 shell_descendant_busy: false,
+                agent_report_activity_seen: false,
                 wait_deferred_revert: false,
             }),
             spawned_at_ms: None,

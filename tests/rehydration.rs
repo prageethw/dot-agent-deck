@@ -397,6 +397,7 @@ fn make_session(
         wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
+        agent_report_activity_seen: false,
     }
 }
 
@@ -3000,6 +3001,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         wait_synthetic_working: false,
         shell_descendant_busy: false,
         wait_deferred_revert: false,
+        agent_report_activity_seen: false,
         model: None,
     };
 
@@ -3152,6 +3154,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         wait_synthetic_working: false,
                         shell_descendant_busy: false,
                         wait_deferred_revert: false,
+                        agent_report_activity_seen: false,
                         model: None,
                     }),
                     spawned_at_ms: None,
@@ -3295,6 +3298,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         wait_synthetic_working: false,
         shell_descendant_busy: false,
         wait_deferred_revert: false,
+        agent_report_activity_seen: false,
         model: None,
         expects_agent_report: false,
     };
@@ -3416,6 +3420,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
+        agent_report_activity_seen: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
@@ -3454,6 +3459,91 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         AgentType::ClaudeCode,
         "event-derived AgentType::None must fall back to the spawn-time ClaudeCode, not \
          seed the card as 'No agent'"
+    );
+}
+
+/// Scenario: A session that has already latched `agent_report_activity_seen`
+/// (a real, non-synthetic status assertion happened before the outage) goes
+/// through `AppState::resync_hydrated_sessions` with an `AgentRecord` whose
+/// live `SessionSnapshot` carries `agent_report_activity_seen: false` — the
+/// shape a stale/lagging daemon snapshot can have (auditor A14, round 4).
+/// Per the field's own doc, it must never revert once set for the lifetime of
+/// the `SessionState`: the resync must OR the incoming value in rather than
+/// overwrite, so the local `true` survives.
+#[spec("session/live/021")]
+#[test]
+fn live_021_resync_never_reverts_agent_report_activity_seen() {
+    let pane = "pane-resync-latch";
+    let agent_id = "agent-resync-latch";
+
+    let mut state = AppState::default();
+    state.register_pane(pane.to_string());
+    state.apply_event(AgentEvent {
+        session_id: format!("sess-{pane}"),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::ToolStart,
+        tool_name: Some("Read".into()),
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(pane.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
+    let session_id = format!("sess-{pane}");
+    assert!(
+        state.sessions[&session_id].agent_report_activity_seen,
+        "precondition: a real ToolStart assertion must latch the flag"
+    );
+
+    // A stale/lagging daemon snapshot for the SAME agent, carrying `false`.
+    let record = AgentRecord {
+        id: agent_id.to_string(),
+        pane_id_env: Some(pane.to_string()),
+        display_name: None,
+        cwd: None,
+        tab_membership: None,
+        agent_type: Some(AgentType::ClaudeCode),
+        rows: 0,
+        cols: 0,
+        live: Some(SessionSnapshot {
+            status: state.sessions[&session_id].status.clone(),
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 0,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
+            wait_deferred_revert: false,
+            agent_report_activity_seen: false,
+            model: None,
+            last_activity_ms: None,
+        }),
+        spawned_at_ms: None,
+        daemon_boot_id: None,
+        registration_generation: None,
+        cli_name: None,
+        crashed: None,
+        outstanding_delegation: None,
+        silence_watch: None,
+        delegation_commission: None,
+    };
+
+    state.resync_hydrated_sessions(&[record]);
+
+    assert!(
+        state.sessions[&session_id].agent_report_activity_seen,
+        "a stale snapshot's `false` must not clear a locally-latched `true` — \
+         the field never reverts once set"
     );
 }
 
@@ -3950,6 +4040,7 @@ async fn live_016_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
             wait_synthetic_working: false,
             shell_descendant_busy: false,
             wait_deferred_revert: false,
+            agent_report_activity_seen: false,
             model: None,
         }),
         spawned_at_ms: None,
@@ -4257,6 +4348,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
             wait_synthetic_working: false,
             shell_descendant_busy: false,
             wait_deferred_revert: false,
+            agent_report_activity_seen: false,
             model: None,
         }),
         spawned_at_ms: None,
