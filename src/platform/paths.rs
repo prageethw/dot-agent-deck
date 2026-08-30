@@ -309,7 +309,7 @@ pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 ///   proven through it — this is what closes the `PATH=.:/usr/bin` case.
 /// - **Shell safety.** A name outside [`is_safe_binary_name`]'s conservative
 ///   allowlist is rejected — not quoted — for the same reason `wrap.rs`'s
-///   `usable()` rejects rather than quotes: the bare name is interpolated
+///   `usable_wrap_binary()` rejects rather than quotes: the bare name is interpolated
 ///   UNQUOTED into ```` ```bash ```` blocks an agent executes verbatim, and
 ///   quoting an unsafe *bare name* would still resolve to nothing on a normal
 ///   `$PATH` — converting an injection into a silent no-op rather than a
@@ -563,7 +563,7 @@ fn is_safe_binary_name(name: &str) -> bool {
 ///   check as `orchestrator_ext`'s `is_executable_file`: `is_file()` plus, on
 ///   Unix, at least one exec permission bit; non-Unix has no cheap exec-bit
 ///   probe, so a regular file is accepted there. Unlike `wrap.rs`'s
-///   `usable()`, a bare existence probe (`is_file()`) is not enough on its
+///   `usable_wrap_binary()`, a bare existence probe (`is_file()`) is not enough on its
 ///   own: `binary_name()` feeds an agent's shell a bare command name it is
 ///   expected to *run*, so a readable-but-not-executable regular file of that
 ///   name earlier on `$PATH` must not report success (issue prageethw/dot-agent-deck#253 review);
