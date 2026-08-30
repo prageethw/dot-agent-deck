@@ -21579,9 +21579,18 @@ fn render_session_card(
     };
     let is_placeholder = shown_agent_type == crate::event::AgentType::None;
     let is_pending = is_placeholder && session.expects_agent_report;
+    // Issue #549: `is_placeholder` alone can't gate "No agent" here once a
+    // pending placeholder has resolved via real activity — it stays true
+    // for as long as the producer stays untagged (`shown_agent_type` is
+    // still `AgentType::None`), which for Codex can be indefinitely.
+    // `agent_report_activity_seen` (set by `AppState::apply_event` — see its
+    // doc) distinguishes "this placeholder was pending and has since done
+    // real work" from "this placeholder was never pending", so a resolved
+    // one falls through to the real `status_style` instead of the
+    // genuinely-empty copy.
     let (status_label, status_style) = if is_pending {
         ("Starting…", text_primary())
-    } else if is_placeholder {
+    } else if is_placeholder && !session.agent_report_activity_seen {
         ("No agent", text_primary())
     } else {
         status_style(&session.status)
@@ -26806,6 +26815,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -30120,6 +30130,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -32105,6 +32116,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         }
     }
 
@@ -32629,6 +32641,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
 
         // Spacious: get all 3
@@ -32671,6 +32684,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32704,6 +32718,7 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             expects_agent_report: false,
+            agent_report_activity_seen: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

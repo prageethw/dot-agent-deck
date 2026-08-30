@@ -969,6 +969,23 @@ pub struct SessionState {
     /// forward only for the reuse guard. `false` for every other
     /// placeholder.
     pub expects_agent_report: bool,
+    /// Issue #549: latched `true` by `AppState::apply_event` the first time
+    /// a genuine, non-synthetic status assertion resolves an
+    /// `expects_agent_report` placeholder — i.e. real, visible activity
+    /// happened before the producer ever identified itself (Codex's shape:
+    /// no `SessionStart` hook, so `agent_type` stays `AgentType::None`,
+    /// until its first turn completes).
+    ///
+    /// `expects_agent_report` alone can't drive `render_session_card`'s
+    /// "No agent" vs. real-status branching here, because it reads `false`
+    /// for TWO different histories that must render differently: a
+    /// placeholder that was never awaiting a report at all (a bare shell or
+    /// unrecognized command — must keep showing "No agent"), and one that
+    /// WAS awaiting and has since resolved via real activity (must show
+    /// `status_style(&session.status)` like any other card, never
+    /// "Starting…" again). This field is what tells those two apart. Never
+    /// reverts once set.
+    pub agent_report_activity_seen: bool,
 }
 
 impl SessionState {
@@ -6769,6 +6786,7 @@ impl AppState {
                 wait_deferred_revert: false,
                 model: None,
                 expects_agent_report,
+                agent_report_activity_seen: false,
             },
         );
         session_id
@@ -9035,6 +9053,7 @@ impl AppState {
                 wait_deferred_revert: false,
                 model: event.model.clone(),
                 expects_agent_report: false,
+                agent_report_activity_seen: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -9603,8 +9622,21 @@ impl AppState {
         // must fire while the producer is still untagged. Once cleared it
         // stays cleared: nothing ever sets `expects_agent_report` back to
         // `true` on an existing session.
+        //
+        // `agent_report_activity_seen` is latched alongside it, gated on
+        // `was_expecting_report` rather than `real_status_assertion` alone:
+        // it must record "this WAS a pending placeholder that has since
+        // resolved", not just "a real event happened", so `render_session_card`
+        // can tell that history apart from a placeholder that was never
+        // pending (see that field's doc). Both stay `AgentType::None` while
+        // untagged, so `expects_agent_report` alone can't carry this
+        // distinction once cleared.
+        let was_expecting_report = session.expects_agent_report;
         if real_status_assertion {
             session.expects_agent_report = false;
+            if was_expecting_report {
+                session.agent_report_activity_seen = true;
+            }
         }
 
         // PRD #361 Item 1: the marker is only meaningful while WaitingForInput
@@ -14149,6 +14181,7 @@ clear = false
                 wait_deferred_revert: false,
                 model: None,
                 expects_agent_report: false,
+                agent_report_activity_seen: false,
             },
         );
 

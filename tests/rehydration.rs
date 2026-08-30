@@ -395,6 +395,7 @@ fn make_session(
         wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
+        agent_report_activity_seen: false,
     }
 }
 
@@ -2841,6 +2842,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         wait_deferred_revert: false,
         model: None,
         expects_agent_report: false,
+        agent_report_activity_seen: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
