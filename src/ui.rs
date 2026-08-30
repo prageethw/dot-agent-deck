@@ -28377,6 +28377,123 @@ mod tests {
         );
     }
 
+    /// Scenario: Apply, via `AppState::apply_event` directly (no prior
+    /// `insert_placeholder_session*` call — this is the ONLY event the session
+    /// ever sees, matching how `spawn::surface_spawned_pane` actually reaches an
+    /// already-attached TUI for a freshly-fired scheduled pane), the exact flat
+    /// `SessionStart` shape that function forges: `agent_type: AgentType::None`
+    /// (an unrecognized command like `cat`), `agent_id: None`, and a
+    /// `display_name` metadata entry. The resulting placeholder must still show
+    /// "No agent" / "Launch an agent to get started", and
+    /// `agent_report_activity_seen` must still be `false`.
+    #[spec("dashboard/placeholder/006")]
+    #[test]
+    fn dashboard_placeholder_006_live_surface_session_start_never_resolves_empty_placeholder() {
+        // Issue #549 fix round 2 (reviewer H1 follow-up): `is_daemon_synthetic()`
+        // originally covered only `ShellBusy`/`ShellIdle`/`MonitoredWaitStart`/
+        // `MonitoredWaitDone` plus the delivery-notice `Error`, so H1's latch fix
+        // (keying on `is_daemon_synthetic()`) still let THIS event through —
+        // `surface_spawned_pane`'s forged `SessionStart` asserts a status
+        // (`EventType::SessionStart`'s arm sets `SessionStatus::Idle` and
+        // returns `asserted_status == true`) and isn't `ShellBusy`/`ShellIdle`/
+        // etc., so the latch fired on it immediately, at session-creation time,
+        // for every scheduler-spawned non-agent pane — before any real hook or
+        // shell activity ever occurred. This is what kept
+        // `live_004_real_hook_supersession_keeps_friendly_title` red even after
+        // the ShellIdle exclusion landed. Fix: `is_daemon_synthetic()` also
+        // recognizes a `SessionStart` carrying the `display_name` metadata key
+        // (`DISPLAY_NAME_METADATA_KEY`) — real agent hooks never emit that key
+        // (see its own doc comment), so this is exactly as safe a discriminator
+        // as the existing delivery-notice key.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::DISPLAY_NAME_METADATA_KEY.to_string(),
+            "morning-digest".to_string(),
+        );
+        state.apply_event(AgentEvent {
+            session_id: "1".to_string(),
+            agent_type: AgentType::None,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("1".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("the live-surface SessionStart must have created a session");
+        assert!(
+            !session.agent_report_activity_seen,
+            "a live-surface SessionStart (daemon-forged, display_name metadata \
+             present) must never latch agent_report_activity_seen on a \
+             genuinely-empty placeholder; got {session:?}"
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("No agent"),
+            "a scheduler-spawned non-agent placeholder must still show the \
+             genuinely-empty 'No agent' status right after the daemon's own \
+             live-surface SessionStart; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "a scheduler-spawned non-agent placeholder must still show the \
+             genuinely-empty body line right after the daemon's own \
+             live-surface SessionStart; got:\n{rendered}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
