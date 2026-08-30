@@ -305,6 +305,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the render-level "Starting…" copy (covered by `dashboard/placeholder/001`/`002`); the respawn wrap decision itself (covered by `tests/agent_detection.rs`'s `spawn_007`/`spawn_008`); `AgentType::from_command_including_devbox`'s own classification rules in isolation (covered by `from_command_including_devbox_recognizes_devbox_run` in `src/event.rs`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/placeholder/004 — Once a "Starting…" placeholder has had real, untagged status-asserting activity, it shows its real status and never reverts to "Starting…" again, even after later going back to Idle.
+- **Layer:** L1 (in-process `TestBackend` render, driven through `AppState::apply_event`).
+- **Agent:** none (synthetic untagged `AgentEvent`s — `agent_type: AgentType::None`, `agent_id: None` — matching Codex's own shape of doing real work before it has reported an agent type or identified its generation).
+- **Asserts:** issue #549 — a session inserted via `insert_placeholder_session_awaiting_report(.., expects_agent_report: true)` that then receives a real, untagged status-asserting event (`Thinking`) must render its real status (`"Thinking"`) and stop showing `"Starting…"`, even though `agent_type` is still `AgentType::None`; and once cleared this must hold permanently — a later untagged `Idle` event must render the normal `"Idle"` label and must still not show `"Starting…"` again.
+- **Does not assert:** the fresh-placeholder positive case (covered by `dashboard/placeholder/001`); the non-agent negative case (covered by `dashboard/placeholder/002`); the role-wiring seeding of `expects_agent_report` itself (covered by `dashboard/placeholder/003`); a *tagged* producer's event (real `agent_id`) reaching the same session — only the untagged path Codex's pre-first-turn shape actually exercises is pinned here.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.

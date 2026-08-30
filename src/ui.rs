@@ -28073,6 +28073,141 @@ mod tests {
         );
     }
 
+    /// Scenario: A placeholder session inserted via
+    /// `insert_placeholder_session_awaiting_report` (agent_type still `None`,
+    /// `expects_agent_report = true` — the shape a spawned-but-not-yet-
+    /// reporting Codex pane has) receives a real, untagged status-asserting
+    /// event, matching Codex's own shape of doing real work before it ever
+    /// reports an agent type. The card must switch from "Starting…" to the
+    /// real asserted status, and once it has done so it must never fall back
+    /// to "Starting…" again, even after the session later goes back to Idle.
+    #[spec("dashboard/placeholder/004")]
+    #[test]
+    fn dashboard_placeholder_004_real_activity_clears_starting_and_never_reverts() {
+        // Issue #549: `expects_agent_report` is only ever set true at spawn
+        // time (`insert_placeholder_session_inner`) and nothing clears it, so
+        // `is_pending` in `render_session_card` stays true forever once set —
+        // even once the session has done real, visible work and
+        // `session.status` genuinely reflects it. This pins the maintainer's
+        // stated fix: the first genuine status-asserting event (an untagged
+        // `Thinking`, matching Codex's own "no SessionStart until the first
+        // turn completes" shape — `agent_type` stays `None` on the event, the
+        // same way the untagged-provenance machinery around
+        // `pane_status_untagged` in `state.rs` treats a producer that hasn't
+        // identified itself) must permanently clear the stuck placeholder,
+        // and a later `Idle` must not resurrect it.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        fn untagged_event_for(
+            pane_id: &str,
+            session_id: &str,
+            event_type: EventType,
+        ) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                // No agent_type reported yet — exactly Codex's shape before its
+                // first turn completes, which is issue #549's own trigger.
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        fn render(state: &AppState) -> String {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut ui = default_ui();
+            let filtered = filter_sessions(state, &ui);
+            terminal
+                .draw(|frame| {
+                    let noop =
+                        crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                    let tab_view = ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                    };
+                    let tab_bar =
+                        TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                    let layout = compute_frame_layout(
+                        frame.area(),
+                        &tab_view,
+                        &tab_bar,
+                        &[],
+                        PaneLayout::Stacked,
+                        None,
+                        1,
+                    );
+                    render_frame(
+                        frame,
+                        state,
+                        &mut ui,
+                        &filtered,
+                        0,
+                        false,
+                        &noop,
+                        PaneLayout::Stacked,
+                        &tab_view,
+                        &tab_bar,
+                        &layout,
+                    )
+                })
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+        }
+
+        state.apply_event(untagged_event_for(
+            "1",
+            "hook-report-1",
+            EventType::Thinking,
+        ));
+
+        let after_activity = render(&state);
+        assert!(
+            after_activity.contains("Thinking"),
+            "a session that has had real, untagged status-asserting activity \
+             must show its real status; got:\n{after_activity}"
+        );
+        assert!(
+            !after_activity.contains("Starting…"),
+            "once real activity has occurred the stuck 'Starting…' \
+             placeholder must clear, even though agent_type is still None; \
+             got:\n{after_activity}"
+        );
+
+        state.apply_event(untagged_event_for("1", "hook-report-2", EventType::Idle));
+
+        let after_idle = render(&state);
+        assert!(
+            after_idle.contains("Idle"),
+            "back at Idle, the card must show the normal Idle status label; \
+             got:\n{after_idle}"
+        );
+        assert!(
+            !after_idle.contains("Starting…"),
+            "once real activity has cleared the placeholder it must never \
+             revert to 'Starting…' again, even after returning to Idle; \
+             got:\n{after_idle}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
