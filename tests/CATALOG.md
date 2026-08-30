@@ -5624,6 +5624,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** a first error turn in isolation, covered by `codex/wrap/012`; real Codex CLI execution or PTY/daemon delivery (`codex/wrap/001`); a THIRD or later error turn, or an intervening segment shaped differently from this one preserved real segment; call-site wiring itself (see `codex/wrap/010`'s **Does not assert** line — the same gap applies here).
 - **Platform coverage:** linux+mac only, `cfg(unix)` — needs a real capture socket to assert on `emitter.emit()`, same convention as `hook.rs`'s `socket_003`–`socket_010`.
 
+##### codex/wrap/014 — `deck_binary_for_wrap`'s binary-usability check accepts a real, resolvable file regardless of its filename, not only one literally named `dot-agent-deck` (issue #642).
+- **Layer:** L1 pure-data — calls the extracted `usable_wrap_binary` free function directly against a synthetic temp file; no subprocess, no PTY, no daemon.
+- **Agent:** none — a zero-byte temp file named `worker-agent-deck` stands in for a real, differently-named build; `current_exe()` inside a `cargo test` process is always the test harness binary and can't be renamed mid-test, which is why this probes the extracted check directly instead of going through `deck_binary_for_wrap`/`wrap_launch_command`.
+- **Asserts:** `usable_wrap_binary` returns the synthetic file's own path (not `None`, not the bare `"dot-agent-deck"` fallback) for a file named `worker-agent-deck` — this fork's installed filename (CLAUDE.md rule 21). Before the fix, the check required `path.file_name()? == "dot-agent-deck"` literally, so a stock fork install (`worker-agent-deck`) always failed it and `deck_binary_for_wrap` silently fell through to the bare name, which a login shell's independent `$PATH` resolution could resolve to a stale, unrelated install (the reported case: upstream Homebrew v0.38.0, six releases behind).
+- **Does not assert:** the `cargo test`-harness-exclusion behavior (a test-harness binary living in `target/<profile>/deps/` must still resolve to the co-located product build, not itself) — that shape is pinned by `wrap_launch_command_wraps_wrapper_strategy` and `wrap_launch_command_names_this_build_not_path`, which run through the full `deck_binary_for_wrap`/`wrap_launch_command` path; end-to-end wrap rewrite call-site wiring, or real process spawning.
+- **Platform coverage:** mac+linux (pure function, no OS dependency).
+
 #### codex/trust
 
 ##### codex/trust/001 — No Codex launch form receives an invocation-global hook-trust bypass (PRD #20 Greptile P1 close-by-deletion).

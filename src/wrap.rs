@@ -3823,18 +3823,21 @@ mod tests {
         }
     }
 
-    /// Issue #642: `usable_wrap_binary` must accept a real, resolvable binary
-    /// regardless of its filename. The old check hardcoded a literal
-    /// `"dot-agent-deck"` filename match, so this fork's installed
-    /// `worker-agent-deck` build (CLAUDE.md rule 21) was never accepted and
-    /// every wrap rewrite silently fell back to a bare `$PATH` lookup —
-    /// resolving to whatever `dot-agent-deck` happened to be installed
-    /// instead of the running build. Probes the extracted function directly
-    /// with a synthetic non-`dot-agent-deck`-named file, since `current_exe()`
-    /// inside a `cargo test` process is always the test harness binary and
-    /// can't be renamed mid-test.
+    /// Scenario: a real, resolvable binary must be accepted by name
+    /// resolution regardless of its filename, not only one literally named
+    /// `dot-agent-deck`.
+    ///
+    /// The old check hardcoded a literal `"dot-agent-deck"` filename match,
+    /// so this fork's installed `worker-agent-deck` build (CLAUDE.md rule 21)
+    /// was never accepted and every wrap rewrite silently fell back to a bare
+    /// `$PATH` lookup — resolving to whatever `dot-agent-deck` happened to be
+    /// installed instead of the running build (issue #642). Probes the
+    /// extracted function directly with a synthetic non-`dot-agent-deck`-named
+    /// file, since `current_exe()` inside a `cargo test` process is always
+    /// the test harness binary and can't be renamed mid-test.
+    #[spec("codex/wrap/014")]
     #[test]
-    fn usable_wrap_binary_accepts_any_filename() {
+    fn wrap_014_usable_wrap_binary_accepts_any_filename() {
         let dir = tempfile::tempdir().expect("tempdir for synthetic binary");
         let renamed = dir.path().join("worker-agent-deck");
         std::fs::write(&renamed, b"").expect("create synthetic binary file");
