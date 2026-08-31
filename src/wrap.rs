@@ -3935,6 +3935,253 @@ mod tests {
         );
     }
 
+    /// A second real Codex TUI segment, at a DIFFERENT composer-footer accent
+    /// color than `codex/wrap/012`/`015`'s fixture (RGB 228,49,113 vs the
+    /// tan 246,226,183 `CODEX_STATUS_BAR_MODEL_SGR` anchors on), must still
+    /// yield the model it visibly carries. Auditor A1: two real interactive
+    /// Codex v0.150.1 PTY captures on this machine (`.dot-agent-deck/652-captures/`)
+    /// paint the same status bar shape in this different color, and the
+    /// current anchor matches neither — `extract_codex_status_bar_model`
+    /// silently returns `None` for both, which is issue #652's exact
+    /// symptom recurring on a healthy session.
+    ///
+    /// `suppress_text_status = false` here (unlike `wrap_015`'s hook-trusted
+    /// `true`) deliberately bypasses the separate suppression-gate defect
+    /// (`codex/wrap/017`, Blocker 2) so this test isolates the anchor/
+    /// extraction bug alone: if only Blocker 1 were fixed, this test would
+    /// go green on its own, independent of whatever `classify_and_emit`'s
+    /// emit gate does.
+    ///
+    /// Scenario: a real, non-error Codex TUI segment whose status bar is
+    /// painted in a different accent color than the existing fixture is fed
+    /// through `classify_and_emit` with suppression off, and the emitted
+    /// event's `model` must still be the raw id the bar shows.
+    #[spec("codex/wrap/016")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_016_status_bar_model_survives_a_different_accent_color() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Verbatim mid-session segment (6994 bytes) at byte offset 6844 of a
+        // real interactive Codex v0.150.1 PTY capture
+        // (`.dot-agent-deck/652-captures/audit-capture.bin`) — genuinely
+        // `Working`-classified (carries both the "esc to interrupt" active
+        // marker and the "Ask Codex to do anything" idle placeholder from an
+        // earlier repaint; active-marker precedence, `codex/wrap/009`,
+        // resolves it `Working`), not an error turn. Its composer footer
+        // reads `gpt-5.6-terra medium \u{b7} <cwd>`, painted with SGR
+        // `\x1b[38;2;228;49;113;49m` — NOT `CODEX_STATUS_BAR_MODEL_SGR`'s tan.
+        let mid_session_segment = "\x1b[39;49m\x1b[K\x1b[2m\u{2022} \x1b[22mYou have 1 usage limit reset available. Run /usage to use one.\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[13;3H\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;7H\x1b[1m\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2827} codexcwd\x07\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;138;138;138;49m\u{2022}\x1b[12;8H\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;9H\x1b[1m\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;63H\x1b[0m\x1b[49m\x1b[K\x1b[12;6H\x1b[1m\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mt\x1b[38;2;202;202;202;49mi\x1b[38;2;231;231;231;49mn\x1b[38;2;242;242;242;49mg\x1b[38;2;231;231;231;49m \x1b[12;13H\x1b[38;2;167;167;167;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;128;128;128;49m ser\x1b[12;25H2\x1b[12;33Hntext7\x1b[22m\x1b[39;49m \x1b[2m(0s \u{2022} esc to interrupt)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;167;167;167;49m\u{2022}\x1b[12;7H\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2807} codexcwd\x07\x1b[?2026h\x1b[12;8H\x1b[1m\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;202;202;202;49m\u{2022}\x1b[12;9H\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280f} codexcwd\x07\x1b[?2026h\x1b[12;10H\x1b[1m\x1b[38;2;128;128;128;49mg\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49mv\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;11H\x1b[1m\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49mM\x1b[38;2;167;167;167;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;12H\x1b[38;2;128;128;128;49mM\x1b[38;2;138;138;138;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280b} codexcwd\x07\x1b[?2026h\x1b[12;13H\x1b[1m\x1b[38;2;128;128;128;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;14H\x1b[1m\x1b[38;2;128;128;128;49mP\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49m \x1b[12;41H\x1b[22m\x1b[2m\x1b[2m\x1b[39;49m1\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;242;242;242;49m\u{2022}\x1b[12;15H\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49m(\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2819} codexcwd\x07\x1b[?2026h\x1b[12;16H\x1b[1m\x1b[38;2;128;128;128;49ms\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49m(\x1b[38;2;138;138;138;49m2\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;17H\x1b[38;2;128;128;128;49me\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49m(\x1b[38;2;167;167;167;49m2\x1b[38;2;138;138;138;49m/\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;18H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49m(\x1b[38;2;202;202;202;49m2\x1b[38;2;167;167;167;49m/\x1b[38;2;138;138;138;49m3\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2839} codexcwd\x07\x1b[?2026h\x1b[12;19H\x1b[1m\x1b[38;2;128;128;128;49mv\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49m(\x1b[38;2;231;231;231;49m2\x1b[38;2;202;202;202;49m/\x1b[38;2;167;167;167;49m3\x1b[38;2;138;138;138;49m)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;codexcwd\x07\x1b[?2026h\x1b[11;1H\x1b[J\x1b[11;2H\x1b[0m\x1b[49m\x1b[K\x1b[12;2H\x1b[0m\x1b[49m\x1b[K\x1b[13;27H\x1b[0m\x1b[49m\x1b[K\x1b[14;2H\x1b[0m\x1b[49m\x1b[K\x1b[15;145H\x1b[0m\x1b[49m\x1b[K\x1b[11;1H \x1b[12;1H \x1b[13;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[14;1H\x1b[22m \x1b[15;1H  \x1b[38;2;228;49;113;49mgpt-5.6-terra medium\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;227;218;130;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/73b541f2-52f4-46a2-913b-c1f611a5282d/scratchpad/codexcwd\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[13;3HWrite the numbers 1 through\x1b[13;31H45,\x1b[13;35Hone\x1b[13;39Hper\x1b[13;43Hline,\x1b[13;49Heach\x1b[13;54Hfollowed\x1b[13;63Hby\x1b[13;66Ha\x1b[13;68Hsingle\x1b[13;75HEnglish\x1b[13;83Hword\x1b[13;88Hstarting\x1b[13;97Hwith\x1b[13;102Hthat\x1b[13;107Hmany\x1b[13;112Hletters\x1b[13;120His\x1b[13;123Hnot\x1b[13;127Hrequired\x1b[13;136H-\x1b[13;138Hjust\x1b[13;143Hany\x1b[13;147Hword.\x1b[13;153HDo\x1b[13;156Hnot\x1b[13;160Huse\x1b[13;164Hany\x1b[13;168Htools.\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;174H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[11;50r\x1b[11;1H\x1bM\x1bM\x1bM\x1bM\x1b[r\x1b[1;14r\x1b[10;1H";
+        assert_eq!(
+            mid_session_segment.len(),
+            6994,
+            "fixture drift: this must stay byte-for-byte the captured \
+             segment (`.dot-agent-deck/652-captures/audit-capture.bin`, \
+             offset 6844, length 6994)"
+        );
+
+        let capture = CapturedSocket::bind();
+        let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(mid_session_segment, &detector, &emitter, true, false);
+
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "precondition: this segment must classify Working (a state \
+             change from the fresh detector's initial None) and reach the \
+             daemon since suppress_text_status is false here; got \
+             {emitted:?}"
+        );
+        let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
+            panic!(
+                "captured line was not a valid AgentEvent: {e}; line={:?}",
+                emitted[0]
+            )
+        });
+        assert_eq!(
+            event.model,
+            Some("gpt-5.6-terra".to_string()),
+            "issue #652 auditor A1: `CODEX_STATUS_BAR_MODEL_SGR` is a single \
+             hardcoded RGB triple, but real Codex v0.150.1 sessions paint \
+             the same status bar shape in a DIFFERENT accent color — \
+             extraction must not depend on one specific color"
+        );
+    }
+
+    /// The SAME real mid-session segment as `codex/wrap/016`, this time fed
+    /// through `classify_and_emit` with `suppress_text_status = true` — the
+    /// hook-trusted default this file's own doc comment (`:232`) calls "the
+    /// common/default case". Reviewer F1 / auditor A1 combined: even once
+    /// extraction itself is fixed, `classify_and_emit`'s emit gate discards
+    /// every non-`Error` classification under suppression, so a healthy,
+    /// non-erroring Codex session — the overwhelming majority of real
+    /// sessions — never reaches the daemon carrying a model at all. Every
+    /// other spec in this file that exercises suppression
+    /// (`codex/wrap/010`\u{2013}`013`, `015`) does so with an
+    /// ERROR-classified segment, the one classification that survives the
+    /// gate; this is the first test in the suite to run a genuinely
+    /// `Working`-classified real segment through the same gate.
+    ///
+    /// Scenario: the same real non-error Codex segment as `codex/wrap/016`
+    /// is fed through `classify_and_emit` with the hook-trusted default
+    /// suppression on, and an event carrying the model must still reach the
+    /// daemon despite the segment classifying `Working`, not `Error`.
+    #[spec("codex/wrap/017")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_017_non_error_model_survives_suppression() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Same verbatim mid-session segment as `codex/wrap/016` — see that
+        // test's comment for provenance.
+        let mid_session_segment = "\x1b[39;49m\x1b[K\x1b[2m\u{2022} \x1b[22mYou have 1 usage limit reset available. Run /usage to use one.\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[13;3H\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;7H\x1b[1m\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2827} codexcwd\x07\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;138;138;138;49m\u{2022}\x1b[12;8H\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;9H\x1b[1m\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;63H\x1b[0m\x1b[49m\x1b[K\x1b[12;6H\x1b[1m\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mt\x1b[38;2;202;202;202;49mi\x1b[38;2;231;231;231;49mn\x1b[38;2;242;242;242;49mg\x1b[38;2;231;231;231;49m \x1b[12;13H\x1b[38;2;167;167;167;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;128;128;128;49m ser\x1b[12;25H2\x1b[12;33Hntext7\x1b[22m\x1b[39;49m \x1b[2m(0s \u{2022} esc to interrupt)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;167;167;167;49m\u{2022}\x1b[12;7H\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2807} codexcwd\x07\x1b[?2026h\x1b[12;8H\x1b[1m\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;202;202;202;49m\u{2022}\x1b[12;9H\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280f} codexcwd\x07\x1b[?2026h\x1b[12;10H\x1b[1m\x1b[38;2;128;128;128;49mg\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49mv\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;11H\x1b[1m\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49mM\x1b[38;2;167;167;167;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;12H\x1b[38;2;128;128;128;49mM\x1b[38;2;138;138;138;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280b} codexcwd\x07\x1b[?2026h\x1b[12;13H\x1b[1m\x1b[38;2;128;128;128;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;14H\x1b[1m\x1b[38;2;128;128;128;49mP\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49m \x1b[12;41H\x1b[22m\x1b[2m\x1b[2m\x1b[39;49m1\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;242;242;242;49m\u{2022}\x1b[12;15H\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49m(\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2819} codexcwd\x07\x1b[?2026h\x1b[12;16H\x1b[1m\x1b[38;2;128;128;128;49ms\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49m(\x1b[38;2;138;138;138;49m2\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;17H\x1b[38;2;128;128;128;49me\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49m(\x1b[38;2;167;167;167;49m2\x1b[38;2;138;138;138;49m/\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;18H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49m(\x1b[38;2;202;202;202;49m2\x1b[38;2;167;167;167;49m/\x1b[38;2;138;138;138;49m3\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2839} codexcwd\x07\x1b[?2026h\x1b[12;19H\x1b[1m\x1b[38;2;128;128;128;49mv\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49m(\x1b[38;2;231;231;231;49m2\x1b[38;2;202;202;202;49m/\x1b[38;2;167;167;167;49m3\x1b[38;2;138;138;138;49m)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;codexcwd\x07\x1b[?2026h\x1b[11;1H\x1b[J\x1b[11;2H\x1b[0m\x1b[49m\x1b[K\x1b[12;2H\x1b[0m\x1b[49m\x1b[K\x1b[13;27H\x1b[0m\x1b[49m\x1b[K\x1b[14;2H\x1b[0m\x1b[49m\x1b[K\x1b[15;145H\x1b[0m\x1b[49m\x1b[K\x1b[11;1H \x1b[12;1H \x1b[13;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[14;1H\x1b[22m \x1b[15;1H  \x1b[38;2;228;49;113;49mgpt-5.6-terra medium\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;227;218;130;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/73b541f2-52f4-46a2-913b-c1f611a5282d/scratchpad/codexcwd\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[13;3HWrite the numbers 1 through\x1b[13;31H45,\x1b[13;35Hone\x1b[13;39Hper\x1b[13;43Hline,\x1b[13;49Heach\x1b[13;54Hfollowed\x1b[13;63Hby\x1b[13;66Ha\x1b[13;68Hsingle\x1b[13;75HEnglish\x1b[13;83Hword\x1b[13;88Hstarting\x1b[13;97Hwith\x1b[13;102Hthat\x1b[13;107Hmany\x1b[13;112Hletters\x1b[13;120His\x1b[13;123Hnot\x1b[13;127Hrequired\x1b[13;136H-\x1b[13;138Hjust\x1b[13;143Hany\x1b[13;147Hword.\x1b[13;153HDo\x1b[13;156Hnot\x1b[13;160Huse\x1b[13;164Hany\x1b[13;168Htools.\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;174H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[11;50r\x1b[11;1H\x1bM\x1bM\x1bM\x1bM\x1b[r\x1b[1;14r\x1b[10;1H";
+        assert_eq!(
+            mid_session_segment.len(),
+            6994,
+            "fixture drift: this must stay byte-for-byte the captured \
+             segment (`.dot-agent-deck/652-captures/audit-capture.bin`, \
+             offset 6844, length 6994)"
+        );
+
+        let capture = CapturedSocket::bind();
+        let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
+
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "issue #652 reviewer F1 / auditor A1: a healthy, non-erroring \
+             Codex session (this segment classifies Working, not Error) \
+             must still reach the daemon carrying its model under the \
+             hook-trusted default (`suppress_text_status = true`) — today \
+             `classify_and_emit`'s emit gate (`if suppress_text_status && \
+             ev != DetectedEvent::Error {{ return; }}`) discards it \
+             entirely, so zero events reach the capture socket for this \
+             segment; got {emitted:?}"
+        );
+        let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
+            panic!(
+                "captured line was not a valid AgentEvent: {e}; line={:?}",
+                emitted[0]
+            )
+        });
+        assert_eq!(
+            event.model,
+            Some("gpt-5.6-terra".to_string()),
+            "the event that does reach the daemon under the fix must carry \
+             the model this segment's status bar shows"
+        );
+    }
+
+    /// Auditor A4 / reviewer F6: `extract_codex_status_bar_model` has never
+    /// had a direct unit test — every existing exercise of it goes through
+    /// `classify_and_emit` and a real fixture. These cover its distinct
+    /// branches with short hand-constructed inputs; it is a pure
+    /// text-processing function, so a real capture is unneeded here.
+    #[test]
+    fn extract_codex_status_bar_model_no_anchor_present() {
+        assert_eq!(
+            extract_codex_status_bar_model("no escape sequences here at all"),
+            None
+        );
+    }
+
+    /// The anchor is present but the span up to the next `\x1b` is empty or
+    /// whitespace-only — neither is a real model id.
+    #[test]
+    fn extract_codex_status_bar_model_empty_or_whitespace_only_span_is_none() {
+        let empty = format!("{CODEX_STATUS_BAR_MODEL_SGR}\x1b[0m");
+        assert_eq!(extract_codex_status_bar_model(&empty), None);
+
+        let whitespace_only = format!("{CODEX_STATUS_BAR_MODEL_SGR}   \x1b[0m");
+        assert_eq!(extract_codex_status_bar_model(&whitespace_only), None);
+    }
+
+    /// Auditor A2: `after.find('\x1b').unwrap_or(after.len())` treats a
+    /// missing closing escape as "the text runs to end of string" and
+    /// happily returns whatever is there — including a `MAX_CLASSIFY_LINE`
+    /// chop landing mid-model-id. The fix must require the closing escape;
+    /// an incomplete bar should report nothing, not a truncated garbage
+    /// model.
+    #[test]
+    fn extract_codex_status_bar_model_no_closing_escape_is_none() {
+        let chopped = format!("{CODEX_STATUS_BAR_MODEL_SGR}gpt-5.6-te");
+        assert_eq!(
+            extract_codex_status_bar_model(&chopped),
+            None,
+            "a chopped status bar with no closing \\x1b must report \
+             nothing, not the truncated fragment 'gpt-5.6-te' as a model id"
+        );
+    }
+
+    /// Auditor A3 / reviewer F4: two repaints coalescing into one segment
+    /// (no `\r`/`\n` between them) leaves TWO status bars in one line.
+    /// `line.split(ANCHOR).nth(1)` binds to the FIRST — the stale bar —
+    /// when the freshest (last) one is the correct model to report.
+    #[test]
+    fn extract_codex_status_bar_model_two_anchors_last_wins() {
+        let two_bars = format!(
+            "{CODEX_STATUS_BAR_MODEL_SGR}model-old low\x1b[0m junk {CODEX_STATUS_BAR_MODEL_SGR}model-new medium\x1b[0m"
+        );
+        assert_eq!(
+            extract_codex_status_bar_model(&two_bars),
+            Some("model-new".to_string()),
+            "the LAST status bar in a coalesced segment must win, not the \
+             first"
+        );
+    }
+
+    /// A double space between model and effort word must not leave a
+    /// trailing space on the extracted model.
+    #[test]
+    fn extract_codex_status_bar_model_double_space_trims_trailing_space() {
+        let double_space = format!("{CODEX_STATUS_BAR_MODEL_SGR}some-model  medium\x1b[0m");
+        assert_eq!(
+            extract_codex_status_bar_model(&double_space),
+            Some("some-model".to_string()),
+            "the extracted model must not carry a trailing space"
+        );
+    }
+
+    /// Reviewer F6: `note_model`'s `Some`-overwrites branch had no direct
+    /// test — only its `None`-never-clears half was implicitly exercised
+    /// through the socket-level tests above. A mid-session model change
+    /// (e.g. a `/model` switch) must overwrite, not stick on the first
+    /// observed value.
+    #[test]
+    fn note_model_overwrites_on_a_later_some() {
+        let mut det = Detector::new();
+        det.note_model(Some("model-a".to_string()));
+        det.note_model(Some("model-b".to_string()));
+        assert_eq!(det.model, Some("model-b".to_string()));
+    }
+
     /// `tee` passes bytes through verbatim (including a trailing newline-less
     /// prompt) and classifies each completed line plus a trailing partial line.
     #[test]
