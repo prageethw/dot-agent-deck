@@ -1837,7 +1837,12 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
 /// same session, since a bare, meaningless `No agent` badge next to a live
 /// status is exactly the noise reviewer R2 flagged; and the toggle still
 /// governs the model-known case (off hides it, matching every other badge
-/// case).
+/// case). Also pins the D4 anti-collision guarantee for the OTHER
+/// placeholder shape — a genuinely empty placeholder (never resolved, no
+/// activity seen) with a known model must still show no badge, exercising
+/// the `!is_empty_placeholder` conjunct in `show_badge`'s gate that every
+/// other case here leaves untested (they all use `model: None` for the
+/// empty-placeholder shape).
 #[spec("dashboard/agent-badge/008")]
 #[test]
 fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
@@ -1973,6 +1978,61 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         !text_toggle_off.contains("some-model-id"),
         "with the agent-type badge toggle off, a resolved Codex \
          placeholder's model must not appear anywhere on the card:\n{text_toggle_off}"
+    );
+
+    // Case 4 (D4 anti-collision guarantee): a genuinely EMPTY placeholder —
+    // never resolved, no activity seen (`is_empty_placeholder == true`) —
+    // with a KNOWN model and the badge toggle on. Every other case above
+    // uses `model: None` for the empty-placeholder shape, so none of them
+    // actually exercises the `!is_empty_placeholder` conjunct in
+    // `show_badge`'s gate; this is the one case that does. The model must
+    // stay hidden and the title must be byte-identical to the same session
+    // with `model: None` — an unresolved placeholder gets no badge
+    // regardless of whether a model happens to be known.
+    let mut empty_with_model = base_session.clone();
+    empty_with_model.model = Some("some-model-id".to_string());
+    empty_with_model.expects_agent_report = false;
+    empty_with_model.agent_report_activity_seen = false;
+    let buffer_empty_with_model = render_card_for_mode_to_buffer(
+        &empty_with_model,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let mut empty_no_model = empty_with_model.clone();
+    empty_no_model.model = None;
+    let buffer_empty_no_model = render_card_for_mode_to_buffer(
+        &empty_no_model,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let title_empty_with_model = row_text(&buffer_empty_with_model, 0);
+    let title_empty_no_model = row_text(&buffer_empty_no_model, 0);
+    assert!(
+        !title_empty_with_model.contains("some-model-id"),
+        "a genuinely EMPTY placeholder (never resolved, no activity seen) \
+         with a known model must show no badge — the model must not appear \
+         in the title, even though the badge toggle is on:\n{title_empty_with_model}"
+    );
+    assert_eq!(
+        title_empty_with_model, title_empty_no_model,
+        "a genuinely EMPTY placeholder's title must be IDENTICAL whether or \
+         not a model is known — `is_empty_placeholder` alone must suppress \
+         the badge, proving the gate's `!is_empty_placeholder` conjunct is \
+         load-bearing and not merely coincidentally satisfied:\nwith model:    {title_empty_with_model}\nwithout model: {title_empty_no_model}"
     );
 }
 
