@@ -2331,21 +2331,33 @@ fn classify_and_emit(
     };
     let model = det.model.clone();
     drop(det);
-    if let Some(ev) = ev {
-        if suppress_text_status && ev != DetectedEvent::Error {
-            // Round 7 (issue #652 reviewer F1 / auditor A1): the suppressed
-            // classification itself still doesn't reach the daemon, but a
-            // model freshly observed on THIS call rides a status-neutral
-            // carrier through instead of being dropped with it — see this
-            // function's doc comment. No fresh model on this call: nothing
-            // changed since the last check, so stay silent exactly as
-            // before.
+    match ev {
+        Some(ev) => {
+            if suppress_text_status && ev != DetectedEvent::Error {
+                // Round 7 (issue #652 reviewer F1 / auditor A1): the
+                // suppressed classification itself still doesn't reach the
+                // daemon, but a model freshly observed on THIS call rides a
+                // status-neutral carrier through instead of being dropped
+                // with it — see this function's doc comment. No fresh model
+                // on this call: nothing changed since the last check, so
+                // stay silent exactly as before.
+                if let Some(fresh_model) = fresh_model {
+                    emitter.emit_with_model(EventType::Unknown, Some(fresh_model));
+                }
+                return;
+            }
+            emitter.emit_with_model(ev.event_type(), model);
+        }
+        None => {
+            // Issue #657: a freshly-observed model must reach the daemon
+            // even when THIS segment doesn't also produce a status
+            // transition — the transition and the status-bar repaint don't
+            // necessarily land on the same segment, so this can't be
+            // folded into the `Some(ev)` arm above.
             if let Some(fresh_model) = fresh_model {
                 emitter.emit_with_model(EventType::Unknown, Some(fresh_model));
             }
-            return;
         }
-        emitter.emit_with_model(ev.event_type(), model);
     }
 }
 
