@@ -4294,7 +4294,7 @@ mod tests {
     #[test]
     fn extract_codex_status_bar_model_two_anchors_last_wins() {
         let two_bars = format!(
-            "{CODEX_STATUS_BAR_MODEL_SGR}model-old low\x1b[0m junk {CODEX_STATUS_BAR_MODEL_SGR}model-new medium\x1b[0m"
+            "{CODEX_STATUS_BAR_MODEL_SGR}model-old low\x1b[2m\x1b[39;49m \u{b7} junk {CODEX_STATUS_BAR_MODEL_SGR}model-new medium\x1b[2m\x1b[39;49m \u{b7} "
         );
         assert_eq!(
             extract_codex_status_bar_model(&two_bars),
@@ -4308,7 +4308,8 @@ mod tests {
     /// trailing space on the extracted model.
     #[test]
     fn extract_codex_status_bar_model_double_space_trims_trailing_space() {
-        let double_space = format!("{CODEX_STATUS_BAR_MODEL_SGR}some-model  medium\x1b[0m");
+        let double_space =
+            format!("{CODEX_STATUS_BAR_MODEL_SGR}some-model  medium\x1b[2m\x1b[39;49m \u{b7} ");
         assert_eq!(
             extract_codex_status_bar_model(&double_space),
             Some("some-model".to_string()),
