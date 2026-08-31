@@ -2603,9 +2603,21 @@ fn orchestrator_remit_pane_is_compacting<'a>(
 /// SessionStatus::Idle` regardless of cause, so `status` alone can't
 /// distinguish "just cleared" from any other route to `Idle`. The caller
 /// edge-detects by comparing this timestamp against the last one it already
-/// reacted to (`RunningUi::orchestration_remit_clear_reasserted_at`), exactly
+/// reacted to (`UiState::orchestration_remit_clear_reasserted_at`), exactly
 /// the way `orchestration_remit_compacting`'s membership check edge-detects
 /// the boolean level above.
+///
+/// Review/audit round (M4, F4): the PRD (Solution Overview point 4, Out of
+/// Scope) and `changelog.d/655.feature.md` both state this feature is
+/// Claude-Code-only, but nothing enforced it here — only the placeholder
+/// exclusion above (`agent_type != AgentType::None`) was checked, which lets
+/// a non-Claude-Code producer (Codex, Devin) trigger a re-assertion. The
+/// check is on the EVENT's own `agent_type`, not the session's: a session's
+/// `agent_type` is set once from its first non-`None` event and never
+/// changes afterward (`AppState::apply_event`), while each `AgentEvent`
+/// retained in `recent_events` carries whatever `agent_type` its own
+/// producer stamped it with — that per-event identity is what must be
+/// Claude Code for a `/clear` on it to count.
 fn orchestrator_remit_pane_latest_clear_session_start<'a>(
     sessions: impl Iterator<Item = &'a SessionState>,
     start_pane_id: &str,
@@ -2615,6 +2627,7 @@ fn orchestrator_remit_pane_latest_clear_session_start<'a>(
         .filter_map(|s| {
             s.recent_events.iter().rev().find_map(|e| {
                 (e.event_type == EventType::SessionStart
+                    && e.agent_type == AgentType::ClaudeCode
                     && e.metadata
                         .get(crate::event::CLEAR_SESSION_START_METADATA_KEY)
                         .map(String::as_str)
@@ -2844,6 +2857,14 @@ const SEND_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_se
 /// so the release build's unmovable value and the test override's fallback
 /// can never drift apart.
 const SEND_RETRY_BASE_MS: u64 = 500;
+
+/// Review/audit round (M4, F3/F2): the minimum interval between successive
+/// `prepare_orchestrator_prompt` attempts for the SAME unreacted `/clear`
+/// edge (`UiState::orchestration_remit_clear_retry_at`). Only needs to be
+/// large enough to turn a ~62 Hz render-loop hot spin into an occasional
+/// retry — this is not meant to add real user-visible latency to the
+/// re-arm, just to bound a persistent-failure retry rate.
+const CLEAR_REASSERT_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// PRD fork#257: ceiling for [`send_retry_base`]'s test override, in
 /// milliseconds via `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`. Pinned to
@@ -3230,6 +3251,38 @@ struct UiState {
     /// entry is only ever inserted, never removed — mirrors
     /// `orchestration_prompt_anchor_at`'s `TabId`-keyed, append-only shape.
     orchestration_remit_clear_reasserted_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
+    /// Review/audit round (M4, F5): the wall-clock moment the `/clear`
+    /// re-arm loop FIRST evaluated this tab — set once, lazily, the first
+    /// time the loop sees a given `TabId`, and never advanced afterward.
+    /// Guards against a `latest_clear` that predates this tab's own
+    /// lifetime: not reachable today (reconnect hydration seeds empty
+    /// `recent_events`, and `SessionSnapshot` carries no event history), but
+    /// forecloses the risk pre-emptively for if `SessionSnapshot` ever
+    /// grows one, per design decision 3 (never replay on reconnect).
+    /// Deliberately its OWN field rather than reusing
+    /// `orchestration_prompt_anchor_at`: that one is re-anchored to NOW on
+    /// every successful re-arm (compaction or clear), so using it here
+    /// would let a later compaction re-arm's reset retroactively make an
+    /// earlier, still-pending `/clear` look "stale" and wrongly discard
+    /// it — this field is append-only and never moves once set, so it
+    /// can't be shifted forward by an unrelated re-arm.
+    orchestration_remit_clear_tab_anchor_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
+    /// Review/audit round (M4, F3/F2): the last `Instant` the `/clear`
+    /// re-arm loop attempted `prepare_orchestrator_prompt` for a
+    /// `latest_clear` edge it has not yet reacted to. Deliberately separate
+    /// from `orchestration_remit_clear_reasserted_at` (which only ever
+    /// records a SUCCESSFUL reaction, or a permanent exclusion) — this one
+    /// exists purely to bound the RATE of a persistently failing attempt
+    /// (deleted/unmounted cwd, read-only fs, disk full), which would
+    /// otherwise retry `create_dir_all` + `fs::write` on the render thread
+    /// every frame (~62 Hz) for as long as the triggering event stays
+    /// inside the pane's `recent_events` window. The "don't silently drop
+    /// it forever" property is preserved — this floors the RATE of
+    /// retrying, not the DURATION, so a transient failure still recovers
+    /// once the floor next elapses. Removed once the edge is finally
+    /// reacted to (success or permanent exclusion), so a later `/clear`
+    /// isn't gratuitously throttled by a stale entry.
+    orchestration_remit_clear_retry_at: HashMap<TabId, std::time::Instant>,
     /// Issue #423 F3 (rename): originally "when the orchestration tab was
     /// created", used only to seed `deliver_orchestrator_prompt`'s
     /// deadline/timeout checks. The remit re-assertion (F2/F4) re-anchors
@@ -3446,6 +3499,8 @@ impl UiState {
             orchestration_prompted: HashSet::new(),
             orchestration_remit_compacting: HashSet::new(),
             orchestration_remit_clear_reasserted_at: HashMap::new(),
+            orchestration_remit_clear_tab_anchor_at: HashMap::new(),
+            orchestration_remit_clear_retry_at: HashMap::new(),
             orchestration_prompt_anchor_at: HashMap::new(),
             orchestration_remit_abandoned: HashSet::new(),
             orchestration_ready_since: HashMap::new(),
@@ -15276,6 +15331,12 @@ pub fn run_tui(
         // `orchestration_remit_abandoned`) so both triggers feed the SAME
         // `deliver_orchestrator_prompt` machinery below, unchanged — a second
         // trigger, not a second delivery path.
+        // Review round (M4, F5) — wall-clock "now", captured once per frame
+        // like `orch_now` just above but on the `chrono` axis: this seeds
+        // `orchestration_remit_clear_tab_anchor_at` the first frame a given
+        // `TabId` is seen, and is compared directly against `latest_clear`
+        // (both `chrono::DateTime<Utc>`) below.
+        let clear_guard_now = Utc::now();
         for tab in tab_manager.tabs_mut() {
             if let Tab::Orchestration {
                 id,
@@ -15292,6 +15353,28 @@ pub fn run_tui(
                     snapshot.sessions.values(),
                     &start_pane_id,
                 );
+
+                // Review round (M4, F5): a `latest_clear` older than this
+                // tab's own anchor moment cannot legitimately belong to
+                // it — `TabId` is fresh on every rebuild, so an event that
+                // predates the anchor can only have reached `recent_events`
+                // via daemon-side history the tab itself never produced
+                // (not reachable today: reconnect hydration seeds empty
+                // `recent_events`, and `SessionSnapshot` carries no event
+                // history — this forecloses the risk pre-emptively for if
+                // that ever changes, per design decision 3: never replay on
+                // reconnect). The anchor is seeded lazily HERE, on first
+                // observation, rather than reusing
+                // `orchestration_prompt_anchor_at` — that field is
+                // re-anchored to NOW on every successful re-arm (compaction
+                // or clear), so a later compaction re-arm's reset would
+                // retroactively make an earlier, still-pending `/clear`
+                // look "stale" and wrongly discard it.
+                let tab_anchor = *ui
+                    .orchestration_remit_clear_tab_anchor_at
+                    .entry(*id)
+                    .or_insert(clear_guard_now);
+                let latest_clear = latest_clear.filter(|latest_clear| *latest_clear >= tab_anchor);
 
                 if let Some(latest_clear) = latest_clear
                     && ui.orchestration_remit_clear_reasserted_at.get(id) != Some(&latest_clear)
@@ -15326,30 +15409,48 @@ pub fn run_tui(
                     let permanently_excluded =
                         ui.orchestration_remit_abandoned.contains(id) || start_role_is_pi;
 
-                    if no_delivery_pending
-                        && !permanently_excluded
-                        && let Some(prompt) = prepare_orchestrator_prompt(config, cwd, None)
-                    {
-                        ui.send_retry_backoff.remove(start_pane_id.as_str());
-                        ui.prompt_delivery.remove(start_pane_id.as_str());
-                        ui.orchestration_ready_since.remove(id);
+                    // Review round (M4, F3/F2): a persistently failing
+                    // `prepare_orchestrator_prompt` (deleted/unmounted cwd,
+                    // read-only fs, disk full) must not be retried every
+                    // frame at the render loop's ~62 Hz rate — bound the
+                    // RATE, not the duration, of the retry. `retry_floor_ok`
+                    // gates the attempt itself, so a throttled frame never
+                    // touches the filesystem at all.
+                    let retry_floor_ok =
+                        ui.orchestration_remit_clear_retry_at
+                            .get(id)
+                            .is_none_or(|last| {
+                                orch_now.saturating_duration_since(*last)
+                                    >= CLEAR_REASSERT_RETRY_FLOOR
+                            });
 
-                        *orchestrator_prompt = Some(prompt);
-                        ui.orchestration_prompted.remove(id);
-                        ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
-                        ui.orchestration_remit_clear_reasserted_at
-                            .insert(*id, latest_clear);
+                    if no_delivery_pending && !permanently_excluded && retry_floor_ok {
+                        ui.orchestration_remit_clear_retry_at.insert(*id, orch_now);
+                        if let Some(prompt) = prepare_orchestrator_prompt(config, cwd, None) {
+                            ui.send_retry_backoff.remove(start_pane_id.as_str());
+                            ui.prompt_delivery.remove(start_pane_id.as_str());
+                            ui.orchestration_ready_since.remove(id);
+
+                            *orchestrator_prompt = Some(prompt);
+                            ui.orchestration_prompted.remove(id);
+                            ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
+                            ui.orchestration_remit_clear_reasserted_at
+                                .insert(*id, latest_clear);
+                            ui.orchestration_remit_clear_retry_at.remove(id);
+                        }
                     } else if permanently_excluded {
                         ui.orchestration_remit_clear_reasserted_at
                             .insert(*id, latest_clear);
+                        ui.orchestration_remit_clear_retry_at.remove(id);
                     }
                     // Else: blocked only by a TRANSIENT condition this frame
                     // (a delivery still probing readiness/backoff before its
-                    // first write, or `prepare_orchestrator_prompt` failing
-                    // to read the context file) — deliberately left
-                    // unmarked, so the next frame retries against the SAME
-                    // `latest_clear` event rather than silently dropping the
-                    // re-assertion the way marking it seen here would.
+                    // first write, `prepare_orchestrator_prompt` failing to
+                    // read the context file, or the retry floor above not
+                    // having elapsed yet) — deliberately left unmarked, so a
+                    // later frame retries against the SAME `latest_clear`
+                    // event rather than silently dropping the re-assertion
+                    // the way marking it seen here would.
                 }
             }
         }
