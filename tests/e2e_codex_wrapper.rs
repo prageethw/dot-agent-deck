@@ -228,6 +228,94 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     );
 }
 
+/// Scenario: With Codex authentication copied into an isolated HOME, submit a
+/// bare interactive `codex` command through the normal Ctrl+N new-pane flow on
+/// the cheap model, send a minimal reply-only prompt (no shell tool use, no
+/// sentinel-file proof), and subscribe to the real daemon event stream. The
+/// wait requires a captured `AgentEvent` with BOTH `model.is_some()` AND
+/// `live_target.is_some()` — the `live_target` clause matters because it is
+/// what disambiguates a wrap-emitted event from Codex's native hook path
+/// (which always reports `live_target: None`); without it the wait could be
+/// satisfied by the hook path instead, making the test pass without
+/// exercising wrap at all. Only an event meeting both clauses can then be
+/// asserted to carry the real model it is running — proving Codex's model
+/// reporting reaches the daemon end to end through a genuine spawn via wrap,
+/// not from byte-frozen capture data pinned to one Codex TUI rendering.
+/// Deliberately does not gate on a `Thinking`/`Idle` transition: on a trusted
+/// session, those depend on Codex's own native hooks firing inside the
+/// interactive TUI, a separate, already-documented gap
+/// (`common::codex_test_model`'s doc comment) unrelated to this issue — the
+/// model carrier this test asserts on is the status-neutral event #652/#657
+/// built specifically so model reporting does not depend on that hook path at
+/// all.
+#[spec("codex/live/002")]
+#[test]
+fn codex_live_002_real_interactive_session_reports_active_model() {
+    skip_unless!(common::check_codex_available());
+
+    const PROMPT_MARKER: &str = "codex_live_002_model_probe_5d13af";
+    let prompt = format!(
+        "This is prompt marker {PROMPT_MARKER}. Reply with exactly the single word acknowledged \
+         and do nothing else. Do not use any tools."
+    );
+    let command = format!(
+        "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
+        common::codex_test_model(),
+    );
+    let config_dir = common::harness_tempdir().expect("Codex new-pane config");
+    let config_path = config_dir.path().join("config.toml");
+    std::fs::write(&config_path, format!("default_command = {command:?}\n"))
+        .expect("write bare Codex default command");
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 45)
+        .with_env("PATH", path_with_binary_dir())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        .with_imported_codex_credentials()
+        .launch_with_fixture("codex-live");
+
+    deck.wait_for_string("No active sessions");
+    let events = deck.subscribe_events();
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("Tab: switch");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    assert!(
+        deck.wait_for_grid_string_within(common::codex_test_model(), Duration::from_secs(30)),
+        "the bare interactive Codex UI never became ready in the new pane:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_keys(prompt.as_bytes());
+    deck.wait_for_string(PROMPT_MARKER);
+    deck.send_keys(b"\r");
+
+    // The core assertion (issue #658): a captured `AgentEvent` from a live,
+    // real Codex process must carry the model it is actually running, read
+    // off that process's own status bar through the real wrap integration —
+    // not asserted against frozen capture bytes the way `codex/wrap/015`-
+    // `018` pin the extraction logic in isolation.
+    let model_event = events.wait_for(
+        |event| {
+            event.agent_type == AgentType::Codex
+                && event.model.is_some()
+                && event.live_target.is_some()
+        },
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        model_event.model.as_deref(),
+        Some(common::codex_test_model()),
+        "a live Codex session's AgentEvent stream must report the real active model observed \
+         off its own status bar; full event: {model_event:?}"
+    );
+
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("Dir:");
+}
+
 /// Scenario: Run a deterministic terminal probe beneath `dot-agent-deck wrap`
 /// in a daemon-managed pane, resize the outer PTY, send a line, and press Ctrl+C.
 /// The child must see all three descriptors as TTYs, receive SIGWINCH plus input,
