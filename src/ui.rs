@@ -3279,9 +3279,16 @@ struct UiState {
     /// inside the pane's `recent_events` window. The "don't silently drop
     /// it forever" property is preserved — this floors the RATE of
     /// retrying, not the DURATION, so a transient failure still recovers
-    /// once the floor next elapses. Removed once the edge is finally
-    /// reacted to (success or permanent exclusion), so a later `/clear`
-    /// isn't gratuitously throttled by a stale entry.
+    /// once the floor next elapses. Removed once the edge is reacted to
+    /// (success or permanent exclusion), so a later `/clear` isn't
+    /// gratuitously throttled by a stale entry — but that cleanup only
+    /// runs while `latest_clear` is still `Some`. If the triggering event
+    /// ages out of `recent_events` (or is filtered by the tab anchor)
+    /// while a retry entry is outstanding, `latest_clear` goes `None`,
+    /// the whole gate stops running for that tab, and the entry is simply
+    /// left behind. Harmless: the next edge's floor check compares
+    /// against that long-past `Instant` and passes immediately, so the
+    /// stale entry never throttles anything — it just isn't removed.
     orchestration_remit_clear_retry_at: HashMap<TabId, std::time::Instant>,
     /// Issue #423 F3 (rename): originally "when the orchestration tab was
     /// created", used only to seed `deliver_orchestrator_prompt`'s
