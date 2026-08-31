@@ -689,21 +689,23 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
 /// `/clear`-originated `SessionStart` fires on the orchestrator START role's
 /// own pane, but stamped with a non-Claude-Code `agent_type` — this must NOT
 /// re-deliver the remit pointer, since the PRD's stated scope is Claude Code
-/// only (`AgentType::ClaudeCode`). Then, as a positive control proving this
-/// is a genuine scope guard and not just an unimplemented feature vacuously
-/// passing the negative check, the same `/clear`-originated `SessionStart`
-/// fires again on the SAME pane, this time stamped `AgentType::ClaudeCode`,
-/// which MUST re-deliver. Mirrors `orchestration_remit_002`'s pattern of
-/// pairing a negative check with a positive control, but proves the
-/// agent-type axis rather than the pane-identity axis `_002`/`_005` already
-/// cover.
-///
-/// Expected RED right now: the Claude-Code-only scope gate this test pins
-/// does not exist yet (it's the coder's next delegation in this same fix
-/// round) — the daemon applies the injected event (status still transitions
-/// to `Idle`, per `inject_clear_session_start`'s own precondition wait) but
-/// today's re-assertion trigger doesn't check `agent_type` at all, so the
-/// pointer is wrongly re-delivered anyway.
+/// only (`AgentType::ClaudeCode`). Deliberately negative-only: unlike
+/// `orchestration_remit_002`/`_005`, this test does not chase the negative
+/// check with a same-pane positive-control injection, because applying a
+/// second `SessionStart` to the SAME pane — even one this guard correctly
+/// filters from re-arming — legitimately advances the daemon's
+/// generation-tracking (`pane_hook_session`/`delivery_target_changed`,
+/// `src/state.rs`, issues #424/#532/#608) and reads the pane as a stale
+/// delivery target after two hops, an artifact of the test's own two-hop
+/// injection shape rather than anything a real pane (whose `agent_type` is
+/// fixed for its whole life) can ever encounter. The "is this harness capable
+/// of proving a positive case at all" concern a positive control exists to
+/// rule out is already covered independently by
+/// `orchestration_remit_004_start_role_clear_reasserts_remit`, a genuine
+/// single-hop injection on this same pane shape proving the trigger fires —
+/// the same relationship `_001`'s positive proof bears to `_002`'s negative
+/// check on a different pane, applied here across the agent-type axis
+/// instead of the pane-identity axis.
 #[spec("orchestration/remit/006")]
 #[test]
 #[cfg(unix)]
@@ -728,25 +730,6 @@ fn orchestration_remit_006_non_claude_agent_type_clear_reasserts_nothing() {
          `agent_type` must not re-assert the orchestrator's remit (PRD #655's stated \
          scope is Claude Code only); the start role's delivery log reached a second \
          `{DELIVERED_POINTER}` line anyway.\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    inject_clear_session_start(
-        &deck,
-        &socket,
-        &pane_id,
-        &agent_id,
-        &format!("{agent_id}-remit006-claude-session"),
-        AgentType::ClaudeCode,
-    );
-    let reasserted_for_claude_code =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
-    assert!(
-        reasserted_for_claude_code,
-        "control failed: a `/clear`-originated SessionStart event stamped \
-         `AgentType::ClaudeCode` on the orchestrator START role's own pane must still \
-         re-deliver the remit pointer — the negative check above is only meaningful if \
-         this positive control also passes.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }
