@@ -328,6 +328,10 @@ fn markers_are_lowercase_ascii(markers: &[&str]) -> bool {
 pub struct Detector {
     rules: &'static RuleSet,
     last: Option<DetectedEvent>,
+    /// Issue #652: the model id last read from a Codex status bar, sticky
+    /// across calls — see [`Self::note_model`]. `None` until the wrapper has
+    /// observed a segment carrying the status bar at all.
+    model: Option<String>,
 }
 
 impl Detector {
@@ -338,7 +342,23 @@ impl Detector {
 
     /// A detector using an explicit rule set (the M7 Codex seam).
     pub fn with_rules(rules: &'static RuleSet) -> Self {
-        Self { rules, last: None }
+        Self {
+            rules,
+            last: None,
+            model: None,
+        }
+    }
+
+    /// Record a model id freshly extracted from a segment ([`extract_codex_status_bar_model`]),
+    /// if any. Sticky: a `None` (this segment had no status bar in it) never
+    /// clears a previously observed model, since the daemon side is sticky
+    /// too (`state.rs::apply_event`) and most segments don't repaint the
+    /// footer at all. A `Some` always overwrites, so a genuine model switch
+    /// mid-session is picked up.
+    fn note_model(&mut self, model: Option<String>) {
+        if let Some(model) = model {
+            self.model = Some(model);
+        }
     }
 
     /// Feed one line; return the event to emit, or `None` when the line is
@@ -386,6 +406,148 @@ fn classify_codex_json(line: &str) -> Option<DetectedEvent> {
         "turn.failed" | "task.failed" | "error" => DetectedEvent::Error,
         _ => DetectedEvent::Working,
     })
+}
+
+/// One real truecolor SGR span (RGB 246,226,183, a warm tan) that Codex's
+/// interactive TUI has been observed painting its composer footer with — the
+/// color `wrap_015`'s real captured fixture happens to use. Issue #652
+/// auditor A1: this exact RGB triple is NOT what every session uses — two
+/// further real Codex v0.150.1 captures (bytes not checked into this repo;
+/// see [`extract_codex_status_bar_model`]'s doc comment for what evidence
+/// actually is) show the identical status-bar shape painted in a different
+/// accent color per session. `#[cfg(test)]`-only: production code no longer
+/// anchors on one fixed triple — see [`CODEX_STATUS_BAR_ANCHOR_PREFIX`] for
+/// what it matches instead — this constant now exists purely so this file's
+/// own hand-written unit tests can build a well-formed anchor without
+/// repeating the literal bytes.
+#[cfg(test)]
+const CODEX_STATUS_BAR_MODEL_SGR: &str = "\x1b[38;2;246;226;183;49m";
+
+/// The generic prefix of a 24-bit truecolor foreground SGR sequence
+/// (`\x1b[38;2;<r>;<g>;<b>;49m`, any RGB triple — the `49` is the paired
+/// default-background parameter Codex always sends alongside it). Issue #652
+/// auditor A1: the composer footer's own accent color varies per session, so
+/// extraction can no longer anchor on one fixed triple like
+/// [`CODEX_STATUS_BAR_MODEL_SGR`]. What stays invariant is the SHAPE of the
+/// escape plus the text that follows it — see
+/// [`extract_codex_status_bar_model`]'s doc comment for the full match +
+/// validation strategy this generality requires.
+const CODEX_STATUS_BAR_ANCHOR_PREFIX: &str = "\x1b[38;2;";
+
+/// The exact byte sequence (dim, default-fg/bg, a space, a middle dot, a
+/// space) that immediately follows the "`<model> <effort>`" text in every
+/// real captured composer-footer redraw, separating it from the cwd segment
+/// that follows. Issue #652 auditor A1: this is what [`extract_codex_status_bar_model`]
+/// validates a [`CODEX_STATUS_BAR_ANCHOR_PREFIX`] match against before
+/// accepting it — the SAME generic truecolor shape also paints ordinary
+/// per-character UI tinting throughout a real capture (a spinner label or
+/// "MCP server" spelled out letter-by-letter, each letter its own
+/// `\x1b[38;2;<r>;<g>;<b>;49m<char>` span), and none of that incidental
+/// tinting is followed by this trailer.
+const CODEX_STATUS_BAR_TRAILER: &str = "\x1b[2m\x1b[39;49m \u{b7} ";
+
+/// Parse the `<r>;<g>;<b>;49m` suffix of a [`CODEX_STATUS_BAR_ANCHOR_PREFIX`]
+/// match — three ASCII-digit groups then the literal `49m` — and return
+/// whatever text follows the closing `m`. `None` when what follows the
+/// prefix doesn't have this shape (a different SGR parameter list entirely,
+/// or a truncated one), so the caller treats the prefix occurrence as not a
+/// match rather than misparsing it.
+fn strip_rgb_49m_suffix(after_prefix: &str) -> Option<&str> {
+    let m_idx = after_prefix.find('m')?;
+    let params = &after_prefix[..m_idx];
+    let mut parts = params.split(';');
+    let (r, g, b, bg) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || bg != "49" {
+        return None;
+    }
+    let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    if !is_digits(r) || !is_digits(g) || !is_digits(b) {
+        return None;
+    }
+    Some(&after_prefix[m_idx + 1..])
+}
+
+/// Extract the active model id from a raw (ANSI-decorated) Codex TUI output
+/// segment, when its composer status bar is present in `line`. Codex paints
+/// the bar as "`<model> <effort>`" (e.g. `gpt-5.1-codex-mini low`) inside a
+/// [`CODEX_STATUS_BAR_ANCHOR_PREFIX`] truecolor span, immediately followed by
+/// [`CODEX_STATUS_BAR_TRAILER`]; the model is everything in that text before
+/// the LAST space — the trailing reasoning-effort word (`low`/`medium`/`high`)
+/// never itself contains a space, while a model id may contain hyphens/dots
+/// but not spaces.
+///
+/// Issue #652 auditor A1: this used to anchor on one hardcoded RGB triple
+/// ([`CODEX_STATUS_BAR_MODEL_SGR`]), which two further real Codex v0.150.1
+/// captures on this machine showed was wrong — the same status-bar shape
+/// painted in a different accent color per session, making the fix a silent
+/// no-op for those sessions. Anchoring generically on
+/// [`CODEX_STATUS_BAR_ANCHOR_PREFIX`] (any RGB triple) alone isn't safe by
+/// itself: the identical truecolor SGR shape also paints ordinary
+/// per-character UI tinting throughout a real capture (individual letters of
+/// a spinner label, each its own truecolor span), so without a further check
+/// a segment busy with that tinting yields garbage. Requiring
+/// [`CODEX_STATUS_BAR_TRAILER`] to immediately follow the extracted text is
+/// what makes the generic anchor safe: that exact trailer is what's actually
+/// invariant across sessions and colors, occurring 1:1 with the real
+/// status-bar count and with nothing else in either of the two additional
+/// captures. Verified against three real inputs total (the original
+/// `wrap_015` fixture plus the two additional captures used by
+/// `wrap_016`/`wrap_017`) — all three extract cleanly; the local capture
+/// bytes this was checked against live at
+/// `/home/prageeth/workspaces/dot-agent-deck-bugs/.dot-agent-deck/652-captures/`,
+/// a scratch location on the machine that produced this fix, not part of
+/// this repo (same caveat #638 left on the now-nonexistent
+/// `.dot-agent-deck/638-captures/`, not repeated here) — the actual
+/// evidence checked into the repo is the fixture bytes embedded in
+/// `wrap_015`/`016`/`017` themselves and their `tests/CATALOG.md` entries.
+///
+/// A segment carrying more than one composer-footer repaint (no `\r`/`\n`
+/// between them, so `tee` delivers both in one line) takes the LAST valid
+/// occurrence, not the first — a mid-session model switch must report the
+/// newer bar, and an older stale one must not win just because it appears
+/// earlier in the segment.
+///
+/// Returns `None` when this segment doesn't carry a validated status bar at
+/// all (most segments won't — Codex only repaints it on the frames that
+/// touch the composer footer, and a segment can be truncated by
+/// `MAX_CLASSIFY_LINE` mid-bar), which is fine: the caller treats this as
+/// sticky and keeps whatever model was last observed, rather than accepting
+/// a truncated fragment as a genuine (and possibly wrong) model id.
+///
+/// Round-2 reviewer M1: the trailer check alone isn't airtight — a stray
+/// truecolor span whose text is a single punctuation character (e.g. `•`)
+/// immediately closed by [`CODEX_STATUS_BAR_TRAILER`] would otherwise pass.
+/// A real `"<model> <effort>"` span always has an interior space, so a
+/// candidate with none is rejected as implausible before being recorded.
+fn extract_codex_status_bar_model(line: &str) -> Option<String> {
+    let mut best: Option<&str> = None;
+    let mut search_from = 0usize;
+    while let Some(rel) = line[search_from..].find(CODEX_STATUS_BAR_ANCHOR_PREFIX) {
+        let anchor_start = search_from + rel;
+        let after_prefix = &line[anchor_start + CODEX_STATUS_BAR_ANCHOR_PREFIX.len()..];
+        search_from = anchor_start + CODEX_STATUS_BAR_ANCHOR_PREFIX.len();
+        let Some(after_sgr) = strip_rgb_49m_suffix(after_prefix) else {
+            continue;
+        };
+        let Some(text_end) = after_sgr.find('\x1b') else {
+            continue;
+        };
+        let text = after_sgr[..text_end].trim();
+        if text.is_empty() {
+            continue;
+        }
+        if after_sgr[text_end..].starts_with(CODEX_STATUS_BAR_TRAILER) && text.contains(' ') {
+            best = Some(text);
+        }
+    }
+    let text = best?;
+    let model = text.rsplit_once(' ').map_or(text, |(model, _effort)| model);
+    let model = model.trim_end();
+    if model.is_empty() {
+        None
+    } else {
+        Some(model.to_string())
+    }
 }
 
 /// PRD #20 finding #11: classify one line of Codex output. Codex emits JSONL
@@ -440,11 +602,17 @@ struct Emitter {
 
 impl Emitter {
     /// Build an [`AgentEvent`] for `event_type` and send it to the daemon over
-    /// the existing raw-`AgentEvent` hook socket. Send failures are ignored so
-    /// the wrapper stays a transparent passthrough even with no daemon (the
-    /// "arbitrary commands as a basic fallback" success criterion).
-    fn emit(&self, event_type: EventType) {
-        self.emit_with_metadata(event_type, HashMap::new());
+    /// the existing raw-`AgentEvent` hook socket, stamping `model` when known.
+    /// Send failures are ignored so the wrapper stays a transparent
+    /// passthrough even with no daemon (the "arbitrary commands as a basic
+    /// fallback" success criterion). Issue #652: `classify_and_emit` and both
+    /// session-end call sites pass the model `Detector` last observed off the
+    /// wrapped Codex TUI's own status bar; a call site with no model context
+    /// passes `None` explicitly — safe, since the daemon's `model` handling
+    /// is STICKY (`state.rs::apply_event`), so a `None` here never clears a
+    /// model an earlier event already reported.
+    fn emit_with_model(&self, event_type: EventType, model: Option<String>) {
+        self.emit_with_metadata(event_type, HashMap::new(), model);
     }
 
     /// PRD #225 M3: the fork-time `SessionStart` this wrapper emits the moment
@@ -474,7 +642,7 @@ impl Emitter {
                 codex_hook_trust_confirmed.to_string(),
             );
         }
-        self.emit_with_metadata(EventType::SessionStart, metadata);
+        self.emit_with_metadata(EventType::SessionStart, metadata, None);
     }
 
     /// Issue #243: the INTERFACE-READY `SessionStart` this wrapper emits once it
@@ -516,7 +684,8 @@ impl Emitter {
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             fact.origin().to_string(),
         );
-        let Ok(json) = serde_json::to_string(&self.build_event(EventType::SessionStart, metadata))
+        let Ok(json) =
+            serde_json::to_string(&self.build_event(EventType::SessionStart, metadata, None))
         else {
             return;
         };
@@ -525,8 +694,13 @@ impl Emitter {
         });
     }
 
-    fn emit_with_metadata(&self, event_type: EventType, metadata: HashMap<String, String>) {
-        let event = self.build_event(event_type, metadata);
+    fn emit_with_metadata(
+        &self,
+        event_type: EventType,
+        metadata: HashMap<String, String>,
+        model: Option<String>,
+    ) {
+        let event = self.build_event(event_type, metadata, model);
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = crate::hook::send_to_socket(&json);
         }
@@ -535,7 +709,12 @@ impl Emitter {
     /// Issue #243 audit F3: build the [`AgentEvent`] without sending it, so a
     /// caller that must not block on the daemon can do the (cheap, pure) build on
     /// its own thread and hand only the serialized line to a sender.
-    fn build_event(&self, event_type: EventType, metadata: HashMap<String, String>) -> AgentEvent {
+    fn build_event(
+        &self,
+        event_type: EventType,
+        metadata: HashMap<String, String>,
+        model: Option<String>,
+    ) -> AgentEvent {
         AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
@@ -554,7 +733,12 @@ impl Emitter {
             // PRD #20 M3: a wrapped session is history-only from the dashboard's
             // perspective (see `Emitter::live_target`).
             live_target: Some(self.live_target),
-            model: None,
+            // Issue #652: the model id `classify_and_emit` extracted from the
+            // Codex TUI's own status bar, when known; `None` everywhere else
+            // (interface-ready, session-start, non-Codex agents). The daemon
+            // side is STICKY on this field, so `None` never regresses an
+            // already-known model.
+            model,
         }
     }
 }
@@ -2106,6 +2290,20 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// narrower case where hook trust is NOT confirmed, or when it classifies as
 /// `Error` regardless of trust state (see [`CODEX`]'s doc comment for that
 /// path's accepted residual limitation).
+///
+/// Round 7 (issue #652 reviewer F1 / auditor A1): round 6 left one gap —
+/// under `suppress_text_status`, a hook-trusted session that never errors
+/// (the overwhelming majority of real sessions) had NO surviving carrier for
+/// the model it just read off the composer footer, since every non-`Error`
+/// event was discarded outright. The suppression gate itself is unchanged
+/// (still only `Error` carries real status under suppression); what's new is
+/// that a freshly-observed model (this call's own
+/// [`extract_codex_status_bar_model`] result, not merely still-sticky from
+/// an earlier call) rides a status-neutral [`EventType::Unknown`] event
+/// through the gate instead of being dropped with it. `Unknown` is
+/// `apply_event`'s no-status-change catch-all (`state.rs`), so this cannot
+/// perturb the pane's status — only the model reaches the daemon, exactly as
+/// the two untouched session-end `emit()` calls already do unconditionally.
 fn classify_and_emit(
     line: &str,
     detector: &Arc<Mutex<Detector>>,
@@ -2114,17 +2312,41 @@ fn classify_and_emit(
     suppress_text_status: bool,
 ) {
     let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+    // Issue #652: try to read the model off this segment's status bar before
+    // classifying — independent of what this segment classifies as, since a
+    // status-bar repaint and a state-change event don't necessarily land on
+    // the same segment. `fresh_model` (this call's own extraction result, as
+    // opposed to `Detector.model`, which is sticky and may only reflect an
+    // earlier call) distinguishes a genuinely new observation from a merely
+    // still-sticky one — round 7 needs that distinction below.
+    let fresh_model = if is_codex {
+        extract_codex_status_bar_model(line)
+    } else {
+        None
+    };
+    det.note_model(fresh_model.clone());
     let ev = if is_codex {
         det.observe_detected(classify_codex_line(line))
     } else {
         det.observe(line)
     };
+    let model = det.model.clone();
     drop(det);
     if let Some(ev) = ev {
         if suppress_text_status && ev != DetectedEvent::Error {
+            // Round 7 (issue #652 reviewer F1 / auditor A1): the suppressed
+            // classification itself still doesn't reach the daemon, but a
+            // model freshly observed on THIS call rides a status-neutral
+            // carrier through instead of being dropped with it — see this
+            // function's doc comment. No fresh model on this call: nothing
+            // changed since the last check, so stay silent exactly as
+            // before.
+            if let Some(fresh_model) = fresh_model {
+                emitter.emit_with_model(EventType::Unknown, Some(fresh_model));
+            }
             return;
         }
-        emitter.emit(ev.event_type());
+        emitter.emit_with_model(ev.event_type(), model);
     }
 }
 
@@ -2648,11 +2870,23 @@ fn run_wrap_pty(
         Some(s) => (s.success(), s.code().unwrap_or(1) as u8),
         None => (false, 1),
     };
-    emitter.emit(if success {
-        EventType::Idle
-    } else {
-        EventType::Error
-    });
+    // Issue #652 reviewer F2: stamp the model here unconditionally — this
+    // call fires on every session end regardless of `suppress_text_status`,
+    // so it's a guaranteed-once-per-session carrier for whatever `detector`
+    // last observed, independent of round 7's suppressed-path carrier above.
+    let model = detector
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .model
+        .clone();
+    emitter.emit_with_model(
+        if success {
+            EventType::Idle
+        } else {
+            EventType::Error
+        },
+        model,
+    );
     ExitCode::from(code)
 }
 
@@ -2812,11 +3046,23 @@ fn run_wrap_pipe(
         Ok(s) => (s.success(), s.code().unwrap_or(1) as u8),
         Err(_) => (false, 1),
     };
-    emitter.emit(if success {
-        EventType::Idle
-    } else {
-        EventType::Error
-    });
+    // Issue #652 reviewer F2: stamp the model here unconditionally — this
+    // call fires on every session end regardless of `suppress_text_status`,
+    // so it's a guaranteed-once-per-session carrier for whatever `detector`
+    // last observed, independent of round 7's suppressed-path carrier above.
+    let model = detector
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .model
+        .clone();
+    emitter.emit_with_model(
+        if success {
+            EventType::Idle
+        } else {
+            EventType::Error
+        },
+        model,
+    );
     ExitCode::from(code)
 }
 
@@ -3750,6 +3996,404 @@ mod tests {
             "the real intervening segment must never itself reach the daemon \
              under suppression, only move internal state; got {emitted:?}"
         );
+    }
+
+    /// Scenario: a real, ANSI-decorated Codex TUI segment carrying the
+    /// composer status bar (`gpt-5.1-codex-mini low · <cwd>`) must produce an
+    /// `AgentEvent` whose `model` field is `Some("gpt-5.1-codex-mini")` — not
+    /// the hardcoded `None` `Emitter::build_event` sends today, on every
+    /// event, unconditionally.
+    ///
+    /// Issue #652: found while fixing #650 (PR #651) — review determined the
+    /// state that PR's badge gate targets (model known while agent type
+    /// unresolved) can never actually happen for Codex, because
+    /// `Emitter::build_event` (`:538`) never carries a model at all. This is
+    /// the wrap integration's own root defect: the interactive TUI's status
+    /// bar clearly carries the active model on screen (verified by this
+    /// fixture, the same real captured bytes `codex/wrap/012` uses — a real
+    /// HTTP-400 error-turn repaint from `codex-cli 0.150.1`, whose composer
+    /// footer segment reads `gpt-5.1-codex-mini low` followed by a middle-dot
+    /// separator and the cwd), but nothing in `wrap.rs` ever reads it back
+    /// out and stamps it on the event the daemon receives.
+    ///
+    /// Reuses the exact `codex/wrap/012` fixture and call shape (same
+    /// `classify_and_emit` entry point, same `is_codex`/`suppress_text_status`
+    /// arguments) rather than a hand-written approximation, per this repo's
+    /// established convention for wrap classifier changes — this segment is
+    /// already known to classify `Error` and reach the daemon as exactly one
+    /// event under suppression (`codex/wrap/012`), so that one captured event
+    /// is the one this test inspects for `model`. The daemon side
+    /// (`state.rs::apply_event`) already treats `model` as STICKY — a later
+    /// `None` does not clear a previously-known model — so the wrap side only
+    /// needs to report the model once, on whichever event first carries it;
+    /// it does not need to re-send it on every event.
+    #[spec("codex/wrap/015")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_015_status_bar_model_reaches_daemon() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Verbatim segment 20 (699 bytes) of
+        // `.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin` —
+        // the same real captured bytes `codex/wrap/012` uses. Its composer
+        // footer carries the status-bar text
+        // `gpt-5.1-codex-mini low \u{b7} <cwd>` (ANSI SGR-decorated), which is
+        // what this test is really after; the leading error payload is
+        // incidental to this test but is what makes the segment classify and
+        // actually emit under suppression.
+        let decorated_error_segment = "\x1b[39;49m\x1b[K\x1b[38;5;1;49m\u{25a0} {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.1-codex-mini' model is not supported when using Codex with a ChatGPT account.\"}}\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[23;3H\x1b[21;2H\x1b[0m\x1b[49m\x1b[K\x1b[22;2H\x1b[0m\x1b[49m\x1b[K\x1b[23;27H\x1b[0m\x1b[49m\x1b[K\x1b[24;2H\x1b[0m\x1b[49m\x1b[K\x1b[25;146H\x1b[0m\x1b[49m\x1b[K\x1b[21;1H \x1b[22;1H \x1b[23;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[24;1H\x1b[22m \x1b[25;1H  \x1b[38;2;246;226;183;49mgpt-5.1-codex-mini low\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;171;223;167;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/45e45f1a-4a0d-4f8f-ba83-27ee7d6ea88b/scratchpad/r4/work\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l";
+        assert_eq!(
+            decorated_error_segment.len(),
+            699,
+            "fixture drift: this must stay byte-for-byte the captured segment \
+             (`.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`, \
+             segment 20)"
+        );
+
+        let capture = CapturedSocket::bind();
+        let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
+
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "precondition (same as codex/wrap/012): exactly one Error event \
+             must reach the daemon for this segment; got {emitted:?}"
+        );
+        let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
+            panic!(
+                "captured line was not a valid AgentEvent: {e}; line={:?}",
+                emitted[0]
+            )
+        });
+        assert_eq!(
+            event.model,
+            Some("gpt-5.1-codex-mini".to_string()),
+            "issue #652: the wrap integration must report the model it reads \
+             back from the Codex TUI's own status bar — `Emitter::build_event` \
+             hardcodes `model: None` unconditionally today, so this event's \
+             model is always None regardless of what's visibly on screen"
+        );
+    }
+
+    /// A second real Codex TUI segment, at a DIFFERENT composer-footer accent
+    /// color than `codex/wrap/012`/`015`'s fixture (RGB 228,49,113 vs the
+    /// tan 246,226,183 `CODEX_STATUS_BAR_MODEL_SGR` anchors on), must still
+    /// yield the model it visibly carries. Auditor A1: two real interactive
+    /// Codex v0.150.1 PTY captures on this machine (`.dot-agent-deck/652-captures/`)
+    /// paint the same status bar shape in this different color, and the
+    /// current anchor matches neither — `extract_codex_status_bar_model`
+    /// silently returns `None` for both, which is issue #652's exact
+    /// symptom recurring on a healthy session.
+    ///
+    /// `suppress_text_status = false` here (unlike `wrap_015`'s hook-trusted
+    /// `true`) deliberately bypasses the separate suppression-gate defect
+    /// (`codex/wrap/017`, Blocker 2) so this test isolates the anchor/
+    /// extraction bug alone: if only Blocker 1 were fixed, this test would
+    /// go green on its own, independent of whatever `classify_and_emit`'s
+    /// emit gate does.
+    ///
+    /// Scenario: a real, non-error Codex TUI segment whose status bar is
+    /// painted in a different accent color than the existing fixture is fed
+    /// through `classify_and_emit` with suppression off, and the emitted
+    /// event's `model` must still be the raw id the bar shows.
+    #[spec("codex/wrap/016")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_016_status_bar_model_survives_a_different_accent_color() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Verbatim mid-session segment (6994 bytes) at byte offset 6844 of a
+        // real interactive Codex v0.150.1 PTY capture
+        // (`.dot-agent-deck/652-captures/audit-capture.bin`) — genuinely
+        // `Working`-classified (carries both the "esc to interrupt" active
+        // marker and the "Ask Codex to do anything" idle placeholder from an
+        // earlier repaint; active-marker precedence, `codex/wrap/009`,
+        // resolves it `Working`), not an error turn. Its composer footer
+        // reads `gpt-5.6-terra medium \u{b7} <cwd>`, painted with SGR
+        // `\x1b[38;2;228;49;113;49m` — NOT `CODEX_STATUS_BAR_MODEL_SGR`'s tan.
+        let mid_session_segment = "\x1b[39;49m\x1b[K\x1b[2m\u{2022} \x1b[22mYou have 1 usage limit reset available. Run /usage to use one.\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[13;3H\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;7H\x1b[1m\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2827} codexcwd\x07\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;138;138;138;49m\u{2022}\x1b[12;8H\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;9H\x1b[1m\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;63H\x1b[0m\x1b[49m\x1b[K\x1b[12;6H\x1b[1m\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mt\x1b[38;2;202;202;202;49mi\x1b[38;2;231;231;231;49mn\x1b[38;2;242;242;242;49mg\x1b[38;2;231;231;231;49m \x1b[12;13H\x1b[38;2;167;167;167;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;128;128;128;49m ser\x1b[12;25H2\x1b[12;33Hntext7\x1b[22m\x1b[39;49m \x1b[2m(0s \u{2022} esc to interrupt)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;167;167;167;49m\u{2022}\x1b[12;7H\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2807} codexcwd\x07\x1b[?2026h\x1b[12;8H\x1b[1m\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;202;202;202;49m\u{2022}\x1b[12;9H\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280f} codexcwd\x07\x1b[?2026h\x1b[12;10H\x1b[1m\x1b[38;2;128;128;128;49mg\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49mv\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;11H\x1b[1m\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49mM\x1b[38;2;167;167;167;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;12H\x1b[38;2;128;128;128;49mM\x1b[38;2;138;138;138;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280b} codexcwd\x07\x1b[?2026h\x1b[12;13H\x1b[1m\x1b[38;2;128;128;128;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;14H\x1b[1m\x1b[38;2;128;128;128;49mP\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49m \x1b[12;41H\x1b[22m\x1b[2m\x1b[2m\x1b[39;49m1\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;242;242;242;49m\u{2022}\x1b[12;15H\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49m(\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2819} codexcwd\x07\x1b[?2026h\x1b[12;16H\x1b[1m\x1b[38;2;128;128;128;49ms\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49m(\x1b[38;2;138;138;138;49m2\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;17H\x1b[38;2;128;128;128;49me\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49m(\x1b[38;2;167;167;167;49m2\x1b[38;2;138;138;138;49m/\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;18H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49m(\x1b[38;2;202;202;202;49m2\x1b[38;2;167;167;167;49m/\x1b[38;2;138;138;138;49m3\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2839} codexcwd\x07\x1b[?2026h\x1b[12;19H\x1b[1m\x1b[38;2;128;128;128;49mv\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49m(\x1b[38;2;231;231;231;49m2\x1b[38;2;202;202;202;49m/\x1b[38;2;167;167;167;49m3\x1b[38;2;138;138;138;49m)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;codexcwd\x07\x1b[?2026h\x1b[11;1H\x1b[J\x1b[11;2H\x1b[0m\x1b[49m\x1b[K\x1b[12;2H\x1b[0m\x1b[49m\x1b[K\x1b[13;27H\x1b[0m\x1b[49m\x1b[K\x1b[14;2H\x1b[0m\x1b[49m\x1b[K\x1b[15;145H\x1b[0m\x1b[49m\x1b[K\x1b[11;1H \x1b[12;1H \x1b[13;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[14;1H\x1b[22m \x1b[15;1H  \x1b[38;2;228;49;113;49mgpt-5.6-terra medium\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;227;218;130;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/73b541f2-52f4-46a2-913b-c1f611a5282d/scratchpad/codexcwd\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[13;3HWrite the numbers 1 through\x1b[13;31H45,\x1b[13;35Hone\x1b[13;39Hper\x1b[13;43Hline,\x1b[13;49Heach\x1b[13;54Hfollowed\x1b[13;63Hby\x1b[13;66Ha\x1b[13;68Hsingle\x1b[13;75HEnglish\x1b[13;83Hword\x1b[13;88Hstarting\x1b[13;97Hwith\x1b[13;102Hthat\x1b[13;107Hmany\x1b[13;112Hletters\x1b[13;120His\x1b[13;123Hnot\x1b[13;127Hrequired\x1b[13;136H-\x1b[13;138Hjust\x1b[13;143Hany\x1b[13;147Hword.\x1b[13;153HDo\x1b[13;156Hnot\x1b[13;160Huse\x1b[13;164Hany\x1b[13;168Htools.\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;174H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[11;50r\x1b[11;1H\x1bM\x1bM\x1bM\x1bM\x1b[r\x1b[1;14r\x1b[10;1H";
+        assert_eq!(
+            mid_session_segment.len(),
+            6994,
+            "fixture drift: this must stay byte-for-byte the captured \
+             segment (`.dot-agent-deck/652-captures/audit-capture.bin`, \
+             offset 6844, length 6994)"
+        );
+
+        let capture = CapturedSocket::bind();
+        let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(mid_session_segment, &detector, &emitter, true, false);
+
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "precondition: this segment must classify Working (a state \
+             change from the fresh detector's initial None) and reach the \
+             daemon since suppress_text_status is false here; got \
+             {emitted:?}"
+        );
+        let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
+            panic!(
+                "captured line was not a valid AgentEvent: {e}; line={:?}",
+                emitted[0]
+            )
+        });
+        assert_eq!(
+            event.model,
+            Some("gpt-5.6-terra".to_string()),
+            "issue #652 auditor A1: `CODEX_STATUS_BAR_MODEL_SGR` is a single \
+             hardcoded RGB triple, but real Codex v0.150.1 sessions paint \
+             the same status bar shape in a DIFFERENT accent color — \
+             extraction must not depend on one specific color"
+        );
+    }
+
+    /// The SAME real mid-session segment as `codex/wrap/016`, this time fed
+    /// through `classify_and_emit` with `suppress_text_status = true` — the
+    /// hook-trusted default this file's own doc comment (`:232`) calls "the
+    /// common/default case". Reviewer F1 / auditor A1 combined: even once
+    /// extraction itself is fixed, `classify_and_emit`'s emit gate discards
+    /// every non-`Error` classification under suppression, so a healthy,
+    /// non-erroring Codex session — the overwhelming majority of real
+    /// sessions — never reaches the daemon carrying a model at all. Every
+    /// other spec in this file that exercises suppression
+    /// (`codex/wrap/010`\u{2013}`013`, `015`) does so with an
+    /// ERROR-classified segment, the one classification that survives the
+    /// gate; this is the first test in the suite to run a genuinely
+    /// `Working`-classified real segment through the same gate.
+    ///
+    /// Scenario: the same real non-error Codex segment as `codex/wrap/016`
+    /// is fed through `classify_and_emit` with the hook-trusted default
+    /// suppression on, and an event carrying the model must still reach the
+    /// daemon despite the segment classifying `Working`, not `Error`.
+    #[spec("codex/wrap/017")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_017_non_error_model_survives_suppression() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Same verbatim mid-session segment as `codex/wrap/016` — see that
+        // test's comment for provenance.
+        let mid_session_segment = "\x1b[39;49m\x1b[K\x1b[2m\u{2022} \x1b[22mYou have 1 usage limit reset available. Run /usage to use one.\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[13;3H\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;7H\x1b[1m\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2827} codexcwd\x07\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;138;138;138;49m\u{2022}\x1b[12;8H\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;9H\x1b[1m\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;63H\x1b[0m\x1b[49m\x1b[K\x1b[12;6H\x1b[1m\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mt\x1b[38;2;202;202;202;49mi\x1b[38;2;231;231;231;49mn\x1b[38;2;242;242;242;49mg\x1b[38;2;231;231;231;49m \x1b[12;13H\x1b[38;2;167;167;167;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;128;128;128;49m ser\x1b[12;25H2\x1b[12;33Hntext7\x1b[22m\x1b[39;49m \x1b[2m(0s \u{2022} esc to interrupt)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;167;167;167;49m\u{2022}\x1b[12;7H\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2807} codexcwd\x07\x1b[?2026h\x1b[12;8H\x1b[1m\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;202;202;202;49m\u{2022}\x1b[12;9H\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280f} codexcwd\x07\x1b[?2026h\x1b[12;10H\x1b[1m\x1b[38;2;128;128;128;49mg\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49mv\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;11H\x1b[1m\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49mM\x1b[38;2;167;167;167;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;12H\x1b[38;2;128;128;128;49mM\x1b[38;2;138;138;138;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280b} codexcwd\x07\x1b[?2026h\x1b[12;13H\x1b[1m\x1b[38;2;128;128;128;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;14H\x1b[1m\x1b[38;2;128;128;128;49mP\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49m \x1b[12;41H\x1b[22m\x1b[2m\x1b[2m\x1b[39;49m1\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;242;242;242;49m\u{2022}\x1b[12;15H\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49m(\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2819} codexcwd\x07\x1b[?2026h\x1b[12;16H\x1b[1m\x1b[38;2;128;128;128;49ms\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49m(\x1b[38;2;138;138;138;49m2\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;17H\x1b[38;2;128;128;128;49me\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49m(\x1b[38;2;167;167;167;49m2\x1b[38;2;138;138;138;49m/\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;18H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49m(\x1b[38;2;202;202;202;49m2\x1b[38;2;167;167;167;49m/\x1b[38;2;138;138;138;49m3\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2839} codexcwd\x07\x1b[?2026h\x1b[12;19H\x1b[1m\x1b[38;2;128;128;128;49mv\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49m(\x1b[38;2;231;231;231;49m2\x1b[38;2;202;202;202;49m/\x1b[38;2;167;167;167;49m3\x1b[38;2;138;138;138;49m)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;codexcwd\x07\x1b[?2026h\x1b[11;1H\x1b[J\x1b[11;2H\x1b[0m\x1b[49m\x1b[K\x1b[12;2H\x1b[0m\x1b[49m\x1b[K\x1b[13;27H\x1b[0m\x1b[49m\x1b[K\x1b[14;2H\x1b[0m\x1b[49m\x1b[K\x1b[15;145H\x1b[0m\x1b[49m\x1b[K\x1b[11;1H \x1b[12;1H \x1b[13;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[14;1H\x1b[22m \x1b[15;1H  \x1b[38;2;228;49;113;49mgpt-5.6-terra medium\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;227;218;130;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/73b541f2-52f4-46a2-913b-c1f611a5282d/scratchpad/codexcwd\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[13;3HWrite the numbers 1 through\x1b[13;31H45,\x1b[13;35Hone\x1b[13;39Hper\x1b[13;43Hline,\x1b[13;49Heach\x1b[13;54Hfollowed\x1b[13;63Hby\x1b[13;66Ha\x1b[13;68Hsingle\x1b[13;75HEnglish\x1b[13;83Hword\x1b[13;88Hstarting\x1b[13;97Hwith\x1b[13;102Hthat\x1b[13;107Hmany\x1b[13;112Hletters\x1b[13;120His\x1b[13;123Hnot\x1b[13;127Hrequired\x1b[13;136H-\x1b[13;138Hjust\x1b[13;143Hany\x1b[13;147Hword.\x1b[13;153HDo\x1b[13;156Hnot\x1b[13;160Huse\x1b[13;164Hany\x1b[13;168Htools.\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;174H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[11;50r\x1b[11;1H\x1bM\x1bM\x1bM\x1bM\x1b[r\x1b[1;14r\x1b[10;1H";
+        assert_eq!(
+            mid_session_segment.len(),
+            6994,
+            "fixture drift: this must stay byte-for-byte the captured \
+             segment (`.dot-agent-deck/652-captures/audit-capture.bin`, \
+             offset 6844, length 6994)"
+        );
+
+        let capture = CapturedSocket::bind();
+        let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
+
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "issue #652 reviewer F1 / auditor A1: a healthy, non-erroring \
+             Codex session (this segment classifies Working, not Error) \
+             must still reach the daemon carrying its model under the \
+             hook-trusted default (`suppress_text_status = true`) — today \
+             `classify_and_emit`'s emit gate (`if suppress_text_status && \
+             ev != DetectedEvent::Error {{ return; }}`) discards it \
+             entirely, so zero events reach the capture socket for this \
+             segment; got {emitted:?}"
+        );
+        let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
+            panic!(
+                "captured line was not a valid AgentEvent: {e}; line={:?}",
+                emitted[0]
+            )
+        });
+        assert_eq!(
+            event.model,
+            Some("gpt-5.6-terra".to_string()),
+            "the event that does reach the daemon under the fix must carry \
+             the model this segment's status bar shows"
+        );
+        assert_eq!(
+            event.event_type,
+            EventType::Unknown,
+            "round-2 reviewer M3: status-neutrality is the entire \
+             justification for using EventType::Unknown as the carrier \
+             (fixing Blocker 2) — this event must ride a status-neutral \
+             carrier, not a text-derived status assertion, or issue #638's \
+             suppression design is silently undone even though `model` \
+             still comes through"
+        );
+    }
+
+    /// Auditor A4 / reviewer F6: `extract_codex_status_bar_model` has never
+    /// had a direct unit test — every existing exercise of it goes through
+    /// `classify_and_emit` and a real fixture. These cover its distinct
+    /// branches with short hand-constructed inputs; it is a pure
+    /// text-processing function, so a real capture is unneeded here.
+    #[test]
+    fn extract_codex_status_bar_model_no_anchor_present() {
+        assert_eq!(
+            extract_codex_status_bar_model("no escape sequences here at all"),
+            None
+        );
+    }
+
+    /// The anchor is present but the span up to the next `\x1b` is empty or
+    /// whitespace-only — neither is a real model id.
+    #[test]
+    fn extract_codex_status_bar_model_empty_or_whitespace_only_span_is_none() {
+        let empty = format!("{CODEX_STATUS_BAR_MODEL_SGR}\x1b[0m");
+        assert_eq!(extract_codex_status_bar_model(&empty), None);
+
+        let whitespace_only = format!("{CODEX_STATUS_BAR_MODEL_SGR}   \x1b[0m");
+        assert_eq!(extract_codex_status_bar_model(&whitespace_only), None);
+    }
+
+    /// Auditor A2: `after.find('\x1b').unwrap_or(after.len())` treats a
+    /// missing closing escape as "the text runs to end of string" and
+    /// happily returns whatever is there — including a `MAX_CLASSIFY_LINE`
+    /// chop landing mid-model-id. The fix must require the closing escape;
+    /// an incomplete bar should report nothing, not a truncated garbage
+    /// model.
+    #[test]
+    fn extract_codex_status_bar_model_no_closing_escape_is_none() {
+        let chopped = format!("{CODEX_STATUS_BAR_MODEL_SGR}gpt-5.6-te");
+        assert_eq!(
+            extract_codex_status_bar_model(&chopped),
+            None,
+            "a chopped status bar with no closing \\x1b must report \
+             nothing, not the truncated fragment 'gpt-5.6-te' as a model id"
+        );
+    }
+
+    /// Auditor A3 / reviewer F4: two repaints coalescing into one segment
+    /// (no `\r`/`\n` between them) leaves TWO status bars in one line.
+    /// `line.split(ANCHOR).nth(1)` binds to the FIRST — the stale bar —
+    /// when the freshest (last) one is the correct model to report.
+    #[test]
+    fn extract_codex_status_bar_model_two_anchors_last_wins() {
+        let two_bars = format!(
+            "{CODEX_STATUS_BAR_MODEL_SGR}model-old low\x1b[2m\x1b[39;49m \u{b7} junk {CODEX_STATUS_BAR_MODEL_SGR}model-new medium\x1b[2m\x1b[39;49m \u{b7} "
+        );
+        assert_eq!(
+            extract_codex_status_bar_model(&two_bars),
+            Some("model-new".to_string()),
+            "the LAST status bar in a coalesced segment must win, not the \
+             first"
+        );
+    }
+
+    /// A double space between model and effort word must not leave a
+    /// trailing space on the extracted model.
+    #[test]
+    fn extract_codex_status_bar_model_double_space_trims_trailing_space() {
+        let double_space =
+            format!("{CODEX_STATUS_BAR_MODEL_SGR}some-model  medium\x1b[2m\x1b[39;49m \u{b7} ");
+        assert_eq!(
+            extract_codex_status_bar_model(&double_space),
+            Some("some-model".to_string()),
+            "the extracted model must not carry a trailing space"
+        );
+    }
+
+    /// Round-2 reviewer M1: the trailer check alone is not airtight against
+    /// every real byte sequence — `audit-capture2.bin` segment 28 contains a
+    /// truecolor span whose text is just a bullet (`•`), immediately
+    /// followed by an intervening cursor-move escape (`\x1b[30;34H`) and
+    /// only THEN the real trailer; that cursor-move escape is the only thing
+    /// standing between this and a false accept today, since `after_sgr`
+    /// starts with `\x1b[30;`, not `CODEX_STATUS_BAR_TRAILER`. This test
+    /// builds the shape with NOTHING between the span and the trailer — a
+    /// single non-alphanumeric character (`•`) immediately closed by the
+    /// real trailer bytes — which the current implementation happily
+    /// accepts as a "model". A plausible model id requires more than one
+    /// punctuation character, so this must be `None`, not `Some("•")`.
+    #[test]
+    fn extract_codex_status_bar_model_single_punctuation_char_before_trailer_is_none() {
+        let bullet_then_trailer =
+            format!("{CODEX_STATUS_BAR_MODEL_SGR}\u{b7}{CODEX_STATUS_BAR_TRAILER}");
+        assert_eq!(
+            extract_codex_status_bar_model(&bullet_then_trailer),
+            None,
+            "a single non-alphanumeric character immediately followed by \
+             the real trailer is not a plausible model id and must not be \
+             extracted, even though it satisfies today's anchor+trailer \
+             check"
+        );
+    }
+
+    /// Round-2 auditor M3: `wrap_016`/`wrap_017`'s fixture happens to have
+    /// the real status bar as the LAST truecolor span, so nothing pins that
+    /// "last occurrence wins" specifically means "last VALID (trailer-
+    /// closed) occurrence" rather than "last occurrence, full stop". This
+    /// places a trailer-validated span with a real-looking model FIRST, then
+    /// a second truecolor span that is NOT trailer-validated (closed by
+    /// `\x1b[0m` instead) — the extractor must still return the earlier
+    /// valid model, not `None` and not confused by the later invalid one.
+    #[test]
+    fn extract_codex_status_bar_model_later_invalid_span_does_not_override_earlier_valid_one() {
+        let valid_then_invalid = format!(
+            "{CODEX_STATUS_BAR_MODEL_SGR}real-model low{CODEX_STATUS_BAR_TRAILER}{CODEX_STATUS_BAR_MODEL_SGR}not a status bar\x1b[0m"
+        );
+        assert_eq!(
+            extract_codex_status_bar_model(&valid_then_invalid),
+            Some("real-model".to_string()),
+            "the earlier trailer-validated span must still win even though \
+             a later, non-trailer-validated span appears after it — \
+             'last wins' means 'last VALID occurrence', not literally the \
+             last truecolor span in the segment"
+        );
+    }
+
+    /// Reviewer F6: `note_model`'s `Some`-overwrites branch had no direct
+    /// test — only its `None`-never-clears half was implicitly exercised
+    /// through the socket-level tests above. A mid-session model change
+    /// (e.g. a `/model` switch) must overwrite, not stick on the first
+    /// observed value.
+    #[test]
+    fn note_model_overwrites_on_a_later_some() {
+        let mut det = Detector::new();
+        det.note_model(Some("model-a".to_string()));
+        det.note_model(Some("model-b".to_string()));
+        assert_eq!(det.model, Some("model-b".to_string()));
     }
 
     /// `tee` passes bytes through verbatim (including a trailing newline-less
