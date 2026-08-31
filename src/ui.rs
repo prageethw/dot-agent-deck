@@ -21653,10 +21653,19 @@ fn render_session_card(
     // Fork #339: the agent-type badge (registry-coloured type label),
     // `370b6228`'s removal, restored behind the deck-global
     // `show_agent_type_badge` toggle (`Ctrl+m` / `m`, off by default). D4:
-    // skipped on a placeholder card even when the toggle is on —
-    // `agent_registry::spec(&AgentType::None).label` is "No agent", which
-    // would collide with the status text as a second "No agent" segment.
-    let show_badge = show_agent_type_badge && !is_placeholder;
+    // skipped on a genuinely-empty placeholder card even when the toggle is
+    // on — `agent_registry::spec(&AgentType::None).label` is "No agent",
+    // which would collide with the status text as a second "No agent"
+    // segment.
+    //
+    // Issue #650: gated on `is_empty_placeholder`, not raw `is_placeholder`
+    // — a RESOLVED placeholder (Codex activity seen but never tagged with a
+    // concrete `AgentType`) has already left the "No agent" status label
+    // behind (see `status_label` above), so the D4 collision this gate
+    // exists to avoid can no longer happen; keeping the badge off for it
+    // instead just hid the resolved session's known `model` from the card
+    // entirely.
+    let show_badge = show_agent_type_badge && !is_empty_placeholder;
     let title_segments: Vec<(String, Style)> = if show_badge {
         // PRD #20 M5 / finding #9: the agent-type label carries its
         // registry badge colour. A friendly `display_name` renders
