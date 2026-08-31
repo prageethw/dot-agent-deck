@@ -231,17 +231,23 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
 /// Scenario: With Codex authentication copied into an isolated HOME, submit a
 /// bare interactive `codex` command through the normal Ctrl+N new-pane flow on
 /// the cheap model, send a minimal reply-only prompt (no shell tool use, no
-/// sentinel-file proof), and subscribe to the real daemon event stream. A
-/// captured `AgentEvent` from this live process must carry a `model` field
-/// matching the real model it is running — proving Codex's model reporting
-/// reaches the daemon end to end through a genuine spawn, not from
-/// byte-frozen capture data pinned to one Codex TUI rendering. Deliberately
-/// does not gate on a `Thinking`/`Idle` transition: on a trusted session,
-/// those depend on Codex's own native hooks firing inside the interactive
-/// TUI, a separate, already-documented gap (`common::codex_test_model`'s doc
-/// comment) unrelated to this issue — the model carrier this test asserts on
-/// is the status-neutral event #652/#657 built specifically so model
-/// reporting does not depend on that hook path at all.
+/// sentinel-file proof), and subscribe to the real daemon event stream. The
+/// wait requires a captured `AgentEvent` with BOTH `model.is_some()` AND
+/// `live_target.is_some()` — the `live_target` clause matters because it is
+/// what disambiguates a wrap-emitted event from Codex's native hook path
+/// (which always reports `live_target: None`); without it the wait could be
+/// satisfied by the hook path instead, making the test pass without
+/// exercising wrap at all. Only an event meeting both clauses can then be
+/// asserted to carry the real model it is running — proving Codex's model
+/// reporting reaches the daemon end to end through a genuine spawn via wrap,
+/// not from byte-frozen capture data pinned to one Codex TUI rendering.
+/// Deliberately does not gate on a `Thinking`/`Idle` transition: on a trusted
+/// session, those depend on Codex's own native hooks firing inside the
+/// interactive TUI, a separate, already-documented gap
+/// (`common::codex_test_model`'s doc comment) unrelated to this issue — the
+/// model carrier this test asserts on is the status-neutral event #652/#657
+/// built specifically so model reporting does not depend on that hook path at
+/// all.
 #[spec("codex/live/002")]
 #[test]
 fn codex_live_002_real_interactive_session_reports_active_model() {
