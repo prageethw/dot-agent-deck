@@ -292,7 +292,11 @@ fn codex_live_002_real_interactive_session_reports_active_model() {
     // not asserted against frozen capture bytes the way `codex/wrap/015`-
     // `018` pin the extraction logic in isolation.
     let model_event = events.wait_for(
-        |event| event.agent_type == AgentType::Codex && event.model.is_some(),
+        |event| {
+            event.agent_type == AgentType::Codex
+                && event.model.is_some()
+                && event.live_target.is_some()
+        },
         Duration::from_secs(60),
     );
     assert_eq!(

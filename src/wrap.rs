@@ -4274,16 +4274,19 @@ mod tests {
         );
     }
 
-    /// Issue #657: the model carrier round 7 added (`classify_and_emit`'s
-    /// doc comment above, and `codex/wrap/017`) lives entirely inside
-    /// `if let Some(ev) = ev {{ ... }}` — it only fires when THIS call's
-    /// classification also produces a status *transition* on
-    /// `det.observe_detected(...)`. A segment that carries a freshly
-    /// repainted model but does NOT change the pane's classified status
-    /// (the pane was already `Working` and stays `Working`, the common
-    /// case for a mid-session model switch after the very first turn) never
-    /// reaches that branch at all, so the fresh model is silently dropped
-    /// even though `extract_codex_status_bar_model` read it just fine.
+    /// Issue #657 (historical bug, now fixed): the model carrier round 7
+    /// added (`classify_and_emit`'s doc comment above, and `codex/wrap/017`)
+    /// used to live entirely inside `if let Some(ev) = ev { ... }` — it only
+    /// fired when THIS call's classification also produced a status
+    /// *transition* on `det.observe_detected(...)`. A segment that carried a
+    /// freshly repainted model but did NOT change the pane's classified
+    /// status (the pane was already `Working` and stayed `Working`, the
+    /// common case for a mid-session model switch after the very first
+    /// turn) never reached that branch at all, so the fresh model was
+    /// silently dropped even though `extract_codex_status_bar_model` read it
+    /// just fine. The fix restructured the `if let` into a `match ev {
+    /// Some(ev) => { ... } None => { ... } }`, adding a `None` arm that
+    /// still emits the freshly-observed model.
     ///
     /// Scenario: the same real non-error Codex segment `codex/wrap/016`/
     /// `017` use is fed to `classify_and_emit` twice in a row. The first
@@ -4335,11 +4338,30 @@ mod tests {
         classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
         capture.drain();
 
+        // Confirm this test's own premise directly, rather than only inferring
+        // it from the emitted-event outcome below: reclassifying the identical
+        // line against the now-`Working` detector state must produce no
+        // transition, i.e. `Detector::observe_detected` returns `None`. This
+        // probe doesn't disturb the detector for the real second call below —
+        // repeating the same classification against unchanged `last` state is
+        // idempotent (`Detector::observe_detected`'s `self.last == Some(detected)`
+        // branch doesn't mutate `last` further).
+        {
+            let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+            let premise = det.observe_detected(classify_codex_line(mid_session_segment));
+            assert_eq!(
+                premise, None,
+                "test premise: reclassifying the identical segment must NOT \
+                 produce a status transition, or this test isn't exercising \
+                 the no-transition case issue #657 fixed at all; got {premise:?}"
+            );
+        }
+
         // Second call, SAME line: `classify_codex_line` reclassifies it as
         // `Working` again, so `Detector::observe_detected` returns `None`
-        // (no transition) — issue #657's exact gap. `extract_codex_status_bar_model`
-        // still freshly re-extracts the same model from this call's own
-        // line regardless.
+        // (no transition, confirmed above) — issue #657's historical gap.
+        // `extract_codex_status_bar_model` still freshly re-extracts the same
+        // model from this call's own line regardless.
         classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
 
         let emitted = capture.drain();
@@ -4347,13 +4369,13 @@ mod tests {
             emitted.len(),
             1,
             "issue #657: a model freshly observed on a segment that does \
-             NOT produce a status transition (this is the identical \
-             segment fed twice, so `Detector::observe_detected` returns \
-             `None` the second time) must still reach the daemon — today \
-             the entire model-carrier branch lives inside \
-             `if let Some(ev) = ev {{ ... }}`, so a `None` transition \
-             silently drops the freshly-observed model along with it; got \
-             {emitted:?}"
+             NOT produce a status transition (confirmed via the premise \
+             check above) must still reach the daemon — the historical bug \
+             this test guards against left the entire model-carrier branch \
+             inside `if let Some(ev) = ev {{ ... }}`, so a `None` transition \
+             silently dropped the freshly-observed model along with it; the \
+             fix restructured this into a `match` with a `None` arm that \
+             still emits it. got {emitted:?}"
         );
         let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
             panic!(
