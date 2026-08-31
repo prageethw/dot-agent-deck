@@ -4244,6 +4244,16 @@ mod tests {
             "the event that does reach the daemon under the fix must carry \
              the model this segment's status bar shows"
         );
+        assert_eq!(
+            event.event_type,
+            EventType::Unknown,
+            "round-2 reviewer M3: status-neutrality is the entire \
+             justification for using EventType::Unknown as the carrier \
+             (fixing Blocker 2) — this event must ride a status-neutral \
+             carrier, not a text-derived status assertion, or issue #638's \
+             suppression design is silently undone even though `model` \
+             still comes through"
+        );
     }
 
     /// Auditor A4 / reviewer F6: `extract_codex_status_bar_model` has never
@@ -4314,6 +4324,55 @@ mod tests {
             extract_codex_status_bar_model(&double_space),
             Some("some-model".to_string()),
             "the extracted model must not carry a trailing space"
+        );
+    }
+
+    /// Round-2 reviewer M1: the trailer check alone is not airtight against
+    /// every real byte sequence — `audit-capture2.bin` segment 28 contains a
+    /// truecolor span whose text is just a bullet (`•`), immediately
+    /// followed by an intervening cursor-move escape (`\x1b[30;34H`) and
+    /// only THEN the real trailer; that cursor-move escape is the only thing
+    /// standing between this and a false accept today, since `after_sgr`
+    /// starts with `\x1b[30;`, not `CODEX_STATUS_BAR_TRAILER`. This test
+    /// builds the shape with NOTHING between the span and the trailer — a
+    /// single non-alphanumeric character (`•`) immediately closed by the
+    /// real trailer bytes — which the current implementation happily
+    /// accepts as a "model". A plausible model id requires more than one
+    /// punctuation character, so this must be `None`, not `Some("•")`.
+    #[test]
+    fn extract_codex_status_bar_model_single_punctuation_char_before_trailer_is_none() {
+        let bullet_then_trailer =
+            format!("{CODEX_STATUS_BAR_MODEL_SGR}\u{b7}{CODEX_STATUS_BAR_TRAILER}");
+        assert_eq!(
+            extract_codex_status_bar_model(&bullet_then_trailer),
+            None,
+            "a single non-alphanumeric character immediately followed by \
+             the real trailer is not a plausible model id and must not be \
+             extracted, even though it satisfies today's anchor+trailer \
+             check"
+        );
+    }
+
+    /// Round-2 auditor M3: `wrap_016`/`wrap_017`'s fixture happens to have
+    /// the real status bar as the LAST truecolor span, so nothing pins that
+    /// "last occurrence wins" specifically means "last VALID (trailer-
+    /// closed) occurrence" rather than "last occurrence, full stop". This
+    /// places a trailer-validated span with a real-looking model FIRST, then
+    /// a second truecolor span that is NOT trailer-validated (closed by
+    /// `\x1b[0m` instead) — the extractor must still return the earlier
+    /// valid model, not `None` and not confused by the later invalid one.
+    #[test]
+    fn extract_codex_status_bar_model_later_invalid_span_does_not_override_earlier_valid_one() {
+        let valid_then_invalid = format!(
+            "{CODEX_STATUS_BAR_MODEL_SGR}real-model low{CODEX_STATUS_BAR_TRAILER}{CODEX_STATUS_BAR_MODEL_SGR}not a status bar\x1b[0m"
+        );
+        assert_eq!(
+            extract_codex_status_bar_model(&valid_then_invalid),
+            Some("real-model".to_string()),
+            "the earlier trailer-validated span must still win even though \
+             a later, non-trailer-validated span appears after it — \
+             'last wins' means 'last VALID occurrence', not literally the \
+             last truecolor span in the segment"
         );
     }
 
