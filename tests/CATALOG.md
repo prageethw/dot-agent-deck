@@ -622,6 +622,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact truncation cap chosen; rendered-card output (no render seam is exercised — see `dashboard/agent-badge/001` for the card's `display_name` body row); `model`'s own sanitization/clamping (`dashboard/agent-badge/005`, `dashboard/agent-badge/006`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/agent-badge/008 — A resolved Codex placeholder (real activity seen via issue #549's `agent_report_activity_seen`, but `agent_type` still `AgentType::None` — Codex's normal shape before/without a `SessionStart` hook) still surfaces a known `session.model` in the rendered badge when the toggle is on (issue #650).
+- **Layer:** L1 (a directly-constructed `SessionState` fed through `render_card_for_mode_to_buffer`, mirroring `dashboard/agent-badge/001`'s construction style).
+- **Agent:** none (a synthetic session shaped like a resolved Codex placeholder: `expects_agent_report: false`, `agent_report_activity_seen: true`, `model: Some("some-model-id")`).
+- **Asserts:** with the agent-type badge toggle on, the rendered card's title/badge area contains the known model string (`"some-model-id"`) even though `shown_agent_type` is still `AgentType::None` — `show_badge` must not stay gated on the raw `is_placeholder` flag once the placeholder has resolved (mirroring the status-label/border fix `dashboard/placeholder/004` already pins).
+- **Does not assert:** the exact badge text shape for the `AgentType::None`-but-model-known case (e.g. `No agent (some-model-id)` vs. some other wording) — left to the fix's own judgement; the status-label/border half of the resolved-placeholder fix (`dashboard/placeholder/004`); a Codex session whose `agent_type` has genuinely resolved (`dashboard/agent-badge/001`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Statuses
 
 #### status/transition

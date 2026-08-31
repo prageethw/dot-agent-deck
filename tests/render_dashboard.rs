@@ -1821,6 +1821,84 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
     );
 }
 
+/// Scenario: issue #650 — construct a session shaped like a Codex pane whose
+/// "Starting…" placeholder has already resolved (issue #549 / PR #641's
+/// `is_empty_placeholder` shape: `expects_agent_report` cleared to `false`,
+/// `agent_report_activity_seen` set to `true`) but whose `agent_type` never
+/// resolved away from `AgentType::None` — the normal, expected shape for a
+/// Codex pane in many configs, since Codex posts no `SessionStart` hook.
+/// The session also carries a known `model`. With the agent-type badge
+/// toggle on, the rendered card must still surface that known model
+/// somewhere in its title/badge area: `render_session_card` currently gates
+/// `show_badge` on the raw `is_placeholder` flag (true here, since
+/// `shown_agent_type` is still `AgentType::None`) rather than
+/// `is_empty_placeholder` (false here, since real activity has been seen),
+/// so today the badge — and the model it would carry — stays suppressed
+/// even though the card's status/border have already moved on from the
+/// empty-placeholder state (`dashboard/placeholder/004`).
+#[spec("dashboard/agent-badge/008")]
+#[test]
+fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "codex-resolved-01".to_string(),
+        // Codex's own shape: never reports an agent_type before its first
+        // turn completes, which for many configs is indefinitely.
+        agent_type: AgentType::None,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Thinking,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("inspect the repository".to_string()),
+        first_prompts: vec!["inspect the repository".to_string()],
+        pane_id: Some("codex-pane-resolved".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: None,
+        pending_permission_tool: None,
+        shell_synthetic_working: false,
+        monitored_wait_active: false,
+        wait_synthetic_working: false,
+        shell_descendant_busy: false,
+        wait_deferred_revert: false,
+        model: Some("some-model-id".to_string()),
+        // Issue #549's resolved-placeholder shape: the report was expected,
+        // never arrived, but real activity has since been seen — so
+        // `is_empty_placeholder` is false even though `is_placeholder`
+        // (raw, `agent_type == AgentType::None`) stays true.
+        expects_agent_report: false,
+        agent_report_activity_seen: true,
+    };
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+
+    let buffer = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text = buffer_to_text(&buffer);
+
+    assert!(
+        text.contains("some-model-id"),
+        "a resolved Codex placeholder (real activity seen, agent_type still \
+         None) with a known model and the agent-type badge toggle on must \
+         still surface that model somewhere in the rendered card — the \
+         badge must not stay suppressed just because agent_type never \
+         resolved:\n{text}"
+    );
+}
+
 /// Scenario: Aggregate a busy mixed deck (14 Claude Code + 8 Codex sessions) and
 /// render its stats bar at 60 columns — the width the bar actually gets, since it
 /// draws into the last row of the left dashboard column whenever panes are open.
