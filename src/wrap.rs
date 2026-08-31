@@ -3751,6 +3751,97 @@ mod tests {
         );
     }
 
+    /// Scenario: a real, ANSI-decorated Codex TUI segment carrying the
+    /// composer status bar (`gpt-5.1-codex-mini low · <cwd>`) must produce an
+    /// `AgentEvent` whose `model` field is `Some("gpt-5.1-codex-mini")` — not
+    /// the hardcoded `None` `Emitter::build_event` sends today, on every
+    /// event, unconditionally.
+    ///
+    /// Issue #652: found while fixing #650 (PR #651) — review determined the
+    /// state that PR's badge gate targets (model known while agent type
+    /// unresolved) can never actually happen for Codex, because
+    /// `Emitter::build_event` (`:538`) never carries a model at all. This is
+    /// the wrap integration's own root defect: the interactive TUI's status
+    /// bar clearly carries the active model on screen (verified by this
+    /// fixture, the same real captured bytes `codex/wrap/012` uses — a real
+    /// HTTP-400 error-turn repaint from `codex-cli 0.150.1`, whose composer
+    /// footer segment reads `gpt-5.1-codex-mini low` followed by a middle-dot
+    /// separator and the cwd), but nothing in `wrap.rs` ever reads it back
+    /// out and stamps it on the event the daemon receives.
+    ///
+    /// Reuses the exact `codex/wrap/012` fixture and call shape (same
+    /// `classify_and_emit` entry point, same `is_codex`/`suppress_text_status`
+    /// arguments) rather than a hand-written approximation, per this repo's
+    /// established convention for wrap classifier changes — this segment is
+    /// already known to classify `Error` and reach the daemon as exactly one
+    /// event under suppression (`codex/wrap/012`), so that one captured event
+    /// is the one this test inspects for `model`. The daemon side
+    /// (`state.rs::apply_event`) already treats `model` as STICKY — a later
+    /// `None` does not clear a previously-known model — so the wrap side only
+    /// needs to report the model once, on whichever event first carries it;
+    /// it does not need to re-send it on every event.
+    #[spec("codex/wrap/015")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_015_status_bar_model_reaches_daemon() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Verbatim segment 20 (699 bytes) of
+        // `.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin` —
+        // the same real captured bytes `codex/wrap/012` uses. Its composer
+        // footer carries the status-bar text
+        // `gpt-5.1-codex-mini low \u{b7} <cwd>` (ANSI SGR-decorated), which is
+        // what this test is really after; the leading error payload is
+        // incidental to this test but is what makes the segment classify and
+        // actually emit under suppression.
+        let decorated_error_segment = "\x1b[39;49m\x1b[K\x1b[38;5;1;49m\u{25a0} {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.1-codex-mini' model is not supported when using Codex with a ChatGPT account.\"}}\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[23;3H\x1b[21;2H\x1b[0m\x1b[49m\x1b[K\x1b[22;2H\x1b[0m\x1b[49m\x1b[K\x1b[23;27H\x1b[0m\x1b[49m\x1b[K\x1b[24;2H\x1b[0m\x1b[49m\x1b[K\x1b[25;146H\x1b[0m\x1b[49m\x1b[K\x1b[21;1H \x1b[22;1H \x1b[23;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[24;1H\x1b[22m \x1b[25;1H  \x1b[38;2;246;226;183;49mgpt-5.1-codex-mini low\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;171;223;167;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/45e45f1a-4a0d-4f8f-ba83-27ee7d6ea88b/scratchpad/r4/work\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l";
+        assert_eq!(
+            decorated_error_segment.len(),
+            699,
+            "fixture drift: this must stay byte-for-byte the captured segment \
+             (`.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`, \
+             segment 20)"
+        );
+
+        let capture = CapturedSocket::bind();
+        let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
+
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "precondition (same as codex/wrap/012): exactly one Error event \
+             must reach the daemon for this segment; got {emitted:?}"
+        );
+        let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
+            panic!(
+                "captured line was not a valid AgentEvent: {e}; line={:?}",
+                emitted[0]
+            )
+        });
+        assert_eq!(
+            event.model,
+            Some("gpt-5.1-codex-mini".to_string()),
+            "issue #652: the wrap integration must report the model it reads \
+             back from the Codex TUI's own status bar — `Emitter::build_event` \
+             hardcodes `model: None` unconditionally today, so this event's \
+             model is always None regardless of what's visibly on screen"
+        );
+    }
+
     /// `tee` passes bytes through verbatim (including a trailing newline-less
     /// prompt) and classifies each completed line plus a trailing partial line.
     #[test]
