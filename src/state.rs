@@ -9577,8 +9577,12 @@ impl AppState {
                 asserted
             }
             EventType::Unknown => {
-                // Forward-compat catch-all — informational at most, never
-                // produced by this build. No status change.
+                // Forward-compat catch-all, informational at most — no
+                // status change. Issue #652: also now the wire value of
+                // `wrap.rs`'s deliberate status-neutral model carrier, so
+                // "never produced by this build" no longer holds; the
+                // no-status-change handling here is exactly why that carrier
+                // is safe to use for out-of-band data like the model.
                 false
             }
             EventType::SessionEnd => unreachable!(),

@@ -408,36 +408,135 @@ fn classify_codex_json(line: &str) -> Option<DetectedEvent> {
     })
 }
 
-/// The exact truecolor SGR span (RGB 246,226,183 — the warm tan Codex's
-/// interactive TUI consistently paints its composer footer with, across every
-/// captured redraw in `.dot-agent-deck/638-captures/`) that immediately
-/// precedes the "`<model> <effort>`" status-bar text. Issue #652: anchoring
-/// extraction on this specific escape sequence — rather than a bare
-/// substring search for a `gpt-`-shaped token anywhere in the segment — is
-/// what keeps a model id embedded incidentally elsewhere (e.g. inside a JSON
-/// error payload's `message` field, which carries no such preceding escape)
-/// from being mistaken for the real status bar.
+/// One real truecolor SGR span (RGB 246,226,183, a warm tan) that Codex's
+/// interactive TUI has been observed painting its composer footer with — the
+/// color `wrap_015`'s real captured fixture happens to use. Issue #652
+/// auditor A1: this exact RGB triple is NOT what every session uses — two
+/// further real Codex v0.150.1 captures (bytes not checked into this repo;
+/// see [`extract_codex_status_bar_model`]'s doc comment for what evidence
+/// actually is) show the identical status-bar shape painted in a different
+/// accent color per session. `#[cfg(test)]`-only: production code no longer
+/// anchors on one fixed triple — see [`CODEX_STATUS_BAR_ANCHOR_PREFIX`] for
+/// what it matches instead — this constant now exists purely so this file's
+/// own hand-written unit tests can build a well-formed anchor without
+/// repeating the literal bytes.
+#[cfg(test)]
 const CODEX_STATUS_BAR_MODEL_SGR: &str = "\x1b[38;2;246;226;183;49m";
+
+/// The generic prefix of a 24-bit truecolor foreground SGR sequence
+/// (`\x1b[38;2;<r>;<g>;<b>;49m`, any RGB triple — the `49` is the paired
+/// default-background parameter Codex always sends alongside it). Issue #652
+/// auditor A1: the composer footer's own accent color varies per session, so
+/// extraction can no longer anchor on one fixed triple like
+/// [`CODEX_STATUS_BAR_MODEL_SGR`]. What stays invariant is the SHAPE of the
+/// escape plus the text that follows it — see
+/// [`extract_codex_status_bar_model`]'s doc comment for the full match +
+/// validation strategy this generality requires.
+const CODEX_STATUS_BAR_ANCHOR_PREFIX: &str = "\x1b[38;2;";
+
+/// The exact byte sequence (dim, default-fg/bg, a space, a middle dot, a
+/// space) that immediately follows the "`<model> <effort>`" text in every
+/// real captured composer-footer redraw, separating it from the cwd segment
+/// that follows. Issue #652 auditor A1: this is what [`extract_codex_status_bar_model`]
+/// validates a [`CODEX_STATUS_BAR_ANCHOR_PREFIX`] match against before
+/// accepting it — the SAME generic truecolor shape also paints ordinary
+/// per-character UI tinting throughout a real capture (a spinner label or
+/// "MCP server" spelled out letter-by-letter, each letter its own
+/// `\x1b[38;2;<r>;<g>;<b>;49m<char>` span), and none of that incidental
+/// tinting is followed by this trailer.
+const CODEX_STATUS_BAR_TRAILER: &str = "\x1b[2m\x1b[39;49m \u{b7} ";
+
+/// Parse the `<r>;<g>;<b>;49m` suffix of a [`CODEX_STATUS_BAR_ANCHOR_PREFIX`]
+/// match — three ASCII-digit groups then the literal `49m` — and return
+/// whatever text follows the closing `m`. `None` when what follows the
+/// prefix doesn't have this shape (a different SGR parameter list entirely,
+/// or a truncated one), so the caller treats the prefix occurrence as not a
+/// match rather than misparsing it.
+fn strip_rgb_49m_suffix(after_prefix: &str) -> Option<&str> {
+    let m_idx = after_prefix.find('m')?;
+    let params = &after_prefix[..m_idx];
+    let mut parts = params.split(';');
+    let (r, g, b, bg) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || bg != "49" {
+        return None;
+    }
+    let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    if !is_digits(r) || !is_digits(g) || !is_digits(b) {
+        return None;
+    }
+    Some(&after_prefix[m_idx + 1..])
+}
 
 /// Extract the active model id from a raw (ANSI-decorated) Codex TUI output
 /// segment, when its composer status bar is present in `line`. Codex paints
-/// the bar as "`<model> <effort>`" (e.g. `gpt-5.1-codex-mini low`) inside
-/// [`CODEX_STATUS_BAR_MODEL_SGR`]; everything up to the next escape sequence
-/// is that text, and the model is everything before the LAST space — the
-/// trailing reasoning-effort word (`low`/`medium`/`high`) never itself
-/// contains a space, while a model id may contain hyphens/dots but not
-/// spaces. Returns `None` when this segment doesn't carry the status bar at
+/// the bar as "`<model> <effort>`" (e.g. `gpt-5.1-codex-mini low`) inside a
+/// [`CODEX_STATUS_BAR_ANCHOR_PREFIX`] truecolor span, immediately followed by
+/// [`CODEX_STATUS_BAR_TRAILER`]; the model is everything in that text before
+/// the LAST space — the trailing reasoning-effort word (`low`/`medium`/`high`)
+/// never itself contains a space, while a model id may contain hyphens/dots
+/// but not spaces.
+///
+/// Issue #652 auditor A1: this used to anchor on one hardcoded RGB triple
+/// ([`CODEX_STATUS_BAR_MODEL_SGR`]), which two further real Codex v0.150.1
+/// captures on this machine showed was wrong — the same status-bar shape
+/// painted in a different accent color per session, making the fix a silent
+/// no-op for those sessions. Anchoring generically on
+/// [`CODEX_STATUS_BAR_ANCHOR_PREFIX`] (any RGB triple) alone isn't safe by
+/// itself: the identical truecolor SGR shape also paints ordinary
+/// per-character UI tinting throughout a real capture (individual letters of
+/// a spinner label, each its own truecolor span), so without a further check
+/// a segment busy with that tinting yields garbage. Requiring
+/// [`CODEX_STATUS_BAR_TRAILER`] to immediately follow the extracted text is
+/// what makes the generic anchor safe: that exact trailer is what's actually
+/// invariant across sessions and colors, occurring 1:1 with the real
+/// status-bar count and with nothing else in either of the two additional
+/// captures. Verified against three real inputs total (the original
+/// `wrap_015` fixture plus the two additional captures used by
+/// `wrap_016`/`wrap_017`) — all three extract cleanly; the local capture
+/// bytes this was checked against live at
+/// `/home/prageeth/workspaces/dot-agent-deck-bugs/.dot-agent-deck/652-captures/`,
+/// a scratch location on the machine that produced this fix, not part of
+/// this repo (same caveat #638 left on the now-nonexistent
+/// `.dot-agent-deck/638-captures/`, not repeated here) — the actual
+/// evidence checked into the repo is the fixture bytes embedded in
+/// `wrap_015`/`016`/`017` themselves and their `tests/CATALOG.md` entries.
+///
+/// A segment carrying more than one composer-footer repaint (no `\r`/`\n`
+/// between them, so `tee` delivers both in one line) takes the LAST valid
+/// occurrence, not the first — a mid-session model switch must report the
+/// newer bar, and an older stale one must not win just because it appears
+/// earlier in the segment.
+///
+/// Returns `None` when this segment doesn't carry a validated status bar at
 /// all (most segments won't — Codex only repaints it on the frames that
-/// touch the composer footer), which is fine: the caller treats this as
-/// sticky and keeps whatever model was last observed.
+/// touch the composer footer, and a segment can be truncated by
+/// `MAX_CLASSIFY_LINE` mid-bar), which is fine: the caller treats this as
+/// sticky and keeps whatever model was last observed, rather than accepting
+/// a truncated fragment as a genuine (and possibly wrong) model id.
 fn extract_codex_status_bar_model(line: &str) -> Option<String> {
-    let after = line.split(CODEX_STATUS_BAR_MODEL_SGR).nth(1)?;
-    let text_end = after.find('\x1b').unwrap_or(after.len());
-    let text = after[..text_end].trim();
-    if text.is_empty() {
-        return None;
+    let mut best: Option<&str> = None;
+    let mut search_from = 0usize;
+    while let Some(rel) = line[search_from..].find(CODEX_STATUS_BAR_ANCHOR_PREFIX) {
+        let anchor_start = search_from + rel;
+        let after_prefix = &line[anchor_start + CODEX_STATUS_BAR_ANCHOR_PREFIX.len()..];
+        search_from = anchor_start + CODEX_STATUS_BAR_ANCHOR_PREFIX.len();
+        let Some(after_sgr) = strip_rgb_49m_suffix(after_prefix) else {
+            continue;
+        };
+        let Some(text_end) = after_sgr.find('\x1b') else {
+            continue;
+        };
+        let text = after_sgr[..text_end].trim();
+        if text.is_empty() {
+            continue;
+        }
+        if after_sgr[text_end..].starts_with(CODEX_STATUS_BAR_TRAILER) {
+            best = Some(text);
+        }
     }
+    let text = best?;
     let model = text.rsplit_once(' ').map_or(text, |(model, _effort)| model);
+    let model = model.trim_end();
     if model.is_empty() {
         None
     } else {
@@ -497,20 +596,15 @@ struct Emitter {
 
 impl Emitter {
     /// Build an [`AgentEvent`] for `event_type` and send it to the daemon over
-    /// the existing raw-`AgentEvent` hook socket. Send failures are ignored so
-    /// the wrapper stays a transparent passthrough even with no daemon (the
-    /// "arbitrary commands as a basic fallback" success criterion).
-    fn emit(&self, event_type: EventType) {
-        self.emit_with_metadata(event_type, HashMap::new(), None);
-    }
-
-    /// Same as [`Self::emit`] but also stamps `model`, when known. Issue #652:
-    /// used by [`classify_and_emit`] to report the model id it reads back
-    /// from the wrapped Codex TUI's own status bar. Every other call site has
-    /// no model context and stays on plain [`Self::emit`], which always sends
-    /// `None` — safe, since the daemon's `model` handling is STICKY
-    /// (`state.rs::apply_event`), so a `None` here never clears a model an
-    /// earlier event already reported.
+    /// the existing raw-`AgentEvent` hook socket, stamping `model` when known.
+    /// Send failures are ignored so the wrapper stays a transparent
+    /// passthrough even with no daemon (the "arbitrary commands as a basic
+    /// fallback" success criterion). Issue #652: `classify_and_emit` and both
+    /// session-end call sites pass the model `Detector` last observed off the
+    /// wrapped Codex TUI's own status bar; a call site with no model context
+    /// passes `None` explicitly — safe, since the daemon's `model` handling
+    /// is STICKY (`state.rs::apply_event`), so a `None` here never clears a
+    /// model an earlier event already reported.
     fn emit_with_model(&self, event_type: EventType, model: Option<String>) {
         self.emit_with_metadata(event_type, HashMap::new(), model);
     }
@@ -2189,6 +2283,20 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// narrower case where hook trust is NOT confirmed, or when it classifies as
 /// `Error` regardless of trust state (see [`CODEX`]'s doc comment for that
 /// path's accepted residual limitation).
+///
+/// Round 7 (issue #652 reviewer F1 / auditor A1): round 6 left one gap —
+/// under `suppress_text_status`, a hook-trusted session that never errors
+/// (the overwhelming majority of real sessions) had NO surviving carrier for
+/// the model it just read off the composer footer, since every non-`Error`
+/// event was discarded outright. The suppression gate itself is unchanged
+/// (still only `Error` carries real status under suppression); what's new is
+/// that a freshly-observed model (this call's own
+/// [`extract_codex_status_bar_model`] result, not merely still-sticky from
+/// an earlier call) rides a status-neutral [`EventType::Unknown`] event
+/// through the gate instead of being dropped with it. `Unknown` is
+/// `apply_event`'s no-status-change catch-all (`state.rs`), so this cannot
+/// perturb the pane's status — only the model reaches the daemon, exactly as
+/// the two untouched session-end `emit()` calls already do unconditionally.
 fn classify_and_emit(
     line: &str,
     detector: &Arc<Mutex<Detector>>,
@@ -2200,11 +2308,16 @@ fn classify_and_emit(
     // Issue #652: try to read the model off this segment's status bar before
     // classifying — independent of what this segment classifies as, since a
     // status-bar repaint and a state-change event don't necessarily land on
-    // the same segment. Sticky in `Detector`, so this is safe to call on
-    // every segment (most won't carry the bar and leave the model unchanged).
-    if is_codex {
-        det.note_model(extract_codex_status_bar_model(line));
-    }
+    // the same segment. `fresh_model` (this call's own extraction result, as
+    // opposed to `Detector.model`, which is sticky and may only reflect an
+    // earlier call) distinguishes a genuinely new observation from a merely
+    // still-sticky one — round 7 needs that distinction below.
+    let fresh_model = if is_codex {
+        extract_codex_status_bar_model(line)
+    } else {
+        None
+    };
+    det.note_model(fresh_model.clone());
     let ev = if is_codex {
         det.observe_detected(classify_codex_line(line))
     } else {
@@ -2214,6 +2327,16 @@ fn classify_and_emit(
     drop(det);
     if let Some(ev) = ev {
         if suppress_text_status && ev != DetectedEvent::Error {
+            // Round 7 (issue #652 reviewer F1 / auditor A1): the suppressed
+            // classification itself still doesn't reach the daemon, but a
+            // model freshly observed on THIS call rides a status-neutral
+            // carrier through instead of being dropped with it — see this
+            // function's doc comment. No fresh model on this call: nothing
+            // changed since the last check, so stay silent exactly as
+            // before.
+            if let Some(fresh_model) = fresh_model {
+                emitter.emit_with_model(EventType::Unknown, Some(fresh_model));
+            }
             return;
         }
         emitter.emit_with_model(ev.event_type(), model);
@@ -2740,11 +2863,23 @@ fn run_wrap_pty(
         Some(s) => (s.success(), s.code().unwrap_or(1) as u8),
         None => (false, 1),
     };
-    emitter.emit(if success {
-        EventType::Idle
-    } else {
-        EventType::Error
-    });
+    // Issue #652 reviewer F2: stamp the model here unconditionally — this
+    // call fires on every session end regardless of `suppress_text_status`,
+    // so it's a guaranteed-once-per-session carrier for whatever `detector`
+    // last observed, independent of round 7's suppressed-path carrier above.
+    let model = detector
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .model
+        .clone();
+    emitter.emit_with_model(
+        if success {
+            EventType::Idle
+        } else {
+            EventType::Error
+        },
+        model,
+    );
     ExitCode::from(code)
 }
 
@@ -2904,11 +3039,23 @@ fn run_wrap_pipe(
         Ok(s) => (s.success(), s.code().unwrap_or(1) as u8),
         Err(_) => (false, 1),
     };
-    emitter.emit(if success {
-        EventType::Idle
-    } else {
-        EventType::Error
-    });
+    // Issue #652 reviewer F2: stamp the model here unconditionally — this
+    // call fires on every session end regardless of `suppress_text_status`,
+    // so it's a guaranteed-once-per-session carrier for whatever `detector`
+    // last observed, independent of round 7's suppressed-path carrier above.
+    let model = detector
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .model
+        .clone();
+    emitter.emit_with_model(
+        if success {
+            EventType::Idle
+        } else {
+            EventType::Error
+        },
+        model,
+    );
     ExitCode::from(code)
 }
 

@@ -43,9 +43,19 @@ pub enum EventType {
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
-    /// without another `PROTOCOL_VERSION` bump. Deserialize-only — never
-    /// produced by this build. Treated as a no-op wherever `EventType` is
-    /// matched (never proof of agent activity, never changes `SessionStatus`).
+    /// without another `PROTOCOL_VERSION` bump. Treated as a no-op wherever
+    /// `EventType` is matched (never proof of agent activity, never changes
+    /// `SessionStatus`).
+    ///
+    /// Issue #652: no longer deserialize-only. `wrap.rs`'s `classify_and_emit`
+    /// now deliberately CONSTRUCTS this variant as a status-neutral carrier —
+    /// a way to send `AgentEvent.model` (out-of-band data unrelated to
+    /// status) without asserting any status, exploiting the exact "no-op,
+    /// never proof of activity" property this catch-all already had for its
+    /// original forward-compat purpose. Both uses share the same wire value
+    /// and the same neutral handling; nothing distinguishes a genuinely
+    /// unrecognized future event type from a deliberate model-only carrier,
+    /// and nothing needs to.
     #[serde(other)]
     Unknown,
 }
@@ -1677,11 +1687,13 @@ mod tests {
         let ty: EventType = serde_json::from_str("\"some_future_event_type\"").unwrap();
         assert_eq!(ty, EventType::Unknown);
 
-        // Deserialize-only: `Unknown` is never produced by this build, so it
-        // has no "own" wire name to round-trip through — unlike
-        // `AgentType::None`, which legitimately serializes as `"none"`.
-        // Confirm the REAL variants this build DOES produce still round-trip
-        // cleanly, so the catch-all didn't disturb ordinary encode/decode.
+        // Issue #652: `Unknown` is now also deliberately produced by this
+        // build (`wrap.rs`'s status-neutral model carrier), so it does have
+        // an "own" wire name (`"unknown"`) like `AgentType::None`'s
+        // `"none"` — this assertion predates that and no longer needs its
+        // own dedicated round-trip case here. Confirm the OTHER real
+        // variants this build produces still round-trip cleanly, so the
+        // catch-all didn't disturb ordinary encode/decode.
         assert_eq!(
             serde_json::from_str::<EventType>(
                 &serde_json::to_string(&EventType::ShellBusy).unwrap()

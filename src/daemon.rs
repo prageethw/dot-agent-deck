@@ -2540,7 +2540,19 @@ async fn run_hook_loop(
                             // a malformed event. Restore that diagnostic here,
                             // at the one place the daemon still has the raw
                             // line the unrecognized value came from.
-                            if event.event_type == crate::event::EventType::Unknown {
+                            //
+                            // Issue #652: `wrap.rs`'s `classify_and_emit` now
+                            // deliberately sends `Unknown` carrying a `model`
+                            // as its status-neutral carrier for a
+                            // hook-trusted Codex session — a legitimate,
+                            // routine event this diagnostic must not flag as
+                            // a suspected typo. A hand-written hook has no
+                            // reason to set `model`, so gate on its absence
+                            // rather than adding a second discriminator field
+                            // to `AgentEvent` just to distinguish the two.
+                            if event.event_type == crate::event::EventType::Unknown
+                                && event.model.is_none()
+                            {
                                 warn!(
                                     session_id = %event.session_id,
                                     pane_id = ?event.pane_id,
