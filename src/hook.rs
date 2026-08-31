@@ -37,6 +37,13 @@ struct ClaudeCodeHookInput {
     // `codex_shell_command`'s "degrades gracefully" contract.
     #[serde(default, deserialize_with = "lenient_model")]
     model: Option<String>,
+    // PRD #655: Claude Code's native `SessionStart` hook carries a `source`
+    // field (`"startup"`/`"resume"`/`"compact"`/`"clear"`) that today is
+    // silently absorbed into `_extra` and never read. A NAMED field, not
+    // routed through `_extra`/`metadata`, matching `model` just above — see
+    // `build_event_typed`'s narrow forwarding of it below.
+    #[serde(default)]
+    source: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -405,6 +412,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         tool_use_id,
         prompt,
         model,
+        source,
         _extra: extra,
     } = input;
 
@@ -490,6 +498,25 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.insert(
             crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+    }
+
+    // PRD #655: forward "this SessionStart came from `/clear`", same
+    // deliberately narrow shape as the boot-provenance forwarding just
+    // above — one key, one value, only on `SessionStart`. Distinct from
+    // `SESSION_START_ORIGIN_METADATA_KEY`: that key is wrapper-fork boot
+    // provenance, an unrelated concern; this one is Claude Code's own
+    // `source` field on its native `SessionStart` hook
+    // (`"startup"`/`"resume"`/`"compact"`/`"clear"`), and only the `"clear"`
+    // value is ever forwarded — `"startup"`/`"resume"`/`"compact"` are not
+    // this PRD's concern and stay dropped, exactly like every other
+    // `source` value.
+    if event_type == EventType::SessionStart
+        && source.as_deref() == Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE)
+    {
+        metadata.insert(
+            crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+            crate::event::CLEAR_SESSION_START_METADATA_VALUE.to_string(),
         );
     }
 
@@ -1317,6 +1344,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1338,6 +1366,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1357,6 +1386,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         assert!(build_event(input).is_none());
@@ -1373,6 +1403,7 @@ mod tests {
             tool_use_id: None,
             prompt: Some("fix the login bug".into()),
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1392,6 +1423,7 @@ mod tests {
             tool_use_id: None,
             prompt: Some(long_prompt),
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2385,6 +2417,7 @@ mod tests {
                 tool_use_id: None,
                 prompt: None,
                 model: None,
+                source: None,
                 _extra: extra,
             }
         };
@@ -2426,10 +2459,82 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             model: None,
+            source: None,
             _extra: HashMap::new(),
         })
         .expect("SessionStart maps to an event");
         assert!(!genuine.is_wrapper_fork_session_start());
+    }
+
+    /// PRD #655: `ClaudeCodeHookInput.source == "clear"` on a `SessionStart`
+    /// must forward `CLEAR_SESSION_START_METADATA_KEY` /
+    /// `CLEAR_SESSION_START_METADATA_VALUE` into `AgentEvent.metadata` —
+    /// narrowly, mirroring `session_start_origin_survives_the_claude_hook_builder`
+    /// above for the sibling `SESSION_START_ORIGIN_METADATA_KEY` forwarding.
+    #[test]
+    fn clear_session_start_source_forwards_narrowly() {
+        let payload = |event: &str, source: Option<&str>| ClaudeCodeHookInput {
+            session_id: "clear-pane-1".into(),
+            hook_event_name: event.into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            prompt: None,
+            model: None,
+            source: source.map(str::to_string),
+            _extra: HashMap::new(),
+        };
+
+        // A `SessionStart` with `source: "clear"` forwards the key.
+        let cleared = build_event(payload("SessionStart", Some("clear")))
+            .expect("SessionStart maps to an event");
+        assert_eq!(
+            cleared
+                .metadata
+                .get(crate::event::CLEAR_SESSION_START_METADATA_KEY)
+                .map(String::as_str),
+            Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE),
+            "a `/clear`-originated SessionStart must forward the metadata key: {:?}",
+            cleared.metadata
+        );
+
+        // A `SessionStart` with a different (or missing) `source` does NOT
+        // forward the key — only the literal `"clear"` value is narrow-cased.
+        let startup = build_event(payload("SessionStart", Some("startup")))
+            .expect("SessionStart maps to an event");
+        assert!(
+            !startup
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "source: \"startup\" must not forward the clear-session-start key: {:?}",
+            startup.metadata
+        );
+
+        let missing_source =
+            build_event(payload("SessionStart", None)).expect("SessionStart maps to an event");
+        assert!(
+            !missing_source
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a SessionStart with no source field must not forward the clear-session-start \
+             key: {:?}",
+            missing_source.metadata
+        );
+
+        // A non-SessionStart event carrying source: "clear" does NOT forward
+        // the key either — proves the narrowing is on event_type too, not
+        // just on the source value.
+        let wrong_event = build_event(payload("UserPromptSubmit", Some("clear")))
+            .expect("UserPromptSubmit maps to an event");
+        assert!(
+            !wrong_event
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a non-SessionStart event must not forward the clear-session-start key even \
+             when source is \"clear\": {:?}",
+            wrong_event.metadata
+        );
     }
 
     #[test]
@@ -2448,6 +2553,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2502,6 +2608,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2527,6 +2634,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2544,6 +2652,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             model: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();

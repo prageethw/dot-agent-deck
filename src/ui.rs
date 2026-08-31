@@ -2591,6 +2591,40 @@ fn orchestrator_remit_pane_is_compacting<'a>(
     })
 }
 
+/// PRD #655 — pure policy: the timestamp of the most recent clear-originated
+/// `SessionStart` recorded against the orchestrator start-role pane's own
+/// (non-placeholder) session, if one is still present in its retained
+/// `recent_events` window. Order-independent lookup and same-pane-placeholder
+/// exclusion mirror `orchestrator_remit_pane_is_compacting` above, but this
+/// returns an event IDENTITY (its own timestamp) rather than a boolean level:
+/// a `SessionStart` is a point-in-time event, not a persisted status the way
+/// `Compacting` is, so there is no level to poll here — the daemon's
+/// `EventType::SessionStart` arm unconditionally sets `session.status =
+/// SessionStatus::Idle` regardless of cause, so `status` alone can't
+/// distinguish "just cleared" from any other route to `Idle`. The caller
+/// edge-detects by comparing this timestamp against the last one it already
+/// reacted to (`RunningUi::orchestration_remit_clear_reasserted_at`), exactly
+/// the way `orchestration_remit_compacting`'s membership check edge-detects
+/// the boolean level above.
+fn orchestrator_remit_pane_latest_clear_session_start<'a>(
+    sessions: impl Iterator<Item = &'a SessionState>,
+    start_pane_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    sessions
+        .filter(|s| s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None)
+        .filter_map(|s| {
+            s.recent_events.iter().rev().find_map(|e| {
+                (e.event_type == EventType::SessionStart
+                    && e.metadata
+                        .get(crate::event::CLEAR_SESSION_START_METADATA_KEY)
+                        .map(String::as_str)
+                        == Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE))
+                .then_some(e.timestamp)
+            })
+        })
+        .max()
+}
+
 /// Issue #423 F7 — pure policy: the start role's displayed status after a
 /// (re-)delivered remit prompt. At spawn this slot is always `Waiting`, so
 /// the transition to `Working` is unconditional there; on a compaction
@@ -3181,6 +3215,21 @@ struct UiState {
     /// Removed the moment the status is next observed as anything else,
     /// which re-arms detection for a possible later compaction.
     orchestration_remit_compacting: HashSet<TabId>,
+    /// PRD #655: for each orchestration tab, the timestamp of the most
+    /// recent clear-originated `SessionStart` the remit re-arm loop has
+    /// already reacted to on the start-role pane, if any. A `SessionStart`
+    /// is a point-in-time event, not a persisted status like `Compacting`,
+    /// so there is no boolean level to track here the way
+    /// `orchestration_remit_compacting` does — this instead records the
+    /// IDENTITY of the last reacted-to event
+    /// (`orchestrator_remit_pane_latest_clear_session_start`'s return
+    /// value) so the render loop, running at ~62 Hz, fires the re-arm
+    /// exactly once per observed `/clear`, not once per frame the same
+    /// event remains within `SessionState::recent_events`'s retained
+    /// window. A missing entry means "never reacted for this tab"; an
+    /// entry is only ever inserted, never removed — mirrors
+    /// `orchestration_prompt_anchor_at`'s `TabId`-keyed, append-only shape.
+    orchestration_remit_clear_reasserted_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
     /// Issue #423 F3 (rename): originally "when the orchestration tab was
     /// created", used only to seed `deliver_orchestrator_prompt`'s
     /// deadline/timeout checks. The remit re-assertion (F2/F4) re-anchors
@@ -3396,6 +3445,7 @@ impl UiState {
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
             orchestration_remit_compacting: HashSet::new(),
+            orchestration_remit_clear_reasserted_at: HashMap::new(),
             orchestration_prompt_anchor_at: HashMap::new(),
             orchestration_remit_abandoned: HashSet::new(),
             orchestration_ready_since: HashMap::new(),
@@ -15205,6 +15255,101 @@ pub fn run_tui(
                     ui.orchestration_remit_compacting.insert(*id);
                 } else {
                     ui.orchestration_remit_compacting.remove(id);
+                }
+            }
+        }
+
+        // PRD #655: a second, INDEPENDENT re-arm trigger — a `/clear`-shaped
+        // `SessionStart` on the start role's own pane. Kept as its own loop
+        // and its own edge-detection state
+        // (`orchestration_remit_clear_reasserted_at`), deliberately not
+        // merged into the `Compacting` loop above: `Compacting` is a
+        // persisted STATUS the daemon holds until something else changes it,
+        // so membership in `orchestration_remit_compacting` is a genuine
+        // level to poll; a `/clear`-originated `SessionStart` is a
+        // POINT-IN-TIME event — `AppState::apply_event`'s `SessionStart` arm
+        // unconditionally sets `status = SessionStatus::Idle` regardless of
+        // cause, so there is no status value here to gate on the way
+        // `should_reassert_orchestrator_remit` does above. Reuses the exact
+        // same reset-and-redeliver sequence and eligibility rules as the
+        // compaction path (no_delivery_pending / Pi exclusion /
+        // `orchestration_remit_abandoned`) so both triggers feed the SAME
+        // `deliver_orchestrator_prompt` machinery below, unchanged — a second
+        // trigger, not a second delivery path.
+        for tab in tab_manager.tabs_mut() {
+            if let Tab::Orchestration {
+                id,
+                role_pane_ids,
+                start_role_index,
+                orchestrator_prompt,
+                config,
+                cwd,
+                ..
+            } = tab
+            {
+                let start_pane_id = role_pane_ids[*start_role_index].clone();
+                let latest_clear = orchestrator_remit_pane_latest_clear_session_start(
+                    snapshot.sessions.values(),
+                    &start_pane_id,
+                );
+
+                if let Some(latest_clear) = latest_clear
+                    && ui.orchestration_remit_clear_reasserted_at.get(id) != Some(&latest_clear)
+                {
+                    // Same landed-vs-still-probing distinction the
+                    // compaction path documents above: a write that has
+                    // LANDED (`PromptDelivery::attempts > 0`) is eligible
+                    // for re-arm; only a delivery still probing
+                    // readiness/backoff before its first write keeps
+                    // blocking it.
+                    let no_delivery_pending = orchestrator_prompt.is_none()
+                        || ui
+                            .prompt_delivery
+                            .get(start_pane_id.as_str())
+                            .is_some_and(|d| d.attempts > 0);
+
+                    // Pi start roles are excluded on purpose, same reason as
+                    // the compaction path: a Pi role's prompt is delivered
+                    // NATIVELY, daemon-side — this gate's TUI-owned PTY
+                    // keystroke injection is the wrong delivery path for it.
+                    let start_role_is_pi = config
+                        .roles
+                        .get(*start_role_index)
+                        .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+                        .unwrap_or(false);
+
+                    // Permanently excluded tabs are marked SEEN regardless of
+                    // outcome this frame — neither condition can ever
+                    // change, so there is nothing to gain by re-evaluating
+                    // them on every subsequent frame this same event
+                    // remains the latest one.
+                    let permanently_excluded =
+                        ui.orchestration_remit_abandoned.contains(id) || start_role_is_pi;
+
+                    if no_delivery_pending
+                        && !permanently_excluded
+                        && let Some(prompt) = prepare_orchestrator_prompt(config, cwd, None)
+                    {
+                        ui.send_retry_backoff.remove(start_pane_id.as_str());
+                        ui.prompt_delivery.remove(start_pane_id.as_str());
+                        ui.orchestration_ready_since.remove(id);
+
+                        *orchestrator_prompt = Some(prompt);
+                        ui.orchestration_prompted.remove(id);
+                        ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
+                        ui.orchestration_remit_clear_reasserted_at
+                            .insert(*id, latest_clear);
+                    } else if permanently_excluded {
+                        ui.orchestration_remit_clear_reasserted_at
+                            .insert(*id, latest_clear);
+                    }
+                    // Else: blocked only by a TRANSIENT condition this frame
+                    // (a delivery still probing readiness/backoff before its
+                    // first write, or `prepare_orchestrator_prompt` failing
+                    // to read the context file) — deliberately left
+                    // unmarked, so the next frame retries against the SAME
+                    // `latest_clear` event rather than silently dropping the
+                    // re-assertion the way marking it seen here would.
                 }
             }
         }
