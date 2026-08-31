@@ -1821,6 +1821,221 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
     );
 }
 
+/// Scenario: issue #650, reviewer round 2 (R2) — construct a session shaped
+/// like a Codex pane whose "Starting…" placeholder has already resolved
+/// (issue #549 / PR #641's `is_empty_placeholder` shape:
+/// `expects_agent_report` cleared to `false`, `agent_report_activity_seen`
+/// set to `true`) but whose `agent_type` never resolved away from
+/// `AgentType::None` — the normal, expected shape for a Codex pane in many
+/// configs, since Codex posts no `SessionStart` hook. Pins the reviewer's
+/// stricter gate on the card's TITLE ROW specifically (mirroring
+/// `dashboard/agent-badge/001`'s row-anchored pattern, not a whole-buffer
+/// `contains`): with a known `model` and the badge toggle on, the title
+/// shows the model ALONE (no `No agent (…)` prefix — there is no agent
+/// identity to report, only a model); with NO known model, the title shows
+/// no badge at all — byte-identical to the badge-toggle-off render of the
+/// same session, since a bare, meaningless `No agent` badge next to a live
+/// status is exactly the noise reviewer R2 flagged; and the toggle still
+/// governs the model-known case (off hides it, matching every other badge
+/// case). Also pins the D4 anti-collision guarantee for the OTHER
+/// placeholder shape — a genuinely empty placeholder (never resolved, no
+/// activity seen) with a known model must still show no badge, exercising
+/// the `!is_empty_placeholder` conjunct in `show_badge`'s gate that every
+/// other case here leaves untested (they all use `model: None` for the
+/// empty-placeholder shape).
+#[spec("dashboard/agent-badge/008")]
+#[test]
+fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
+    let now = chrono::Utc::now();
+    let base_session = SessionState {
+        session_id: "codex-resolved-01".to_string(),
+        // Codex's own shape: never reports an agent_type before its first
+        // turn completes, which for many configs is indefinitely.
+        agent_type: AgentType::None,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Thinking,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("inspect the repository".to_string()),
+        first_prompts: vec!["inspect the repository".to_string()],
+        pane_id: Some("codex-pane-resolved".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: None,
+        pending_permission_tool: None,
+        shell_synthetic_working: false,
+        monitored_wait_active: false,
+        wait_synthetic_working: false,
+        shell_descendant_busy: false,
+        wait_deferred_revert: false,
+        model: None,
+        // Issue #549's resolved-placeholder shape: the report was expected,
+        // never arrived, but real activity has since been seen — so
+        // `is_empty_placeholder` is false even though `is_placeholder`
+        // (raw, `agent_type == AgentType::None`) stays true.
+        expects_agent_report: false,
+        agent_report_activity_seen: true,
+    };
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+
+    // Case 1 (positive): resolved + model known, badge toggle on — the
+    // title must show the model ALONE, with NO `No agent` text anywhere.
+    let mut with_model = base_session.clone();
+    with_model.model = Some("some-model-id".to_string());
+    let buffer_with_model = render_card_for_mode_to_buffer(
+        &with_model,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let title_with_model = row_text(&buffer_with_model, 0);
+    assert!(
+        title_with_model.contains("some-model-id"),
+        "a resolved Codex placeholder (real activity seen, agent_type still \
+         None) with a known model and the agent-type badge toggle on must \
+         show that model in the title row:\n{title_with_model}"
+    );
+    assert!(
+        !title_with_model.contains("No agent"),
+        "the resolved+model-known title must show the model ALONE — no \
+         `No agent` prefix, since there is no agent identity to report, \
+         only a model:\n{title_with_model}"
+    );
+
+    // Case 2 (no-model half): resolved, NO known model, badge toggle on —
+    // no badge at all. The title must be byte-identical to the same
+    // session's badge-toggle-off render: a bare `No agent` badge next to a
+    // live status is meaningless noise (reviewer R2), so the toggle-on
+    // title must collapse to exactly the toggle-off shape (shortcut prefix
+    // only), not merely "no `No agent` substring".
+    let buffer_no_model_on = render_card_for_mode_to_buffer(
+        &base_session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let buffer_no_model_off = render_card_for_mode_to_buffer(
+        &base_session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        false,
+    );
+    let title_no_model_on = row_text(&buffer_no_model_on, 0);
+    let title_no_model_off = row_text(&buffer_no_model_off, 0);
+    assert!(
+        !title_no_model_on.contains("No agent"),
+        "a resolved Codex placeholder with NO known model must render no \
+         badge at all — a bare `No agent` badge next to a live status is \
+         meaningless noise:\n{title_no_model_on}"
+    );
+    assert_eq!(
+        title_no_model_on, title_no_model_off,
+        "a resolved Codex placeholder with NO known model must render an \
+         IDENTICAL title whether the badge toggle is on or off — the new \
+         gate must produce exactly the badge-off shape (no badge segments) \
+         when there is no model to show:\non:  {title_no_model_on}\noff: {title_no_model_off}"
+    );
+
+    // Case 3 (negative half): the same resolved+model-known session with
+    // the badge toggle OFF must still hide the model — the toggle keeps
+    // governing this new gate exactly as it governs every other badge case.
+    let buffer_toggle_off = render_card_for_mode_to_buffer(
+        &with_model,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        false,
+    );
+    let text_toggle_off = buffer_to_text(&buffer_toggle_off);
+    assert!(
+        !text_toggle_off.contains("some-model-id"),
+        "with the agent-type badge toggle off, a resolved Codex \
+         placeholder's model must not appear anywhere on the card:\n{text_toggle_off}"
+    );
+
+    // Case 4 (D4 anti-collision guarantee): a genuinely EMPTY placeholder —
+    // never resolved, no activity seen (`is_empty_placeholder == true`) —
+    // with a KNOWN model and the badge toggle on. Every other case above
+    // uses `model: None` for the empty-placeholder shape, so none of them
+    // actually exercises the `!is_empty_placeholder` conjunct in
+    // `show_badge`'s gate; this is the one case that does. The model must
+    // stay hidden and the title must be byte-identical to the same session
+    // with `model: None` — an unresolved placeholder gets no badge
+    // regardless of whether a model happens to be known.
+    let mut empty_with_model = base_session.clone();
+    empty_with_model.model = Some("some-model-id".to_string());
+    empty_with_model.expects_agent_report = false;
+    empty_with_model.agent_report_activity_seen = false;
+    let buffer_empty_with_model = render_card_for_mode_to_buffer(
+        &empty_with_model,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let mut empty_no_model = empty_with_model.clone();
+    empty_no_model.model = None;
+    let buffer_empty_no_model = render_card_for_mode_to_buffer(
+        &empty_no_model,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let title_empty_with_model = row_text(&buffer_empty_with_model, 0);
+    let title_empty_no_model = row_text(&buffer_empty_no_model, 0);
+    assert!(
+        !title_empty_with_model.contains("some-model-id"),
+        "a genuinely EMPTY placeholder (never resolved, no activity seen) \
+         with a known model must show no badge — the model must not appear \
+         in the title, even though the badge toggle is on:\n{title_empty_with_model}"
+    );
+    assert_eq!(
+        title_empty_with_model, title_empty_no_model,
+        "a genuinely EMPTY placeholder's title must be IDENTICAL whether or \
+         not a model is known — `is_empty_placeholder` alone must suppress \
+         the badge, proving the gate's `!is_empty_placeholder` conjunct is \
+         load-bearing and not merely coincidentally satisfied:\nwith model:    {title_empty_with_model}\nwithout model: {title_empty_no_model}"
+    );
+}
+
 /// Scenario: Aggregate a busy mixed deck (14 Claude Code + 8 Codex sessions) and
 /// render its stats bar at 60 columns — the width the bar actually gets, since it
 /// draws into the last row of the left dashboard column whenever panes are open.
