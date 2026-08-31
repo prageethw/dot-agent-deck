@@ -1102,8 +1102,8 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
     );
 }
 
-/// Scenario: Open a real orchestration tab and let the start role's
-/// spawn-time remit pointer deliver once, then inject a synthetic
+/// Scenario: PRD #655. Open a real orchestration tab and let the start
+/// role's spawn-time remit pointer deliver once, then inject a synthetic
 /// `SessionStart` for that SAME start-role pane carrying the
 /// `/clear`-originated marker (`CLEAR_SESSION_START_METADATA_KEY` /
 /// `CLEAR_SESSION_START_METADATA_VALUE`). The pointer must reach the pane's
@@ -1219,16 +1219,17 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     );
 }
 
-/// Scenario: In the same orchestration, a `/clear`-originated `SessionStart`
-/// fires first on the non-start `worker` role's pane — this must NOT
-/// re-deliver the remit pointer to the start role. Then, as a positive
-/// control proving this is a genuine scoping guard and not just an
+/// Scenario: PRD #655. In the same orchestration, a `/clear`-originated
+/// `SessionStart` fires first on the non-start `worker` role's pane — this
+/// must NOT re-deliver the remit pointer to the start role. Then, as a
+/// positive control proving this is a genuine scoping guard and not just an
 /// unimplemented feature vacuously passing the negative check, the same
 /// `/clear`-originated `SessionStart` fires on the orchestrator start role
 /// itself, which MUST re-deliver. Mirrors `orchestration_remit_002`'s exact
-/// pattern for the compaction trigger, extended to the `/clear` trigger: the
-/// guard against re-assertion leaking into every pane of an orchestration
-/// applies identically to both triggers.
+/// pattern for the compaction trigger, extended to this PRD's `/clear`
+/// trigger: the guard against re-assertion leaking into every pane of an
+/// orchestration applies identically to both triggers (issue #423's stated
+/// scope, reused unchanged by PRD #655).
 #[spec("orchestration/remit/005")]
 #[test]
 #[cfg(unix)]
@@ -1292,22 +1293,22 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
     );
 }
 
-/// Scenario: In the same orchestration, a `/clear`-originated `SessionStart`
-/// fires on the orchestrator START role's own pane, but stamped with a
-/// non-Claude-Code `agent_type` — this must NOT re-deliver the remit
-/// pointer, since the `/clear` trigger's scope is Claude Code only
-/// (`AgentType::ClaudeCode`). Deliberately negative-only: unlike
+/// Scenario: PRD #655 review round, finding F4. In the same orchestration, a
+/// `/clear`-originated `SessionStart` fires on the orchestrator START role's
+/// own pane, but stamped with a non-Claude-Code `agent_type` — this must NOT
+/// re-deliver the remit pointer, since the PRD's stated scope is Claude Code
+/// only (`AgentType::ClaudeCode`). Deliberately negative-only: unlike
 /// `orchestration_remit_002`/`_005`, this test does not chase the negative
 /// check with a same-pane positive-control injection, because applying a
 /// second `SessionStart` to the SAME pane — even one this guard correctly
-/// filters from re-arming — legitimately advances `pane_hook_session`
-/// (`src/state.rs`), the bookkeeping `delivery_target_changed` (`src/ui.rs`)
-/// compares against, and reads the pane as a stale delivery
-/// target after two hops, an artifact of the test's own two-hop injection
-/// shape rather than anything a real pane (whose `agent_type` is fixed for
-/// its whole life) can ever encounter. The "is this harness capable of
-/// proving a positive case at all" concern a positive control exists to rule
-/// out is already covered independently by
+/// filters from re-arming — legitimately advances the daemon's
+/// generation-tracking (`pane_hook_session`/`delivery_target_changed`,
+/// `src/state.rs`, issues #424/#532/#608) and reads the pane as a stale
+/// delivery target after two hops, an artifact of the test's own two-hop
+/// injection shape rather than anything a real pane (whose `agent_type` is
+/// fixed for its whole life) can ever encounter. The "is this harness capable
+/// of proving a positive case at all" concern a positive control exists to
+/// rule out is already covered independently by
 /// `orchestration_remit_004_start_role_clear_reasserts_remit`, a genuine
 /// single-hop injection on this same pane shape proving the trigger fires —
 /// the same relationship `_001`'s positive proof bears to `_002`'s negative

@@ -1875,6 +1875,7 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
         shell_descendant_busy: false,

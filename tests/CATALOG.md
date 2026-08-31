@@ -5031,7 +5031,6 @@ without depending on the config struct API.
 - **Does not assert:** `AgentRecord.live` — deliberately. It is `Some(Idle)` for every role within ~1.5s of the dispatch, before a byte reaches any of those PTYs (measured), so it is a pane-level fact and an assertion on it is vacuous. Also not asserted: the `work-done` RETURN edge (the worker's completion signal back to the orchestrator, and the feedback line the daemon writes into the orchestrator pane); delegation to more than one role, or fan-out to `reviewer`, which stays a booted-but-unused role here; cross-orchestration routing isolation (`orchestration/route/001` owns that); and the `delegate` CLI's failure exit codes, which `orchestration/dispatch/001` pins cheaply without spending tokens.
 - **Platform coverage:** mac+linux.
 
-
 ##### orchestration/dispatch/003 — A `clear = true` respawn relaunches a worker identically whether the orchestration came up through the daemon's dispatch primitive or through the TUI's `StartAgent` path (issue #584's control).
 - **Layer:** fast integration (the REAL `crate::spawn::spawn` dispatch primitive on one side and the `StartAgent` spawn shape on the other, both against one in-process daemon, plus the real `handle_delegate_with_state`; no LLM and no `e2e` feature gate).
 - **Agent:** none — a recorder stand-in that appends its argv, cwd, pane id, hook socket and `$SHELL` to a log on every invocation and then behaves like `cat`, so what each replacement was actually LAUNCHED with is on disk rather than inferred.
@@ -6802,7 +6801,6 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** exact overlay layout / wording.
 - **Platform coverage:** mac+linux+windows.
 
-
 ### Theme contrast
 
 Under PRD #13's terminal-relative color model there is no baked light/dark palette, so the per-theme snapshot *pairs* collapse into structural-property assertions: the dashboard may emit no absolute `Color::Rgb(..)` on any contrast-critical surface — backgrounds resolve to `Color::Reset` (the terminal's own background) and selection/active-tab highlights are cued without an absolute background tint.
@@ -6889,7 +6887,6 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** for every agent status and in BOTH `UiMode::Normal` and `UiMode::PaneInput`, a SELECTED card's border resolves to `palette::SELECTED` (`Color::Reset`) and never to that status's role colour, thickens its glyph from `│` to `┃`, and never carries `Modifier::DIM`. The CONTROL in the same loop is that the UNSELECTED card is untouched — still its status role, still `│` — so an idle agent keeps receding. Guards issue #442 in both of its reported forms: selection dimmed into the `palette::STATUS_IDLE` band (the original report), and a selected idle card inheriting DarkGray so that thickening its border changed nothing (the follow-up).
 - **Does not assert:** the `▸ ` title marker (covered by `theme/palette/003` / `theme/guard/001`); the BOLD-vs-plain mode emphasis (covered by `mode/deck/001`); embedded-pane borders (covered by `theme/palette/002`, `004`, `005`).
 - **Platform coverage:** mac+linux+windows.
-
 
 ### Mode indication (PRD #341)
 
@@ -7758,7 +7755,6 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the reconnect-hydration call site (covered by `orchestration/hydration/001`/`002`, a different call site entirely — nothing races there); the exact wording of the warning beyond the required substring; the unparseable-config case for this call site (only the "parses but doesn't list it" case is constructed here, matching what a FIFO rendezvous can deterministically drive); the card's status badge / body layout.
 - **Platform coverage:** mac+linux (`mkfifo` / POSIX named pipes; the L2 tier is already Unix-only per CLAUDE.md rule 2).
 
-
 ### Daemon-side project resolution (PRD #819)
 
 #### project/resolve
@@ -7799,7 +7795,6 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** driving the desktop's own sequence over the attach socket — `ResolveProject` (canonical path + `config_revision`, both carried forward verbatim), then `PrepareWorkflow` so the DAEMON composes and publishes the coordinator context carrying a directive list-files task, then `StartAgent` for the coordinator role, then the production guarded `WriteAndSubmit` RPC typing in the one-line `Read .dot-agent-deck/orchestrator-context.md …` pointer — the uniquely named fixture sentinel `context_proof_9d4f2a.txt` appears in the coordinator's pane (wrap-insensitively, via the daemon's own `Snapshot`). That line names the file and nothing else, and the sentinel is asserted to be ABSENT from the published context, so reporting it requires both reading the daemon's write and genuinely running the tool: spawn → agent → work. The coordinator's pane is opened in the already-attached TUI first, so the live agent is on screen (and on the cast) for the whole turn. Preconditions, deliberately separate from the claim so a red run says which half broke: the reply is `ok`, the reported context file is readable, and it carries the task text.
 - **Does not assert:** the publish contract itself — path, reply shape, the failed-preparation case (`project/launch/001`); canonical-spelling propagation as a property (`project/launch/002`); the wire shape or boundary refusals (`tests/project_projection.rs`, `tests/daemon_protocol.rs`); the `prep_token`, which rides on the separate `start-prepared-agent` verb and is not presented here; delegation or work-done routing (`orchestration/route/001`, `scheduler/dispatch/013`); the desktop GUI half, for which no harness exists (PRD #819 *Testing: what rule 4 means here*); the sentinel reaching the deck's own vt100 stream, which is logged best-effort because a claude TUI can hard-wrap a filename across a row boundary.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — the pane/attach helpers it drives are Unix-domain-socket only).
-
 
 ### Experimental feature flag (PRD #139)
 
