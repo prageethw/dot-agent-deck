@@ -2897,9 +2897,9 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
 /// Per the field's own doc, it must never revert once set for the lifetime of
 /// the `SessionState`: the resync must OR the incoming value in rather than
 /// overwrite, so the local `true` survives.
-#[spec("session/live/018")]
+#[spec("session/live/020")]
 #[test]
-fn live_018_resync_never_reverts_agent_report_activity_seen() {
+fn live_020_resync_never_reverts_agent_report_activity_seen() {
     let pane = "pane-resync-latch";
     let agent_id = "agent-resync-latch";
 

@@ -4837,7 +4837,6 @@ without depending on the config struct API.
 - **Does not assert:** `AgentRecord.live` — deliberately. It is `Some(Idle)` for every role within ~1.5s of the dispatch, before a byte reaches any of those PTYs (measured), so it is a pane-level fact and an assertion on it is vacuous. Also not asserted: the `work-done` RETURN edge (the worker's completion signal back to the orchestrator, and the feedback line the daemon writes into the orchestrator pane); delegation to more than one role, or fan-out to `reviewer`, which stays a booted-but-unused role here; cross-orchestration routing isolation (`orchestration/route/001` owns that); and the `delegate` CLI's failure exit codes, which `orchestration/dispatch/001` pins cheaply without spending tokens.
 - **Platform coverage:** mac+linux.
 
-
 ##### orchestration/dispatch/003 — A `clear = true` respawn relaunches a worker identically whether the orchestration came up through the daemon's dispatch primitive or through the TUI's `StartAgent` path (issue #584's control).
 - **Layer:** fast integration (the REAL `crate::spawn::spawn` dispatch primitive on one side and the `StartAgent` spawn shape on the other, both against one in-process daemon, plus the real `handle_delegate_with_state`; no LLM and no `e2e` feature gate).
 - **Agent:** none — a recorder stand-in that appends its argv, cwd, pane id, hook socket and `$SHELL` to a log on every invocation and then behaves like `cat`, so what each replacement was actually LAUNCHED with is on disk rather than inferred.
@@ -5572,7 +5571,7 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** the wire-boundary scrub/clamp (`session/live/007`); a real socket reconnect (`session/live/006`); the synthetic-`Working` provenance story (`session/live/011`); model-label normalization, truncation, or `Cf` sanitization at render time (`dashboard/agent-badge/001`, `/005`, `/006`).
 - **Platform coverage:** mac+linux (file is `#![cfg(unix)]` throughout — see the file's own doc comment).
 
-##### session/live/018 — A resync from a stale/lagging daemon snapshot must never clear an already-latched `agent_report_activity_seen` (issue #549 fix round 4, auditor A14).
+##### session/live/020 — A resync from a stale/lagging daemon snapshot must never clear an already-latched `agent_report_activity_seen` (issue #549 fix round 4, auditor A14).
 - **Layer:** L1 pure state (one `AppState`, a real `ToolStart` event to latch the flag, then a direct `AppState::resync_hydrated_sessions` call — no wire round-trip, mirroring the `seed_hydrated_session` unit tests `session/live/005`/`008` but for the resync path instead).
 - **Agent:** none (a synthetic `ToolStart` to latch the flag, then a hand-built `AgentRecord` modelling the stale snapshot).
 - **Asserts:** after a real, non-synthetic status assertion latches `agent_report_activity_seen` to `true` on an existing session, resyncing that same session against an `AgentRecord` whose live `SessionSnapshot` carries `agent_report_activity_seen: false` leaves the field `true` — the field's own doc says it never reverts once set for the lifetime of the `SessionState`, so the resync must OR the incoming value in rather than overwrite. Before the round-4 fix, an unconditional assign let a stale snapshot's `false` clear a locally-latched `true`, so an idle pane between turns could read "No agent" again for as long as it stayed quiet after a resync.
@@ -6263,7 +6262,6 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** exact overlay layout / wording.
 - **Platform coverage:** mac+linux+windows.
 
-
 ### Theme contrast
 
 Under PRD #13's terminal-relative color model there is no baked light/dark palette, so the per-theme snapshot *pairs* collapse into structural-property assertions: the dashboard may emit no absolute `Color::Rgb(..)` on any contrast-critical surface — backgrounds resolve to `Color::Reset` (the terminal's own background) and selection/active-tab highlights are cued without an absolute background tint.
@@ -6350,7 +6348,6 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** for every agent status and in BOTH `UiMode::Normal` and `UiMode::PaneInput`, a SELECTED card's border resolves to `palette::SELECTED` (`Color::Reset`) and never to that status's role colour, thickens its glyph from `│` to `┃`, and never carries `Modifier::DIM`. The CONTROL in the same loop is that the UNSELECTED card is untouched — still its status role, still `│` — so an idle agent keeps receding. Guards issue #442 in both of its reported forms: selection dimmed into the `palette::STATUS_IDLE` band (the original report), and a selected idle card inheriting DarkGray so that thickening its border changed nothing (the follow-up).
 - **Does not assert:** the `▸ ` title marker (covered by `theme/palette/003` / `theme/guard/001`); the BOLD-vs-plain mode emphasis (covered by `mode/deck/001`); embedded-pane borders (covered by `theme/palette/002`, `004`, `005`).
 - **Platform coverage:** mac+linux+windows.
-
 
 ### Mode indication (PRD #341)
 
@@ -7164,7 +7161,6 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** firing a schedule whose target directory defines a two-role `[[orchestrations]]` entry named `demo-orch` spawns and registers the orchestrator role (precondition, confirms the daemon's config read already saw "demo-orch"); with the local config then rewritten (via the second FIFO rendezvous) to no longer list `demo-orch` before the attached TUI's `surface_one_orchestration` reads it, the SAME on-screen substring `orchestration/hydration/001` pins (`orchestration 'demo-orch' not found in local config`) appears on the rendered grid.
 - **Does not assert:** the reconnect-hydration call site (covered by `orchestration/hydration/001`/`002`, a different call site entirely — nothing races there); the exact wording of the warning beyond the required substring; the unparseable-config case for this call site (only the "parses but doesn't list it" case is constructed here, matching what a FIFO rendezvous can deterministically drive); the card's status badge / body layout.
 - **Platform coverage:** mac+linux (`mkfifo` / POSIX named pipes; the L2 tier is already Unix-only per CLAUDE.md rule 2).
-
 
 ### Experimental feature flag (PRD #139)
 

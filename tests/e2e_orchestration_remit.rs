@@ -371,6 +371,7 @@ fn inject_clear_session_start(
     );
 }
 
+
 /// Open the orchestration, write and launch the orchestrator's synthetic
 /// script, and confirm the spawn-time remit pointer lands once. Returns the
 /// daemon socket path, the start role's `(pane_id, agent_id)`, the log path
@@ -619,14 +620,14 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
     );
 }
 
-/// Scenario: Open a real orchestration tab and let the start role's
-/// spawn-time remit pointer deliver once, then inject a synthetic
+/// Scenario: PRD #655. Open a real orchestration tab and let the start
+/// role's spawn-time remit pointer deliver once, then inject a synthetic
 /// `SessionStart` for that SAME start-role pane carrying the
 /// `/clear`-originated marker (`CLEAR_SESSION_START_METADATA_KEY` /
 /// `CLEAR_SESSION_START_METADATA_VALUE`). The pointer must reach the pane's
 /// stdin a second time — the orchestrator's remit re-asserting itself on
-/// `/clear`, exactly as it already re-asserts on compaction, via the same
-/// reused delivery machinery.
+/// `/clear`, exactly as issue #423 already made it re-assert on compaction,
+/// via the same reused delivery machinery (PRD #655's Decisions section).
 #[spec("orchestration/remit/004")]
 #[test]
 #[cfg(unix)]
@@ -648,17 +649,18 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     assert!(
         reasserted,
         "a `/clear`-originated SessionStart event on the orchestrator start-role pane \
-         must re-deliver the `{DELIVERED_POINTER}` remit pointer a second time; the \
-         log only shows it once within {DELIVERY_TIMEOUT:?}.\nFinal grid:\n{}",
+         must re-deliver the `{DELIVERED_POINTER}` remit pointer a second time (PRD \
+         #655); the log only shows it once within {DELIVERY_TIMEOUT:?}.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 
-    // Pin non-repetition, not just arrival — a single `/clear`-originated
-    // `SessionStart` event must deliver the pointer exactly once more, never
-    // repeatedly. Mirrors the "stays put" shape `orchestration_remit_002`/
-    // `_005` already use for their negative leak checks
-    // (`!wait_for_file_substr_count(..., short bound)`), applied here to the
-    // count staying AT 2 rather than never reaching 2.
+    // PRD #655 review round, finding F2b: pin non-repetition, not just
+    // arrival — a single `/clear`-originated `SessionStart` event must
+    // deliver the pointer exactly once more, never repeatedly. Mirrors the
+    // "stays put" shape `orchestration_remit_002`/`_005` already use for
+    // their negative leak checks (`!wait_for_file_substr_count(..., short
+    // bound)`), applied here to the count staying AT 2 rather than never
+    // reaching 2.
     let repeated_beyond_two =
         common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 3, Duration::from_millis(900));
     assert!(
@@ -670,22 +672,24 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     );
 }
 
-/// Scenario: In the same orchestration, a `/clear`-originated `SessionStart`
-/// fires first on the non-start `worker` role's pane — this must NOT
-/// re-deliver the remit pointer to the start role. Then, as a positive
-/// control proving this is a genuine scoping guard and not just an
+/// Scenario: PRD #655. In the same orchestration, a `/clear`-originated
+/// `SessionStart` fires first on the non-start `worker` role's pane — this
+/// must NOT re-deliver the remit pointer to the start role. Then, as a
+/// positive control proving this is a genuine scoping guard and not just an
 /// unimplemented feature vacuously passing the negative check, the same
 /// `/clear`-originated `SessionStart` fires on the orchestrator start role
 /// itself, which MUST re-deliver. Mirrors `orchestration_remit_002`'s exact
-/// pattern for the compaction trigger, extended to the `/clear` trigger: the
-/// guard against re-assertion leaking into every pane of an orchestration
-/// applies identically to both triggers.
+/// pattern for the compaction trigger, extended to this PRD's `/clear`
+/// trigger: the guard against re-assertion leaking into every pane of an
+/// orchestration applies identically to both triggers (issue #423's stated
+/// scope, reused unchanged by PRD #655).
 #[spec("orchestration/remit/005")]
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
     let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
-    let (socket, orch_pane_id, orch_agent_id, log, _role_cwd) = open_and_confirm_initial_delivery(&deck);
+    let (socket, orch_pane_id, orch_agent_id, log, _role_cwd) =
+        open_and_confirm_initial_delivery(&deck);
 
     let worker_record = role_agent_record(&socket, "worker");
     let worker_pane_id = worker_record
@@ -733,22 +737,22 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
     );
 }
 
-/// Scenario: In the same orchestration, a `/clear`-originated `SessionStart`
-/// fires on the orchestrator START role's own pane, but stamped with a
-/// non-Claude-Code `agent_type` — this must NOT re-deliver the remit
-/// pointer, since the `/clear` trigger's scope is Claude Code only
-/// (`AgentType::ClaudeCode`). Deliberately negative-only: unlike
+/// Scenario: PRD #655 review round, finding F4. In the same orchestration, a
+/// `/clear`-originated `SessionStart` fires on the orchestrator START role's
+/// own pane, but stamped with a non-Claude-Code `agent_type` — this must NOT
+/// re-deliver the remit pointer, since the PRD's stated scope is Claude Code
+/// only (`AgentType::ClaudeCode`). Deliberately negative-only: unlike
 /// `orchestration_remit_002`/`_005`, this test does not chase the negative
 /// check with a same-pane positive-control injection, because applying a
 /// second `SessionStart` to the SAME pane — even one this guard correctly
-/// filters from re-arming — legitimately advances `pane_hook_session`
-/// (`src/state.rs`), the bookkeeping `delivery_target_changed` (`src/ui.rs`)
-/// compares against, and reads the pane as a stale delivery
-/// target after two hops, an artifact of the test's own two-hop injection
-/// shape rather than anything a real pane (whose `agent_type` is fixed for
-/// its whole life) can ever encounter. The "is this harness capable of
-/// proving a positive case at all" concern a positive control exists to rule
-/// out is already covered independently by
+/// filters from re-arming — legitimately advances the daemon's
+/// generation-tracking (`pane_hook_session`/`delivery_target_changed`,
+/// `src/state.rs`, issues #424/#532/#608) and reads the pane as a stale
+/// delivery target after two hops, an artifact of the test's own two-hop
+/// injection shape rather than anything a real pane (whose `agent_type` is
+/// fixed for its whole life) can ever encounter. The "is this harness capable
+/// of proving a positive case at all" concern a positive control exists to
+/// rule out is already covered independently by
 /// `orchestration_remit_004_start_role_clear_reasserts_remit`, a genuine
 /// single-hop injection on this same pane shape proving the trigger fires —
 /// the same relationship `_001`'s positive proof bears to `_002`'s negative
@@ -775,7 +779,7 @@ fn orchestration_remit_006_non_claude_agent_type_clear_reasserts_nothing() {
     assert!(
         !leaked_for_non_claude_agent_type,
         "a `/clear`-originated SessionStart event stamped with a non-Claude-Code \
-         `agent_type` must not re-assert the orchestrator's remit (the trigger's stated \
+         `agent_type` must not re-assert the orchestrator's remit (PRD #655's stated \
          scope is Claude Code only); the start role's delivery log reached a second \
          `{DELIVERED_POINTER}` line anyway.\nFinal grid:\n{}",
         deck.snapshot_grid()

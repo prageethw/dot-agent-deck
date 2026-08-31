@@ -20,19 +20,6 @@ struct ClaudeCodeHookInput {
     tool_input: Option<Value>,
     tool_use_id: Option<String>,
     prompt: Option<String>,
-    // Claude Code's native `SessionStart` hook carries a `source` field
-    // (`"startup"`/`"resume"`/`"compact"`/`"clear"`) that today is silently
-    // absorbed into `_extra` and never read. A NAMED field, not routed
-    // through `_extra`/`metadata` — see `build_event_typed`'s narrow
-    // forwarding of it below.
-    //
-    // `lenient_string` degrades a non-string shape (object, number, bool,
-    // array) to `None` instead of failing the whole payload decode: `handle_hook`
-    // swallows a decode error silently (`Err(_) => return ExitCode::SUCCESS`),
-    // so a strict `Option<String>` would blackout the WHOLE event over an
-    // unexpected `source` shape, not just lose the field.
-    #[serde(default, deserialize_with = "lenient_string")]
-    source: Option<String>,
     // PRD fork#378: the agent's active model, posted top-level (Codex posts
     // the same Claude-compatible stdin shape — see
     // tests/codex_hook_ingestion.rs's schema-accurate `model` key). A NAMED
@@ -45,21 +32,28 @@ struct ClaudeCodeHookInput {
     // harmlessly in `_extra` and was ignored. `handle_hook` swallows a
     // decode error silently (`Err(_) => return ExitCode::SUCCESS`), so that
     // was a total status blackout for the agent, not just a lost model.
-    // `lenient_model` degrades an unexpected shape to `None` instead,
+    // `lenient_string` degrades an unexpected shape to `None` instead,
     // matching `EventType`'s `#[serde(other)]` catch-all and
     // `codex_shell_command`'s "degrades gracefully" contract.
-    #[serde(default, deserialize_with = "lenient_model")]
+    #[serde(default, deserialize_with = "lenient_string")]
     model: Option<String>,
+    // PRD #655: Claude Code's native `SessionStart` hook carries a `source`
+    // field (`"startup"`/`"resume"`/`"compact"`/`"clear"`) that today is
+    // silently absorbed into `_extra` and never read. A NAMED field, not
+    // routed through `_extra`/`metadata`, matching `model` just above — see
+    // `build_event_typed`'s narrow forwarding of it below.
+    //
+    // Review/audit round (M4, F1): same `lenient_string` treatment as
+    // `model` just above, for the exact same reason — a strict
+    // `Option<String>` fails the WHOLE decode on a non-string `source`
+    // (object, number, bool, array), which `handle_hook` swallows silently
+    // for all four producer arms (Claude/Codex/Devin/default). See
+    // `agent_model_002_non_string_model_does_not_drop_the_event` for the
+    // precedent this pins the same way.
+    #[serde(default, deserialize_with = "lenient_string")]
+    source: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
-}
-
-/// A non-string value (object, number, bool, array) degrades to `None` rather
-/// than failing the whole payload decode. `null` and a missing key already
-/// decode to `None` via `#[serde(default)]`; this only widens the tolerance
-/// to non-string, non-null shapes. See [`ClaudeCodeHookInput::source`].
-fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    Ok(Option::<Value>::deserialize(d)?.and_then(|v| v.as_str().map(str::to_owned)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,20 +67,21 @@ struct OpenCodeHookInput {
     prompt: Option<String>,
     // PRD fork#378: mirrors ClaudeCodeHookInput's `model` field, in case a
     // future OpenCode payload carries one; `None` today. See that field's
-    // doc comment for why this is `lenient_model` rather than a strict
+    // doc comment for why this is `lenient_string` rather than a strict
     // `Option<String>`.
-    #[serde(default, deserialize_with = "lenient_model")]
+    #[serde(default, deserialize_with = "lenient_string")]
     model: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
 
-/// A non-string `model` (object, number, bool, array) degrades to `None`
+/// A non-string value (object, number, bool, array) degrades to `None`
 /// rather than failing the whole payload decode. `null` and a missing key
 /// already decode to `None` via `#[serde(default)]`; this only widens the
 /// tolerance to non-string, non-null shapes. See the field doc comments on
-/// [`ClaudeCodeHookInput::model`] / [`OpenCodeHookInput::model`].
-fn lenient_model<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+/// [`ClaudeCodeHookInput::model`] / [`OpenCodeHookInput::model`] /
+/// [`ClaudeCodeHookInput::source`].
+fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     Ok(Option::<Value>::deserialize(d)?.and_then(|v| v.as_str().map(str::to_owned)))
 }
 
@@ -515,22 +510,26 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         );
     }
 
-    // Forward "this SessionStart came from `/clear`", same deliberately
-    // narrow shape as the boot-provenance forwarding just above — one key,
-    // one value, only on `SessionStart`. Distinct from
+    // PRD #655: forward "this SessionStart came from `/clear`", same
+    // deliberately narrow shape as the boot-provenance forwarding just
+    // above — one key, one value, only on `SessionStart`. Distinct from
     // `SESSION_START_ORIGIN_METADATA_KEY`: that key is wrapper-fork boot
     // provenance, an unrelated concern; this one is Claude Code's own
     // `source` field on its native `SessionStart` hook
     // (`"startup"`/`"resume"`/`"compact"`/`"clear"`), and only the `"clear"`
-    // value is ever forwarded — every other `source` value stays dropped.
+    // value is ever forwarded — `"startup"`/`"resume"`/`"compact"` are not
+    // this PRD's concern and stay dropped, exactly like every other
+    // `source` value.
     //
-    // Also gated on `agent_type == AgentType::ClaudeCode`, since this
-    // builder is shared by the Codex/Devin/default hook arms (all decode
-    // the same `ClaudeCodeHookInput`) and this feature is Claude-Code only.
-    // Defense-in-depth: the consumer-side check in
-    // `orchestrator_remit_pane_latest_clear_session_start` (`src/ui.rs`) is
-    // what actually enforces the scope for a raw `AgentEvent` injected
-    // straight onto the hook socket, which bypasses this builder entirely.
+    // Review/audit round (M4, F4): also gated on `agent_type ==
+    // AgentType::ClaudeCode`, since this builder is shared by the
+    // Codex/Devin/default hook arms (all decode the same
+    // `ClaudeCodeHookInput`) — the PRD states this feature is Claude-Code
+    // only. Defense-in-depth: the consumer-side check in
+    // `orchestrator_remit_pane_latest_clear_session_start`
+    // (`src/ui.rs`) is what actually enforces the scope for a raw
+    // `AgentEvent` injected straight onto the hook socket, which bypasses
+    // this builder entirely.
     if event_type == EventType::SessionStart
         && agent_type == AgentType::ClaudeCode
         && source.as_deref() == Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE)
@@ -1542,6 +1541,46 @@ mod tests {
         assert!(hook_input.model.is_none());
     }
 
+    /// Review/audit round (M4, F1): `source` carries the exact same
+    /// `#[serde(default)]`-only regression class `agent_model_002` above
+    /// pins for `model` — a strict `Option<String>` fails the WHOLE decode
+    /// on a non-string `source` (object, number, bool, array), and
+    /// `handle_hook` swallows that error silently
+    /// (`Err(_) => return ExitCode::SUCCESS`) for all four producer arms.
+    /// `lenient_string` must degrade a non-string `source` to `None`
+    /// instead of failing the whole payload.
+    #[test]
+    fn source_002_non_string_source_does_not_drop_the_event() {
+        for (label, source_json) in [
+            ("object", r#"{"kind":"clear"}"#),
+            ("number", "3"),
+            ("bool", "true"),
+            ("array", r#"["clear"]"#),
+        ] {
+            let payload = format!(
+                r#"{{"session_id":"test-123","hook_event_name":"SessionStart","source":{source_json}}}"#
+            );
+            let hook_input: ClaudeCodeHookInput =
+                serde_json::from_str(&payload).unwrap_or_else(|e| {
+                    panic!("a non-string ({label}) source must not fail the whole decode: {e}")
+                });
+            assert!(
+                hook_input.source.is_none(),
+                "a non-string ({label}) source must degrade to None, not a decode error"
+            );
+            let event = build_event(hook_input)
+                .expect("the rest of the event must survive a non-string source");
+            assert_eq!(event.session_id, "test-123");
+            assert_eq!(event.event_type, EventType::SessionStart);
+        }
+
+        // `null` already works and must keep working.
+        let payload = r#"{"session_id":"test-123","hook_event_name":"SessionStart","source":null}"#;
+        let hook_input: ClaudeCodeHookInput =
+            serde_json::from_str(payload).expect("a null source must decode fine");
+        assert!(hook_input.source.is_none());
+    }
+
     #[test]
     fn send_to_missing_socket_returns_none() {
         // With no daemon running, send should silently fail
@@ -2525,14 +2564,14 @@ mod tests {
         assert!(!genuine.is_wrapper_fork_session_start());
     }
 
-    /// `ClaudeCodeHookInput.source == "clear"` on a `SessionStart` must
-    /// forward `CLEAR_SESSION_START_METADATA_KEY` / `CLEAR_SESSION_START_METADATA_VALUE`
-    /// into `AgentEvent.metadata` — narrowly, mirroring
-    /// `session_start_origin_survives_the_claude_hook_builder` above for the
-    /// sibling `SESSION_START_ORIGIN_METADATA_KEY` forwarding. Also covers a
-    /// non-`ClaudeCode` `agent_type` (built via `build_event_typed` directly,
-    /// since `build_event` hardcodes `ClaudeCode`) not forwarding the key
-    /// even when `source == "clear"`.
+    /// Scenario: PRD #655: `ClaudeCodeHookInput.source == "clear"` on a
+    /// `SessionStart` must forward `CLEAR_SESSION_START_METADATA_KEY` /
+    /// `CLEAR_SESSION_START_METADATA_VALUE` into `AgentEvent.metadata` —
+    /// narrowly, mirroring `session_start_origin_survives_the_claude_hook_builder`
+    /// above for the sibling `SESSION_START_ORIGIN_METADATA_KEY` forwarding.
+    /// Also covers the review-round M4/F4 gap: a non-`ClaudeCode` `agent_type`
+    /// (built via `build_event_typed` directly, since `build_event` hardcodes
+    /// `ClaudeCode`) must not forward the key even when `source == "clear"`.
     #[test]
     fn clear_session_start_source_forwards_narrowly() {
         let payload = |event: &str, source: Option<&str>| ClaudeCodeHookInput {
@@ -2598,13 +2637,14 @@ mod tests {
             wrong_event.metadata
         );
 
-        // This feature is Claude-Code only — a `SessionStart` with
+        // M4/F4: this feature is Claude-Code only — a `SessionStart` with
         // `source: "clear"` stamped with a non-`ClaudeCode` agent_type must
         // NOT forward the key, even though every other condition is met.
         // Goes through `build_event_typed` directly (not the `build_event`
         // convenience wrapper, which hardcodes `AgentType::ClaudeCode`) so
         // this actually exercises the `agent_type == AgentType::ClaudeCode`
-        // gate — deleting that condition would break no other test.
+        // gate at the top of this file — deleting that condition would break
+        // no fast-tier test without this case.
         let non_claude_code =
             build_event_typed(payload("SessionStart", Some("clear")), AgentType::Codex)
                 .expect("SessionStart maps to an event");
