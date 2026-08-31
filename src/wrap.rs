@@ -328,6 +328,10 @@ fn markers_are_lowercase_ascii(markers: &[&str]) -> bool {
 pub struct Detector {
     rules: &'static RuleSet,
     last: Option<DetectedEvent>,
+    /// Issue #652: the model id last read from a Codex status bar, sticky
+    /// across calls — see [`Self::note_model`]. `None` until the wrapper has
+    /// observed a segment carrying the status bar at all.
+    model: Option<String>,
 }
 
 impl Detector {
@@ -338,7 +342,23 @@ impl Detector {
 
     /// A detector using an explicit rule set (the M7 Codex seam).
     pub fn with_rules(rules: &'static RuleSet) -> Self {
-        Self { rules, last: None }
+        Self {
+            rules,
+            last: None,
+            model: None,
+        }
+    }
+
+    /// Record a model id freshly extracted from a segment ([`extract_codex_status_bar_model`]),
+    /// if any. Sticky: a `None` (this segment had no status bar in it) never
+    /// clears a previously observed model, since the daemon side is sticky
+    /// too (`state.rs::apply_event`) and most segments don't repaint the
+    /// footer at all. A `Some` always overwrites, so a genuine model switch
+    /// mid-session is picked up.
+    fn note_model(&mut self, model: Option<String>) {
+        if let Some(model) = model {
+            self.model = Some(model);
+        }
     }
 
     /// Feed one line; return the event to emit, or `None` when the line is
@@ -386,6 +406,43 @@ fn classify_codex_json(line: &str) -> Option<DetectedEvent> {
         "turn.failed" | "task.failed" | "error" => DetectedEvent::Error,
         _ => DetectedEvent::Working,
     })
+}
+
+/// The exact truecolor SGR span (RGB 246,226,183 — the warm tan Codex's
+/// interactive TUI consistently paints its composer footer with, across every
+/// captured redraw in `.dot-agent-deck/638-captures/`) that immediately
+/// precedes the "`<model> <effort>`" status-bar text. Issue #652: anchoring
+/// extraction on this specific escape sequence — rather than a bare
+/// substring search for a `gpt-`-shaped token anywhere in the segment — is
+/// what keeps a model id embedded incidentally elsewhere (e.g. inside a JSON
+/// error payload's `message` field, which carries no such preceding escape)
+/// from being mistaken for the real status bar.
+const CODEX_STATUS_BAR_MODEL_SGR: &str = "\x1b[38;2;246;226;183;49m";
+
+/// Extract the active model id from a raw (ANSI-decorated) Codex TUI output
+/// segment, when its composer status bar is present in `line`. Codex paints
+/// the bar as "`<model> <effort>`" (e.g. `gpt-5.1-codex-mini low`) inside
+/// [`CODEX_STATUS_BAR_MODEL_SGR`]; everything up to the next escape sequence
+/// is that text, and the model is everything before the LAST space — the
+/// trailing reasoning-effort word (`low`/`medium`/`high`) never itself
+/// contains a space, while a model id may contain hyphens/dots but not
+/// spaces. Returns `None` when this segment doesn't carry the status bar at
+/// all (most segments won't — Codex only repaints it on the frames that
+/// touch the composer footer), which is fine: the caller treats this as
+/// sticky and keeps whatever model was last observed.
+fn extract_codex_status_bar_model(line: &str) -> Option<String> {
+    let after = line.split(CODEX_STATUS_BAR_MODEL_SGR).nth(1)?;
+    let text_end = after.find('\x1b').unwrap_or(after.len());
+    let text = after[..text_end].trim();
+    if text.is_empty() {
+        return None;
+    }
+    let model = text.rsplit_once(' ').map_or(text, |(model, _effort)| model);
+    if model.is_empty() {
+        None
+    } else {
+        Some(model.to_string())
+    }
 }
 
 /// PRD #20 finding #11: classify one line of Codex output. Codex emits JSONL
@@ -444,7 +501,18 @@ impl Emitter {
     /// the wrapper stays a transparent passthrough even with no daemon (the
     /// "arbitrary commands as a basic fallback" success criterion).
     fn emit(&self, event_type: EventType) {
-        self.emit_with_metadata(event_type, HashMap::new());
+        self.emit_with_metadata(event_type, HashMap::new(), None);
+    }
+
+    /// Same as [`Self::emit`] but also stamps `model`, when known. Issue #652:
+    /// used by [`classify_and_emit`] to report the model id it reads back
+    /// from the wrapped Codex TUI's own status bar. Every other call site has
+    /// no model context and stays on plain [`Self::emit`], which always sends
+    /// `None` — safe, since the daemon's `model` handling is STICKY
+    /// (`state.rs::apply_event`), so a `None` here never clears a model an
+    /// earlier event already reported.
+    fn emit_with_model(&self, event_type: EventType, model: Option<String>) {
+        self.emit_with_metadata(event_type, HashMap::new(), model);
     }
 
     /// PRD #225 M3: the fork-time `SessionStart` this wrapper emits the moment
@@ -474,7 +542,7 @@ impl Emitter {
                 codex_hook_trust_confirmed.to_string(),
             );
         }
-        self.emit_with_metadata(EventType::SessionStart, metadata);
+        self.emit_with_metadata(EventType::SessionStart, metadata, None);
     }
 
     /// Issue #243: the INTERFACE-READY `SessionStart` this wrapper emits once it
@@ -516,7 +584,8 @@ impl Emitter {
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             fact.origin().to_string(),
         );
-        let Ok(json) = serde_json::to_string(&self.build_event(EventType::SessionStart, metadata))
+        let Ok(json) =
+            serde_json::to_string(&self.build_event(EventType::SessionStart, metadata, None))
         else {
             return;
         };
@@ -525,8 +594,13 @@ impl Emitter {
         });
     }
 
-    fn emit_with_metadata(&self, event_type: EventType, metadata: HashMap<String, String>) {
-        let event = self.build_event(event_type, metadata);
+    fn emit_with_metadata(
+        &self,
+        event_type: EventType,
+        metadata: HashMap<String, String>,
+        model: Option<String>,
+    ) {
+        let event = self.build_event(event_type, metadata, model);
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = crate::hook::send_to_socket(&json);
         }
@@ -535,7 +609,12 @@ impl Emitter {
     /// Issue #243 audit F3: build the [`AgentEvent`] without sending it, so a
     /// caller that must not block on the daemon can do the (cheap, pure) build on
     /// its own thread and hand only the serialized line to a sender.
-    fn build_event(&self, event_type: EventType, metadata: HashMap<String, String>) -> AgentEvent {
+    fn build_event(
+        &self,
+        event_type: EventType,
+        metadata: HashMap<String, String>,
+        model: Option<String>,
+    ) -> AgentEvent {
         AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
@@ -554,7 +633,12 @@ impl Emitter {
             // PRD #20 M3: a wrapped session is history-only from the dashboard's
             // perspective (see `Emitter::live_target`).
             live_target: Some(self.live_target),
-            model: None,
+            // Issue #652: the model id `classify_and_emit` extracted from the
+            // Codex TUI's own status bar, when known; `None` everywhere else
+            // (interface-ready, session-start, non-Codex agents). The daemon
+            // side is STICKY on this field, so `None` never regresses an
+            // already-known model.
+            model,
         }
     }
 }
@@ -2113,17 +2197,26 @@ fn classify_and_emit(
     suppress_text_status: bool,
 ) {
     let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+    // Issue #652: try to read the model off this segment's status bar before
+    // classifying — independent of what this segment classifies as, since a
+    // status-bar repaint and a state-change event don't necessarily land on
+    // the same segment. Sticky in `Detector`, so this is safe to call on
+    // every segment (most won't carry the bar and leave the model unchanged).
+    if is_codex {
+        det.note_model(extract_codex_status_bar_model(line));
+    }
     let ev = if is_codex {
         det.observe_detected(classify_codex_line(line))
     } else {
         det.observe(line)
     };
+    let model = det.model.clone();
     drop(det);
     if let Some(ev) = ev {
         if suppress_text_status && ev != DetectedEvent::Error {
             return;
         }
-        emitter.emit(ev.event_type());
+        emitter.emit_with_model(ev.event_type(), model);
     }
 }
 
