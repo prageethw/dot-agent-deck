@@ -36,22 +36,13 @@ mod common;
 use std::time::Duration;
 
 use common::{TuiDeck, commit_fixture, open_orchestration, write_executable};
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::event::{
+    AgentEvent, AgentType, CLEAR_SESSION_START_METADATA_KEY, CLEAR_SESSION_START_METADATA_VALUE,
+    EventType,
+};
 use spec::spec;
 
 const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
-
-/// PRD #655: the `AgentEvent.metadata` key/value this test file INVENTS to
-/// model a `/clear`-originated `SessionStart`, since no production constant
-/// exists yet — M1 (`src/hook.rs`) is what the coder adds next, driven by
-/// these tests, and it must forward `ClaudeCodeHookInput.source == "clear"`
-/// into exactly this key/value pair for `orchestration_remit_004`/`_005` to
-/// go GREEN. Picked short and self-explanatory, deliberately distinct from
-/// the existing [`dot_agent_deck::event::SESSION_START_ORIGIN_METADATA_KEY`]
-/// (wrapper-fork provenance, an unrelated concern) so the two keys can never
-/// be confused with each other.
-const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
-const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
 
 /// The synthetic orchestrator role script: a BACKGROUNDED subshell declares
 /// the role live immediately (fast-path readiness for the spawn-time remit
@@ -265,10 +256,15 @@ fn inject_compacting(
 /// too.
 ///
 /// The `metadata` map carries [`CLEAR_SESSION_START_METADATA_KEY`] /
-/// [`CLEAR_SESSION_START_METADATA_VALUE`] — the literal this test file
-/// invents to mark "this `SessionStart` originated from `/clear`", since no
-/// production constant exists yet (PRD #655 M1 is what adds one, in
-/// `src/hook.rs`, driven by these tests).
+/// [`CLEAR_SESSION_START_METADATA_VALUE`] (`dot_agent_deck::event`) — the
+/// real production constants M1 (`src/hook.rs`) forwards
+/// `ClaudeCodeHookInput.source == "clear"` into.
+///
+/// `agent_type` is a caller-supplied parameter, not a hardcoded value: PRD
+/// #655's stated scope is Claude Code only, so `orchestration_remit_004`/
+/// `_005` pass [`AgentType::ClaudeCode`] to exercise the trigger within
+/// scope, while `orchestration_remit_006` deliberately passes a non-Claude
+/// `agent_type` to prove events outside that scope are ignored.
 #[cfg(unix)]
 fn inject_clear_session_start(
     deck: &TuiDeck,
@@ -276,6 +272,7 @@ fn inject_clear_session_start(
     pane_id: &str,
     agent_id: &str,
     session_id: &str,
+    agent_type: AgentType,
 ) {
     let mut metadata = std::collections::HashMap::new();
     metadata.insert(
@@ -284,7 +281,7 @@ fn inject_clear_session_start(
     );
     let event = AgentEvent {
         session_id: session_id.to_string(),
-        agent_type: AgentType::Codex,
+        agent_type,
         event_type: EventType::SessionStart,
         tool_name: None,
         tool_detail: None,
@@ -592,6 +589,7 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
         &pane_id,
         &agent_id,
         &format!("{agent_id}-remit004-session"),
+        AgentType::ClaudeCode,
     );
 
     let reasserted =
@@ -601,6 +599,23 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
         "a `/clear`-originated SessionStart event on the orchestrator start-role pane \
          must re-deliver the `{DELIVERED_POINTER}` remit pointer a second time (PRD \
          #655); the log only shows it once within 10s.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // PRD #655 review round, finding F2b: pin non-repetition, not just
+    // arrival — a single `/clear`-originated `SessionStart` event must
+    // deliver the pointer exactly once more, never repeatedly. Mirrors the
+    // "stays put" shape `orchestration_remit_002`/`_005` already use for
+    // their negative leak checks (`!wait_for_file_substr_count(..., short
+    // bound)`), applied here to the count staying AT 2 rather than never
+    // reaching 2.
+    let repeated_beyond_two =
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 3, Duration::from_millis(900));
+    assert!(
+        !repeated_beyond_two,
+        "a single `/clear`-originated SessionStart event must not re-deliver the remit \
+         pointer more than once; the log reached a third `{DELIVERED_POINTER}` line \
+         within a bounded wait after the second.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }
@@ -637,6 +652,7 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
         &worker_pane_id,
         &worker_agent_id,
         &format!("{worker_agent_id}-remit005-worker-session"),
+        AgentType::ClaudeCode,
     );
 
     let leaked_to_worker =
@@ -655,6 +671,7 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
         &orch_pane_id,
         &orch_agent_id,
         &format!("{orch_agent_id}-remit005-orch-session"),
+        AgentType::ClaudeCode,
     );
     let reasserted_on_start_role =
         common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
@@ -664,6 +681,72 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
          START role must still re-deliver the remit pointer in this same orchestration \
          — the negative check above is only meaningful if this positive control also \
          passes.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: PRD #655 review round, finding F4. In the same orchestration, a
+/// `/clear`-originated `SessionStart` fires on the orchestrator START role's
+/// own pane, but stamped with a non-Claude-Code `agent_type` — this must NOT
+/// re-deliver the remit pointer, since the PRD's stated scope is Claude Code
+/// only (`AgentType::ClaudeCode`). Then, as a positive control proving this
+/// is a genuine scope guard and not just an unimplemented feature vacuously
+/// passing the negative check, the same `/clear`-originated `SessionStart`
+/// fires again on the SAME pane, this time stamped `AgentType::ClaudeCode`,
+/// which MUST re-deliver. Mirrors `orchestration_remit_002`'s pattern of
+/// pairing a negative check with a positive control, but proves the
+/// agent-type axis rather than the pane-identity axis `_002`/`_005` already
+/// cover.
+///
+/// Expected RED right now: the Claude-Code-only scope gate this test pins
+/// does not exist yet (it's the coder's next delegation in this same fix
+/// round) — the daemon applies the injected event (status still transitions
+/// to `Idle`, per `inject_clear_session_start`'s own precondition wait) but
+/// today's re-assertion trigger doesn't check `agent_type` at all, so the
+/// pointer is wrongly re-delivered anyway.
+#[spec("orchestration/remit/006")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_006_non_claude_agent_type_clear_reasserts_nothing() {
+    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let (socket, pane_id, agent_id, log, _role_cwd) = open_and_confirm_initial_delivery(&deck);
+
+    inject_clear_session_start(
+        &deck,
+        &socket,
+        &pane_id,
+        &agent_id,
+        &format!("{agent_id}-remit006-non-claude-session"),
+        AgentType::Codex,
+    );
+
+    let leaked_for_non_claude_agent_type =
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_millis(900));
+    assert!(
+        !leaked_for_non_claude_agent_type,
+        "a `/clear`-originated SessionStart event stamped with a non-Claude-Code \
+         `agent_type` must not re-assert the orchestrator's remit (PRD #655's stated \
+         scope is Claude Code only); the start role's delivery log reached a second \
+         `{DELIVERED_POINTER}` line anyway.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    inject_clear_session_start(
+        &deck,
+        &socket,
+        &pane_id,
+        &agent_id,
+        &format!("{agent_id}-remit006-claude-session"),
+        AgentType::ClaudeCode,
+    );
+    let reasserted_for_claude_code =
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
+    assert!(
+        reasserted_for_claude_code,
+        "control failed: a `/clear`-originated SessionStart event stamped \
+         `AgentType::ClaudeCode` on the orchestrator START role's own pane must still \
+         re-deliver the remit pointer — the negative check above is only meaningful if \
+         this positive control also passes.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }

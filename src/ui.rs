@@ -34024,6 +34024,209 @@ mod tests {
         );
     }
 
+    // PRD #655 review round, finding F2a — pure policy:
+    // `orchestrator_remit_pane_latest_clear_session_start` must find only a
+    // genuinely qualifying `/clear`-originated `SessionStart` on the REAL,
+    // tagged session on the start-role pane, ignoring (a) a co-resident
+    // placeholder, (b) a matching event on a DIFFERENT pane, (c) a
+    // non-`SessionStart` event carrying the clear metadata, and (d) a
+    // `SessionStart` event with absent or wrong clear metadata — then must
+    // return the LATEST qualifying timestamp when more than one co-resident
+    // session on the pane carries one, order-independently. Direct template:
+    // `remit_pane_compacting_ignores_placeholder_and_other_panes` above.
+    #[test]
+    fn remit_pane_latest_clear_session_start_filters_and_picks_latest() {
+        fn clear_event(timestamp: chrono::DateTime<Utc>) -> AgentEvent {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+                crate::event::CLEAR_SESSION_START_METADATA_VALUE.to_string(),
+            );
+            AgentEvent {
+                session_id: "s".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp,
+                user_prompt: None,
+                metadata,
+                pane_id: None,
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        let base = Utc::now();
+
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "no sessions at all on the pane must yield None"
+        );
+
+        // Co-resident placeholder on the target pane, carrying a qualifying
+        // clear event — must not count; `agent_type: None` means no real
+        // agent produced it.
+        let mut placeholder_events = std::collections::VecDeque::new();
+        placeholder_events.push_back(clear_event(base));
+        sessions.insert(
+            "placeholder".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::None,
+                recent_events: placeholder_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a placeholder session (agent_type: None) must not count"
+        );
+
+        // A real, tagged session on a DIFFERENT pane carrying a qualifying
+        // clear event must not count for "orch-pane" either.
+        let mut other_pane_events = std::collections::VecDeque::new();
+        other_pane_events.push_back(clear_event(base));
+        sessions.insert(
+            "other-pane-session".to_string(),
+            SessionState {
+                pane_id: Some("other-pane".to_string()),
+                agent_type: AgentType::Codex,
+                recent_events: other_pane_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a qualifying event on a different pane must not count"
+        );
+
+        // The real, tagged session on "orch-pane" itself, but its only event
+        // carries the clear metadata on the WRONG event type (Compacting,
+        // not SessionStart) — must not count.
+        let mut wrong_type_event = clear_event(base);
+        wrong_type_event.event_type = EventType::Compacting;
+        let mut real_events = std::collections::VecDeque::new();
+        real_events.push_back(wrong_type_event);
+        sessions.insert(
+            "orch-pane-real".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::Codex,
+                recent_events: real_events.clone(),
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a non-SessionStart event carrying the clear metadata must not count"
+        );
+
+        // Same pane/session, a genuine SessionStart but with NO metadata at
+        // all — must not count.
+        real_events.clear();
+        real_events.push_back(AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: base,
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a SessionStart event with no clear metadata must not count"
+        );
+
+        // Same pane/session, a genuine SessionStart but with the WRONG clear
+        // metadata value — must not count.
+        let mut wrong_value_metadata = HashMap::new();
+        wrong_value_metadata.insert(
+            crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+            "not-clear".to_string(),
+        );
+        real_events.clear();
+        real_events.push_back(AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: base,
+            user_prompt: None,
+            metadata: wrong_value_metadata,
+            pane_id: None,
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a SessionStart event with the wrong clear metadata value must not count"
+        );
+
+        // Now give the real, tagged session a genuinely qualifying clear
+        // event — must count, and its timestamp must be returned.
+        real_events.clear();
+        real_events.push_back(clear_event(base));
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            Some(base),
+            "a genuinely qualifying clear-originated SessionStart on the real, tagged \
+             session must count"
+        );
+
+        // A SECOND real, tagged session co-resident on the same pane
+        // (`AppState::apply_event` documents this co-residence is legitimate,
+        // mirroring `remit_pane_compacting_ignores_placeholder_and_other_panes`
+        // above), with a LATER qualifying clear event, must win via `.max()`
+        // — order-independently, regardless of HashMap iteration order.
+        let later = base + Duration::seconds(30);
+        let mut second_events = std::collections::VecDeque::new();
+        second_events.push_back(clear_event(later));
+        sessions.insert(
+            "orch-pane-real-2".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::ClaudeCode,
+                recent_events: second_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            Some(later),
+            "the LATEST qualifying clear-originated SessionStart across co-resident \
+             sessions on the pane must win, regardless of HashMap iteration order"
+        );
+    }
+
     // Issue #423 F7 — pure policy: a (re-)delivered remit prompt sets the
     // start role's displayed status to `Working` from `Waiting`/`Working`,
     // but must never clobber a TERMINAL status (`Done`, or `Failed` — the
