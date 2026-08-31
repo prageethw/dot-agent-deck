@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.44.3] - 2026-08-31
+
+### Added
+
+- **Orchestrator remit re-asserted on /clear**
+  The orchestrator's role prompt — the pointer telling an orchestration tab to read its context file and adopt the orchestrator role, available agents, and delegation protocol — used to be delivered only once at spawn, plus a single re-assertion when the pane auto-compacted. Running `/clear` inside an orchestrator's start-role pane left it with a genuinely fresh context and no memory of its role, and nothing re-seeded it — the user had to retype the pointer instruction by hand.
+  `/clear` now re-asserts the remit the same way compaction already does: the moment Claude Code reports a `SessionStart` event with `source: "clear"` for the orchestrator's start-role pane, the pointer prompt is retyped automatically, using the same bounded retry-and-confirmation delivery already in place. Scope matches the existing compaction re-assertion exactly — only the orchestrator's own start-role pane is affected, never a worker/delegate pane, and only for Claude Code start roles.
+  No configuration is needed; this is on by default for every orchestration tab.
+
+### Fixed
+
+  Fixes a gate inconsistency in the agent-type badge (`Ctrl+m` / `m`) for a resolved-but-untagged session (real activity seen, but the pane never picked up a concrete agent type): the badge could either hide a known model entirely or, once gated on activity instead of the raw placeholder flag, show a misleading `No agent (<model>)` next to a live status. Such a session now shows its model alone in the badge (e.g. `gpt-5.1-codex-mini`, rendered with any vendor prefix stripped, as `normalize_model_label` already does) when one is known, and shows no badge at all when none is known yet; a genuinely-empty, never-resolved placeholder is unaffected. As of this fix, this state (agent type unresolved, model already known) is not reachable from any shipped producer — Codex's own integration (`src/wrap.rs`) does not yet report a model at all, so this does not make Codex's model badge visible in practice today; that gap is tracked separately in #652. This change fixes the gate's internal consistency so the badge behaves correctly once #652 lands.
+  Fixes `worker-agent-deck wrap`'s Codex integration never reporting the active model to the daemon. Two compounding bugs, both fixed: (1) the model was read off Codex's composer status bar by anchoring on one hardcoded accent color, but real Codex sessions paint the identical status bar in a different color per session — extraction now matches the bar's stable *shape* (a truecolor escape immediately followed by the model/effort text and a fixed separator) instead of one fixed color, so it survives whatever accent a given session happens to use; (2) under the default hook-trusted configuration, only an error turn ever carried the model through to the daemon, so a healthy session that never errors showed no model at all — a freshly-observed model now reaches the daemon on a status-neutral event that cannot affect the pane's Working/Idle state, and the model is also stamped on session end unconditionally as a backstop. Also fixes a truncated status-bar read (from a very long line) reporting a garbled model instead of nothing, a stale model winning over a fresher one when two repaints land in the same read, and a double space before the effort word leaving a trailing space on the reported model.
+  Fixes `worker-agent-deck wrap`'s Codex integration dropping a freshly-observed model when the segment that carried it did not also produce a status transition (e.g. a mid-session model switch on a pane that was already `Working` and stays `Working`). The fresh-model carrier now reaches the daemon independently of whether this call's classification changed status, still riding the same status-neutral `Unknown` event as before.
+
+
+
 ## [0.44.2] - 2026-08-30
 
 ### Fixed
