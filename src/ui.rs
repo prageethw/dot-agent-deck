@@ -2591,6 +2591,53 @@ fn orchestrator_remit_pane_is_compacting<'a>(
     })
 }
 
+/// PRD #655 — pure policy: the timestamp of the most recent clear-originated
+/// `SessionStart` recorded against the orchestrator start-role pane's own
+/// (non-placeholder) session, if one is still present in its retained
+/// `recent_events` window. Order-independent lookup and same-pane-placeholder
+/// exclusion mirror `orchestrator_remit_pane_is_compacting` above, but this
+/// returns an event IDENTITY (its own timestamp) rather than a boolean level:
+/// a `SessionStart` is a point-in-time event, not a persisted status the way
+/// `Compacting` is, so there is no level to poll here — the daemon's
+/// `EventType::SessionStart` arm unconditionally sets `session.status =
+/// SessionStatus::Idle` regardless of cause, so `status` alone can't
+/// distinguish "just cleared" from any other route to `Idle`. The caller
+/// edge-detects by comparing this timestamp against the last one it already
+/// reacted to (`UiState::orchestration_remit_clear_reasserted_at`), exactly
+/// the way `orchestration_remit_compacting`'s membership check edge-detects
+/// the boolean level above.
+///
+/// Review/audit round (M4, F4): the PRD (Solution Overview point 4, Out of
+/// Scope) and `changelog.d/655.feature.md` both state this feature is
+/// Claude-Code-only, but nothing enforced it here — only the placeholder
+/// exclusion above (`agent_type != AgentType::None`) was checked, which lets
+/// a non-Claude-Code producer (Codex, Devin) trigger a re-assertion. The
+/// check is on the EVENT's own `agent_type`, not the session's: a session's
+/// `agent_type` is set once from its first non-`None` event and never
+/// changes afterward (`AppState::apply_event`), while each `AgentEvent`
+/// retained in `recent_events` carries whatever `agent_type` its own
+/// producer stamped it with — that per-event identity is what must be
+/// Claude Code for a `/clear` on it to count.
+fn orchestrator_remit_pane_latest_clear_session_start<'a>(
+    sessions: impl Iterator<Item = &'a SessionState>,
+    start_pane_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    sessions
+        .filter(|s| s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None)
+        .filter_map(|s| {
+            s.recent_events.iter().rev().find_map(|e| {
+                (e.event_type == EventType::SessionStart
+                    && e.agent_type == AgentType::ClaudeCode
+                    && e.metadata
+                        .get(crate::event::CLEAR_SESSION_START_METADATA_KEY)
+                        .map(String::as_str)
+                        == Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE))
+                .then_some(e.timestamp)
+            })
+        })
+        .max()
+}
+
 /// Issue #423 F7 — pure policy: the start role's displayed status after a
 /// (re-)delivered remit prompt. At spawn this slot is always `Waiting`, so
 /// the transition to `Working` is unconditional there; on a compaction
@@ -2810,6 +2857,14 @@ const SEND_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_se
 /// so the release build's unmovable value and the test override's fallback
 /// can never drift apart.
 const SEND_RETRY_BASE_MS: u64 = 500;
+
+/// Review/audit round (M4, F3/F2): the minimum interval between successive
+/// `prepare_orchestrator_prompt` attempts for the SAME unreacted `/clear`
+/// edge (`UiState::orchestration_remit_clear_retry_at`). Only needs to be
+/// large enough to turn a ~62 Hz render-loop hot spin into an occasional
+/// retry — this is not meant to add real user-visible latency to the
+/// re-arm, just to bound a persistent-failure retry rate.
+const CLEAR_REASSERT_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// PRD fork#257: ceiling for [`send_retry_base`]'s test override, in
 /// milliseconds via `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`. Pinned to
@@ -3181,6 +3236,60 @@ struct UiState {
     /// Removed the moment the status is next observed as anything else,
     /// which re-arms detection for a possible later compaction.
     orchestration_remit_compacting: HashSet<TabId>,
+    /// PRD #655: for each orchestration tab, the timestamp of the most
+    /// recent clear-originated `SessionStart` the remit re-arm loop has
+    /// already reacted to on the start-role pane, if any. A `SessionStart`
+    /// is a point-in-time event, not a persisted status like `Compacting`,
+    /// so there is no boolean level to track here the way
+    /// `orchestration_remit_compacting` does — this instead records the
+    /// IDENTITY of the last reacted-to event
+    /// (`orchestrator_remit_pane_latest_clear_session_start`'s return
+    /// value) so the render loop, running at ~62 Hz, fires the re-arm
+    /// exactly once per observed `/clear`, not once per frame the same
+    /// event remains within `SessionState::recent_events`'s retained
+    /// window. A missing entry means "never reacted for this tab"; an
+    /// entry is only ever inserted, never removed — mirrors
+    /// `orchestration_prompt_anchor_at`'s `TabId`-keyed, append-only shape.
+    orchestration_remit_clear_reasserted_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
+    /// Review/audit round (M4, F5): the wall-clock moment the `/clear`
+    /// re-arm loop FIRST evaluated this tab — set once, lazily, the first
+    /// time the loop sees a given `TabId`, and never advanced afterward.
+    /// Guards against a `latest_clear` that predates this tab's own
+    /// lifetime: not reachable today (reconnect hydration seeds empty
+    /// `recent_events`, and `SessionSnapshot` carries no event history), but
+    /// forecloses the risk pre-emptively for if `SessionSnapshot` ever
+    /// grows one, per design decision 3 (never replay on reconnect).
+    /// Deliberately its OWN field rather than reusing
+    /// `orchestration_prompt_anchor_at`: that one is re-anchored to NOW on
+    /// every successful re-arm (compaction or clear), so using it here
+    /// would let a later compaction re-arm's reset retroactively make an
+    /// earlier, still-pending `/clear` look "stale" and wrongly discard
+    /// it — this field is append-only and never moves once set, so it
+    /// can't be shifted forward by an unrelated re-arm.
+    orchestration_remit_clear_tab_anchor_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
+    /// Review/audit round (M4, F3/F2): the last `Instant` the `/clear`
+    /// re-arm loop attempted `prepare_orchestrator_prompt` for a
+    /// `latest_clear` edge it has not yet reacted to. Deliberately separate
+    /// from `orchestration_remit_clear_reasserted_at` (which only ever
+    /// records a SUCCESSFUL reaction, or a permanent exclusion) — this one
+    /// exists purely to bound the RATE of a persistently failing attempt
+    /// (deleted/unmounted cwd, read-only fs, disk full), which would
+    /// otherwise retry `create_dir_all` + `fs::write` on the render thread
+    /// every frame (~62 Hz) for as long as the triggering event stays
+    /// inside the pane's `recent_events` window. The "don't silently drop
+    /// it forever" property is preserved — this floors the RATE of
+    /// retrying, not the DURATION, so a transient failure still recovers
+    /// once the floor next elapses. Removed once the edge is reacted to
+    /// (success or permanent exclusion), so a later `/clear` isn't
+    /// gratuitously throttled by a stale entry — but that cleanup only
+    /// runs while `latest_clear` is still `Some`. If the triggering event
+    /// ages out of `recent_events` (or is filtered by the tab anchor)
+    /// while a retry entry is outstanding, `latest_clear` goes `None`,
+    /// the whole gate stops running for that tab, and the entry is simply
+    /// left behind. Harmless: the next edge's floor check compares
+    /// against that long-past `Instant` and passes immediately, so the
+    /// stale entry never throttles anything — it just isn't removed.
+    orchestration_remit_clear_retry_at: HashMap<TabId, std::time::Instant>,
     /// Issue #423 F3 (rename): originally "when the orchestration tab was
     /// created", used only to seed `deliver_orchestrator_prompt`'s
     /// deadline/timeout checks. The remit re-assertion (F2/F4) re-anchors
@@ -3396,6 +3505,9 @@ impl UiState {
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
             orchestration_remit_compacting: HashSet::new(),
+            orchestration_remit_clear_reasserted_at: HashMap::new(),
+            orchestration_remit_clear_tab_anchor_at: HashMap::new(),
+            orchestration_remit_clear_retry_at: HashMap::new(),
             orchestration_prompt_anchor_at: HashMap::new(),
             orchestration_remit_abandoned: HashSet::new(),
             orchestration_ready_since: HashMap::new(),
@@ -15205,6 +15317,147 @@ pub fn run_tui(
                     ui.orchestration_remit_compacting.insert(*id);
                 } else {
                     ui.orchestration_remit_compacting.remove(id);
+                }
+            }
+        }
+
+        // PRD #655: a second, INDEPENDENT re-arm trigger — a `/clear`-shaped
+        // `SessionStart` on the start role's own pane. Kept as its own loop
+        // and its own edge-detection state
+        // (`orchestration_remit_clear_reasserted_at`), deliberately not
+        // merged into the `Compacting` loop above: `Compacting` is a
+        // persisted STATUS the daemon holds until something else changes it,
+        // so membership in `orchestration_remit_compacting` is a genuine
+        // level to poll; a `/clear`-originated `SessionStart` is a
+        // POINT-IN-TIME event — `AppState::apply_event`'s `SessionStart` arm
+        // unconditionally sets `status = SessionStatus::Idle` regardless of
+        // cause, so there is no status value here to gate on the way
+        // `should_reassert_orchestrator_remit` does above. Reuses the exact
+        // same reset-and-redeliver sequence and eligibility rules as the
+        // compaction path (no_delivery_pending / Pi exclusion /
+        // `orchestration_remit_abandoned`) so both triggers feed the SAME
+        // `deliver_orchestrator_prompt` machinery below, unchanged — a second
+        // trigger, not a second delivery path.
+        // Review round (M4, F5) — wall-clock "now", captured once per frame
+        // like `orch_now` just above but on the `chrono` axis: this seeds
+        // `orchestration_remit_clear_tab_anchor_at` the first frame a given
+        // `TabId` is seen, and is compared directly against `latest_clear`
+        // (both `chrono::DateTime<Utc>`) below.
+        let clear_guard_now = Utc::now();
+        for tab in tab_manager.tabs_mut() {
+            if let Tab::Orchestration {
+                id,
+                role_pane_ids,
+                start_role_index,
+                orchestrator_prompt,
+                config,
+                cwd,
+                ..
+            } = tab
+            {
+                let start_pane_id = role_pane_ids[*start_role_index].clone();
+                let latest_clear = orchestrator_remit_pane_latest_clear_session_start(
+                    snapshot.sessions.values(),
+                    &start_pane_id,
+                );
+
+                // Review round (M4, F5): a `latest_clear` older than this
+                // tab's own anchor moment cannot legitimately belong to
+                // it — `TabId` is fresh on every rebuild, so an event that
+                // predates the anchor can only have reached `recent_events`
+                // via daemon-side history the tab itself never produced
+                // (not reachable today: reconnect hydration seeds empty
+                // `recent_events`, and `SessionSnapshot` carries no event
+                // history — this forecloses the risk pre-emptively for if
+                // that ever changes, per design decision 3: never replay on
+                // reconnect). The anchor is seeded lazily HERE, on first
+                // observation, rather than reusing
+                // `orchestration_prompt_anchor_at` — that field is
+                // re-anchored to NOW on every successful re-arm (compaction
+                // or clear), so a later compaction re-arm's reset would
+                // retroactively make an earlier, still-pending `/clear`
+                // look "stale" and wrongly discard it.
+                let tab_anchor = *ui
+                    .orchestration_remit_clear_tab_anchor_at
+                    .entry(*id)
+                    .or_insert(clear_guard_now);
+                let latest_clear = latest_clear.filter(|latest_clear| *latest_clear >= tab_anchor);
+
+                if let Some(latest_clear) = latest_clear
+                    && ui.orchestration_remit_clear_reasserted_at.get(id) != Some(&latest_clear)
+                {
+                    // Same landed-vs-still-probing distinction the
+                    // compaction path documents above: a write that has
+                    // LANDED (`PromptDelivery::attempts > 0`) is eligible
+                    // for re-arm; only a delivery still probing
+                    // readiness/backoff before its first write keeps
+                    // blocking it.
+                    let no_delivery_pending = orchestrator_prompt.is_none()
+                        || ui
+                            .prompt_delivery
+                            .get(start_pane_id.as_str())
+                            .is_some_and(|d| d.attempts > 0);
+
+                    // Pi start roles are excluded on purpose, same reason as
+                    // the compaction path: a Pi role's prompt is delivered
+                    // NATIVELY, daemon-side — this gate's TUI-owned PTY
+                    // keystroke injection is the wrong delivery path for it.
+                    let start_role_is_pi = config
+                        .roles
+                        .get(*start_role_index)
+                        .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+                        .unwrap_or(false);
+
+                    // Permanently excluded tabs are marked SEEN regardless of
+                    // outcome this frame — neither condition can ever
+                    // change, so there is nothing to gain by re-evaluating
+                    // them on every subsequent frame this same event
+                    // remains the latest one.
+                    let permanently_excluded =
+                        ui.orchestration_remit_abandoned.contains(id) || start_role_is_pi;
+
+                    // Review round (M4, F3/F2): a persistently failing
+                    // `prepare_orchestrator_prompt` (deleted/unmounted cwd,
+                    // read-only fs, disk full) must not be retried every
+                    // frame at the render loop's ~62 Hz rate — bound the
+                    // RATE, not the duration, of the retry. `retry_floor_ok`
+                    // gates the attempt itself, so a throttled frame never
+                    // touches the filesystem at all.
+                    let retry_floor_ok =
+                        ui.orchestration_remit_clear_retry_at
+                            .get(id)
+                            .is_none_or(|last| {
+                                orch_now.saturating_duration_since(*last)
+                                    >= CLEAR_REASSERT_RETRY_FLOOR
+                            });
+
+                    if no_delivery_pending && !permanently_excluded && retry_floor_ok {
+                        ui.orchestration_remit_clear_retry_at.insert(*id, orch_now);
+                        if let Some(prompt) = prepare_orchestrator_prompt(config, cwd, None) {
+                            ui.send_retry_backoff.remove(start_pane_id.as_str());
+                            ui.prompt_delivery.remove(start_pane_id.as_str());
+                            ui.orchestration_ready_since.remove(id);
+
+                            *orchestrator_prompt = Some(prompt);
+                            ui.orchestration_prompted.remove(id);
+                            ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
+                            ui.orchestration_remit_clear_reasserted_at
+                                .insert(*id, latest_clear);
+                            ui.orchestration_remit_clear_retry_at.remove(id);
+                        }
+                    } else if permanently_excluded {
+                        ui.orchestration_remit_clear_reasserted_at
+                            .insert(*id, latest_clear);
+                        ui.orchestration_remit_clear_retry_at.remove(id);
+                    }
+                    // Else: blocked only by a TRANSIENT condition this frame
+                    // (a delivery still probing readiness/backoff before its
+                    // first write, `prepare_orchestrator_prompt` failing to
+                    // read the context file, or the retry floor above not
+                    // having elapsed yet) — deliberately left unmarked, so a
+                    // later frame retries against the SAME `latest_clear`
+                    // event rather than silently dropping the re-assertion
+                    // the way marking it seen here would.
                 }
             }
         }
@@ -33876,6 +34129,242 @@ mod tests {
             orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
             "the real tagged session on the target pane must count even with \
              a co-resident placeholder present"
+        );
+    }
+
+    // PRD #655 review round, finding F2a — pure policy:
+    // `orchestrator_remit_pane_latest_clear_session_start` must find only a
+    // genuinely qualifying `/clear`-originated `SessionStart` on the REAL,
+    // tagged session on the start-role pane, ignoring (a) a co-resident
+    // placeholder, (b) a matching event on a DIFFERENT pane, (c) a
+    // non-`SessionStart` event carrying the clear metadata, (d) a
+    // `SessionStart` event with absent or wrong clear metadata, and (e) a
+    // fully metadata-qualifying `SessionStart` with a non-`ClaudeCode`
+    // agent_type — then must return the LATEST qualifying timestamp when more
+    // than one co-resident session on the pane carries one,
+    // order-independently. Direct template:
+    // `remit_pane_compacting_ignores_placeholder_and_other_panes` above.
+    //
+    // Final-round fix (last two N-findings before merge): cases (d)'s two
+    // sub-cases now build their event with `agent_type: ClaudeCode` (not
+    // `Codex`, as originally written) so they isolate the metadata predicate
+    // specifically, rather than being confounded by also failing the F4
+    // agent_type gate first; case (e) is new and isolates that agent_type
+    // gate on its own, which neither (d) sub-case did before this fix.
+    #[test]
+    fn remit_pane_latest_clear_session_start_filters_and_picks_latest() {
+        fn clear_event(timestamp: chrono::DateTime<Utc>) -> AgentEvent {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+                crate::event::CLEAR_SESSION_START_METADATA_VALUE.to_string(),
+            );
+            AgentEvent {
+                session_id: "s".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp,
+                user_prompt: None,
+                metadata,
+                pane_id: None,
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        let base = Utc::now();
+
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "no sessions at all on the pane must yield None"
+        );
+
+        // Co-resident placeholder on the target pane, carrying a qualifying
+        // clear event — must not count; `agent_type: None` means no real
+        // agent produced it.
+        let mut placeholder_events = std::collections::VecDeque::new();
+        placeholder_events.push_back(clear_event(base));
+        sessions.insert(
+            "placeholder".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::None,
+                recent_events: placeholder_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a placeholder session (agent_type: None) must not count"
+        );
+
+        // A real, tagged session on a DIFFERENT pane carrying a qualifying
+        // clear event must not count for "orch-pane" either.
+        let mut other_pane_events = std::collections::VecDeque::new();
+        other_pane_events.push_back(clear_event(base));
+        sessions.insert(
+            "other-pane-session".to_string(),
+            SessionState {
+                pane_id: Some("other-pane".to_string()),
+                agent_type: AgentType::Codex,
+                recent_events: other_pane_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a qualifying event on a different pane must not count"
+        );
+
+        // The real, tagged session on "orch-pane" itself, but its only event
+        // carries the clear metadata on the WRONG event type (Compacting,
+        // not SessionStart) — must not count.
+        let mut wrong_type_event = clear_event(base);
+        wrong_type_event.event_type = EventType::Compacting;
+        let mut real_events = std::collections::VecDeque::new();
+        real_events.push_back(wrong_type_event);
+        sessions.insert(
+            "orch-pane-real".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::Codex,
+                recent_events: real_events.clone(),
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a non-SessionStart event carrying the clear metadata must not count"
+        );
+
+        // Same pane/session, a genuine SessionStart but with NO metadata at
+        // all — must not count. `agent_type: ClaudeCode` here (not `Codex`,
+        // as this case originally read) isolates the metadata predicate on
+        // its own: the F4 `e.agent_type == AgentType::ClaudeCode` gate is
+        // satisfied, so this case would still fail even if that gate were
+        // deleted, proving it's the metadata check doing the work.
+        real_events.clear();
+        real_events.push_back(AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: base,
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a SessionStart event with no clear metadata must not count"
+        );
+
+        // Same pane/session, a genuine SessionStart but with the WRONG clear
+        // metadata value — must not count. `agent_type: ClaudeCode` again,
+        // for the same isolation reason as the no-metadata case above.
+        let mut wrong_value_metadata = HashMap::new();
+        wrong_value_metadata.insert(
+            crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+            "not-clear".to_string(),
+        );
+        real_events.clear();
+        real_events.push_back(AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: base,
+            user_prompt: None,
+            metadata: wrong_value_metadata,
+            pane_id: None,
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a SessionStart event with the wrong clear metadata value must not count"
+        );
+
+        // Same pane/session, fully metadata-qualifying (SessionStart, correct
+        // key/value) but with a non-ClaudeCode agent_type — must not count.
+        // This isolates the F4 `agent_type == AgentType::ClaudeCode` gate on
+        // its own, which neither case above does: both of those already fail
+        // on the metadata predicate first (once fixed above to use
+        // ClaudeCode), so deleting the agent_type gate would break no case
+        // without this one.
+        let mut non_claude_code_event = clear_event(base);
+        non_claude_code_event.agent_type = AgentType::Codex;
+        real_events.clear();
+        real_events.push_back(non_claude_code_event);
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a fully metadata-qualifying SessionStart with a non-ClaudeCode agent_type must \
+             not count"
+        );
+
+        // Now give the real, tagged session a genuinely qualifying clear
+        // event — must count, and its timestamp must be returned.
+        real_events.clear();
+        real_events.push_back(clear_event(base));
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            Some(base),
+            "a genuinely qualifying clear-originated SessionStart on the real, tagged \
+             session must count"
+        );
+
+        // A SECOND real, tagged session co-resident on the same pane
+        // (`AppState::apply_event` documents this co-residence is legitimate,
+        // mirroring `remit_pane_compacting_ignores_placeholder_and_other_panes`
+        // above), with a LATER qualifying clear event, must win via `.max()`
+        // — order-independently, regardless of HashMap iteration order.
+        let later = base + Duration::seconds(30);
+        let mut second_events = std::collections::VecDeque::new();
+        second_events.push_back(clear_event(later));
+        sessions.insert(
+            "orch-pane-real-2".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::ClaudeCode,
+                recent_events: second_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            Some(later),
+            "the LATEST qualifying clear-originated SessionStart across co-resident \
+             sessions on the pane must win, regardless of HashMap iteration order"
         );
     }
 
