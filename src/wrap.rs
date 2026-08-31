@@ -4262,6 +4262,109 @@ mod tests {
         );
     }
 
+    /// Issue #657: the model carrier round 7 added (`classify_and_emit`'s
+    /// doc comment above, and `codex/wrap/017`) lives entirely inside
+    /// `if let Some(ev) = ev {{ ... }}` — it only fires when THIS call's
+    /// classification also produces a status *transition* on
+    /// `det.observe_detected(...)`. A segment that carries a freshly
+    /// repainted model but does NOT change the pane's classified status
+    /// (the pane was already `Working` and stays `Working`, the common
+    /// case for a mid-session model switch after the very first turn) never
+    /// reaches that branch at all, so the fresh model is silently dropped
+    /// even though `extract_codex_status_bar_model` read it just fine.
+    ///
+    /// Scenario: the same real non-error Codex segment `codex/wrap/016`/
+    /// `017` use is fed to `classify_and_emit` twice in a row. The first
+    /// call establishes `Working` as the detector's last-seen state (and,
+    /// as an incidental side effect of that real transition, already
+    /// carries the model — that path is `codex/wrap/017`'s, not this
+    /// test's). The second call reclassifies the identical line as
+    /// `Working` again, so `Detector::observe_detected` returns `None`
+    /// (no transition) — but `extract_codex_status_bar_model` still
+    /// freshly re-reads the same model off this call's own line. That
+    /// second call must still deliver an event carrying the model.
+    #[spec("codex/wrap/018")]
+    #[test]
+    #[cfg(unix)]
+    fn wrap_018_model_observed_without_status_transition_still_reaches_daemon() {
+        let emitter = Emitter {
+            agent_type: AgentType::Codex,
+            session_id: "test-session".to_string(),
+            pane_id: None,
+            agent_id: None,
+            cwd: None,
+            live_target: LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        };
+
+        // Same verbatim mid-session segment as `codex/wrap/016`/`017` — see
+        // those tests' comments for provenance.
+        let mid_session_segment = "\x1b[39;49m\x1b[K\x1b[2m\u{2022} \x1b[22mYou have 1 usage limit reset available. Run /usage to use one.\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[13;3H\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;7H\x1b[1m\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2827} codexcwd\x07\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;138;138;138;49m\u{2022}\x1b[12;8H\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;9H\x1b[1m\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;63H\x1b[0m\x1b[49m\x1b[K\x1b[12;6H\x1b[1m\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mt\x1b[38;2;202;202;202;49mi\x1b[38;2;231;231;231;49mn\x1b[38;2;242;242;242;49mg\x1b[38;2;231;231;231;49m \x1b[12;13H\x1b[38;2;167;167;167;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;128;128;128;49m ser\x1b[12;25H2\x1b[12;33Hntext7\x1b[22m\x1b[39;49m \x1b[2m(0s \u{2022} esc to interrupt)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;167;167;167;49m\u{2022}\x1b[12;7H\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2807} codexcwd\x07\x1b[?2026h\x1b[12;8H\x1b[1m\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;202;202;202;49m\u{2022}\x1b[12;9H\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280f} codexcwd\x07\x1b[?2026h\x1b[12;10H\x1b[1m\x1b[38;2;128;128;128;49mg\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49mv\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;11H\x1b[1m\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49mM\x1b[38;2;167;167;167;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;12H\x1b[38;2;128;128;128;49mM\x1b[38;2;138;138;138;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280b} codexcwd\x07\x1b[?2026h\x1b[12;13H\x1b[1m\x1b[38;2;128;128;128;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;14H\x1b[1m\x1b[38;2;128;128;128;49mP\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49m \x1b[12;41H\x1b[22m\x1b[2m\x1b[2m\x1b[39;49m1\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;242;242;242;49m\u{2022}\x1b[12;15H\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49m(\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2819} codexcwd\x07\x1b[?2026h\x1b[12;16H\x1b[1m\x1b[38;2;128;128;128;49ms\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49m(\x1b[38;2;138;138;138;49m2\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;17H\x1b[38;2;128;128;128;49me\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49m(\x1b[38;2;167;167;167;49m2\x1b[38;2;138;138;138;49m/\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;18H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49m(\x1b[38;2;202;202;202;49m2\x1b[38;2;167;167;167;49m/\x1b[38;2;138;138;138;49m3\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2839} codexcwd\x07\x1b[?2026h\x1b[12;19H\x1b[1m\x1b[38;2;128;128;128;49mv\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49m(\x1b[38;2;231;231;231;49m2\x1b[38;2;202;202;202;49m/\x1b[38;2;167;167;167;49m3\x1b[38;2;138;138;138;49m)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;codexcwd\x07\x1b[?2026h\x1b[11;1H\x1b[J\x1b[11;2H\x1b[0m\x1b[49m\x1b[K\x1b[12;2H\x1b[0m\x1b[49m\x1b[K\x1b[13;27H\x1b[0m\x1b[49m\x1b[K\x1b[14;2H\x1b[0m\x1b[49m\x1b[K\x1b[15;145H\x1b[0m\x1b[49m\x1b[K\x1b[11;1H \x1b[12;1H \x1b[13;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[14;1H\x1b[22m \x1b[15;1H  \x1b[38;2;228;49;113;49mgpt-5.6-terra medium\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;227;218;130;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/73b541f2-52f4-46a2-913b-c1f611a5282d/scratchpad/codexcwd\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[13;3HWrite the numbers 1 through\x1b[13;31H45,\x1b[13;35Hone\x1b[13;39Hper\x1b[13;43Hline,\x1b[13;49Heach\x1b[13;54Hfollowed\x1b[13;63Hby\x1b[13;66Ha\x1b[13;68Hsingle\x1b[13;75HEnglish\x1b[13;83Hword\x1b[13;88Hstarting\x1b[13;97Hwith\x1b[13;102Hthat\x1b[13;107Hmany\x1b[13;112Hletters\x1b[13;120His\x1b[13;123Hnot\x1b[13;127Hrequired\x1b[13;136H-\x1b[13;138Hjust\x1b[13;143Hany\x1b[13;147Hword.\x1b[13;153HDo\x1b[13;156Hnot\x1b[13;160Huse\x1b[13;164Hany\x1b[13;168Htools.\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;174H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[11;50r\x1b[11;1H\x1bM\x1bM\x1bM\x1bM\x1b[r\x1b[1;14r\x1b[10;1H";
+        assert_eq!(
+            mid_session_segment.len(),
+            6994,
+            "fixture drift: this must stay byte-for-byte the captured \
+             segment (`.dot-agent-deck/652-captures/audit-capture.bin`, \
+             offset 6844, length 6994)"
+        );
+
+        let capture = CapturedSocket::bind();
+        let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+            &AgentType::Codex,
+        ))));
+
+        // First call establishes `Working` as the detector's last-seen
+        // state. The real transition on THIS call already carries the
+        // model as a side effect (`codex/wrap/017`'s scenario) — drain and
+        // discard it here since this test isolates the SECOND call's
+        // behavior, not the first's.
+        classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
+        capture.drain();
+
+        // Second call, SAME line: `classify_codex_line` reclassifies it as
+        // `Working` again, so `Detector::observe_detected` returns `None`
+        // (no transition) — issue #657's exact gap. `extract_codex_status_bar_model`
+        // still freshly re-extracts the same model from this call's own
+        // line regardless.
+        classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
+
+        let emitted = capture.drain();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "issue #657: a model freshly observed on a segment that does \
+             NOT produce a status transition (this is the identical \
+             segment fed twice, so `Detector::observe_detected` returns \
+             `None` the second time) must still reach the daemon — today \
+             the entire model-carrier branch lives inside \
+             `if let Some(ev) = ev {{ ... }}`, so a `None` transition \
+             silently drops the freshly-observed model along with it; got \
+             {emitted:?}"
+        );
+        let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
+            panic!(
+                "captured line was not a valid AgentEvent: {e}; line={:?}",
+                emitted[0]
+            )
+        });
+        assert_eq!(
+            event.model,
+            Some("gpt-5.6-terra".to_string()),
+            "the event that does reach the daemon under the fix must carry \
+             the model this segment's status bar shows, even on a call \
+             that produced no status transition"
+        );
+        assert_eq!(
+            event.event_type,
+            EventType::Unknown,
+            "the model-only carrier for a no-transition call must stay \
+             status-neutral, exactly as the transition-carrying case does \
+             (`codex/wrap/017`)"
+        );
+    }
+
     /// Auditor A4 / reviewer F6: `extract_codex_status_bar_model` has never
     /// had a direct unit test — every existing exercise of it goes through
     /// `classify_and_emit` and a real fixture. These cover its distinct

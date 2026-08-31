@@ -15362,6 +15362,91 @@ clear = false
         );
     }
 
+    /// Scenario: issue #659 — `apply_event`'s handling of the issue #652
+    /// `EventType::Unknown` model carrier (`wrap.rs`'s `classify_and_emit`)
+    /// has never had a direct daemon-side unit test; every existing
+    /// exercise goes through `wrap.rs`'s own `classify_and_emit` tests
+    /// instead. Feed an `Unknown` event carrying `model: Some(..)` into a
+    /// session whose status/active_tool are already non-default (seeded
+    /// `Thinking` + a fake active tool, not the types' own defaults) and
+    /// assert the model updates while status and active_tool are left
+    /// completely untouched — pinning `Unknown`'s no-status-change contract
+    /// for this specific carrier, not just in the abstract.
+    #[test]
+    fn apply_event_unknown_model_carrier_updates_model_leaves_status_untouched() {
+        let mut state = AppState::default();
+        state.register_pane("pane".to_string());
+        let session_id = state.insert_placeholder_session(
+            "pane".to_string(),
+            None,
+            Some(AgentType::Codex),
+            None,
+        );
+
+        {
+            let session = state
+                .sessions
+                .get_mut(&session_id)
+                .expect("insert_placeholder_session must have inserted a session");
+            session.status = SessionStatus::Thinking;
+            session.active_tool = Some(ActiveTool {
+                name: "some-tool".to_string(),
+                detail: Some("some-detail".to_string()),
+            });
+            assert_eq!(
+                session.model, None,
+                "sanity: a fresh placeholder must not already carry a model"
+            );
+        }
+
+        state.apply_event(AgentEvent {
+            session_id: session_id.clone(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Unknown,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pane".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: Some("some-model".to_string()),
+        });
+
+        let session = state
+            .sessions
+            .get(&session_id)
+            .expect("the session must still exist after the Unknown event");
+        assert_eq!(
+            session.model,
+            Some("some-model".to_string()),
+            "issue #659: an Unknown event carrying a model must still \
+             update session.model — this is the wire carrier issue #652's \
+             `classify_and_emit` uses for a status-neutral model report"
+        );
+        assert_eq!(
+            session.status,
+            SessionStatus::Thinking,
+            "an Unknown event must not change status — it is \
+             apply_event's no-status-change catch-all, and this session's \
+             status was deliberately seeded to a non-default value to make \
+             this assertion meaningful"
+        );
+        assert!(
+            matches!(
+                session.active_tool,
+                Some(ActiveTool { ref name, ref detail })
+                    if name == "some-tool" && detail.as_deref() == Some("some-detail")
+            ),
+            "an Unknown event must not touch active_tool either; got {:?}",
+            session.active_tool
+        );
+    }
+
     /// Scenario: pending-status redesign blocker 2 — a `SessionEnd` for a
     /// session that carries a real `agent_id` (state.rs's terminal-frame
     /// restoration branch) rebuilds a placeholder via the plain
