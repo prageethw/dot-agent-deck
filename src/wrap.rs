@@ -513,6 +513,12 @@ fn strip_rgb_49m_suffix(after_prefix: &str) -> Option<&str> {
 /// `MAX_CLASSIFY_LINE` mid-bar), which is fine: the caller treats this as
 /// sticky and keeps whatever model was last observed, rather than accepting
 /// a truncated fragment as a genuine (and possibly wrong) model id.
+///
+/// Round-2 reviewer M1: the trailer check alone isn't airtight — a stray
+/// truecolor span whose text is a single punctuation character (e.g. `•`)
+/// immediately closed by [`CODEX_STATUS_BAR_TRAILER`] would otherwise pass.
+/// A real `"<model> <effort>"` span always has an interior space, so a
+/// candidate with none is rejected as implausible before being recorded.
 fn extract_codex_status_bar_model(line: &str) -> Option<String> {
     let mut best: Option<&str> = None;
     let mut search_from = 0usize;
@@ -530,7 +536,7 @@ fn extract_codex_status_bar_model(line: &str) -> Option<String> {
         if text.is_empty() {
             continue;
         }
-        if after_sgr[text_end..].starts_with(CODEX_STATUS_BAR_TRAILER) {
+        if after_sgr[text_end..].starts_with(CODEX_STATUS_BAR_TRAILER) && text.contains(' ') {
             best = Some(text);
         }
     }
