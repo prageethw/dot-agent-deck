@@ -41,6 +41,18 @@ use spec::spec;
 
 const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 
+/// PRD #655: the `AgentEvent.metadata` key/value this test file INVENTS to
+/// model a `/clear`-originated `SessionStart`, since no production constant
+/// exists yet — M1 (`src/hook.rs`) is what the coder adds next, driven by
+/// these tests, and it must forward `ClaudeCodeHookInput.source == "clear"`
+/// into exactly this key/value pair for `orchestration_remit_004`/`_005` to
+/// go GREEN. Picked short and self-explanatory, deliberately distinct from
+/// the existing [`dot_agent_deck::event::SESSION_START_ORIGIN_METADATA_KEY`]
+/// (wrapper-fork provenance, an unrelated concern) so the two keys can never
+/// be confused with each other.
+const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
+const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
+
 /// The synthetic orchestrator role script: a BACKGROUNDED subshell declares
 /// the role live immediately (fast-path readiness for the spawn-time remit
 /// pointer) and — only if the test writes the corresponding control file
@@ -230,6 +242,81 @@ fn inject_compacting(
          for pane {pane_id} (agent_id {agent_id}) within 10s — the hook socket write \
          was accepted, but AppState::apply_event may have rejected it or applied it \
          to the wrong session.",
+    );
+}
+
+/// PRD #655: inject a synthetic `/clear`-shaped `SessionStart` `AgentEvent`
+/// for the given pane/agent identity over the deck's hook socket, and block
+/// until the daemon's own `ListAgents`/live-status join reports
+/// `SessionStatus::Idle` for that pane — proof the daemon's state (not just
+/// the wire) reflects the change before the caller starts asserting on
+/// anything driven by it. Mirrors [`inject_compacting`] above, specialized to
+/// the `/clear` trigger this PRD adds: `AppState::apply_event`'s
+/// `EventType::SessionStart` arm unconditionally sets `session.status =
+/// SessionStatus::Idle` (`src/state.rs`), which is the one observable,
+/// already-existing state transition available to poll on — there is no
+/// persisted "clear was observed" status the way `Compacting` is a status in
+/// its own right, since a `SessionStart` is a point-in-time event (PRD #655's
+/// Solution Overview, point 2). The event carries no `live_target`, exactly
+/// like `inject_compacting` above, and the same-agent reuse guard in
+/// `AppState::apply_event` keeps this update on the SAME session card
+/// (keyed by pane/agent identity, not by `session_id`) rather than spawning a
+/// second one, so a differing synthetic `session_id` per call is safe here
+/// too.
+///
+/// The `metadata` map carries [`CLEAR_SESSION_START_METADATA_KEY`] /
+/// [`CLEAR_SESSION_START_METADATA_VALUE`] — the literal this test file
+/// invents to mark "this `SessionStart` originated from `/clear`", since no
+/// production constant exists yet (PRD #655 M1 is what adds one, in
+/// `src/hook.rs`, driven by these tests).
+#[cfg(unix)]
+fn inject_clear_session_start(
+    deck: &TuiDeck,
+    socket: &std::path::Path,
+    pane_id: &str,
+    agent_id: &str,
+    session_id: &str,
+) {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        CLEAR_SESSION_START_METADATA_KEY.to_string(),
+        CLEAR_SESSION_START_METADATA_VALUE.to_string(),
+    );
+    let event = AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::Codex,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata,
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    };
+    let line = serde_json::to_string(&event)
+        .expect("serialize synthetic clear-originated SessionStart AgentEvent");
+    common::write_hook_line(deck.hook_socket_path(), &line)
+        .expect("inject synthetic clear-originated SessionStart AgentEvent over hook socket");
+
+    let applied = common::wait_until(Duration::from_secs(10), || {
+        common::agent_records_on(socket).into_iter().any(|r| {
+            r.pane_id_env.as_deref() == Some(pane_id)
+                && r.live.as_ref().map(|s| &s.status)
+                    == Some(&dot_agent_deck::state::SessionStatus::Idle)
+        })
+    });
+    assert!(
+        applied,
+        "the daemon's own ListAgents/live-status join never reported Idle for pane \
+         {pane_id} (agent_id {agent_id}) within 10s after injecting a synthetic \
+         clear-originated SessionStart — the hook socket write was accepted, but \
+         AppState::apply_event may have rejected it or applied it to the wrong session.",
     );
 }
 
@@ -480,6 +567,103 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
         "once the start-role pane reports itself live again, the deferred \
          re-assertion must complete and deliver the pointer a second time\n\
          Final grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: PRD #655. Open a real orchestration tab and let the start
+/// role's spawn-time remit pointer deliver once, then inject a synthetic
+/// `SessionStart` for that SAME start-role pane carrying the
+/// `/clear`-originated marker (`CLEAR_SESSION_START_METADATA_KEY` /
+/// `CLEAR_SESSION_START_METADATA_VALUE`). The pointer must reach the pane's
+/// stdin a second time — the orchestrator's remit re-asserting itself on
+/// `/clear`, exactly as issue #423 already made it re-assert on compaction,
+/// via the same reused delivery machinery (PRD #655's Decisions section).
+#[spec("orchestration/remit/004")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_004_start_role_clear_reasserts_remit() {
+    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let (socket, pane_id, agent_id, log, _role_cwd) = open_and_confirm_initial_delivery(&deck);
+
+    inject_clear_session_start(
+        &deck,
+        &socket,
+        &pane_id,
+        &agent_id,
+        &format!("{agent_id}-remit004-session"),
+    );
+
+    let reasserted =
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
+    assert!(
+        reasserted,
+        "a `/clear`-originated SessionStart event on the orchestrator start-role pane \
+         must re-deliver the `{DELIVERED_POINTER}` remit pointer a second time (PRD \
+         #655); the log only shows it once within 10s.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: PRD #655. In the same orchestration, a `/clear`-originated
+/// `SessionStart` fires first on the non-start `worker` role's pane — this
+/// must NOT re-deliver the remit pointer to the start role. Then, as a
+/// positive control proving this is a genuine scoping guard and not just an
+/// unimplemented feature vacuously passing the negative check, the same
+/// `/clear`-originated `SessionStart` fires on the orchestrator start role
+/// itself, which MUST re-deliver. Mirrors `orchestration_remit_002`'s exact
+/// pattern for the compaction trigger, extended to this PRD's `/clear`
+/// trigger: the guard against re-assertion leaking into every pane of an
+/// orchestration applies identically to both triggers (issue #423's stated
+/// scope, reused unchanged by PRD #655).
+#[spec("orchestration/remit/005")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
+    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let (socket, orch_pane_id, orch_agent_id, log, _role_cwd) =
+        open_and_confirm_initial_delivery(&deck);
+
+    let worker_record = role_agent_record(&socket, "worker");
+    let worker_pane_id = worker_record
+        .pane_id_env
+        .clone()
+        .expect("worker role pane must have a DOT_AGENT_DECK_PANE_ID recorded");
+    let worker_agent_id = worker_record.id.clone();
+
+    inject_clear_session_start(
+        &deck,
+        &socket,
+        &worker_pane_id,
+        &worker_agent_id,
+        &format!("{worker_agent_id}-remit005-worker-session"),
+    );
+
+    let leaked_to_worker =
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_millis(900));
+    assert!(
+        !leaked_to_worker,
+        "a `/clear`-originated SessionStart event on the non-start `worker` role's pane \
+         must not re-assert the orchestrator's remit; the start role's delivery log \
+         reached a second `{DELIVERED_POINTER}` line anyway.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    inject_clear_session_start(
+        &deck,
+        &socket,
+        &orch_pane_id,
+        &orch_agent_id,
+        &format!("{orch_agent_id}-remit005-orch-session"),
+    );
+    let reasserted_on_start_role =
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
+    assert!(
+        reasserted_on_start_role,
+        "control failed: a `/clear`-originated SessionStart event on the orchestrator \
+         START role must still re-deliver the remit pointer in this same orchestration \
+         — the negative check above is only meaningful if this positive control also \
+         passes.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }

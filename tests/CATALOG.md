@@ -5120,6 +5120,20 @@ without depending on the config struct API.
 - **Does not assert:** the pure liveness-toggle mechanism in isolation (covered generally by `prompt/pane-input/007`'s identical `emit_target` technique at spawn time); #424's own internal retry/backoff bookkeeping (out of scope by design, per the task's decoupling requirement); a genuinely dropped/lost re-assertion attempt distinct from a merely-deferred one (not constructible without the coder's implementation to compare against).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`002`).
 
+##### orchestration/remit/004 — A `/clear`-originated `SessionStart` event on the orchestrator start-role pane re-delivers the remit pointer a second time (PRD #655).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness; the daemon's own `AppState::apply_event` and `deliver_orchestrator_prompt` render-loop path handle the injected event and the redelivery for real).
+- **Agent:** none (`remit-reassert-orchestration` fixture, as `001`).
+- **Asserts:** after the spawn-time remit pointer (`Read .dot-agent-deck/orchestrator-context.md`) delivers once (confirmed via the log), injecting a synthetic `SessionStart` `AgentEvent` carrying the `session_start_source: clear` metadata marker (this test file's own invented literal — no production constant exists yet) for the SAME start-role pane/agent identity — confirmed applied via the daemon's own `ListAgents` live-status join reporting `Idle` before proceeding — causes the log to show the pointer a second time within 10s.
+- **Does not assert:** that `ClaudeCodeHookInput`/`build_event_typed` actually parse and forward a real hook JSON payload's `source` field into this metadata key (that is the coder's pure-data unit test in `src/hook.rs`, per this PRD's task split); the guard against firing on a non-start-role pane (`005`); the compaction trigger this PRD's mechanism is reused from (`001`).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — the fixture script's `emit_target` helper is a POSIX shell function calling `python3`).
+
+##### orchestration/remit/005 — A `/clear`-originated `SessionStart` event on a non-start `worker` role's pane re-asserts nothing, while the same event on the orchestrator start role in the same orchestration still re-asserts (PRD #655, reusing issue #423's settled scope: the orchestrator start role only).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`remit-reassert-orchestration` fixture, as `001`).
+- **Asserts:** after the spawn-time remit pointer delivers once, injecting the `/clear`-originated `SessionStart` marker for the non-start `worker` role's pane/agent identity does not push the start role's delivery log to a second `Read .dot-agent-deck/orchestrator-context.md` line within a 900ms bounded wait; injecting the same marker immediately afterward for the orchestrator START role's own identity, in the SAME orchestration, DOES push the log to a second line within 10s — the positive control that makes the negative check meaningful rather than a vacuous pass against an unimplemented feature.
+- **Does not assert:** a genuinely non-orchestration (plain agent/mode) pane's `/clear` re-asserting nothing — deliberately not exercised here, matching `002`'s own scope decision; the readiness-gating/delivery-confirmation discipline of the re-assertion itself (covered generally by `003` for the compaction trigger, reused unchanged by this PRD).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`004`).
+
 #### orchestration/hydration
 
 ##### orchestration/hydration/001 — Renaming an orchestration in the local `.dot-agent-deck.toml` while its tab is live surfaces an on-screen drift warning naming the orchestration when the TUI reattaches to the still-running daemon (fork issue #314 / upstream #554).
