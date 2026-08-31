@@ -34130,11 +34130,20 @@ mod tests {
     // genuinely qualifying `/clear`-originated `SessionStart` on the REAL,
     // tagged session on the start-role pane, ignoring (a) a co-resident
     // placeholder, (b) a matching event on a DIFFERENT pane, (c) a
-    // non-`SessionStart` event carrying the clear metadata, and (d) a
-    // `SessionStart` event with absent or wrong clear metadata — then must
-    // return the LATEST qualifying timestamp when more than one co-resident
-    // session on the pane carries one, order-independently. Direct template:
+    // non-`SessionStart` event carrying the clear metadata, (d) a
+    // `SessionStart` event with absent or wrong clear metadata, and (e) a
+    // fully metadata-qualifying `SessionStart` with a non-`ClaudeCode`
+    // agent_type — then must return the LATEST qualifying timestamp when more
+    // than one co-resident session on the pane carries one,
+    // order-independently. Direct template:
     // `remit_pane_compacting_ignores_placeholder_and_other_panes` above.
+    //
+    // Final-round fix (last two N-findings before merge): cases (d)'s two
+    // sub-cases now build their event with `agent_type: ClaudeCode` (not
+    // `Codex`, as originally written) so they isolate the metadata predicate
+    // specifically, rather than being confounded by also failing the F4
+    // agent_type gate first; case (e) is new and isolates that agent_type
+    // gate on its own, which neither (d) sub-case did before this fix.
     #[test]
     fn remit_pane_latest_clear_session_start_filters_and_picks_latest() {
         fn clear_event(timestamp: chrono::DateTime<Utc>) -> AgentEvent {
@@ -34233,11 +34242,15 @@ mod tests {
         );
 
         // Same pane/session, a genuine SessionStart but with NO metadata at
-        // all — must not count.
+        // all — must not count. `agent_type: ClaudeCode` here (not `Codex`,
+        // as this case originally read) isolates the metadata predicate on
+        // its own: the F4 `e.agent_type == AgentType::ClaudeCode` gate is
+        // satisfied, so this case would still fail even if that gate were
+        // deleted, proving it's the metadata check doing the work.
         real_events.clear();
         real_events.push_back(AgentEvent {
             session_id: "s".to_string(),
-            agent_type: AgentType::Codex,
+            agent_type: AgentType::ClaudeCode,
             event_type: EventType::SessionStart,
             tool_name: None,
             tool_detail: None,
@@ -34260,7 +34273,8 @@ mod tests {
         );
 
         // Same pane/session, a genuine SessionStart but with the WRONG clear
-        // metadata value — must not count.
+        // metadata value — must not count. `agent_type: ClaudeCode` again,
+        // for the same isolation reason as the no-metadata case above.
         let mut wrong_value_metadata = HashMap::new();
         wrong_value_metadata.insert(
             crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
@@ -34269,7 +34283,7 @@ mod tests {
         real_events.clear();
         real_events.push_back(AgentEvent {
             session_id: "s".to_string(),
-            agent_type: AgentType::Codex,
+            agent_type: AgentType::ClaudeCode,
             event_type: EventType::SessionStart,
             tool_name: None,
             tool_detail: None,
@@ -34289,6 +34303,25 @@ mod tests {
             orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
             None,
             "a SessionStart event with the wrong clear metadata value must not count"
+        );
+
+        // Same pane/session, fully metadata-qualifying (SessionStart, correct
+        // key/value) but with a non-ClaudeCode agent_type — must not count.
+        // This isolates the F4 `agent_type == AgentType::ClaudeCode` gate on
+        // its own, which neither case above does: both of those already fail
+        // on the metadata predicate first (once fixed above to use
+        // ClaudeCode), so deleting the agent_type gate would break no case
+        // without this one.
+        let mut non_claude_code_event = clear_event(base);
+        non_claude_code_event.agent_type = AgentType::Codex;
+        real_events.clear();
+        real_events.push_back(non_claude_code_event);
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a fully metadata-qualifying SessionStart with a non-ClaudeCode agent_type must \
+             not count"
         );
 
         // Now give the real, tagged session a genuinely qualifying clear

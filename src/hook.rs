@@ -2526,11 +2526,14 @@ mod tests {
         assert!(!genuine.is_wrapper_fork_session_start());
     }
 
-    /// PRD #655: `ClaudeCodeHookInput.source == "clear"` on a `SessionStart`
-    /// must forward `CLEAR_SESSION_START_METADATA_KEY` /
+    /// Scenario: PRD #655: `ClaudeCodeHookInput.source == "clear"` on a
+    /// `SessionStart` must forward `CLEAR_SESSION_START_METADATA_KEY` /
     /// `CLEAR_SESSION_START_METADATA_VALUE` into `AgentEvent.metadata` —
     /// narrowly, mirroring `session_start_origin_survives_the_claude_hook_builder`
     /// above for the sibling `SESSION_START_ORIGIN_METADATA_KEY` forwarding.
+    /// Also covers the review-round M4/F4 gap: a non-`ClaudeCode` `agent_type`
+    /// (built via `build_event_typed` directly, since `build_event` hardcodes
+    /// `ClaudeCode`) must not forward the key even when `source == "clear"`.
     #[test]
     fn clear_session_start_source_forwards_narrowly() {
         let payload = |event: &str, source: Option<&str>| ClaudeCodeHookInput {
@@ -2594,6 +2597,26 @@ mod tests {
             "a non-SessionStart event must not forward the clear-session-start key even \
              when source is \"clear\": {:?}",
             wrong_event.metadata
+        );
+
+        // M4/F4: this feature is Claude-Code only — a `SessionStart` with
+        // `source: "clear"` stamped with a non-`ClaudeCode` agent_type must
+        // NOT forward the key, even though every other condition is met.
+        // Goes through `build_event_typed` directly (not the `build_event`
+        // convenience wrapper, which hardcodes `AgentType::ClaudeCode`) so
+        // this actually exercises the `agent_type == AgentType::ClaudeCode`
+        // gate at the top of this file — deleting that condition would break
+        // no fast-tier test without this case.
+        let non_claude_code =
+            build_event_typed(payload("SessionStart", Some("clear")), AgentType::Codex)
+                .expect("SessionStart maps to an event");
+        assert!(
+            !non_claude_code
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a non-ClaudeCode agent_type must not forward the clear-session-start key even \
+             when source is \"clear\": {:?}",
+            non_claude_code.metadata
         );
     }
 
