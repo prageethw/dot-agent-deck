@@ -22440,10 +22440,29 @@ fn render_session_card(
     // Fork #339: the agent-type badge (registry-coloured type label),
     // `370b6228`'s removal, restored behind the deck-global
     // `show_agent_type_badge` toggle (`Ctrl+m` / `m`, off by default). D4:
-    // skipped on a placeholder card even when the toggle is on —
-    // `agent_registry::spec(&AgentType::None).label` is "No agent", which
-    // would collide with the status text as a second "No agent" segment.
-    let show_badge = show_agent_type_badge && !is_placeholder;
+    // skipped on a genuinely-empty placeholder card even when the toggle is
+    // on — `agent_registry::spec(&AgentType::None).label` is "No agent",
+    // which would collide with the status text as a second "No agent"
+    // segment.
+    //
+    // Issue #650 fix round 2 (reviewer R2 / auditor F1): a RESOLVED
+    // placeholder (Codex activity seen but never tagged with a concrete
+    // `AgentType`) has already left the "No agent" status label behind (see
+    // `status_label` above), so the D4 collision this gate exists to avoid
+    // can never happen for it either way. But a resolved-but-untyped card
+    // has no type worth badging — `agent_registry::spec(&AgentType::None)
+    // .label` is the placeholder word "No agent", not an agent identity, and
+    // badging it put those words right back next to a live status. Badge it
+    // only when there is a model worth showing, and show the model alone
+    // (see `badge_text` below) rather than "No agent (<model>)".
+    let model_label = session
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    let show_badge = show_agent_type_badge
+        && !is_empty_placeholder
+        && (!is_placeholder || model_label.is_some());
     let title_segments: Vec<(String, Style)> = if show_badge {
         // PRD #20 M5 / finding #9: the agent-type label carries its
         // registry badge colour. A friendly `display_name` renders
@@ -22453,21 +22472,19 @@ fn render_session_card(
             .add_modifier(Modifier::BOLD);
         // PRD fork#378: a known active model grows the badge text to
         // `<type> (<model>)`, still one registry-coloured, bold segment.
-        // The marker is appended AFTER the `<type>[ (<model>)] · <id-or-name>`
-        // so the `<type> ·` shape callers match on when NO model is known
-        // (e.g. `Codex ·`, `Pi · orch-01`) stays intact — only a trailing
-        // view-only annotation is added. Once a model IS known the badge
-        // reads `<type> (<model>) · …` instead, and never the bare form.
-        //
         // Reviewer/audit round 2 (F4): trim and treat an empty/whitespace-only
-        // model as absent, so a producer posting `Some("")` or `Some("   ")`
-        // renders the bare `<type> · …` form rather than an empty `()`.
-        let badge_text = match session
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
+        // model as absent (`model_label`, above), so a producer posting
+        // `Some("")` or `Some("   ")` renders the bare `<type>` form rather
+        // than an empty `()`.
+        //
+        // Issue #650 fix round 2: `shown_agent_type` is a placeholder
+        // (`AgentType::None`) whenever `is_placeholder` is true — `show_badge`
+        // only lets that case through when `model_label` is known, so render
+        // the model alone with no "No agent" prefix. When not a placeholder,
+        // the type is a real identity and the `<type>[ (<model>)]` shape is
+        // unchanged.
+        let badge_text = match model_label {
+            Some(model) if is_placeholder => normalize_model_label(model).to_string(),
             Some(model) => format!("{} ({})", shown_agent_type, normalize_model_label(model)),
             None => format!("{}", shown_agent_type),
         };
