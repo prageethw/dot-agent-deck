@@ -483,6 +483,17 @@ pub const CWD_MAX_LEN: usize = 4096;
 /// validating a request whose sender can send a corrected one.
 /// [`crate::untrusted_text::sanitize_display_name`] is the repairing
 /// counterpart, used at seams where the surrounding data must still be applied.
+///
+/// **Deliberate consequence, not an oversight (issue #562 M1):** `U+200D`
+/// ZERO WIDTH JOINER — the glue in every ZWJ emoji sequence (👨‍💻, family/
+/// profession emoji, 🏳️‍🌈) — is itself `Cf`, so a name containing one is
+/// now rejected. A rename to such a name fails silently: `RenameOutcome`
+/// resolves to `Rejected`, which is documented elsewhere as an intentional
+/// no-op, so the user sees nothing happen. This project's blanket `Cf`
+/// rejection policy (matching `untrusted_text`/`terminal_sanitize`
+/// elsewhere) is taken to be the right call even at this cost, rather than
+/// maintaining an exception list for "the ZWJ sequences we thought of" —
+/// see `dashboard/agent-badge/009`'s ZWJ case for the pinned behavior.
 pub fn is_valid_display_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= DISPLAY_NAME_MAX_LEN
@@ -9726,6 +9737,7 @@ impl Drop for AgentPtyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
     // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
@@ -10101,6 +10113,51 @@ mod tests {
             "control-byte command must fall through to shell, not be stored verbatim"
         );
         assert_eq!(resolve_display_name(None, Some(evil_cmd)), "shell");
+    }
+
+    /// Scenario: Confirms `is_valid_display_name` rejects names containing
+    /// Unicode `Cf` format characters — a U+202E RIGHT-TO-LEFT OVERRIDE
+    /// plus a handful of other Cf codepoints (zero-width space,
+    /// left-to-right isolate, BOM) — that the prior byte-level `>= 0x20`
+    /// check let through because they encode as bytes all `>= 0x20`,
+    /// while still accepting ordinary non-ASCII names like accented
+    /// Latin, Cyrillic, and CJK text (issue #562 gap 1).
+    #[spec("dashboard/agent-badge/009")]
+    #[test]
+    fn agent_badge_009_is_valid_display_name_rejects_unicode_bidi_format_characters() {
+        // Issue #562 gap 1: the byte-level check (`value.bytes().all(|b| b
+        // >= 0x20 && b != 0x7f)`) only catches C0/C1 controls and DEL. A
+        // `U+202E` RIGHT-TO-LEFT OVERRIDE (Unicode general category `Cf`,
+        // not `Cc`) encodes as UTF-8 bytes all `>= 0x20`, so the old check
+        // let it straight through the rename gate — from there it reaches
+        // `ui.display_names` and visually reorders the rendered card title.
+        assert!(
+            !is_valid_display_name("evil\u{202e}name"),
+            "a name containing U+202E RIGHT-TO-LEFT OVERRIDE must fail validation"
+        );
+        // A handful of other Cf codepoints, so this isn't pinned to one
+        // enumerated bidi override (mirrors the module-level policy already
+        // proven in `crate::untrusted_text`'s own Cf coverage test).
+        for c in ['\u{200b}', '\u{2066}', '\u{feff}'] {
+            let name = format!("agent{c}name");
+            assert!(
+                !is_valid_display_name(&name),
+                "Cf format character U+{:04X} must fail validation, name={name:?}",
+                c as u32
+            );
+        }
+        // A genuinely ordinary Unicode name (accents, CJK) must still pass —
+        // the tightening targets `Cf` specifically, not "any non-ASCII".
+        assert!(is_valid_display_name("café-агент-日本語"));
+        // Issue #562 M1: U+200D ZERO WIDTH JOINER is itself `Cf`, so a name
+        // containing a ZWJ emoji sequence (the "technologist" emoji, glued
+        // from a person + ZWJ + laptop) is now rejected too — a deliberate
+        // consequence of the blanket-Cf policy, pinned here rather than left
+        // to whichever test happens to feed one first.
+        assert!(
+            !is_valid_display_name("agent-\u{1f468}\u{200d}\u{1f4bb}"),
+            "a name containing a ZWJ emoji sequence must fail validation (Cf policy, issue #562 M1)"
+        );
     }
 
     /// Round-12 auditor #2: orchestration_cwd must be validated.

@@ -807,6 +807,12 @@ const MAX_FIRST_PROMPT_BYTES: usize = 65536;
 /// raw control byte (ANSI escape, NUL, DEL, C1) survives into a rendered cell.
 /// Mirrors the `char::is_control` policy `login_shell` / the build-handshake
 /// render seam apply elsewhere on untrusted wire input.
+///
+/// Control-only, deliberately: this is the *hydration* path's scrub, and it
+/// predates bidi (`Cf`) being treated as part of the same threat class. Do
+/// not reuse this for a fresh ingest seam — reach for
+/// [`crate::untrusted_text::strip_control_and_bidi`] instead, which also
+/// strips bidi overrides (issue #562 gap 2's fix uses that, not this).
 fn strip_control_chars(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
@@ -842,9 +848,24 @@ pub struct AgentListing {
 
 /// Sanitize a single `AgentRecord` echoed by the daemon before it reaches the
 /// TUI. Defense in depth at the wire boundary (M2.12 fixup auditor #1, PRD
-/// #162 findings #1/#2): the daemon validates on `StartAgent`, but a malformed
-/// or older daemon could still echo an untrusted record. Two scrubs:
+/// #162 findings #1/#2, issue #562): the daemon validates on `StartAgent` /
+/// `SetAgentLabel` via `is_valid_display_name`, but a malformed or older
+/// daemon (one built before that gate also rejected Unicode `Cf` format
+/// characters) could still echo an untrusted record. Three scrubs:
 ///
+/// - `display_name`: routed through
+///   [`crate::untrusted_text::sanitize_display_name`] — the same
+///   control+bidi-stripping, trim, and [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`]-byte
+///   clamp the hook-socket ingest seam already applies to this field (#410/PR
+///   #558). Every record that reaches the TUI through
+///   [`DaemonClient::list_agents`] passes through here, so a `display_name`
+///   sourced that way can never carry a raw control byte or a `U+202E`-style
+///   bidi override regardless of which daemon build echoed it. `None` when
+///   nothing usable survives. This is *not* an unconditional guarantee on
+///   `ui.display_names` as a whole — a few call sites read `AgentRecord`
+///   fields directly off `AttachRequest::ListAgents` and bypass this scrub
+///   (none of them currently render `display_name`, so this is a scope note,
+///   not a live defect).
 /// - `tab_membership`: clamped to `None` if the embedded `name` fails
 ///   [`validate_tab_membership`] (logged via `tracing::warn!` — the agent is
 ///   real, we just don't trust the bucketing hint).
@@ -3442,13 +3463,24 @@ mod tests {
         drop(dir);
     }
 
+    /// Scenario: Confirms `sanitize_record_tab_membership` scrubs
+    /// `AgentRecord.display_name` itself, not just `tab_membership`/`live`
+    /// — stripping a control byte and a U+202E bidi override from a
+    /// hydrated record's name, and clamping an oversized display_name to
+    /// `DISPLAY_NAME_MAX_LEN` on a character boundary (issue #833 /
+    /// issue #562 gap 1 — two independent reports of the same gap).
+    #[spec("dashboard/agent-badge/010")]
     #[test]
-    fn sanitize_record_tab_membership_scrubs_display_name() {
-        // Issue #833. `display_name` is the card TITLE the TUI actually uses —
-        // hydration copies it into `ui.pane_display_names`, from which the
-        // dashboard loop fills `ui.display_names`, and `render_card_grid`
-        // prefers that map over the session's own name — and it was the one
-        // string on this record with no scrub here at all.
+    fn agent_badge_010_sanitize_record_tab_membership_scrubs_display_name() {
+        // `ui.display_names` (the path `render_card_grid` prefers) is
+        // populated from `AgentRecord.display_name` on hydration, but this
+        // sanitizer used to never touch that field — only `tab_membership`
+        // and the `live` snapshot. A malformed or older daemon (one
+        // predating the `is_valid_display_name` Cf tightening) could echo a
+        // control byte or a `U+202E` RIGHT-TO-LEFT OVERRIDE straight into a
+        // rendered card title. Both a control byte and a bidi override must
+        // be gone afterward, and an oversized name must be clamped to the
+        // daemon's own `DISPLAY_NAME_MAX_LEN` on a character boundary.
         let mut rec = AgentRecord {
             id: "9".into(),
             pane_id_env: None,
@@ -3464,7 +3496,6 @@ mod tests {
             registration_generation: None,
             cli_name: None,
             crashed: None,
-
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
