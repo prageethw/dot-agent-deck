@@ -8643,6 +8643,7 @@ impl Drop for AgentPtyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
     // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
@@ -8983,8 +8984,16 @@ mod tests {
         assert_eq!(resolve_display_name(None, Some(evil_cmd)), "shell");
     }
 
+    /// Scenario: Confirms `is_valid_display_name` rejects names containing
+    /// Unicode `Cf` format characters — a U+202E RIGHT-TO-LEFT OVERRIDE
+    /// plus a handful of other Cf codepoints (zero-width space,
+    /// left-to-right isolate, BOM) — that the prior byte-level `>= 0x20`
+    /// check let through because they encode as bytes all `>= 0x20`,
+    /// while still accepting ordinary non-ASCII names like accented
+    /// Latin, Cyrillic, and CJK text (issue #562 gap 1).
+    #[spec("dashboard/agent-badge/009")]
     #[test]
-    fn is_valid_display_name_rejects_unicode_bidi_format_characters() {
+    fn agent_badge_009_is_valid_display_name_rejects_unicode_bidi_format_characters() {
         // Issue #562 gap 1: the byte-level check (`value.bytes().all(|b| b
         // >= 0x20 && b != 0x7f)`) only catches C0/C1 controls and DEL. A
         // `U+202E` RIGHT-TO-LEFT OVERRIDE (Unicode general category `Cf`,

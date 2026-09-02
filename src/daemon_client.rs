@@ -1267,8 +1267,14 @@ mod tests {
         );
     }
 
+    /// Scenario: Confirms `sanitize_record_tab_membership` now scrubs
+    /// `AgentRecord.display_name` itself, not just `tab_membership`/`live`
+    /// — stripping a control byte and a U+202E bidi override from a
+    /// hydrated record's name, and clamping an oversized display_name to
+    /// `DISPLAY_NAME_MAX_LEN` (issue #562 gap 1).
+    #[spec("dashboard/agent-badge/010")]
     #[test]
-    fn sanitize_record_tab_membership_scrubs_display_name() {
+    fn agent_badge_010_sanitize_record_tab_membership_scrubs_display_name() {
         // Issue #562 gap 1: `ui.display_names` (the path `render_card_grid`
         // prefers) is populated from `AgentRecord.display_name` on hydration,
         // but this sanitizer never touched that field — only

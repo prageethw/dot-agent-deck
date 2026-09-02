@@ -13542,8 +13542,15 @@ clear = false
     /// this handler owns lacked it, so a hostile/malformed same-user peer
     /// posting a `ToolStart` with a raw ANSI escape or an oversized
     /// `tool_name`/`tool_detail` could still reach the rendered tool line.
+    /// Scenario: Confirms `apply_event`'s `ToolStart` handler scrubs and
+    /// length-clamps `tool_name`/`tool_detail` before storing them into
+    /// `session.active_tool`, closing the asymmetry with the hydration
+    /// path (`daemon_client::sanitize_record_tab_membership`) which
+    /// already sanitized the same fields on `list_agents` responses but
+    /// left this direct hook-socket ingest path raw (issue #562 gap 2).
+    #[spec("dashboard/agent-badge/011")]
     #[test]
-    fn tool_start_scrubs_and_clamps_tool_name_and_detail() {
+    fn agent_badge_011_tool_start_scrubs_and_clamps_tool_name_and_detail() {
         fn event(
             session_id: &str,
             tool_name: Option<&str>,

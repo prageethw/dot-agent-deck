@@ -629,6 +629,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the status-label/border half of the resolved-placeholder fix (`dashboard/placeholder/004`); a Codex session whose `agent_type` has genuinely resolved (`dashboard/agent-badge/001`); model-label vendor-prefix normalization, already covered generically (`dashboard/agent-badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/agent-badge/009 — `is_valid_display_name`'s byte-level check (`value.bytes().all(|b| b >= 0x20 && b != 0x7f)`) only catches `Cc`/DEL, so a Unicode `Cf` format character — whose UTF-8 bytes are all `>= 0x20` — passed the rename gate straight through to `ui.display_names`, where it can visually reorder a rendered card title (issue #562 gap 1).
+- **Layer:** L1 (in-process unit test on `is_valid_display_name` directly; no render, no PTY).
+- **Agent:** none (directly-constructed `&str` fixtures).
+- **Asserts:** `is_valid_display_name` rejects a name containing U+202E RIGHT-TO-LEFT OVERRIDE, and rejects each of U+200B ZERO WIDTH SPACE, U+2066 LEFT-TO-RIGHT ISOLATE, and U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM) individually — proving the tightening targets the `Cf` general category, not one enumerated codepoint; an ordinary non-ASCII name (accented Latin, Cyrillic, CJK) still passes, proving the check doesn't over-reject.
+- **Does not assert:** the daemon-side hydration path that scrubs an already-stored `display_name` (`dashboard/agent-badge/010`); rendered-card output (no render seam exercised); `Cc`/ANSI control-byte rejection (pre-existing, covered elsewhere in this module's tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/agent-badge/010 — `sanitize_record_tab_membership` scrubbed `tab_membership` and the `live` snapshot but never touched `AgentRecord.display_name` itself, so a malformed or older daemon (predating the `Cf` tightening) could echo a control byte or bidi override straight into a rendered card title via the `ui.display_names` hydration path (issue #562 gap 1).
+- **Layer:** L1 (in-process unit test on `sanitize_record_tab_membership`; asserts directly on `AgentRecord.display_name`, no render involved).
+- **Agent:** none (directly-constructed `AgentRecord` fixtures).
+- **Asserts:** a `display_name` carrying both an ANSI control byte and a U+202E RIGHT-TO-LEFT OVERRIDE has neither surviving after sanitization; a `display_name` longer than `agent_pty::DISPLAY_NAME_MAX_LEN` is clamped to at most that length.
+- **Does not assert:** the validation-gate side of the same class (`dashboard/agent-badge/009`); `tab_membership`'s own name-scrubbing (covered by `sanitize_record_tab_membership_strips_invalid_name`, same module); rendered-card output.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/agent-badge/011 — `apply_event`'s `ToolStart` handler stored `event.tool_name`/`event.tool_detail` into `session.active_tool` raw, with no scrubbing — asymmetric with the hydration counterpart (`daemon_client::sanitize_record_tab_membership`, `dashboard/agent-badge/010`) which already strips control bytes and length-clamps the same fields on `AgentRecord.live.active_tool` when a record comes back through `list_agents` (issue #562 gap 2).
+- **Layer:** L1 (in-process `AppState::apply_event` seam; asserts directly on `session.active_tool`, no render involved).
+- **Agent:** none (a synthetic `SessionStart` to admit the session, followed by a synthetic `ToolStart` carrying a control byte and an oversized `tool_name`/`tool_detail`).
+- **Asserts:** the stored `active_tool.name`/`.detail` have control bytes stripped and are clamped in length, matching the daemon-hydration path's existing behavior for the same fields.
+- **Does not assert:** the hydration-side scrubbing this mirrors (`dashboard/agent-badge/010`); rendered tool-line output; other `ToolStart` fields unrelated to name/detail sanitization.
+- **Platform coverage:** mac+linux+windows.
+
 ### Statuses
 
 #### status/transition
