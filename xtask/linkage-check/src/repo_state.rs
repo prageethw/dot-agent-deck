@@ -1628,10 +1628,21 @@ mod real_git {
     /// switched off — `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` pointed at a
     /// path that does not exist, `HOME` and `XDG_CONFIG_HOME` inside the
     /// sandbox, an empty template dir so no system hook is installed, and the
-    /// commit identity supplied by environment rather than by config — so the
-    /// repositories are byte-identical on a developer's machine and on a bare
-    /// runner, and nothing here can read or write the checkout these tests are
-    /// running inside.
+    /// commit identity supplied by environment rather than by config — and
+    /// git's *location* discovery is switched off too: `GIT_DIR`,
+    /// `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+    /// `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+    /// `GIT_CEILING_DIRECTORIES`, and `GIT_NAMESPACE` are all stripped from
+    /// the child's environment (`env_remove`, not overridden — unlike the
+    /// config vars, git's un-set behaviour for every one of these is to
+    /// auto-discover from `cwd`, which is exactly the sandbox-confined
+    /// behaviour wanted here, so removal alone is correct and there is no
+    /// "real" default location to override away from). So the repositories
+    /// are byte-identical on a developer's machine and on a bare runner, and
+    /// nothing here can read or write the checkout these tests are running
+    /// inside — including when a parent process (a pre-commit hook, `git
+    /// rebase --exec`, `git bisect run`) leaves one of these vars set
+    /// ambiently before spawning the test binary (issue #579).
     ///
     /// [`collect`] itself is deliberately *not* given that environment: it is
     /// called exactly the way `main.rs` calls it, so what is under test is the
@@ -1679,6 +1690,17 @@ mod real_git {
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_TEMPLATE_DIR", self.at("empty-template"))
                 .env("GIT_TERMINAL_PROMPT", "0")
+                // Location discovery, stripped rather than overridden — see
+                // the doc comment on `Sandbox` for why removal is correct
+                // here (issue #579).
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                .env_remove("GIT_CEILING_DIRECTORIES")
+                .env_remove("GIT_NAMESPACE")
                 .env("GIT_AUTHOR_NAME", "linkage-check tests")
                 .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
                 .env("GIT_COMMITTER_NAME", "linkage-check tests")
