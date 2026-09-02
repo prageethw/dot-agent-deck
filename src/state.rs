@@ -13568,9 +13568,33 @@ clear = false
             }
         }
 
+        // `apply_event` only auto-admits `pane_id`/`agent_id` into
+        // `managed_pane_ids` on `SessionStart` — without it, `ToolStart`
+        // never reaches the scrubbing code under test.
+        fn admit(session_id: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
         // Control bytes / ANSI escapes must not survive into the stored
         // ActiveTool.
         let mut state = AppState::default();
+        state.apply_event(admit("t1"));
         state.apply_event(event(
             "t1",
             Some("Bash\x1b[31mevil"),
@@ -13596,6 +13620,7 @@ clear = false
         use crate::daemon_client::MAX_FIRST_PROMPT_BYTES;
         let mut state = AppState::default();
         let oversized = "a".repeat(MAX_FIRST_PROMPT_BYTES + 100);
+        state.apply_event(admit("t2"));
         state.apply_event(event("t2", Some(&oversized), Some(&oversized)));
         let tool = state.sessions["t2"].active_tool.as_ref().unwrap();
         assert!(
