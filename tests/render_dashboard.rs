@@ -1822,9 +1822,14 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
 }
 
 /// Scenario: Drive a `ToolStart` `AgentEvent` whose `tool_detail` embeds a
-/// Unicode `Cf` format character (U+202E RIGHT-TO-LEFT OVERRIDE) through the
-/// real `AppState::apply_event` seam, render the card, and confirm the raw
-/// bidi character does not appear anywhere in the rendered buffer.
+/// Unicode `Cf` format character (U+200D ZERO WIDTH JOINER, merged into a
+/// wider grapheme cluster so it actually reaches the rendered buffer —
+/// U+202E has zero display width and ratatui's `render_line` skips
+/// zero-width graphemes entirely, which made an earlier version of this
+/// test pass whether or not the ingest sanitizer ran) through the real
+/// `AppState::apply_event` seam, render the card, and confirm the raw
+/// format character does not appear anywhere in the rendered buffer, and
+/// that the (sanitized) hostile content itself is present.
 ///
 /// Issue #562 gap 2, round 2 (reviewer B1, auditor A1): the tool line
 /// (`recent_tool_lines` in `src/ui.rs`) is the actual render seam for
@@ -1862,7 +1867,7 @@ fn agent_badge_012_tool_detail_with_format_chars_is_sanitized_in_render() {
         agent_type: AgentType::ClaudeCode,
         event_type: EventType::ToolStart,
         tool_name: Some("Bash".to_string()),
-        tool_detail: Some("rm -rf /\u{202e}-evil".to_string()),
+        tool_detail: Some("rm -rf /a\u{200d}b-evil".to_string()),
         cwd: None,
         timestamp: started,
         user_prompt: None,
@@ -1902,8 +1907,13 @@ fn agent_badge_012_tool_detail_with_format_chars_is_sanitized_in_render() {
         "the tool line must still render the (unhostile) tool name:\n{text}"
     );
     assert!(
-        !text.contains('\u{202e}'),
-        "a Cf format char (U+202E RIGHT-TO-LEFT OVERRIDE) in tool_detail must \
+        text.contains("rm -rf /ab-evil"),
+        "the sanitized (format-char-stripped) tool_detail content must still \
+         reach the rendered tool line:\n{text}"
+    );
+    assert!(
+        !text.contains('\u{200d}'),
+        "a Cf format char (U+200D ZERO WIDTH JOINER) in tool_detail must \
          not reach the rendered tool line unsanitized:\n{text}"
     );
 }

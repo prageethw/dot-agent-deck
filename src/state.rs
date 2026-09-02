@@ -47,9 +47,20 @@ const MODEL_MAX_LEN: usize = 40;
 /// Issue #562 gap 2 (reviewer L1): the display cap for `event.tool_name` on
 /// ingest. Same reasoning as [`MODEL_MAX_LEN`] — a short producer-string
 /// field competing for the card's tool-line width budget, not a free-text
-/// body — so it reuses that value rather than the 64 KiB
-/// `daemon_client::MAX_FIRST_PROMPT_BYTES` bound meant for prompt bodies.
-const TOOL_NAME_MAX_LEN: usize = MODEL_MAX_LEN;
+/// body — but it needs its own, larger literal rather than reusing
+/// `MODEL_MAX_LEN`: real MCP tool names (`mcp__<server>__<tool>`) routinely
+/// exceed 40 bytes (e.g. `mcp__plugin_engram_engram__mem_capture_passive` is
+/// 46), and `session.pending_permission_tool` — set from one event's
+/// truncated `tool_name` — is later compared via
+/// `Some(pending.as_str()) == event.tool_name.as_deref()` against another
+/// event's independently-truncated `tool_name` (~line 9320). Two distinct
+/// legitimate tool names sharing a too-short truncated prefix would compare
+/// equal and produce a false match (the #86 concurrent-subagent regression
+/// class). 128 bytes comfortably covers realistic `mcp__server__tool` names
+/// and makes an accidental prefix collision between two distinct tool names
+/// implausible, well short of the 64 KiB `daemon_client::MAX_FIRST_PROMPT_BYTES`
+/// bound meant for prompt bodies.
+const TOOL_NAME_MAX_LEN: usize = 128;
 
 /// Issue #562 gap 2: the display cap for `event.tool_detail` on ingest.
 /// Unlike `tool_name`, a detail can legitimately hold a real file path or a
@@ -8415,9 +8426,14 @@ impl AppState {
         // (`session.recent_events.push_back(event)`). Scrubbing only
         // `active_tool` — a field with no render site at all — left the
         // actual rendered path exploitable. Doing it here instead means
-        // `active_tool`, `recent_events`, and the `daemon status` CLI's TOOL
-        // column all read one consistent, already-sanitized value from one
-        // write.
+        // `active_tool` and `recent_events` — and the `daemon status` CLI's
+        // TOOL column when it is served by a same-build daemon — all read
+        // one consistent, already-sanitized value from one write. That CLI
+        // path is NOT guaranteed sanitized against an OLDER daemon:
+        // `run_daemon_status_cli` builds its rows from
+        // `DaemonClient::list_agents()`, whose client-side `live.active_tool`
+        // scrub (`daemon_client.rs:295`) is still `Cc`-only, so a pre-#562
+        // daemon can still hand this CLI a `U+202E` in that field.
         //
         // Use `untrusted_text::strip_control_and_bidi` (Cc + Cf/bidi), not
         // `daemon_client::strip_control_chars` (Cc only — ratatui already
