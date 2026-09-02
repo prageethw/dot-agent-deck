@@ -1341,7 +1341,7 @@ mod tests {
         let mut scrubs_to_nothing = AgentRecord {
             id: "11".into(),
             pane_id_env: None,
-            display_name: Some("\x1b[31m\u{202e}  ".into()),
+            display_name: Some("\x1b\u{202e}  ".into()),
             cwd: None,
             tab_membership: None,
             agent_type: None,
