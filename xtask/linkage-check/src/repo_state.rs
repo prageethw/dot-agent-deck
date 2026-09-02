@@ -2153,4 +2153,83 @@ mod real_git {
         );
         assert!(run(&bare).is_empty());
     }
+
+    /// **Read/write escape — issue #579.** `Sandbox::git()` neutralizes git's
+    /// *config* discovery (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`) but, as of
+    /// this test, leaves its *location* discovery ambient: `GIT_DIR` and
+    /// `GIT_WORK_TREE` set in the parent process — exactly what a pre-commit
+    /// hook, `git rebase --exec`, or `git bisect run` legitimately leaves
+    /// behind before spawning a test binary — steer every `git` invocation
+    /// straight past `cwd` and onto whatever repo those vars name, no matter
+    /// which fixture directory `Sandbox::git()` is told to run in.
+    ///
+    /// Demonstrates both directions with a throwaway `ambient` repo standing
+    /// in for "the real checkout" a parent process's `GIT_DIR`/`GIT_WORK_TREE`
+    /// might point at, so this test cannot itself touch anything outside the
+    /// sandbox tempdir: a `rev-parse HEAD` run "in" `fixture` must return
+    /// `fixture`'s own HEAD, not `ambient`'s (read escape), and a `commit`
+    /// run "in" `fixture` must land there rather than silently moving
+    /// `ambient`'s HEAD (write escape).
+    #[test]
+    fn sandbox_git_ignores_ambient_git_dir_and_git_work_tree() {
+        let sb = Sandbox::new();
+
+        let fixture = sb.at("fixture");
+        fs::create_dir_all(&fixture).expect("mkdir fixture");
+        sb.git(&fixture, &["init", "-q", "-b", "main"]);
+        sb.git(
+            &fixture,
+            &["commit", "-q", "--allow-empty", "-m", "fixture first"],
+        );
+        let fixture_head = sb.git(&fixture, &["rev-parse", "HEAD"]);
+
+        let ambient = sb.at("ambient");
+        fs::create_dir_all(&ambient).expect("mkdir ambient");
+        sb.git(&ambient, &["init", "-q", "-b", "main"]);
+        sb.git(
+            &ambient,
+            &["commit", "-q", "--allow-empty", "-m", "ambient first"],
+        );
+        let ambient_head_before = sb.git(&ambient, &["rev-parse", "HEAD"]);
+
+        // `cargo-nextest` runs each test in its own process, so mutating the
+        // process environment here cannot bleed into any other test.
+        unsafe {
+            std::env::set_var("GIT_DIR", ambient.join(".git"));
+            std::env::set_var("GIT_WORK_TREE", &ambient);
+        }
+        let head_seen_from_fixture = sb.git(&fixture, &["rev-parse", "HEAD"]);
+        sb.git(
+            &fixture,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "escape via ambient GIT_DIR/GIT_WORK_TREE",
+            ],
+        );
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+            std::env::remove_var("GIT_WORK_TREE");
+        }
+
+        let ambient_head_after = sb.git(&ambient, &["rev-parse", "HEAD"]);
+
+        assert_eq!(
+            head_seen_from_fixture,
+            fixture_head,
+            "ambient GIT_DIR/GIT_WORK_TREE steered `git rev-parse HEAD` run in {} onto a \
+             different repository: got {head_seen_from_fixture}, wanted the fixture's own \
+             HEAD {fixture_head} — this is the read escape issue #579 describes",
+            fixture.display()
+        );
+        assert_eq!(
+            ambient_head_after, ambient_head_before,
+            "a commit run \"in\" the fixture while GIT_DIR/GIT_WORK_TREE ambiently pointed \
+             at `ambient` moved ambient's HEAD from {ambient_head_before} to \
+             {ambient_head_after} instead of staying confined to the fixture — this is the \
+             write escape issue #579 describes"
+        );
+    }
 }
