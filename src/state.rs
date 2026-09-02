@@ -9269,9 +9269,29 @@ impl AppState {
                 if asserted {
                     session.status = SessionStatus::Working;
                 }
+                // Issue #562: this is the direct hook-socket ingest path's
+                // own construction of `ActiveTool` — the *hydration*
+                // counterpart of the same fields (`AgentRecord.live.active_tool`
+                // echoed via `list_agents`) is already scrubbed by
+                // `daemon_client::sanitize_record_tab_membership`. Apply the
+                // identical strip-control + length-clamp treatment here so a
+                // raw control byte / ANSI escape / oversized string in
+                // `event.tool_name` or `event.tool_detail` can't reach the
+                // rendered tool line through this seam while the hydration
+                // seam blocks it.
                 session.active_tool = Some(ActiveTool {
-                    name: event.tool_name.clone().unwrap_or_default(),
-                    detail: event.tool_detail.clone(),
+                    name: crate::daemon_client::clamp_bytes(
+                        crate::daemon_client::strip_control_chars(
+                            &event.tool_name.clone().unwrap_or_default(),
+                        ),
+                        crate::daemon_client::MAX_FIRST_PROMPT_BYTES,
+                    ),
+                    detail: event.tool_detail.clone().map(|detail| {
+                        crate::daemon_client::clamp_bytes(
+                            crate::daemon_client::strip_control_chars(&detail),
+                            crate::daemon_client::MAX_FIRST_PROMPT_BYTES,
+                        )
+                    }),
                 });
                 asserted
             }
@@ -13572,10 +13592,8 @@ clear = false
         );
 
         // An oversized tool_name/tool_detail must be clamped, mirroring the
-        // hydration-path bound (`daemon_client::MAX_FIRST_PROMPT_BYTES`, 64
-        // KiB — spelled out here rather than referenced so this test doesn't
-        // require that constant's visibility to change to compile).
-        const MAX_FIRST_PROMPT_BYTES: usize = 65536;
+        // hydration-path bound (`daemon_client::MAX_FIRST_PROMPT_BYTES`).
+        use crate::daemon_client::MAX_FIRST_PROMPT_BYTES;
         let mut state = AppState::default();
         let oversized = "a".repeat(MAX_FIRST_PROMPT_BYTES + 100);
         state.apply_event(event("t2", Some(&oversized), Some(&oversized)));

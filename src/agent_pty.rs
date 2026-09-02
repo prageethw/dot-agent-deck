@@ -374,15 +374,24 @@ pub const DISPLAY_NAME_MAX_LEN: usize = 128;
 pub const CWD_MAX_LEN: usize = 4096;
 
 /// Returns `true` if `value` is a well-formed display name: non-empty,
-/// ≤ [`DISPLAY_NAME_MAX_LEN`] bytes, and free of ASCII control characters
-/// (bytes < 0x20 plus 0x7F DEL). Unicode beyond 0x7F is allowed so the
-/// user can type UTF-8 names. Rejects values containing ANSI escapes,
-/// NUL, newlines, carriage returns, etc. — anything that could perturb
-/// the TUI render path when echoed back via `list_agents`.
+/// ≤ [`DISPLAY_NAME_MAX_LEN`] bytes, free of ASCII control characters
+/// (bytes < 0x20 plus 0x7F DEL), and free of Unicode general-category `Cf`
+/// format characters (bidi overrides/isolates, zero-width marks, the tag
+/// block — see [`crate::untrusted_text::is_bidi_format_char`]). Ordinary
+/// Unicode beyond 0x7F (accents, CJK, emoji) is allowed so the user can
+/// type UTF-8 names. Rejects values containing ANSI escapes, NUL,
+/// newlines, carriage returns, a `U+202E` RIGHT-TO-LEFT OVERRIDE, etc. —
+/// anything that could perturb or spoof the TUI render path when echoed
+/// back via `list_agents` (issue #562: `char::is_control()` alone does not
+/// catch `Cf`, so a bidi override previously survived this gate on the
+/// rename path even though the byte-level control check passed).
 pub fn is_valid_display_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= DISPLAY_NAME_MAX_LEN
         && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+        && !value
+            .chars()
+            .any(crate::untrusted_text::is_bidi_format_char)
 }
 
 /// Canonical resolver for the human-readable display name shown on a pane

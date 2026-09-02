@@ -210,19 +210,31 @@ pub async fn issue_command<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// `first_prompts` entry (PRD #162 finding #2). A hostile/malformed daemon
 /// could advertise a megabyte-long prompt that would bloat the rebuilt card;
 /// 64 KiB is far above any real first prompt yet bounds the worst case.
-const MAX_FIRST_PROMPT_BYTES: usize = 65536;
+///
+/// `pub(crate)` (issue #562) so [`crate::state`]'s `apply_event` can apply
+/// the identical clamp to `event.tool_name` / `event.tool_detail` on the
+/// direct hook-socket ingest path — that path stores an `ActiveTool`
+/// through the exact same fields this module scrubs on the hydration path,
+/// and the two must not diverge on the bound they enforce.
+pub(crate) const MAX_FIRST_PROMPT_BYTES: usize = 65536;
 
 /// Drop ASCII/Unicode control characters from a daemon-supplied string so no
 /// raw control byte (ANSI escape, NUL, DEL, C1) survives into a rendered cell.
 /// Mirrors the `char::is_control` policy `login_shell` / the build-handshake
 /// render seam apply elsewhere on untrusted wire input.
-fn strip_control_chars(s: &str) -> String {
+///
+/// `pub(crate)` (issue #562) — see [`MAX_FIRST_PROMPT_BYTES`] for why
+/// [`crate::state`] reuses this rather than writing a second copy.
+pub(crate) fn strip_control_chars(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Truncate `s` to at most `max_bytes`, snapping back to the nearest char
 /// boundary so a multi-byte UTF-8 sequence is never split.
-fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
+///
+/// `pub(crate)` (issue #562) — see [`MAX_FIRST_PROMPT_BYTES`] for why
+/// [`crate::state`] reuses this rather than writing a second copy.
+pub(crate) fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s;
     }
@@ -236,9 +248,19 @@ fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
 
 /// Sanitize a single `AgentRecord` echoed by the daemon before it reaches the
 /// TUI. Defense in depth at the wire boundary (M2.12 fixup auditor #1, PRD
-/// #162 findings #1/#2): the daemon validates on `StartAgent`, but a malformed
-/// or older daemon could still echo an untrusted record. Two scrubs:
+/// #162 findings #1/#2, issue #562): the daemon validates on `StartAgent` /
+/// `SetAgentLabel` via `is_valid_display_name`, but a malformed or older
+/// daemon (one built before that gate also rejected Unicode `Cf` format
+/// characters) could still echo an untrusted record. Three scrubs:
 ///
+/// - `display_name`: routed through
+///   [`crate::untrusted_text::sanitize_display_name`] — the same
+///   control+bidi-stripping, trim, and [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`]-byte
+///   clamp the hook-socket ingest seam already applies to this field (#410/PR
+///   #558), so `ui.display_names` (populated from this field on both
+///   hydration and rename) can never carry a raw control byte or a
+///   `U+202E`-style bidi override regardless of which daemon build echoed
+///   it. `None` when nothing usable survives.
 /// - `tab_membership`: clamped to `None` if the embedded `name` fails
 ///   [`validate_tab_membership`] (logged via `tracing::warn!` — the agent is
 ///   real, we just don't trust the bucketing hint).
@@ -249,6 +271,10 @@ fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
 ///   most [`crate::state::MAX_FIRST_PROMPTS`] entries. The snapshot is KEPT as
 ///   `Some(..)` — the agent is real; only its strings are scrubbed.
 fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
+    if let Some(name) = rec.display_name.take() {
+        rec.display_name = crate::untrusted_text::sanitize_display_name(&name);
+    }
+
     if let Some(tm) = rec.tab_membership.take() {
         let name_len = tm.name().len();
         match validate_tab_membership(tm) {
