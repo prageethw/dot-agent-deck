@@ -1242,6 +1242,68 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_record_tab_membership_scrubs_display_name() {
+        // Issue #562 gap 1: `ui.display_names` (the path `render_card_grid`
+        // prefers) is populated from `AgentRecord.display_name` on hydration,
+        // but this sanitizer never touched that field — only
+        // `tab_membership` and the `live` snapshot. A malformed or older
+        // daemon (one predating the `is_valid_display_name` Cf tightening)
+        // could echo a control byte or a `U+202E` RIGHT-TO-LEFT OVERRIDE
+        // straight into a rendered card title. Both a control byte and a
+        // bidi override must be gone afterward, and an oversized name must
+        // be clamped to the daemon's own `DISPLAY_NAME_MAX_LEN`.
+        let mut rec = AgentRecord {
+            id: "9".into(),
+            pane_id_env: None,
+            display_name: Some("evil\x1b[31m\u{202e}name".into()),
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        sanitize_record_tab_membership(&mut rec);
+        let scrubbed = rec
+            .display_name
+            .as_deref()
+            .expect("a name with printable characters survives scrubbing");
+        assert!(
+            !scrubbed.contains('\x1b') && !scrubbed.contains('\u{202e}'),
+            "display_name must have control bytes and bidi overrides stripped, got {scrubbed:?}"
+        );
+
+        let mut oversized = AgentRecord {
+            id: "10".into(),
+            pane_id_env: None,
+            display_name: Some("a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN + 40)),
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        sanitize_record_tab_membership(&mut oversized);
+        assert!(
+            oversized.display_name.as_deref().unwrap().len()
+                <= crate::agent_pty::DISPLAY_NAME_MAX_LEN,
+            "an oversized display_name must be clamped to DISPLAY_NAME_MAX_LEN, got {} bytes",
+            oversized.display_name.as_deref().unwrap().len()
+        );
+    }
+
+    #[test]
     fn sanitize_record_tab_membership_strips_invalid_name() {
         // M2.12 fixup auditor #1: the daemon validates `tab_membership`
         // on `StartAgent`, but a malformed or older daemon could echo

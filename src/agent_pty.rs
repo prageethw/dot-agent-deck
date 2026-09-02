@@ -8974,6 +8974,34 @@ mod tests {
         assert_eq!(resolve_display_name(None, Some(evil_cmd)), "shell");
     }
 
+    #[test]
+    fn is_valid_display_name_rejects_unicode_bidi_format_characters() {
+        // Issue #562 gap 1: the byte-level check (`value.bytes().all(|b| b
+        // >= 0x20 && b != 0x7f)`) only catches C0/C1 controls and DEL. A
+        // `U+202E` RIGHT-TO-LEFT OVERRIDE (Unicode general category `Cf`,
+        // not `Cc`) encodes as UTF-8 bytes all `>= 0x20`, so the old check
+        // let it straight through the rename gate — from there it reaches
+        // `ui.display_names` and visually reorders the rendered card title.
+        assert!(
+            !is_valid_display_name("evil\u{202e}name"),
+            "a name containing U+202E RIGHT-TO-LEFT OVERRIDE must fail validation"
+        );
+        // A handful of other Cf codepoints, so this isn't pinned to one
+        // enumerated bidi override (mirrors the module-level policy already
+        // proven in `crate::untrusted_text`'s own Cf coverage test).
+        for c in ['\u{200b}', '\u{2066}', '\u{feff}'] {
+            let name = format!("agent{c}name");
+            assert!(
+                !is_valid_display_name(&name),
+                "Cf format character U+{:04X} must fail validation, name={name:?}",
+                c as u32
+            );
+        }
+        // A genuinely ordinary Unicode name (accents, CJK) must still pass —
+        // the tightening targets `Cf` specifically, not "any non-ASCII".
+        assert!(is_valid_display_name("café-агент-日本語"));
+    }
+
     /// Round-12 auditor #2: orchestration_cwd must be validated.
     /// Hostile inputs (NUL bytes, control chars, oversized strings,
     /// relative paths) should make validate_tab_membership return

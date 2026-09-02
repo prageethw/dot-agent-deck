@@ -13512,6 +13512,86 @@ clear = false
         );
     }
 
+    /// Issue #562 gap 2: `apply_event`'s `ToolStart` handler stores
+    /// `event.tool_name` / `event.tool_detail` into `session.active_tool`
+    /// raw — no scrubbing. This is asymmetric with the *hydration*
+    /// counterpart of the same fields: `daemon_client::sanitize_record_tab_membership`
+    /// already strips control bytes and length-clamps
+    /// `AgentRecord.live.active_tool.name` / `.detail` when a record comes
+    /// back through `list_agents`. Only the direct hook-socket ingest path
+    /// this handler owns lacked it, so a hostile/malformed same-user peer
+    /// posting a `ToolStart` with a raw ANSI escape or an oversized
+    /// `tool_name`/`tool_detail` could still reach the rendered tool line.
+    #[test]
+    fn tool_start_scrubs_and_clamps_tool_name_and_detail() {
+        fn event(
+            session_id: &str,
+            tool_name: Option<&str>,
+            tool_detail: Option<&str>,
+        ) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart,
+                tool_name: tool_name.map(str::to_string),
+                tool_detail: tool_detail.map(str::to_string),
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        // Control bytes / ANSI escapes must not survive into the stored
+        // ActiveTool.
+        let mut state = AppState::default();
+        state.apply_event(event(
+            "t1",
+            Some("Bash\x1b[31mevil"),
+            Some("rm -rf /\x1b[0m"),
+        ));
+        let tool = state.sessions["t1"]
+            .active_tool
+            .as_ref()
+            .expect("ToolStart must set active_tool");
+        assert!(
+            !tool.name.contains('\x1b'),
+            "tool_name must have control bytes stripped, got {:?}",
+            tool.name
+        );
+        assert!(
+            !tool.detail.as_deref().unwrap_or_default().contains('\x1b'),
+            "tool_detail must have control bytes stripped, got {:?}",
+            tool.detail
+        );
+
+        // An oversized tool_name/tool_detail must be clamped, mirroring the
+        // hydration-path bound (`daemon_client::MAX_FIRST_PROMPT_BYTES`, 64
+        // KiB — spelled out here rather than referenced so this test doesn't
+        // require that constant's visibility to change to compile).
+        const MAX_FIRST_PROMPT_BYTES: usize = 65536;
+        let mut state = AppState::default();
+        let oversized = "a".repeat(MAX_FIRST_PROMPT_BYTES + 100);
+        state.apply_event(event("t2", Some(&oversized), Some(&oversized)));
+        let tool = state.sessions["t2"].active_tool.as_ref().unwrap();
+        assert!(
+            tool.name.len() <= MAX_FIRST_PROMPT_BYTES,
+            "tool_name must be clamped to MAX_FIRST_PROMPT_BYTES, got {} bytes",
+            tool.name.len()
+        );
+        assert!(
+            tool.detail.as_deref().unwrap().len() <= MAX_FIRST_PROMPT_BYTES,
+            "tool_detail must be clamped to MAX_FIRST_PROMPT_BYTES, got {} bytes",
+            tool.detail.as_deref().unwrap().len()
+        );
+    }
+
     /// PRD #249 M3 + review finding B3, as amended by issue #686: the
     /// silent-worker notice carries daemon-authored text plus **exactly one**
     /// untrusted value — the worker pane's own rendered text — and that value
