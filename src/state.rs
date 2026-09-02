@@ -44,6 +44,23 @@ pub(crate) const MAX_FIRST_PROMPTS: usize = 3;
 /// model could push the identity off the title entirely.
 const MODEL_MAX_LEN: usize = 40;
 
+/// Issue #562 gap 2 (reviewer L1): the display cap for `event.tool_name` on
+/// ingest. Same reasoning as [`MODEL_MAX_LEN`] — a short producer-string
+/// field competing for the card's tool-line width budget, not a free-text
+/// body — so it reuses that value rather than the 64 KiB
+/// `daemon_client::MAX_FIRST_PROMPT_BYTES` bound meant for prompt bodies.
+const TOOL_NAME_MAX_LEN: usize = MODEL_MAX_LEN;
+
+/// Issue #562 gap 2: the display cap for `event.tool_detail` on ingest.
+/// Unlike `tool_name`, a detail can legitimately hold a real file path or a
+/// full `bash` command line, so it needs more room than
+/// [`TOOL_NAME_MAX_LEN`] — but nowhere near
+/// `daemon_client::MAX_FIRST_PROMPT_BYTES` (64 KiB is three orders of
+/// magnitude past anything a single tool invocation would ever produce).
+/// 256 bytes comfortably covers realistic paths/commands while still
+/// bounding the tool line's render width.
+const TOOL_DETAIL_MAX_LEN: usize = 256;
+
 /// PRD #92 F9 followup-6: how long the post-respawn dispatch task
 /// waits for the freshly-spawned agent to emit a `SessionStart` hook
 /// event before falling back to writing the prompt anyway.
@@ -8389,6 +8406,43 @@ impl AppState {
             ));
         }
 
+        // Issue #562 gap 2 (reviewer B1/auditor A1): sanitize `tool_name` /
+        // `tool_detail` ON THE EVENT ITSELF, here, before it is journalled —
+        // NOT only on the `session.active_tool` copy the ToolStart arm below
+        // builds. `recent_tool_lines` (src/ui.rs), the only render site for a
+        // tool line, reads `session.recent_events`, which is fed by pushing
+        // this very `event` unmodified a few hundred lines down
+        // (`session.recent_events.push_back(event)`). Scrubbing only
+        // `active_tool` — a field with no render site at all — left the
+        // actual rendered path exploitable. Doing it here instead means
+        // `active_tool`, `recent_events`, and the `daemon status` CLI's TOOL
+        // column all read one consistent, already-sanitized value from one
+        // write.
+        //
+        // Use `untrusted_text::strip_control_and_bidi` (Cc + Cf/bidi), not
+        // `daemon_client::strip_control_chars` (Cc only — ratatui already
+        // filters that at render time) or `terminal_sanitize::sanitize_for_
+        // terminal_display` (escapes rather than strips — right for a
+        // diagnostic, wrong for a width-constrained render line). This is
+        // the same function `untrusted_text::sanitize_display_name` builds
+        // on for gap 1, and issue #562's own suggested direction for gap 2.
+        // Sanitize BEFORE truncating, same reasoning as `model` above: the
+        // length bound must apply to what will actually render.
+        if let Some(name) = event.tool_name.take() {
+            let sanitized = crate::untrusted_text::strip_control_and_bidi(&name, false);
+            event.tool_name = Some(crate::prompt_delivery::truncate_on_char_boundary(
+                &sanitized,
+                TOOL_NAME_MAX_LEN,
+            ));
+        }
+        if let Some(detail) = event.tool_detail.take() {
+            let sanitized = crate::untrusted_text::strip_control_and_bidi(&detail, false);
+            event.tool_detail = Some(crate::prompt_delivery::truncate_on_char_boundary(
+                &sanitized,
+                TOOL_DETAIL_MAX_LEN,
+            ));
+        }
+
         // Only accept events from panes managed by our app.
         // Events without a pane_id (external agents) are rejected when we have
         // managed panes. Events with an unknown pane_id are rejected unless it
@@ -9269,29 +9323,16 @@ impl AppState {
                 if asserted {
                     session.status = SessionStatus::Working;
                 }
-                // Issue #562: this is the direct hook-socket ingest path's
-                // own construction of `ActiveTool` — the *hydration*
-                // counterpart of the same fields (`AgentRecord.live.active_tool`
-                // echoed via `list_agents`) is already scrubbed by
-                // `daemon_client::sanitize_record_tab_membership`. Apply the
-                // identical strip-control + length-clamp treatment here so a
-                // raw control byte / ANSI escape / oversized string in
-                // `event.tool_name` or `event.tool_detail` can't reach the
-                // rendered tool line through this seam while the hydration
-                // seam blocks it.
+                // Issue #562 gap 2: `event.tool_name` / `event.tool_detail`
+                // are already sanitized and clamped in place near the top of
+                // this function, before this arm runs — the same scrub
+                // `session.recent_events.push_back(event)` further down also
+                // benefits from. No separate scrub belongs here; doing one
+                // would be a redundant, silently-divergent second copy of
+                // the same policy.
                 session.active_tool = Some(ActiveTool {
-                    name: crate::daemon_client::clamp_bytes(
-                        crate::daemon_client::strip_control_chars(
-                            &event.tool_name.clone().unwrap_or_default(),
-                        ),
-                        crate::daemon_client::MAX_FIRST_PROMPT_BYTES,
-                    ),
-                    detail: event.tool_detail.clone().map(|detail| {
-                        crate::daemon_client::clamp_bytes(
-                            crate::daemon_client::strip_control_chars(&detail),
-                            crate::daemon_client::MAX_FIRST_PROMPT_BYTES,
-                        )
-                    }),
+                    name: event.tool_name.as_deref().unwrap_or_default().to_string(),
+                    detail: event.tool_detail.as_deref().map(str::to_string),
                 });
                 asserted
             }
@@ -13532,22 +13573,24 @@ clear = false
         );
     }
 
-    /// Issue #562 gap 2: `apply_event`'s `ToolStart` handler stores
-    /// `event.tool_name` / `event.tool_detail` into `session.active_tool`
-    /// raw — no scrubbing. This is asymmetric with the *hydration*
-    /// counterpart of the same fields: `daemon_client::sanitize_record_tab_membership`
-    /// already strips control bytes and length-clamps
-    /// `AgentRecord.live.active_tool.name` / `.detail` when a record comes
-    /// back through `list_agents`. Only the direct hook-socket ingest path
-    /// this handler owns lacked it, so a hostile/malformed same-user peer
-    /// posting a `ToolStart` with a raw ANSI escape or an oversized
-    /// `tool_name`/`tool_detail` could still reach the rendered tool line.
-    /// Scenario: Confirms `apply_event`'s `ToolStart` handler scrubs and
-    /// length-clamps `tool_name`/`tool_detail` before storing them into
-    /// `session.active_tool`, closing the asymmetry with the hydration
-    /// path (`daemon_client::sanitize_record_tab_membership`) which
-    /// already sanitized the same fields on `list_agents` responses but
-    /// left this direct hook-socket ingest path raw (issue #562 gap 2).
+    /// Scenario: Confirms `apply_event` sanitizes `event.tool_name` /
+    /// `event.tool_detail` — stripping both ASCII control bytes and Unicode
+    /// `Cf` bidi/format characters, then length-clamping — on `event`
+    /// itself before it is journalled into `session.recent_events`, which
+    /// is the field `recent_tool_lines` (`src/ui.rs`) actually renders on
+    /// the card's tool line. Also confirms `session.active_tool` (a
+    /// separate, non-rendered copy consumed by `daemon status`) mirrors the
+    /// same already-sanitized value rather than carrying its own scrub.
+    ///
+    /// Issue #562 gap 2, round 2 (reviewer B1/B2, auditor A1/A2): the
+    /// previous version of this test only asserted against
+    /// `session.active_tool`, which has no render site anywhere in
+    /// `src/ui.rs` — so it passed while the actual rendered tool line
+    /// (fed by `session.recent_events`) remained fully exploitable. It also
+    /// only asserted `\x1b` (`Cc`) removal, not the `U+202E`-class bidi
+    /// override (`Cf`) issue #562 is named after, since the prior fix used
+    /// `daemon_client::strip_control_chars` (`Cc`-only) rather than
+    /// `untrusted_text::strip_control_and_bidi`.
     #[spec("dashboard/agent-badge/011")]
     #[test]
     fn agent_badge_011_tool_start_scrubs_and_clamps_tool_name_and_detail() {
@@ -13598,47 +13641,79 @@ clear = false
             }
         }
 
-        // Control bytes / ANSI escapes must not survive into the stored
-        // ActiveTool.
+        fn last_tool_start(session: &SessionState) -> &AgentEvent {
+            session
+                .recent_events
+                .iter()
+                .rev()
+                .find(|e| e.event_type == EventType::ToolStart)
+                .expect("ToolStart must be journalled into recent_events")
+        }
+
+        // Control bytes AND Cf bidi/format characters must not survive into
+        // the journalled event — the field recent_tool_lines actually reads.
         let mut state = AppState::default();
         state.apply_event(admit("t1"));
         state.apply_event(event(
             "t1",
-            Some("Bash\x1b[31mevil"),
-            Some("rm -rf /\x1b[0m"),
+            Some("Bash\x1b[31m\u{202e}evil"),
+            Some("rm -rf /\x1b[0m\u{202e}"),
         ));
-        let tool = state.sessions["t1"]
+        let session = &state.sessions["t1"];
+        let recorded = last_tool_start(session);
+        let name = recorded.tool_name.as_deref().unwrap_or_default();
+        let detail = recorded.tool_detail.as_deref().unwrap_or_default();
+        assert!(
+            !name.contains('\x1b') && !name.contains('\u{202e}'),
+            "recent_events' tool_name must have both control bytes and bidi \
+             overrides stripped, got {name:?}"
+        );
+        assert!(
+            !detail.contains('\x1b') && !detail.contains('\u{202e}'),
+            "recent_events' tool_detail must have both control bytes and \
+             bidi overrides stripped, got {detail:?}"
+        );
+
+        // `active_tool` is a separate, non-rendered copy — confirm it
+        // mirrors the same already-sanitized value rather than carrying its
+        // own (potentially divergent) scrub.
+        let tool = session
             .active_tool
             .as_ref()
             .expect("ToolStart must set active_tool");
-        assert!(
-            !tool.name.contains('\x1b'),
-            "tool_name must have control bytes stripped, got {:?}",
-            tool.name
+        assert_eq!(
+            tool.name, name,
+            "active_tool.name must mirror the sanitized event, not scrub separately"
         );
-        assert!(
-            !tool.detail.as_deref().unwrap_or_default().contains('\x1b'),
-            "tool_detail must have control bytes stripped, got {:?}",
-            tool.detail
+        assert_eq!(
+            tool.detail.as_deref(),
+            Some(detail),
+            "active_tool.detail must mirror the sanitized event, not scrub separately"
         );
 
-        // An oversized tool_name/tool_detail must be clamped, mirroring the
-        // hydration-path bound (`daemon_client::MAX_FIRST_PROMPT_BYTES`).
-        use crate::daemon_client::MAX_FIRST_PROMPT_BYTES;
+        // An oversized tool_name/tool_detail must be clamped on ingest,
+        // using this project's own tool-field bounds (TOOL_NAME_MAX_LEN /
+        // TOOL_DETAIL_MAX_LEN) rather than the 64 KiB prompt-body bound.
+        // `truncate_on_char_boundary` appends a trailing `…` on cut (same as
+        // `model`'s clamp above), so the surviving length can exceed the
+        // nominal cap by that marker's byte length.
         let mut state = AppState::default();
-        let oversized = "a".repeat(MAX_FIRST_PROMPT_BYTES + 100);
+        let oversized = "a".repeat(TOOL_DETAIL_MAX_LEN + 100);
         state.apply_event(admit("t2"));
         state.apply_event(event("t2", Some(&oversized), Some(&oversized)));
-        let tool = state.sessions["t2"].active_tool.as_ref().unwrap();
+        let recorded = last_tool_start(&state.sessions["t2"]);
+        let ellipsis_len = "…".len();
+        let name = recorded.tool_name.as_deref().unwrap();
+        let detail = recorded.tool_detail.as_deref().unwrap();
         assert!(
-            tool.name.len() <= MAX_FIRST_PROMPT_BYTES,
-            "tool_name must be clamped to MAX_FIRST_PROMPT_BYTES, got {} bytes",
-            tool.name.len()
+            name.len() <= TOOL_NAME_MAX_LEN + ellipsis_len,
+            "tool_name must be clamped to TOOL_NAME_MAX_LEN (+ ellipsis), got {} bytes",
+            name.len()
         );
         assert!(
-            tool.detail.as_deref().unwrap().len() <= MAX_FIRST_PROMPT_BYTES,
-            "tool_detail must be clamped to MAX_FIRST_PROMPT_BYTES, got {} bytes",
-            tool.detail.as_deref().unwrap().len()
+            detail.len() <= TOOL_DETAIL_MAX_LEN + ellipsis_len,
+            "tool_detail must be clamped to TOOL_DETAIL_MAX_LEN (+ ellipsis), got {} bytes",
+            detail.len()
         );
     }
 

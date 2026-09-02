@@ -210,31 +210,25 @@ pub async fn issue_command<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// `first_prompts` entry (PRD #162 finding #2). A hostile/malformed daemon
 /// could advertise a megabyte-long prompt that would bloat the rebuilt card;
 /// 64 KiB is far above any real first prompt yet bounds the worst case.
-///
-/// `pub(crate)` (issue #562) so [`crate::state`]'s `apply_event` can apply
-/// the identical clamp to `event.tool_name` / `event.tool_detail` on the
-/// direct hook-socket ingest path — that path stores an `ActiveTool`
-/// through the exact same fields this module scrubs on the hydration path,
-/// and the two must not diverge on the bound they enforce.
-pub(crate) const MAX_FIRST_PROMPT_BYTES: usize = 65536;
+const MAX_FIRST_PROMPT_BYTES: usize = 65536;
 
 /// Drop ASCII/Unicode control characters from a daemon-supplied string so no
 /// raw control byte (ANSI escape, NUL, DEL, C1) survives into a rendered cell.
 /// Mirrors the `char::is_control` policy `login_shell` / the build-handshake
 /// render seam apply elsewhere on untrusted wire input.
 ///
-/// `pub(crate)` (issue #562) — see [`MAX_FIRST_PROMPT_BYTES`] for why
-/// [`crate::state`] reuses this rather than writing a second copy.
-pub(crate) fn strip_control_chars(s: &str) -> String {
+/// Control-only, deliberately: this is the *hydration* path's scrub, and it
+/// predates bidi (`Cf`) being treated as part of the same threat class. Do
+/// not reuse this for a fresh ingest seam — reach for
+/// [`crate::untrusted_text::strip_control_and_bidi`] instead, which also
+/// strips bidi overrides (issue #562 gap 2's fix uses that, not this).
+fn strip_control_chars(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Truncate `s` to at most `max_bytes`, snapping back to the nearest char
 /// boundary so a multi-byte UTF-8 sequence is never split.
-///
-/// `pub(crate)` (issue #562) — see [`MAX_FIRST_PROMPT_BYTES`] for why
-/// [`crate::state`] reuses this rather than writing a second copy.
-pub(crate) fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
+fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s;
     }
@@ -257,10 +251,15 @@ pub(crate) fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
 ///   [`crate::untrusted_text::sanitize_display_name`] — the same
 ///   control+bidi-stripping, trim, and [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`]-byte
 ///   clamp the hook-socket ingest seam already applies to this field (#410/PR
-///   #558), so `ui.display_names` (populated from this field on both
-///   hydration and rename) can never carry a raw control byte or a
-///   `U+202E`-style bidi override regardless of which daemon build echoed
-///   it. `None` when nothing usable survives.
+///   #558). Every record that reaches the TUI through
+///   [`DaemonClient::list_agents`] passes through here, so a `display_name`
+///   sourced that way can never carry a raw control byte or a `U+202E`-style
+///   bidi override regardless of which daemon build echoed it. `None` when
+///   nothing usable survives. This is *not* an unconditional guarantee on
+///   `ui.display_names` as a whole — a few call sites read `AgentRecord`
+///   fields directly off `AttachRequest::ListAgents` and bypass this scrub
+///   (none of them currently render `display_name`, so this is a scope note,
+///   not a live defect).
 /// - `tab_membership`: clamped to `None` if the embedded `name` fails
 ///   [`validate_tab_membership`] (logged via `tracing::warn!` — the agent is
 ///   real, we just don't trust the bucketing hint).
@@ -1332,6 +1331,34 @@ mod tests {
                 <= crate::agent_pty::DISPLAY_NAME_MAX_LEN,
             "an oversized display_name must be clamped to DISPLAY_NAME_MAX_LEN, got {} bytes",
             oversized.display_name.as_deref().unwrap().len()
+        );
+
+        // Reviewer N3: a display_name that scrubs away to nothing (control
+        // bytes and bidi overrides only, no printable content once
+        // stripped+trimmed) must become `None`, not an empty string — the
+        // one genuinely new failure mode this scrub introduces versus the
+        // raw value that used to survive.
+        let mut scrubs_to_nothing = AgentRecord {
+            id: "11".into(),
+            pane_id_env: None,
+            display_name: Some("\x1b[31m\u{202e}  ".into()),
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        sanitize_record_tab_membership(&mut scrubs_to_nothing);
+        assert_eq!(
+            scrubs_to_nothing.display_name, None,
+            "a display_name with no printable content surviving control/bidi \
+             stripping must become None, not an empty string"
         );
     }
 

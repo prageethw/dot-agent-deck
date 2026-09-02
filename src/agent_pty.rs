@@ -378,13 +378,24 @@ pub const CWD_MAX_LEN: usize = 4096;
 /// (bytes < 0x20 plus 0x7F DEL), and free of Unicode general-category `Cf`
 /// format characters (bidi overrides/isolates, zero-width marks, the tag
 /// block — see [`crate::untrusted_text::is_bidi_format_char`]). Ordinary
-/// Unicode beyond 0x7F (accents, CJK, emoji) is allowed so the user can
-/// type UTF-8 names. Rejects values containing ANSI escapes, NUL,
-/// newlines, carriage returns, a `U+202E` RIGHT-TO-LEFT OVERRIDE, etc. —
-/// anything that could perturb or spoof the TUI render path when echoed
-/// back via `list_agents` (issue #562: `char::is_control()` alone does not
-/// catch `Cf`, so a bidi override previously survived this gate on the
-/// rename path even though the byte-level control check passed).
+/// Unicode beyond 0x7F (accents, CJK) is allowed so the user can type UTF-8
+/// names. Rejects values containing ANSI escapes, NUL, newlines, carriage
+/// returns, a `U+202E` RIGHT-TO-LEFT OVERRIDE, etc. — anything that could
+/// perturb or spoof the TUI render path when echoed back via `list_agents`
+/// (issue #562: `char::is_control()` alone does not catch `Cf`, so a bidi
+/// override previously survived this gate on the rename path even though
+/// the byte-level control check passed).
+///
+/// **Deliberate consequence, not an oversight (issue #562 M1):** `U+200D`
+/// ZERO WIDTH JOINER — the glue in every ZWJ emoji sequence (👨‍💻, family/
+/// profession emoji, 🏳️‍🌈) — is itself `Cf`, so a name containing one is
+/// now rejected. A rename to such a name fails silently: `RenameOutcome`
+/// resolves to `Rejected`, which is documented elsewhere as an intentional
+/// no-op, so the user sees nothing happen. This project's blanket `Cf`
+/// rejection policy (matching `untrusted_text`/`terminal_sanitize`
+/// elsewhere) is taken to be the right call even at this cost, rather than
+/// maintaining an exception list for "the ZWJ sequences we thought of" —
+/// see `dashboard/agent-badge/009`'s ZWJ case for the pinned behavior.
 pub fn is_valid_display_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= DISPLAY_NAME_MAX_LEN
@@ -9018,6 +9029,15 @@ mod tests {
         // A genuinely ordinary Unicode name (accents, CJK) must still pass —
         // the tightening targets `Cf` specifically, not "any non-ASCII".
         assert!(is_valid_display_name("café-агент-日本語"));
+        // Issue #562 M1: U+200D ZERO WIDTH JOINER is itself `Cf`, so a name
+        // containing a ZWJ emoji sequence (the "technologist" emoji, glued
+        // from a person + ZWJ + laptop) is now rejected too — a deliberate
+        // consequence of the blanket-Cf policy, pinned here rather than left
+        // to whichever test happens to feed one first.
+        assert!(
+            !is_valid_display_name("agent-\u{1f468}\u{200d}\u{1f4bb}"),
+            "a name containing a ZWJ emoji sequence must fail validation (Cf policy, issue #562 M1)"
+        );
     }
 
     /// Round-12 auditor #2: orchestration_cwd must be validated.

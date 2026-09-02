@@ -1821,6 +1821,93 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
     );
 }
 
+/// Scenario: Drive a `ToolStart` `AgentEvent` whose `tool_detail` embeds a
+/// Unicode `Cf` format character (U+202E RIGHT-TO-LEFT OVERRIDE) through the
+/// real `AppState::apply_event` seam, render the card, and confirm the raw
+/// bidi character does not appear anywhere in the rendered buffer.
+///
+/// Issue #562 gap 2, round 2 (reviewer B1, auditor A1): the tool line
+/// (`recent_tool_lines` in `src/ui.rs`) is the actual render seam for
+/// `tool_name`/`tool_detail` — `session.active_tool` has no render site at
+/// all — so this is the render-level half of the twin-test pattern
+/// `dashboard/agent-badge/006`/`007` already established for `model` and
+/// `display_name`; `dashboard/agent-badge/011` (`src/state.rs`) is the
+/// matching ingest-level half for this field.
+#[spec("dashboard/agent-badge/012")]
+#[test]
+fn agent_badge_012_tool_detail_with_format_chars_is_sanitized_in_render() {
+    let mut state = AppState::default();
+    state.register_pane("pane-badge-tool".to_string());
+    let started = chrono::Utc::now();
+
+    state.apply_event(AgentEvent {
+        session_id: "tool-cf-id-01".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-badge-tool".to_string()),
+        agent_id: Some("agent-badge-tool".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
+    state.apply_event(AgentEvent {
+        session_id: "tool-cf-id-01".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::ToolStart,
+        tool_name: Some("Bash".to_string()),
+        tool_detail: Some("rm -rf /\u{202e}-evil".to_string()),
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-badge-tool".to_string()),
+        agent_id: Some("agent-badge-tool".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
+    let session = state
+        .sessions
+        .get("tool-cf-id-01")
+        .expect("the session exists after SessionStart")
+        .clone();
+
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let buffer = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text = buffer_to_text(&buffer);
+
+    assert!(
+        text.contains("Bash"),
+        "the tool line must still render the (unhostile) tool name:\n{text}"
+    );
+    assert!(
+        !text.contains('\u{202e}'),
+        "a Cf format char (U+202E RIGHT-TO-LEFT OVERRIDE) in tool_detail must \
+         not reach the rendered tool line unsanitized:\n{text}"
+    );
+}
+
 /// Scenario: issue #650, reviewer round 2 (R2) — construct a session shaped
 /// like a Codex pane whose "Starting…" placeholder has already resolved
 /// (issue #549 / PR #641's `is_empty_placeholder` shape:
