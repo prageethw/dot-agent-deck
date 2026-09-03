@@ -60,6 +60,7 @@
 # below, whose own comments warn that a rename makes them match nothing.
 [test-groups]
 orchestration-remit = { max-threads = 1 }
+pty-e2e = { max-threads = 2 }
 
 [[profile.default.overrides]]
 filter = 'test(/^orchestration_remit_/)'
@@ -367,8 +368,6 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 # it is red. It applies to local `cargo test-e2e` too, which is the same direction
 # CLAUDE.md rule 5 already pushes — the L2 tier is what starved the contributor
 # machine that prompted moving this tier into CI at all.
-[test-groups]
-pty-e2e = { max-threads = 2 }
 
 [[profile.default.overrides]]
 filter = 'binary(/^e2e_/) - test(/^common::harness_unit_tests::/)'
