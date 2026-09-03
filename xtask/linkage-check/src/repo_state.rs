@@ -1638,7 +1638,19 @@ mod real_git {
     /// The environment variables through which git's *location* discovery can
     /// be steered from outside the process (issue #834) — the location-side
     /// counterparts of the `GIT_CONFIG_*` pair, and every one of them
-    /// outranks the `current_dir` a fixture invocation passes.
+    /// outranks the `current_dir` a fixture invocation passes. The last two,
+    /// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`, close a second, distinct
+    /// channel (issue #579 reviewer F6 / auditor A2): git also accepts config
+    /// *values* — including `core.hooksPath` — directly from
+    /// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`+`GIT_CONFIG_KEY_<n>`/
+    /// `GIT_CONFIG_VALUE_<n>`, bypassing `GIT_CONFIG_NOSYSTEM`/
+    /// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` entirely. Removing
+    /// `GIT_CONFIG_COUNT` alone is sufficient to neutralize the numbered
+    /// `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs too, since git only
+    /// reads and parses them when `GIT_CONFIG_COUNT` is present. Both are
+    /// vars git itself sets ambiently in a `pre-commit` hook and in
+    /// `git rebase --exec` children (verified on git 2.55) — two of this
+    /// module's three named threat-model contexts.
     ///
     /// Cleared rather than overridden, because for each of these "unset" *is*
     /// the default git behaviour — measured: with `GIT_DIR` aimed at another
@@ -1662,13 +1674,22 @@ mod real_git {
         // upward walk cross a mount point, which is one of the two things
         // that bound it at all.
         "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
     ];
 
     /// A throwaway tree of repositories under a `tempfile::tempdir()`.
     ///
     /// Every *fixture* command runs with the ambient git environment switched
     /// off, in three groups, because the claim below needs all three and used
-    /// to rest on only the first (issue #834):
+    /// to rest on only the first (issue #834). The location group also closes
+    /// a distinct config-injection channel (issue #579): a parent process (a
+    /// pre-commit hook, `git rebase --exec`, `git bisect run`) can leave
+    /// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` set ambiently before
+    /// spawning the test binary, and those bypass `GIT_CONFIG_NOSYSTEM`/
+    /// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` entirely — see
+    /// [`AMBIENT_LOCATION_VARS`]'s own doc for why they are cleared alongside
+    /// the location vars rather than as a fourth group.
     ///
     /// - **Configuration** — `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` pointed
     ///   at a path that does not exist, `HOME` and `XDG_CONFIG_HOME` inside
@@ -1769,18 +1790,14 @@ mod real_git {
             self.root.parent().unwrap_or(&self.root)
         }
 
-        /// Runs a fixture git command and hands back its raw [`Output`],
-        /// failure included.
-        ///
-        /// Split out of [`Sandbox::git`] so a test can drive an invocation
-        /// that is *expected to fail*: the ceiling's effect is only observable
-        /// on a command that must not find a repository, and the asserting
-        /// wrapper cannot express that.
-        fn try_git(&self, cwd: &Path, args: &[&str]) -> Output {
+        /// Builds (without running) the fixture-isolated [`Command`] a call
+        /// to [`Sandbox::git`] would run — same env, not yet given `args` or
+        /// `.output()`'d. Split out so a test can assert on the env
+        /// directly (`Command::get_envs()`) instead of only on the effect a
+        /// specific ambient var happens to have on a specific invocation.
+        fn command(&self, cwd: &Path) -> Command {
             let mut cmd = Command::new("git");
-            cmd.args(args)
-                .current_dir(cwd)
-                // Ambient configuration.
+            cmd.current_dir(cwd)
                 .env("HOME", self.at("home"))
                 .env("XDG_CONFIG_HOME", self.at("home/.config"))
                 .env("GIT_CONFIG_GLOBAL", self.at("no-such-gitconfig"))
@@ -1800,7 +1817,20 @@ mod real_git {
             for var in AMBIENT_LOCATION_VARS {
                 cmd.env_remove(var);
             }
-            cmd.output()
+            cmd
+        }
+
+        /// Runs a fixture git command and hands back its raw [`Output`],
+        /// failure included.
+        ///
+        /// Split out of [`Sandbox::git`] so a test can drive an invocation
+        /// that is *expected to fail*: the ceiling's effect is only observable
+        /// on a command that must not find a repository, and the asserting
+        /// wrapper cannot express that.
+        fn try_git(&self, cwd: &Path, args: &[&str]) -> Output {
+            self.command(cwd)
+                .args(args)
+                .output()
                 .unwrap_or_else(|e| panic!("failed to invoke `git {}`: {e}", args.join(" ")))
         }
 
@@ -2467,5 +2497,123 @@ mod real_git {
              invocation is the one that must be named: {err}"
         );
         assert!(run(&bare).is_empty());
+    }
+
+    /// **Read/write escape — issue #579.** `Sandbox::git()` neutralizes git's
+    /// *config* discovery (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`) but, as of
+    /// this test, leaves its *location* discovery ambient: `GIT_DIR` and
+    /// `GIT_WORK_TREE` set in the parent process — exactly what a pre-commit
+    /// hook, `git rebase --exec`, or `git bisect run` legitimately leaves
+    /// behind before spawning a test binary — steer every `git` invocation
+    /// straight past `cwd` and onto whatever repo those vars name, no matter
+    /// which fixture directory `Sandbox::git()` is told to run in.
+    ///
+    /// Demonstrates both directions with a throwaway `ambient` repo standing
+    /// in for "the real checkout" a parent process's `GIT_DIR`/`GIT_WORK_TREE`
+    /// might point at, so this test cannot itself touch anything outside the
+    /// sandbox tempdir: a `rev-parse HEAD` run "in" `fixture` must return
+    /// `fixture`'s own HEAD, not `ambient`'s (read escape), and a `commit`
+    /// run "in" `fixture` must land there rather than silently moving
+    /// `ambient`'s HEAD (write escape) — asserted both ways: `fixture`'s own
+    /// HEAD must have actually advanced (positive; catches a commit that
+    /// silently went nowhere at all) *and* `ambient`'s HEAD must be
+    /// unchanged (negative; catches it landing in the wrong repo).
+    #[test]
+    fn sandbox_git_ignores_ambient_git_dir_and_git_work_tree() {
+        let sb = Sandbox::new();
+
+        let fixture = sb.at("fixture");
+        fs::create_dir_all(&fixture).expect("mkdir fixture");
+        sb.git(&fixture, &["init", "-q", "-b", "main"]);
+        sb.git(
+            &fixture,
+            &["commit", "-q", "--allow-empty", "-m", "fixture first"],
+        );
+        let fixture_head = sb.git(&fixture, &["rev-parse", "HEAD"]);
+
+        let ambient = sb.at("ambient");
+        fs::create_dir_all(&ambient).expect("mkdir ambient");
+        sb.git(&ambient, &["init", "-q", "-b", "main"]);
+        sb.git(
+            &ambient,
+            &["commit", "-q", "--allow-empty", "-m", "ambient first"],
+        );
+        let ambient_head_before = sb.git(&ambient, &["rev-parse", "HEAD"]);
+
+        // `cargo-nextest` runs each test in its own process, so mutating the
+        // process environment here cannot bleed into any other test.
+        unsafe {
+            std::env::set_var("GIT_DIR", ambient.join(".git"));
+            std::env::set_var("GIT_WORK_TREE", &ambient);
+        }
+        let head_seen_from_fixture = sb.git(&fixture, &["rev-parse", "HEAD"]);
+        sb.git(
+            &fixture,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "escape via ambient GIT_DIR/GIT_WORK_TREE",
+            ],
+        );
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+            std::env::remove_var("GIT_WORK_TREE");
+        }
+
+        let ambient_head_after = sb.git(&ambient, &["rev-parse", "HEAD"]);
+        let fixture_head_after = sb.git(&fixture, &["rev-parse", "HEAD"]);
+
+        assert_eq!(
+            head_seen_from_fixture,
+            fixture_head,
+            "ambient GIT_DIR/GIT_WORK_TREE steered `git rev-parse HEAD` run in {} onto a \
+             different repository: got {head_seen_from_fixture}, wanted the fixture's own \
+             HEAD {fixture_head} — this is the read escape issue #579 describes",
+            fixture.display()
+        );
+        assert_ne!(
+            fixture_head_after, fixture_head,
+            "a commit run \"in\" the fixture while GIT_DIR/GIT_WORK_TREE ambiently pointed \
+             at `ambient` left the fixture's own HEAD at {fixture_head_after} — unchanged from \
+             before the commit — instead of advancing it; a vacuous negative-only write-escape \
+             assertion (ambient unmoved) would not catch the commit having landed nowhere at \
+             all rather than in the fixture"
+        );
+        assert_eq!(
+            ambient_head_after, ambient_head_before,
+            "a commit run \"in\" the fixture while GIT_DIR/GIT_WORK_TREE ambiently pointed \
+             at `ambient` moved ambient's HEAD from {ambient_head_before} to \
+             {ambient_head_after} instead of staying confined to the fixture — this is the \
+             write escape issue #579 describes"
+        );
+    }
+
+    /// Issue #579 reviewer F1 / auditor A4: `sandbox_git_ignores_ambient_…`
+    /// above only ever exercises `GIT_DIR`/`GIT_WORK_TREE` — the other eight
+    /// vars [`Sandbox::git`] clears (six original + the two
+    /// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` config-injection vars
+    /// added for #579) are unpinned: deleting any one of the corresponding
+    /// `env_remove` calls would not turn any existing test red. Pins them
+    /// directly against the `Command` [`Sandbox::command`] builds, the same
+    /// way `list_tests.rs`'s `git_command_clears_all_git_location_env_vars`
+    /// pins its own (unrelated, #344) var list — no spawn needed, since
+    /// `Command::get_envs()` reports each `env_remove`'d variable as
+    /// `(key, None)`.
+    #[test]
+    fn sandbox_command_clears_all_location_and_config_injection_env_vars() {
+        let sb = Sandbox::new();
+        let cmd = sb.command(&sb.at("fixture"));
+        for var in AMBIENT_LOCATION_VARS {
+            let removed = cmd
+                .get_envs()
+                .any(|(k, v)| k == std::ffi::OsStr::new(var) && v.is_none());
+            assert!(
+                removed,
+                "expected {var} to be explicitly removed, got envs: {:?}",
+                cmd.get_envs().collect::<Vec<_>>()
+            );
+        }
     }
 }
