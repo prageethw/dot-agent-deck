@@ -680,9 +680,21 @@ mod tests {
                 first_prompts: Vec::new(),
                 last_user_prompt: None,
                 live_target: None,
+                shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
+                wait_deferred_revert: false,
+                model: None,
                 last_activity_ms: None,
+                agent_report_activity_seen: false,
             }),
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
         }
     }
 

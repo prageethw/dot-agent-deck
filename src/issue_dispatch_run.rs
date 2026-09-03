@@ -6368,7 +6368,8 @@ exit 0
         let dirty = tmp.path().join("repo-dispatch-dirty");
         init_repo_with_worktree(&repo, &dirty);
         std::fs::write(dirty.join("scratch.txt"), "work").unwrap();
-        let outcome = remove_worktree(&dirty, &repo, RemovalPolicy::KeepIfDirty, "test:remover").await;
+        let outcome =
+            remove_worktree(&dirty, &repo, RemovalPolicy::KeepIfDirty, "test:remover").await;
         assert_eq!(
             outcome,
             RemoveOutcome::Kept(crate::event::KeptReason::Dirty)

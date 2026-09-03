@@ -226,6 +226,7 @@ fn workflow_start_options(
         // Desktop workflow coordinators always use the acknowledged delivery
         // path below. Pi coordinators are rejected before this builder runs.
         seed: None,
+        isolated_clone_origin: None,
     }
 }
 

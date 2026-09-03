@@ -371,7 +371,6 @@ fn inject_clear_session_start(
     );
 }
 
-
 /// Open the orchestration, write and launch the orchestrator's synthetic
 /// script, and confirm the spawn-time remit pointer lands once. Returns the
 /// daemon socket path, the start role's `(pane_id, agent_id)`, the log path

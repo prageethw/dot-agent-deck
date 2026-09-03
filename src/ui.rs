@@ -2943,7 +2943,7 @@ fn send_retry_base() -> std::time::Duration {
 /// `cfg(any(test, debug_assertions))`, fixed at [`SEND_RETRY_BASE_MS`]
 /// otherwise — so the exponential shape and [`SEND_RETRY_BACKOFF_CAP`] stay
 /// untouched regardless of which floor is in effect.
-fn send_retry_delay(attempts: u32) -> std::time::Duration {
+pub fn send_retry_delay(attempts: u32) -> std::time::Duration {
     let shift = attempts.saturating_sub(1).min(6);
     send_retry_base()
         .saturating_mul(1u32 << shift)
@@ -3705,7 +3705,11 @@ pub(crate) fn orchestration_layout_percents(stage: SplitStage, zoomed: bool) -> 
     if zoomed {
         (0, 100)
     } else {
-        split_stage_percents(stage, ORCHESTRATION_LEFT_PERCENT, ORCHESTRATION_PANES_PERCENT)
+        split_stage_percents(
+            stage,
+            ORCHESTRATION_LEFT_PERCENT,
+            ORCHESTRATION_PANES_PERCENT,
+        )
     }
 }
 
@@ -17358,10 +17362,8 @@ fn compute_frame_layout(
             // drawn whatever `Ctrl+t` is set to. Both halves are resolved here,
             // once, and carried in `FrameContent::Cards`; see the Orchestration
             // arm below for why that matters (PRD #84 invariant 1).
-            let (left_percent, panes_percent) = dashboard_layout_percents(
-                ACTIVE_SPLIT_STAGE.with(|c| c.get()),
-                *zoomed,
-            );
+            let (left_percent, panes_percent) =
+                dashboard_layout_percents(ACTIVE_SPLIT_STAGE.with(|c| c.get()), *zoomed);
             let pane_layout = if *zoomed {
                 PaneLayout::Stacked
             } else {
@@ -17396,10 +17398,8 @@ fn compute_frame_layout(
             // place zoom touches geometry. The role panes' PTYs follow from the
             // same rects through `pane_target_dims`, so the agent reflows to the
             // new width with no spawn-site or resize-site plumbing of its own.
-            let (left_percent, panes_percent) = orchestration_layout_percents(
-                ACTIVE_SPLIT_STAGE.with(|c| c.get()),
-                *zoomed,
-            );
+            let (left_percent, panes_percent) =
+                orchestration_layout_percents(ACTIVE_SPLIT_STAGE.with(|c| c.get()), *zoomed);
             // PRD #313 M1 — the EFFECTIVE pane layout for this frame. Zoom's
             // promise is "the focused agent gets the frame and everything else
             // gets out of the way", and the second half of that is false under
@@ -34562,9 +34562,9 @@ mod tests {
     /// drains it — and check what lands in `ui.session_warnings`. Pins that
     /// the delivered message names the retained worktree's path, not just
     /// that "a worktree was kept" somewhere.
-    #[spec("dispatch/close/004")]
+    #[spec("dispatch/close/002")]
     #[test]
-    fn dispatch_close_004_kept_worktree_notice_names_the_retained_path() {
+    fn dispatch_close_002_kept_worktree_notice_names_the_retained_path() {
         let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
         let mut ui = default_ui();
 

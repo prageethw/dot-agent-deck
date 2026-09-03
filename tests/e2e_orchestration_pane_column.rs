@@ -672,9 +672,9 @@ fn role_border_title_marked(grid: &str, role: &str) -> bool {
 /// agent is still registered and running behind the zoom. A second press restores
 /// the 34/66 split with the other roles' sidebar cards — and `beta`'s live
 /// hook-driven `Working` status — visible again.
-#[spec("tabs/orchestration/011")]
+#[spec("tabs/orchestration/018")]
 #[test]
-fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
+fn orchestration_018_z_zooms_the_focused_role_pane_in_command_mode() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-focus-lifecycle");
@@ -716,9 +716,10 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
     // fails the test. Narrowing it to the border title would make it harder to
     // trip and so WEAKEN the check; a spoofed display name could only ever
     // cause a false FAILURE here, never a false pass.
-    let zoomed_in_pane_input = deck
-        .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
-            find_pane_box_left_edge(grid, "orchestrator").is_some_and(|e| e <= 1) || grid.contains(ZOOM_MARKER)
+    let zoomed_in_pane_input =
+        deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+            find_pane_box_left_edge(grid, "orchestrator").is_some_and(|e| e <= 1)
+                || grid.contains(ZOOM_MARKER)
         });
     assert!(
         !zoomed_in_pane_input,
@@ -735,7 +736,8 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
     deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
     let zoomed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        find_pane_box_left_edge(grid, "orchestrator") == Some(0) && role_border_title_marked(grid, "orchestrator")
+        find_pane_box_left_edge(grid, "orchestrator") == Some(0)
+            && role_border_title_marked(grid, "orchestrator")
     });
     assert!(
         zoomed,
@@ -869,9 +871,9 @@ fn directive_is_answered(
 /// repeat with a `.log` file, proving it reflows back down just as well. Uses a
 /// cheap model and two short turns; self-skips where the CLI or credentials are
 /// absent.
-#[spec("tabs/orchestration/012")]
+#[spec("tabs/orchestration/019")]
 #[test]
-fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
+fn orchestration_019_real_agent_reflows_across_a_zoom_round_trip() {
     // A missing CLI or credentials is an environmental condition, not a broken
     // test (Decision 26).
     skip_unless!(common::check_claude_available());

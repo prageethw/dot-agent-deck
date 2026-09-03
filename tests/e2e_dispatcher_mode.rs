@@ -1648,9 +1648,9 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
 /// control close of a caller pane that owns no worktree must say nothing of the
 /// sort; and after confirming, the status line must repeat the path and the
 /// directory must still be on disk.
-#[spec("dispatch/close/002")]
+#[spec("dispatch/close/004")]
 #[test]
-fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_close() {
+fn dispatch_close_004_a_kept_dirty_worktree_is_announced_before_and_after_the_close() {
     const UNIT: &str = "keep-probe";
     /// The single-agent dispatch labels its card with the task name.
     const CARD: &str = "dispatch-keep-probe";
