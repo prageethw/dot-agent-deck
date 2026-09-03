@@ -4,7 +4,8 @@ expression: unzoomed
 ---
  orchestration                                                                                      
  dot-agent-deck — 2 session(s)    ┏orchestrator━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┏ ▸ 1 ClaudeCode · orche… ● Idle ┓┃                                                                ┃
+┏ ▸ 1 ━━━━━━━━━━━━━━━━━━━ ● Idle ┓┃                                                                ┃
+┃orchestrator                    ┃┃                                                                ┃
 ┃Dir:  —                         ┃┃                                                                ┃
 ┃                                ┃┃                                                                ┃
 ┃                                ┃┃                                                                ┃
@@ -12,11 +13,10 @@ expression: unzoomed
 ┃                                ┃┃                                                                ┃
 ┃                                ┃┃                                                                ┃
 ┃                                ┃┃                                                                ┃
-┃                                ┃┃                                                                ┃
 ┗━━━━━━━━━━━━ Last: 2h  Tools: 0 ┛┃                                                                ┃
-┌ 2 ClaudeCode · worker ─ ● Idle ┐┃                                                                ┃
+┌ 2 ───────────────────── ● Idle ┐┃                                                                ┃
+│worker                          │┃                                                                ┃
 │Dir:  —                         │┃                                                                ┃
-│                                │┃                                                                ┃
 │                                │┃                                                                ┃
 │                                │┃                                                                ┃
 │                                │┃                         Ctrl+D to type                         ┃
