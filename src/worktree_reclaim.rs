@@ -3225,7 +3225,7 @@ mod tests {
     }
 
     /// The half of injectivity a hand-rolled `\xNN` escape usually forgets, and
-    /// which `worktree/reclaim/024` cannot cheaply reach: a directory whose name
+    /// which `worktree/reclaim/026` cannot cheaply reach: a directory whose name
     /// literally contains the four ASCII characters `\`, `x`, `F`, `F` must not
     /// render the same as one holding the single raw byte `0xFF`. Escaping only
     /// the invalid bytes and leaving a literal backslash alone relocates the
