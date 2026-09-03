@@ -398,7 +398,28 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// "daemon rejected the request" rather than silently behaving as though no
 /// claim exists, which is the intentionally loud failure mode for a
 /// same-wire safety check. See `changelog.d/201.breaking.md`.
-pub const PROTOCOL_VERSION: u32 = 10;
+///
+/// Fork-only 2026-09-03 Stage B rebase bumps 10 → 11. The paragraph above
+/// ("Issue #717 bumped 7 → 8 ... `AttachRequest::DispatchWorktreeClosePreview`")
+/// is upstream's own doc-comment prose, merged into this file verbatim as
+/// part of the same rebase because it is unformatted text, not code — it
+/// describes upstream's independent counter, not this fork's. The two
+/// version lines are not one number line: upstream's issue #717 bumped
+/// upstream's own `PROTOCOL_VERSION` from 7 to 8 for this and one other
+/// change, on upstream's own history. This fork's counter reached 10
+/// (issue #201, above) along a completely different sequence of bumps and
+/// had never bumped for this variant — `DispatchWorktreeClosePreview` did
+/// not exist anywhere in this fork's tree before this rebase merged it in
+/// for the first time. So the variant landing here now is squarely the
+/// module doc's first bullet ("new `AttachRequest` variants"), independent
+/// of what upstream numbered its own equivalent bump. `AttachRequest` has
+/// no `#[serde(other)]` catch-all (same as issue #201's reasoning above), so
+/// an older fork daemon receiving `DispatchWorktreeClosePreview` fails to
+/// deserialize the externally-tagged enum entirely and returns a
+/// malformed-request error rather than silently mishandling the close
+/// preview. See `docs/develop/fork-sync-workflow.md`'s 2026-09-03 Stage B
+/// section for the full decision record.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
