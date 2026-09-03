@@ -146,14 +146,8 @@ fn non_utf8_path(parent: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Run `f`, expecting it to panic, and return the panic message.
-///
-/// The default hook is muted for the duration so an EXPECTED panic does not
-/// print a scary backtrace inside a passing test.
 fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let payload = std::panic::catch_unwind(f);
-    std::panic::set_hook(previous);
 
     let payload = payload.expect_err("the call must panic, not return");
     payload

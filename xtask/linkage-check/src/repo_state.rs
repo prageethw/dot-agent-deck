@@ -1978,6 +1978,14 @@ mod real_git {
             )
             .env("GIT_NAMESPACE", "escape")
             .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
+            // Placeholder ambient config-injection payload (issue #579): the
+            // value need not be realistic, only received — see
+            // `ambient_location_child`'s vacuity guard.
+            .env("GIT_CONFIG_COUNT", "1")
+            .env(
+                "GIT_CONFIG_PARAMETERS",
+                "'ambient.attacker=injected-config-value'",
+            )
             .env("GIT_CEILING_DIRECTORIES", &victim)
             .output()
             .expect("re-exec this test binary");
