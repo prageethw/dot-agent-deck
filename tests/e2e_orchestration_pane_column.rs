@@ -672,9 +672,9 @@ fn role_border_title_marked(grid: &str, role: &str) -> bool {
 /// agent is still registered and running behind the zoom. A second press restores
 /// the 34/66 split with the other roles' sidebar cards — and `beta`'s live
 /// hook-driven `Working` status — visible again.
-#[spec("tabs/orchestration/011")]
+#[spec("tabs/orchestration/018")]
 #[test]
-fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
+fn orchestration_018_z_zooms_the_focused_role_pane_in_command_mode() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-focus-lifecycle");
@@ -871,9 +871,9 @@ fn directive_is_answered(
 /// repeat with a `.log` file, proving it reflows back down just as well. Uses a
 /// cheap model and two short turns; self-skips where the CLI or credentials are
 /// absent.
-#[spec("tabs/orchestration/012")]
+#[spec("tabs/orchestration/019")]
 #[test]
-fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
+fn orchestration_019_real_agent_reflows_across_a_zoom_round_trip() {
     // A missing CLI or credentials is an environmental condition, not a broken
     // test (Decision 26).
     skip_unless!(common::check_claude_available());

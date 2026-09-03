@@ -35508,9 +35508,9 @@ mod tests {
     /// drains it — and check what lands in `ui.session_warnings`. Pins that
     /// the delivered message names the retained worktree's path, not just
     /// that "a worktree was kept" somewhere.
-    #[spec("dispatch/close/004")]
+    #[spec("dispatch/close/002")]
     #[test]
-    fn dispatch_close_004_kept_worktree_notice_names_the_retained_path() {
+    fn dispatch_close_002_kept_worktree_notice_names_the_retained_path() {
         let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
         let mut ui = default_ui();
 
