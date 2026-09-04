@@ -399,7 +399,14 @@ fn resolve_worktree_owner(
 /// `local_hostname()`. Never panics, never shells out to anything other than
 /// `gh` — a failure resolves `Unknown` with a stated reason rather than
 /// crashing `worktree list`.
-fn resolve_human_owner() -> WorktreeOwner {
+///
+/// `pub`, not private (issue #300 blocker 1): `run_worktree_list_cli`
+/// (`src/main.rs`) needs this same resolution to fall back to a human
+/// identity when `DOT_AGENT_DECK_WORKTREE_OWNER` is absent, and `src/main.rs`
+/// is a separate binary crate that only sees this crate's `pub` surface —
+/// `pub(crate)` would not cross that boundary, matching why `is_mine` and
+/// `owner_disagreements` above are already `pub` rather than `pub(crate)`.
+pub fn resolve_human_owner() -> WorktreeOwner {
     let host = crate::issue_dispatch_run::local_hostname();
     match crate::issue_claim::resolve_gh_login() {
         Ok(login) => WorktreeOwner::Human { login, host },
@@ -672,8 +679,17 @@ pub fn owner_disagreements<'a>(reports: &'a [WorktreeReport], owner: &str) -> Ve
 /// Extracted (issue #221 review round) so `run_worktree_list_cli`'s retain
 /// and its test share one definition instead of two independently typed
 /// copies of the same predicate that could silently drift apart.
+///
+/// Issue #300 blocker 2: `owned` alone can never be true for an unmarked,
+/// human-owned row (a hand-made worktree writes no marker at all — see
+/// [`resolve_worktree_owner`]), so an unconditional `owned &&` conjunct
+/// structurally excludes every human row regardless of how correctly
+/// `owner_filter` resolves an identity. A human row (`owner_kind == "human"`)
+/// is matchable by owner string alone; an agent row still requires `owned`
+/// (PR #215's fail-closed guard against a marker-forged claim stays intact —
+/// `owned` is never relaxed for `owner_kind == "agent"`).
 pub fn is_mine(report: &WorktreeReport, owner: &str) -> bool {
-    report.owned && report.owner.as_deref() == Some(owner)
+    (report.owned || report.owner_kind == "human") && report.owner.as_deref() == Some(owner)
 }
 
 /// Formats the issue #221 disagreement warning printed by `--mine` before
@@ -8529,6 +8545,48 @@ mod tests {
             "gh must never be spawned at all when the slug guard refuses -- the marker's \
              presence would prove resolve_pr_state ran (and thus that the untrusted attacker \
              slug was queried) before the guard's refusal short-circuited it"
+        );
+    }
+
+    /// Scenario: Issue #300 blocker 2. `is_mine`'s `owned &&` conjunct
+    /// (PR #215 round-1 reviewer F4 / auditor L1 item 3, deliberately
+    /// fail-closed against a marker-forged agent row) structurally excludes
+    /// every human-owned row, since a human-made worktree has no marker at
+    /// all and so always resolves `owned: false` -- even once `owner_filter`
+    /// correctly derives a human identity to filter on (issue #300 blocker
+    /// 1, `worktree/reclaim/084`). A `WorktreeReport` standing in for an
+    /// unmarked, human-owned worktree (`owned: false`, `owner_kind:
+    /// "human"`, `owner: Some("human:alice@laptop")`) must satisfy
+    /// `is_mine(&report, "human:alice@laptop")` -- it does not today, since
+    /// `owned` alone vetoes the row regardless of whether `owner` matches.
+    #[spec("worktree/reclaim/085")]
+    #[test]
+    fn worktree_reclaim_085_is_mine_matches_an_unmarked_human_owned_row() {
+        let report = WorktreeReport {
+            path: PathBuf::from("/repo/wt-human"),
+            branch: Some("feat/human".to_string()),
+            clean: true,
+            owned: false,
+            owner: Some("human:alice@laptop".to_string()),
+            owner_kind: "human".to_string(),
+            owner_reason: None,
+            pr_state: "open".to_string(),
+            verdict: "ask".to_string(),
+            reason: Some("foreign".to_string()),
+            pinned: false,
+            kind: KIND_LINKED.to_string(),
+            real_path: PathBuf::from("/repo/wt-human"),
+            removed_by: None,
+        };
+
+        assert!(
+            is_mine(&report, "human:alice@laptop"),
+            "an unmarked, human-owned worktree whose resolved identity matches the filter must \
+             satisfy `is_mine` -- `owned` answers a DIFFERENT question (may a bare `reclaim` \
+             remove this with no prompt?) than \"does this belong to the caller?\" does, and \
+             conjoining them onto `is_mine` structurally excludes every human row, however \
+             correctly `owner_filter` resolves an identity (issue #300 blocker 2); got: {}",
+            is_mine(&report, "human:alice@laptop")
         );
     }
 }
