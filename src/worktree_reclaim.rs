@@ -1502,11 +1502,18 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 /// checkout with no default set.
 ///
 /// Matches results on `headRefName` AND `headRepositoryOwner.login` matching
-/// `expected_owner` — the owner half of the SAME remote's own slug that
-/// `repo_slug` was derived from (issue #144 finding 2): `headRefName` alone
-/// is not namespaced by head repository owner, so a merged PR opened from a
-/// DIFFERENT fork with the same head branch name would otherwise be
-/// attributed to an unrelated local branch of that name. The owner
+/// ANY of `acceptable_owners` (issue #144 finding 2, widened by issue #191
+/// F1/A3): for an `origin` query this is a single-element slice (`origin`'s
+/// own owner); for the `upstream` fallback it is TWO owners — `origin`'s and
+/// `upstream`'s — because a PR opened FROM this fork AGAINST upstream
+/// carries `headRepositoryOwner.login` equal to `origin`'s own owner, not
+/// `upstream`'s (the head repository is the fork, not the base), and both
+/// shapes are real (reviewer's 10-PR sample: 6 cross-fork, 4 same-repo).
+/// Still a bounded allowlist of owners this checkout is genuinely attached
+/// to via one of its own remotes, never a wildcard — `headRefName` alone is
+/// not namespaced by head repository owner, so a merged PR opened from a
+/// DIFFERENT, unrelated fork with the same head branch name would otherwise
+/// be attributed to an unrelated local branch of that name. The owner
 /// comparison is ASCII-case-insensitive (issue #144 finding 3 / NEW-1):
 /// GitHub logins are case-insensitive and ASCII-only, so a case-variant
 /// remote (`PrageethW` vs. the canonical `prageethw` `gh` returns) must
@@ -1522,11 +1529,16 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 /// must be reported as `Unresolvable` naming the real cause, never as `NoPr`
 /// — `NoPr`'s "no pull request found for this branch" is false when a PR
 /// with that head ref genuinely exists and was found; it only wasn't
-/// confirmed as this remote's own. Zero `headRefName` matches at all resolve
-/// to `NoPr` (genuinely no PR exists on THIS remote); more than one
-/// surviving owner match resolves to `Unresolvable` (ambiguous), never
-/// guessing.
-fn query_pr_state(repo_dir: &Path, branch: &str, repo_slug: &str, expected_owner: &str) -> PrState {
+/// confirmed as one of the acceptable owners' own. Zero `headRefName`
+/// matches at all resolve to `NoPr` (genuinely no PR exists on THIS remote);
+/// more than one surviving owner match resolves to `Unresolvable`
+/// (ambiguous), never guessing.
+fn query_pr_state(
+    repo_dir: &Path,
+    branch: &str,
+    repo_slug: &str,
+    acceptable_owners: &[&str],
+) -> PrState {
     let out = Command::new("gh")
         .current_dir(repo_dir)
         .args([
@@ -1568,14 +1580,19 @@ fn query_pr_state(repo_dir: &Path, branch: &str, repo_slug: &str, expected_owner
             v.get("headRepositoryOwner")
                 .and_then(|o| o.get("login"))
                 .and_then(|l| l.as_str())
-                .is_some_and(|login| login.eq_ignore_ascii_case(expected_owner))
+                .is_some_and(|login| {
+                    acceptable_owners
+                        .iter()
+                        .any(|owner| login.eq_ignore_ascii_case(owner))
+                })
         })
         .collect();
     match (owner_matches.as_slice(), name_matches.as_slice()) {
         ([], []) => PrState::NoPr,
         ([], _) => PrState::Unresolvable(format!(
-            "{} pull request(s) match branch {branch:?} but none has headRepositoryOwner \
-             {expected_owner:?} — the head repository owner could not be confirmed",
+            "{} pull request(s) match branch {branch:?} but none has a headRepositoryOwner \
+             matching any of {acceptable_owners:?} — the head repository owner could not be \
+             confirmed",
             name_matches.len()
         )),
         ([one], _) => match one.get("state").and_then(|s| s.as_str()) {
@@ -1592,7 +1609,8 @@ fn query_pr_state(repo_dir: &Path, branch: &str, repo_slug: &str, expected_owner
             None => PrState::Unresolvable("PR entry has no `state` field".to_string()),
         },
         _ => PrState::Unresolvable(format!(
-            "{} pull requests matched branch {branch:?} and owner {expected_owner:?}",
+            "{} pull requests matched branch {branch:?} and an acceptable owner in \
+             {acceptable_owners:?}",
             owner_matches.len()
         )),
     }
@@ -1608,13 +1626,52 @@ fn slug_owner(repo_slug: &str) -> &str {
         .unwrap_or(repo_slug)
 }
 
+/// Which remote a [`PrState`] was ultimately resolved against — the
+/// provenance [`resolve_pr_state_for_linked_worktree`] needs to tell an
+/// `origin`-sourced result (trusted, same-uid, unchanged behavior) apart
+/// from an `upstream`-sourced one (a third party's repository, issue #191
+/// A2) so it knows which results need the extra `headRefOid` binding and
+/// which don't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrStateSource {
+    Origin,
+    Upstream,
+}
+
+/// Query `origin` alone for `branch`'s PR state — no `upstream` fallback,
+/// ever. Returns the resolved slug alongside the state so a caller that
+/// wants to widen the query to `upstream` (see [`resolve_pr_state_with_source`])
+/// can build `upstream`'s acceptable-owners set from it (issue #191 F1/A3)
+/// without re-deriving `origin`'s slug a second time; a caller that has no
+/// use for the slug (isolated clones, which must never touch `upstream` at
+/// all — issue #191 F2/A1) just discards it.
+fn resolve_origin_pr_state(repo_dir: &Path, branch: &str) -> (PrState, Option<String>) {
+    match derive_repo_slug_for_remote(repo_dir, "origin") {
+        Some(slug) => {
+            let state = query_pr_state(repo_dir, branch, &slug, &[slug_owner(&slug)]);
+            (state, Some(slug))
+        }
+        None => (
+            PrState::Unresolvable(
+                "could not derive --repo from the origin remote (missing, or not a parseable \
+                 GitHub URL)"
+                    .to_string(),
+            ),
+            None,
+        ),
+    }
+}
+
 /// Resolve a branch's PR state by querying `origin` first and falling back
 /// to `upstream` (issue #191) — this fork's documented contribution
 /// workflow (CLAUDE.md rule 19) routinely opens the real PR against
 /// `upstream`, leaving `origin` with no PR for the same branch at all; a
 /// resolver that only ever asked `origin` reported that as `NoPr`, which is
 /// false — a PR genuinely exists, it just lives on a remote nobody asked
-/// about.
+/// about. Also reports which remote the returned state actually came from
+/// (see [`PrStateSource`]) — [`resolve_pr_state`] discards that half for
+/// callers that don't need it; [`resolve_pr_state_for_linked_worktree`]
+/// consumes it directly.
 ///
 /// Combination policy (deliberately conservative, matching this gate's
 /// existing fail-closed stance):
@@ -1634,30 +1691,130 @@ fn slug_owner(repo_slug: &str) -> &str {
 /// - `upstream` is consulted only when `origin` resolved to `NoPr` AND an
 ///   `upstream` remote exists with a slug [`derive_repo_slug_for_remote`]
 ///   can parse. Its result — whatever it is, including its own `NoPr` or
-///   `Unresolvable` — becomes the final answer, matched against `upstream`'s
-///   OWN owner (never cross-checked against `origin`'s owner).
+///   `Unresolvable` — becomes the final answer, matched against EITHER
+///   `origin`'s own owner OR `upstream`'s (issue #191 F1/A3): a PR opened
+///   from this fork against upstream carries `headRepositoryOwner.login`
+///   equal to `origin`'s owner, not `upstream`'s, since the head repository
+///   is the fork, not the base — both that cross-fork shape and a same-repo
+///   PR pushed straight into `upstream` are real (6 of 10 and 4 of 10 in a
+///   sample of this maintainer's own upstream PRs, respectively). Still a
+///   bounded two-entry allowlist of owners this checkout is genuinely
+///   attached to via its own remotes, never a wildcard — issue #144's
+///   original protection is unchanged in kind, only widened from one
+///   acceptable owner to two.
 /// - When there is no `upstream` remote, or its URL doesn't parse, behavior
 ///   is identical to today: `origin`'s `NoPr` stands.
-fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
-    let origin_slug = match derive_repo_slug_for_remote(repo_dir, "origin") {
-        Some(slug) => slug,
-        None => {
-            return PrState::Unresolvable(
-                "could not derive --repo from the origin remote (missing, or not a parseable \
-                 GitHub URL)"
-                    .to_string(),
-            );
-        }
-    };
-    let origin_state = query_pr_state(repo_dir, branch, &origin_slug, slug_owner(&origin_slug));
+fn resolve_pr_state_with_source(repo_dir: &Path, branch: &str) -> (PrState, PrStateSource) {
+    let (origin_state, origin_slug) = resolve_origin_pr_state(repo_dir, branch);
     if !matches!(origin_state, PrState::NoPr) {
-        return origin_state;
+        return (origin_state, PrStateSource::Origin);
     }
+    // `query_pr_state` only ever returns `PrState::NoPr` when it was given a
+    // slug to query in the first place, so `origin_state == NoPr` proves
+    // `origin_slug` is `Some` here.
+    let origin_slug = origin_slug.expect("PrState::NoPr implies origin's slug was resolved");
     match derive_repo_slug_for_remote(repo_dir, "upstream") {
         Some(upstream_slug) => {
-            query_pr_state(repo_dir, branch, &upstream_slug, slug_owner(&upstream_slug))
+            let acceptable_owners = [slug_owner(&origin_slug), slug_owner(&upstream_slug)];
+            let state = query_pr_state(repo_dir, branch, &upstream_slug, &acceptable_owners);
+            (state, PrStateSource::Upstream)
         }
-        None => origin_state,
+        None => (origin_state, PrStateSource::Origin),
+    }
+}
+
+/// Resolve a branch's PR state, trying `origin` then falling back to
+/// `upstream` — see [`resolve_pr_state_with_source`] for the full
+/// combination policy; this is that function with the provenance half
+/// discarded, kept as its own name because most callers only ever care
+/// about the resolved state itself.
+///
+/// `#[cfg(test)]` (matching [`owner_of`]'s own precedent): issue #191's fix
+/// switched every production call site to one of the two provenance-aware
+/// wrappers — [`resolve_pr_state_for_linked_worktree`] for the trusted
+/// linked-worktree path, [`resolve_pr_state_for_isolated_clone`] for the
+/// untrusted isolated-clone paths — so this function's only remaining
+/// callers are its own test suite; a production build with no test callers
+/// left it as a genuine dead-code warning under `-D warnings`.
+#[cfg(test)]
+fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
+    resolve_pr_state_with_source(repo_dir, branch).0
+}
+
+/// [`resolve_pr_state`] restricted to `origin` alone — for the isolated-clone
+/// paths only (issue #191 F2/A1). An isolated clone is a separate clone with
+/// its own `.git/config`, one this module's threat model already treats a
+/// same-uid actor as able to write (fork#533 / auditor B3); the slug-equality
+/// guards at [`isolated_clone_report`] and [`remove_isolated_clone_dir`]
+/// validate the candidate's `origin` against the root checkout's own before
+/// ever calling this, but validate nothing about a second `upstream` remote
+/// the same untrusted candidate could plant. Never even deriving an
+/// `upstream` slug here — rather than deriving one and declining to trust
+/// it — means `gh` is never spawned against whatever repository a forged
+/// `upstream` names, not merely that its answer would be discarded.
+fn resolve_pr_state_for_isolated_clone(repo_dir: &Path, branch: &str) -> PrState {
+    resolve_origin_pr_state(repo_dir, branch).0
+}
+
+/// [`resolve_pr_state`] for the ordinary linked-worktree path — a strictly
+/// narrower wrapper (issue #191 A2). An `origin`-sourced result is returned
+/// completely unchanged, preserving today's existing behavior: `decide()`
+/// already trusts an `origin`-sourced `Merged` verdict with no SHA check at
+/// all, and that is an existing, out-of-scope design choice this fix does
+/// not touch (linked worktrees share the root checkout's own trusted
+/// `.git/config`, so `origin` there is same-uid-trusted the way it always
+/// has been).
+///
+/// An `upstream`-sourced result is different: `upstream` is a third party's
+/// repository, and this fork's branch names are shared and predictable
+/// (`fix/<n>-<slug>`, `feat/<slug>`) — anyone with push access to `upstream`
+/// merging an UNRELATED PR whose head branch happens to share this
+/// worktree's branch name must never be trusted as evidence THIS worktree
+/// was merged. So a `Merged` or `Open` verdict sourced from `upstream` is
+/// downgraded to `Unresolvable` unless `local_head_sha` is `Some` and equals
+/// the reply's own `headRefOid` — cryptographic identity in place of a
+/// name+owner coincidence. `PrState::Open` never carries a `headRefOid` at
+/// all ([`query_pr_state`] only captures it for `Merged`), so an
+/// `upstream`-sourced `Open` is always downgraded; that is intentional, not
+/// an oversight — there is nothing to bind it to. A `None` `local_head_sha`
+/// (the worktree's own HEAD could not be resolved) fails closed the same
+/// way, never treated as a free pass. `ClosedUnmerged`, `NoPr`, and an
+/// already-`Unresolvable` result pass through unchanged regardless of
+/// source — none of those needs, or benefits from, a SHA check.
+fn resolve_pr_state_for_linked_worktree(
+    repo_dir: &Path,
+    branch: &str,
+    local_head_sha: Option<&str>,
+) -> PrState {
+    let (state, source) = resolve_pr_state_with_source(repo_dir, branch);
+    if source == PrStateSource::Origin {
+        return state;
+    }
+    match state {
+        PrState::Merged { ref head_ref_oid } => {
+            let confirmed = matches!(
+                (local_head_sha, head_ref_oid.as_deref()),
+                (Some(local), Some(remote)) if local == remote
+            );
+            if confirmed {
+                state
+            } else {
+                PrState::Unresolvable(
+                    "an upstream-sourced MERGED verdict's headRefOid does not match this \
+                     worktree's own local branch tip -- refusing to trust what may be a \
+                     same-named-branch collision on a third party's repository rather than \
+                     this worktree's own PR"
+                        .to_string(),
+                )
+            }
+        }
+        PrState::Open => PrState::Unresolvable(
+            "an upstream-sourced OPEN verdict carries no headRefOid to confirm it is this \
+             worktree's own branch rather than a same-named-branch collision on a third \
+             party's repository"
+                .to_string(),
+        ),
+        other => other,
     }
 }
 
@@ -1724,7 +1881,10 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
         let owner_kind = resolved_owner.kind().to_string();
         let owner_reason = resolved_owner.reason().map(str::to_string);
         let pr_state = match &wt.branch {
-            Some(branch) => resolve_pr_state(&wt.path, branch),
+            Some(branch) => {
+                let local_head_sha = resolve_isolated_clone_head_sha(&wt.path);
+                resolve_pr_state_for_linked_worktree(&wt.path, branch, local_head_sha.as_deref())
+            }
             None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
         };
         let verdict = decide(&pr_state, &cleanliness, ownership);
@@ -2178,13 +2338,13 @@ fn resolve_isolated_clone_branch(clone_dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(raw).into_owned())
 }
 
-/// Resolve an isolated clone's own current HEAD **commit** SHA via `git
-/// rev-parse HEAD`, run inside the clone itself (fork#325 M4c, PR #526 round
-/// 3, reviewer B2) — `None` on any spawn/exit/parse failure. Mirrors
+/// Resolve a clone or worktree's own current HEAD **commit** SHA via `git
+/// rev-parse HEAD`, run inside it (fork#325 M4c, PR #526 round 3, reviewer
+/// B2) — `None` on any spawn/exit/parse failure. Mirrors
 /// [`resolve_isolated_clone_branch`]'s shape exactly, including running via
 /// [`git_in_untrusted_dir`] for the same reason: this is a `git` invocation
-/// with `current_dir` set inside an untrusted candidate. Used by
-/// [`isolated_clone_report`] to compare against a merged PR's own
+/// with `current_dir` set inside a directory that isn't always trusted.
+/// Used by [`isolated_clone_report`] to compare against a merged PR's own
 /// `headRefOid` ([`PrState::Merged::head_ref_oid`]) — plain commit-SHA
 /// equality, replacing round 2's `HEAD^{tree}` comparison
 /// (`resolve_isolated_clone_head_tree_sha`, removed): `headRefOid` names the
@@ -2192,7 +2352,12 @@ fn resolve_isolated_clone_branch(clone_dir: &Path) -> Option<String> {
 /// merged cleanly and picked up no local drift IS the clone's own `git
 /// rev-parse HEAD` — no tree-level comparison needed once the round-2
 /// mismatch (comparing against the base-branch merge commit instead) is
-/// fixed at the source.
+/// fixed at the source. Despite the name (kept to avoid an unrelated rename
+/// churning this diff), also reused by [`examine_worktrees`] for a LINKED
+/// worktree's own HEAD SHA (issue #191 A2) — the same plain `git rev-parse
+/// HEAD` question, asked of a different kind of directory; `git_in_untrusted_dir`
+/// is a no-op safety margin for a trusted linked worktree, not a behavior
+/// change.
 fn resolve_isolated_clone_head_sha(clone_dir: &Path) -> Option<String> {
     let out = git_in_untrusted_dir(clone_dir)
         .args(["rev-parse", "HEAD"])
@@ -2393,9 +2558,20 @@ fn isolated_clone_report(
     // root checkout's own before ever spending a `gh` call rejects that for
     // (almost) free: a genuine deck-provisioned clone always matches, and a
     // mismatch is itself a strong signal the candidate isn't one.
+    //
+    // [`resolve_pr_state_for_isolated_clone`], not [`resolve_pr_state`]
+    // (issue #191 F2/A1): this guard only ever validates the candidate's
+    // `origin`, and a same-uid actor who can write this candidate's
+    // `.git/config` could otherwise plant an equally-untrusted `upstream`
+    // remote that nothing here checks at all — `resolve_pr_state`'s
+    // upstream fallback would read it and spend a `gh` call against
+    // whatever repository it names. `resolve_pr_state_for_isolated_clone`
+    // never even derives an `upstream` slug, so `gh` is never queried
+    // against a repository EITHER of this candidate's own (untrusted)
+    // remotes chose, not just the one this guard happens to check.
     let pr_state = match &branch {
         Some(b) if repo_slug.is_some() && derive_repo_slug(&path).as_deref() == repo_slug => {
-            resolve_pr_state(&path, b)
+            resolve_pr_state_for_isolated_clone(&path, b)
         }
         Some(_) => PrState::Unresolvable(
             "isolated clone's derived repo slug does not match the root checkout's own -- gh is \
@@ -2841,9 +3017,10 @@ fn remove_isolated_clone_dir(
     }
     // Fork issue #533: mirrors `isolated_clone_report`'s own slug-equality
     // guard (auditor B3) at removal time instead of examination time --
-    // `resolve_pr_state` must never be spent against a repo slug the
-    // candidate's own (untrusted) `origin` chose, since that `origin` can
-    // be repointed by a same-uid actor between examination and removal.
+    // `resolve_pr_state_for_isolated_clone` must never be spent against a
+    // repo slug the candidate's own (untrusted) `origin` chose, since that
+    // `origin` can be repointed by a same-uid actor between examination and
+    // removal.
     if root_repo_slug.is_none() {
         return Err(
             "refusing to remove: the root checkout's own repo slug could not be re-resolved \
@@ -2860,7 +3037,14 @@ fn remove_isolated_clone_dir(
                 .to_string(),
         );
     }
-    let head_ref_oid = match resolve_pr_state(worktree_path, &branch) {
+    // Issue #191 F2/A1: `resolve_pr_state_for_isolated_clone`, not
+    // `resolve_pr_state` -- the guard just above only re-validates the
+    // candidate's `origin`, and `resolve_pr_state`'s `upstream` fallback
+    // would read a second, entirely unvalidated remote from this same
+    // untrusted candidate. `resolve_pr_state_for_isolated_clone` never
+    // derives or queries `upstream` at all, so `gh` is never spent against a
+    // repository EITHER of this candidate's own remotes chose.
+    let head_ref_oid = match resolve_pr_state_for_isolated_clone(worktree_path, &branch) {
         PrState::Merged {
             head_ref_oid: Some(oid),
         } => oid,
