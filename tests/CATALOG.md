@@ -3074,6 +3074,13 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the rendered card label (the `AgentRecord`→placeholder→render mapping is covered by `rehydration` + L1 dashboard tests); the live-stream upgrade path while a TUI is already attached.
 - **Platform coverage:** mac+linux.
 
+##### hooks/delivery/008 — An unterminated hook-socket line does not hold the connection open indefinitely (issue #393).
+- **Layer:** L2.
+- **Agent:** none (raw `UnixStream` write directly to the per-test hook socket, bypassing `write_hook_line`'s newline-completion helper on purpose).
+- **Asserts:** a connection that writes a partial JSON line with no trailing newline and never completes it is closed/rejected by the daemon within a bounded window — `run_hook_loop`'s reader (`read_bounded_hook_line` in `src/daemon.rs`) now caps the line at `MAX_HOOK_LINE_LEN` and bounds the whole read by a 5s total-operation deadline, rather than blocking on it forever.
+- **Does not assert:** the specific byte cap (`MAX_HOOK_LINE_LEN`) an oversized-but-terminated line is rejected at, or the log line's content.
+- **Platform coverage:** mac+linux.
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.
