@@ -3880,4 +3880,113 @@ mod tests {
              {ambient_head_after}"
         );
     }
+
+    // -- Issue #669 auditor A1: the PRODUCTION `run_git` (line ~988,
+    //    outside this `mod tests`) — the one `init_self_test_repo` /
+    //    `--self-test` actually calls — still carries the same escape the
+    //    test above just proved this module's `#[cfg(test)]`-only `git()`
+    //    has been fixed for -----------------------------------------------
+
+    /// **Write escape — issue #669 auditor A1.** Mirrors
+    /// [`git_test_helper_leaks_ambient_git_dir_and_git_work_tree`] above
+    /// exactly, but targets `super::run_git` (line ~988) — the PRODUCTION
+    /// helper, sitting outside this `mod tests`, that [`init_self_test_repo`]
+    /// and `self_test_r0`…`self_test_r4` actually use to build `--self-test`'s
+    /// scratch repos. It is not the `#[cfg(test)]`-only `git()` this module
+    /// defines above (which is test-fixture plumbing this module's own tests
+    /// happen to use, and is not reachable from `--self-test` at all). It
+    /// currently pins `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` to `/dev/null`
+    /// and clears no ambient location-discovery vars at all, so an ambient
+    /// `GIT_DIR`/`GIT_WORK_TREE` — exactly what a pre-commit hook or `git
+    /// rebase --exec` leaves behind before spawning `--self-test` — steers a
+    /// call past `dir` onto whatever repository those vars name. The auditor
+    /// reproduced this as a destructive rewrite of a victim repo's
+    /// `refs/remotes/origin/main` by replaying `init_self_test_repo`'s exact
+    /// sequence; this test proves the same escape with a single minimal call
+    /// rather than the full `--self-test` sequence.
+    ///
+    /// Scenario: build a fixture repo and a separate ambient repo, set
+    /// ambient `GIT_DIR`/`GIT_WORK_TREE` to point at the ambient repo, then
+    /// call the PRODUCTION `run_git` asking it to commit "in" the fixture.
+    /// Asserts the ambient repo's `HEAD` did NOT move (the fixed behaviour)
+    /// — today it DOES move (the commit lands in the ambient repo instead),
+    /// so this test is RED until coder adds the same `env_remove` treatment
+    /// to production `run_git` that this module's own `git()` already
+    /// carries.
+    #[test]
+    fn production_run_git_leaks_ambient_git_dir_and_git_work_tree() {
+        fn head_of(dir: &Path) -> String {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap_or_else(|e| panic!("git rev-parse HEAD in {dir:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git rev-parse HEAD in {dir:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let fixture = root.join("fixture");
+        std::fs::create_dir_all(&fixture).expect("mkdir fixture");
+        git(&["init", "-q", "-b", "main"], &fixture);
+        git(&["config", "user.email", "test@example.com"], &fixture);
+        git(&["config", "user.name", "test"], &fixture);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "fixture first"],
+            &fixture,
+        );
+
+        let ambient = root.join("ambient");
+        std::fs::create_dir_all(&ambient).expect("mkdir ambient");
+        git(&["init", "-q", "-b", "main"], &ambient);
+        git(&["config", "user.email", "test@example.com"], &ambient);
+        git(&["config", "user.name", "test"], &ambient);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "ambient first"],
+            &ambient,
+        );
+        let ambient_head_before = head_of(&ambient);
+
+        // `cargo-nextest` runs each test in its own process, so mutating the
+        // process environment here cannot bleed into any other test.
+        unsafe {
+            std::env::set_var("GIT_DIR", ambient.join(".git"));
+            std::env::set_var("GIT_WORK_TREE", &ambient);
+        }
+        let result = run_git(
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "escape via ambient GIT_DIR/GIT_WORK_TREE",
+            ],
+            &fixture,
+        );
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+            std::env::remove_var("GIT_WORK_TREE");
+        }
+        result.expect(
+            "the fixture (or, if the escape occurs, the ambient repo) commit should \
+             succeed either way — a failure here is a broken fixture, not the escape \
+             this test exists to demand a fix for",
+        );
+
+        let ambient_head_after = head_of(&ambient);
+        assert_eq!(
+            ambient_head_after, ambient_head_before,
+            "issue #669 auditor A1: `work_type.rs`'s PRODUCTION `run_git` (line ~988, \
+             used by `init_self_test_repo` / `--self-test`, NOT this module's own \
+             `#[cfg(test)]`-only `git()` helper) leaked ambient GIT_DIR/GIT_WORK_TREE, so \
+             a commit run \"in\" the fixture landed in the ambient repo instead — ambient \
+             HEAD moved from {ambient_head_before} to {ambient_head_after}"
+        );
+    }
 }
