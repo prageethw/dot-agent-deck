@@ -1183,19 +1183,34 @@ fn read_reply_line(
     }
 }
 
+/// The read-error kinds that are transient — worth retrying rather than
+/// treating as the end of the exchange — shared with `src/daemon.rs`'s
+/// hook-socket line reader (issue #393 round 2), which needs the same
+/// classification but not the deadline gating [`is_transient_read_error`]
+/// applies below: its whole read is already bounded by an outer
+/// `tokio::time::timeout` rather than a per-read `SO_RCVTIMEO`, so every kind
+/// named here can retry unconditionally there instead of being checked
+/// against a deadline first.
+pub(crate) fn is_transient_read_error_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// Should this `read(2)` failure send [`read_reply_line`] back for another
 /// pass rather than ending the exchange? See the call site for why each class
 /// is here; `deadline` is what decides the timeout-class ones, so a caller
 /// that passed no deadline at all (unbounded blocking reads) keeps treating
 /// them as final rather than spinning on them forever.
 fn is_transient_read_error(err: &std::io::Error, deadline: Option<std::time::Instant>) -> bool {
-    match err.kind() {
-        std::io::ErrorKind::Interrupted => true,
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-            deadline.is_some_and(|deadline| deadline > std::time::Instant::now())
-        }
-        _ => false,
+    if err.kind() == std::io::ErrorKind::Interrupted {
+        return true;
     }
+    is_transient_read_error_kind(err.kind())
+        && deadline.is_some_and(|deadline| deadline > std::time::Instant::now())
 }
 
 #[cfg(test)]

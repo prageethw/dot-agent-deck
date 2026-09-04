@@ -2128,6 +2128,16 @@ async fn run_monitored_wait_sweep(state: SharedState, event_tx: broadcast::Sende
 /// future change to `MAX_FRAME_LEN` cannot silently retune this bound too.
 const MAX_HOOK_LINE_LEN: usize = 16 * 1024 * 1024;
 
+// If you're here because you changed `MAX_HOOK_LINE_LEN` or
+// `MAX_FRAME_LEN` and this assertion started failing: the two are pinned
+// equal on purpose (see the doc comment above), not because one is derived
+// from the other — they bound different things (this socket's newline-framed
+// input vs. the TUI↔daemon wire's length-framed transport) that only
+// happen to share a value today. Don't just bump the other constant's
+// literal to make the build pass — that silently re-creates the coupling
+// this pair of constants exists to avoid. Either update both together
+// deliberately (if they should keep matching) or remove/relax this
+// assertion (if they should now differ).
 const _: () = assert!(MAX_HOOK_LINE_LEN == crate::daemon_protocol::MAX_FRAME_LEN);
 
 /// Total-operation deadline for reading one hook-socket line, matching the
@@ -2160,32 +2170,76 @@ enum HookLineOutcome {
 /// idiom as `read_reply_line` in `src/hook.rs`, so a chunk that completes the
 /// cap violation is caught before it is appended rather than after growing
 /// past the bound to discover it.
-async fn read_hook_line<R>(reader: &mut R) -> HookLineOutcome
+///
+/// `carry` holds bytes that arrived in a previous call's `read()` after that
+/// call's newline — i.e. the start of the *next* message, when a peer
+/// pipelines more than one line into a single write. It is owned by the
+/// connection's loop in [`run_hook_loop`], not this function: each call
+/// drains it first (so a message that already arrived doesn't wait on a new
+/// syscall) and, on a completed line, leaves whatever comes after that
+/// line's newline in `carry` for the next call. The removed
+/// `BufReader::lines()` did this internally; a hand-rolled reader has to do
+/// it explicitly or it silently drops pipelined messages (fork issue #393
+/// round 2) — `read_reply_line` in `src/hook.rs`, which this was originally
+/// copied from, doesn't need this because it is called exactly once per
+/// connection and always discards whatever is left.
+async fn read_hook_line<R>(reader: &mut R, carry: &mut Vec<u8>) -> HookLineOutcome
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut chunk = [0u8; 4096];
     let mut line: Vec<u8> = Vec::new();
+    // `pending`/`pending_start` is the current scan window: either the
+    // leftover bytes from a previous call (until they're exhausted) or the
+    // most recent `read()`'s bytes. It is never a mix of the two at once —
+    // once `carry` is drained we replace it wholesale with a fresh read,
+    // exactly like the original single-`chunk` version did — so the cap
+    // check below always measures the same thing it did before this
+    // parameter existed: `line`'s length so far plus this window's bytes up
+    // to (and not including) a newline.
+    let mut pending = std::mem::take(carry);
+    let mut pending_start = 0usize;
     loop {
-        let n = match reader.read(&mut chunk).await {
-            Ok(n) => n,
-            Err(_) => return HookLineOutcome::Closed,
+        let n = if pending_start < pending.len() {
+            pending.len() - pending_start
+        } else {
+            let n = loop {
+                match reader.read(&mut chunk).await {
+                    Ok(0) => return HookLineOutcome::Closed,
+                    Ok(n) => break n,
+                    // Fork issue #393 round 2 / #564: EINTR and friends say
+                    // nothing about the peer — retry the read rather than
+                    // folding it into "connection closed". Safe to retry
+                    // unconditionally (no deadline check, unlike
+                    // `is_transient_read_error` in `src/hook.rs`) because
+                    // the whole operation is already bounded by the
+                    // `tokio::time::timeout` wrapped around this future in
+                    // `read_bounded_hook_line`.
+                    Err(err) if crate::hook::is_transient_read_error_kind(err.kind()) => continue,
+                    Err(_) => return HookLineOutcome::Closed,
+                }
+            };
+            pending.clear();
+            pending.extend_from_slice(&chunk[..n]);
+            pending_start = 0;
+            n
         };
-        if n == 0 {
-            return HookLineOutcome::Closed;
-        }
-        let newline_pos = chunk[..n].iter().position(|&b| b == b'\n');
+        let window = &pending[pending_start..pending_start + n];
+        let newline_pos = window.iter().position(|&b| b == b'\n');
         let end = newline_pos.unwrap_or(n);
         if line.len().saturating_add(end) > MAX_HOOK_LINE_LEN {
             return HookLineOutcome::TooLong;
         }
-        line.extend_from_slice(&chunk[..end]);
-        if newline_pos.is_some() {
+        line.extend_from_slice(&window[..end]);
+        if let Some(pos) = newline_pos {
+            let consumed = pending_start + pos + 1; // +1 to drop the newline itself
+            *carry = pending[consumed..].to_vec();
             return match String::from_utf8(line) {
                 Ok(line) => HookLineOutcome::Line(line),
                 Err(_) => HookLineOutcome::InvalidUtf8,
             };
         }
+        pending_start += end;
     }
 }
 
@@ -2199,11 +2253,15 @@ where
 /// (unlike the hook CLI, which calls no `tracing` anywhere), and echoing
 /// untrusted socket content into the log would just move the unbounded-input
 /// hazard from memory into the log file instead of closing it.
-async fn read_bounded_hook_line<R>(reader: &mut R) -> Option<String>
+///
+/// `carry` is the same leftover-bytes buffer [`read_hook_line`] documents;
+/// the caller owns one per connection and passes it to every call in that
+/// connection's loop.
+async fn read_bounded_hook_line<R>(reader: &mut R, carry: &mut Vec<u8>) -> Option<String>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    match tokio::time::timeout(HOOK_LINE_READ_DEADLINE, read_hook_line(reader)).await {
+    match tokio::time::timeout(HOOK_LINE_READ_DEADLINE, read_hook_line(reader, carry)).await {
         Ok(HookLineOutcome::Line(line)) => Some(line),
         Ok(HookLineOutcome::Closed) => None,
         Ok(HookLineOutcome::InvalidUtf8) => {
@@ -2263,8 +2321,15 @@ async fn run_hook_loop(
                     // on this socket is fire-and-forget, so the write half is
                     // only ever used by the `GetSeed` arm below.
                     let (mut read_half, mut write_half) = tokio::io::split(stream);
+                    // Owned by this connection's loop, not by
+                    // `read_hook_line`/`read_bounded_hook_line`: bytes a
+                    // peer pipelines past a line's newline in the same
+                    // `read()` must survive into the NEXT call rather than
+                    // being dropped with each call's function-local state
+                    // (fork issue #393 round 2).
+                    let mut carry: Vec<u8> = Vec::new();
 
-                    while let Some(line) = read_bounded_hook_line(&mut read_half).await {
+                    while let Some(line) = read_bounded_hook_line(&mut read_half, &mut carry).await {
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
                             match msg {
                                 DaemonMessage::Delegate(signal) => {

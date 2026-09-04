@@ -65,11 +65,11 @@ fn delivery_001_session_start_creates_card() {
 /// Scenario: Issue #393 — connect directly to the daemon's hook socket and
 /// write a partial line with no terminating newline, then hold the
 /// connection open without ever completing it. Asserts the daemon
-/// closes/rejects the connection within a bounded window instead of
-/// blocking `next_line()` on it forever, which is today's behavior: the
-/// hook-socket reader in `run_hook_loop` (`src/daemon.rs`) has no cap and
-/// no total-operation deadline, unlike the reply-path read in `src/hook.rs`
-/// this fix is meant to mirror.
+/// closes/rejects the connection within a bounded window rather than
+/// blocking forever: `run_hook_loop`'s reader (`read_bounded_hook_line` in
+/// `src/daemon.rs`) now wraps a 16 MiB per-line cap and a 5s
+/// total-operation deadline around the read, mirroring the reply-path read
+/// in `src/hook.rs` this fix was modeled on.
 #[spec("hooks/delivery/008")]
 #[test]
 fn delivery_008_unterminated_hook_socket_line_is_bounded() {
