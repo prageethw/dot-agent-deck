@@ -195,10 +195,25 @@ mod tests {
         // Enumerated rather than spot-checked: a range typo in
         // `is_bidi_format_char` would otherwise leave one override live, and one
         // is all a spoof needs.
+        //
+        // Issue #497 reviewer R7: every codepoint above is ZERO-cell-width, so
+        // ratatui's own render pipeline already drops it before a `Buffer`
+        // write regardless of whether this module's filter catches it too —
+        // these entries do not, by themselves, prove this module's filter is
+        // what stops a bidi override reaching the terminal. `U+0600` and
+        // `U+110BD` are genuine category `Cf` (so `is_bidi_format_char` must
+        // still recognise them) but NONZERO-width, so ratatui's structural
+        // protection does not cover them and this module's own filter is the
+        // only thing standing between them and the terminal — the class
+        // `ui::tests::message_001_status_message_strips_control_and_bidi_before_render`
+        // exists to close. Chained here rather than left as that one
+        // integration-style fixture's sole coverage, so a regression is caught
+        // by this module's own unit tests too.
         for c in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}']
             .into_iter()
             .chain(['\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'])
             .chain(['\u{200E}', '\u{200F}', '\u{061C}'])
+            .chain(['\u{0600}', '\u{110BD}'])
         {
             assert!(
                 is_bidi_format_char(c),

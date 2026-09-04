@@ -20202,8 +20202,12 @@ fn render_bottom_bar(
             // message (e.g. "PaneInput mode …") on the left and expose the
             // [Command Mode Ctrl+D] affordance at the right edge — clicking it
             // returns to the dashboard (command mode) exactly as Ctrl+D does.
-            if let Some((ref msg, _)) = ui.status_message {
-                let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+            let sanitized_msg = ui
+                .status_message
+                .as_ref()
+                .map(|(msg, _)| crate::untrusted_text::strip_control_and_bidi(msg, false));
+            if let Some(ref sanitized) = sanitized_msg {
+                let line = Line::styled(sanitized.clone(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
             // PRD #241 M4: same mode-aware seam the wide bar uses, so the two
@@ -20224,10 +20228,15 @@ fn render_bottom_bar(
             // message. `Ctrl+D` itself still works with no on-screen affordance
             // for it, exactly as every other global chord does when the banner
             // has decayed.
-            let msg_width = ui
-                .status_message
+            //
+            // Issue #497 audit F1: measure the SANITIZED string, the same one
+            // actually rendered above — measuring the raw message would inflate
+            // this width by every character `strip_control_and_bidi` drops,
+            // spuriously eliding the button even when the rendered (shorter)
+            // text would have left room for it.
+            let msg_width = sanitized_msg
                 .as_ref()
-                .map(|(msg, _)| msg.chars().count() as u16)
+                .map(|s| s.chars().count() as u16)
                 .unwrap_or(0);
             let button_width = button.display_label().chars().count() as u16;
             if area.width >= msg_width.saturating_add(button_width) {
@@ -20238,7 +20247,8 @@ fn render_bottom_bar(
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
-                let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+                let sanitized = crate::untrusted_text::strip_control_and_bidi(msg, false);
+                let line = Line::styled(sanitized, Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
                 // A transient status message occupies the bar row this frame;
                 // no buttons are drawn, so nothing is hit-testable.
@@ -48535,6 +48545,157 @@ mod tests {
             row.ends_with(&badge),
             "badge must render, right-aligned, one column past the boundary \
              (bw={bw}, width={width_plus_one}), got row:\n{row:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Issue #497 — `ui.status_message` render seam does not sanitize
+    // ---------------------------------------------------------------------------
+    //
+    // `render_bottom_bar`'s `_` fallback arm (`UiMode::Normal` and every other
+    // mode not explicitly matched) passes `msg.as_str()` straight to
+    // `Line::styled` with no sanitization, so a status message carrying raw
+    // control characters or a bidi override (e.g. interpolated from
+    // subprocess stderr) renders unsanitized on the status bar. Mirrors
+    // `render_bottom_bar_with_update_available_to_buffer` above: `status_message`
+    // is a private `UiState` field neither existing `pub fn *_to_buffer` seam
+    // can set, so this calls `render_bottom_bar` directly from inside this
+    // `#[cfg(test)] mod tests`, which already sees the private field.
+
+    /// Renders `render_bottom_bar` in `mode` (no lock context,
+    /// `has_pane_control = true`, no extra buttons) with `ui.status_message`
+    /// set to `status_message`, into a `width x 1` buffer. Reviewer R5 /
+    /// auditor F3: `mode` is a parameter (not hardcoded to `UiMode::Normal`)
+    /// so this same helper reaches both render arms that sanitize
+    /// `status_message` — the `_` fallback arm and `UiMode::PaneInput` — since
+    /// `UiState::mode` is a private field this module already sees directly,
+    /// same as `status_message` itself.
+    fn render_bottom_bar_with_status_message_to_buffer(
+        status_message: &str,
+        width: u16,
+        mode: UiMode,
+    ) -> Buffer {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.status_message = Some((status_message.to_string(), std::time::Instant::now()));
+        ui.mode = mode;
+        terminal
+            .draw(|frame| {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 1,
+                };
+                render_bottom_bar(frame, &mut ui, area, true, &[], None);
+            })
+            .expect("TestBackend draw should succeed");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Scenario: Set `ui.status_message` to text carrying ESC, NUL, CR/LF, DEL,
+    /// a C1 control, a `U+202E` right-to-left override, AND a `U+0600` ARABIC
+    /// NUMBER SIGN — then render the bottom bar in `UiMode::Normal` (the `_`
+    /// fallback arm). The rendered row must not contain any of those raw
+    /// characters, and must match what `untrusted_text::strip_control_and_bidi`
+    /// produces for the same input.
+    ///
+    /// `U+0600` is load-bearing, not decoration: every other class in this
+    /// fixture (every `char::is_control` byte, and `U+202E` itself) is already
+    /// stripped by ratatui's OWN rendering pipeline before it ever reaches a
+    /// `Buffer` cell — `ratatui-core-0.1.2`'s `Span::styled_graphemes` drops
+    /// any grapheme containing a control char (`src/text/span.rs:314`), and
+    /// `ratatui-widgets-0.3.2::paragraph::render_line` skips any grapheme whose
+    /// `unicode-width`-derived `cell_width()` is `0` — which `U+202E` is,
+    /// verified empirically by compiling `unicode-width 0.2.2` standalone
+    /// against the exact codepoint. So the pre-fix version of this fixture
+    /// passed against completely unsanitized production code: `render_bottom_bar`
+    /// never calls a sanitizer on `status_message` at all (confirmed by
+    /// inspection — the `_` arm passes `msg.as_str()` straight to
+    /// `Line::styled`), yet nothing in this fixture could tell "ratatui
+    /// accidentally neutralized it" apart from "the application sanitized it".
+    /// `U+0600` is genuine `Cf` category (confirmed via Python's `unicodedata`,
+    /// which `untrusted_text::is_bidi_format_char`'s `\p{Cf}` regex agrees is
+    /// dangerous per this module's own threat model) but — unlike `U+202E` —
+    /// `unicode-width` reports it as width `1`, not `0` (same standalone
+    /// experiment), so ratatui's accidental protection does not cover it: it
+    /// is not `char::is_control`, and it is not zero-width, so it sails
+    /// through both of ratatui's filters untouched and lands in the rendered
+    /// `Buffer` exactly as sent, in `TestBackend` and a real `CrosstermBackend`
+    /// alike. That is what actually turns this test RED against today's
+    /// unfixed code, and it is what a real fix (calling
+    /// `strip_control_and_bidi` on `status_message` before `Line::styled`)
+    /// must strip for this test to go GREEN.
+    #[spec("status/message/001")]
+    #[test]
+    fn message_001_status_message_strips_control_and_bidi_before_render() {
+        let dirty = "ze\x1b[31mta\0-li\u{202e}ve\x7f-\u{0085}77\u{0600}\r\n";
+        let width = 120;
+
+        let buffer = render_bottom_bar_with_status_message_to_buffer(dirty, width, UiMode::Normal);
+        let row = buffer_row_text(&buffer, width);
+
+        let expected = crate::untrusted_text::strip_control_and_bidi(dirty, false);
+        assert!(
+            row.contains(&expected),
+            "sanitized status message must render, got row:\n{row:?} (expected {expected:?})"
+        );
+        assert!(
+            !row.chars()
+                .any(|c| c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+            "no control character or bidi override from an interpolated status message may \
+             reach the terminal, got row:\n{row:?}"
+        );
+        // Reviewer R6: the two assertions above are both expressed in terms of
+        // `strip_control_and_bidi`/`is_bidi_format_char` themselves, so a
+        // regression in either would move `expected` and the predicate in
+        // lockstep and this test would stay green. This check is independent
+        // of both — a literal codepoint, not a re-derivation — so it still
+        // catches the one character (`U+0600`) that actually makes this test a
+        // real gate (see the doc comment above) if the sanitizer regresses.
+        assert!(
+            !row.contains('\u{0600}'),
+            "U+0600 must not reach the terminal, got row:\n{row:?}"
+        );
+    }
+
+    /// Scenario: Same dirty fixture as `message_001` (ESC, NUL, CR/LF, DEL, a
+    /// C1 control, `U+202E`, and `U+0600`), but rendered through
+    /// `render_bottom_bar`'s `UiMode::PaneInput` arm instead of the `_`
+    /// fallback arm. `PaneInput` sanitizes via the same
+    /// `strip_control_and_bidi` call, but — reviewer R5 / auditor F3 — that
+    /// arm was unpinned by any test even though the seam to reach it (setting
+    /// the private `UiState::mode` field directly, as other tests in this
+    /// module already do) exists. The rendered row must not contain any raw
+    /// control character or bidi override, and must not contain the
+    /// load-bearing `U+0600` literal specifically (mirrors `message_001`'s R6
+    /// strengthening: an independent check, not solely a re-derivation via
+    /// `strip_control_and_bidi`/`is_bidi_format_char`).
+    #[spec("status/message/002")]
+    #[test]
+    fn message_002_status_message_strips_control_and_bidi_in_pane_input_mode() {
+        let dirty = "ze\x1b[31mta\0-li\u{202e}ve\x7f-\u{0085}77\u{0600}\r\n";
+        let width = 120;
+
+        let buffer =
+            render_bottom_bar_with_status_message_to_buffer(dirty, width, UiMode::PaneInput);
+        let row = buffer_row_text(&buffer, width);
+
+        let expected = crate::untrusted_text::strip_control_and_bidi(dirty, false);
+        assert!(
+            row.contains(&expected),
+            "sanitized status message must render, got row:\n{row:?} (expected {expected:?})"
+        );
+        assert!(
+            !row.chars()
+                .any(|c| c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+            "no control character or bidi override from an interpolated status message may \
+             reach the terminal, got row:\n{row:?}"
+        );
+        assert!(
+            !row.contains('\u{0600}'),
+            "U+0600 must not reach the terminal, got row:\n{row:?}"
         );
     }
 
