@@ -39310,6 +39310,62 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #605 — PRD fork#544 M2b made isolated-clone
+    /// provisioning UNCONDITIONAL, so a live orchestration's ACTUAL
+    /// reported cwd for a picked directory is always the sibling workspace
+    /// path `resolve_workspace_path`/`sanitize_workspace_segment` derive
+    /// from `(directory, name)` — never the picked directory itself, even
+    /// when the live orchestration was opened from the exact same source
+    /// directory a second form now targets. Construct that exact
+    /// production shape (the sibling path a real live orchestration named
+    /// `already-live-orchestrator-1`, opened from `/work/already-live`,
+    /// would actually report) and attach it via
+    /// `with_live_orchestration_cwds` the way the real `Ctrl+n` call site
+    /// does. The PRD #140 same-cwd warning must detect this as occupying
+    /// the picked directory — the same "is this really the same directory"
+    /// comparison `live_orchestration_occupies` (fork#603) already gets
+    /// right for the sibling name-collision feature, not the
+    /// literal/canonical-only `cwd_matches` comparison
+    /// `live_orchestration_in_same_cwd` is stuck on today.
+    #[spec("orchestration/guard/004")]
+    #[test]
+    fn guard_004_same_directory_reopen_detects_the_sibling_workspace_cwd_as_occupied() {
+        let dir = PathBuf::from("/work/already-live");
+        let live_name = "already-live-orchestrator-1".to_string();
+        // The exact formula the real spawn path (`Action::SpawnPane`) uses
+        // to derive a NEW orchestration's isolated-clone sibling directory
+        // from `(source directory, name)` — reproduced here via the same
+        // private helpers so this fixture can never quietly drift from
+        // what `resolve_workspace_path`/`sanitize_workspace_segment`
+        // actually compute.
+        let live_cwd = resolve_workspace_path(&dir, &sanitize_workspace_segment(&live_name))
+            .to_string_lossy()
+            .into_owned();
+
+        let form = NewPaneFormState::new(
+            dir,
+            "already-live-orchestrator-2".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_cwds(vec![(live_cwd.clone(), live_name)]);
+
+        assert!(
+            form.live_orchestration_in_same_cwd,
+            "a live orchestration's real sibling-workspace cwd ({live_cwd}) \
+             for the SAME picked directory must register as occupying it — \
+             `live_orchestration_in_same_cwd` (fed by \
+             `with_live_orchestration_cwds`) must route through \
+             `live_orchestration_occupies` per `(cwd, name)` pair, not stop \
+             at a literal/canonical `cwd_matches` comparison a sibling \
+             workspace path can never satisfy (issue #605): since \
+             fork#544 M2b, `live_orchestration_in_same_cwd` cannot return \
+             `true` in production for ANY directory, so the warning never \
+             renders"
+        );
+    }
+
     /// Scenario: Submit an orchestration form with a typed Name against a
     /// `dir` that is deliberately NOT a git repository, so the real
     /// isolated-clone provisioning step fails when `Action::SpawnPane` is
