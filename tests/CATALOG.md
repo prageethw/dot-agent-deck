@@ -4454,6 +4454,13 @@ without depending on the config struct API.
 - **Does not assert:** WHERE the collision is enforced beyond `name_collision()` itself (render-layer warning text, `[Submit]` inertness are covered generically by `orchestration/guard/002`/`003`); any literal other than `unknown` (case variants, whitespace-padded forms); the `--mine` refusal itself, which is a separate CLI-side check this test only proves the Name field now anticipates.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/040 — Issue #222 edge 2 follow-up (reviewer F8 / auditor F2): the false-positive `identity/039`'s fix closed. An orchestration whose config `name` is literally `unknown` is selected but the Name field itself is left EMPTY (never typed into) — `resolved_title()` falls back to that config name, but `reserved_name_collision()` must compare the RAW typed field (empty) rather than that resolved fallback, since the actual spawn path (`build_new_pane_request`) derives the creator from the raw field alone and never applies the fallback substitution.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, constructing `NewPaneFormState` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** with an orchestration configured with `name = "unknown"` selected and the Name field never typed into, `form.name` is empty and `resolved_title()` resolves to `Some("unknown")` (sanity that the fallback genuinely would trip the pre-fix comparison); `reserved_name_collision()` and `name_collision()` are both `false` — submission is NOT blocked.
+- **Does not assert:** the positive collision case (typing the literal `unknown`, covered by `orchestration/identity/039`); any case where the Name field is empty but the fallback resolves to something other than the sentinel (never a collision either way, not the interesting boundary).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a directory that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140), detected against the live orchestration's REAL reported cwd — the sibling isolated-clone workspace path (fork#544 M2b), never the picked directory itself (issue #605).
@@ -6591,6 +6598,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none.
 - **Asserts:** two task names sharing a 185-char prefix, differing only in their last 65 bytes, genuinely collide under today's `sanitize_marker_creator` 200-char truncation when formatted as `issue-dispatch:{name}#7` (sanity check); loading a `[[scheduled_tasks]]` TOML document containing both overlong names yields zero loaded tasks and two load errors — the producer rejects both rather than truncation silently aliasing them at the sink.
 - **Does not assert:** the exact byte-length bound `validate_task` enforces beyond "185+65 collides, so the cap must sit below that"; the malformed-entry/missing-command load-error paths (`scheduler/config/001`/`002`, informally numbered in `src/config.rs` but not yet catalog-registered); `sanitize_marker_creator`'s own truncation behavior in isolation (covered separately in `worktree_reclaim.rs`); any daemon-side reload or CLI surface (`scheduler/reload`/`scheduler/cli`).
+- **Platform coverage:** mac+linux+windows.
+
+##### scheduler/config/004 — Issue #222 edge 1 follow-up: `validate_task` also rejects a `ScheduledTask.name` that `worktree_reclaim::marker_creator_normalizes` says `sanitize_marker_creator` would change (a dropped control character, `\n`/`\r` mapped to a space, or leading/trailing whitespace trimmed) — closing the collision surface the length bound (`scheduler/config/003`) leaves open, since two short, distinct names like `"deploy prod"` and `"deploy\nprod"` collapse to the identical marker-creator string well under the 200-char truncation cap.
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::LoadedSchedules::parse`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** `"deploy prod"` and `"deploy\nprod"` genuinely sanitize to the identical marker-creator string, and `marker_creator_normalizes` distinguishes them (`false`/`true` respectively) as a sanity check; an already-normalized name (`"deploy prod"`) loads with zero errors; a name with an embedded newline (`"deploy\nprod"`) and a name with leading/trailing whitespace (`"  deploy prod  "`) are each rejected at load time with exactly one load error apiece.
+- **Does not assert:** the length-bound rejection path (covered by `scheduler/config/003`); `schedule add`'s mirrored write-time check (covered by the `schedule_cli.rs` unit tests alongside `scheduler/cli/001`); any daemon-side reload or CLI surface.
 - **Platform coverage:** mac+linux+windows.
 
 #### scheduler/reload

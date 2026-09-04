@@ -2766,6 +2766,87 @@ prompt = "do the thing"
         );
     }
 
+    /// Scenario: Issue #222 edge 1 follow-up — the length bound above doesn't
+    /// close the collision on its own: `sanitize_marker_creator`
+    /// (worktree_reclaim.rs) also drops control characters, maps `\n`/`\r` to
+    /// a space, and trims, all BEFORE truncating, so two short, distinct names
+    /// like `"deploy prod"` and `"deploy\nprod"` still collapse to the
+    /// identical marker-creator string well under the 200-char cap.
+    /// `validate_task` now also rejects any name
+    /// `worktree_reclaim::marker_creator_normalizes` says would be changed by
+    /// that cleanup, closing the remaining collision surface.
+    #[spec("scheduler/config/004")]
+    #[test]
+    fn config_004_schedules_reject_names_normalization_would_change() {
+        assert_eq!(
+            crate::worktree_reclaim::sanitize_marker_creator("deploy prod"),
+            crate::worktree_reclaim::sanitize_marker_creator("deploy\nprod"),
+            "sanity: without this check, these two distinct names collapse to \
+             the identical marker-creator string once sanitized"
+        );
+        assert!(
+            !crate::worktree_reclaim::marker_creator_normalizes("deploy prod"),
+            "sanity: an already-clean name is left alone by normalization"
+        );
+        assert!(
+            crate::worktree_reclaim::marker_creator_normalizes("deploy\nprod"),
+            "sanity: normalization does change the embedded-newline name"
+        );
+
+        let clean = r#"
+[[scheduled_tasks]]
+name = "deploy prod"
+cron = "0 9 * * *"
+working_dir = "/tmp/clean"
+command = "claude"
+prompt = "do the thing"
+"#;
+        let loaded = LoadedSchedules::parse(clean);
+        assert_eq!(
+            loaded.tasks.len(),
+            1,
+            "an already-normalized name needs no rejection, got errors: {:?}",
+            loaded.errors
+        );
+        assert!(loaded.errors.is_empty(), "got: {:?}", loaded.errors);
+
+        let embedded_newline = r#"
+[[scheduled_tasks]]
+name = "deploy\nprod"
+cron = "0 9 * * *"
+working_dir = "/tmp/newline"
+command = "claude"
+prompt = "do the thing"
+"#;
+        let loaded = LoadedSchedules::parse(embedded_newline);
+        assert!(
+            loaded.tasks.is_empty(),
+            "a name containing an embedded newline must be rejected at load \
+             time, since it would silently collapse with \"deploy prod\" once \
+             `sanitize_marker_creator` maps `\\n` to a space — got tasks: {:?}",
+            loaded.tasks.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.errors.len(), 1, "got: {:?}", loaded.errors);
+
+        let padded = r#"
+[[scheduled_tasks]]
+name = "  deploy prod  "
+cron = "0 9 * * *"
+working_dir = "/tmp/padded"
+command = "claude"
+prompt = "do the thing"
+"#;
+        let loaded = LoadedSchedules::parse(padded);
+        assert!(
+            loaded.tasks.is_empty(),
+            "a name with leading/trailing whitespace must be rejected at load \
+             time, since trimming would collapse it onto \"deploy prod\" — got \
+             tasks: {:?}",
+            loaded.tasks.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.errors.len(), 1, "got: {:?}", loaded.errors);
+    }
+
     #[test]
     fn schedules_missing_file_is_empty_not_error() {
         let dir = tempfile::tempdir().unwrap();

@@ -374,6 +374,58 @@ mod tests {
         assert!(err.contains("already exists"), "got: {err}");
     }
 
+    // fork #222 fix 5 (auditor F4) — `add` mirrors `config::validate_task`'s
+    // bound at WRITE time: an overlong `--name` is rejected before anything is
+    // pushed into `tasks`, rather than writing an entry `validate_task` would
+    // silently drop at the daemon's next load.
+    #[test]
+    fn add_rejects_overlong_name_before_writing_to_tasks() {
+        let mut tasks = Vec::new();
+        let overlong = "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN + 1);
+        let err = add(&mut tasks, sample_add(&overlong, "0 9 * * *")).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("name"),
+            "error should name the offending field, got: {err}"
+        );
+        assert!(
+            tasks.is_empty(),
+            "no task should be appended to `tasks` when the name is rejected \
+             for length — got: {:?}",
+            tasks
+                .iter()
+                .map(|t: &ScheduledTask| &t.name)
+                .collect::<Vec<_>>()
+        );
+
+        // A name right at the cap is accepted.
+        let at_cap = "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN);
+        assert!(add(&mut tasks, sample_add(&at_cap, "0 9 * * *")).is_ok());
+        assert_eq!(tasks.len(), 1);
+    }
+
+    // fork #222 fix 5 (auditor F4) — same write-time mirroring as the length
+    // check above, for the normalization-collision half: `add` also rejects
+    // any name `worktree_reclaim::marker_creator_normalizes` says would be
+    // changed (e.g. an embedded newline), before writing into `tasks`.
+    #[test]
+    fn add_rejects_normalization_changing_name_before_writing_to_tasks() {
+        let mut tasks = Vec::new();
+        let err = add(&mut tasks, sample_add("deploy\nprod", "0 9 * * *")).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("name"),
+            "error should name the offending field, got: {err}"
+        );
+        assert!(
+            tasks.is_empty(),
+            "no task should be appended to `tasks` when the name would be \
+             changed by normalization — got: {:?}",
+            tasks
+                .iter()
+                .map(|t: &ScheduledTask| &t.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
     // PRD #421 M3.0: `triage` is a parameter, not a hardcoded `false`, so
     // callers can exercise both states of the flag through the same fixture.
     fn sample_issue_dispatch_add(name: &str, repo: &str, triage: bool) -> AddArgs {

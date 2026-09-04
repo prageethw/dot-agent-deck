@@ -38880,6 +38880,56 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #222 edge 2 follow-up (reviewer F8 / auditor F2) — the
+    /// FALSE-POSITIVE case the raw-field fix closes. An orchestration whose
+    /// config `name` is literally `"unknown"` is selected, but the Name field
+    /// itself is left EMPTY (never typed into). Before this fix,
+    /// `name_collision` compared `resolved_title()` — which substitutes the
+    /// orchestration's config name when the Name field is empty — against the
+    /// sentinel, so this case wrongly blocked submission even though the user
+    /// typed nothing. The fixed `reserved_name_collision` compares the RAW
+    /// typed field instead, matching what `build_new_pane_request` actually
+    /// derives the creator string from for an empty field.
+    #[spec("orchestration/identity/040")]
+    #[test]
+    fn identity_040_empty_name_field_resolving_to_unknown_via_fallback_is_not_a_collision() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("unknown")],
+        );
+        form.selection_index = 1; // the only orchestration
+
+        assert_eq!(
+            form.name, "",
+            "sanity: the typed Name field is untouched/empty"
+        );
+        assert_eq!(
+            form.resolved_title().as_deref(),
+            Some("unknown"),
+            "sanity: with an empty Name field, resolved_title() falls back to the \
+             orchestration's config name, which is literally \"unknown\" here — \
+             this is the fallback value the pre-fix code wrongly compared"
+        );
+        assert!(
+            !form.reserved_name_collision(),
+            "an EMPTY Name field must not be treated as the reserved-name \
+             collision just because resolved_title()'s fallback (config name or \
+             directory basename) happens to resolve to \"unknown\" — the check \
+             must read the RAW typed field (empty here), not the resolved \
+             fallback title, since the actual spawn path (`build_new_pane_request`) \
+             computes the creator from the raw field alone and never applies \
+             that fallback"
+        );
+        assert!(
+            !form.name_collision(),
+            "name_collision() must not block submission for this case either, \
+             since it defers to reserved_name_collision() first"
+        );
+    }
+
     /// Scenario: Two RED cases pinning that the uniqueness gate normalizes
     /// on the SAME trim the sink (`build_new_pane_request`) applies, not a
     /// looser comparison (fork#192 audit F1). (a) A live orchestration holds
