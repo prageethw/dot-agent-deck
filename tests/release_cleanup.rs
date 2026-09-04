@@ -118,10 +118,58 @@ fn cleanup_script_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude/skills/dot-ai-tag-release/cleanup.sh")
 }
 
+/// Caller contract: `dir` must be a repository root, a worktree root, or an
+/// explicit `init`/`clone` target — never a subdirectory relying on upward
+/// discovery, or [`try_run_git`]/`run_git` now fail/panic (the ceiling below
+/// bounds discovery at `dir` exactly).
+///
 /// Run `git` with `args` in `dir`, panicking with full stdout/stderr on
 /// failure so a broken fixture is diagnosable instead of a mystifying
 /// downstream test failure.
-fn run_git(dir: &Path, args: &[&str]) -> String {
+///
+/// Issue #669: alongside `GIT_DIR`/`GIT_WORK_TREE`, also clears the other
+/// ambient location-discovery vars that outrank `current_dir` the same way
+/// (`GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`), the two vars
+/// through which git accepts config values (including `core.hooksPath`)
+/// directly from the environment — `GIT_CONFIG_PARAMETERS`/
+/// `GIT_CONFIG_COUNT`+`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` — bypassing
+/// `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` entirely
+/// (auditor A2), and bounds `GIT_CEILING_DIRECTORIES` at `dir`'s parent
+/// rather than clearing it: a `dir` that is not itself a repository (a
+/// fixture's plain subdirectory) must fail discovery closed at `dir`
+/// instead of silently resolving a real repository somewhere above it. This
+/// is a new, stricter decision for this file, not an application of
+/// `run_cleanup`'s own precedent below — `run_cleanup` bounds at the OS temp
+/// dir (the whole fixture tree stays discoverable, only escape to the real
+/// `$HOME` is blocked), while this bounds at `dir`'s parent (no upward
+/// discovery at all). git's own docs: `current_dir` is always searched
+/// regardless of the ceiling list, so the ceiling has to name the directory
+/// git must not walk up *into* — `dir`'s parent, not `dir` itself.
+/// Canonicalized, with the uncanonicalized path as fallback, matching
+/// `run_cleanup`'s own fallback style. `GIT_CONFIG_GLOBAL=/dev/null` (auditor
+/// A3) additionally keeps the invoking developer's or runner's real
+/// `$HOME/.gitconfig` — a `core.hooksPath` there included — out of every
+/// fixture invocation, matching `run_cleanup`'s own isolation below.
+///
+/// `dir` must be absolute (debug-asserted): a relative `dir` makes
+/// `dir.parent()` resolve to `Some("")`, and an empty `GIT_CEILING_DIRECTORIES`
+/// entry is git's own "not a symlink" marker, silently voiding the bound
+/// rather than erroring — not reachable today (every call site passes an
+/// absolute tempdir-derived path). `GIT_CEILING_DIRECTORIES` is also
+/// `:`-separated, so a `:` anywhere in `dir`'s parent path would split the
+/// entry into garbage and fail open the same way (not reachable today
+/// either — see `Sandbox::ceiling` in `repo_state.rs` for the same caveat
+/// documented against a real call site).
+fn try_run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    debug_assert!(
+        dir.is_absolute(),
+        "try_run_git dir must be absolute: {dir:?}"
+    );
+    let ceiling = dir
+        .parent()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+        .unwrap_or_else(|| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -130,18 +178,35 @@ fn run_git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_NAME", "Fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
         .output()
-        .unwrap_or_else(|e| panic!("spawn `git {args:?}` in {dir:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "`git {args:?}` in {dir:?} failed (status {:?})\nstdout: {}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+        .map_err(|e| format!("spawn `git {args:?}` in {dir:?}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git {args:?}` in {dir:?} failed (status {:?})\nstdout: {}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Panicking wrapper around [`try_run_git`] for the (overwhelming majority
+/// of) call sites that treat a fixture-setup failure as fatal — see
+/// [`try_run_git`]'s doc comment for the isolation this applies.
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    try_run_git(dir, args).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Add a worktree on a NEW branch off `main`, add one commit, and
@@ -2239,5 +2304,292 @@ fn release_cleanup_027_worktree_path_containing_a_newline_is_not_truncated() {
          stdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr
+    );
+}
+
+// -- Issue #669: `run_git` clears only GIT_DIR/GIT_WORK_TREE, leaking the
+//    other 6 ambient git location-discovery vars into fixture invocations --
+
+/// **Write escape — issue #669.** `run_git` (above) `env_remove`s `GIT_DIR`
+/// and `GIT_WORK_TREE` (fork issue #579 fix round) but leaves the other 6
+/// location vars — `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_CEILING_DIRECTORIES`,
+/// `GIT_NAMESPACE` — ambient. `GIT_INDEX_FILE` is the representative for the
+/// 5 of those (all but `GIT_CEILING_DIRECTORIES`, which needs its own test
+/// below — see that test's doc comment): pointed at another repository's
+/// index, `git add` in the fixture stages the file into the AMBIENT repo's
+/// index instead of the fixture's own — measured directly (`repo_state.rs`'s
+/// `mod real_git` tests this same class of leak via `Command::get_envs()`
+/// inspection, which is not available here because `run_git` builds and
+/// runs its `Command` internally without exposing it).
+#[test]
+fn release_cleanup_028_run_git_leaks_ambient_git_index_file() {
+    let root = common::harness_tempdir().expect("tempdir for git-index-file fixture");
+
+    let fixture = root.path().join("fixture");
+    std::fs::create_dir_all(&fixture).expect("mkdir fixture");
+    run_git(&fixture, &["init", "-q", "-b", "main"]);
+    run_git(
+        &fixture,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    run_git(&fixture, &["config", "user.name", "fixture"]);
+    run_git(
+        &fixture,
+        &["commit", "-q", "--allow-empty", "-m", "fixture first"],
+    );
+
+    let ambient = root.path().join("ambient");
+    std::fs::create_dir_all(&ambient).expect("mkdir ambient");
+    run_git(&ambient, &["init", "-q", "-b", "main"]);
+    run_git(
+        &ambient,
+        &["config", "user.email", "ambient@example.invalid"],
+    );
+    run_git(&ambient, &["config", "user.name", "ambient"]);
+    run_git(
+        &ambient,
+        &["commit", "-q", "--allow-empty", "-m", "ambient first"],
+    );
+
+    std::fs::write(fixture.join("file.txt"), "hello\n").expect("write file.txt");
+
+    // `cargo-nextest` runs each test in its own process, so mutating the
+    // process environment here cannot bleed into any other test.
+    unsafe {
+        std::env::set_var("GIT_INDEX_FILE", ambient.join(".git/index"));
+    }
+    run_git(&fixture, &["add", "file.txt"]);
+    unsafe {
+        std::env::remove_var("GIT_INDEX_FILE");
+    }
+
+    let status = run_git(&fixture, &["status", "--porcelain"]);
+    assert_eq!(
+        status.trim(),
+        "A  file.txt",
+        "issue #669: expected `run_git`'s `git add file.txt` in the fixture to stage the \
+         file into the FIXTURE's own index (the fixed behaviour this test exists to \
+         demand) even while an ambient GIT_INDEX_FILE points at a different repository's \
+         index — instead the file was staged into that AMBIENT index, leaving the \
+         fixture's own index still showing the file as untracked. `git status --porcelain` \
+         reported: {status:?}"
+    );
+}
+
+/// **Read escape — issue #669, `GIT_CEILING_DIRECTORIES` specifically.**
+/// Unlike the other 5 leaked vars above, the fix here cannot be a blind
+/// `env_remove`: `tests/release_cleanup.rs:1212`'s `run_cleanup` (the SCRIPT
+/// invocation, already correct on this point) documents why — a call site
+/// that runs git in a directory that is not yet a repository needs discovery
+/// to fail closed at cwd, which requires `GIT_CEILING_DIRECTORIES` to be SET
+/// to a bound, not merely cleared (clearing only restores git's default
+/// *unbounded* upward walk).
+///
+/// `run_git` never touches `GIT_CEILING_DIRECTORIES` at all today, so a
+/// fixture command run in a plain subdirectory of a real repository — not
+/// itself a repository — walks straight past it and resolves the outer
+/// repository instead of failing, exactly the escape
+/// `sandbox_git_cannot_discover_a_repository_above_its_root`
+/// (`repo_state.rs`'s `mod real_git`) pins for `Sandbox::git()`.
+///
+/// Scenario: reviewer B1 rework — `run_git` splits into a `Result`-returning
+/// `try_run_git` (this test's target) plus a panicking `run_git` wrapper
+/// around it, so this test asserts on the `Result` directly instead of
+/// installing a competing panic hook / `catch_unwind` around the panicking
+/// wrapper (which trips this repo's own
+/// `no_test_installs_a_competing_panic_hook` harness invariant and turned CI
+/// red on `cb26a89c` — reviewer B1). `try_run_git` does not exist yet, so
+/// this test is RED by failing to *compile* until coder adds it (reviewer
+/// B1's suggested shape) — a valid, if unusual, form of RED. Per auditor L2,
+/// the `Err` arm also asserts the error text names the real cause (`"not a
+/// git repository"`, git's own message for a ceiling-bounded discovery
+/// failure — see `try_run_git`'s error-string format, mirrored from
+/// `run_git`'s current panic message), so a future unrelated failure (a
+/// spawn error, a tempdir failure) cannot silently satisfy this assertion.
+#[test]
+fn release_cleanup_029_run_git_does_not_bound_upward_discovery_with_git_ceiling_directories() {
+    let root = common::harness_tempdir().expect("tempdir for git-ceiling-directories fixture");
+    let outer = root.path().join("outer");
+    std::fs::create_dir_all(&outer).expect("mkdir outer");
+    run_git(&outer, &["init", "-q", "-b", "main"]);
+    run_git(&outer, &["config", "user.email", "outer@example.invalid"]);
+    run_git(&outer, &["config", "user.name", "outer"]);
+    run_git(&outer, &["commit", "-q", "--allow-empty", "-m", "outer"]);
+
+    // NOT itself a repository — a plain subdirectory of `outer`.
+    let candidate = outer.join("candidate");
+    std::fs::create_dir_all(&candidate).expect("mkdir candidate");
+
+    match try_run_git(&candidate, &["rev-parse", "--show-toplevel"]) {
+        Ok(toplevel) => panic!(
+            "issue #669: expected `try_run_git` to fail closed when invoked in `candidate` \
+             (not itself a repository) instead of escaping upward past it and resolving \
+             `outer`'s repository above it — the FIXED behaviour this test exists to \
+             demand is that GIT_CEILING_DIRECTORIES bounds the walk — instead the escape \
+             still succeeded and resolved: {toplevel:?}"
+        ),
+        Err(e) => {
+            assert!(
+                e.contains("not a git repository"),
+                "issue #669 auditor L2: `try_run_git` failed as expected, but its error \
+                 text didn't name the real cause (`\"not a git repository\"`, from git's \
+                 own stderr on a ceiling-bounded discovery failure) — a future unrelated \
+                 failure (a spawn error, a tempdir failure) could satisfy a bare `is_err()` \
+                 check the same way this one does. Got: {e:?}"
+            );
+        }
+    }
+}
+
+// -- Issue #669 auditor A2/A3: two more ambient-config channels `run_git`
+//    still leaks, both of which give an attacker (or an unrelated ambient
+//    hook) real code execution rather than just misdirected discovery -------
+
+/// Write an executable `sh` script at `hook_path` whose body creates `marker`
+/// when run — the standard way to prove a git hook fired (issue #669 auditor
+/// A2/A3).
+fn write_marker_hook(hook_path: &Path, marker: &Path) {
+    common::write_executable(
+        hook_path,
+        &format!("#!/bin/sh\ntouch {}\n", sh_quote_path(marker)),
+    );
+}
+
+/// **RCE — issue #669 auditor A2.** `run_git` neutralizes the 7 ambient
+/// location-discovery vars (`GIT_DIR` etc., `release_cleanup_028`/`029`
+/// above) and bounds `GIT_CEILING_DIRECTORIES`, but never touches
+/// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` — the
+/// numbered-pair channel git accepts config VALUES from, which bypasses
+/// `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` entirely.
+/// `repo_state.rs`'s `AMBIENT_LOCATION_VARS` doc comment (crediting #579
+/// reviewer F6 / auditor A2) explains why this matters even absent a hostile
+/// attacker: git itself sets this shape ambiently inside `pre-commit` hooks
+/// and `git rebase --exec` children.
+///
+/// Scenario: set an ambient `GIT_CONFIG_COUNT=1` /
+/// `GIT_CONFIG_KEY_0=core.hooksPath` / `GIT_CONFIG_VALUE_0=<attacker dir>`
+/// pointing at a marker-writing `pre-commit` hook, then run a fixture `git
+/// commit` through `run_git`. Asserts the hook did NOT fire (the fixed
+/// behaviour) — today it DOES fire (the marker is created), so this test is
+/// RED until coder adds `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` clearing
+/// to `run_git`, at which point the marker stops being created and the
+/// assertion passes.
+#[test]
+fn release_cleanup_030_run_git_leaks_ambient_git_config_count_hook_execution() {
+    let root = common::harness_tempdir().expect("tempdir for git-config-count fixture");
+
+    let fixture = root.path().join("fixture");
+    std::fs::create_dir_all(&fixture).expect("mkdir fixture");
+    run_git(&fixture, &["init", "-q", "-b", "main"]);
+    run_git(
+        &fixture,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    run_git(&fixture, &["config", "user.name", "fixture"]);
+
+    let hooks_dir = root.path().join("attacker-hooks");
+    std::fs::create_dir_all(&hooks_dir).expect("mkdir attacker-hooks");
+    let marker = root.path().join("pwned-config-count");
+    write_marker_hook(&hooks_dir.join("pre-commit"), &marker);
+
+    // `cargo-nextest` runs each test in its own process, so mutating the
+    // process environment here cannot bleed into any other test.
+    unsafe {
+        std::env::set_var("GIT_CONFIG_COUNT", "1");
+        std::env::set_var("GIT_CONFIG_KEY_0", "core.hooksPath");
+        std::env::set_var(
+            "GIT_CONFIG_VALUE_0",
+            hooks_dir.to_str().expect("hooks dir is UTF-8"),
+        );
+    }
+    run_git(
+        &fixture,
+        &["commit", "-q", "--allow-empty", "-m", "trigger hook"],
+    );
+    unsafe {
+        std::env::remove_var("GIT_CONFIG_COUNT");
+        std::env::remove_var("GIT_CONFIG_KEY_0");
+        std::env::remove_var("GIT_CONFIG_VALUE_0");
+    }
+
+    assert!(
+        !marker.is_file(),
+        "issue #669 auditor A2: `run_git` leaked ambient GIT_CONFIG_COUNT/GIT_CONFIG_KEY_0/\
+         GIT_CONFIG_VALUE_0, letting an attacker-controlled core.hooksPath fire a \
+         pre-commit hook during a fixture `git commit` — marker file {marker:?} was \
+         created, proving the hook fired. This channel bypasses GIT_CONFIG_NOSYSTEM \
+         entirely, so clearing that var alone (what `run_git` already does) does not \
+         close it."
+    );
+}
+
+/// **Leak — issue #669 auditor A3.** `run_git` sets `GIT_CONFIG_NOSYSTEM=1`
+/// but never `GIT_CONFIG_GLOBAL` (unlike `run_cleanup` above, which sets
+/// both — see its `GIT_CONFIG_GLOBAL=/dev/null` isolation, referenced from
+/// `init_repo`'s doc comment), so every fixture `git` invocation still reads
+/// whatever `$HOME/.gitconfig` the invoking developer or CI runner has.
+///
+/// Scenario: point `HOME` at a fixture home containing a `.gitconfig` with a
+/// `core.hooksPath` aimed at a marker-writing `pre-commit` hook, then run a
+/// fixture `git commit` through `run_git`. Asserts the hook did NOT fire (the
+/// fixed behaviour) — today it DOES fire (the marker is created) because
+/// `run_git` never points `GIT_CONFIG_GLOBAL` away from `$HOME/.gitconfig`,
+/// so this test is RED until coder adds `GIT_CONFIG_GLOBAL=/dev/null` to
+/// `run_git`, at which point the marker stops being created and the
+/// assertion passes.
+#[test]
+fn release_cleanup_031_run_git_leaks_ambient_home_gitconfig_hook_execution() {
+    let root = common::harness_tempdir().expect("tempdir for git-global-config fixture");
+
+    let fixture = root.path().join("fixture");
+    std::fs::create_dir_all(&fixture).expect("mkdir fixture");
+    run_git(&fixture, &["init", "-q", "-b", "main"]);
+    run_git(
+        &fixture,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    run_git(&fixture, &["config", "user.name", "fixture"]);
+
+    let fixture_home = root.path().join("fixture-home");
+    std::fs::create_dir_all(&fixture_home).expect("mkdir fixture-home");
+    let hooks_dir = root.path().join("home-hooks");
+    std::fs::create_dir_all(&hooks_dir).expect("mkdir home-hooks");
+    let marker = root.path().join("pwned-home-gitconfig");
+    write_marker_hook(&hooks_dir.join("pre-commit"), &marker);
+    std::fs::write(
+        fixture_home.join(".gitconfig"),
+        format!(
+            "[core]\n\thooksPath = {}\n",
+            hooks_dir.to_str().expect("hooks dir is UTF-8")
+        ),
+    )
+    .expect("write fixture $HOME/.gitconfig");
+
+    // `cargo-nextest` runs each test in its own process, so mutating the
+    // process environment here cannot bleed into any other test.
+    let original_home = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("HOME", &fixture_home);
+    }
+    run_git(
+        &fixture,
+        &["commit", "-q", "--allow-empty", "-m", "trigger hook"],
+    );
+    unsafe {
+        match &original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    assert!(
+        !marker.is_file(),
+        "issue #669 auditor A3: `run_git` never points GIT_CONFIG_GLOBAL away from \
+         $HOME/.gitconfig (only GIT_CONFIG_NOSYSTEM is set), so a core.hooksPath in the \
+         invoking user's global gitconfig fired a pre-commit hook during a fixture `git \
+         commit` — marker file {marker:?} was created, proving the hook fired. \
+         `run_cleanup` above already isolates this with GIT_CONFIG_GLOBAL=/dev/null; \
+         `run_git` does not."
     );
 }
