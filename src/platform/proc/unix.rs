@@ -1393,8 +1393,10 @@ mod tests {
     /// `child.wait().await` pair appears back-to-back with nothing else
     /// between them. Today that count is 5, one per remediation arm named in
     /// issue #241; the fix must bring it to 0.
+    #[spec("status/shell-activity/012")]
     #[test]
-    fn capture_bounded_async_remediation_arms_never_leave_kill_and_wait_unbounded() {
+    fn shell_activity_012_capture_bounded_async_remediation_arms_never_leave_kill_and_wait_unbounded()
+     {
         const SRC: &str = include_str!("unix.rs");
         // `include_str!` yields the file exactly as checked out, and Windows
         // checks it out with CRLF endings — normalize once so this reads the
