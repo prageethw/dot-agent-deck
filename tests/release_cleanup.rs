@@ -126,15 +126,21 @@ fn cleanup_script_path() -> PathBuf {
 /// ambient location-discovery vars that outrank `current_dir` the same way
 /// (`GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
 /// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`), and bounds
-/// `GIT_CEILING_DIRECTORIES` at `dir` itself rather than clearing it — the
+/// `GIT_CEILING_DIRECTORIES` at `dir`'s parent rather than clearing it — the
 /// same reasoning `run_cleanup` below already applies at the OS temp dir
 /// for the script under test: a `dir` that is not itself a repository (a
 /// fixture's plain subdirectory) must fail discovery closed at `dir`
 /// instead of silently resolving a real repository somewhere above it.
+/// git's own docs: `current_dir` is always searched regardless of the
+/// ceiling list, so the ceiling has to name the directory git must not walk
+/// up *into* — `dir`'s parent, not `dir` itself.
 /// Canonicalized, with the uncanonicalized path as fallback, matching
 /// `run_cleanup`'s own fallback style.
 fn run_git(dir: &Path, args: &[&str]) -> String {
-    let ceiling = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let ceiling = dir
+        .parent()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+        .unwrap_or_else(|| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
