@@ -39335,7 +39335,7 @@ mod tests {
     }
 
     /// Scenario: Issue #605 — PRD fork#544 M2b made isolated-clone
-    /// provisioning UNCONDITIONAL, so a live orchestration's ACTUAL
+    /// provisioning unconditional, so a live orchestration's ACTUAL
     /// reported cwd for a picked directory is always the sibling workspace
     /// path `resolve_workspace_path`/`sanitize_workspace_segment` derive
     /// from `(directory, name)` — never the picked directory itself, even
@@ -39345,12 +39345,17 @@ mod tests {
     /// `already-live-orchestrator-1`, opened from `/work/already-live`,
     /// would actually report) and attach it via
     /// `with_live_orchestration_cwds` the way the real `Ctrl+n` call site
-    /// does. The PRD #140 same-cwd warning must detect this as occupying
-    /// the picked directory — the same "is this really the same directory"
-    /// comparison `live_orchestration_occupies` (fork#603) already gets
-    /// right for the sibling name-collision feature, not the
-    /// literal/canonical-only `cwd_matches` comparison
-    /// `live_orchestration_in_same_cwd` is stuck on today.
+    /// does. `live_orchestration_in_same_cwd` now routes this `(cwd,
+    /// name)` pair through `live_orchestration_occupies` — the same "is
+    /// this really the same directory" comparison fork#603's sibling
+    /// name-collision feature already gets right — instead of stopping at
+    /// the literal/canonical-only `cwd_matches` comparison, so the PRD
+    /// #140 same-cwd warning detects this as occupying the picked
+    /// directory again. Fixed only for a named orchestration; a live
+    /// orchestration opened with a blank Name still isn't detected (the
+    /// comparison uses the display title rather than the segment the spawn
+    /// path actually derives from, and the two diverge only when Name is
+    /// blank) — tracked as follow-up #687.
     #[spec("orchestration/guard/004")]
     #[test]
     fn guard_004_same_directory_reopen_detects_the_sibling_workspace_cwd_as_occupied() {
@@ -39383,10 +39388,7 @@ mod tests {
              `with_live_orchestration_cwds`) must route through \
              `live_orchestration_occupies` per `(cwd, name)` pair, not stop \
              at a literal/canonical `cwd_matches` comparison a sibling \
-             workspace path can never satisfy (issue #605): since \
-             fork#544 M2b, `live_orchestration_in_same_cwd` cannot return \
-             `true` in production for ANY directory, so the warning never \
-             renders"
+             workspace path can never satisfy (issue #605)"
         );
     }
 
