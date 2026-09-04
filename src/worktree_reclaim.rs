@@ -2638,11 +2638,21 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// rather than trusting anything computed during examination; any mismatch
 /// refuses (returns `Err`, never deletes), and an unreadable pin signal
 /// refuses exactly like every other unresolvable signal in this chain,
-/// never silently treated as unpinned. This deliberately takes the
-/// signature's own two arguments as its only input (matching
-/// [`worktree/reclaim/071`]'s direct-call contract) rather than threading
-/// the examination pass's cached values through, so a caller can never
-/// accidentally pass a stale expectation.
+/// never silently treated as unpinned. **Fork issue #533** adds one more
+/// re-check guarding how the `headRefOid` signal itself gets computed:
+/// immediately before `resolve_pr_state` is called (mirroring
+/// [`isolated_clone_report`]'s own slug-equality guard, auditor B3), the
+/// candidate's own derived repo slug must still equal `root_repo_slug` —
+/// the ROOT checkout's own slug, re-derived by [`run_reclaim`] at removal
+/// time, not a value cached from examination — so `resolve_pr_state` is
+/// never spent against a repository the candidate's own (untrusted)
+/// `origin` chose. This deliberately takes the signature's own **three**
+/// arguments as its only input (matching [`worktree/reclaim/071`]'s
+/// direct-call contract) rather than threading the examination pass's
+/// cached values through, so a caller can never accidentally pass a stale
+/// expectation — `root_repo_slug` is not an exception to that: it is the
+/// trusted root's own current slug, not anything computed about this
+/// candidate during examination.
 ///
 /// **`has_attach_lock` is deliberately the one signal whose PRESENCE is NOT
 /// re-derived here** (auditor N5 / reviewer N3, PR #526 final round). The
@@ -2732,7 +2742,15 @@ fn remove_isolated_clone_dir(
     // `resolve_pr_state` must never be spent against a repo slug the
     // candidate's own (untrusted) `origin` chose, since that `origin` can
     // be repointed by a same-uid actor between examination and removal.
-    if !(root_repo_slug.is_some() && derive_repo_slug(worktree_path).as_deref() == root_repo_slug) {
+    if root_repo_slug.is_none() {
+        return Err(
+            "refusing to remove: the root checkout's own repo slug could not be re-resolved \
+             immediately before deletion -- gh is never queried without a trusted repo slug to \
+             validate the candidate against"
+                .to_string(),
+        );
+    }
+    if derive_repo_slug(worktree_path).as_deref() != root_repo_slug {
         return Err(
             "refusing to remove: the clone's derived repo slug no longer matches the root \
              checkout's own immediately before deletion -- gh is never queried against a \
@@ -2865,6 +2883,11 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool, remover: &str) -> Result<ReclaimO
     let mut removed = Vec::new();
     let mut pending = Vec::new();
     let mut kept = Vec::new();
+    // Fork issue #533 fix round: resolved once per `run_reclaim` call, not
+    // once per removed row -- mirrors `examine_worktrees`'s own hoisted
+    // derivation above its loop (line 1667), and drops N-1 `git remote
+    // get-url origin` subprocess spawns on a batch reclaim.
+    let root_repo_slug = derive_repo_slug(repo_dir);
 
     for r in reports {
         match r.verdict.as_str() {
@@ -2902,11 +2925,7 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool, remover: &str) -> Result<ReclaimO
             // how the gating condition happens to line up with `"ask"`
             // today.
             VERDICT_ISOLATED_CLONE_RECLAIMABLE if yes => {
-                match remove_isolated_clone_dir(
-                    &r.real_path,
-                    remover,
-                    derive_repo_slug(repo_dir).as_deref(),
-                ) {
+                match remove_isolated_clone_dir(&r.real_path, remover, root_repo_slug.as_deref()) {
                     Ok(()) => {
                         let mut r = r;
                         r.removed_by = Some(remover.to_string());
@@ -5470,6 +5489,14 @@ mod tests {
     /// matches a DIFFERENT (attacker) slug's owner, not the root checkout's
     /// own, to prove `resolve_pr_state` genuinely resolves the reply against
     /// whichever slug it was asked about.
+    ///
+    /// Also `touch`es [`GH_INVOKED_MARKER_NAME`] in `bindir` as its very
+    /// first action, unconditionally -- before the `$1`/`$2` branch, so it
+    /// fires on ANY invocation of this stub, not only a `pr list` call
+    /// (auditor's ordering-coverage suggestion, PR #686 fix round). A caller
+    /// that asserts the marker is absent after a refusal is asserting that
+    /// `gh` was never spawned at all, not merely that the call ultimately
+    /// failed.
     #[cfg(unix)]
     fn write_merged_gh_stub_with_owner_and_head_ref_oid(
         bindir: &Path,
@@ -5478,16 +5505,25 @@ mod tests {
         head_ref_oid: &str,
     ) {
         use std::os::unix::fs::PermissionsExt;
+        let marker_path = bindir.join(GH_INVOKED_MARKER_NAME);
         let gh_script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+            "#!/bin/sh\ntouch '{}'\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
              '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"{owner}\"}},\"headRefOid\":\"{head_ref_oid}\"}}]'\n    \
-             exit 0\nfi\nexit 1\n"
+             exit 0\nfi\nexit 1\n",
+            marker_path.display()
         );
         std::fs::create_dir_all(bindir).unwrap();
         let gh_path = bindir.join("gh");
         std::fs::write(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+
+    /// Filename [`write_merged_gh_stub_with_owner_and_head_ref_oid`]'s stub
+    /// `touch`es on every invocation, inside the same `bindir` the stub
+    /// itself lives in -- lets a caller assert the marker's absence to prove
+    /// `gh` was never spawned, not merely that a `gh` call ultimately failed.
+    #[cfg(unix)]
+    const GH_INVOKED_MARKER_NAME: &str = "gh-was-invoked.marker";
 
     /// `git rev-parse HEAD` run inside `dir`, trimmed -- a fixture-only
     /// helper for tests that need to assert on an isolated clone's actual
@@ -7283,10 +7319,13 @@ mod tests {
 
         let result = remove_isolated_clone_dir(&clone_dir, "test-remover", None);
 
-        assert!(
-            result.is_err(),
+        let err = result.expect_err(
             "remove_isolated_clone_dir must refuse when `.git` is no longer a directory at \
-             removal time, got {result:?}"
+             removal time",
+        );
+        assert!(
+            err.contains("no `.git` directory found"),
+            "the refusal must fail at the `.git`-shape check, not some other guard, got: {err}"
         );
         assert!(
             clone_dir.exists(),
@@ -7496,10 +7535,13 @@ mod tests {
             derive_repo_slug(&repo).as_deref(),
         );
 
+        let err = result.expect_err(
+            "remove_isolated_clone_dir must refuse when the clone has been dirtied since it \
+             was examined, not trust the stale examination-time verdict",
+        );
         assert!(
-            result.is_err(),
-            "remove_isolated_clone_dir must refuse when the clone has been dirtied since it was \
-             examined, not trust the stale examination-time verdict, got {result:?}"
+            err.contains("no longer clean"),
+            "the refusal must fail at the cleanliness re-check, not some other guard, got: {err}"
         );
         assert!(
             clone_dir.exists(),
@@ -7875,10 +7917,13 @@ mod tests {
             derive_repo_slug(&repo).as_deref(),
         );
 
-        assert!(
-            result.is_err(),
+        let err = result.expect_err(
             "remove_isolated_clone_dir must refuse when the clone has been pinned since it was \
-             examined, not trust the stale examination-time verdict, got {result:?}"
+             examined, not trust the stale examination-time verdict",
+        );
+        assert!(
+            err.contains("has been pinned"),
+            "the refusal must fail at the pin re-check, not some other guard, got: {err}"
         );
         assert!(
             clone_dir.exists(),
@@ -8434,16 +8479,32 @@ mod tests {
         let result =
             remove_isolated_clone_dir(&clone_dir, "test-remover", root_repo_slug.as_deref());
 
-        assert!(
-            result.is_err(),
+        let err = result.expect_err(
             "remove_isolated_clone_dir must refuse when the candidate's own derived repo slug \
              no longer matches the root checkout's, exactly as isolated_clone_report already \
              does at examination time -- it must never resolve PR state against a repo the \
-             untrusted candidate's own origin chose, got {result:?}"
+             untrusted candidate's own origin chose",
+        );
+        assert!(
+            err.contains("repo slug"),
+            "the refusal must fail at the slug guard, not some other guard, got: {err}"
         );
         assert!(
             clone_dir.exists(),
             "the candidate directory must be left on disk when the slug-mismatch refusal fires"
+        );
+        // Auditor's ordering-coverage suggestion (PR #686 fix round): the
+        // guard's own message claims `gh` is never queried against the
+        // attacker slug at all, not merely that the eventual result is
+        // discarded. Prove it: the stub touches this marker on ANY
+        // invocation, unconditionally, so its absence here means `gh` was
+        // never spawned -- the guard genuinely runs BEFORE
+        // `resolve_pr_state`, not merely before the result is trusted.
+        assert!(
+            !bindir.join(GH_INVOKED_MARKER_NAME).exists(),
+            "gh must never be spawned at all when the slug guard refuses -- the marker's \
+             presence would prove resolve_pr_state ran (and thus that the untrusted attacker \
+             slug was queried) before the guard's refusal short-circuited it"
         );
     }
 }
