@@ -2285,6 +2285,199 @@ where
     }
 }
 
+// Fork issue #393 round-2 review finding #2: `read_hook_line` is generic
+// over `AsyncRead` specifically so it can be driven from an in-memory buffer
+// at the unit level, but before this module only `delivery_008` (an L2 PTY
+// test) exercised it, and only the "no trailing newline, times out" arm.
+// These tests drive it directly, bypassing sockets and the timeout wrapper
+// entirely, so they need no `#[cfg(unix)]` gate like `hook_ingestion_tests`
+// below does.
+#[cfg(test)]
+mod read_hook_line_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    /// An `AsyncRead` that hands out `remaining_fill` bytes of `fill_byte`,
+    /// then (if `trailing_newline`) one `\n`, then EOF — without ever
+    /// materializing a buffer anywhere near `remaining_fill` itself. Each
+    /// `poll_read` call only ever fills the caller's own chunk (at most 4096
+    /// bytes, `read_hook_line`'s own scan-window size), so a multi-megabyte
+    /// `remaining_fill` costs this reader nothing; whatever accumulates
+    /// happens inside `read_hook_line`'s own `line: Vec<u8>`, which is the
+    /// thing under test.
+    struct CappedFillReader {
+        remaining_fill: usize,
+        fill_byte: u8,
+        trailing_newline: bool,
+    }
+
+    impl AsyncRead for CappedFillReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.remaining_fill > 0 {
+                let n = buf.remaining().min(self.remaining_fill);
+                buf.put_slice(&vec![self.fill_byte; n]);
+                self.remaining_fill -= n;
+                return Poll::Ready(Ok(()));
+            }
+            if self.trailing_newline {
+                self.trailing_newline = false;
+                buf.put_slice(b"\n");
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A reader whose `poll_read` must never be called — used to prove a
+    /// second `read_hook_line` call served entirely from `carry` performs no
+    /// further I/O at all, not just that it happens not to need any of the
+    /// bytes a working reader would have supplied.
+    struct UnreachableReader;
+
+    impl AsyncRead for UnreachableReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            unreachable!(
+                "read_hook_line must serve this call entirely from `carry`, \
+                 issuing no further read()"
+            )
+        }
+    }
+
+    /// Scenario: a line that keeps growing past `MAX_HOOK_LINE_LEN` without
+    /// ever hitting a newline must be rejected as `TooLong`, not read forever
+    /// or accepted once it happens to stop.
+    #[tokio::test]
+    async fn read_hook_line_rejects_line_exceeding_max_len() {
+        let mut reader = CappedFillReader {
+            // Comfortably past the cap so the cap check — not the reader
+            // running dry — is what ends the loop.
+            remaining_fill: MAX_HOOK_LINE_LEN + 8192,
+            fill_byte: b'a',
+            trailing_newline: false,
+        };
+        let mut carry = Vec::new();
+        let outcome = read_hook_line(&mut reader, &mut carry).await;
+        assert!(
+            matches!(outcome, HookLineOutcome::TooLong),
+            "expected TooLong, got a different outcome"
+        );
+    }
+
+    /// Scenario: a line whose bytes total exactly `MAX_HOOK_LINE_LEN` (not
+    /// one over) and is newline-terminated within that budget must still
+    /// complete as `Line`, confirming the cap check (`>`, checked before the
+    /// line grows) doesn't off-by-one reject a legitimate max-size line.
+    #[tokio::test]
+    async fn read_hook_line_accepts_line_exactly_at_max_len() {
+        let mut reader = CappedFillReader {
+            remaining_fill: MAX_HOOK_LINE_LEN,
+            fill_byte: b'a',
+            trailing_newline: true,
+        };
+        let mut carry = Vec::new();
+        let outcome = read_hook_line(&mut reader, &mut carry).await;
+        match outcome {
+            HookLineOutcome::Line(line) => {
+                assert_eq!(
+                    line.len(),
+                    MAX_HOOK_LINE_LEN,
+                    "line should be exactly at the cap"
+                );
+                assert!(line.bytes().all(|b| b == b'a'));
+            }
+            other => panic!(
+                "expected a completed Line at exactly the cap, got a different outcome: {}",
+                match other {
+                    HookLineOutcome::Closed => "Closed",
+                    HookLineOutcome::InvalidUtf8 => "InvalidUtf8",
+                    HookLineOutcome::TooLong => "TooLong",
+                    HookLineOutcome::Line(_) => unreachable!(),
+                }
+            ),
+        }
+        assert!(
+            carry.is_empty(),
+            "nothing should be left over after an exact-cap line"
+        );
+    }
+
+    /// Scenario: a complete, newline-terminated line whose bytes are not
+    /// valid UTF-8 must be reported as `InvalidUtf8`, not silently lossy- or
+    /// panic-converted.
+    #[tokio::test]
+    async fn read_hook_line_returns_invalid_utf8_for_non_utf8_line() {
+        let mut reader = std::io::Cursor::new(vec![b'{', 0xFF, 0xFE, b'}', b'\n']);
+        let mut carry = Vec::new();
+        let outcome = read_hook_line(&mut reader, &mut carry).await;
+        assert!(
+            matches!(outcome, HookLineOutcome::InvalidUtf8),
+            "expected InvalidUtf8, got a different outcome"
+        );
+    }
+
+    /// Scenario: fork issue #393 round 2's pipelining fix. A peer that
+    /// writes two newline-terminated lines in a single `write()` delivers
+    /// them to the reader as one `read()` chunk (`"line1\nline2\n"`). The
+    /// first `read_hook_line` call must return only the first line and leave
+    /// the second in `carry`; a second call fed that same `carry`, against a
+    /// reader that panics if touched at all, must return the second line
+    /// purely from the carried-over bytes — proving the carry-over path
+    /// works, not just that it compiles.
+    #[tokio::test]
+    async fn read_hook_line_carries_over_pipelined_second_line() {
+        let mut reader = std::io::Cursor::new(b"line1\nline2\n".to_vec());
+        let mut carry = Vec::new();
+
+        let first = read_hook_line(&mut reader, &mut carry).await;
+        assert!(
+            matches!(&first, HookLineOutcome::Line(line) if line == "line1"),
+            "expected the first call to return only \"line1\""
+        );
+        assert_eq!(
+            carry, b"line2\n",
+            "the second line's bytes (including its own trailing newline) must be carried over"
+        );
+
+        let mut unreachable_reader = UnreachableReader;
+        let second = read_hook_line(&mut unreachable_reader, &mut carry).await;
+        assert!(
+            matches!(&second, HookLineOutcome::Line(line) if line == "line2"),
+            "expected the second call, served from `carry` alone, to return \"line2\""
+        );
+        assert!(
+            carry.is_empty(),
+            "carry should be fully drained after the second line"
+        );
+    }
+
+    /// Scenario: fork issue #393 round 2's Fix 4. A transient read error
+    /// (`Interrupted`/EINTR) says nothing about the peer and must be
+    /// retried, not folded into "connection closed" — a reader that fails
+    /// once with `Interrupted` and then succeeds must still yield the line.
+    #[tokio::test]
+    async fn read_hook_line_retries_after_transient_interrupted_error() {
+        let mut reader = tokio_test::io::Builder::new()
+            .read_error(io::Error::new(io::ErrorKind::Interrupted, "eintr"))
+            .read(b"line1\n")
+            .build();
+        let mut carry = Vec::new();
+        let outcome = read_hook_line(&mut reader, &mut carry).await;
+        assert!(
+            matches!(&outcome, HookLineOutcome::Line(line) if line == "line1"),
+            "expected the read to be retried past the transient error and yield \"line1\""
+        );
+    }
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
