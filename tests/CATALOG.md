@@ -1583,6 +1583,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the examination-time guard itself (already the production behavior in `isolated_clone_report`); the exact wording of the refusal reason; any behavior once the fix genuinely closes the window (that's the GREEN round).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `073`/`081`).
 
+##### worktree/reclaim/084 — Issue #300 blocker 1 (RED). With `DOT_AGENT_DECK_WORKTREE_OWNER` entirely absent but a `gh`-resolvable human login available, `--mine` must NOT immediately refuse the way `033` pins today — it must fall back to attempting human-identity resolution instead, the same seam unmarked rows already use.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly removed from the spawned subprocess's environment and the stub `gh api user` configured to resolve a login.
+- **Agent:** none (one unmarked, human-owned worktree, plus one same-repo worktree marked owned by a different orchestration identity).
+- **Asserts:** the process exits zero (not the `033` refusal); the combined output does not contain the literal "DOT_AGENT_DECK_WORKTREE_OWNER is not set" refusal text; the worktree owned by the different orchestration identity never appears in the output (rules out a wrongly-permissive fix that disables filtering entirely on an absent env var); with blocker 2's independent `is_mine` fix (`085`) now also landed in this same PR, that the unmarked human-owned worktree itself appears in the listing — pinning the coupling between this filter's `identity_string()` and the report's own `owner` field end to end.
+- **Does not assert:** the exact wording of any message printed on the empty-result path; the `DOT_AGENT_DECK_PANE_ID`-gated refusal for an orchestration pane that lost its saved identity (that's a separate, not-yet-written case).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/085 — Issue #300 blocker 2 (RED). `is_mine`'s `owned &&` conjunct structurally excludes every human-owned row, since an unmarked (hand-made) worktree always resolves `owned: false` regardless of whether its resolved identity matches the `--mine` filter.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` (as `worktree/reclaim/030`).
+- **Agent:** none.
+- **Asserts:** `is_mine` returns `true` for a hand-constructed `WorktreeReport` representing an unmarked, human-owned worktree (`owned: false`, `owner_kind: "human"`, `owner: Some("human:alice@laptop")`) filtered against the exact same identity string.
+- **Does not assert:** `owner_disagreements`, which is deliberately restricted to `owner_kind == "agent"` and is unaffected by this fix; the CLI-level `owner_filter` derivation (`084`'s job); the reclaim-eligibility verdict.
+- **Platform coverage:** mac+linux+windows (pure in-memory logic, no filesystem or subprocess).
+
+##### worktree/reclaim/086 — Issue #300 round-2 review R2. With `DOT_AGENT_DECK_WORKTREE_OWNER` absent AND `DOT_AGENT_DECK_PANE_ID` present, `--mine` must still refuse loudly exactly as `033` pins for the no-PANE_ID case, not fall back to human-identity resolution the way `084` does — the pane-gated refusal (auditor M1) itself had no test until now, and `084`/`033` never set `DOT_AGENT_DECK_PANE_ID` at all.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/084`), via the new `Fixture::run_with_owner_and_pane` (owner absent, pane id present); `gh` left genuinely resolvable (`set_login`, not `fail_login`) so a dropped pane gate would wrongly succeed rather than fail for an unrelated reason.
+- **Agent:** none (one unmarked worktree that would be human-owned if the pane gate were dropped).
+- **Asserts:** the process exits non-zero; the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`; the unmarked worktree never appears in the output (rules out the gate being silently replaced by `084`'s human-fallback behavior).
+- **Does not assert:** the `NotUnicode` set-but-invalid case (a different match arm, untouched by this fix); the exact refusal wording beyond naming the variable.
+- **Platform coverage:** mac+linux.
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.
