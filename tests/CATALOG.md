@@ -1597,10 +1597,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** `owner_disagreements`, which is deliberately restricted to `owner_kind == "agent"` and is unaffected by this fix; the CLI-level `owner_filter` derivation (`084`'s job); the reclaim-eligibility verdict.
 - **Platform coverage:** mac+linux+windows (pure in-memory logic, no filesystem or subprocess).
 
-##### worktree/reclaim/084 — Issue #300 round-2 review R2. With `DOT_AGENT_DECK_WORKTREE_OWNER` absent AND `DOT_AGENT_DECK_PANE_ID` present, `--mine` must still refuse loudly exactly as `033` pins for the no-PANE_ID case, not fall back to human-identity resolution the way `082` does — the pane-gated refusal (auditor M1) itself had no test until now, and `082`/`033` never set `DOT_AGENT_DECK_PANE_ID` at all.
-- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/082`), via the new `Fixture::run_with_owner_and_pane` (owner absent, pane id present); `gh` left genuinely resolvable (`set_login`, not `fail_login`) so a dropped pane gate would wrongly succeed rather than fail for an unrelated reason.
+##### worktree/reclaim/086 — Issue #300 round-2 review R2. With `DOT_AGENT_DECK_WORKTREE_OWNER` absent AND `DOT_AGENT_DECK_PANE_ID` present, `--mine` must still refuse loudly exactly as `033` pins for the no-PANE_ID case, not fall back to human-identity resolution the way `084` does — the pane-gated refusal (auditor M1) itself had no test until now, and `084`/`033` never set `DOT_AGENT_DECK_PANE_ID` at all.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/084`), via the new `Fixture::run_with_owner_and_pane` (owner absent, pane id present); `gh` left genuinely resolvable (`set_login`, not `fail_login`) so a dropped pane gate would wrongly succeed rather than fail for an unrelated reason.
 - **Agent:** none (one unmarked worktree that would be human-owned if the pane gate were dropped).
-- **Asserts:** the process exits non-zero; the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`; the unmarked worktree never appears in the output (rules out the gate being silently replaced by `082`'s human-fallback behavior).
+- **Asserts:** the process exits non-zero; the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`; the unmarked worktree never appears in the output (rules out the gate being silently replaced by `084`'s human-fallback behavior).
 - **Does not assert:** the `NotUnicode` set-but-invalid case (a different match arm, untouched by this fix); the exact refusal wording beyond naming the variable.
 - **Platform coverage:** mac+linux.
 

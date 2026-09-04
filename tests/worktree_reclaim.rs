@@ -570,7 +570,7 @@ impl Fixture {
     /// this repo's own orchestration) leaks a real `DOT_AGENT_DECK_PANE_ID`
     /// into the spawned subprocess, which the pane gate added for issue
     /// #300 now treats as "this is an orchestration pane" and refuses --
-    /// breaking `082`'s human-fallback assertion for a reason having
+    /// breaking `084`'s human-fallback assertion for a reason having
     /// nothing to do with the code under test. Do not delete this as
     /// redundant with the `DOT_AGENT_DECK_WORKTREE_OWNER` removal above.
     fn run_with_owner(&self, args: &[&str], owner: Option<&str>) -> std::process::Output {
@@ -581,8 +581,8 @@ impl Fixture {
     /// `DOT_AGENT_DECK_PANE_ID` on the spawned subprocess -- `Some(v)` sets
     /// it to exactly `v`, `None` removes it. Added for issue #300 round-2
     /// review R2, to pin the pane-gated refusal itself: "owner var absent,
-    /// PANE_ID present" (`worktree_reclaim_084`) is the one square of the
-    /// blocker-1/auditor-M1 matrix `033`/`082` don't cover.
+    /// PANE_ID present" (`worktree_reclaim_086`) is the one square of the
+    /// blocker-1/auditor-M1 matrix `033`/`084` don't cover.
     fn run_with_owner_and_pane(
         &self,
         args: &[&str],
@@ -1975,7 +1975,7 @@ fn worktree_reclaim_032_mine_matches_after_simulated_restart() {
 /// answer here is worse than no answer). `fail_login()` (issue #300) keeps
 /// this a genuinely UNRESOLVABLE identity even once `--mine` starts falling
 /// back to `gh`-derived human-identity resolution on an absent env var
-/// (`082`) -- without it, the stub's default `stub-user` login would make
+/// (`084`) -- without it, the stub's default `stub-user` login would make
 /// this scenario a RESOLVABLE identity instead, which is a different case
 /// this test was never meant to cover.
 #[spec("worktree/reclaim/033")]
@@ -3228,23 +3228,23 @@ fn worktree_reclaim_084_mine_falls_back_to_human_resolution_when_owner_env_absen
 /// simply lost its saved identity (e.g. a tab reattached to a warm daemon,
 /// per `docs/orchestration.md`) -- `--mine` must still refuse loudly exactly
 /// as `033` pins for the no-PANE_ID case, NOT fall back to human-identity
-/// resolution the way `082` does. `gh` is left genuinely RESOLVABLE here
+/// resolution the way `084` does. `gh` is left genuinely RESOLVABLE here
 /// (`set_login`, not `fail_login`) so a regression that dropped the pane
 /// gate entirely would succeed (wrongly) rather than fail for an unrelated
 /// reason -- the one thing that makes this a real guard on the gate itself,
-/// not just on the refusal message. `082`/`033` predate this test and never
+/// not just on the refusal message. `084`/`033` predate this test and never
 /// set `DOT_AGENT_DECK_PANE_ID` at all, so neither one exercises this square
 /// of the matrix.
-#[spec("worktree/reclaim/084")]
+#[spec("worktree/reclaim/086")]
 #[test]
 #[cfg(unix)]
-fn worktree_reclaim_084_mine_still_refuses_when_pane_id_present_and_owner_absent() {
+fn worktree_reclaim_086_mine_still_refuses_when_pane_id_present_and_owner_absent() {
     let fx = Fixture::new();
     let _wt = fx.add_worktree_with_commit("wt-reattached-pane", "feat/reattached-pane");
     fx.set_pr_state("feat/reattached-pane", "OPEN");
     fx.set_login("alice");
     // Deliberately NOT marked -- if the pane gate were dropped, this would
-    // be the exact unmarked row `082`'s human-fallback would wrongly surface.
+    // be the exact unmarked row `084`'s human-fallback would wrongly surface.
 
     let out = fx.run_with_owner_and_pane(
         &["worktree", "list", "--mine"],
@@ -3257,7 +3257,7 @@ fn worktree_reclaim_084_mine_still_refuses_when_pane_id_present_and_owner_absent
         "`--mine` with DOT_AGENT_DECK_WORKTREE_OWNER absent but DOT_AGENT_DECK_PANE_ID present \
          must still refuse loudly (non-zero exit) -- this is the orchestration-pane-lost-its-\
          identity case the fail-loud contract exists for, not the human-at-a-terminal case \
-         `082` covers; got {:?} out={text}",
+         `084` covers; got {:?} out={text}",
         out.status
     );
     assert!(
@@ -3268,7 +3268,7 @@ fn worktree_reclaim_084_mine_still_refuses_when_pane_id_present_and_owner_absent
     assert!(
         !text.contains("wt-reattached-pane"),
         "the unmarked worktree must never appear -- if it did, the pane gate had silently been \
-         replaced by the human-identity fallback (`082`'s behavior), answering for the wrong \
+         replaced by the human-identity fallback (`084`'s behavior), answering for the wrong \
          scope; got:\n{text}"
     );
 }
