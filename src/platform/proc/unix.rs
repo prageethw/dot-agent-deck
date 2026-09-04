@@ -802,23 +802,43 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
 ///
 /// `budget` bounds the SUCCESS path — spawn, read and the final wait, if all
 /// three complete without needing remediation — matching the sync form's
-/// single `deadline` loop over that same span. **It does not bound the
-/// remediation `kill().await` / `wait().await` pairs on the error, size-cap
-/// and timeout arms below** (PR #233 review, R2): `tokio::process::Child::
-/// kill()` is `start_kill()` followed by an unbounded `wait()`, so a child
-/// wedged in uninterruptible sleep (`D` state) still parks this function —
-/// now on the remediation path instead of the happy path. `SIGSTOP`ed
-/// children genuinely are fixed by this, since SIGKILL does terminate a
-/// stopped process; bounding the remediation arms themselves is filed as a
-/// follow-up rather than folded into this PR. Fork issue #160's audit (A4):
-/// an earlier version of this function wrapped only the read in `timeout`,
-/// leaving the final `wait()` unbounded on the success path — a child that
-/// reached stdout EOF without exiting (wedged in `D` state, `SIGSTOP`ed)
-/// parked this function, and with it the daemon's whole poll, forever, even
-/// when nothing had actually timed out. Keep the wait inside the bounded
-/// region if this is ever edited again.
+/// single `deadline` loop over that same span. The remediation arms below
+/// (error, size-cap and timeout) are bounded too (fork issue #241; PR #233
+/// review, R2 originally flagged them as the gap): each uses `start_kill()`
+/// — the non-async half of `tokio::process::Child::kill()`, which only sends
+/// `SIGKILL` and returns immediately — followed by `child.wait()` wrapped in
+/// `tokio::time::timeout(KILL_REAP_TIMEOUT, _)` rather than `kill().await`'s
+/// own unbounded `wait()`. A child wedged in uninterruptible sleep (`D`
+/// state) can still outlive `KILL_REAP_TIMEOUT` — SIGKILL does not preempt
+/// that state — so a bounded wait can still return before the child is
+/// actually reaped. That is fine: `kill_on_drop(true)` above is exactly the
+/// safety net for that case — dropping `child` hands it to tokio's orphan
+/// queue, which keeps trying to reap it in the background without blocking
+/// this function, so no remediation arm below either parks indefinitely or
+/// leaves a permanent zombie. Fork issue #160's audit (A4): an earlier
+/// version of this function wrapped only the read in `timeout`, leaving the
+/// final `wait()` unbounded on the success path — a child that reached
+/// stdout EOF without exiting (wedged in `D` state, `SIGSTOP`ed) parked this
+/// function, and with it the daemon's whole poll, forever, even when nothing
+/// had actually timed out. Keep the wait inside the bounded region if this is
+/// ever edited again.
 async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -> Option<String> {
     use tokio::io::AsyncReadExt;
+
+    // Bounds each remediation arm's post-`start_kill()` wait (fork issue
+    // #241) — deliberately independent of `budget`/`PS_SAMPLE_BUDGET`, which
+    // bounds the overall sample and is already spent by the time remediation
+    // runs. By the time any remediation arm reaches this wait, `SIGKILL` has
+    // already been sent; this is purely "how long do we let the OS take to
+    // reap an already-killed child before we stop blocking on it and let
+    // `kill_on_drop`'s orphan queue take over." Short and fixed rather than a
+    // fraction of `budget`: a healthy reap after `SIGKILL` is near-instant, so
+    // this only needs enough slack to absorb scheduler noise on a loaded
+    // machine (this file's own doc comments above measure load averages of
+    // 11-19 during this repo's test runs), not enough to matter for the
+    // pathological case that leaves it unreaped (a `D`-state child), which
+    // this timeout is not meant to fix — `kill_on_drop` is.
+    const KILL_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 
     if budget.is_zero() {
         return None;
@@ -835,8 +855,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
     let Some(mut pipe) = child.stdout.take() else {
         // Unreachable — stdout was just configured as a pipe — but returning
         // without reaping would leave a zombie behind on every call.
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
         return None;
     };
 
@@ -865,8 +885,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
                 "process-table sample's read failed — reporting no sample rather than a \
                  partial table"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
             return None;
         }
         Err(_) => {
@@ -875,8 +895,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
                 ?budget,
                 "process-table sample exceeded its budget — killing it and reporting no sample"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
             return None;
         }
     };
@@ -896,8 +916,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
                 "process-table sample exceeded its size cap — killing it and reporting no sample"
             );
         }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
         return None;
     }
 
@@ -917,8 +937,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
                 "process-table sample's child did not exit after its stdout was fully read — \
                  killing it and reporting no sample"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
             return None;
         }
     };
