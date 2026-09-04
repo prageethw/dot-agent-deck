@@ -1135,31 +1135,33 @@ const NAME_COLLISION_WARNING: [&str; 1] =
     ["  ! This name is already in use by a live orchestration."];
 
 /// PRD #140 M4.0: the shared warning DECISION — does `form_cwd` collide with
-/// any directory the daemon reports as hosting a live orchestration? The single
-/// code path behind both the L1 seam
-/// ([`render_new_pane_orchestration_guard_to_buffer`]) and the interactive
-/// `Ctrl+n` flow, so the test and the real form can't drift apart.
+/// any live orchestration's real reported cwd? The single code path behind
+/// both the L1 seam ([`render_new_pane_orchestration_guard_to_buffer`]) and
+/// the interactive `Ctrl+n` flow, so the test and the real form can't drift
+/// apart.
 ///
-/// Compared as [`Path`]s rather than strings so a trailing separator
-/// (`/work/proj/` vs `/work/proj`) doesn't read as a fresh directory.
+/// PRD fork#603 fix round (issue #605): each `(cwd, name)` candidate is now
+/// routed through [`live_orchestration_occupies`] rather than a bare
+/// path-equality/canonicalize compare. The `name` half exists because, since
+/// PRD fork#544 M2b made isolated-clone provisioning UNCONDITIONAL, a live
+/// orchestration's reported `cwd` is never the source directory it was
+/// opened from — it is always a SIBLING workspace path derived from `(source
+/// directory, name)`. So "does `form_cwd` already host that live
+/// orchestration" can only be answered by re-deriving the sibling path
+/// `form_cwd` would ITSELF produce for the candidate's `name` and comparing
+/// that against the live `cwd` — which is exactly what
+/// [`live_orchestration_occupies`] does (see its doc for that derivation,
+/// the raw-compare/canonicalize fallback it still tries first for a live
+/// entry that genuinely IS `form_cwd` itself, and the nested-pick handling).
 ///
-/// PRD #140 review: the raw compare alone missed a whole class of same-directory
-/// collision — a symlinked or otherwise non-canonical ALIAS of a live
-/// orchestration's directory (`~/link-to-proj` vs `/work/proj`, `/work/proj/../proj`,
-/// a macOS `/tmp` → `/private/tmp` path) is the same tree with the same
-/// `.dot-agent-deck/*-{role}.md` files, yet compared unequal and silently
-/// skipped the warning. So a miss on the raw compare escalates to a BEST-EFFORT
-/// [`std::fs::canonicalize`] of both sides. Failing OPEN is deliberate: any
-/// canonicalisation error (path gone, permission denied, a synthetic path from
-/// the L1 render seam) just keeps the raw verdict, never panics, and never
-/// blocks the form. The result is cached once per form open by
-/// [`NewPaneFormState::with_live_orchestration_cwds`] — the warning decision is
-/// read every frame, and the filesystem must not be.
+/// The result is cached once per form open by
+/// [`NewPaneFormState::with_live_orchestration_cwds`] — the warning decision
+/// is read every frame, and the filesystem/daemon must not be.
 fn live_orchestration_in_same_cwd(
     form_cwd: &Path,
-    live_orchestration_cwds: &[(String, String)],
+    live_orchestration_identities: &[(String, String)],
 ) -> bool {
-    live_orchestration_cwds
+    live_orchestration_identities
         .iter()
         .any(|(cwd, name)| live_orchestration_occupies(form_cwd, cwd, name))
 }
@@ -1188,10 +1190,13 @@ fn cwd_matches(form_cwd: &Path, candidate: &str) -> bool {
 }
 
 /// PRD fork#603 fix round (CI regression on `8523e3c5`): whether a live
-/// orchestration identity `(live_cwd, live_name)` belongs to `form_cwd`, for
-/// the directory-scoped suggestion/collision check
-/// ([`NewPaneFormState::suggest_orchestration_name`],
-/// [`NewPaneFormState::name_collision`]).
+/// orchestration identity `(live_cwd, live_name)` belongs to `form_cwd`.
+/// Originally written for, and still used by, the directory-scoped
+/// suggestion/collision check ([`NewPaneFormState::suggest_orchestration_name`],
+/// [`NewPaneFormState::name_collision`]); PRD fork#603 fix round (issue #605)
+/// added a third caller, [`live_orchestration_in_same_cwd`] — the same-cwd
+/// warning needs exactly the same "does this directory already host that
+/// live orchestration" answer this function already computed.
 ///
 /// [`cwd_matches`] alone (the original fork#603 implementation) is not
 /// enough: PRD fork#544 M2b made isolated-clone provisioning UNCONDITIONAL
@@ -1428,11 +1433,15 @@ fn live_orchestration_cwds_and_titles() -> Vec<(Option<String>, String)> {
 /// which must never run directly on a tokio worker thread that other
 /// connections share.
 ///
-/// Deliberately NOT [`live_orchestration_in_same_cwd`]'s raw path-equality
-/// compare, which only catches two orchestrations sharing the exact same
-/// pane cwd (the no-worktree-slug case). The actual #325 incident shape is N
-/// orchestrations each carving their OWN worktree sibling off one shared
-/// checkout — `orchestration_cwd` for each of those is the WORKTREE path,
+/// Deliberately NOT [`live_orchestration_in_same_cwd`]'s comparison (which,
+/// since issue #605, is no longer raw path-equality either — it routes each
+/// candidate through [`live_orchestration_occupies`], so it also catches a
+/// live orchestration's sibling workspace path when it was derived from
+/// `form_cwd` itself). Even so, that check only recognizes a live
+/// orchestration OPENED FROM (or occupying) the SAME source directory. The
+/// actual #325 incident shape is different: N orchestrations each carving
+/// their OWN worktree sibling off one shared checkout — `orchestration_cwd`
+/// for each of those is the WORKTREE path,
 /// never `target_dir` itself (see [`crate::tab::TabManager::open_orchestration_tab`],
 /// which stamps `orchestration_cwd: Some(cwd.to_string())` where `cwd` is
 /// the already-resolved worktree dir) — so raw equality against `target_dir`
@@ -1947,11 +1956,17 @@ impl NewPaneFormState {
     /// so the many existing construction sites — and the daemon-free L1 seams —
     /// stay untouched.
     ///
-    /// The collision verdict is decided HERE, once, and cached: the comparison
-    /// canonicalises paths (PRD #140 review) and the render path asks for it
-    /// every frame.
-    fn with_live_orchestration_cwds(mut self, cwds: Vec<(String, String)>) -> Self {
-        self.live_orchestration_in_same_cwd = live_orchestration_in_same_cwd(&self.dir, &cwds);
+    /// The collision verdict is decided HERE, once, and cached: since issue
+    /// #605 the comparison routes each `(cwd, name)` pair through
+    /// [`live_orchestration_occupies`] (raw-compare/canonicalize first, then
+    /// a sibling-workspace re-derivation using `name`), and the render path
+    /// asks for the cached verdict every frame rather than recomputing it.
+    /// Takes a slice rather than an owned `Vec` — the one production call
+    /// site also feeds the same pairs to [`Self::with_live_orchestration_identities`],
+    /// and paying for a clone just to satisfy two owned-`Vec` builders would
+    /// be pure waste.
+    fn with_live_orchestration_cwds(mut self, identities: &[(String, String)]) -> Self {
+        self.live_orchestration_in_same_cwd = live_orchestration_in_same_cwd(&self.dir, identities);
         self
     }
 
@@ -9478,10 +9493,16 @@ fn transition_after_dir_pick(ui: &mut UiState) {
             // PRD fork#603 fix round (reviewer M1): partition into
             // directory-scoped identities and wildcard names — a `None`
             // cwd (a backward-compat peer) carries no directory to pair
-            // with a title, so it's skipped from both
-            // `with_live_orchestration_cwds`'s same-cwd warning and
-            // `live_orchestration_occupies`'s comparison; it occupies every
-            // directory unconditionally instead.
+            // with a title, so it can't participate in either directory-
+            // scoped check. The two checks disagree on what that means:
+            // `with_live_orchestration_cwds`'s same-cwd warning simply
+            // never sees it (no directory, no candidate to compare — no
+            // warning, ever, for this entry); `name_collision`/
+            // `suggest_orchestration_name` instead treat it as occupying
+            // every directory unconditionally, via
+            // `live_orchestration_wildcard_names` below (see that field's
+            // doc) — a name-uniqueness refusal must fail closed, while a
+            // same-cwd hint is best-effort and fails open.
             let mut live_orch_scoped: Vec<(String, String)> = Vec::new();
             let mut live_orch_wildcard_names: Vec<String> = Vec::new();
             for (cwd, name) in live_orch_identities {
@@ -9491,7 +9512,7 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 }
             }
             NewPaneFormState::new(dir, name, command, modes, orchestrations)
-                .with_live_orchestration_cwds(live_orch_scoped.clone())
+                .with_live_orchestration_cwds(&live_orch_scoped)
                 .with_live_orchestration_identities(live_orch_scoped)
                 .with_live_orchestration_wildcard_names(live_orch_wildcard_names)
         }
@@ -25126,19 +25147,24 @@ pub fn render_new_pane_form_to_buffer(
 
 /// PRD #140 M4.0 L1 seam: render the new-pane form with an ORCHESTRATION
 /// selected into a `Buffer`, for a form directory of `form_cwd` and the
-/// directories `live_orchestration_cwds` that the daemon reports as already
-/// hosting a live orchestration.
+/// `(cwd, name)` pairs `live_orchestration_identities` that the daemon
+/// reports as already hosting a live orchestration.
 ///
 /// Drives the production `render_new_pane_form` through a `TestBackend`, so the
 /// warning decision it exercises is literally the one the interactive `Ctrl+n`
 /// flow runs ([`live_orchestration_in_same_cwd`], fed there by
-/// [`live_orchestration_cwds_and_titles`] instead of this parameter). A
-/// `form_cwd` present in the list renders [`SAME_CWD_ORCHESTRATION_WARNING`]; a
-/// fresh one renders the form unchanged. Either way the `[Submit]` action stays
+/// [`live_orchestration_cwds_and_titles`] instead of this parameter). Since
+/// issue #605, that decision routes each pair through
+/// [`live_orchestration_occupies`] rather than a bare cwd compare, so a pair
+/// whose `cwd` is a SIBLING workspace `form_cwd`'s own isolated-clone
+/// provisioning would derive for that `name` renders
+/// [`SAME_CWD_ORCHESTRATION_WARNING`] too — not only a pair whose `cwd`
+/// literally equals `form_cwd`. A directory/name combination that matches
+/// nothing renders the form unchanged. Either way the `[Submit]` action stays
 /// — the warning never blocks. Mirrors [`render_new_pane_form_to_buffer`].
 pub fn render_new_pane_orchestration_guard_to_buffer(
     form_cwd: &str,
-    live_orchestration_cwds: &[(&str, &str)],
+    live_orchestration_identities: &[(&str, &str)],
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -25163,10 +25189,10 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
         orchestrations,
     )
     .with_live_orchestration_cwds(
-        live_orchestration_cwds
+        &live_orchestration_identities
             .iter()
             .map(|(c, n)| ((*c).to_string(), (*n).to_string()))
-            .collect(),
+            .collect::<Vec<_>>(),
     );
     // Select the single orchestration option (index 0 is "No mode"; there are no
     // plain modes) — the state the guard applies to.
@@ -39347,7 +39373,7 @@ mod tests {
             vec![],
             vec![make_orchestration("review")],
         )
-        .with_live_orchestration_cwds(vec![(live_cwd.clone(), live_name)]);
+        .with_live_orchestration_cwds(&[(live_cwd.clone(), live_name)]);
 
         assert!(
             form.live_orchestration_in_same_cwd,
