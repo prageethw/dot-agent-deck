@@ -5609,6 +5609,156 @@ mod tests {
         );
     }
 
+    /// Same discrimination shape as [`write_dual_repo_gh_stub`] (empty for
+    /// `origin_slug`, a real reply only for `upstream_slug`), but answers a
+    /// MERGED PR carrying `headRefOid` rather than an OPEN one with no SHA --
+    /// issue #191 F1/A3: a PR opened FROM this fork AGAINST upstream carries
+    /// `headRepositoryOwner.login` equal to `origin`'s own owner, never
+    /// `upstream`'s (the head repository is the fork, not the base) -- the
+    /// majority real-world shape (6 of 10 sampled upstream PRs, reviewer
+    /// F1). Takes the `headRepositoryOwner` login and `headRefOid`
+    /// explicitly so a fixture can set the owner to `origin`'s own instead
+    /// of `upstream`'s, and can force a specific (possibly non-matching)
+    /// commit SHA for the A2 name-collision fixture.
+    #[cfg(unix)]
+    fn write_dual_repo_merged_upstream_gh_stub(
+        bindir: &Path,
+        branch: &str,
+        origin_slug: &str,
+        upstream_slug: &str,
+        head_owner: &str,
+        head_ref_oid: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let gh_script = format!(
+            "#!/bin/sh\n\
+             repo=\"\"\n\
+             prev=\"\"\n\
+             for arg in \"$@\"; do\n\
+             \x20   if [ \"$prev\" = \"--repo\" ]; then repo=\"$arg\"; fi\n\
+             \x20   prev=\"$arg\"\n\
+             done\n\
+             if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n\
+             \x20   if [ \"$repo\" = \"{origin_slug}\" ]; then\n\
+             \x20       printf '%s\\n' '[]'\n\
+             \x20       exit 0\n\
+             \x20   elif [ \"$repo\" = \"{upstream_slug}\" ]; then\n\
+             \x20       printf '%s\\n' '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"{head_owner}\"}},\"headRefOid\":\"{head_ref_oid}\"}}]'\n\
+             \x20       exit 0\n\
+             \x20   fi\n\
+             \x20   exit 1\n\
+             fi\n\
+             exit 1\n"
+        );
+        std::fs::create_dir_all(bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Scenario: A worktree's branch has no pull request on `origin`
+    /// (`test-org/test-repo`) but a MERGED pull request on `upstream`
+    /// (`vfarcic/dot-agent-deck`) whose `headRepositoryOwner` is `origin`'s
+    /// OWN owner (`test-org`), not `upstream`'s -- the cross-fork shape a
+    /// PR opened from this fork against upstream actually produces, and the
+    /// majority real-world case (6 of 10 sampled), per issue #191's own
+    /// reported worktrees. `resolve_pr_state` must resolve `PrState::Merged`,
+    /// not `Unresolvable` on an owner mismatch against `upstream`'s own
+    /// owner alone (reviewer F1 / auditor A3).
+    #[spec("worktree/reclaim/084")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_084_resolve_pr_state_accepts_origin_owner_on_cross_fork_upstream_pr() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        add_upstream_remote(&repo, "vfarcic", "dot-agent-deck");
+
+        let branch = "fix/191-cross-fork-owner";
+        let bindir = scratch.path().join("bin");
+        write_dual_repo_merged_upstream_gh_stub(
+            &bindir,
+            branch,
+            "test-org/test-repo",
+            "vfarcic/dot-agent-deck",
+            "test-org",
+            "cafef00dcafef00dcafef00dcafef00dcafef00d",
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let state = resolve_pr_state(&repo, branch);
+        assert!(
+            matches!(state, PrState::Merged { .. }),
+            "a MERGED PR on upstream whose headRepositoryOwner is ORIGIN's own owner (the \
+             cross-fork shape issue #191's own reported worktrees actually have) must resolve \
+             to PrState::Merged, not Unresolvable -- got {state:?}"
+        );
+    }
+
+    /// Scenario: fork issue #191 / auditor A2 (RED -- compile error, new
+    /// function). On the linked-worktree path, `decide()` ignores
+    /// `headRefOid` entirely for a `Merged` verdict -- fine while `Merged`
+    /// could only ever be sourced from the same-uid-trusted `origin`, but
+    /// the new `upstream` fallback (this PR) can now source a
+    /// `Merged`/`Open` verdict from a THIRD PARTY's repository: anyone with
+    /// push access to `upstream` who merges a PR from an upstream-hosted
+    /// branch of the same name collides with a local branch that is a
+    /// completely different commit. Builds a fixture repo whose `upstream`
+    /// PR for the branch is MERGED with a matching owner but a `headRefOid`
+    /// that does NOT equal the worktree's own actual branch-tip commit -- a
+    /// name collision, not the same commit reappearing on a second remote
+    /// -- and calls the intended fixed entry point,
+    /// `resolve_pr_state_for_linked_worktree(repo_dir, branch,
+    /// local_head_sha: Option<&str>) -> PrState`, which does not exist yet.
+    /// Design: a strictly-narrower wrapper around `resolve_pr_state` that
+    /// returns an `origin`-sourced result unchanged, and downgrades an
+    /// `upstream`-sourced `Merged`/`Open` result to `Unresolvable` when
+    /// `local_head_sha` is `Some` and does not equal the reply's
+    /// `headRefOid` (a `None` local SHA -- unresolvable HEAD -- fails
+    /// closed the same way, never treated as a free pass).
+    #[spec("worktree/reclaim/086")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_086_linked_worktree_upstream_merged_verdict_requires_head_ref_oid_match() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        add_upstream_remote(&repo, "vfarcic", "dot-agent-deck");
+
+        let branch = "fix/191-name-collision-branch";
+        let local_head_sha = git_rev_parse_head(&repo);
+        let colliding_head_ref_oid = "0123456789abcdef0123456789abcdef01234567";
+        assert_ne!(
+            local_head_sha, colliding_head_ref_oid,
+            "sanity: the fixture's forged headRefOid must genuinely differ from the local \
+             branch tip so this test exercises the mismatch path"
+        );
+
+        let bindir = scratch.path().join("bin");
+        write_dual_repo_merged_upstream_gh_stub(
+            &bindir,
+            branch,
+            "test-org/test-repo",
+            "vfarcic/dot-agent-deck",
+            "vfarcic",
+            colliding_head_ref_oid,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let state = resolve_pr_state_for_linked_worktree(&repo, branch, Some(&local_head_sha));
+        assert!(
+            !matches!(state, PrState::Merged { .. }),
+            "an upstream-sourced MERGED PR whose headRefOid does not match the linked \
+             worktree's own local branch tip -- a same-named-branch collision on a third \
+             party's repo, not the same commit reappearing -- must never be trusted as \
+             PrState::Merged, got {state:?}"
+        );
+    }
+
     /// A `gh` stub answering `gh pr list --head <branch> ...` with a single
     /// canned MERGED reply for `branch`, matching `worktree_reclaim_008`'s
     /// own script shape.
@@ -8673,6 +8823,116 @@ mod tests {
             "gh must never be spawned at all when the slug guard refuses -- the marker's \
              presence would prove resolve_pr_state ran (and thus that the untrusted attacker \
              slug was queried) before the guard's refusal short-circuited it"
+        );
+    }
+
+    /// Scenario: fork issue #191 F2 / auditor A1. `isolated_clone_report`
+    /// and `remove_isolated_clone_dir`'s slug-equality guards (fork#533 /
+    /// auditor B3) validate only the candidate's `origin` against the root
+    /// checkout's own slug -- but `resolve_pr_state`'s new `upstream`
+    /// fallback (this PR) reads `remote.upstream.url` from that same
+    /// untrusted candidate directory with nothing validating it. A same-uid
+    /// actor who can write a genuine, deck-provisioned clone's `.git/config`
+    /// adds an `upstream` remote pointing at a repository they control; a
+    /// `gh` stub answers a well-formed MERGED PR -- matching branch,
+    /// `headRepositoryOwner`, and `headRefOid` -- ONLY for that attacker
+    /// slug, and `[]` (no PR) for the real, unmodified `origin`, so the
+    /// origin-only guard passes exactly as it should for a genuine clone.
+    /// `remove_isolated_clone_dir` must never let the forged upstream-
+    /// sourced `Merged` verdict through to deletion -- restoring exactly
+    /// the hole fork issue #533 closed, reached through a second remote
+    /// nobody validates.
+    #[spec("worktree/reclaim/085")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_085_removal_refuses_a_merged_verdict_sourced_from_candidates_own_unvalidated_upstream()
+     {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        let root_repo_slug = derive_repo_slug(&repo);
+        assert_eq!(
+            root_repo_slug.as_deref(),
+            Some("test-org/test-repo"),
+            "sanity: init_repo_with_origin's own fixture origin must derive to this slug"
+        );
+
+        let clone_dir = scratch.path().join("repo-isolated-upstream-attack");
+        let creator = "issue-dispatch:upstream-attack#191";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "upstream-attack-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        // Attacker plants an `upstream` remote on the genuine candidate --
+        // `origin` stays untouched and still matches the root checkout's
+        // own slug, so the fork#533 / auditor B3 slug-equality guard passes
+        // exactly as it should for a genuine, unmolested clone.
+        let out = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args([
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/attacker-org/evil-repo.git",
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git remote add upstream failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git remote add upstream failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // `gh` stub discriminates on `--repo`: `[]` (no PR) for the real
+        // root/origin slug, a well-formed MERGED reply -- matching branch,
+        // owner, and this clone's own `headRefOid` -- ONLY for the
+        // attacker's upstream slug.
+        let bindir = scratch.path().join("bin");
+        write_dual_repo_merged_upstream_gh_stub(
+            &bindir,
+            "upstream-attack-branch",
+            "test-org/test-repo",
+            "attacker-org/evil-repo",
+            "attacker-org",
+            &clone_head_sha,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let result =
+            remove_isolated_clone_dir(&clone_dir, "test-remover", root_repo_slug.as_deref());
+
+        assert!(
+            result.is_err(),
+            "remove_isolated_clone_dir must never let a candidate's own unvalidated `upstream` \
+             remote steer gh at an attacker-controlled repo and launder a forged MERGED verdict \
+             into a deletion -- the origin-only slug guard (fork#533 / auditor B3) passes \
+             because origin is untouched, but resolve_pr_state's new upstream fallback reads \
+             the candidate's own untrusted upstream remote with nothing validating it, got: \
+             {result:?}"
+        );
+        assert!(
+            clone_dir.exists(),
+            "the candidate directory must be left on disk -- its absence would mean the forged \
+             upstream-sourced MERGED verdict was trusted and the clone was deleted"
         );
     }
 }
