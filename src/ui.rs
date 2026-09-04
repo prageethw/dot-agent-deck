@@ -1155,10 +1155,13 @@ const NAME_COLLISION_WARNING: [&str; 1] =
 /// blocks the form. The result is cached once per form open by
 /// [`NewPaneFormState::with_live_orchestration_cwds`] — the warning decision is
 /// read every frame, and the filesystem must not be.
-fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[String]) -> bool {
+fn live_orchestration_in_same_cwd(
+    form_cwd: &Path,
+    live_orchestration_cwds: &[(String, String)],
+) -> bool {
     live_orchestration_cwds
         .iter()
-        .any(|c| cwd_matches(form_cwd, c))
+        .any(|(cwd, name)| live_orchestration_occupies(form_cwd, cwd, name))
 }
 
 /// PRD fork#603: the single shared "is this the same directory" comparison,
@@ -1947,7 +1950,7 @@ impl NewPaneFormState {
     /// The collision verdict is decided HERE, once, and cached: the comparison
     /// canonicalises paths (PRD #140 review) and the render path asks for it
     /// every frame.
-    fn with_live_orchestration_cwds(mut self, cwds: Vec<String>) -> Self {
+    fn with_live_orchestration_cwds(mut self, cwds: Vec<(String, String)>) -> Self {
         self.live_orchestration_in_same_cwd = live_orchestration_in_same_cwd(&self.dir, &cwds);
         self
     }
@@ -9475,25 +9478,20 @@ fn transition_after_dir_pick(ui: &mut UiState) {
             // PRD fork#603 fix round (reviewer M1): partition into
             // directory-scoped identities and wildcard names — a `None`
             // cwd (a backward-compat peer) carries no directory to pair
-            // with a title (so it's also skipped from
-            // `with_live_orchestration_cwds`'s OTHER, pre-existing
-            // same-cwd warning, which is unaffected by this fix) or to
-            // compare via `live_orchestration_occupies`; it occupies every
+            // with a title, so it's skipped from both
+            // `with_live_orchestration_cwds`'s same-cwd warning and
+            // `live_orchestration_occupies`'s comparison; it occupies every
             // directory unconditionally instead.
-            let mut live_orch_cwds: Vec<String> = Vec::new();
             let mut live_orch_scoped: Vec<(String, String)> = Vec::new();
             let mut live_orch_wildcard_names: Vec<String> = Vec::new();
             for (cwd, name) in live_orch_identities {
                 match cwd {
-                    Some(cwd) => {
-                        live_orch_cwds.push(cwd.clone());
-                        live_orch_scoped.push((cwd, name));
-                    }
+                    Some(cwd) => live_orch_scoped.push((cwd, name)),
                     None => live_orch_wildcard_names.push(name),
                 }
             }
             NewPaneFormState::new(dir, name, command, modes, orchestrations)
-                .with_live_orchestration_cwds(live_orch_cwds)
+                .with_live_orchestration_cwds(live_orch_scoped.clone())
                 .with_live_orchestration_identities(live_orch_scoped)
                 .with_live_orchestration_wildcard_names(live_orch_wildcard_names)
         }
@@ -25140,7 +25138,7 @@ pub fn render_new_pane_form_to_buffer(
 /// — the warning never blocks. Mirrors [`render_new_pane_form_to_buffer`].
 pub fn render_new_pane_orchestration_guard_to_buffer(
     form_cwd: &str,
-    live_orchestration_cwds: &[&str],
+    live_orchestration_cwds: &[(&str, &str)],
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -25167,7 +25165,7 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
     .with_live_orchestration_cwds(
         live_orchestration_cwds
             .iter()
-            .map(|c| (*c).to_string())
+            .map(|(c, n)| ((*c).to_string(), (*n).to_string()))
             .collect(),
     );
     // Select the single orchestration option (index 0 is "No mode"; there are no
@@ -27291,7 +27289,7 @@ mod tests {
         #[cfg(not(unix))]
         std::os::windows::fs::symlink_dir(&real, &alias).unwrap();
 
-        let live = vec![real.to_string_lossy().into_owned()];
+        let live = vec![(real.to_string_lossy().into_owned(), "test".to_string())];
         assert!(
             live_orchestration_in_same_cwd(&real, &live),
             "the exact same path must still warn"
@@ -27324,7 +27322,7 @@ mod tests {
     /// false-positive.
     #[test]
     fn same_cwd_guard_falls_back_to_raw_compare_for_nonexistent_paths() {
-        let live = vec!["/work/already-live".to_string()];
+        let live = vec![("/work/already-live".to_string(), "test".to_string())];
         assert!(live_orchestration_in_same_cwd(
             Path::new("/work/already-live"),
             &live
