@@ -25,13 +25,14 @@
 //!
 //! This is now the single implementation of the control+bidi filter.
 //! [`crate::build_version_handshake`] carried a byte-identical copy until issue
-//! #670 and delegates here instead. [`crate::daemon_client`] still has its own
-//! `strip_control_chars`, which drops control characters but NOT bidi — that is
-//! a different seam (the `list_agents` wire boundary, on records the daemon has
-//! already validated) with its own audit, and folding it in here is deliberately
-//! not part of #670. Reach for this module rather than writing a third copy: it
-//! is the divergence between those two that let the bidi half be present on one
-//! untrusted path and absent on another.
+//! #670 and delegates here instead. [`crate::daemon_client`] used to carry its
+//! own `strip_control_chars` (control characters only, NOT bidi) on the
+//! `list_agents` wire boundary — issues #664/#665 folded that seam into this
+//! module too (`sanitize_record_tab_membership`'s `cwd`/prompt/`active_tool`
+//! scrubs), so the function no longer exists. Reach for this module rather than
+//! writing a third copy: divergence between two near-identical filters is
+//! exactly how the bidi half ends up present on one untrusted path and absent
+//! on another.
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
 use crate::prompt_delivery::truncate_on_char_boundary;

@@ -72,6 +72,19 @@ const TOOL_NAME_MAX_LEN: usize = 128;
 /// bounding the tool line's render width.
 const TOOL_DETAIL_MAX_LEN: usize = 256;
 
+/// Issues #664/#665 fix-round MEDIUM 3: the byte ceiling `apply_event`
+/// clamps `event.user_prompt` to on ingest, mirroring
+/// `daemon_client::MAX_FIRST_PROMPT_BYTES`'s existing 64 KiB shape (that
+/// constant is private to `daemon_client` and bounds the same field class on
+/// the hydration/wire-boundary side; this one bounds it on the hook-socket
+/// ingest side — same reasoning, different seam, so two constants rather
+/// than a shared pub one). Far above `prompt_delivery::USER_PROMPT_MAX_LEN`
+/// (200 bytes), so this clamp never interacts with delivery-confirmation
+/// matching — it exists only to bound a same-uid hostile producer posting
+/// directly to the hook socket (which accepts a bare `AgentEvent` JSON line
+/// with no length limit of its own), not to shape any real prompt.
+const USER_PROMPT_INGEST_MAX_BYTES: usize = 65536;
+
 /// PRD #92 F9 followup-6: how long the post-respawn dispatch task
 /// waits for the freshly-spawned agent to emit a `SessionStart` hook
 /// event before falling back to writing the prompt anyway.
@@ -8482,15 +8495,17 @@ impl AppState {
         // actual rendered path exploitable. Doing it here instead means
         // `active_tool` and `recent_events` — and the `daemon status` CLI's
         // TOOL column when it is served by a same-build daemon — all read
-        // one consistent, already-sanitized value from one write. That CLI
-        // path is NOT guaranteed sanitized against an OLDER daemon:
-        // `run_daemon_status_cli` builds its rows from
+        // one consistent, already-sanitized value from one write. As of
+        // issues #664/#665, that CLI path is ALSO covered against an OLDER
+        // daemon: `run_daemon_status_cli` builds its rows from
         // `DaemonClient::list_agents()`, whose client-side `live.active_tool`
-        // scrub (`daemon_client.rs:295`) is still `Cc`-only, so a pre-#562
-        // daemon can still hand this CLI a `U+202E` in that field.
+        // scrub (`daemon_client.rs`'s `sanitize_record_tab_membership`) was
+        // upgraded from `Cc`-only to `strip_control_and_bidi` in that same
+        // fix, so a pre-#562 daemon handing this CLI a `U+202E` in that
+        // field no longer survives to the terminal.
         //
         // Use `untrusted_text::strip_control_and_bidi` (Cc + Cf/bidi), not
-        // `daemon_client::strip_control_chars` (Cc only — ratatui already
+        // `char::is_control` alone (Cc only — ratatui already
         // filters that at render time) or `terminal_sanitize::sanitize_for_
         // terminal_display` (escapes rather than strips — right for a
         // diagnostic, wrong for a width-constrained render line). This is
@@ -8510,6 +8525,76 @@ impl AppState {
             event.tool_detail = Some(crate::prompt_delivery::truncate_on_char_boundary(
                 &sanitized,
                 TOOL_DETAIL_MAX_LEN,
+            ));
+        }
+        // Issue #664 / #665: `event.cwd` and `event.user_prompt` are stored
+        // verbatim onto `session.cwd` / `session.last_user_prompt` /
+        // `session.first_prompts` below with no sanitization, unlike
+        // `tool_name`/`tool_detail` just above — scrub them at the same
+        // ingest choke point, before they're stored, for the same reason
+        // given above (a stored value is inherited and re-read, so scrubbing
+        // only at a render seam would miss every other reader).
+        //
+        // `cwd` keeps `keep_newlines: false` — a path is genuinely
+        // single-line, and `is_valid_cwd` has always rejected `\n` at the
+        // byte level anyway. A scrub that collapses to empty (an all-`Cf`
+        // input) is normalized to `None` rather than `Some("")`, matching
+        // `sanitize_display_name`'s disposition — `Some("")` would still
+        // read as "has a cwd" downstream (`event.cwd.is_some()` at the
+        // `session.cwd` write site below) and resolve relative to the TUI
+        // process's own working directory instead of failing closed.
+        //
+        // `user_prompt` uses `keep_newlines: true`, unlike every other field
+        // scrubbed at this seam — `false` looked right on the theory that
+        // the `Prmt:` render line is single-line (ratatui renders an
+        // embedded `\n` as ordinary text within one `Line`, not a break, so
+        // there was never a render hazard here), until CI proved it breaks a
+        // DIFFERENT, non-render consumer: `apply_event` mutates `event` in
+        // place, then journals it into `session.recent_events`
+        // (`push_back(event)`, further down) — and `SubmissionEvidence`
+        // (`src/ui.rs`), the TUI-side half of prompt-delivery confirmation,
+        // reads `user_prompt` straight out of THAT journal, not off a
+        // pre-scrub copy. (The daemon-side half, `PromptWatch` /
+        // `wait_for_prompt_submission` below, reads the raw broadcast clone
+        // `ingest_event_with_hook` takes BEFORE calling `apply_event`
+        // (`daemon.rs`), so it never sees the scrub either way — that
+        // ordering is why this looked settled in favor of `false` on a first
+        // read; it only protects one of the two confirmation paths.)
+        // `prompt_submission_matches` / `prompt_submission_accumulated`
+        // (`prompt_delivery.rs`) key their candidate shapes on newline
+        // separators, so stripping the newline out of the journalled copy
+        // while `expected` (the text the deck actually wrote into the pane)
+        // keeps its newlines makes every multi-line delivery confirmation
+        // fail into a retry loop — which re-writes the prompt into a LIVE
+        // pane a third time. Reproduced deterministically on
+        // `build`/`build-macos`/`build-windows` via
+        // `pane_input_024_seed_write_is_provisional_until_confirmation`
+        // (`src/ui.rs`); pinned directly by
+        // `apply_event_preserves_user_prompt_newlines` below.
+        //
+        // Length bound: `event.cwd` still has none (pre-existing — a path is
+        // short by nature and gated elsewhere by `is_valid_cwd`).
+        // `event.user_prompt` is clamped here to
+        // `USER_PROMPT_INGEST_MAX_BYTES`, mirroring the `model`/`tool_name`/
+        // `tool_detail` clamps just above: the daemon's hook socket accepts
+        // a bare `AgentEvent` JSON line directly (`daemon.rs`'s
+        // `BufReader::lines()` + `serde_json::from_str`), bypassing the hook
+        // CLI's own `USER_PROMPT_MAX_LEN` (200-byte) clamp entirely, so that
+        // clamp alone does not bound what reaches here. 64 KiB — far above
+        // `USER_PROMPT_MAX_LEN`, so it never interacts with delivery
+        // matching — mirrors `daemon_client::MAX_FIRST_PROMPT_BYTES`'s
+        // existing shape for the same reason that constant exists: bound a
+        // same-uid hostile producer's worst case without touching any real
+        // prompt.
+        if let Some(cwd) = event.cwd.take() {
+            let scrubbed = crate::untrusted_text::strip_control_and_bidi(&cwd, false);
+            event.cwd = (!scrubbed.is_empty()).then_some(scrubbed);
+        }
+        if let Some(prompt) = event.user_prompt.take() {
+            let scrubbed = crate::untrusted_text::strip_control_and_bidi(&prompt, true);
+            event.user_prompt = Some(crate::prompt_delivery::truncate_on_char_boundary(
+                &scrubbed,
+                USER_PROMPT_INGEST_MAX_BYTES,
             ));
         }
 
@@ -13659,8 +13744,9 @@ clear = false
     /// `src/ui.rs` — so it passed while the actual rendered tool line
     /// (fed by `session.recent_events`) remained fully exploitable. It also
     /// only asserted `\x1b` (`Cc`) removal, not the `U+202E`-class bidi
-    /// override (`Cf`) issue #562 is named after, since the prior fix used
-    /// `daemon_client::strip_control_chars` (`Cc`-only) rather than
+    /// override (`Cf`) issue #562 is named after, since the prior fix used a
+    /// `Cc`-only strip (that helper was later removed — issues #664/#665
+    /// folded its one remaining seam into this same module) rather than
     /// `untrusted_text::strip_control_and_bidi`.
     #[spec("dashboard/agent-badge/011")]
     #[test]
@@ -13785,6 +13871,223 @@ clear = false
             detail.len() <= TOOL_DETAIL_MAX_LEN + ellipsis_len,
             "tool_detail must be clamped to TOOL_DETAIL_MAX_LEN (+ ellipsis), got {} bytes",
             detail.len()
+        );
+    }
+
+    /// Issue #665: unlike `event.tool_name`/`event.tool_detail`
+    /// (`agent_badge_011` above), `apply_event` stores `event.user_prompt`
+    /// into `session.last_user_prompt` / `session.first_prompts` with no
+    /// call to `crate::untrusted_text::strip_control_and_bidi` at all. A
+    /// `U+202E` RIGHT-TO-LEFT OVERRIDE therefore survives into session
+    /// state and reaches the `Prmt:` line (`Span::raw` in `src/ui.rs`)
+    /// unstripped. This must be sanitized the same way tool_name/tool_detail
+    /// already are.
+    #[test]
+    fn apply_event_scrubs_user_prompt_bidi_override() {
+        fn admit(session_id: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        fn prompt_event(session_id: &str, prompt: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: Some(prompt.to_string()),
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut state = AppState::default();
+        state.apply_event(admit("p1"));
+        let hostile = "attacker.example\u{202e} then [UNTRUSTED";
+        state.apply_event(prompt_event("p1", hostile));
+
+        let session = &state.sessions["p1"];
+        let last = session
+            .last_user_prompt
+            .as_deref()
+            .expect("UserPromptSubmit must set last_user_prompt");
+        assert!(
+            !last.contains('\u{202e}'),
+            "session.last_user_prompt must have bidi overrides stripped, got {last:?}"
+        );
+        let first = session
+            .first_prompts
+            .last()
+            .expect("UserPromptSubmit must push into first_prompts");
+        assert!(
+            !first.contains('\u{202e}'),
+            "session.first_prompts entries must have bidi overrides stripped, got {first:?}"
+        );
+    }
+
+    /// Issue #664: `apply_event` stores `event.cwd` into `session.cwd`
+    /// (`session.cwd.clone_from(&event.cwd)`) with no sanitization at all,
+    /// unlike `event.tool_name`/`event.tool_detail` (`agent_badge_011`
+    /// above). A `U+202E` RIGHT-TO-LEFT OVERRIDE therefore survives into
+    /// `session.cwd` and reaches the `Dir:` line (`Span::raw` in
+    /// `src/ui.rs`) unstripped.
+    #[test]
+    fn apply_event_scrubs_cwd_bidi_override() {
+        fn admit_with_cwd(session_id: &str, cwd: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some(cwd.to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut state = AppState::default();
+        let hostile = "/tmp/\u{202e}gnp.sh";
+        state.apply_event(admit_with_cwd("c1", hostile));
+
+        let session = &state.sessions["c1"];
+        let cwd = session
+            .cwd
+            .as_deref()
+            .expect("SessionStart with cwd must set session.cwd");
+        assert!(
+            !cwd.contains('\u{202e}'),
+            "session.cwd must have bidi overrides stripped, got {cwd:?}"
+        );
+    }
+
+    /// Issues #664/#665 fix-round BLOCKER 1: pins that a genuine multi-line
+    /// prompt survives `apply_event`'s `user_prompt` scrub with its interior
+    /// newlines INTACT. `apply_event_scrubs_user_prompt_bidi_override` above
+    /// already pins the `Cf`/bidi stripping half; this pins the
+    /// newline-preservation half, which regressed silently once when
+    /// `strip_control_and_bidi` was called with `keep_newlines: false` for
+    /// `user_prompt` — that stripped interior `\n` from every ingested
+    /// prompt, which broke `prompt_submission_matches` /
+    /// `prompt_submission_accumulated` (`prompt_delivery.rs`), whose
+    /// candidate shapes key on newline separators between `expected` (what
+    /// the deck wrote into the pane) and `reported` (what a hook echoes back
+    /// via `session.recent_events`/`session.last_user_prompt`). A dispatch
+    /// prompt that can never be confirmed delivered gets rewritten into a
+    /// LIVE pane a third time — reproduced deterministically on CI via
+    /// `pane_input_024_seed_write_is_provisional_until_confirmation`
+    /// (`src/ui.rs`) before this fix. `keep_newlines: true` is safe here
+    /// because the render seam this was meant to protect
+    /// (`collect_recent_prompts`) already renders an embedded `\n` as
+    /// ordinary text within one `Line`, not a break.
+    #[test]
+    fn apply_event_preserves_user_prompt_newlines() {
+        fn admit(session_id: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        fn prompt_event(session_id: &str, prompt: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: Some(prompt.to_string()),
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut state = AppState::default();
+        state.apply_event(admit("m1"));
+        let multiline = "line one\nline two\nline three";
+        state.apply_event(prompt_event("m1", multiline));
+
+        let session = &state.sessions["m1"];
+        let last = session
+            .last_user_prompt
+            .as_deref()
+            .expect("UserPromptSubmit must set last_user_prompt");
+        assert_eq!(
+            last, multiline,
+            "session.last_user_prompt must keep interior newlines intact, got {last:?}"
+        );
+        let first = session
+            .first_prompts
+            .last()
+            .expect("UserPromptSubmit must push into first_prompts");
+        assert_eq!(
+            first, multiline,
+            "session.first_prompts entries must keep interior newlines intact, got {first:?}"
+        );
+
+        // The journalled copy is what `SubmissionEvidence` (src/ui.rs) reads
+        // for prompt-delivery confirmation — pin it directly, not just the
+        // session-level fields above.
+        let journalled = session
+            .recent_events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == EventType::ToolStart)
+            .and_then(|e| e.user_prompt.as_deref())
+            .expect("ToolStart with user_prompt must be journalled into recent_events");
+        assert_eq!(
+            journalled, multiline,
+            "the journalled event's user_prompt must keep interior newlines intact, got {journalled:?}"
         );
     }
 

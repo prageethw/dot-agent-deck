@@ -477,14 +477,34 @@ pub fn resolve_display_name(form_name: Option<&str>, command: Option<&str>) -> S
 }
 
 /// Returns `true` if `value` is acceptable to retain as a cwd: non-empty,
-/// ≤ [`CWD_MAX_LEN`] bytes, and free of ASCII control characters (bytes
-/// < 0x20 plus 0x7F DEL). Mirrors the [`is_valid_display_name`] filter so
-/// the dashboard, which renders `cwd`'s basename through `Span::raw`,
-/// can't be tricked into emitting terminal control sequences via a
-/// hostile `SetAgentLabel` like `/tmp/\x1b[31mpwn`. Unicode beyond 0x7F
-/// stays valid (paths are UTF-8 and legitimately contain accented bytes).
+/// ≤ [`CWD_MAX_LEN`] bytes, free of ASCII control characters (bytes < 0x20
+/// plus 0x7F DEL), and free of Unicode bidi formatting/override characters.
+/// Mirrors the [`is_valid_display_name`] filter so the dashboard, which
+/// renders `cwd`'s basename through `Span::raw`, can't be tricked into
+/// emitting terminal control sequences via a hostile `SetAgentLabel` like
+/// `/tmp/\x1b[31mpwn`, nor into a spoofed path via a `U+202E`-style bidi
+/// override (issue #664). Unicode beyond 0x7F otherwise stays valid (paths
+/// are UTF-8 and legitimately contain accented bytes).
+///
+/// **Deliberate consequence, not an oversight — inherited from
+/// [`is_valid_display_name`]'s `Cf` policy, sharper here.** `U+200D` ZERO
+/// WIDTH JOINER (the glue in every ZWJ emoji sequence) and `U+00AD` SOFT
+/// HYPHEN are both `Cf`, so a directory literally named with a ZWJ emoji or
+/// carrying a soft hyphen now fails this gate. Where a rejected display name
+/// just fails a rename silently, a rejected cwd cascades further: it drops
+/// the registry's cwd at spawn time (`capture_cwd` — the card renders
+/// `Dir: —`), clears a previously-good cwd on relabel (`set_agent_label`),
+/// and — via [`is_valid_orchestration_cwd`] — rejects the **entire**
+/// orchestration surface or tab membership for that pane. This
+/// project's blanket `Cf` rejection policy is taken to be the right call
+/// even at this cost, for the same reason `is_valid_display_name` gives.
 pub fn is_valid_cwd(value: &str) -> bool {
-    !value.is_empty() && value.len() <= CWD_MAX_LEN && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+    !value.is_empty()
+        && value.len() <= CWD_MAX_LEN
+        && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+        && !value
+            .chars()
+            .any(crate::untrusted_text::is_bidi_format_char)
 }
 
 /// Extracted from [`AgentPtyRegistry::spawn_agent`] (SonarCloud cognitive
@@ -9183,6 +9203,33 @@ mod tests {
             !is_valid_display_name("agent-\u{1f468}\u{200d}\u{1f4bb}"),
             "a name containing a ZWJ emoji sequence must fail validation (Cf policy, issue #562 M1)"
         );
+    }
+
+    /// Issue #664: `is_valid_cwd`'s own doc comment claims it "Mirrors the
+    /// `is_valid_display_name` filter", but unlike that function
+    /// (`agent_badge_009` above), it only checks byte-level ASCII control
+    /// characters (`b >= 0x20 && b != 0x7f`) and never calls
+    /// `crate::untrusted_text::is_bidi_format_char`. A `U+202E`
+    /// RIGHT-TO-LEFT OVERRIDE encodes as UTF-8 bytes all `>= 0x20`, so it
+    /// passes `is_valid_cwd` today and can spoof the `Dir:` line
+    /// (`Span::raw` in `src/ui.rs`).
+    #[test]
+    fn is_valid_cwd_rejects_unicode_bidi_format_characters() {
+        assert!(
+            !is_valid_cwd("/tmp/\u{202e}gnp.sh"),
+            "a cwd containing U+202E RIGHT-TO-LEFT OVERRIDE must fail validation, matching is_valid_display_name"
+        );
+        for c in ['\u{200b}', '\u{2066}', '\u{feff}'] {
+            let cwd = format!("/tmp/agent{c}dir");
+            assert!(
+                !is_valid_cwd(&cwd),
+                "Cf format character U+{:04X} must fail validation, cwd={cwd:?}",
+                c as u32
+            );
+        }
+        // An ordinary Unicode path (accents, CJK) must still pass — the
+        // tightening targets `Cf` specifically, not "any non-ASCII".
+        assert!(is_valid_cwd("/home/café/агент/日本語"));
     }
 
     /// Round-12 auditor #2: orchestration_cwd must be validated.
