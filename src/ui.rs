@@ -48281,15 +48281,42 @@ mod tests {
     }
 
     /// Scenario: Set `ui.status_message` to text carrying ESC, NUL, CR/LF, DEL,
-    /// a C1 control and a `U+202E` right-to-left override — the same fixture
-    /// `strip_control_and_bidi`'s own tests use — then render the bottom bar in
-    /// `UiMode::Normal` (the `_` fallback arm). The rendered row must not
-    /// contain any of those raw characters, and must match what
-    /// `untrusted_text::strip_control_and_bidi` produces for the same input.
+    /// a C1 control, a `U+202E` right-to-left override, AND a `U+0600` ARABIC
+    /// NUMBER SIGN — then render the bottom bar in `UiMode::Normal` (the `_`
+    /// fallback arm). The rendered row must not contain any of those raw
+    /// characters, and must match what `untrusted_text::strip_control_and_bidi`
+    /// produces for the same input.
+    ///
+    /// `U+0600` is load-bearing, not decoration: every other class in this
+    /// fixture (every `char::is_control` byte, and `U+202E` itself) is already
+    /// stripped by ratatui's OWN rendering pipeline before it ever reaches a
+    /// `Buffer` cell — `ratatui-core-0.1.2`'s `Span::styled_graphemes` drops
+    /// any grapheme containing a control char (`src/text/span.rs:314`), and
+    /// `ratatui-widgets-0.3.2::paragraph::render_line` skips any grapheme whose
+    /// `unicode-width`-derived `cell_width()` is `0` — which `U+202E` is,
+    /// verified empirically by compiling `unicode-width 0.2.2` standalone
+    /// against the exact codepoint. So the pre-fix version of this fixture
+    /// passed against completely unsanitized production code: `render_bottom_bar`
+    /// never calls a sanitizer on `status_message` at all (confirmed by
+    /// inspection — the `_` arm passes `msg.as_str()` straight to
+    /// `Line::styled`), yet nothing in this fixture could tell "ratatui
+    /// accidentally neutralized it" apart from "the application sanitized it".
+    /// `U+0600` is genuine `Cf` category (confirmed via Python's `unicodedata`,
+    /// which `untrusted_text::is_bidi_format_char`'s `\p{Cf}` regex agrees is
+    /// dangerous per this module's own threat model) but — unlike `U+202E` —
+    /// `unicode-width` reports it as width `1`, not `0` (same standalone
+    /// experiment), so ratatui's accidental protection does not cover it: it
+    /// is not `char::is_control`, and it is not zero-width, so it sails
+    /// through both of ratatui's filters untouched and lands in the rendered
+    /// `Buffer` exactly as sent, in `TestBackend` and a real `CrosstermBackend`
+    /// alike. That is what actually turns this test RED against today's
+    /// unfixed code, and it is what a real fix (calling
+    /// `strip_control_and_bidi` on `status_message` before `Line::styled`)
+    /// must strip for this test to go GREEN.
     #[spec("status/message/001")]
     #[test]
     fn message_001_status_message_strips_control_and_bidi_before_render() {
-        let dirty = "ze\x1b[31mta\0-li\u{202e}ve\x7f-\u{0085}77\r\n";
+        let dirty = "ze\x1b[31mta\0-li\u{202e}ve\x7f-\u{0085}77\u{0600}\r\n";
         let width = 120;
 
         let buffer = render_bottom_bar_with_status_message_to_buffer(dirty, width);
