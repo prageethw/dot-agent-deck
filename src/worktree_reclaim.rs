@@ -5665,10 +5665,10 @@ mod tests {
     /// reported worktrees. `resolve_pr_state` must resolve `PrState::Merged`,
     /// not `Unresolvable` on an owner mismatch against `upstream`'s own
     /// owner alone (reviewer F1 / auditor A3).
-    #[spec("worktree/reclaim/084")]
+    #[spec("worktree/reclaim/087")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_084_resolve_pr_state_accepts_origin_owner_on_cross_fork_upstream_pr() {
+    fn worktree_reclaim_087_resolve_pr_state_accepts_origin_owner_on_cross_fork_upstream_pr() {
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let scratch = tempfile::tempdir().unwrap();
@@ -5718,10 +5718,10 @@ mod tests {
     /// `local_head_sha` is `Some` and does not equal the reply's
     /// `headRefOid` (a `None` local SHA -- unresolvable HEAD -- fails
     /// closed the same way, never treated as a free pass).
-    #[spec("worktree/reclaim/086")]
+    #[spec("worktree/reclaim/089")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_086_linked_worktree_upstream_merged_verdict_requires_head_ref_oid_match() {
+    fn worktree_reclaim_089_linked_worktree_upstream_merged_verdict_requires_head_ref_oid_match() {
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let scratch = tempfile::tempdir().unwrap();
@@ -8842,10 +8842,10 @@ mod tests {
     /// sourced `Merged` verdict through to deletion -- restoring exactly
     /// the hole fork issue #533 closed, reached through a second remote
     /// nobody validates.
-    #[spec("worktree/reclaim/085")]
+    #[spec("worktree/reclaim/088")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_085_removal_refuses_a_merged_verdict_sourced_from_candidates_own_unvalidated_upstream()
+    fn worktree_reclaim_088_removal_refuses_a_merged_verdict_sourced_from_candidates_own_unvalidated_upstream()
      {
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
