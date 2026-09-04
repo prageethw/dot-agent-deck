@@ -8395,10 +8395,10 @@ mod tests {
     /// `isolated_clone_report`'s own `repo_slug: Option<&str>` parameter),
     /// which does not exist yet -- this is a compile-error RED, the same
     /// shape as `worktree_reclaim_081`'s `WorktreeReport.pinned` reference.
-    #[spec("worktree/reclaim/082")]
+    #[spec("worktree/reclaim/084")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_082_removal_refuses_when_candidate_slug_no_longer_matches_root() {
+    fn worktree_reclaim_084_removal_refuses_when_candidate_slug_no_longer_matches_root() {
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let scratch = tempfile::tempdir().unwrap();
