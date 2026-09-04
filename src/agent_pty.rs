@@ -485,6 +485,19 @@ pub fn resolve_display_name(form_name: Option<&str>, command: Option<&str>) -> S
 /// `/tmp/\x1b[31mpwn`, nor into a spoofed path via a `U+202E`-style bidi
 /// override (issue #664). Unicode beyond 0x7F otherwise stays valid (paths
 /// are UTF-8 and legitimately contain accented bytes).
+///
+/// **Deliberate consequence, not an oversight — inherited from
+/// [`is_valid_display_name`]'s `Cf` policy, sharper here.** `U+200D` ZERO
+/// WIDTH JOINER (the glue in every ZWJ emoji sequence) and `U+00AD` SOFT
+/// HYPHEN are both `Cf`, so a directory literally named with a ZWJ emoji or
+/// carrying a soft hyphen now fails this gate. Where a rejected display name
+/// just fails a rename silently, a rejected cwd cascades further: it drops
+/// the registry's cwd at spawn time (`capture_cwd` — the card renders
+/// `Dir: —`), clears a previously-good cwd on relabel (`set_agent_label`),
+/// and — via [`is_valid_orchestration_cwd`] — rejects the **entire**
+/// orchestration surface or tab membership for that pane. This
+/// project's blanket `Cf` rejection policy is taken to be the right call
+/// even at this cost, for the same reason `is_valid_display_name` gives.
 pub fn is_valid_cwd(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= CWD_MAX_LEN

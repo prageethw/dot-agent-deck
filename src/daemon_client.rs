@@ -269,7 +269,13 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
     }
 
     if let Some(cwd) = rec.cwd.take() {
-        rec.cwd = Some(crate::untrusted_text::strip_control_and_bidi(&cwd, false));
+        // Issues #664/#665 fix-round LOW 7: collapse an all-`Cf` input's
+        // empty scrub result to `None` rather than `Some("")` — matching
+        // `sanitize_display_name`'s disposition above. `Some("")` still
+        // reads as "has a cwd" downstream and resolves relative to the TUI
+        // process's own working directory instead of failing closed.
+        let scrubbed = crate::untrusted_text::strip_control_and_bidi(&cwd, false);
+        rec.cwd = (!scrubbed.is_empty()).then_some(scrubbed);
     }
 
     if let Some(tm) = rec.tab_membership.take() {

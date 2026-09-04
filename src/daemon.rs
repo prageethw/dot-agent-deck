@@ -1195,13 +1195,21 @@ async fn ingest_event_with_hook<H, F>(
     F: std::future::Future<Output = ()>,
 {
     let mut state = state.write().await;
-    // Issue #562 scope note: this broadcasts the RAW `event` — `apply_event`
-    // below is what sanitizes `model`/`tool_name`/`tool_detail`, and it runs
-    // AFTER this send. Harmless today because every current consumer of the
-    // broadcast (the TUI, `daemon status`) re-applies through `apply_event`
-    // rather than rendering straight off the wire frame, but a future
-    // consumer that reads this broadcast directly would see unsanitized
-    // values.
+    // Issue #562 scope note, updated for issues #664/#665: this broadcasts
+    // the RAW `event` — `apply_event` below is what sanitizes
+    // `model`/`tool_name`/`tool_detail`/`cwd`/`user_prompt`, and it runs
+    // AFTER this send. NOT harmless-by-uniformity: most consumers of the
+    // broadcast (the TUI's journal path, `daemon status`) re-apply through
+    // `apply_event` rather than rendering straight off the wire frame, but
+    // `state.rs`'s `PromptWatch` (`wait_for_prompt_submission`) is a live
+    // counter-example — it reads `BroadcastMsg::Event` directly and compares
+    // `event.user_prompt` against the delivered text without re-applying.
+    // That is load-bearing, not incidental: `PromptWatch` needs the
+    // PRE-scrub value so its comparison sees the same newline structure the
+    // deck actually wrote into the pane. A future "fix" that moved this send
+    // to after `apply_event` (to close the general unsanitized-broadcast
+    // gap) would silently break prompt-delivery confirmation for every
+    // multi-line seed.
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     between_broadcast_and_apply().await;
     state.apply_event(event);
