@@ -39562,6 +39562,48 @@ mod tests {
         );
     }
 
+    /// Scenario: Render the new-pane form with the typed Name field set to
+    /// the literal `unknown` and an orchestration selected — the
+    /// `reserved_name_collision` render branch (fork #222 edge 2 follow-up,
+    /// reviewer F1 / auditor F1) that neither `guard_002` nor `guard_003`
+    /// exercise, since both drive the OTHER branch (a typed name colliding
+    /// with a live orchestration's name), not the reserved sentinel literal.
+    /// `identity_039` already pins `name_collision()` going `true` for this
+    /// case at the state layer, but nothing before this test asserted WHICH
+    /// warning copy the render seam picks for it — the whole point of
+    /// splitting `RESERVED_NAME_WARNING` out from `NAME_COLLISION_WARNING`
+    /// was that the latter's "already in use by a live orchestration" claim
+    /// is false here (no live orchestration need exist), so this test proves
+    /// the distinct copy renders instead, not merely that a warning fires.
+    #[spec("orchestration/guard/005")]
+    #[test]
+    fn guard_005_reserved_name_literal_renders_distinct_warning_copy() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/work/reserved-name-check"),
+            "unknown".to_string(),
+            "mycmd".to_string(),
+            Vec::new(),
+            vec![make_orchestration("review")],
+        );
+        form.selection_index = 1; // the only orchestration
+
+        let text = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+            render_new_pane_form(frame, &form);
+        }));
+
+        assert!(
+            text.contains("\"unknown\" is a reserved name"),
+            "typing the literal `unknown` with an orchestration selected \
+             must render RESERVED_NAME_WARNING's distinct copy, got:\n{text}"
+        );
+        assert!(
+            !text.contains("already in use by a live orchestration"),
+            "the reserved-name case must NOT render NAME_COLLISION_WARNING's \
+             copy — no live orchestration need exist for this branch to \
+             fire, so that claim would be false here, got:\n{text}"
+        );
+    }
+
     /// Scenario: Submit an orchestration form with a typed Name against a
     /// `dir` that is deliberately NOT a git repository, so the real
     /// isolated-clone provisioning step fails when `Action::SpawnPane` is
