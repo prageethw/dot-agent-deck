@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, broadcast};
 use tracing::{debug, error, info, warn};
 
@@ -2112,6 +2112,121 @@ async fn run_monitored_wait_sweep(state: SharedState, event_tx: broadcast::Sende
     }
 }
 
+/// Bound on a single line read from the hook socket (fork issue #393).
+/// Mirrors the reject-don't-truncate, cap-plus-deadline discipline the
+/// reply-path read in `src/hook.rs` (`MAX_REPLY_LINE_BYTES`/
+/// `read_reply_line`) already applies to the same "peer can dribble bytes
+/// forever" shape, but kept as its own distinctly-named constant rather than
+/// reused from `daemon_protocol::MAX_FRAME_LEN` or `hook::MAX_STDIN_BYTES`:
+/// aliasing an unrelated wire-transport or hook-CLI-request bound for this
+/// input bound would let a future change to either — made for reasons that
+/// have nothing to do with this socket — silently retune what an untrusted
+/// hook-socket peer may allocate here. The value is intentionally equal to
+/// `MAX_FRAME_LEN` (16 MiB), the same "far above any legitimate single
+/// message" number `hook::MAX_STDIN_BYTES` already reuses for the hook CLI's
+/// own request cap; the `const _` assertion below pins the literal so a
+/// future change to `MAX_FRAME_LEN` cannot silently retune this bound too.
+const MAX_HOOK_LINE_LEN: usize = 16 * 1024 * 1024;
+
+const _: () = assert!(MAX_HOOK_LINE_LEN == crate::daemon_protocol::MAX_FRAME_LEN);
+
+/// Total-operation deadline for reading one hook-socket line, matching the
+/// reply path's 5s total-operation deadline in `src/hook.rs`. Unlike that
+/// sync implementation, no per-read re-arming is needed here:
+/// `tokio::time::timeout` already bounds the whole `read_hook_line` future by
+/// wall clock regardless of how many small reads the peer forces it through,
+/// so a peer dribbling one byte at a time is bounded exactly the same as one
+/// that goes silent after the first byte.
+const HOOK_LINE_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Outcome of reading one line off the hook socket, bounded by
+/// [`MAX_HOOK_LINE_LEN`] but not yet by [`HOOK_LINE_READ_DEADLINE`] — the
+/// deadline wraps this future at the call site in [`read_bounded_hook_line`].
+enum HookLineOutcome {
+    Line(String),
+    /// EOF with nothing usable: either the peer closed cleanly, or it closed
+    /// mid-line (a partial, unterminated line at EOF) — both are treated the
+    /// same as "no message to process", since a partial line was never valid
+    /// JSON either way.
+    Closed,
+    /// The line was not valid UTF-8.
+    InvalidUtf8,
+    /// The line grew past [`MAX_HOOK_LINE_LEN`] without ever completing.
+    TooLong,
+}
+
+/// Read one newline-terminated line off `reader`, checking [`MAX_HOOK_LINE_LEN`]
+/// before each chunk extends the accumulated buffer (never after) — same
+/// idiom as `read_reply_line` in `src/hook.rs`, so a chunk that completes the
+/// cap violation is caught before it is appended rather than after growing
+/// past the bound to discover it.
+async fn read_hook_line<R>(reader: &mut R) -> HookLineOutcome
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut chunk = [0u8; 4096];
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(n) => n,
+            Err(_) => return HookLineOutcome::Closed,
+        };
+        if n == 0 {
+            return HookLineOutcome::Closed;
+        }
+        let newline_pos = chunk[..n].iter().position(|&b| b == b'\n');
+        let end = newline_pos.unwrap_or(n);
+        if line.len().saturating_add(end) > MAX_HOOK_LINE_LEN {
+            return HookLineOutcome::TooLong;
+        }
+        line.extend_from_slice(&chunk[..end]);
+        if newline_pos.is_some() {
+            return match String::from_utf8(line) {
+                Ok(line) => HookLineOutcome::Line(line),
+                Err(_) => HookLineOutcome::InvalidUtf8,
+            };
+        }
+    }
+}
+
+/// [`read_hook_line`] wrapped in [`HOOK_LINE_READ_DEADLINE`]'s total-operation
+/// deadline, folding every rejection (cap exceeded, deadline exceeded,
+/// invalid UTF-8) into `None` so the caller's loop simply stops — same
+/// "reject, don't hang" contract `run_hook_loop`'s `while let Some(line) =
+/// ...` already expected from `Lines::next_line()`, just now actually
+/// bounded. A rejection is logged once here rather than in `read_hook_line`,
+/// deliberately without echoing the accumulated payload: this daemon logs
+/// (unlike the hook CLI, which calls no `tracing` anywhere), and echoing
+/// untrusted socket content into the log would just move the unbounded-input
+/// hazard from memory into the log file instead of closing it.
+async fn read_bounded_hook_line<R>(reader: &mut R) -> Option<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match tokio::time::timeout(HOOK_LINE_READ_DEADLINE, read_hook_line(reader)).await {
+        Ok(HookLineOutcome::Line(line)) => Some(line),
+        Ok(HookLineOutcome::Closed) => None,
+        Ok(HookLineOutcome::InvalidUtf8) => {
+            warn!("hook socket line was not valid UTF-8; closing connection");
+            None
+        }
+        Ok(HookLineOutcome::TooLong) => {
+            warn!(
+                "hook socket line exceeded {MAX_HOOK_LINE_LEN} bytes without a terminating \
+                 newline; closing connection"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                "hook socket line exceeded the {HOOK_LINE_READ_DEADLINE:?} read deadline \
+                 without completing; closing connection"
+            );
+            None
+        }
+    }
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -2147,11 +2262,9 @@ async fn run_hook_loop(
                     // a reply back on the same connection. Every other message
                     // on this socket is fire-and-forget, so the write half is
                     // only ever used by the `GetSeed` arm below.
-                    let (read_half, mut write_half) = tokio::io::split(stream);
-                    let reader = tokio::io::BufReader::new(read_half);
-                    let mut lines = reader.lines();
+                    let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-                    while let Ok(Some(line)) = lines.next_line().await {
+                    while let Some(line) = read_bounded_hook_line(&mut read_half).await {
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
                             match msg {
                                 DaemonMessage::Delegate(signal) => {
