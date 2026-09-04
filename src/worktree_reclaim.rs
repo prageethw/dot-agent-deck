@@ -399,7 +399,14 @@ fn resolve_worktree_owner(
 /// `local_hostname()`. Never panics, never shells out to anything other than
 /// `gh` — a failure resolves `Unknown` with a stated reason rather than
 /// crashing `worktree list`.
-fn resolve_human_owner() -> WorktreeOwner {
+///
+/// `pub`, not private (issue #300 blocker 1): `run_worktree_list_cli`
+/// (`src/main.rs`) needs this same resolution to fall back to a human
+/// identity when `DOT_AGENT_DECK_WORKTREE_OWNER` is absent, and `src/main.rs`
+/// is a separate binary crate that only sees this crate's `pub` surface —
+/// `pub(crate)` would not cross that boundary, matching why `is_mine` and
+/// `owner_disagreements` above are already `pub` rather than `pub(crate)`.
+pub fn resolve_human_owner() -> WorktreeOwner {
     let host = crate::issue_dispatch_run::local_hostname();
     match crate::issue_claim::resolve_gh_login() {
         Ok(login) => WorktreeOwner::Human { login, host },
@@ -672,8 +679,17 @@ pub fn owner_disagreements<'a>(reports: &'a [WorktreeReport], owner: &str) -> Ve
 /// Extracted (issue #221 review round) so `run_worktree_list_cli`'s retain
 /// and its test share one definition instead of two independently typed
 /// copies of the same predicate that could silently drift apart.
+///
+/// Issue #300 blocker 2: `owned` alone can never be true for an unmarked,
+/// human-owned row (a hand-made worktree writes no marker at all — see
+/// [`resolve_worktree_owner`]), so an unconditional `owned &&` conjunct
+/// structurally excludes every human row regardless of how correctly
+/// `owner_filter` resolves an identity. A human row (`owner_kind == "human"`)
+/// is matchable by owner string alone; an agent row still requires `owned`
+/// (PR #215's fail-closed guard against a marker-forged claim stays intact —
+/// `owned` is never relaxed for `owner_kind == "agent"`).
 pub fn is_mine(report: &WorktreeReport, owner: &str) -> bool {
-    report.owned && report.owner.as_deref() == Some(owner)
+    (report.owned || report.owner_kind == "human") && report.owner.as_deref() == Some(owner)
 }
 
 /// Formats the issue #221 disagreement warning printed by `--mine` before
