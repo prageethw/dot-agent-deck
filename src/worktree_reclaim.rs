@@ -1372,6 +1372,23 @@ const MARKER_CREATOR_MAX_CHARS: usize = 200;
 /// already-sanitized value is harmless rather than a second, diverging
 /// derivation.
 pub fn sanitize_marker_creator(name: &str) -> String {
+    let trimmed = clean_and_trim_marker_creator(name);
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    if trimmed.chars().count() > MARKER_CREATOR_MAX_CHARS {
+        let truncated: String = trimmed.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        trimmed
+    }
+}
+
+/// The clean-and-trim half of [`sanitize_marker_creator`] — everything it
+/// does except the final truncation. Factored out so a producer can reject a
+/// name that normalization would *change*, not merely truncate (see
+/// [`marker_creator_normalizes`]).
+fn clean_and_trim_marker_creator(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter_map(|c| match c {
@@ -1380,16 +1397,23 @@ pub fn sanitize_marker_creator(name: &str) -> String {
             c => Some(c),
         })
         .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return "unknown".to_string();
-    }
-    if trimmed.chars().count() > MARKER_CREATOR_MAX_CHARS {
-        let truncated: String = trimmed.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
-        format!("{truncated}…")
-    } else {
-        trimmed.to_string()
-    }
+    cleaned.trim().to_string()
+}
+
+/// True when [`sanitize_marker_creator`] would change `name` for a reason
+/// *other* than truncation — a dropped control character, a `\n`/`\r`
+/// mapped to a space, or leading/trailing whitespace trimmed away. Any of
+/// these lets two distinct `name` values collapse to the identical
+/// marker-creator string well before either is anywhere near
+/// [`MARKER_CREATOR_MAX_CHARS`] (fork #222 edge 1 follow-up: length alone
+/// doesn't close the collision — `"deploy prod"` and `"deploy\nprod"` are
+/// both short and both sanitize to `"deploy prod"`). A producer that rejects
+/// whenever this returns `true` guarantees its own `name` is already a fixed
+/// point of everything `sanitize_marker_creator` does except truncate, so
+/// the only remaining way two distinct names can collide is the length
+/// truncation itself — which callers must still bound separately.
+pub fn marker_creator_normalizes(name: &str) -> bool {
+    clean_and_trim_marker_creator(name) != name
 }
 
 /// Derive a `gh --repo owner/name` slug from the worktree's own `origin`
