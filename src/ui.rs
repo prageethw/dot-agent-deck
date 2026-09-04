@@ -2196,8 +2196,10 @@ impl NewPaneFormState {
     /// marker-creator string. Treat it the same as an existing collision
     /// rather than let it round-trip into that reserved identity.
     fn reserved_name_collision(&self) -> bool {
-        self.resolved_title().is_some()
-            && orchestration_creator_string(self.name.trim())
+        let trimmed = self.name.trim();
+        !trimmed.is_empty()
+            && self.resolved_title().is_some()
+            && orchestration_creator_string(trimmed)
                 == crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL
     }
 
