@@ -756,6 +756,23 @@ impl LoadedSchedules {
 /// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
 /// crashing the daemon.
 fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, ScheduleLoadError> {
+    // #222: an unbounded `task.name` lets two scheduled tasks' marker-creator
+    // strings (`issue-dispatch:{name}#{issue}`) collide once
+    // `sanitize_marker_creator` truncates at `MARKER_CREATOR_MAX_CHARS`
+    // (src/worktree_reclaim.rs). Reject an overlong name outright at the
+    // producer, using the same cap the daemon already enforces on a live
+    // orchestration's display name, rather than tie this to that
+    // truncation's exact prefix/suffix arithmetic.
+    if task.name.chars().count() > crate::agent_pty::DISPLAY_NAME_MAX_LEN {
+        return Err(ScheduleLoadError {
+            entry: Some(index),
+            message: format!(
+                "scheduled task name is {} characters, exceeding the {}-character limit",
+                task.name.chars().count(),
+                crate::agent_pty::DISPLAY_NAME_MAX_LEN
+            ),
+        });
+    }
     // PRD #120: an issue-dispatch task has no top-level `command` — the per-issue
     // spawn derives its command from each cloned repo's `.dot-agent-deck.toml`
     // (orchestration roles, or the single-agent default). Only the #127

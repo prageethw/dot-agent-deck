@@ -2128,6 +2128,17 @@ impl NewPaneFormState {
     fn name_collision(&self) -> bool {
         self.resolved_title().is_some_and(|t| {
             let t = t.trim();
+            // #222: typing the literal `unknown` resolves, via
+            // `orchestration_creator_string`, to the exact same
+            // `orchestration:unknown` string the sentinel already reserves
+            // for a NAMELESS spawn (`ORCHESTRATION_UNKNOWN_SENTINEL`) — so a
+            // typed name here would collide with every future nameless
+            // orchestration's marker-creator string. Treat it the same as an
+            // existing collision rather than let it round-trip into that
+            // reserved identity.
+            if orchestration_creator_string(t) == crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL {
+                return true;
+            }
             // PRD fork#603 fix round: `live_orchestration_occupies` rather
             // than a bare `cwd_matches(&self.dir, cwd)` — see that
             // function's doc comment.
