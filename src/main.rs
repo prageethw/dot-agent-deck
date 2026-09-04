@@ -2609,21 +2609,66 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
             // reason to export `DOT_AGENT_DECK_WORKTREE_OWNER` at all, and
             // `resolve_worktree_owner` already treats every unmarked row's
             // owner this same way (this is the seam it uses). Fall back to
-            // that resolution; only refuse once BOTH the env var and
-            // human-identity resolution have failed.
-            Err(_) => match resolve_human_owner().identity_string() {
-                Some(identity) => Some(identity),
-                None => {
-                    eprintln!(
-                        "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is not set, and \
-                         this caller's identity could not be resolved via `gh` either -- cannot \
-                         determine which worktrees belong to this orchestration or this caller; \
-                         supply {DOT_AGENT_DECK_WORKTREE_OWNER}, authenticate `gh`, or drop \
-                         --mine"
-                    );
-                    return ExitCode::FAILURE;
+            // that resolution -- but ONLY when this process is not itself
+            // running inside an orchestration pane. `docs/orchestration.md`
+            // documents cases where a legitimate orchestration pane
+            // legitimately carries no `DOT_AGENT_DECK_WORKTREE_OWNER`
+            // (notably a tab reattached to a warm daemon, whose metadata is
+            // rebuilt without the saved identity) and promises `--mine`
+            // fails loudly there rather than guessing. `DOT_AGENT_DECK_PANE_ID`
+            // is set in every orchestration pane regardless (see its own doc
+            // comment), so its absence is what actually distinguishes "a
+            // human at an interactive terminal" (issue #300's reported case)
+            // from "an orchestration pane that lost its identity" (the case
+            // the fail-loud contract exists for). Only refuse once BOTH the
+            // env var and human-identity resolution have failed.
+            Err(std::env::VarError::NotPresent)
+                if std::env::var(DOT_AGENT_DECK_PANE_ID).is_err() =>
+            {
+                match resolve_human_owner().identity_string() {
+                    Some(identity) => Some(identity),
+                    None => {
+                        eprintln!(
+                            "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is not set, \
+                             and this caller's identity could not be resolved via `gh` either -- \
+                             cannot determine which worktrees belong to this orchestration or \
+                             this caller; supply {DOT_AGENT_DECK_WORKTREE_OWNER}, authenticate \
+                             `gh`, or drop --mine"
+                        );
+                        return ExitCode::FAILURE;
+                    }
                 }
-            },
+            }
+            // Issue #300 fix round (auditor M1): a `DOT_AGENT_DECK_PANE_ID`
+            // present alongside an absent owner var means this IS an
+            // orchestration pane that simply lost its saved identity -- the
+            // exact legitimate case `docs/orchestration.md` promises fails
+            // loudly rather than guessing. Refuse exactly as before this
+            // fix; do not attempt the human-identity fallback here, since
+            // doing so would silently answer for the wrong scope.
+            Err(std::env::VarError::NotPresent) => {
+                eprintln!(
+                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is not set -- cannot \
+                     determine which worktrees belong to this orchestration; supply it or drop \
+                     --mine"
+                );
+                return ExitCode::FAILURE;
+            }
+            // Issue #300 fix round (reviewer F3): a SET-but-invalid value is
+            // a different, more suspicious case than a genuinely absent one
+            // -- matching the empty-value guard above's own reasoning, an
+            // exported-but-meaningless value deserves its own explicit
+            // refusal, not silent fallthrough into either the pane-gated
+            // refusal or the human-identity fallback.
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eprintln!(
+                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is set to a value \
+                     that is not valid Unicode -- refusing rather than falling back to this \
+                     caller's own identity, which would answer for a different scope than the \
+                     one that was asked for"
+                );
+                return ExitCode::FAILURE;
+            }
         }
     } else {
         None
@@ -2728,8 +2773,8 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
             // variable's value" as load-bearing, and printing it raw
             // reintroduced that terminal-escape / forged-line sink.
             // Round-4 fixup (R4-1): `owner` is already sanitized at
-            // construction (the single `Ok(v) => Some(sanitize_marker_creator(&v))`
-            // arm above), which guarantees this is the exact string the
+            // construction via the `Ok(v) => Some(sanitize_marker_creator(&v))`
+            // arm above, which guarantees this is the exact string the
             // filter compared against -- not a second, possibly-divergent
             // normalization of it. Issue #232 round 2 (gap 3) corrects M1's
             // premise, though: `sanitize_marker_creator` strips Unicode
@@ -2738,6 +2783,14 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
             // a terminal" -- this is the same terminal-display sink
             // `format_disagreement_warning` has, so it goes through the same
             // display sanitizer immediately before printing.
+            // Issue #300 fix round: there is now a SECOND construction arm
+            // (the pane-gated `Err(VarError::NotPresent) => resolve_human_owner()`
+            // fallback above), which applies no sanitizer at all -- and
+            // deliberately so, since `src/worktree_reclaim.rs`'s matching
+            // `owner` field (built from the same `resolve_human_owner`
+            // call) is unsanitized too. The two must stay symmetric: if
+            // either side started sanitizing without the other, `--mine`
+            // would stop matching a human's own worktree.
             println!(
                 "no worktrees owned by {}",
                 sanitize_for_terminal_display(owner)

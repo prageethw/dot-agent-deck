@@ -3134,10 +3134,11 @@ fn pin_004_pin_a_bare_relative_name_resolves_like_an_absolute_path() {
 /// -- one that reacts to the absent env var by disabling filtering
 /// entirely (`owner_filter = None`, listing everything) rather than by
 /// resolving a real identity to filter on -- is caught too: that worktree
-/// must never appear in the output. This test deliberately stops short of
-/// asserting the unmarked human-owned worktree itself appears in the
-/// listing -- that also requires issue #300 blocker 2's independent
-/// `is_mine` fix (`085`), which this test does not exercise.
+/// must never appear in the output. Now that issue #300 blocker 2's
+/// independent `is_mine` fix (`085`) has also landed in this same PR, this
+/// test also asserts the unmarked human-owned worktree itself appears in
+/// the listing -- pinning the coupling between this filter's
+/// `identity_string()` and the report's own `owner` field end to end.
 #[spec("worktree/reclaim/084")]
 #[test]
 #[cfg(unix)]
@@ -3173,5 +3174,15 @@ fn worktree_reclaim_084_mine_falls_back_to_human_resolution_when_owner_env_absen
         "falling back to human-identity resolution must never mean \"stop filtering \
          altogether\" -- a worktree owned by a DIFFERENT identity must still be excluded; got:\n\
          {text}"
+    );
+    // Issue #300 fix round (reviewer F2): with blocker 2's `is_mine` fix
+    // (`085`) also landed in this same PR, the human-owned worktree must
+    // actually APPEAR in the listing -- pinning the coupling between this
+    // filter's `identity_string()` and the report's own `owner` field end
+    // to end, not just the two blockers independently.
+    assert!(
+        text.contains("wt-human-owner"),
+        "the unmarked worktree created by the same identity `--mine` resolved to must appear \
+         in the listing once both issue #300 blockers are fixed; got:\n{text}"
     );
 }
