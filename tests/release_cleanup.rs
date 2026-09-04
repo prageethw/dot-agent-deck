@@ -2302,12 +2302,13 @@ fn release_cleanup_028_run_git_leaks_ambient_git_index_file() {
     let status = run_git(&fixture, &["status", "--porcelain"]);
     assert_eq!(
         status.trim(),
-        "?? file.txt",
-        "issue #669: `run_git`'s `git add file.txt` in the fixture, run while an ambient \
-         GIT_INDEX_FILE pointed at a different repository's index, staged the file into \
-         that AMBIENT index instead of the fixture's own — the fixture's real index still \
-         shows the file as untracked instead of staged. `git status --porcelain` reported: \
-         {status:?}"
+        "A  file.txt",
+        "issue #669: expected `run_git`'s `git add file.txt` in the fixture to stage the \
+         file into the FIXTURE's own index (the fixed behaviour this test exists to \
+         demand) even while an ambient GIT_INDEX_FILE points at a different repository's \
+         index — instead the file was staged into that AMBIENT index, leaving the \
+         fixture's own index still showing the file as untracked. `git status --porcelain` \
+         reported: {status:?}"
     );
 }
 
@@ -2357,22 +2358,19 @@ fn release_cleanup_029_run_git_does_not_bound_upward_discovery_with_git_ceiling_
 
     std::panic::set_hook(previous_hook);
 
-    let outer_canon = std::fs::canonicalize(&outer).unwrap_or(outer);
     match result {
-        Ok(toplevel) => {
-            assert_eq!(
-                Path::new(toplevel.trim()),
-                outer_canon.as_path(),
-                "issue #669: `run_git`, invoked in `candidate` (not itself a repository), \
-                 escaped upward to an unexpected location instead of `outer`'s own \
-                 repository: {toplevel:?}"
-            );
-        }
-        Err(_) => panic!(
-            "issue #669: expected `run_git` to currently ESCAPE upward past `candidate` \
-             (no repository there) and resolve `outer`'s repository above it, proving \
-             GIT_CEILING_DIRECTORIES is unbounded — instead the invocation failed, which is \
-             the FIXED behaviour this test exists to demand"
+        Ok(toplevel) => panic!(
+            "issue #669: expected `run_git` to fail closed when invoked in `candidate` \
+             (not itself a repository) instead of escaping upward past it and resolving \
+             `outer`'s repository above it — the FIXED behaviour this test exists to \
+             demand is that GIT_CEILING_DIRECTORIES bounds the walk — instead the escape \
+             still succeeded and resolved: {toplevel:?}"
         ),
+        Err(_) => {
+            // Fixed behaviour: `run_git` bounds upward discovery at `candidate`
+            // via `GIT_CEILING_DIRECTORIES`, so `rev-parse --show-toplevel` finds
+            // no repository there and the invocation fails closed, panicking
+            // inside `run_git` as designed (caught by `catch_unwind` above).
+        }
     }
 }
