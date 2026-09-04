@@ -980,29 +980,30 @@ fn describe_success(
 ///
 /// Plain removal (not a bound, unlike `GIT_CEILING_DIRECTORIES` in
 /// `repo_state.rs`'s `Sandbox::git`) is correct for all 11: every caller's
-/// `dir` — all 20 production call sites via [`init_self_test_repo`], and
+/// `dir` — all 21 production call sites via [`init_self_test_repo`], and
 /// every fixture call site in `mod tests` — targets a directory already
 /// made a repository by an immediately-preceding `git init`, never a walk
 /// that could resolve past `dir` into nothing.
 ///
-/// The first 8 mirror `repo_state.rs`'s `Sandbox`'s `AMBIENT_LOCATION_VARS`
-/// (issue #579, PR #663). A third, non-`#[cfg(test)]` copy of that same
-/// location list also exists in this crate, at `list_tests.rs:808`'s own
-/// `GIT_ENV_VARS_TO_CLEAR` — not reused here because it backs
+/// The first 8 mirror `list_tests.rs:808`'s own `GIT_ENV_VARS_TO_CLEAR`
+/// byte-for-byte — not reused directly here because that one backs
 /// `list_tests.rs`'s own `git_command()` builder for a materially different
 /// call surface (read-only test-comparison tooling, not scratch-repo
 /// construction), and importing across that module boundary wasn't judged
-/// worth the coupling in an already-large diff. The last 3 —
+/// worth the coupling in an already-large diff. `GIT_CEILING_DIRECTORIES`
+/// (one of those first 8) is cleared here — unlike `repo_state.rs`'s
+/// `Sandbox::git`, which *sets* it via `Sandbox::ceiling` — because neither
+/// of the two helpers sharing this list has a ceiling bound. The last 3 —
 /// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`/`GIT_DISCOVERY_ACROSS_FILESYSTEM`
-/// — close the channel issue #669 auditor A2 found still open here: git
-/// accepts config values (including `core.hooksPath`) directly from
+/// — mirror what `repo_state.rs`'s `Sandbox`'s `AMBIENT_LOCATION_VARS`
+/// carries beyond those 8 (issue #579, PR #663), and close the channel
+/// issue #669 auditor A2 found still open here: git accepts config values
+/// (including `core.hooksPath`) directly from
 /// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`+`GIT_CONFIG_KEY_<n>`/
 /// `GIT_CONFIG_VALUE_<n>`, bypassing `GIT_CONFIG_NOSYSTEM`/
 /// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` entirely; `GIT_DISCOVERY_ACROSS_FILESYSTEM`
-/// is one of only two things that bound an otherwise-unbounded upward walk,
-/// and neither of the two helpers sharing this list has a
-/// `GIT_CEILING_DIRECTORIES` bound.
-const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
+/// is one of only two things that bound an otherwise-unbounded upward walk.
+const SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -1030,7 +1031,7 @@ const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
 /// lives in the scratch repo's own `.git/config`, never in the global/system
 /// files this points away from.
 ///
-/// [`GIT_ENV_VARS_TO_CLEAR`] cleared alongside (issue #669 auditor A1): this
+/// [`SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`] cleared alongside (issue #669 auditor A1): this
 /// used to clear nothing on the location/config-injection axis, unlike `mod
 /// tests`'s own `git()` fixture helper below, which the auditor reproduced
 /// as a destructive write into a real repository — an ambient `GIT_DIR`/
@@ -1045,7 +1046,7 @@ fn run_git(args: &[&str], dir: &Path) -> Result<(), String> {
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null");
-    for var in GIT_ENV_VARS_TO_CLEAR {
+    for var in SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR {
         cmd.env_remove(var);
     }
     let out = cmd
@@ -2031,7 +2032,7 @@ mod tests {
     /// other than gpgsign, and each call site already sets its own
     /// `user.email`/`user.name` in the scratch repo's local config.
     ///
-    /// [`super::GIT_ENV_VARS_TO_CLEAR`] cleared alongside (issue #669),
+    /// [`super::SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`] cleared alongside (issue #669),
     /// imported via `use super::*` above rather than duplicated a second
     /// time in this file — this helper builds scratch repos exactly the way
     /// the production [`run_git`] above does, so it needs the identical
@@ -2046,7 +2047,7 @@ mod tests {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null");
-        for var in GIT_ENV_VARS_TO_CLEAR {
+        for var in SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR {
             cmd.env_remove(var);
         }
         let out = cmd

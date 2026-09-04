@@ -162,7 +162,10 @@ fn cleanup_script_path() -> PathBuf {
 /// either — see `Sandbox::ceiling` in `repo_state.rs` for the same caveat
 /// documented against a real call site).
 fn try_run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    debug_assert!(dir.is_absolute(), "run_git dir must be absolute: {dir:?}");
+    debug_assert!(
+        dir.is_absolute(),
+        "try_run_git dir must be absolute: {dir:?}"
+    );
     let ceiling = dir
         .parent()
         .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
@@ -2447,17 +2450,10 @@ fn release_cleanup_029_run_git_does_not_bound_upward_discovery_with_git_ceiling_
 /// when run — the standard way to prove a git hook fired (issue #669 auditor
 /// A2/A3).
 fn write_marker_hook(hook_path: &Path, marker: &Path) {
-    std::fs::write(
+    common::write_executable(
         hook_path,
-        format!("#!/bin/sh\ntouch {}\n", sh_quote_path(marker)),
-    )
-    .unwrap_or_else(|e| panic!("write hook script {hook_path:?}: {e}"));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(hook_path, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("chmod hook script {hook_path:?}: {e}"));
-    }
+        &format!("#!/bin/sh\ntouch {}\n", sh_quote_path(marker)),
+    );
 }
 
 /// **RCE — issue #669 auditor A2.** `run_git` neutralizes the 7 ambient

@@ -22,29 +22,30 @@ use std::path::Path;
 use std::process::Command;
 
 /// Ambient git location- and config-injection environment variables that
-/// must never leak into a fixture `git` invocation below (issue #669) —
-/// mirrors `work_type.rs`'s own `GIT_ENV_VARS_TO_CLEAR`, which in turn
-/// mirrors `repo_state.rs`'s `mod real_git::Sandbox`'s
-/// `AMBIENT_LOCATION_VARS` (issue #579, PR #663). Duplicated here rather
-/// than imported — unlike `work_type.rs`'s own two internal call sites,
-/// which share one copy within that file — because `xtask/linkage-check` is
-/// bin-only (`Cargo.toml` declares `[[bin]]` and there is no `src/lib.rs`),
-/// so an integration test under `tests/` has nothing to import a const
-/// from; this is the one genuinely unavoidable copy of the four such lists
-/// in this crate (issue #669 N3).
+/// must never leak into a fixture `git` invocation below (issue #669) — the
+/// first 8 mirror `list_tests.rs:808`'s own `GIT_ENV_VARS_TO_CLEAR`
+/// byte-for-byte (as does `work_type.rs`'s own copy of this same list), and
+/// the last 3 mirror what `repo_state.rs`'s `mod real_git::Sandbox`'s
+/// `AMBIENT_LOCATION_VARS` carries beyond those 8 (issue #579, PR #663).
+/// Duplicated here rather than imported — unlike `work_type.rs`'s own two
+/// internal call sites, which share one copy within that file — because
+/// `xtask/linkage-check` is bin-only (`Cargo.toml` declares `[[bin]]` and
+/// there is no `src/lib.rs`), so an integration test under `tests/` has
+/// nothing to import a const from; this is the one genuinely unavoidable
+/// copy of the four such lists in this crate (issue #669 N3).
 ///
 /// Plain removal (not a bound) is correct for all 11, including
-/// `GIT_CEILING_DIRECTORIES`: every fixture command this helper runs
-/// targets an already-initialized repo, never a walk that could resolve
-/// past `dir` into nothing. The last 3 — `GIT_CONFIG_PARAMETERS`/
-/// `GIT_CONFIG_COUNT`/`GIT_DISCOVERY_ACROSS_FILESYSTEM` — close the
-/// config-injection channel issue #669 auditor A2 found still open: git
-/// accepts config values (including `core.hooksPath`) directly from
-/// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`+`GIT_CONFIG_KEY_<n>`/
+/// `GIT_CEILING_DIRECTORIES` — cleared here unlike `repo_state.rs`'s
+/// `Sandbox::git`, which *sets* it via `Sandbox::ceiling` — because every
+/// fixture command this helper runs targets an already-initialized repo,
+/// never a walk that could resolve past `dir` into nothing. The last 3 —
+/// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`/`GIT_DISCOVERY_ACROSS_FILESYSTEM`
+/// — close the config-injection channel issue #669 auditor A2 found still
+/// open: git accepts config values (including `core.hooksPath`) directly
+/// from `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`+`GIT_CONFIG_KEY_<n>`/
 /// `GIT_CONFIG_VALUE_<n>`, bypassing `GIT_CONFIG_NOSYSTEM`/
 /// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` entirely; `GIT_DISCOVERY_ACROSS_FILESYSTEM`
-/// is one of only two things that bound an otherwise-unbounded upward walk,
-/// and this helper has no `GIT_CEILING_DIRECTORIES` bound.
+/// is one of only two things that bound an otherwise-unbounded upward walk.
 const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
