@@ -1957,6 +1957,26 @@ mod tests {
     use crate::list_tests::collect_tests_from_sources;
     use std::process::Command;
 
+    /// Ambient git location-discovery variables cleared before every fixture
+    /// `git` invocation below — mirrors `repo_state.rs`'s `mod
+    /// real_git::Sandbox`'s `AMBIENT_LOCATION_VARS` (issue #579, PR #663),
+    /// duplicated here rather than imported because that module is
+    /// `#[cfg(test)]`-private to `repo_state.rs`. Plain removal (not a
+    /// bound, unlike `GIT_CEILING_DIRECTORIES` in `Sandbox::git`) is correct
+    /// for all 8, including `GIT_CEILING_DIRECTORIES`: every fixture command
+    /// this helper runs targets an already-initialized repo or an init/clone
+    /// target, never a walk that could resolve past `dir` into nothing.
+    const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_NAMESPACE",
+    ];
+
     /// Run `git <args>` in `dir`, panicking with git's own stderr on
     /// failure — these fixtures are the test's own setup, not the thing
     /// under test, so a setup failure should look like a setup failure.
@@ -1972,12 +1992,22 @@ mod tests {
     /// identity via env): nothing here reads `~/.gitconfig` for anything
     /// other than gpgsign, and each call site already sets its own
     /// `user.email`/`user.name` in the scratch repo's local config.
+    ///
+    /// [`GIT_ENV_VARS_TO_CLEAR`] cleared alongside, for the same reason
+    /// `repo_state.rs`'s `Sandbox::git` clears its own copy (issue #669): an
+    /// ambient `GIT_DIR`/`GIT_WORK_TREE` etc. outranks `current_dir` and can
+    /// silently redirect a fixture command at a repository outside the
+    /// scratch tree this helper builds.
     fn git(args: &[&str], dir: &Path) {
-        let out = Command::new("git")
-            .args(args)
+        let mut cmd = Command::new("git");
+        cmd.args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        for var in GIT_ENV_VARS_TO_CLEAR {
+            cmd.env_remove(var);
+        }
+        let out = cmd
             .output()
             .unwrap_or_else(|e| panic!("run git {args:?} in {dir:?}: {e}"));
         assert!(

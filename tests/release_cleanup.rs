@@ -121,7 +121,20 @@ fn cleanup_script_path() -> PathBuf {
 /// Run `git` with `args` in `dir`, panicking with full stdout/stderr on
 /// failure so a broken fixture is diagnosable instead of a mystifying
 /// downstream test failure.
+///
+/// Issue #669: alongside `GIT_DIR`/`GIT_WORK_TREE`, also clears the other
+/// ambient location-discovery vars that outrank `current_dir` the same way
+/// (`GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`), and bounds
+/// `GIT_CEILING_DIRECTORIES` at `dir` itself rather than clearing it — the
+/// same reasoning `run_cleanup` below already applies at the OS temp dir
+/// for the script under test: a `dir` that is not itself a repository (a
+/// fixture's plain subdirectory) must fail discovery closed at `dir`
+/// instead of silently resolving a real repository somewhere above it.
+/// Canonicalized, with the uncanonicalized path as fallback, matching
+/// `run_cleanup`'s own fallback style.
 fn run_git(dir: &Path, args: &[&str]) -> String {
+    let ceiling = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -130,8 +143,14 @@ fn run_git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_NAME", "Fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_NAMESPACE")
         .output()
         .unwrap_or_else(|e| panic!("spawn `git {args:?}` in {dir:?}: {e}"));
     assert!(

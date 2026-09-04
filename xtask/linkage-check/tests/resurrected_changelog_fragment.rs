@@ -27,12 +27,35 @@ use std::process::Command;
 /// `git update-ref refs/remotes/origin/main HEAD` trick
 /// `work_type.rs::init_self_test_repo` uses for `--self-test`'s own scratch
 /// repos.
+/// Ambient git location-discovery variables cleared before every fixture
+/// `git` invocation below — mirrors this function's own copy in
+/// `work_type.rs`, which in turn mirrors `repo_state.rs`'s `mod
+/// real_git::Sandbox`'s `AMBIENT_LOCATION_VARS` (issue #579, PR #663).
+/// Plain removal (not a bound) is correct for all 8, including
+/// `GIT_CEILING_DIRECTORIES`: every fixture command this helper runs
+/// targets an already-initialized repo, never a walk that could resolve
+/// past `dir` into nothing.
+const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
 fn git(args: &[&str], dir: &Path) {
-    let out = Command::new("git")
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    for var in GIT_ENV_VARS_TO_CLEAR {
+        cmd.env_remove(var);
+    }
+    let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("run git {args:?} in {dir:?}: {e}"));
     assert!(
