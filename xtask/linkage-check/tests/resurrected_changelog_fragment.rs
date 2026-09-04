@@ -21,20 +21,30 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-/// Same minimal `## Test Case Catalog` fixture shape as
-/// `duplicate_catalog_id.rs`'s `write_fixture`, plus a git repository (check
-/// 11 needs one) with `origin/main` faked at the base commit — the same
-/// `git update-ref refs/remotes/origin/main HEAD` trick
-/// `work_type.rs::init_self_test_repo` uses for `--self-test`'s own scratch
-/// repos.
-/// Ambient git location-discovery variables cleared before every fixture
-/// `git` invocation below — mirrors this function's own copy in
-/// `work_type.rs`, which in turn mirrors `repo_state.rs`'s `mod
-/// real_git::Sandbox`'s `AMBIENT_LOCATION_VARS` (issue #579, PR #663).
-/// Plain removal (not a bound) is correct for all 8, including
+/// Ambient git location- and config-injection environment variables that
+/// must never leak into a fixture `git` invocation below (issue #669) —
+/// mirrors `work_type.rs`'s own `GIT_ENV_VARS_TO_CLEAR`, which in turn
+/// mirrors `repo_state.rs`'s `mod real_git::Sandbox`'s
+/// `AMBIENT_LOCATION_VARS` (issue #579, PR #663). Duplicated here rather
+/// than imported — unlike `work_type.rs`'s own two internal call sites,
+/// which share one copy within that file — because `xtask/linkage-check` is
+/// bin-only (`Cargo.toml` declares `[[bin]]` and there is no `src/lib.rs`),
+/// so an integration test under `tests/` has nothing to import a const
+/// from; this is the one genuinely unavoidable copy of the four such lists
+/// in this crate (issue #669 N3).
+///
+/// Plain removal (not a bound) is correct for all 11, including
 /// `GIT_CEILING_DIRECTORIES`: every fixture command this helper runs
 /// targets an already-initialized repo, never a walk that could resolve
-/// past `dir` into nothing.
+/// past `dir` into nothing. The last 3 — `GIT_CONFIG_PARAMETERS`/
+/// `GIT_CONFIG_COUNT`/`GIT_DISCOVERY_ACROSS_FILESYSTEM` — close the
+/// config-injection channel issue #669 auditor A2 found still open: git
+/// accepts config values (including `core.hooksPath`) directly from
+/// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`+`GIT_CONFIG_KEY_<n>`/
+/// `GIT_CONFIG_VALUE_<n>`, bypassing `GIT_CONFIG_NOSYSTEM`/
+/// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` entirely; `GIT_DISCOVERY_ACROSS_FILESYSTEM`
+/// is one of only two things that bound an otherwise-unbounded upward walk,
+/// and this helper has no `GIT_CEILING_DIRECTORIES` bound.
 const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -44,8 +54,17 @@ const GIT_ENV_VARS_TO_CLEAR: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CEILING_DIRECTORIES",
     "GIT_NAMESPACE",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 ];
 
+/// Same minimal `## Test Case Catalog` fixture shape as
+/// `duplicate_catalog_id.rs`'s `write_fixture`, plus a git repository (check
+/// 11 needs one) with `origin/main` faked at the base commit — the same
+/// `git update-ref refs/remotes/origin/main HEAD` trick
+/// `work_type.rs::init_self_test_repo` uses for `--self-test`'s own scratch
+/// repos.
 fn git(args: &[&str], dir: &Path) {
     let mut cmd = Command::new("git");
     cmd.args(args)

@@ -118,6 +118,11 @@ fn cleanup_script_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude/skills/dot-ai-tag-release/cleanup.sh")
 }
 
+/// Caller contract: `dir` must be a repository root, a worktree root, or an
+/// explicit `init`/`clone` target — never a subdirectory relying on upward
+/// discovery, or [`try_run_git`]/`run_git` now fail/panic (the ceiling below
+/// bounds discovery at `dir` exactly).
+///
 /// Run `git` with `args` in `dir`, panicking with full stdout/stderr on
 /// failure so a broken fixture is diagnosable instead of a mystifying
 /// downstream test failure.
@@ -125,18 +130,39 @@ fn cleanup_script_path() -> PathBuf {
 /// Issue #669: alongside `GIT_DIR`/`GIT_WORK_TREE`, also clears the other
 /// ambient location-discovery vars that outrank `current_dir` the same way
 /// (`GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
-/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`), and bounds
-/// `GIT_CEILING_DIRECTORIES` at `dir`'s parent rather than clearing it — the
-/// same reasoning `run_cleanup` below already applies at the OS temp dir
-/// for the script under test: a `dir` that is not itself a repository (a
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`), the two vars
+/// through which git accepts config values (including `core.hooksPath`)
+/// directly from the environment — `GIT_CONFIG_PARAMETERS`/
+/// `GIT_CONFIG_COUNT`+`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` — bypassing
+/// `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` entirely
+/// (auditor A2), and bounds `GIT_CEILING_DIRECTORIES` at `dir`'s parent
+/// rather than clearing it: a `dir` that is not itself a repository (a
 /// fixture's plain subdirectory) must fail discovery closed at `dir`
-/// instead of silently resolving a real repository somewhere above it.
-/// git's own docs: `current_dir` is always searched regardless of the
-/// ceiling list, so the ceiling has to name the directory git must not walk
-/// up *into* — `dir`'s parent, not `dir` itself.
+/// instead of silently resolving a real repository somewhere above it. This
+/// is a new, stricter decision for this file, not an application of
+/// `run_cleanup`'s own precedent below — `run_cleanup` bounds at the OS temp
+/// dir (the whole fixture tree stays discoverable, only escape to the real
+/// `$HOME` is blocked), while this bounds at `dir`'s parent (no upward
+/// discovery at all). git's own docs: `current_dir` is always searched
+/// regardless of the ceiling list, so the ceiling has to name the directory
+/// git must not walk up *into* — `dir`'s parent, not `dir` itself.
 /// Canonicalized, with the uncanonicalized path as fallback, matching
-/// `run_cleanup`'s own fallback style.
-fn run_git(dir: &Path, args: &[&str]) -> String {
+/// `run_cleanup`'s own fallback style. `GIT_CONFIG_GLOBAL=/dev/null` (auditor
+/// A3) additionally keeps the invoking developer's or runner's real
+/// `$HOME/.gitconfig` — a `core.hooksPath` there included — out of every
+/// fixture invocation, matching `run_cleanup`'s own isolation below.
+///
+/// `dir` must be absolute (debug-asserted): a relative `dir` makes
+/// `dir.parent()` resolve to `Some("")`, and an empty `GIT_CEILING_DIRECTORIES`
+/// entry is git's own "not a symlink" marker, silently voiding the bound
+/// rather than erroring — not reachable today (every call site passes an
+/// absolute tempdir-derived path). `GIT_CEILING_DIRECTORIES` is also
+/// `:`-separated, so a `:` anywhere in `dir`'s parent path would split the
+/// entry into garbage and fail open the same way (not reachable today
+/// either — see `Sandbox::ceiling` in `repo_state.rs` for the same caveat
+/// documented against a real call site).
+fn try_run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    debug_assert!(dir.is_absolute(), "run_git dir must be absolute: {dir:?}");
     let ceiling = dir
         .parent()
         .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
@@ -149,6 +175,7 @@ fn run_git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_NAME", "Fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CEILING_DIRECTORIES", ceiling)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -157,16 +184,26 @@ fn run_git(dir: &Path, args: &[&str]) -> String {
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
         .output()
-        .unwrap_or_else(|e| panic!("spawn `git {args:?}` in {dir:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "`git {args:?}` in {dir:?} failed (status {:?})\nstdout: {}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+        .map_err(|e| format!("spawn `git {args:?}` in {dir:?}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git {args:?}` in {dir:?} failed (status {:?})\nstdout: {}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Panicking wrapper around [`try_run_git`] for the (overwhelming majority
+/// of) call sites that treat a fixture-setup failure as fatal — see
+/// [`try_run_git`]'s doc comment for the isolation this applies.
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    try_run_git(dir, args).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Add a worktree on a NEW branch off `main`, add one commit, and
