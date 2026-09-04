@@ -1319,6 +1319,108 @@ mod tests {
         );
     }
 
+    /// Fork issue #241: `capture_bounded_async`'s remediation arms — the ones
+    /// that react to a read error, a size-cap trip, or a timeout — call
+    /// `child.kill().await` followed by `child.wait().await` with no bound
+    /// on the pair itself. `Child::kill()` is `start_kill()` plus an
+    /// *unbounded* `wait()` (see this function's own doc comment, PR #233
+    /// review R2), so a child wedged in uninterruptible sleep (`D` state)
+    /// parks the remediation path forever — the same failure the happy-path
+    /// `wait()` was fixed for in fork #160/PR #233 (issue A4), just reached
+    /// through a different door.
+    ///
+    /// The real trigger (a `D`-state child) cannot be created deterministically
+    /// from userspace in a portable, CI-safe way: `SIGKILL` cannot be blocked
+    /// or ignored by an ordinary process, so any real test child dies near-
+    /// instantly under `kill()` regardless of whether the remediation arms are
+    /// bounded, and the one thing that genuinely *can* delay reaping (real
+    /// `D` state, or a ptrace-stop trick) either needs a wedged kernel I/O
+    /// path this test cannot force, or a mechanism CI sandboxes routinely
+    /// deny — see the existing `SlowReapChild` doubles in
+    /// `platform/proc/mod.rs` for the same tradeoff on the sibling
+    /// `portable_pty::Child`-based teardown paths; that pattern is not
+    /// reusable here because `capture_bounded_async` is hard-wired to the
+    /// concrete `tokio::process::Child`, not a trait object, and giving it a
+    /// swappable seam is a production-code change (the coder's job, not the
+    /// tester's).
+    ///
+    /// So this pins the STRUCTURAL half of the fix instead of the runtime
+    /// half: issue #241 itself names the defect as the naked, unbounded
+    /// `let _ = child.kill().await; let _ = child.wait().await;` idiom
+    /// repeated across all five remediation arms — this asserts that idiom
+    /// is gone from `capture_bounded_async` entirely. The scan is
+    /// whitespace/indentation-agnostic (the five sites sit at different
+    /// nesting depths) so it does not overfit to today's exact formatting,
+    /// and it is a genuine RED today (all five sites still match) that is
+    /// expected to flip GREEN once every remediation arm is rewritten to
+    /// something bounded — e.g. `child.start_kill()` plus
+    /// `tokio::time::timeout(_, child.wait())`, the shape issue #241 itself
+    /// suggests — rather than the bare await pair. A fix that instead wraps
+    /// the exact two-line pair unchanged inside an outer `timeout(async {
+    /// .. })` would still read as unbounded to this scan even though it
+    /// would behave correctly; that gap is accepted deliberately in exchange
+    /// for a test that runs in microseconds and cannot flake, and is exactly
+    /// why the assertion message below spells out the expected shape rather
+    /// than leaving the fix implicit.
+    ///
+    /// Precedent for pinning a structural invariant this way — when the
+    /// underlying property has no direct runtime observable — is
+    /// `embedded_pane.rs`'s `parser_is_constructed_in_exactly_one_place`.
+    ///
+    /// Scenario: reads this file's own source (`include_str!`, compile-time,
+    /// no I/O at test time), isolates `capture_bounded_async`'s body, and
+    /// counts how many times the naked `child.kill().await` /
+    /// `child.wait().await` pair appears back-to-back with nothing else
+    /// between them. Today that count is 5, one per remediation arm named in
+    /// issue #241; the fix must bring it to 0.
+    #[test]
+    fn capture_bounded_async_remediation_arms_never_leave_kill_and_wait_unbounded() {
+        const SRC: &str = include_str!("unix.rs");
+        // `include_str!` yields the file exactly as checked out, and Windows
+        // checks it out with CRLF endings — normalize once so this reads the
+        // same on every platform (same caveat as
+        // `embedded_pane.rs::parser_is_constructed_in_exactly_one_place`).
+        let src = SRC.replace("\r\n", "\n");
+
+        let fn_start = src
+            .find("async fn capture_bounded_async(")
+            .expect("`capture_bounded_async` must exist");
+        let body_end = src[fn_start..]
+            .find("\n}\n")
+            .map(|rel| fn_start + rel)
+            .expect("`capture_bounded_async` must end at a top-level brace");
+        let body = &src[fn_start..body_end];
+
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        let mut naked_pairs = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if *line != "let _ = child.kill().await;" {
+                continue;
+            }
+            // Tolerate a blank line between the two calls even though none of
+            // today's five sites have one, so a purely cosmetic reflow can't
+            // make this scan miss a real naked pair.
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].is_empty() {
+                j += 1;
+            }
+            if lines.get(j) == Some(&"let _ = child.wait().await;") {
+                naked_pairs.push(i);
+            }
+        }
+
+        assert_eq!(
+            naked_pairs.len(),
+            0,
+            "issue #241: `capture_bounded_async` must not leave any remediation \
+             `child.kill().await` / `child.wait().await` pair unbounded — found {} naked \
+             pair(s) at body-relative line index {naked_pairs:?}; bound each remediation arm \
+             instead (e.g. `child.start_kill()` + `tokio::time::timeout(_, child.wait())`) \
+             rather than awaiting the pair directly",
+            naked_pairs.len()
+        );
+    }
+
     /// A sample that fails outright — a non-zero exit, or a program that is not
     /// there to run at all — is also "no sample", never an empty table.
     #[test]
