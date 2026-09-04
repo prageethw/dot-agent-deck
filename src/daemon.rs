@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, broadcast};
 use tracing::{debug, error, info, warn};
 
@@ -2120,6 +2120,372 @@ async fn run_monitored_wait_sweep(state: SharedState, event_tx: broadcast::Sende
     }
 }
 
+/// Bound on a single line read from the hook socket (fork issue #393).
+/// Mirrors the reject-don't-truncate, cap-plus-deadline discipline the
+/// reply-path read in `src/hook.rs` (`MAX_REPLY_LINE_BYTES`/
+/// `read_reply_line`) already applies to the same "peer can dribble bytes
+/// forever" shape, but kept as its own distinctly-named constant rather than
+/// reused from `daemon_protocol::MAX_FRAME_LEN` or `hook::MAX_STDIN_BYTES`:
+/// aliasing an unrelated wire-transport or hook-CLI-request bound for this
+/// input bound would let a future change to either — made for reasons that
+/// have nothing to do with this socket — silently retune what an untrusted
+/// hook-socket peer may allocate here. The value is intentionally equal to
+/// `MAX_FRAME_LEN` (16 MiB), the same "far above any legitimate single
+/// message" number `hook::MAX_STDIN_BYTES` already reuses for the hook CLI's
+/// own request cap; the `const _` assertion below pins the literal so a
+/// future change to `MAX_FRAME_LEN` cannot silently retune this bound too.
+const MAX_HOOK_LINE_LEN: usize = 16 * 1024 * 1024;
+
+// If you're here because you changed `MAX_HOOK_LINE_LEN` or
+// `MAX_FRAME_LEN` and this assertion started failing: the two are pinned
+// equal on purpose (see the doc comment above), not because one is derived
+// from the other — they bound different things (this socket's newline-framed
+// input vs. the TUI↔daemon wire's length-framed transport) that only
+// happen to share a value today. Don't just bump the other constant's
+// literal to make the build pass — that silently re-creates the coupling
+// this pair of constants exists to avoid. Either update both together
+// deliberately (if they should keep matching) or remove/relax this
+// assertion (if they should now differ).
+const _: () = assert!(MAX_HOOK_LINE_LEN == crate::daemon_protocol::MAX_FRAME_LEN);
+
+/// Total-operation deadline for reading one hook-socket line, matching the
+/// reply path's 5s total-operation deadline in `src/hook.rs`. Unlike that
+/// sync implementation, no per-read re-arming is needed here:
+/// `tokio::time::timeout` already bounds the whole `read_hook_line` future by
+/// wall clock regardless of how many small reads the peer forces it through,
+/// so a peer dribbling one byte at a time is bounded exactly the same as one
+/// that goes silent after the first byte.
+const HOOK_LINE_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Outcome of reading one line off the hook socket, bounded by
+/// [`MAX_HOOK_LINE_LEN`] but not yet by [`HOOK_LINE_READ_DEADLINE`] — the
+/// deadline wraps this future at the call site in [`read_bounded_hook_line`].
+enum HookLineOutcome {
+    Line(String),
+    /// EOF with nothing usable: either the peer closed cleanly, or it closed
+    /// mid-line (a partial, unterminated line at EOF) — both are treated the
+    /// same as "no message to process", since a partial line was never valid
+    /// JSON either way.
+    Closed,
+    /// The line was not valid UTF-8.
+    InvalidUtf8,
+    /// The line grew past [`MAX_HOOK_LINE_LEN`] without ever completing.
+    TooLong,
+}
+
+/// Read one newline-terminated line off `reader`, checking [`MAX_HOOK_LINE_LEN`]
+/// before each chunk extends the accumulated buffer (never after) — same
+/// idiom as `read_reply_line` in `src/hook.rs`, so a chunk that completes the
+/// cap violation is caught before it is appended rather than after growing
+/// past the bound to discover it.
+///
+/// `carry` holds bytes that arrived in a previous call's `read()` after that
+/// call's newline — i.e. the start of the *next* message, when a peer
+/// pipelines more than one line into a single write. It is owned by the
+/// connection's loop in [`run_hook_loop`], not this function: each call
+/// drains it first (so a message that already arrived doesn't wait on a new
+/// syscall) and, on a completed line, leaves whatever comes after that
+/// line's newline in `carry` for the next call. The removed
+/// `BufReader::lines()` did this internally; a hand-rolled reader has to do
+/// it explicitly or it silently drops pipelined messages (fork issue #393
+/// round 2) — `read_reply_line` in `src/hook.rs`, which this was originally
+/// copied from, doesn't need this because it is called exactly once per
+/// connection and always discards whatever is left.
+async fn read_hook_line<R>(reader: &mut R, carry: &mut Vec<u8>) -> HookLineOutcome
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut chunk = [0u8; 4096];
+    let mut line: Vec<u8> = Vec::new();
+    // `pending`/`pending_start` is the current scan window: either the
+    // leftover bytes from a previous call (until they're exhausted) or the
+    // most recent `read()`'s bytes. It is never a mix of the two at once —
+    // once `carry` is drained we replace it wholesale with a fresh read,
+    // exactly like the original single-`chunk` version did — so the cap
+    // check below always measures the same thing it did before this
+    // parameter existed: `line`'s length so far plus this window's bytes up
+    // to (and not including) a newline.
+    let mut pending = std::mem::take(carry);
+    let mut pending_start = 0usize;
+    loop {
+        let n = if pending_start < pending.len() {
+            pending.len() - pending_start
+        } else {
+            let n = loop {
+                match reader.read(&mut chunk).await {
+                    Ok(0) => return HookLineOutcome::Closed,
+                    Ok(n) => break n,
+                    // Fork issue #393 round 2 / #564: EINTR and friends say
+                    // nothing about the peer — retry the read rather than
+                    // folding it into "connection closed". Safe to retry
+                    // unconditionally (no deadline check, unlike
+                    // `is_transient_read_error` in `src/hook.rs`) because
+                    // the whole operation is already bounded by the
+                    // `tokio::time::timeout` wrapped around this future in
+                    // `read_bounded_hook_line`.
+                    Err(err) if crate::hook::is_transient_read_error_kind(err.kind()) => continue,
+                    Err(_) => return HookLineOutcome::Closed,
+                }
+            };
+            pending.clear();
+            pending.extend_from_slice(&chunk[..n]);
+            pending_start = 0;
+            n
+        };
+        let window = &pending[pending_start..pending_start + n];
+        let newline_pos = window.iter().position(|&b| b == b'\n');
+        let end = newline_pos.unwrap_or(n);
+        if line.len().saturating_add(end) > MAX_HOOK_LINE_LEN {
+            return HookLineOutcome::TooLong;
+        }
+        line.extend_from_slice(&window[..end]);
+        if let Some(pos) = newline_pos {
+            let consumed = pending_start + pos + 1; // +1 to drop the newline itself
+            *carry = pending[consumed..].to_vec();
+            return match String::from_utf8(line) {
+                Ok(line) => HookLineOutcome::Line(line),
+                Err(_) => HookLineOutcome::InvalidUtf8,
+            };
+        }
+        pending_start += end;
+    }
+}
+
+/// [`read_hook_line`] wrapped in [`HOOK_LINE_READ_DEADLINE`]'s total-operation
+/// deadline, folding every rejection (cap exceeded, deadline exceeded,
+/// invalid UTF-8) into `None` so the caller's loop simply stops — same
+/// "reject, don't hang" contract `run_hook_loop`'s `while let Some(line) =
+/// ...` already expected from `Lines::next_line()`, just now actually
+/// bounded. A rejection is logged once here rather than in `read_hook_line`,
+/// deliberately without echoing the accumulated payload: this daemon logs
+/// (unlike the hook CLI, which calls no `tracing` anywhere), and echoing
+/// untrusted socket content into the log would just move the unbounded-input
+/// hazard from memory into the log file instead of closing it.
+///
+/// `carry` is the same leftover-bytes buffer [`read_hook_line`] documents;
+/// the caller owns one per connection and passes it to every call in that
+/// connection's loop.
+async fn read_bounded_hook_line<R>(reader: &mut R, carry: &mut Vec<u8>) -> Option<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match tokio::time::timeout(HOOK_LINE_READ_DEADLINE, read_hook_line(reader, carry)).await {
+        Ok(HookLineOutcome::Line(line)) => Some(line),
+        Ok(HookLineOutcome::Closed) => None,
+        Ok(HookLineOutcome::InvalidUtf8) => {
+            warn!("hook socket line was not valid UTF-8; closing connection");
+            None
+        }
+        Ok(HookLineOutcome::TooLong) => {
+            warn!(
+                "hook socket line exceeded {MAX_HOOK_LINE_LEN} bytes without a terminating \
+                 newline; closing connection"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                "hook socket line exceeded the {HOOK_LINE_READ_DEADLINE:?} read deadline \
+                 without completing; closing connection"
+            );
+            None
+        }
+    }
+}
+
+// Fork issue #393 round-2 review finding #2: `read_hook_line` is generic
+// over `AsyncRead` specifically so it can be driven from an in-memory buffer
+// at the unit level, but before this module only `delivery_008` (an L2 PTY
+// test) exercised it, and only the "no trailing newline, times out" arm.
+// These tests drive it directly, bypassing sockets and the timeout wrapper
+// entirely, so they need no `#[cfg(unix)]` gate like `hook_ingestion_tests`
+// below does.
+#[cfg(test)]
+mod read_hook_line_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    /// An `AsyncRead` that hands out `remaining_fill` bytes of `fill_byte`,
+    /// then (if `trailing_newline`) one `\n`, then EOF — without ever
+    /// materializing a buffer anywhere near `remaining_fill` itself. Each
+    /// `poll_read` call only ever fills the caller's own chunk (at most 4096
+    /// bytes, `read_hook_line`'s own scan-window size), so a multi-megabyte
+    /// `remaining_fill` costs this reader nothing; whatever accumulates
+    /// happens inside `read_hook_line`'s own `line: Vec<u8>`, which is the
+    /// thing under test.
+    struct CappedFillReader {
+        remaining_fill: usize,
+        fill_byte: u8,
+        trailing_newline: bool,
+    }
+
+    impl AsyncRead for CappedFillReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.remaining_fill > 0 {
+                let n = buf.remaining().min(self.remaining_fill);
+                buf.put_slice(&vec![self.fill_byte; n]);
+                self.remaining_fill -= n;
+                return Poll::Ready(Ok(()));
+            }
+            if self.trailing_newline {
+                self.trailing_newline = false;
+                buf.put_slice(b"\n");
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A reader whose `poll_read` must never be called — used to prove a
+    /// second `read_hook_line` call served entirely from `carry` performs no
+    /// further I/O at all, not just that it happens not to need any of the
+    /// bytes a working reader would have supplied.
+    struct UnreachableReader;
+
+    impl AsyncRead for UnreachableReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            unreachable!(
+                "read_hook_line must serve this call entirely from `carry`, \
+                 issuing no further read()"
+            )
+        }
+    }
+
+    /// Scenario: a line that keeps growing past `MAX_HOOK_LINE_LEN` without
+    /// ever hitting a newline must be rejected as `TooLong`, not read forever
+    /// or accepted once it happens to stop.
+    #[tokio::test]
+    async fn read_hook_line_rejects_line_exceeding_max_len() {
+        let mut reader = CappedFillReader {
+            // Comfortably past the cap so the cap check — not the reader
+            // running dry — is what ends the loop.
+            remaining_fill: MAX_HOOK_LINE_LEN + 8192,
+            fill_byte: b'a',
+            trailing_newline: false,
+        };
+        let mut carry = Vec::new();
+        let outcome = read_hook_line(&mut reader, &mut carry).await;
+        assert!(
+            matches!(outcome, HookLineOutcome::TooLong),
+            "expected TooLong, got a different outcome"
+        );
+    }
+
+    /// Scenario: a line whose bytes total exactly `MAX_HOOK_LINE_LEN` (not
+    /// one over) and is newline-terminated within that budget must still
+    /// complete as `Line`, confirming the cap check (`>`, checked before the
+    /// line grows) doesn't off-by-one reject a legitimate max-size line.
+    #[tokio::test]
+    async fn read_hook_line_accepts_line_exactly_at_max_len() {
+        let mut reader = CappedFillReader {
+            remaining_fill: MAX_HOOK_LINE_LEN,
+            fill_byte: b'a',
+            trailing_newline: true,
+        };
+        let mut carry = Vec::new();
+        let outcome = read_hook_line(&mut reader, &mut carry).await;
+        match outcome {
+            HookLineOutcome::Line(line) => {
+                assert_eq!(
+                    line.len(),
+                    MAX_HOOK_LINE_LEN,
+                    "line should be exactly at the cap"
+                );
+                assert!(line.bytes().all(|b| b == b'a'));
+            }
+            other => panic!(
+                "expected a completed Line at exactly the cap, got a different outcome: {}",
+                match other {
+                    HookLineOutcome::Closed => "Closed",
+                    HookLineOutcome::InvalidUtf8 => "InvalidUtf8",
+                    HookLineOutcome::TooLong => "TooLong",
+                    HookLineOutcome::Line(_) => unreachable!(),
+                }
+            ),
+        }
+        assert!(
+            carry.is_empty(),
+            "nothing should be left over after an exact-cap line"
+        );
+    }
+
+    /// Scenario: a complete, newline-terminated line whose bytes are not
+    /// valid UTF-8 must be reported as `InvalidUtf8`, not silently lossy- or
+    /// panic-converted.
+    #[tokio::test]
+    async fn read_hook_line_returns_invalid_utf8_for_non_utf8_line() {
+        let mut reader = std::io::Cursor::new(vec![b'{', 0xFF, 0xFE, b'}', b'\n']);
+        let mut carry = Vec::new();
+        let outcome = read_hook_line(&mut reader, &mut carry).await;
+        assert!(
+            matches!(outcome, HookLineOutcome::InvalidUtf8),
+            "expected InvalidUtf8, got a different outcome"
+        );
+    }
+
+    /// Scenario: fork issue #393 round 2's pipelining fix. A peer that
+    /// writes two newline-terminated lines in a single `write()` delivers
+    /// them to the reader as one `read()` chunk (`"line1\nline2\n"`). The
+    /// first `read_hook_line` call must return only the first line and leave
+    /// the second in `carry`; a second call fed that same `carry`, against a
+    /// reader that panics if touched at all, must return the second line
+    /// purely from the carried-over bytes — proving the carry-over path
+    /// works, not just that it compiles.
+    #[tokio::test]
+    async fn read_hook_line_carries_over_pipelined_second_line() {
+        let mut reader = std::io::Cursor::new(b"line1\nline2\n".to_vec());
+        let mut carry = Vec::new();
+
+        let first = read_hook_line(&mut reader, &mut carry).await;
+        assert!(
+            matches!(&first, HookLineOutcome::Line(line) if line == "line1"),
+            "expected the first call to return only \"line1\""
+        );
+        assert_eq!(
+            carry, b"line2\n",
+            "the second line's bytes (including its own trailing newline) must be carried over"
+        );
+
+        let mut unreachable_reader = UnreachableReader;
+        let second = read_hook_line(&mut unreachable_reader, &mut carry).await;
+        assert!(
+            matches!(&second, HookLineOutcome::Line(line) if line == "line2"),
+            "expected the second call, served from `carry` alone, to return \"line2\""
+        );
+        assert!(
+            carry.is_empty(),
+            "carry should be fully drained after the second line"
+        );
+    }
+
+    /// Scenario: fork issue #393 round 2's Fix 4. A transient read error
+    /// (`Interrupted`/EINTR) says nothing about the peer and must be
+    /// retried, not folded into "connection closed" — a reader that fails
+    /// once with `Interrupted` and then succeeds must still yield the line.
+    #[tokio::test]
+    async fn read_hook_line_retries_after_transient_interrupted_error() {
+        let mut reader = tokio_test::io::Builder::new()
+            .read_error(io::Error::new(io::ErrorKind::Interrupted, "eintr"))
+            .read(b"line1\n")
+            .build();
+        let mut carry = Vec::new();
+        let outcome = read_hook_line(&mut reader, &mut carry).await;
+        assert!(
+            matches!(&outcome, HookLineOutcome::Line(line) if line == "line1"),
+            "expected the read to be retried past the transient error and yield \"line1\""
+        );
+    }
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -2155,11 +2521,16 @@ async fn run_hook_loop(
                     // a reply back on the same connection. Every other message
                     // on this socket is fire-and-forget, so the write half is
                     // only ever used by the `GetSeed` arm below.
-                    let (read_half, mut write_half) = tokio::io::split(stream);
-                    let reader = tokio::io::BufReader::new(read_half);
-                    let mut lines = reader.lines();
+                    let (mut read_half, mut write_half) = tokio::io::split(stream);
+                    // Owned by this connection's loop, not by
+                    // `read_hook_line`/`read_bounded_hook_line`: bytes a
+                    // peer pipelines past a line's newline in the same
+                    // `read()` must survive into the NEXT call rather than
+                    // being dropped with each call's function-local state
+                    // (fork issue #393 round 2).
+                    let mut carry: Vec<u8> = Vec::new();
 
-                    while let Ok(Some(line)) = lines.next_line().await {
+                    while let Some(line) = read_bounded_hook_line(&mut read_half, &mut carry).await {
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
                             match msg {
                                 DaemonMessage::Delegate(signal) => {

@@ -399,7 +399,14 @@ fn resolve_worktree_owner(
 /// `local_hostname()`. Never panics, never shells out to anything other than
 /// `gh` — a failure resolves `Unknown` with a stated reason rather than
 /// crashing `worktree list`.
-fn resolve_human_owner() -> WorktreeOwner {
+///
+/// `pub`, not private (issue #300 blocker 1): `run_worktree_list_cli`
+/// (`src/main.rs`) needs this same resolution to fall back to a human
+/// identity when `DOT_AGENT_DECK_WORKTREE_OWNER` is absent, and `src/main.rs`
+/// is a separate binary crate that only sees this crate's `pub` surface —
+/// `pub(crate)` would not cross that boundary, matching why `is_mine` and
+/// `owner_disagreements` above are already `pub` rather than `pub(crate)`.
+pub fn resolve_human_owner() -> WorktreeOwner {
     let host = crate::issue_dispatch_run::local_hostname();
     match crate::issue_claim::resolve_gh_login() {
         Ok(login) => WorktreeOwner::Human { login, host },
@@ -672,8 +679,17 @@ pub fn owner_disagreements<'a>(reports: &'a [WorktreeReport], owner: &str) -> Ve
 /// Extracted (issue #221 review round) so `run_worktree_list_cli`'s retain
 /// and its test share one definition instead of two independently typed
 /// copies of the same predicate that could silently drift apart.
+///
+/// Issue #300 blocker 2: `owned` alone can never be true for an unmarked,
+/// human-owned row (a hand-made worktree writes no marker at all — see
+/// [`resolve_worktree_owner`]), so an unconditional `owned &&` conjunct
+/// structurally excludes every human row regardless of how correctly
+/// `owner_filter` resolves an identity. A human row (`owner_kind == "human"`)
+/// is matchable by owner string alone; an agent row still requires `owned`
+/// (PR #215's fail-closed guard against a marker-forged claim stays intact —
+/// `owned` is never relaxed for `owner_kind == "agent"`).
 pub fn is_mine(report: &WorktreeReport, owner: &str) -> bool {
-    report.owned && report.owner.as_deref() == Some(owner)
+    (report.owned || report.owner_kind == "human") && report.owner.as_deref() == Some(owner)
 }
 
 /// Formats the issue #221 disagreement warning printed by `--mine` before
@@ -1372,6 +1388,23 @@ const MARKER_CREATOR_MAX_CHARS: usize = 200;
 /// already-sanitized value is harmless rather than a second, diverging
 /// derivation.
 pub fn sanitize_marker_creator(name: &str) -> String {
+    let trimmed = clean_and_trim_marker_creator(name);
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    if trimmed.chars().count() > MARKER_CREATOR_MAX_CHARS {
+        let truncated: String = trimmed.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        trimmed
+    }
+}
+
+/// The clean-and-trim half of [`sanitize_marker_creator`] — everything it
+/// does except the final truncation. Factored out so a producer can reject a
+/// name that normalization would *change*, not merely truncate (see
+/// [`marker_creator_normalizes`]).
+fn clean_and_trim_marker_creator(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter_map(|c| match c {
@@ -1380,16 +1413,23 @@ pub fn sanitize_marker_creator(name: &str) -> String {
             c => Some(c),
         })
         .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return "unknown".to_string();
-    }
-    if trimmed.chars().count() > MARKER_CREATOR_MAX_CHARS {
-        let truncated: String = trimmed.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
-        format!("{truncated}…")
-    } else {
-        trimmed.to_string()
-    }
+    cleaned.trim().to_string()
+}
+
+/// True when [`sanitize_marker_creator`] would change `name` for a reason
+/// *other* than truncation — a dropped control character, a `\n`/`\r`
+/// mapped to a space, or leading/trailing whitespace trimmed away. Any of
+/// these lets two distinct `name` values collapse to the identical
+/// marker-creator string well before either is anywhere near
+/// [`MARKER_CREATOR_MAX_CHARS`] (fork #222 edge 1 follow-up: length alone
+/// doesn't close the collision — `"deploy prod"` and `"deploy\nprod"` are
+/// both short and both sanitize to `"deploy prod"`). A producer that rejects
+/// whenever this returns `true` guarantees its own `name` is already a fixed
+/// point of everything `sanitize_marker_creator` does except truncate, so
+/// the only remaining way two distinct names can collide is the length
+/// truncation itself — which callers must still bound separately.
+pub fn marker_creator_normalizes(name: &str) -> bool {
+    clean_and_trim_marker_creator(name) != name
 }
 
 /// Derive a `gh --repo owner/name` slug from the worktree's own `origin`
@@ -8933,6 +8973,48 @@ mod tests {
             clone_dir.exists(),
             "the candidate directory must be left on disk -- its absence would mean the forged \
              upstream-sourced MERGED verdict was trusted and the clone was deleted"
+        );
+    }
+
+    /// Scenario: Issue #300 blocker 2. `is_mine`'s `owned &&` conjunct
+    /// (PR #215 round-1 reviewer F4 / auditor L1 item 3, deliberately
+    /// fail-closed against a marker-forged agent row) structurally excludes
+    /// every human-owned row, since a human-made worktree has no marker at
+    /// all and so always resolves `owned: false` -- even once `owner_filter`
+    /// correctly derives a human identity to filter on (issue #300 blocker
+    /// 1, `worktree/reclaim/084`). A `WorktreeReport` standing in for an
+    /// unmarked, human-owned worktree (`owned: false`, `owner_kind:
+    /// "human"`, `owner: Some("human:alice@laptop")`) must satisfy
+    /// `is_mine(&report, "human:alice@laptop")` -- it does not today, since
+    /// `owned` alone vetoes the row regardless of whether `owner` matches.
+    #[spec("worktree/reclaim/085")]
+    #[test]
+    fn worktree_reclaim_085_is_mine_matches_an_unmarked_human_owned_row() {
+        let report = WorktreeReport {
+            path: PathBuf::from("/repo/wt-human"),
+            branch: Some("feat/human".to_string()),
+            clean: true,
+            owned: false,
+            owner: Some("human:alice@laptop".to_string()),
+            owner_kind: "human".to_string(),
+            owner_reason: None,
+            pr_state: "open".to_string(),
+            verdict: "ask".to_string(),
+            reason: Some("foreign".to_string()),
+            pinned: false,
+            kind: KIND_LINKED.to_string(),
+            real_path: PathBuf::from("/repo/wt-human"),
+            removed_by: None,
+        };
+
+        assert!(
+            is_mine(&report, "human:alice@laptop"),
+            "an unmarked, human-owned worktree whose resolved identity matches the filter must \
+             satisfy `is_mine` -- `owned` answers a DIFFERENT question (may a bare `reclaim` \
+             remove this with no prompt?) than \"does this belong to the caller?\" does, and \
+             conjoining them onto `is_mine` structurally excludes every human row, however \
+             correctly `owner_filter` resolves an identity (issue #300 blocker 2); got: {}",
+            is_mine(&report, "human:alice@laptop")
         );
     }
 }

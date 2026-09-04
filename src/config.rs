@@ -756,6 +756,45 @@ impl LoadedSchedules {
 /// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
 /// crashing the daemon.
 fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, ScheduleLoadError> {
+    // fork #222: an unbounded `task.name` lets two scheduled tasks' marker-creator
+    // strings (`issue-dispatch:{name}#{issue}`) collide once
+    // `sanitize_marker_creator` truncates at `MARKER_CREATOR_MAX_CHARS`
+    // (src/worktree_reclaim.rs). Reject an overlong name outright at the
+    // producer, borrowing the same numeric VALUE the daemon already enforces
+    // on a live orchestration's display name (`DISPLAY_NAME_MAX_LEN`) — but
+    // deliberately on a different UNIT. `DISPLAY_NAME_MAX_LEN` is a byte cap
+    // everywhere else it's used; this counts chars because
+    // `sanitize_marker_creator` truncates by chars, and chars is the unit
+    // that actually determines whether two names' truncated creator strings
+    // collide.
+    if task.name.chars().count() > crate::agent_pty::DISPLAY_NAME_MAX_LEN {
+        return Err(ScheduleLoadError {
+            entry: Some(index),
+            message: format!(
+                "scheduled task name is {} characters, exceeding the {}-character limit",
+                task.name.chars().count(),
+                crate::agent_pty::DISPLAY_NAME_MAX_LEN
+            ),
+        });
+    }
+    // fork #222 edge 1 follow-up: the length check alone doesn't close the
+    // collision — `sanitize_marker_creator` also drops control characters,
+    // maps `\n`/`\r` to a space, and trims, all BEFORE truncating. Two
+    // distinct, both-short names (e.g. `"deploy prod"` and `"deploy\nprod"`)
+    // can still collapse to the identical marker-creator string. Reject any
+    // name normalization would change at all, so the only remaining
+    // collision surface is the length bound just above. Deliberately does
+    // not echo the offending name back, matching the length check above.
+    if crate::worktree_reclaim::marker_creator_normalizes(&task.name) {
+        return Err(ScheduleLoadError {
+            entry: Some(index),
+            message: "scheduled task name contains control characters, a newline/carriage \
+                       return, or leading/trailing whitespace that would be stripped before \
+                       comparison, which can make it collide with another task's \
+                       worktree-ownership identity"
+                .to_string(),
+        });
+    }
     // PRD #120: an issue-dispatch task has no top-level `command` — the per-issue
     // spawn derives its command from each cloned repo's `.dot-agent-deck.toml`
     // (orchestration roles, or the single-agent default). Only the #127
@@ -2662,6 +2701,150 @@ prompt = "do the thing"
         let loaded = LoadedSchedules::parse(blank);
         assert!(loaded.tasks.is_empty(), "a blank command is not a command");
         assert_eq!(loaded.errors.len(), 1);
+    }
+
+    /// Scenario: Issue #222 edge 1 — `validate_task` never bounds
+    /// `ScheduledTask.name`, so two names sharing a 185-char prefix collide
+    /// once `sanitize_marker_creator` (worktree_reclaim.rs,
+    /// `MARKER_CREATOR_MAX_CHARS` = 200) truncates the formatted
+    /// `issue-dispatch:{task_name}#{issue}` creator string at 200 chars: the
+    /// 15-char `"issue-dispatch:"` prefix plus a 185-char shared name prefix
+    /// is exactly the 200-char cutoff, so both entries' markers become
+    /// byte-identical and match each other's worktrees under `--mine`. The
+    /// issue's preferred fix is a load-time rejection at the producer
+    /// (here), not a truncation-collision-avoidance trick at the sink.
+    #[spec("scheduler/config/003")]
+    #[test]
+    fn config_003_schedules_reject_overlong_task_name_that_would_collide() {
+        let shared_prefix = "a".repeat(185);
+        let name_one = format!("{shared_prefix}{}", "b".repeat(65));
+        let name_two = format!("{shared_prefix}{}", "c".repeat(65));
+        assert_ne!(name_one, name_two, "sanity: the two names must differ");
+
+        let creator_one = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+            "issue-dispatch:{name_one}#7"
+        ));
+        let creator_two = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+            "issue-dispatch:{name_two}#7"
+        ));
+        assert_eq!(
+            creator_one, creator_two,
+            "sanity: today's 200-char truncation genuinely collides these two names"
+        );
+
+        let toml_str = format!(
+            r#"
+[[scheduled_tasks]]
+name = "{name_one}"
+cron = "0 9 * * *"
+working_dir = "/tmp/one"
+command = "claude"
+prompt = "do the thing"
+
+[[scheduled_tasks]]
+name = "{name_two}"
+cron = "0 9 * * *"
+working_dir = "/tmp/two"
+command = "claude"
+prompt = "do the thing"
+"#
+        );
+        let loaded = LoadedSchedules::parse(&toml_str);
+        assert!(
+            loaded.tasks.is_empty(),
+            "an overlong task name must be rejected at load time — today's gap: \
+             `validate_task` never checks `task.name` length, so both of these \
+             load successfully and later collide under `sanitize_marker_creator`'s \
+             200-char truncation — got tasks: {:?}",
+            loaded.tasks.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            loaded.errors.len(),
+            2,
+            "both overlong entries should be reported as load errors, got: {:?}",
+            loaded.errors
+        );
+    }
+
+    /// Scenario: Issue #222 edge 1 follow-up — the length bound above doesn't
+    /// close the collision on its own: `sanitize_marker_creator`
+    /// (worktree_reclaim.rs) also drops control characters, maps `\n`/`\r` to
+    /// a space, and trims, all BEFORE truncating, so two short, distinct names
+    /// like `"deploy prod"` and `"deploy\nprod"` still collapse to the
+    /// identical marker-creator string well under the 200-char cap.
+    /// `validate_task` now also rejects any name
+    /// `worktree_reclaim::marker_creator_normalizes` says would be changed by
+    /// that cleanup, closing the remaining collision surface.
+    #[spec("scheduler/config/004")]
+    #[test]
+    fn config_004_schedules_reject_names_normalization_would_change() {
+        assert_eq!(
+            crate::worktree_reclaim::sanitize_marker_creator("deploy prod"),
+            crate::worktree_reclaim::sanitize_marker_creator("deploy\nprod"),
+            "sanity: without this check, these two distinct names collapse to \
+             the identical marker-creator string once sanitized"
+        );
+        assert!(
+            !crate::worktree_reclaim::marker_creator_normalizes("deploy prod"),
+            "sanity: an already-clean name is left alone by normalization"
+        );
+        assert!(
+            crate::worktree_reclaim::marker_creator_normalizes("deploy\nprod"),
+            "sanity: normalization does change the embedded-newline name"
+        );
+
+        let clean = r#"
+[[scheduled_tasks]]
+name = "deploy prod"
+cron = "0 9 * * *"
+working_dir = "/tmp/clean"
+command = "claude"
+prompt = "do the thing"
+"#;
+        let loaded = LoadedSchedules::parse(clean);
+        assert_eq!(
+            loaded.tasks.len(),
+            1,
+            "an already-normalized name needs no rejection, got errors: {:?}",
+            loaded.errors
+        );
+        assert!(loaded.errors.is_empty(), "got: {:?}", loaded.errors);
+
+        let embedded_newline = r#"
+[[scheduled_tasks]]
+name = "deploy\nprod"
+cron = "0 9 * * *"
+working_dir = "/tmp/newline"
+command = "claude"
+prompt = "do the thing"
+"#;
+        let loaded = LoadedSchedules::parse(embedded_newline);
+        assert!(
+            loaded.tasks.is_empty(),
+            "a name containing an embedded newline must be rejected at load \
+             time, since it would silently collapse with \"deploy prod\" once \
+             `sanitize_marker_creator` maps `\\n` to a space — got tasks: {:?}",
+            loaded.tasks.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.errors.len(), 1, "got: {:?}", loaded.errors);
+
+        let padded = r#"
+[[scheduled_tasks]]
+name = "  deploy prod  "
+cron = "0 9 * * *"
+working_dir = "/tmp/padded"
+command = "claude"
+prompt = "do the thing"
+"#;
+        let loaded = LoadedSchedules::parse(padded);
+        assert!(
+            loaded.tasks.is_empty(),
+            "a name with leading/trailing whitespace must be rejected at load \
+             time, since trimming would collapse it onto \"deploy prod\" — got \
+             tasks: {:?}",
+            loaded.tasks.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.errors.len(), 1, "got: {:?}", loaded.errors);
     }
 
     #[test]

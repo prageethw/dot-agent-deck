@@ -87,6 +87,27 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
         )?;
     }
     validate_cron(&args.cron).map_err(|e| format!("invalid cron expression: {e}"))?;
+    // fork #222 fix 5 (auditor F4): mirror `config::validate_task`'s bound
+    // here, at WRITE time, not just load time — this command's own module
+    // doc / design comment above says a malformed input is "rejected at
+    // write time ... rather than producing a task the daemon would reject
+    // at load", and without this an overlong or normalization-colliding
+    // `--name` wrote an entry that would silently never load.
+    if args.name.chars().count() > crate::agent_pty::DISPLAY_NAME_MAX_LEN {
+        return Err(format!(
+            "--name is {} characters, exceeding the {}-character limit",
+            args.name.chars().count(),
+            crate::agent_pty::DISPLAY_NAME_MAX_LEN
+        ));
+    }
+    if crate::worktree_reclaim::marker_creator_normalizes(&args.name) {
+        return Err(
+            "--name contains control characters, a newline/carriage return, or \
+             leading/trailing whitespace that would be stripped before comparison, \
+             which can make it collide with another task's worktree-ownership identity"
+                .to_string(),
+        );
+    }
     if tasks.iter().any(|t| t.name == args.name) {
         return Err(format!(
             "a schedule named {:?} already exists; use `schedule update` to change it",
@@ -351,6 +372,58 @@ mod tests {
         add(&mut tasks, sample_add("dup", "0 9 * * *")).unwrap();
         let err = add(&mut tasks, sample_add("dup", "0 9 * * *")).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
+    }
+
+    // fork #222 fix 5 (auditor F4) — `add` mirrors `config::validate_task`'s
+    // bound at WRITE time: an overlong `--name` is rejected before anything is
+    // pushed into `tasks`, rather than writing an entry `validate_task` would
+    // silently drop at the daemon's next load.
+    #[test]
+    fn add_rejects_overlong_name_before_writing_to_tasks() {
+        let mut tasks = Vec::new();
+        let overlong = "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN + 1);
+        let err = add(&mut tasks, sample_add(&overlong, "0 9 * * *")).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("name"),
+            "error should name the offending field, got: {err}"
+        );
+        assert!(
+            tasks.is_empty(),
+            "no task should be appended to `tasks` when the name is rejected \
+             for length — got: {:?}",
+            tasks
+                .iter()
+                .map(|t: &ScheduledTask| &t.name)
+                .collect::<Vec<_>>()
+        );
+
+        // A name right at the cap is accepted.
+        let at_cap = "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN);
+        assert!(add(&mut tasks, sample_add(&at_cap, "0 9 * * *")).is_ok());
+        assert_eq!(tasks.len(), 1);
+    }
+
+    // fork #222 fix 5 (auditor F4) — same write-time mirroring as the length
+    // check above, for the normalization-collision half: `add` also rejects
+    // any name `worktree_reclaim::marker_creator_normalizes` says would be
+    // changed (e.g. an embedded newline), before writing into `tasks`.
+    #[test]
+    fn add_rejects_normalization_changing_name_before_writing_to_tasks() {
+        let mut tasks = Vec::new();
+        let err = add(&mut tasks, sample_add("deploy\nprod", "0 9 * * *")).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("name"),
+            "error should name the offending field, got: {err}"
+        );
+        assert!(
+            tasks.is_empty(),
+            "no task should be appended to `tasks` when the name would be \
+             changed by normalization — got: {:?}",
+            tasks
+                .iter()
+                .map(|t: &ScheduledTask| &t.name)
+                .collect::<Vec<_>>()
+        );
     }
 
     // PRD #421 M3.0: `triage` is a parameter, not a hardcoded `false`, so

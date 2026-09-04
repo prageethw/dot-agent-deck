@@ -902,6 +902,22 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the runtime half of the fix — that a remediation arm actually returns promptly against a real wedged (`D`-state) child. `SIGKILL` cannot be blocked or ignored by an ordinary process, so no portable, CI-safe test child can be made to reap slowly under `kill()`, and `capture_bounded_async` is hard-wired to the concrete `tokio::process::Child` rather than a swappable trait object (unlike the `SlowReapChild` doubles in `platform/proc/mod.rs`). This test pins the structural shape only — a fix that wraps the exact unbounded pair unchanged inside an outer `timeout(async { .. })` would still read as unbounded to this scan even though it would behave correctly; that gap is accepted deliberately for a test that runs in microseconds and cannot flake.
 - **Platform coverage:** mac+linux (`unix.rs` is `#[cfg(unix)]` throughout; the scan itself is pure string matching with no OS process calls).
 
+#### status/message
+
+##### status/message/001 — `ui.status_message` renders sanitized: control characters and bidi overrides interpolated into the transient status-bar message do not reach the terminal (issue #497).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests` since `status_message` is a private `UiState` field neither existing `pub fn *_to_buffer` seam can set — mirrors `lifecycle/version/002`'s reasoning for `update_available`).
+- **Agent:** none.
+- **Asserts:** with `ui.status_message` set to text carrying ESC, NUL, CR/LF, DEL, a C1 control, a `U+0600` ARABIC NUMBER SIGN, and a `U+202E` RIGHT-TO-LEFT OVERRIDE (the same fixture `untrusted_text::strip_control_and_bidi`'s own tests use), rendered through `render_bottom_bar`'s `_` fallback arm (`UiMode::Normal`), the rendered row contains no raw control character or bidi override anywhere, and matches `strip_control_and_bidi`'s own output for the same input byte-for-byte. `U+0600` is the only character in the fixture ratatui does not already filter structurally (control chars are dropped as whole graphemes, `U+202E` is width-0 and skipped at buffer-write) — it is the only reason this test is a real gate rather than a proxy that would pass unchanged against unsanitized code. `status_message` construction sites across `src/ui.rs` interpolate untrusted content (subprocess stderr, error messages, user-typed values); both render call sites (`Line::styled(sanitized.as_str(), ..)`) now sanitize via `strip_control_and_bidi` before rendering.
+- **Does not assert:** the `PaneInput` mode's render arm — pinned separately by `status/message/002`; the other `status_message`-shaped fields in `src/pane.rs`, `src/embedded_pane.rs`, `src/tab.rs`, `src/mode_manager.rs`, `src/daemon_protocol.rs`, which carry their own separate audit; which specific construction site's untrusted content is sanitized (fixed at the render seam, not per call site).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/message/002 — `ui.status_message` renders sanitized in `UiMode::PaneInput`, the other render arm that calls `strip_control_and_bidi` (issue #497 reviewer R5 / auditor F3).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests`, same seam `status/message/001` uses).
+- **Agent:** none.
+- **Asserts:** the same dirty fixture as `status/message/001` (ESC, NUL, CR/LF, DEL, a C1 control, `U+202E`, and the load-bearing `U+0600`), rendered through `render_bottom_bar`'s `UiMode::PaneInput` arm instead of the `_` fallback arm, produces a row with no raw control character or bidi override anywhere, matches `strip_control_and_bidi`'s own output for the same input, and — independent of `strip_control_and_bidi`/`is_bidi_format_char` themselves — does not contain the literal `U+0600` codepoint. `render_bottom_bar_with_status_message_to_buffer` takes a `mode: UiMode` parameter (setting the private `UiState::mode` field directly, the same private-field seam it already used for `status_message`) so this test and `status/message/001` share one helper rather than duplicating it.
+- **Does not assert:** the `PaneInput` arm's button-elision width measurement (issue #497 audit F1 / reviewer R3, already fixed in production: `msg_width` is measured against the sanitized string); anything about `strip_control_and_bidi`'s own correctness beyond the one literal codepoint check (that is `untrusted_text`'s own unit tests' job, including `strip_control_and_bidi_covers_every_bidi_codepoint`, which this fix extended with `U+0600`/`U+110BD`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Agent protocol
 
 #### agent/readiness
@@ -1610,6 +1626,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** `resolve_pr_state_for_linked_worktree(repo, branch, Some(local_head_sha))` does NOT resolve to `PrState::Merged` when the upstream-sourced reply's `headRefOid` differs from `local_head_sha`.
 - **Does not assert:** the matching-SHA (positive) case — that an `upstream`-sourced `Merged` verdict IS still accepted once `headRefOid` genuinely matches; that `examine_worktrees`'s linked-worktree call site has been switched over to the new function (that's the GREEN round); the isolated-clone path, which already has its own independent `headRefOid` re-check and is unaffected by this gap (`088`'s job instead).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `087`).
+
+##### worktree/reclaim/084 — Issue #300 blocker 1 (RED). With `DOT_AGENT_DECK_WORKTREE_OWNER` entirely absent but a `gh`-resolvable human login available, `--mine` must NOT immediately refuse the way `033` pins today — it must fall back to attempting human-identity resolution instead, the same seam unmarked rows already use.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly removed from the spawned subprocess's environment and the stub `gh api user` configured to resolve a login.
+- **Agent:** none (one unmarked, human-owned worktree, plus one same-repo worktree marked owned by a different orchestration identity).
+- **Asserts:** the process exits zero (not the `033` refusal); the combined output does not contain the literal "DOT_AGENT_DECK_WORKTREE_OWNER is not set" refusal text; the worktree owned by the different orchestration identity never appears in the output (rules out a wrongly-permissive fix that disables filtering entirely on an absent env var); with blocker 2's independent `is_mine` fix (`085`) now also landed in this same PR, that the unmarked human-owned worktree itself appears in the listing — pinning the coupling between this filter's `identity_string()` and the report's own `owner` field end to end.
+- **Does not assert:** the exact wording of any message printed on the empty-result path; the `DOT_AGENT_DECK_PANE_ID`-gated refusal for an orchestration pane that lost its saved identity (that's a separate, not-yet-written case).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/085 — Issue #300 blocker 2 (RED). `is_mine`'s `owned &&` conjunct structurally excludes every human-owned row, since an unmarked (hand-made) worktree always resolves `owned: false` regardless of whether its resolved identity matches the `--mine` filter.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` (as `worktree/reclaim/030`).
+- **Agent:** none.
+- **Asserts:** `is_mine` returns `true` for a hand-constructed `WorktreeReport` representing an unmarked, human-owned worktree (`owned: false`, `owner_kind: "human"`, `owner: Some("human:alice@laptop")`) filtered against the exact same identity string.
+- **Does not assert:** `owner_disagreements`, which is deliberately restricted to `owner_kind == "agent"` and is unaffected by this fix; the CLI-level `owner_filter` derivation (`084`'s job); the reclaim-eligibility verdict.
+- **Platform coverage:** mac+linux+windows (pure in-memory logic, no filesystem or subprocess).
+
+##### worktree/reclaim/086 — Issue #300 round-2 review R2. With `DOT_AGENT_DECK_WORKTREE_OWNER` absent AND `DOT_AGENT_DECK_PANE_ID` present, `--mine` must still refuse loudly exactly as `033` pins for the no-PANE_ID case, not fall back to human-identity resolution the way `084` does — the pane-gated refusal (auditor M1) itself had no test until now, and `084`/`033` never set `DOT_AGENT_DECK_PANE_ID` at all.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/084`), via the new `Fixture::run_with_owner_and_pane` (owner absent, pane id present); `gh` left genuinely resolvable (`set_login`, not `fail_login`) so a dropped pane gate would wrongly succeed rather than fail for an unrelated reason.
+- **Agent:** none (one unmarked worktree that would be human-owned if the pane gate were dropped).
+- **Asserts:** the process exits non-zero; the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`; the unmarked worktree never appears in the output (rules out the gate being silently replaced by `084`'s human-fallback behavior).
+- **Does not assert:** the `NotUnicode` set-but-invalid case (a different match arm, untouched by this fix); the exact refusal wording beyond naming the variable.
+- **Platform coverage:** mac+linux.
 
 #### worktree/guard
 
@@ -3102,6 +3139,13 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the rendered card label (the `AgentRecord`→placeholder→render mapping is covered by `rehydration` + L1 dashboard tests); the live-stream upgrade path while a TUI is already attached.
 - **Platform coverage:** mac+linux.
 
+##### hooks/delivery/008 — An unterminated hook-socket line does not hold the connection open indefinitely (issue #393).
+- **Layer:** L2.
+- **Agent:** none (raw `UnixStream` write directly to the per-test hook socket, bypassing `write_hook_line`'s newline-completion helper on purpose).
+- **Asserts:** a connection that writes a partial JSON line with no trailing newline and never completes it is closed/rejected by the daemon within a bounded window — `run_hook_loop`'s reader (`read_bounded_hook_line` in `src/daemon.rs`) now caps the line at `MAX_HOOK_LINE_LEN` and bounds the whole read by a 5s total-operation deadline, rather than blocking on it forever.
+- **Does not assert:** the specific byte cap (`MAX_HOOK_LINE_LEN`) an oversized-but-terminated line is rejected at, or the log line's content.
+- **Platform coverage:** mac+linux.
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.
@@ -4475,6 +4519,20 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side compound-key comparison over the values sent, which is `orchestration/identity/036`'s own scope; the RESTORE/reconnect call site's own claim `cwd` (unchanged by this PRD's fix, and not exercised by a live spawn); the isolated-clone provisioning outcome itself (covered by `orchestration/workspace/033`-`036`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/039 — Issue #222 edge 2: typing the literal `unknown` into the new-pane form's Name field, with an orchestration selected, resolves (via `orchestration_creator_string`) to `orchestration:unknown` — byte-identical to `ORCHESTRATION_UNKNOWN_SENTINEL` (`src/agent_pty.rs`), the sentinel `run_worktree_list_cli`'s `--mine` refuses outright as "never a real identity" — so an orchestration literally named `unknown` must be treated as a collision, blocking `[Submit]`, rather than silently becoming permanently unmatchable by `--mine`.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** typing `unknown` into a focused, empty Name field with the form's one orchestration selected directly round-trips unmodified into `form.name`; `orchestration_creator_string(&typed)` equals `crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL` (sanity that the literal genuinely resolves to the refused sentinel); and `form.name_collision()` is true for that literal, the same as a live-name collision.
+- **Does not assert:** WHERE the collision is enforced beyond `name_collision()` itself ([`Submit`] inertness is covered generically by `orchestration/guard/002`/`003`; the DISTINCT `RESERVED_NAME_WARNING` copy this specific reserved-sentinel branch renders — as opposed to `guard/002`/`003`'s own `NAME_COLLISION_WARNING` copy — is covered by `orchestration/guard/005`); any literal other than `unknown` (case variants, whitespace-padded forms); the `--mine` refusal itself, which is a separate CLI-side check this test only proves the Name field now anticipates.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/040 — Issue #222 edge 2 follow-up (reviewer F8 / auditor F2): the false-positive `identity/039`'s fix closed. An orchestration whose config `name` is literally `unknown` is selected but the Name field itself is left EMPTY (never typed into) — `resolved_title()` falls back to that config name, but `reserved_name_collision()` must compare the RAW typed field (empty) rather than that resolved fallback, since the actual spawn path (`build_new_pane_request`) derives the creator from the raw field alone and never applies the fallback substitution.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, constructing `NewPaneFormState` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** with an orchestration configured with `name = "unknown"` selected and the Name field never typed into, `form.name` is empty and `resolved_title()` resolves to `Some("unknown")` (sanity that the fallback genuinely would trip the pre-fix comparison); `reserved_name_collision()` and `name_collision()` are both `false` — submission is NOT blocked.
+- **Does not assert:** the positive collision case (typing the literal `unknown`, covered by `orchestration/identity/039`); any case where the Name field is empty but the fallback resolves to something other than the sentinel (never a collision either way, not the interesting boundary).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a directory that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140), detected against the live orchestration's REAL reported cwd — the sibling isolated-clone workspace path (fork#544 M2b), never the picked directory itself (issue #605).
@@ -4505,6 +4563,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** for a picked directory `/work/already-live` and a live orchestration named `already-live-orchestrator-1` whose reported cwd is computed via the SAME `resolve_workspace_path`/`sanitize_workspace_segment` formula the real spawn path uses (yielding `/work/already-live-already-live-orchestrator-1`), `NewPaneFormState::new(...).with_live_orchestration_cwds(&[(live_cwd, live_name)])` leaves `live_orchestration_in_same_cwd == true`.
 - **Does not assert:** the rendered warning copy or the `[Submit]`-retained non-blocking contract (covered by `orchestration/guard/001`); the nested-pick (git-toplevel-relative) sibling derivation `live_orchestration_occupies`'s reviewer-B1 fix handles (`orchestration/identity/035`); the daemon `ListAgents` round-trip that supplies real `(cwd, name)` pairs in production (`live_orchestration_cwds_and_titles`, not unit-testable without a live daemon); the case where the live orchestration was opened with a blank Name (known limitation — see `orchestration/guard/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/guard/005 — The reserved-sentinel branch of the guard seam (typed Name is the literal `unknown`, an orchestration selected) renders the DISTINCT `RESERVED_NAME_WARNING` copy, not `guard/002`/`003`'s `NAME_COLLISION_WARNING` copy — proving the render seam actually picks the branch the fix (fork #222 edge 2 follow-up, reviewer F1 / auditor F1) introduced, which nothing pinned before this test even though `orchestration/identity/039` already pins `name_collision()` going `true` for the same case at the state layer.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving the private `render_new_pane_form` directly through a `TestBackend`/`render_overlay_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (a form with the Name field set to the literal `unknown` and one orchestration selected; no live-orchestration identities needed — `reserved_name_collision()` doesn't require any).
+- **Asserts:** the rendered buffer contains `RESERVED_NAME_WARNING`'s own copy (`"unknown" is a reserved name`) AND does NOT contain `NAME_COLLISION_WARNING`'s copy (`already in use by a live orchestration`) — proving the correct, distinct warning renders for this specific reserved-sentinel case rather than the generic live-name-collision copy `guard/002`/`003` exercise.
+- **Does not assert:** `[Submit]` inertness or `[Cancel]` click-rect non-overlap for this branch (both already covered generically by `orchestration/guard/002`/`003`, since `name_collision()` short-circuits true through `reserved_name_collision()` and the render seam's Submit-button gating doesn't distinguish the two sub-branches); the `Action::FormSubmit` dispatch-level refusal for this literal (covered generically by `orchestration/guard/003`, using a live-name collision rather than the sentinel); the state-layer `name_collision()`/`reserved_name_collision()` truth values themselves (covered by `orchestration/identity/039`/`040`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/lock
@@ -6604,6 +6669,22 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ### Scheduled tasks (PRD #127)
+
+#### scheduler/config
+
+##### scheduler/config/003 — Issue #222 edge 1: `validate_task` bounds `ScheduledTask.name` so two names sharing a 185-char prefix are rejected at load time, rather than loading successfully and later colliding once `sanitize_marker_creator` (`worktree_reclaim.rs`, `MARKER_CREATOR_MAX_CHARS` = 200) truncates the formatted `issue-dispatch:{task_name}#{issue}` creator string at the 200-char cutoff and makes both entries' markers byte-identical under `--mine`.
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::LoadedSchedules::parse`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** two task names sharing a 185-char prefix, differing only in their last 65 bytes, genuinely collide under today's `sanitize_marker_creator` 200-char truncation when formatted as `issue-dispatch:{name}#7` (sanity check); loading a `[[scheduled_tasks]]` TOML document containing both overlong names yields zero loaded tasks and two load errors — the producer rejects both rather than truncation silently aliasing them at the sink.
+- **Does not assert:** the exact byte-length bound `validate_task` enforces beyond "185+65 collides, so the cap must sit below that"; the malformed-entry/missing-command load-error paths (`scheduler/config/001`/`002`, informally numbered in `src/config.rs` but not yet catalog-registered); `sanitize_marker_creator`'s own truncation behavior in isolation (covered separately in `worktree_reclaim.rs`); any daemon-side reload or CLI surface (`scheduler/reload`/`scheduler/cli`).
+- **Platform coverage:** mac+linux+windows.
+
+##### scheduler/config/004 — Issue #222 edge 1 follow-up: `validate_task` also rejects a `ScheduledTask.name` that `worktree_reclaim::marker_creator_normalizes` says `sanitize_marker_creator` would change (a dropped control character, `\n`/`\r` mapped to a space, or leading/trailing whitespace trimmed) — closing the collision surface the length bound (`scheduler/config/003`) leaves open, since two short, distinct names like `"deploy prod"` and `"deploy\nprod"` collapse to the identical marker-creator string well under the 200-char truncation cap.
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::LoadedSchedules::parse`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** `"deploy prod"` and `"deploy\nprod"` genuinely sanitize to the identical marker-creator string, and `marker_creator_normalizes` distinguishes them (`false`/`true` respectively) as a sanity check; an already-normalized name (`"deploy prod"`) loads with zero errors; a name with an embedded newline (`"deploy\nprod"`) and a name with leading/trailing whitespace (`"  deploy prod  "`) are each rejected at load time with exactly one load error apiece.
+- **Does not assert:** the length-bound rejection path (covered by `scheduler/config/003`); `schedule add`'s mirrored write-time check (covered by the `schedule_cli.rs` unit tests alongside `scheduler/cli/001`); any daemon-side reload or CLI surface.
+- **Platform coverage:** mac+linux+windows.
 
 #### scheduler/reload
 
