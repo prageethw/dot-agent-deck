@@ -13788,6 +13788,123 @@ clear = false
         );
     }
 
+    /// Issue #665: unlike `event.tool_name`/`event.tool_detail`
+    /// (`agent_badge_011` above), `apply_event` stores `event.user_prompt`
+    /// into `session.last_user_prompt` / `session.first_prompts` with no
+    /// call to `crate::untrusted_text::strip_control_and_bidi` at all. A
+    /// `U+202E` RIGHT-TO-LEFT OVERRIDE therefore survives into session
+    /// state and reaches the `Prmt:` line (`Span::raw` in `src/ui.rs`)
+    /// unstripped. This must be sanitized the same way tool_name/tool_detail
+    /// already are.
+    #[test]
+    fn apply_event_scrubs_user_prompt_bidi_override() {
+        fn admit(session_id: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        fn prompt_event(session_id: &str, prompt: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: Some(prompt.to_string()),
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut state = AppState::default();
+        state.apply_event(admit("p1"));
+        let hostile = "attacker.example\u{202e} then [UNTRUSTED";
+        state.apply_event(prompt_event("p1", hostile));
+
+        let session = &state.sessions["p1"];
+        let last = session
+            .last_user_prompt
+            .as_deref()
+            .expect("UserPromptSubmit must set last_user_prompt");
+        assert!(
+            !last.contains('\u{202e}'),
+            "session.last_user_prompt must have bidi overrides stripped, got {last:?}"
+        );
+        let first = session
+            .first_prompts
+            .last()
+            .expect("UserPromptSubmit must push into first_prompts");
+        assert!(
+            !first.contains('\u{202e}'),
+            "session.first_prompts entries must have bidi overrides stripped, got {first:?}"
+        );
+    }
+
+    /// Issue #664: `apply_event` stores `event.cwd` into `session.cwd`
+    /// (`session.cwd.clone_from(&event.cwd)`) with no sanitization at all,
+    /// unlike `event.tool_name`/`event.tool_detail` (`agent_badge_011`
+    /// above). A `U+202E` RIGHT-TO-LEFT OVERRIDE therefore survives into
+    /// `session.cwd` and reaches the `Dir:` line (`Span::raw` in
+    /// `src/ui.rs`) unstripped.
+    #[test]
+    fn apply_event_scrubs_cwd_bidi_override() {
+        fn admit_with_cwd(session_id: &str, cwd: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some(cwd.to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut state = AppState::default();
+        let hostile = "/tmp/\u{202e}gnp.sh";
+        state.apply_event(admit_with_cwd("c1", hostile));
+
+        let session = &state.sessions["c1"];
+        let cwd = session
+            .cwd
+            .as_deref()
+            .expect("SessionStart with cwd must set session.cwd");
+        assert!(
+            !cwd.contains('\u{202e}'),
+            "session.cwd must have bidi overrides stripped, got {cwd:?}"
+        );
+    }
+
     /// PRD #249 M3 + review finding B3, as amended by issue #686: the
     /// silent-worker notice carries daemon-authored text plus **exactly one**
     /// untrusted value — the worker pane's own rendered text — and that value

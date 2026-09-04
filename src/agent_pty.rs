@@ -9185,6 +9185,33 @@ mod tests {
         );
     }
 
+    /// Issue #664: `is_valid_cwd`'s own doc comment claims it "Mirrors the
+    /// `is_valid_display_name` filter", but unlike that function
+    /// (`agent_badge_009` above), it only checks byte-level ASCII control
+    /// characters (`b >= 0x20 && b != 0x7f`) and never calls
+    /// `crate::untrusted_text::is_bidi_format_char`. A `U+202E`
+    /// RIGHT-TO-LEFT OVERRIDE encodes as UTF-8 bytes all `>= 0x20`, so it
+    /// passes `is_valid_cwd` today and can spoof the `Dir:` line
+    /// (`Span::raw` in `src/ui.rs`).
+    #[test]
+    fn is_valid_cwd_rejects_unicode_bidi_format_characters() {
+        assert!(
+            !is_valid_cwd("/tmp/\u{202e}gnp.sh"),
+            "a cwd containing U+202E RIGHT-TO-LEFT OVERRIDE must fail validation, matching is_valid_display_name"
+        );
+        for c in ['\u{200b}', '\u{2066}', '\u{feff}'] {
+            let cwd = format!("/tmp/agent{c}dir");
+            assert!(
+                !is_valid_cwd(&cwd),
+                "Cf format character U+{:04X} must fail validation, cwd={cwd:?}",
+                c as u32
+            );
+        }
+        // An ordinary Unicode path (accents, CJK) must still pass — the
+        // tightening targets `Cf` specifically, not "any non-ASCII".
+        assert!(is_valid_cwd("/home/café/агент/日本語"));
+    }
+
     /// Round-12 auditor #2: orchestration_cwd must be validated.
     /// Hostile inputs (NUL bytes, control chars, oversized strings,
     /// relative paths) should make validate_tab_membership return

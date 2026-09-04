@@ -1369,6 +1369,109 @@ mod tests {
         );
     }
 
+    /// Issue #665: `sanitize_record_tab_membership`'s `live` snapshot scrub
+    /// (`agent_badge_010` above covers `display_name`) routes
+    /// `last_user_prompt`/`first_prompts` through `strip_control_chars`,
+    /// which only strips Unicode `Cc` control characters — not the `Cf`
+    /// bidi/format class `crate::untrusted_text::strip_control_and_bidi`
+    /// also strips. A string with a `U+202E` RIGHT-TO-LEFT OVERRIDE and no
+    /// ASCII control bytes at all therefore survives this scrub unstripped
+    /// today, reaching the `Prmt:` line (`Span::raw` in `src/ui.rs`).
+    #[test]
+    fn sanitize_record_tab_membership_scrubs_bidi_only_user_prompt() {
+        let hostile = "attacker.example\u{202e} then [UNTRUSTED".to_string();
+        let mut rec = AgentRecord {
+            id: "12".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: Some(crate::state::SessionSnapshot {
+                status: crate::state::SessionStatus::Idle,
+                agent_type: None,
+                active_tool: None,
+                tool_count: 0,
+                first_prompts: vec![hostile.clone()],
+                last_user_prompt: Some(hostile.clone()),
+                live_target: None,
+                last_activity_ms: None,
+                shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
+                wait_deferred_revert: false,
+                model: None,
+                agent_report_activity_seen: false,
+            }),
+            spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        sanitize_record_tab_membership(&mut rec);
+        let live = rec
+            .live
+            .as_ref()
+            .expect("live snapshot must survive scrubbing");
+        let last = live
+            .last_user_prompt
+            .as_deref()
+            .expect("bidi-only prompt has printable content and survives scrubbing");
+        assert!(
+            !last.contains('\u{202e}'),
+            "live.last_user_prompt must have bidi overrides stripped, got {last:?}"
+        );
+        let first = live
+            .first_prompts
+            .first()
+            .expect("first_prompts entry must survive scrubbing");
+        assert!(
+            !first.contains('\u{202e}'),
+            "live.first_prompts entries must have bidi overrides stripped, got {first:?}"
+        );
+    }
+
+    /// Issue #664: `sanitize_record_tab_membership` scrubs `display_name`
+    /// (`agent_badge_010` above) and `live.last_user_prompt`/`first_prompts`,
+    /// but never touches `AgentRecord.cwd` at all — a malformed or older
+    /// daemon can echo a `U+202E` RIGHT-TO-LEFT OVERRIDE straight into
+    /// `rec.cwd`, which reaches the `Dir:` line (`Span::raw` in
+    /// `src/ui.rs`) via `seed_hydrated_session` unscrubbed.
+    #[test]
+    fn sanitize_record_tab_membership_scrubs_cwd_bidi_override() {
+        let mut rec = AgentRecord {
+            id: "13".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: Some("/tmp/\u{202e}gnp.sh".into()),
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        sanitize_record_tab_membership(&mut rec);
+        let cwd = rec
+            .cwd
+            .as_deref()
+            .expect("a cwd with printable characters survives scrubbing");
+        assert!(
+            !cwd.contains('\u{202e}'),
+            "rec.cwd must have bidi overrides stripped, got {cwd:?}"
+        );
+    }
+
     #[test]
     fn sanitize_record_tab_membership_strips_invalid_name() {
         // M2.12 fixup auditor #1: the daemon validates `tab_membership`
