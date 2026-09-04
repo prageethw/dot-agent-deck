@@ -20126,9 +20126,12 @@ fn render_bottom_bar(
             // message (e.g. "PaneInput mode …") on the left and expose the
             // [Command Mode Ctrl+D] affordance at the right edge — clicking it
             // returns to the dashboard (command mode) exactly as Ctrl+D does.
-            if let Some((ref msg, _)) = ui.status_message {
-                let sanitized = crate::untrusted_text::strip_control_and_bidi(msg, false);
-                let line = Line::styled(sanitized, Style::default().fg(Color::Yellow));
+            let sanitized_msg = ui
+                .status_message
+                .as_ref()
+                .map(|(msg, _)| crate::untrusted_text::strip_control_and_bidi(msg, false));
+            if let Some(ref sanitized) = sanitized_msg {
+                let line = Line::styled(sanitized.clone(), Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
             // PRD #241 M4: same mode-aware seam the wide bar uses, so the two
@@ -20149,10 +20152,15 @@ fn render_bottom_bar(
             // message. `Ctrl+D` itself still works with no on-screen affordance
             // for it, exactly as every other global chord does when the banner
             // has decayed.
-            let msg_width = ui
-                .status_message
+            //
+            // Issue #497 audit F1: measure the SANITIZED string, the same one
+            // actually rendered above — measuring the raw message would inflate
+            // this width by every character `strip_control_and_bidi` drops,
+            // spuriously eliding the button even when the rendered (shorter)
+            // text would have left room for it.
+            let msg_width = sanitized_msg
                 .as_ref()
-                .map(|(msg, _)| msg.chars().count() as u16)
+                .map(|s| s.chars().count() as u16)
                 .unwrap_or(0);
             let button_width = button.display_label().chars().count() as u16;
             if area.width >= msg_width.saturating_add(button_width) {
