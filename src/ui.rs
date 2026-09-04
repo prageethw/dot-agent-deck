@@ -38762,6 +38762,61 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #222 edge 2 — typing the literal `unknown` into the
+    /// new-pane form's Name field, with an orchestration selected, resolves
+    /// (via `orchestration_creator_string`) to `orchestration:unknown` —
+    /// byte-identical to `ORCHESTRATION_UNKNOWN_SENTINEL`
+    /// (`src/agent_pty.rs`), the sentinel meaning "no name was available".
+    /// `run_worktree_list_cli`'s `--mine` refuses that sentinel outright
+    /// ("which is never a real identity"), so an orchestration literally
+    /// named `unknown` is permanently unmatchable by `--mine`. Today
+    /// `name_collision` only checks the typed name against live orchestration
+    /// identities/wildcard names, with no equivalent check against this
+    /// literal, so nothing warns the user or blocks `[Submit]` before they
+    /// walk into it.
+    #[test]
+    fn name_field_literal_unknown_is_treated_as_a_collision() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_new_pane_form_key(tab, &mut ui); // Mode -> Name
+
+        for c in "unknown".chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+        // Select the orchestration directly (mirroring identity_012), so
+        // `name_collision()` — which requires a selected orchestration —
+        // applies to the literal we just typed.
+        ui.new_pane_form.as_mut().unwrap().selection_index = 1;
+
+        let typed = ui.new_pane_form.as_ref().unwrap().name.clone();
+        assert_eq!(
+            typed, "unknown",
+            "sanity: the typed literal round-trips unmodified"
+        );
+        assert_eq!(
+            orchestration_creator_string(&typed),
+            crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL,
+            "sanity: typing the literal `unknown` genuinely resolves to the sentinel \
+             string that `--mine` refuses to match"
+        );
+        assert!(
+            ui.new_pane_form.as_ref().unwrap().name_collision(),
+            "typing the literal `unknown` must be treated as a collision — blocking \
+             [Submit] and rendering NAME_COLLISION_WARNING the same way a live-name \
+             collision does — since it resolves to `orchestration:unknown`, byte- \
+             identical to ORCHESTRATION_UNKNOWN_SENTINEL, which `--mine` can never \
+             match again"
+        );
+    }
+
     /// Scenario: Two RED cases pinning that the uniqueness gate normalizes
     /// on the SAME trim the sink (`build_new_pane_request`) applies, not a
     /// looser comparison (fork#192 audit F1). (a) A live orchestration holds

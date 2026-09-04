@@ -2664,6 +2664,70 @@ prompt = "do the thing"
         assert_eq!(loaded.errors.len(), 1);
     }
 
+    // Issue #222 edge 1 — `validate_task` never bounds `ScheduledTask.name`,
+    // so two names sharing a 185-char prefix collide once
+    // `sanitize_marker_creator` (worktree_reclaim.rs,
+    // `MARKER_CREATOR_MAX_CHARS` = 200) truncates the formatted
+    // `issue-dispatch:{task_name}#{issue}` creator string at 200 chars: the
+    // 15-char `"issue-dispatch:"` prefix plus a 185-char shared name prefix
+    // is exactly the 200-char cutoff, so both entries' markers become
+    // byte-identical and match each other's worktrees under `--mine`. The
+    // issue's preferred fix is a load-time rejection at the producer
+    // (here), not a truncation-collision-avoidance trick at the sink.
+    // `validate_task` currently accepts any name length, so this is
+    // expected RED until `coder` adds the bound.
+    #[test]
+    fn schedules_reject_overlong_task_name_that_would_collide() {
+        let shared_prefix = "a".repeat(185);
+        let name_one = format!("{shared_prefix}{}", "b".repeat(65));
+        let name_two = format!("{shared_prefix}{}", "c".repeat(65));
+        assert_ne!(name_one, name_two, "sanity: the two names must differ");
+
+        let creator_one = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+            "issue-dispatch:{name_one}#7"
+        ));
+        let creator_two = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+            "issue-dispatch:{name_two}#7"
+        ));
+        assert_eq!(
+            creator_one, creator_two,
+            "sanity: today's 200-char truncation genuinely collides these two names"
+        );
+
+        let toml_str = format!(
+            r#"
+[[scheduled_tasks]]
+name = "{name_one}"
+cron = "0 9 * * *"
+working_dir = "/tmp/one"
+command = "claude"
+prompt = "do the thing"
+
+[[scheduled_tasks]]
+name = "{name_two}"
+cron = "0 9 * * *"
+working_dir = "/tmp/two"
+command = "claude"
+prompt = "do the thing"
+"#
+        );
+        let loaded = LoadedSchedules::parse(&toml_str);
+        assert!(
+            loaded.tasks.is_empty(),
+            "an overlong task name must be rejected at load time — today's gap: \
+             `validate_task` never checks `task.name` length, so both of these \
+             load successfully and later collide under `sanitize_marker_creator`'s \
+             200-char truncation — got tasks: {:?}",
+            loaded.tasks.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            loaded.errors.len(),
+            2,
+            "both overlong entries should be reported as load errors, got: {:?}",
+            loaded.errors
+        );
+    }
+
     #[test]
     fn schedules_missing_file_is_empty_not_error() {
         let dir = tempfile::tempdir().unwrap();
