@@ -87,6 +87,27 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
         )?;
     }
     validate_cron(&args.cron).map_err(|e| format!("invalid cron expression: {e}"))?;
+    // fork #222 fix 5 (auditor F4): mirror `config::validate_task`'s bound
+    // here, at WRITE time, not just load time — this command's own module
+    // doc / design comment above says a malformed input is "rejected at
+    // write time ... rather than producing a task the daemon would reject
+    // at load", and without this an overlong or normalization-colliding
+    // `--name` wrote an entry that would silently never load.
+    if args.name.chars().count() > crate::agent_pty::DISPLAY_NAME_MAX_LEN {
+        return Err(format!(
+            "--name is {} characters, exceeding the {}-character limit",
+            args.name.chars().count(),
+            crate::agent_pty::DISPLAY_NAME_MAX_LEN
+        ));
+    }
+    if crate::worktree_reclaim::marker_creator_normalizes(&args.name) {
+        return Err(
+            "--name contains control characters, a newline/carriage return, or \
+             leading/trailing whitespace that would be stripped before comparison, \
+             which can make it collide with another task's worktree-ownership identity"
+                .to_string(),
+        );
+    }
     if tasks.iter().any(|t| t.name == args.name) {
         return Err(format!(
             "a schedule named {:?} already exists; use `schedule update` to change it",

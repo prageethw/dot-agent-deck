@@ -756,13 +756,17 @@ impl LoadedSchedules {
 /// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
 /// crashing the daemon.
 fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, ScheduleLoadError> {
-    // #222: an unbounded `task.name` lets two scheduled tasks' marker-creator
+    // fork #222: an unbounded `task.name` lets two scheduled tasks' marker-creator
     // strings (`issue-dispatch:{name}#{issue}`) collide once
     // `sanitize_marker_creator` truncates at `MARKER_CREATOR_MAX_CHARS`
     // (src/worktree_reclaim.rs). Reject an overlong name outright at the
-    // producer, using the same cap the daemon already enforces on a live
-    // orchestration's display name, rather than tie this to that
-    // truncation's exact prefix/suffix arithmetic.
+    // producer, borrowing the same numeric VALUE the daemon already enforces
+    // on a live orchestration's display name (`DISPLAY_NAME_MAX_LEN`) — but
+    // deliberately on a different UNIT. `DISPLAY_NAME_MAX_LEN` is a byte cap
+    // everywhere else it's used; this counts chars because
+    // `sanitize_marker_creator` truncates by chars, and chars is the unit
+    // that actually determines whether two names' truncated creator strings
+    // collide.
     if task.name.chars().count() > crate::agent_pty::DISPLAY_NAME_MAX_LEN {
         return Err(ScheduleLoadError {
             entry: Some(index),
@@ -771,6 +775,24 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
                 task.name.chars().count(),
                 crate::agent_pty::DISPLAY_NAME_MAX_LEN
             ),
+        });
+    }
+    // fork #222 edge 1 follow-up: the length check alone doesn't close the
+    // collision — `sanitize_marker_creator` also drops control characters,
+    // maps `\n`/`\r` to a space, and trims, all BEFORE truncating. Two
+    // distinct, both-short names (e.g. `"deploy prod"` and `"deploy\nprod"`)
+    // can still collapse to the identical marker-creator string. Reject any
+    // name normalization would change at all, so the only remaining
+    // collision surface is the length bound just above. Deliberately does
+    // not echo the offending name back, matching the length check above.
+    if crate::worktree_reclaim::marker_creator_normalizes(&task.name) {
+        return Err(ScheduleLoadError {
+            entry: Some(index),
+            message: "scheduled task name contains control characters, a newline/carriage \
+                       return, or leading/trailing whitespace that would be stripped before \
+                       comparison, which can make it collide with another task's \
+                       worktree-ownership identity"
+                .to_string(),
         });
     }
     // PRD #120: an issue-dispatch task has no top-level `command` — the per-issue

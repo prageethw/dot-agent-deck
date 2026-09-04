@@ -1134,6 +1134,20 @@ const SAME_CWD_ORCHESTRATION_WARNING: [&str; 3] = [
 const NAME_COLLISION_WARNING: [&str; 1] =
     ["  ! This name is already in use by a live orchestration."];
 
+/// fork #222 edge 2 follow-up (reviewer F2 / auditor F1): a DISTINCT warning
+/// for the sentinel-collision branch of [`NewPaneFormState::name_collision`]
+/// (see [`NewPaneFormState::reserved_name_collision`]). Reusing
+/// [`NAME_COLLISION_WARNING`] there told a user on an otherwise-empty deck
+/// that "a live orchestration" already holds the name they typed — false,
+/// since no live orchestration need exist for the reserved-identity case.
+/// Selected on the same render seam ([`render_new_pane_form`]) that picks
+/// `NAME_COLLISION_WARNING`; submitting is refused either way, only the copy
+/// changes.
+const RESERVED_NAME_WARNING: [&str; 2] = [
+    "  ! \"unknown\" is a reserved name -- every",
+    "    nameless orchestration already uses it.",
+];
+
 /// PRD #140 M4.0: the shared warning DECISION — does `form_cwd` collide with
 /// any live orchestration's real reported cwd? The single code path behind
 /// both the L1 seam ([`render_new_pane_orchestration_guard_to_buffer`]) and
@@ -2126,19 +2140,11 @@ impl NewPaneFormState {
     /// both point at is that the gate must ultimately compare
     /// POST-`sanitize_marker_creator` values, not just post-trim ones.
     fn name_collision(&self) -> bool {
+        if self.reserved_name_collision() {
+            return true;
+        }
         self.resolved_title().is_some_and(|t| {
             let t = t.trim();
-            // #222: typing the literal `unknown` resolves, via
-            // `orchestration_creator_string`, to the exact same
-            // `orchestration:unknown` string the sentinel already reserves
-            // for a NAMELESS spawn (`ORCHESTRATION_UNKNOWN_SENTINEL`) — so a
-            // typed name here would collide with every future nameless
-            // orchestration's marker-creator string. Treat it the same as an
-            // existing collision rather than let it round-trip into that
-            // reserved identity.
-            if orchestration_creator_string(t) == crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL {
-                return true;
-            }
             // PRD fork#603 fix round: `live_orchestration_occupies` rather
             // than a bare `cwd_matches(&self.dir, cwd)` — see that
             // function's doc comment.
@@ -2155,6 +2161,44 @@ impl NewPaneFormState {
                     .iter()
                     .any(|name| name == t)
         })
+    }
+
+    /// The sentinel-collision half of [`Self::name_collision`], split out so
+    /// the render seam can pick [`RESERVED_NAME_WARNING`] instead of
+    /// [`NAME_COLLISION_WARNING`] for this specific case (fork #222 edge 2
+    /// follow-up, reviewer F2 / auditor F1: reusing the live-orchestration
+    /// copy here told the user something false — no live orchestration need
+    /// exist for the reserved-identity case to fire).
+    ///
+    /// Only meaningful when an orchestration is selected (mirrors
+    /// [`Self::name_collision`]'s own gating via [`Self::resolved_title`]),
+    /// even though the comparison itself doesn't need `resolved_title()`'s
+    /// value — a plain mode/card/authoring option carries no identity
+    /// uniqueness constraint at all.
+    ///
+    /// fork #222 edge 2 follow-up (auditor F2 / reviewer F8): compares
+    /// `self.name.trim()` — the RAW typed field — rather than
+    /// `resolved_title()` (which substitutes the orchestration's config name
+    /// or the project directory's basename when the Name field is empty).
+    /// The actual spawn path (`build_new_pane_request`) computes the creator
+    /// from `form.name.trim()` alone and never applies that fallback.
+    /// Comparing `resolved_title()` would hard-block an EMPTY Name field
+    /// whenever the config name or directory basename happens to be
+    /// `"unknown"`, even though the spawn path for an empty field computes
+    /// the ordinary, permitted nameless-spawn identity every other name
+    /// gets.
+    ///
+    /// fork #222: typing the literal `unknown` resolves, via
+    /// `orchestration_creator_string`, to the exact same
+    /// `orchestration:unknown` string the sentinel already reserves for a
+    /// NAMELESS spawn (`ORCHESTRATION_UNKNOWN_SENTINEL`) — so a typed name
+    /// here would collide with every future nameless orchestration's
+    /// marker-creator string. Treat it the same as an existing collision
+    /// rather than let it round-trip into that reserved identity.
+    fn reserved_name_collision(&self) -> bool {
+        self.resolved_title().is_some()
+            && orchestration_creator_string(self.name.trim())
+                == crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL
     }
 
     /// PRD #140 M4.0: whether the form should render
@@ -21716,12 +21760,19 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // fork#192 M1.0: decided once and reused below to also drop `[Submit]`
     // from the action row.
     let name_collision = form.name_collision();
+    // fork #222 edge 2 follow-up (reviewer F2 / auditor F1): decided
+    // separately from `name_collision` so the render side can pick the
+    // sentinel-specific copy — `NAME_COLLISION_WARNING`'s "already in use by
+    // a live orchestration" is false for this branch.
+    let reserved_name_collision = form.reserved_name_collision();
     // PRD #140 M4.0 / fork#192 M1.0: the warning/refusal block — a blank
     // separator row plus the copy lines. A name collision takes priority over
     // the non-blocking same-cwd warning (it's the more urgent of the two and
     // blocks submit); empty when neither applies, so every other form state
     // keeps its exact prior geometry.
-    let warning_lines: &[&str] = if name_collision {
+    let warning_lines: &[&str] = if reserved_name_collision {
+        &RESERVED_NAME_WARNING
+    } else if name_collision {
         &NAME_COLLISION_WARNING
     } else if form.same_cwd_orchestration_warning() {
         &SAME_CWD_ORCHESTRATION_WARNING
