@@ -1403,6 +1403,19 @@ pub fn sanitize_marker_creator(name: &str) -> String {
 /// (`gh` only ever talks to GitHub, so a non-GitHub remote must never resolve
 /// to a slug `gh` would misinterpret rather than reject).
 ///
+/// A thin wrapper over [`derive_repo_slug_for_remote`] fixed to `"origin"` —
+/// kept as its own function so the many existing callers that only ever care
+/// about `origin` don't need to name the remote themselves.
+pub(crate) fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
+    derive_repo_slug_for_remote(repo_dir, "origin")
+}
+
+/// Derive a `gh --repo owner/name` slug from an arbitrary named remote of
+/// the worktree (issue #191) — same fail-closed contract as
+/// [`derive_repo_slug`], generalized over the remote name so
+/// [`resolve_pr_state`] can ask the same question of `upstream` as it does
+/// of `origin`.
+///
 /// Runs via [`git_in_untrusted_dir`] (fork#325 M4a final round, auditor
 /// B3), even though `remote get-url` is a pure config read that cannot
 /// reach `core.fsmonitor`: this function is called with `repo_dir` set to
@@ -1411,9 +1424,9 @@ pub fn sanitize_marker_creator(name: &str) -> String {
 /// rather than reasoning per call site about which ones need it — is the
 /// isolation this module already commits to for [`check_cleanliness`] and
 /// [`resolve_isolated_clone_branch`].
-pub(crate) fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
+pub(crate) fn derive_repo_slug_for_remote(repo_dir: &Path, remote: &str) -> Option<String> {
     let out = git_in_untrusted_dir(repo_dir)
-        .args(["remote", "get-url", "origin"])
+        .args(["remote", "get-url", remote])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -1442,25 +1455,26 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 }
 
 /// `gh pr list --head <branch> --state all --repo <owner/name> --json
-/// state,headRefName,headRepositoryOwner` — `--state all` because `gh pr
-/// list` defaults to `--state open`, which makes every merged PR invisible;
-/// `--repo`, derived from `origin` via [`derive_repo_slug`], because letting
-/// `gh` infer it queries the upstream repo from a fork checkout with no
-/// default set.
+/// state,headRefName,headRepositoryOwner` against a single already-derived
+/// `repo_slug` — `--state all` because `gh pr list` defaults to `--state
+/// open`, which makes every merged PR invisible; an explicit `--repo`
+/// because letting `gh` infer it queries the upstream repo from a fork
+/// checkout with no default set.
 ///
 /// Matches results on `headRefName` AND `headRepositoryOwner.login` matching
-/// the `origin` slug's own owner (issue #144 finding 2): `headRefName` alone
+/// `expected_owner` — the owner half of the SAME remote's own slug that
+/// `repo_slug` was derived from (issue #144 finding 2): `headRefName` alone
 /// is not namespaced by head repository owner, so a merged PR opened from a
 /// DIFFERENT fork with the same head branch name would otherwise be
 /// attributed to an unrelated local branch of that name. The owner
 /// comparison is ASCII-case-insensitive (issue #144 finding 3 / NEW-1):
 /// GitHub logins are case-insensitive and ASCII-only, so a case-variant
-/// `origin` remote (`PrageethW` vs. the canonical `prageethw` `gh` returns)
-/// must still match. A reply missing the `headRepositoryOwner` field
-/// entirely (the shape `gh` can return once the head repo is no longer
-/// resolvable, e.g. a fork deleted after merge) is treated as a non-match,
-/// not a wildcard — an unverifiable owner must never be treated as a match,
-/// the same fail-closed stance every other branch of this gate takes.
+/// remote (`PrageethW` vs. the canonical `prageethw` `gh` returns) must
+/// still match. A reply missing the `headRepositoryOwner` field entirely
+/// (the shape `gh` can return once the head repo is no longer resolvable,
+/// e.g. a fork deleted after merge) is treated as a non-match, not a
+/// wildcard — an unverifiable owner must never be treated as a match, the
+/// same fail-closed stance every other branch of this gate takes.
 ///
 /// The owner filter is applied as a SEPARATE pass over the `headRefName`
 /// matches, not fused into one `.filter()` chain (NEW-2): a `headRefName`
@@ -1468,26 +1482,11 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 /// must be reported as `Unresolvable` naming the real cause, never as `NoPr`
 /// — `NoPr`'s "no pull request found for this branch" is false when a PR
 /// with that head ref genuinely exists and was found; it only wasn't
-/// confirmed as this repo's own. Zero `headRefName` matches at all resolve to
-/// `NoPr` (genuinely no PR exists); more than one surviving owner match
-/// resolves to `Unresolvable` (ambiguous), never guessing.
-fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
-    let repo_slug = match derive_repo_slug(repo_dir) {
-        Some(slug) => slug,
-        None => {
-            return PrState::Unresolvable(
-                "could not derive --repo from the origin remote (missing, or not a parseable \
-                 GitHub URL)"
-                    .to_string(),
-            );
-        }
-    };
-    // `derive_repo_slug` returns "owner/name"; the owner half is what
-    // `headRepositoryOwner.login` must match.
-    let expected_owner = repo_slug
-        .split_once('/')
-        .map(|(owner, _)| owner)
-        .unwrap_or(repo_slug.as_str());
+/// confirmed as this remote's own. Zero `headRefName` matches at all resolve
+/// to `NoPr` (genuinely no PR exists on THIS remote); more than one
+/// surviving owner match resolves to `Unresolvable` (ambiguous), never
+/// guessing.
+fn query_pr_state(repo_dir: &Path, branch: &str, repo_slug: &str, expected_owner: &str) -> PrState {
     let out = Command::new("gh")
         .current_dir(repo_dir)
         .args([
@@ -1498,7 +1497,7 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             "--state",
             "all",
             "--repo",
-            &repo_slug,
+            repo_slug,
             "--json",
             "state,headRefName,headRepositoryOwner,headRefOid",
         ])
@@ -1556,6 +1555,69 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             "{} pull requests matched branch {branch:?} and owner {expected_owner:?}",
             owner_matches.len()
         )),
+    }
+}
+
+/// The owner half of an `owner/name` slug, for matching against
+/// `headRepositoryOwner.login`. Distinct from [`owner_of`], which answers a
+/// different question (a worktree's filesystem owner).
+fn slug_owner(repo_slug: &str) -> &str {
+    repo_slug
+        .split_once('/')
+        .map(|(owner, _)| owner)
+        .unwrap_or(repo_slug)
+}
+
+/// Resolve a branch's PR state by querying `origin` first and falling back
+/// to `upstream` (issue #191) — this fork's documented contribution
+/// workflow (CLAUDE.md rule 19) routinely opens the real PR against
+/// `upstream`, leaving `origin` with no PR for the same branch at all; a
+/// resolver that only ever asked `origin` reported that as `NoPr`, which is
+/// false — a PR genuinely exists, it just lives on a remote nobody asked
+/// about.
+///
+/// Combination policy (deliberately conservative, matching this gate's
+/// existing fail-closed stance):
+///
+/// - `origin` is always queried first. Whatever it resolves to — a clean
+///   single match, `Unresolvable` (ambiguous, or a hard `gh`/parse
+///   failure), or `NoPr` — is a REAL answer about `origin`'s own state.
+/// - Only `NoPr` is treated as "nothing new here, ask elsewhere": every
+///   other `origin` outcome is returned immediately, without even
+///   consulting `upstream`. This is why a `origin`-side ambiguous case (2+
+///   candidate PRs) is never silently overridden by a clean `upstream`
+///   match — `upstream` is a fallback for genuinely NEW information when
+///   `origin` found nothing, never a tiebreaker or override for a real
+///   `origin`-side answer. Symmetrically, if `origin` already resolves
+///   cleanly to one PR, a DIFFERENT PR that happens to also exist on
+///   `upstream` is irrelevant and never queried.
+/// - `upstream` is consulted only when `origin` resolved to `NoPr` AND an
+///   `upstream` remote exists with a slug [`derive_repo_slug_for_remote`]
+///   can parse. Its result — whatever it is, including its own `NoPr` or
+///   `Unresolvable` — becomes the final answer, matched against `upstream`'s
+///   OWN owner (never cross-checked against `origin`'s owner).
+/// - When there is no `upstream` remote, or its URL doesn't parse, behavior
+///   is identical to today: `origin`'s `NoPr` stands.
+fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
+    let origin_slug = match derive_repo_slug_for_remote(repo_dir, "origin") {
+        Some(slug) => slug,
+        None => {
+            return PrState::Unresolvable(
+                "could not derive --repo from the origin remote (missing, or not a parseable \
+                 GitHub URL)"
+                    .to_string(),
+            );
+        }
+    };
+    let origin_state = query_pr_state(repo_dir, branch, &origin_slug, slug_owner(&origin_slug));
+    if !matches!(origin_state, PrState::NoPr) {
+        return origin_state;
+    }
+    match derive_repo_slug_for_remote(repo_dir, "upstream") {
+        Some(upstream_slug) => {
+            query_pr_state(repo_dir, branch, &upstream_slug, slug_owner(&upstream_slug))
+        }
+        None => origin_state,
     }
 }
 
