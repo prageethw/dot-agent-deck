@@ -4447,6 +4447,20 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side compound-key comparison over the values sent, which is `orchestration/identity/036`'s own scope; the RESTORE/reconnect call site's own claim `cwd` (unchanged by this PRD's fix, and not exercised by a live spawn); the isolated-clone provisioning outcome itself (covered by `orchestration/workspace/033`-`036`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/039 — Issue #222 edge 2: typing the literal `unknown` into the new-pane form's Name field, with an orchestration selected, resolves (via `orchestration_creator_string`) to `orchestration:unknown` — byte-identical to `ORCHESTRATION_UNKNOWN_SENTINEL` (`src/agent_pty.rs`), the sentinel `run_worktree_list_cli`'s `--mine` refuses outright as "never a real identity" — so an orchestration literally named `unknown` must be treated as a collision, blocking `[Submit]`, rather than silently becoming permanently unmatchable by `--mine`.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** typing `unknown` into a focused, empty Name field with the form's one orchestration selected directly round-trips unmodified into `form.name`; `orchestration_creator_string(&typed)` equals `crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL` (sanity that the literal genuinely resolves to the refused sentinel); and `form.name_collision()` is true for that literal, the same as a live-name collision.
+- **Does not assert:** WHERE the collision is enforced beyond `name_collision()` itself ([`Submit`] inertness is covered generically by `orchestration/guard/002`/`003`; the DISTINCT `RESERVED_NAME_WARNING` copy this specific reserved-sentinel branch renders — as opposed to `guard/002`/`003`'s own `NAME_COLLISION_WARNING` copy — is covered by `orchestration/guard/005`); any literal other than `unknown` (case variants, whitespace-padded forms); the `--mine` refusal itself, which is a separate CLI-side check this test only proves the Name field now anticipates.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/040 — Issue #222 edge 2 follow-up (reviewer F8 / auditor F2): the false-positive `identity/039`'s fix closed. An orchestration whose config `name` is literally `unknown` is selected but the Name field itself is left EMPTY (never typed into) — `resolved_title()` falls back to that config name, but `reserved_name_collision()` must compare the RAW typed field (empty) rather than that resolved fallback, since the actual spawn path (`build_new_pane_request`) derives the creator from the raw field alone and never applies the fallback substitution.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, constructing `NewPaneFormState` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** with an orchestration configured with `name = "unknown"` selected and the Name field never typed into, `form.name` is empty and `resolved_title()` resolves to `Some("unknown")` (sanity that the fallback genuinely would trip the pre-fix comparison); `reserved_name_collision()` and `name_collision()` are both `false` — submission is NOT blocked.
+- **Does not assert:** the positive collision case (typing the literal `unknown`, covered by `orchestration/identity/039`); any case where the Name field is empty but the fallback resolves to something other than the sentinel (never a collision either way, not the interesting boundary).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a directory that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140), detected against the live orchestration's REAL reported cwd — the sibling isolated-clone workspace path (fork#544 M2b), never the picked directory itself (issue #605).
@@ -4477,6 +4491,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** for a picked directory `/work/already-live` and a live orchestration named `already-live-orchestrator-1` whose reported cwd is computed via the SAME `resolve_workspace_path`/`sanitize_workspace_segment` formula the real spawn path uses (yielding `/work/already-live-already-live-orchestrator-1`), `NewPaneFormState::new(...).with_live_orchestration_cwds(&[(live_cwd, live_name)])` leaves `live_orchestration_in_same_cwd == true`.
 - **Does not assert:** the rendered warning copy or the `[Submit]`-retained non-blocking contract (covered by `orchestration/guard/001`); the nested-pick (git-toplevel-relative) sibling derivation `live_orchestration_occupies`'s reviewer-B1 fix handles (`orchestration/identity/035`); the daemon `ListAgents` round-trip that supplies real `(cwd, name)` pairs in production (`live_orchestration_cwds_and_titles`, not unit-testable without a live daemon); the case where the live orchestration was opened with a blank Name (known limitation — see `orchestration/guard/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/guard/005 — The reserved-sentinel branch of the guard seam (typed Name is the literal `unknown`, an orchestration selected) renders the DISTINCT `RESERVED_NAME_WARNING` copy, not `guard/002`/`003`'s `NAME_COLLISION_WARNING` copy — proving the render seam actually picks the branch the fix (fork #222 edge 2 follow-up, reviewer F1 / auditor F1) introduced, which nothing pinned before this test even though `orchestration/identity/039` already pins `name_collision()` going `true` for the same case at the state layer.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving the private `render_new_pane_form` directly through a `TestBackend`/`render_overlay_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (a form with the Name field set to the literal `unknown` and one orchestration selected; no live-orchestration identities needed — `reserved_name_collision()` doesn't require any).
+- **Asserts:** the rendered buffer contains `RESERVED_NAME_WARNING`'s own copy (`"unknown" is a reserved name`) AND does NOT contain `NAME_COLLISION_WARNING`'s copy (`already in use by a live orchestration`) — proving the correct, distinct warning renders for this specific reserved-sentinel case rather than the generic live-name-collision copy `guard/002`/`003` exercise.
+- **Does not assert:** `[Submit]` inertness or `[Cancel]` click-rect non-overlap for this branch (both already covered generically by `orchestration/guard/002`/`003`, since `name_collision()` short-circuits true through `reserved_name_collision()` and the render seam's Submit-button gating doesn't distinguish the two sub-branches); the `Action::FormSubmit` dispatch-level refusal for this literal (covered generically by `orchestration/guard/003`, using a live-name collision rather than the sentinel); the state-layer `name_collision()`/`reserved_name_collision()` truth values themselves (covered by `orchestration/identity/039`/`040`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/lock
@@ -6576,6 +6597,22 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ### Scheduled tasks (PRD #127)
+
+#### scheduler/config
+
+##### scheduler/config/003 — Issue #222 edge 1: `validate_task` bounds `ScheduledTask.name` so two names sharing a 185-char prefix are rejected at load time, rather than loading successfully and later colliding once `sanitize_marker_creator` (`worktree_reclaim.rs`, `MARKER_CREATOR_MAX_CHARS` = 200) truncates the formatted `issue-dispatch:{task_name}#{issue}` creator string at the 200-char cutoff and makes both entries' markers byte-identical under `--mine`.
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::LoadedSchedules::parse`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** two task names sharing a 185-char prefix, differing only in their last 65 bytes, genuinely collide under today's `sanitize_marker_creator` 200-char truncation when formatted as `issue-dispatch:{name}#7` (sanity check); loading a `[[scheduled_tasks]]` TOML document containing both overlong names yields zero loaded tasks and two load errors — the producer rejects both rather than truncation silently aliasing them at the sink.
+- **Does not assert:** the exact byte-length bound `validate_task` enforces beyond "185+65 collides, so the cap must sit below that"; the malformed-entry/missing-command load-error paths (`scheduler/config/001`/`002`, informally numbered in `src/config.rs` but not yet catalog-registered); `sanitize_marker_creator`'s own truncation behavior in isolation (covered separately in `worktree_reclaim.rs`); any daemon-side reload or CLI surface (`scheduler/reload`/`scheduler/cli`).
+- **Platform coverage:** mac+linux+windows.
+
+##### scheduler/config/004 — Issue #222 edge 1 follow-up: `validate_task` also rejects a `ScheduledTask.name` that `worktree_reclaim::marker_creator_normalizes` says `sanitize_marker_creator` would change (a dropped control character, `\n`/`\r` mapped to a space, or leading/trailing whitespace trimmed) — closing the collision surface the length bound (`scheduler/config/003`) leaves open, since two short, distinct names like `"deploy prod"` and `"deploy\nprod"` collapse to the identical marker-creator string well under the 200-char truncation cap.
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::LoadedSchedules::parse`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** `"deploy prod"` and `"deploy\nprod"` genuinely sanitize to the identical marker-creator string, and `marker_creator_normalizes` distinguishes them (`false`/`true` respectively) as a sanity check; an already-normalized name (`"deploy prod"`) loads with zero errors; a name with an embedded newline (`"deploy\nprod"`) and a name with leading/trailing whitespace (`"  deploy prod  "`) are each rejected at load time with exactly one load error apiece.
+- **Does not assert:** the length-bound rejection path (covered by `scheduler/config/003`); `schedule add`'s mirrored write-time check (covered by the `schedule_cli.rs` unit tests alongside `scheduler/cli/001`); any daemon-side reload or CLI surface.
+- **Platform coverage:** mac+linux+windows.
 
 #### scheduler/reload
 

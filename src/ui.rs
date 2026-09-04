@@ -1134,6 +1134,20 @@ const SAME_CWD_ORCHESTRATION_WARNING: [&str; 3] = [
 const NAME_COLLISION_WARNING: [&str; 1] =
     ["  ! This name is already in use by a live orchestration."];
 
+/// fork #222 edge 2 follow-up (reviewer F2 / auditor F1): a DISTINCT warning
+/// for the sentinel-collision branch of [`NewPaneFormState::name_collision`]
+/// (see [`NewPaneFormState::reserved_name_collision`]). Reusing
+/// [`NAME_COLLISION_WARNING`] there told a user on an otherwise-empty deck
+/// that "a live orchestration" already holds the name they typed — false,
+/// since no live orchestration need exist for the reserved-identity case.
+/// Selected on the same render seam ([`render_new_pane_form`]) that picks
+/// `NAME_COLLISION_WARNING`; submitting is refused either way, only the copy
+/// changes.
+const RESERVED_NAME_WARNING: [&str; 2] = [
+    "  ! \"unknown\" is a reserved name -- every",
+    "    nameless orchestration already uses it.",
+];
+
 /// PRD #140 M4.0: the shared warning DECISION — does `form_cwd` collide with
 /// any live orchestration's real reported cwd? The single code path behind
 /// both the L1 seam ([`render_new_pane_orchestration_guard_to_buffer`]) and
@@ -2126,6 +2140,9 @@ impl NewPaneFormState {
     /// both point at is that the gate must ultimately compare
     /// POST-`sanitize_marker_creator` values, not just post-trim ones.
     fn name_collision(&self) -> bool {
+        if self.reserved_name_collision() {
+            return true;
+        }
         self.resolved_title().is_some_and(|t| {
             let t = t.trim();
             // PRD fork#603 fix round: `live_orchestration_occupies` rather
@@ -2144,6 +2161,46 @@ impl NewPaneFormState {
                     .iter()
                     .any(|name| name == t)
         })
+    }
+
+    /// The sentinel-collision half of [`Self::name_collision`], split out so
+    /// the render seam can pick [`RESERVED_NAME_WARNING`] instead of
+    /// [`NAME_COLLISION_WARNING`] for this specific case (fork #222 edge 2
+    /// follow-up, reviewer F2 / auditor F1: reusing the live-orchestration
+    /// copy here told the user something false — no live orchestration need
+    /// exist for the reserved-identity case to fire).
+    ///
+    /// Only meaningful when an orchestration is selected (mirrors
+    /// [`Self::name_collision`]'s own gating via [`Self::resolved_title`]),
+    /// even though the comparison itself doesn't need `resolved_title()`'s
+    /// value — a plain mode/card/authoring option carries no identity
+    /// uniqueness constraint at all.
+    ///
+    /// fork #222 edge 2 follow-up (auditor F2 / reviewer F8): compares
+    /// `self.name.trim()` — the RAW typed field — rather than
+    /// `resolved_title()` (which substitutes the orchestration's config name
+    /// or the project directory's basename when the Name field is empty).
+    /// The actual spawn path (`build_new_pane_request`) computes the creator
+    /// from `form.name.trim()` alone and never applies that fallback.
+    /// Comparing `resolved_title()` would hard-block an EMPTY Name field
+    /// whenever the config name or directory basename happens to be
+    /// `"unknown"`, even though the spawn path for an empty field computes
+    /// the ordinary, permitted nameless-spawn identity every other name
+    /// gets.
+    ///
+    /// fork #222: typing the literal `unknown` resolves, via
+    /// `orchestration_creator_string`, to the exact same
+    /// `orchestration:unknown` string the sentinel already reserves for a
+    /// NAMELESS spawn (`ORCHESTRATION_UNKNOWN_SENTINEL`) — so a typed name
+    /// here would collide with every future nameless orchestration's
+    /// marker-creator string. Treat it the same as an existing collision
+    /// rather than let it round-trip into that reserved identity.
+    fn reserved_name_collision(&self) -> bool {
+        let trimmed = self.name.trim();
+        !trimmed.is_empty()
+            && self.resolved_title().is_some()
+            && orchestration_creator_string(trimmed)
+                == crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL
     }
 
     /// PRD #140 M4.0: whether the form should render
@@ -21705,12 +21762,19 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // fork#192 M1.0: decided once and reused below to also drop `[Submit]`
     // from the action row.
     let name_collision = form.name_collision();
+    // fork #222 edge 2 follow-up (reviewer F2 / auditor F1): decided
+    // separately from `name_collision` so the render side can pick the
+    // sentinel-specific copy — `NAME_COLLISION_WARNING`'s "already in use by
+    // a live orchestration" is false for this branch.
+    let reserved_name_collision = form.reserved_name_collision();
     // PRD #140 M4.0 / fork#192 M1.0: the warning/refusal block — a blank
     // separator row plus the copy lines. A name collision takes priority over
     // the non-blocking same-cwd warning (it's the more urgent of the two and
     // blocks submit); empty when neither applies, so every other form state
     // keeps its exact prior geometry.
-    let warning_lines: &[&str] = if name_collision {
+    let warning_lines: &[&str] = if reserved_name_collision {
+        &RESERVED_NAME_WARNING
+    } else if name_collision {
         &NAME_COLLISION_WARNING
     } else if form.same_cwd_orchestration_warning() {
         &SAME_CWD_ORCHESTRATION_WARNING
@@ -38762,6 +38826,112 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #222 edge 2 — typing the literal `unknown` into the
+    /// new-pane form's Name field, with an orchestration selected, resolves
+    /// (via `orchestration_creator_string`) to `orchestration:unknown` —
+    /// byte-identical to `ORCHESTRATION_UNKNOWN_SENTINEL`
+    /// (`src/agent_pty.rs`), the sentinel meaning "no name was available".
+    /// `run_worktree_list_cli`'s `--mine` refuses that sentinel outright
+    /// ("which is never a real identity"), so an orchestration literally
+    /// named `unknown` is permanently unmatchable by `--mine`. Today
+    /// `name_collision` only checks the typed name against live orchestration
+    /// identities/wildcard names, with no equivalent check against this
+    /// literal, so nothing warns the user or blocks `[Submit]` before they
+    /// walk into it.
+    #[spec("orchestration/identity/039")]
+    #[test]
+    fn identity_039_name_field_literal_unknown_is_treated_as_a_collision() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_new_pane_form_key(tab, &mut ui); // Mode -> Name
+
+        for c in "unknown".chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+        // Select the orchestration directly (mirroring identity_012), so
+        // `name_collision()` — which requires a selected orchestration —
+        // applies to the literal we just typed.
+        ui.new_pane_form.as_mut().unwrap().selection_index = 1;
+
+        let typed = ui.new_pane_form.as_ref().unwrap().name.clone();
+        assert_eq!(
+            typed, "unknown",
+            "sanity: the typed literal round-trips unmodified"
+        );
+        assert_eq!(
+            orchestration_creator_string(&typed),
+            crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL,
+            "sanity: typing the literal `unknown` genuinely resolves to the sentinel \
+             string that `--mine` refuses to match"
+        );
+        assert!(
+            ui.new_pane_form.as_ref().unwrap().name_collision(),
+            "typing the literal `unknown` must be treated as a collision — blocking \
+             [Submit] and rendering NAME_COLLISION_WARNING the same way a live-name \
+             collision does — since it resolves to `orchestration:unknown`, byte- \
+             identical to ORCHESTRATION_UNKNOWN_SENTINEL, which `--mine` can never \
+             match again"
+        );
+    }
+
+    /// Scenario: Issue #222 edge 2 follow-up (reviewer F8 / auditor F2) — the
+    /// FALSE-POSITIVE case the raw-field fix closes. An orchestration whose
+    /// config `name` is literally `"unknown"` is selected, but the Name field
+    /// itself is left EMPTY (never typed into). Before this fix,
+    /// `name_collision` compared `resolved_title()` — which substitutes the
+    /// orchestration's config name when the Name field is empty — against the
+    /// sentinel, so this case wrongly blocked submission even though the user
+    /// typed nothing. The fixed `reserved_name_collision` compares the RAW
+    /// typed field instead, matching what `build_new_pane_request` actually
+    /// derives the creator string from for an empty field.
+    #[spec("orchestration/identity/040")]
+    #[test]
+    fn identity_040_empty_name_field_resolving_to_unknown_via_fallback_is_not_a_collision() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("unknown")],
+        );
+        form.selection_index = 1; // the only orchestration
+
+        assert_eq!(
+            form.name, "",
+            "sanity: the typed Name field is untouched/empty"
+        );
+        assert_eq!(
+            form.resolved_title().as_deref(),
+            Some("unknown"),
+            "sanity: with an empty Name field, resolved_title() falls back to the \
+             orchestration's config name, which is literally \"unknown\" here — \
+             this is the fallback value the pre-fix code wrongly compared"
+        );
+        assert!(
+            !form.reserved_name_collision(),
+            "an EMPTY Name field must not be treated as the reserved-name \
+             collision just because resolved_title()'s fallback (config name or \
+             directory basename) happens to resolve to \"unknown\" — the check \
+             must read the RAW typed field (empty here), not the resolved \
+             fallback title, since the actual spawn path (`build_new_pane_request`) \
+             computes the creator from the raw field alone and never applies \
+             that fallback"
+        );
+        assert!(
+            !form.name_collision(),
+            "name_collision() must not block submission for this case either, \
+             since it defers to reserved_name_collision() first"
+        );
+    }
+
     /// Scenario: Two RED cases pinning that the uniqueness gate normalizes
     /// on the SAME trim the sink (`build_new_pane_request`) applies, not a
     /// looser comparison (fork#192 audit F1). (a) A live orchestration holds
@@ -39389,6 +39559,48 @@ mod tests {
              `live_orchestration_occupies` per `(cwd, name)` pair, not stop \
              at a literal/canonical `cwd_matches` comparison a sibling \
              workspace path can never satisfy (issue #605)"
+        );
+    }
+
+    /// Scenario: Render the new-pane form with the typed Name field set to
+    /// the literal `unknown` and an orchestration selected — the
+    /// `reserved_name_collision` render branch (fork #222 edge 2 follow-up,
+    /// reviewer F1 / auditor F1) that neither `guard_002` nor `guard_003`
+    /// exercise, since both drive the OTHER branch (a typed name colliding
+    /// with a live orchestration's name), not the reserved sentinel literal.
+    /// `identity_039` already pins `name_collision()` going `true` for this
+    /// case at the state layer, but nothing before this test asserted WHICH
+    /// warning copy the render seam picks for it — the whole point of
+    /// splitting `RESERVED_NAME_WARNING` out from `NAME_COLLISION_WARNING`
+    /// was that the latter's "already in use by a live orchestration" claim
+    /// is false here (no live orchestration need exist), so this test proves
+    /// the distinct copy renders instead, not merely that a warning fires.
+    #[spec("orchestration/guard/005")]
+    #[test]
+    fn guard_005_reserved_name_literal_renders_distinct_warning_copy() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/work/reserved-name-check"),
+            "unknown".to_string(),
+            "mycmd".to_string(),
+            Vec::new(),
+            vec![make_orchestration("review")],
+        );
+        form.selection_index = 1; // the only orchestration
+
+        let text = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+            render_new_pane_form(frame, &form);
+        }));
+
+        assert!(
+            text.contains("\"unknown\" is a reserved name"),
+            "typing the literal `unknown` with an orchestration selected \
+             must render RESERVED_NAME_WARNING's distinct copy, got:\n{text}"
+        );
+        assert!(
+            !text.contains("already in use by a live orchestration"),
+            "the reserved-name case must NOT render NAME_COLLISION_WARNING's \
+             copy — no live orchestration need exist for this branch to \
+             fire, so that claim would be false here, got:\n{text}"
         );
     }
 
