@@ -802,23 +802,55 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
 ///
 /// `budget` bounds the SUCCESS path — spawn, read and the final wait, if all
 /// three complete without needing remediation — matching the sync form's
-/// single `deadline` loop over that same span. **It does not bound the
-/// remediation `kill().await` / `wait().await` pairs on the error, size-cap
-/// and timeout arms below** (PR #233 review, R2): `tokio::process::Child::
-/// kill()` is `start_kill()` followed by an unbounded `wait()`, so a child
-/// wedged in uninterruptible sleep (`D` state) still parks this function —
-/// now on the remediation path instead of the happy path. `SIGSTOP`ed
-/// children genuinely are fixed by this, since SIGKILL does terminate a
-/// stopped process; bounding the remediation arms themselves is filed as a
-/// follow-up rather than folded into this PR. Fork issue #160's audit (A4):
-/// an earlier version of this function wrapped only the read in `timeout`,
-/// leaving the final `wait()` unbounded on the success path — a child that
-/// reached stdout EOF without exiting (wedged in `D` state, `SIGSTOP`ed)
-/// parked this function, and with it the daemon's whole poll, forever, even
-/// when nothing had actually timed out. Keep the wait inside the bounded
-/// region if this is ever edited again.
+/// single `deadline` loop over that same span. The remediation arms below
+/// (error, size-cap and timeout) are bounded too (fork issue #241; PR #233
+/// review, R2 originally flagged them as the gap): each uses `start_kill()`
+/// — the non-async half of `tokio::process::Child::kill()`, which only sends
+/// `SIGKILL` and returns immediately — followed by `child.wait()` wrapped in
+/// `tokio::time::timeout(KILL_REAP_TIMEOUT, _)` rather than `kill().await`'s
+/// own unbounded `wait()`. A child wedged in uninterruptible sleep (`D`
+/// state) can still outlive `KILL_REAP_TIMEOUT` — SIGKILL does not preempt
+/// that state — so a bounded wait can still return before the child is
+/// actually reaped. That is fine: dropping `child` unconditionally lands it
+/// in tokio's global orphan queue via `Reaper::drop`/`PidfdReaper::drop`
+/// (Unix) — independent of `kill_on_drop`, and re-drained non-blockingly on
+/// every `SIGCHLD` — so no remediation arm below either parks indefinitely or
+/// leaves a permanent zombie. `kill_on_drop(true)` above is not what performs
+/// that reaping: a successful `start_kill()` already disarms it, so on this
+/// exact path it fires nothing at drop time. It remains a genuine safety net
+/// for the paths that drop `child` *without* reaching `start_kill()` first —
+/// a panic, or a future early return added between spawn and the first
+/// remediation arm. Fork issue #160's audit (A4): an earlier
+/// version of this function wrapped only the read in `timeout`, leaving the
+/// final `wait()` unbounded on the success path — a child that reached
+/// stdout EOF without exiting (wedged in `D` state, `SIGSTOP`ed) parked this
+/// function, and with it the daemon's whole poll, forever, even when nothing
+/// had actually timed out. Keep the wait inside the bounded region if this is
+/// ever edited again.
 async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -> Option<String> {
     use tokio::io::AsyncReadExt;
+
+    // Bounds each remediation arm's post-`start_kill()` wait (fork issue
+    // #241) — deliberately independent of `budget`/`PS_SAMPLE_BUDGET`, which
+    // bounds the overall sample and is already spent by the time remediation
+    // runs. By the time any remediation arm reaches this wait, `SIGKILL` has
+    // already been sent; this is purely "how long do we let the OS take to
+    // reap an already-killed child before we stop blocking on it and let
+    // tokio's orphan queue (see this function's doc comment above) take
+    // over." Short and fixed rather than a fraction of `budget`: a healthy
+    // reap after `SIGKILL` is near-instant, so this only needs enough slack
+    // to absorb scheduler noise on a loaded machine (this file's own doc
+    // comments above measure load averages of 11-19 during this repo's test
+    // runs), not enough to matter for the pathological case that leaves it
+    // unreaped (a `D`-state child), which this timeout is not meant to fix —
+    // the unconditional orphan-queue handoff on drop is. On any remediation
+    // path this adds at most `KILL_REAP_TIMEOUT` on top of `budget`; since
+    // [`sample_table_async`]'s first capture short-circuits the second on
+    // `None`, at most one of a sample's two captures can hit a remediation
+    // arm, so the daemon-visible ceiling for one [`process_table_async`]
+    // sample is `2 * PS_SAMPLE_BUDGET + KILL_REAP_TIMEOUT`, not the plain
+    // `2 * PS_SAMPLE_BUDGET` a reader would otherwise assume.
+    const KILL_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 
     if budget.is_zero() {
         return None;
@@ -835,8 +867,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
     let Some(mut pipe) = child.stdout.take() else {
         // Unreachable — stdout was just configured as a pipe — but returning
         // without reaping would leave a zombie behind on every call.
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
         return None;
     };
 
@@ -865,8 +897,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
                 "process-table sample's read failed — reporting no sample rather than a \
                  partial table"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
             return None;
         }
         Err(_) => {
@@ -875,8 +907,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
                 ?budget,
                 "process-table sample exceeded its budget — killing it and reporting no sample"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
             return None;
         }
     };
@@ -896,8 +928,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
                 "process-table sample exceeded its size cap — killing it and reporting no sample"
             );
         }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
         return None;
     }
 
@@ -917,8 +949,8 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
                 "process-table sample's child did not exit after its stdout was fully read — \
                  killing it and reporting no sample"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
             return None;
         }
     };
@@ -1056,8 +1088,10 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 /// is a second, narrower line of defense — it kills a `ps` that is merely
 /// slow — not a substitute for the caller's: a genuinely D-state-wedged child
 /// does not act on `kill()` until it leaves D-state, so `capture_bounded_async`'s
-/// own remediation `wait()` can itself run long past its nominal budget on
-/// that specific pathology, which is exactly the case the external
+/// own remediation `wait()` can now overrun its nominal budget by at most
+/// [`capture_bounded_async`]'s fixed `KILL_REAP_TIMEOUT` (fork issue #241),
+/// never unboundedly — but that residual slack, plus the case of a
+/// slow-but-not-wedged `ps` merely running long, is exactly what the external
 /// timeout-with-retention exists to bound (issue #429/#500 — see
 /// `SAMPLE_TIMEOUT` and `inflight` in `run_shell_activity_monitor_with`).
 ///
@@ -1316,6 +1350,136 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the budget must actually bound the call (took {:?})",
             started.elapsed()
+        );
+    }
+
+    /// Fork issue #241: `capture_bounded_async`'s remediation arms — the ones
+    /// that react to a read error, a size-cap trip, or a timeout — used to
+    /// call `child.kill().await` followed by `child.wait().await` with no
+    /// bound on the pair itself. `Child::kill()` is `start_kill()` plus an
+    /// *unbounded* `wait()` (see this function's own doc comment, PR #233
+    /// review R2), so a child wedged in uninterruptible sleep (`D` state)
+    /// could park the remediation path forever — the same failure the
+    /// happy-path `wait()` was fixed for in fork #160/PR #233 (issue A4),
+    /// just reached through a different door.
+    ///
+    /// The real trigger (a `D`-state child) cannot be created deterministically
+    /// from userspace in a portable, CI-safe way: `SIGKILL` cannot be blocked
+    /// or ignored by an ordinary process, so any real test child dies near-
+    /// instantly under `kill()` regardless of whether the remediation arms are
+    /// bounded, and the one thing that genuinely *can* delay reaping (real
+    /// `D` state, or a ptrace-stop trick) either needs a wedged kernel I/O
+    /// path this test cannot force, or a mechanism CI sandboxes routinely
+    /// deny — see the existing `SlowReapChild` doubles in
+    /// `platform/proc/mod.rs` for the same tradeoff on the sibling
+    /// `portable_pty::Child`-based teardown paths; that pattern is not
+    /// reusable here because `capture_bounded_async` is hard-wired to the
+    /// concrete `tokio::process::Child`, not a trait object, and giving it a
+    /// swappable seam is a production-code change (the coder's job, not the
+    /// tester's).
+    ///
+    /// So this pins the STRUCTURAL half of the fix instead of the runtime
+    /// half: issue #241 itself named the defect as the naked, unbounded
+    /// `let _ = child.kill().await; let _ = child.wait().await;` idiom
+    /// repeated across all five remediation arms — this asserts that idiom
+    /// is gone from `capture_bounded_async` entirely. The scan is
+    /// whitespace/indentation-agnostic (the five sites sit at different
+    /// nesting depths) so it does not overfit to today's exact formatting.
+    /// It was a genuine RED before the fix (all five sites matched) and is
+    /// GREEN now that every remediation arm has been rewritten to something
+    /// bounded — `child.start_kill()` plus
+    /// `tokio::time::timeout(_, child.wait())`, the shape issue #241 itself
+    /// suggested — rather than the bare await pair. A fix that instead
+    /// wrapped the exact two-line pair unchanged inside an outer
+    /// `timeout(async { .. })` would still read as unbounded to this scan
+    /// even though it would behave correctly; that gap is accepted
+    /// deliberately in exchange for a test that runs in microseconds and
+    /// cannot flake, and is exactly why the assertion message below spells
+    /// out the expected shape rather than leaving the fix implicit.
+    ///
+    /// Precedent for pinning a structural invariant this way — when the
+    /// underlying property has no direct runtime observable — is
+    /// `embedded_pane.rs`'s `parser_is_constructed_in_exactly_one_place`.
+    ///
+    /// Scenario: reads this file's own source (`include_str!`, compile-time,
+    /// no I/O at test time), isolates `capture_bounded_async`'s body, and
+    /// counts how many times the naked `child.kill().await` /
+    /// `child.wait().await` pair appears back-to-back with nothing else
+    /// between them. That count was 5 before the fix, one per remediation
+    /// arm named in issue #241; it must remain 0. Also asserts the inverse
+    /// gap stays closed for any future arm: every `child.wait()` line must
+    /// also contain `timeout(`, and no bare `child.kill()` call may appear.
+    #[spec("status/shell-activity/012")]
+    #[test]
+    fn shell_activity_012_capture_bounded_async_remediation_arms_never_leave_kill_and_wait_unbounded()
+     {
+        const SRC: &str = include_str!("unix.rs");
+        // `include_str!` yields the file exactly as checked out, and Windows
+        // checks it out with CRLF endings — normalize once so this reads the
+        // same on every platform (same caveat as
+        // `embedded_pane.rs::parser_is_constructed_in_exactly_one_place`).
+        let src = SRC.replace("\r\n", "\n");
+
+        let fn_start = src
+            .find("async fn capture_bounded_async(")
+            .expect("`capture_bounded_async` must exist");
+        let body_end = src[fn_start..]
+            .find("\n}\n")
+            .map(|rel| fn_start + rel)
+            .expect("`capture_bounded_async` must end at a top-level brace");
+        let body = &src[fn_start..body_end];
+
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        let mut naked_pairs = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if *line != "let _ = child.kill().await;" {
+                continue;
+            }
+            // Tolerate a blank line between the two calls even though none of
+            // today's five sites have one, so a purely cosmetic reflow can't
+            // make this scan miss a real naked pair.
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].is_empty() {
+                j += 1;
+            }
+            if lines.get(j) == Some(&"let _ = child.wait().await;") {
+                naked_pairs.push(i);
+            }
+        }
+
+        assert_eq!(
+            naked_pairs.len(),
+            0,
+            "issue #241: `capture_bounded_async` must not leave any remediation \
+             `child.kill().await` / `child.wait().await` pair unbounded — found {} naked \
+             pair(s) at body-relative line index {naked_pairs:?}; bound each remediation arm \
+             instead (e.g. `child.start_kill()` + `tokio::time::timeout(_, child.wait())`) \
+             rather than awaiting the pair directly",
+            naked_pairs.len()
+        );
+
+        // The forward check above only catches a mangled COPY of today's exact
+        // idiom. The inverse gap — a newly added remediation arm reaping with
+        // a bare `child.wait()` and no `timeout(` at all, or with a bare
+        // `child.kill().await` instead of `start_kill()` — would reintroduce
+        // the same unbounded park and pass the scan above unchanged. These two
+        // checks close that gap and, as of this fix, pass against every
+        // existing site with no changes needed.
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("child.wait()") {
+                assert!(
+                    line.contains("timeout("),
+                    "issue #241: every `child.wait()` in `capture_bounded_async` must be \
+                     wrapped in `tokio::time::timeout(...)` on the same line — found an \
+                     unwrapped wait at body-relative line index {i}: {line:?}"
+                );
+            }
+        }
+        assert!(
+            !body.contains("child.kill()"),
+            "issue #241: `capture_bounded_async` must not call the unbounded `child.kill()` \
+             directly — use `child.start_kill()` (non-async) followed by a bounded \
+             `tokio::time::timeout(_, child.wait())` instead"
         );
     }
 

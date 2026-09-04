@@ -895,6 +895,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** anything about a real process table, a real agent, or the daemon's poll loop (`run_shell_activity_monitor`) — this is the pure discriminator only. Does not assert what happens when SOME candidates are unreadable and OTHERS are confirmed busy (a confirmed-busy candidate already short-circuits to `Some(true)` before the unreadable one is reached, per the function's existing candidate-order semantics, untouched by this fix).
 - **Platform coverage:** mac+linux+windows (pure data, no OS process calls — `scan.rs` compiles everywhere per its module doc comment).
 
+##### status/shell-activity/012 — `capture_bounded_async`'s remediation arms never leave a naked, unbounded `child.kill().await` / `child.wait().await` pair (fork issue #241).
+- **Layer:** L1 (in-src unit test, `src/platform/proc/unix.rs`; no daemon, no PTY).
+- **Agent:** none (`include_str!` reads this file's own source at compile time; no process is spawned).
+- **Asserts:** scanning `capture_bounded_async`'s body for the naked `let _ = child.kill().await; let _ = child.wait().await;` idiom (whitespace/indentation-agnostic, tolerant of a blank line between the two calls) finds zero occurrences. Before the fix this idiom appeared once per remediation arm (five sites, one per read-error/size-cap/timeout path); the fix must rewrite every arm to something bounded (e.g. `child.start_kill()` plus `tokio::time::timeout(_, child.wait())`) rather than awaiting the pair directly. Also guards the inverse gap for future arms: every `child.wait()` line must also contain `timeout(`, and no bare `child.kill()` call (only `start_kill()`) may appear anywhere in the body.
+- **Does not assert:** the runtime half of the fix — that a remediation arm actually returns promptly against a real wedged (`D`-state) child. `SIGKILL` cannot be blocked or ignored by an ordinary process, so no portable, CI-safe test child can be made to reap slowly under `kill()`, and `capture_bounded_async` is hard-wired to the concrete `tokio::process::Child` rather than a swappable trait object (unlike the `SlowReapChild` doubles in `platform/proc/mod.rs`). This test pins the structural shape only — a fix that wraps the exact unbounded pair unchanged inside an outer `timeout(async { .. })` would still read as unbounded to this scan even though it would behave correctly; that gap is accepted deliberately for a test that runs in microseconds and cannot flake.
+- **Platform coverage:** mac+linux (`unix.rs` is `#[cfg(unix)]` throughout; the scan itself is pure string matching with no OS process calls).
+
 ### Agent protocol
 
 #### agent/readiness
