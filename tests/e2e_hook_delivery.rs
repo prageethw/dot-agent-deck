@@ -61,3 +61,73 @@ fn delivery_001_session_start_creates_card() {
     // or display_name".
     deck.wait_for_string("m2demo");
 }
+
+/// Scenario: Issue #393 — connect directly to the daemon's hook socket and
+/// write a partial line with no terminating newline, then hold the
+/// connection open without ever completing it. Asserts the daemon
+/// closes/rejects the connection within a bounded window instead of
+/// blocking `next_line()` on it forever, which is today's behavior: the
+/// hook-socket reader in `run_hook_loop` (`src/daemon.rs`) has no cap and
+/// no total-operation deadline, unlike the reply-path read in `src/hook.rs`
+/// this fix is meant to mirror.
+#[spec("hooks/delivery/008")]
+#[test]
+fn delivery_008_unterminated_hook_socket_line_is_bounded() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    let deck = TuiDeck::launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    let mut stream = UnixStream::connect(deck.hook_socket_path()).expect("connect to hook socket");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .expect("set read timeout");
+
+    // No trailing newline: `BufReader::lines().next_line()` never completes
+    // this line, so a peer that keeps the connection open without ever
+    // sending one — exactly what an attacker or a wedged agent would do —
+    // should not be able to hold the daemon's read loop (and its
+    // accumulating buffer) open forever.
+    stream
+        .write_all(b"{\"session_id\":\"issue-393-unterminated\"")
+        .expect("write partial hook payload");
+    stream.flush().expect("flush partial hook payload");
+
+    // Comfortably above the 5s total-operation deadline the reply-path read
+    // in `src/hook.rs` already uses for the same idiom — a correct fix is
+    // expected to close well inside this budget.
+    let budget = Duration::from_secs(10);
+    let deadline = Instant::now() + budget;
+    let mut buf = [0u8; 64];
+    let mut closed = false;
+    while Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        closed,
+        "expected the daemon to close/reject a hook-socket connection that sent a line with no \
+         terminating newline within {budget:?}, but it never did — today's `next_line()` read \
+         in `run_hook_loop` (src/daemon.rs) has no cap and no total-operation deadline (issue \
+         #393), so a peer that never completes its line can hold the connection open \
+         indefinitely"
+    );
+}
