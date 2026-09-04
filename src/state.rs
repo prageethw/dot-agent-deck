@@ -8512,6 +8512,24 @@ impl AppState {
                 TOOL_DETAIL_MAX_LEN,
             ));
         }
+        // Issue #664 / #665: `event.cwd` and `event.user_prompt` are stored
+        // verbatim onto `session.cwd` / `session.last_user_prompt` /
+        // `session.first_prompts` below with no sanitization, unlike
+        // `tool_name`/`tool_detail` just above — scrub them at the same
+        // ingest choke point, before they're stored, for the same reason
+        // given above (a stored value is inherited and re-read, so scrubbing
+        // only at a render seam would miss every other reader). No new
+        // length bound: `event.cwd` has none today, and `event.user_prompt`
+        // is already truncated to `USER_PROMPT_MAX_LEN` by the hook CLI
+        // before it reaches this daemon.
+        if let Some(cwd) = event.cwd.take() {
+            event.cwd = Some(crate::untrusted_text::strip_control_and_bidi(&cwd, false));
+        }
+        if let Some(prompt) = event.user_prompt.take() {
+            event.user_prompt = Some(crate::untrusted_text::strip_control_and_bidi(
+                &prompt, false,
+            ));
+        }
 
         // Only accept events from panes managed by our app.
         // Events without a pane_id (external agents) are rejected when we have

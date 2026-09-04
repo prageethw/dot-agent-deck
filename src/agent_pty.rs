@@ -477,14 +477,21 @@ pub fn resolve_display_name(form_name: Option<&str>, command: Option<&str>) -> S
 }
 
 /// Returns `true` if `value` is acceptable to retain as a cwd: non-empty,
-/// ≤ [`CWD_MAX_LEN`] bytes, and free of ASCII control characters (bytes
-/// < 0x20 plus 0x7F DEL). Mirrors the [`is_valid_display_name`] filter so
-/// the dashboard, which renders `cwd`'s basename through `Span::raw`,
-/// can't be tricked into emitting terminal control sequences via a
-/// hostile `SetAgentLabel` like `/tmp/\x1b[31mpwn`. Unicode beyond 0x7F
-/// stays valid (paths are UTF-8 and legitimately contain accented bytes).
+/// ≤ [`CWD_MAX_LEN`] bytes, free of ASCII control characters (bytes < 0x20
+/// plus 0x7F DEL), and free of Unicode bidi formatting/override characters.
+/// Mirrors the [`is_valid_display_name`] filter so the dashboard, which
+/// renders `cwd`'s basename through `Span::raw`, can't be tricked into
+/// emitting terminal control sequences via a hostile `SetAgentLabel` like
+/// `/tmp/\x1b[31mpwn`, nor into a spoofed path via a `U+202E`-style bidi
+/// override (issue #664). Unicode beyond 0x7F otherwise stays valid (paths
+/// are UTF-8 and legitimately contain accented bytes).
 pub fn is_valid_cwd(value: &str) -> bool {
-    !value.is_empty() && value.len() <= CWD_MAX_LEN && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+    !value.is_empty()
+        && value.len() <= CWD_MAX_LEN
+        && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+        && !value
+            .chars()
+            .any(crate::untrusted_text::is_bidi_format_char)
 }
 
 /// Extracted from [`AgentPtyRegistry::spawn_agent`] (SonarCloud cognitive
