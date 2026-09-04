@@ -20127,7 +20127,8 @@ fn render_bottom_bar(
             // [Command Mode Ctrl+D] affordance at the right edge — clicking it
             // returns to the dashboard (command mode) exactly as Ctrl+D does.
             if let Some((ref msg, _)) = ui.status_message {
-                let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+                let sanitized = crate::untrusted_text::strip_control_and_bidi(msg, false);
+                let line = Line::styled(sanitized, Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
             }
             // PRD #241 M4: same mode-aware seam the wide bar uses, so the two
@@ -20162,7 +20163,8 @@ fn render_bottom_bar(
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
-                let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
+                let sanitized = crate::untrusted_text::strip_control_and_bidi(msg, false);
+                let line = Line::styled(sanitized, Style::default().fg(Color::Yellow));
                 frame.render_widget(Paragraph::new(line), area);
                 // A transient status message occupies the bar row this frame;
                 // no buttons are drawn, so nothing is hit-testable.
