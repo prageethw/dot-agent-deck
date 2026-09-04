@@ -4442,11 +4442,11 @@ without depending on the config struct API.
 
 #### orchestration/guard
 
-##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
+##### orchestration/guard/001 — Opening an orchestration in a directory that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140), detected against the live orchestration's REAL reported cwd — the sibling isolated-clone workspace path (fork#544 M2b), never the picked directory itself (issue #605).
 - **Layer:** L1 (in-process `TestBackend` via `render_new_pane_orchestration_guard_to_buffer`; no PTY, no subprocess).
-- **Agent:** none (the render seam supplies synthetic live-daemon orchestration cwd records).
-- **Asserts:** an orchestration selected for a cwd matching an existing live orchestration renders a warning containing `.dot-agent-deck` and `worktree` while retaining `[Submit]`; the same form for a fresh cwd renders neither warning substring.
-- **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational).
+- **Agent:** none (the render seam supplies synthetic live-daemon `(cwd, name)` records).
+- **Asserts:** an orchestration selected for a directory that also hosts a live orchestration whose reported cwd is the SIBLING WORKSPACE PATH that directory's isolated-clone provisioning would actually produce (`<basename>-<sibling-segment>`, not the picked directory itself — issue #605) renders a warning containing `.dot-agent-deck` and `worktree` while retaining `[Submit]`; the same form for a fresh directory (no live orchestration's sibling path matches it) renders neither warning substring.
+- **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational); the nested-pick (git-toplevel-relative) sibling derivation, which neither this test nor `orchestration/guard/004` exercises (covered generically by `live_orchestration_occupies`'s own reviewer-B1 coverage, `orchestration/identity/035`); the case where the live orchestration was opened with a blank Name (the identity fed to the comparison is the display title, not the segment source, and the two diverge for a blank Name — the warning is still dead for that case; a known limitation, not covered here).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/guard/002 — A name collision (the typed Name matches a name a live orchestration already holds) renders a BLOCKING refusal on the same guard seam `guard/001` uses; `[Submit]` renders present-but-INERT rather than removed, and `[Cancel]`'s clickable rect does not overlap it; a distinct typed name renders normally (fork#192 M1.0; contract corrected twice in review round 2 — see below).
@@ -4463,6 +4463,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** dispatching `Action::FormSubmit` against a form whose typed Name (`myproj-orchestrator-1`) matches a live orchestration name results in zero recorded orchestration identities on the `CapturingPaneController` (no pane spawned), `ui.mode` still `UiMode::NewPaneForm`, and `ui.new_pane_form` still `Some` (not taken).
 - **Does not assert:** the render-layer inertness of the `[Submit]` button itself (covered by `orchestration/guard/002`); the Enter-key submit door (covered by `orchestration/identity/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/guard/004 — Direct-unit pin (below `orchestration/guard/001`'s render layer) that `NewPaneFormState::with_live_orchestration_cwds`/`live_orchestration_in_same_cwd` detect a live orchestration's REAL reported cwd — the sibling isolated-clone workspace path fork#544 M2b's unconditional provisioning always produces — as occupying the SAME picked directory the live orchestration was itself opened from, rather than only a literal/canonical match on the picked directory itself (issue #605).
+- **Layer:** L1 (fast synthetic direct-call unit test, `src/ui.rs`'s own `#[cfg(test)] mod tests`, calling `NewPaneFormState::with_live_orchestration_cwds` directly and reading the cached `live_orchestration_in_same_cwd` field it sets — no render, no `TestBackend`).
+- **Agent:** none.
+- **Asserts:** for a picked directory `/work/already-live` and a live orchestration named `already-live-orchestrator-1` whose reported cwd is computed via the SAME `resolve_workspace_path`/`sanitize_workspace_segment` formula the real spawn path uses (yielding `/work/already-live-already-live-orchestrator-1`), `NewPaneFormState::new(...).with_live_orchestration_cwds(&[(live_cwd, live_name)])` leaves `live_orchestration_in_same_cwd == true`.
+- **Does not assert:** the rendered warning copy or the `[Submit]`-retained non-blocking contract (covered by `orchestration/guard/001`); the nested-pick (git-toplevel-relative) sibling derivation `live_orchestration_occupies`'s reviewer-B1 fix handles (`orchestration/identity/035`); the daemon `ListAgents` round-trip that supplies real `(cwd, name)` pairs in production (`live_orchestration_cwds_and_titles`, not unit-testable without a live daemon); the case where the live orchestration was opened with a blank Name (known limitation — see `orchestration/guard/001`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/lock
