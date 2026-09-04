@@ -472,9 +472,15 @@ enum WorktreeCmd {
         /// Fork #166 M3.0: list only worktrees this orchestration created,
         /// determined by matching each worktree's marker owner against
         /// `DOT_AGENT_DECK_WORKTREE_OWNER`. Fails loudly (non-zero exit) if
-        /// the variable is absent or set to the `orchestration:unknown`
-        /// sentinel, rather than silently returning everything or nothing —
-        /// a wrong answer here hands one orchestration another's worktree.
+        /// the variable is set to the `orchestration:unknown` sentinel, or
+        /// if it is absent while running inside an orchestration pane
+        /// (issue #300: detected via `DOT_AGENT_DECK_PANE_ID`). If it is
+        /// absent outside an orchestration pane -- a human at an
+        /// interactive terminal -- falls back to this caller's own
+        /// `gh`-resolved identity instead, refusing only if that
+        /// resolution also fails. Never silently returns everything or
+        /// nothing — a wrong answer here hands one orchestration another's
+        /// worktree.
         #[arg(long)]
         mine: bool,
     },
@@ -2622,8 +2628,15 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
             // from "an orchestration pane that lost its identity" (the case
             // the fail-loud contract exists for). Only refuse once BOTH the
             // env var and human-identity resolution have failed.
+            //
+            // `var_os(...).is_none()`, not `var(...).is_err()`: the latter
+            // is also true for `VarError::NotUnicode`, which would treat a
+            // non-UTF-8 `DOT_AGENT_DECK_PANE_ID` as "absent" and fall
+            // through to the human-identity fallback -- the fail-open
+            // direction this gate exists to prevent -- and is also false
+            // for `Ok("")`, which `var_os` correctly still reports present.
             Err(std::env::VarError::NotPresent)
-                if std::env::var(DOT_AGENT_DECK_PANE_ID).is_err() =>
+                if std::env::var_os(DOT_AGENT_DECK_PANE_ID).is_none() =>
             {
                 match resolve_human_owner().identity_string() {
                     Some(identity) => Some(identity),
@@ -2738,9 +2751,14 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
         // explicitly accepted that divergence as cosmetic ONLY because "no
         // consumer treats `owner`'s mere presence as an ownership signal."
         // `--mine` is now such a consumer, so the conjunct restores the
-        // precondition that comment relies on. `is_mine` (issue #221 review
-        // round) is the same predicate `worktree/reclaim/030` asserts
-        // against, so this retain and that test cannot silently drift apart.
+        // precondition that comment relies on -- for `owner_kind == "agent"`
+        // rows. Issue #300 relaxed `is_mine` so an `owner_kind == "human"`
+        // row (a human's own `resolve_worktree_owner` fallback, never a
+        // marker read) matches on `owner` alone, since a human's unmarked
+        // worktree has no `owned_git_dir` marker to disagree over in the
+        // first place. `is_mine` (issue #221 review round; issue #300 round)
+        // is the same predicate `worktree/reclaim/030`/`083` assert against,
+        // so this retain and those tests cannot silently drift apart.
         reports.retain(|r| is_mine(r, owner));
     }
 
