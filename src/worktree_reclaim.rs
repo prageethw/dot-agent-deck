@@ -186,7 +186,7 @@ const VERDICT_ISOLATED_CLONE_RECLAIMABLE: &str = "isolated_clone_reclaimable";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrState {
     Merged { head_ref_oid: Option<String> },
-    Open,
+    Open { head_ref_oid: Option<String> },
     ClosedUnmerged,
     NoPr,
     Unresolvable(String),
@@ -196,7 +196,7 @@ impl PrState {
     fn label(&self) -> &'static str {
         match self {
             PrState::Merged { .. } => "merged",
-            PrState::Open => "open",
+            PrState::Open { .. } => "open",
             PrState::ClosedUnmerged => "closed_unmerged",
             PrState::NoPr => "no_pr",
             PrState::Unresolvable(_) => "unresolvable",
@@ -483,7 +483,7 @@ pub fn decide(pr_state: &PrState, clean: &Cleanliness, ownership: Ownership) -> 
             },
         },
         PrState::NoPr => Verdict::Keep("no pull request found for this branch".to_string()),
-        PrState::Open => Verdict::Keep("pull request is still open".to_string()),
+        PrState::Open { .. } => Verdict::Keep("pull request is still open".to_string()),
         PrState::ClosedUnmerged => {
             Verdict::Keep("pull request was closed without being merged".to_string())
         }
@@ -1603,7 +1603,13 @@ fn query_pr_state(
                     .map(|s| s.to_string());
                 PrState::Merged { head_ref_oid }
             }
-            Some("OPEN") => PrState::Open,
+            Some("OPEN") => {
+                let head_ref_oid = one
+                    .get("headRefOid")
+                    .and_then(|o| o.as_str())
+                    .map(|s| s.to_string());
+                PrState::Open { head_ref_oid }
+            }
             Some("CLOSED") => PrState::ClosedUnmerged,
             Some(other) => PrState::Unresolvable(format!("unrecognized PR state {other:?}")),
             None => PrState::Unresolvable("PR entry has no `state` field".to_string()),
@@ -1687,7 +1693,15 @@ fn resolve_origin_pr_state(repo_dir: &Path, branch: &str) -> (PrState, Option<St
 ///   `origin` found nothing, never a tiebreaker or override for a real
 ///   `origin`-side answer. Symmetrically, if `origin` already resolves
 ///   cleanly to one PR, a DIFFERENT PR that happens to also exist on
-///   `upstream` is irrelevant and never queried.
+///   `upstream` is never queried — genuinely irrelevant for an `origin`
+///   outcome of `Open`, `ClosedUnmerged`, or `Unresolvable`, since `decide()`
+///   keeps regardless of what `upstream` might have said. It is **not**
+///   irrelevant for an `origin` outcome of `Merged`: that is the one state
+///   `decide()` can map straight to `Verdict::Remove`, and `origin`-sourced
+///   `Merged` is trusted with no `headRefOid` check at all (a pre-existing,
+///   out-of-scope design choice — see [`resolve_pr_state_for_linked_worktree`]).
+///   An unqueried, differently-stated `upstream` PR for the same branch name
+///   is simply never consulted in that case, not proven harmless.
 /// - `upstream` is consulted only when `origin` resolved to `NoPr` AND an
 ///   `upstream` remote exists with a slug [`derive_repo_slug_for_remote`]
 ///   can parse. Its result — whatever it is, including its own `NoPr` or
@@ -1773,12 +1787,14 @@ fn resolve_pr_state_for_isolated_clone(repo_dir: &Path, branch: &str) -> PrState
 /// was merged. So a `Merged` or `Open` verdict sourced from `upstream` is
 /// downgraded to `Unresolvable` unless `local_head_sha` is `Some` and equals
 /// the reply's own `headRefOid` — cryptographic identity in place of a
-/// name+owner coincidence. `PrState::Open` never carries a `headRefOid` at
-/// all ([`query_pr_state`] only captures it for `Merged`), so an
-/// `upstream`-sourced `Open` is always downgraded; that is intentional, not
-/// an oversight — there is nothing to bind it to. A `None` `local_head_sha`
-/// (the worktree's own HEAD could not be resolved) fails closed the same
-/// way, never treated as a free pass. `ClosedUnmerged`, `NoPr`, and an
+/// name+owner coincidence. [`query_pr_state`] captures `headRefOid` for an
+/// OPEN reply the same way it does for a MERGED one (`gh pr list --json`
+/// requests the field regardless of state), so an `upstream`-sourced `Open`
+/// is bound to the same SHA check as `Merged` rather than always downgraded
+/// — there is something to bind it to. A `None` `local_head_sha` (the
+/// worktree's own HEAD could not be resolved), or a reply that itself
+/// carries no `headRefOid`, fails closed the same way, never treated as a
+/// free pass. `ClosedUnmerged`, `NoPr`, and an
 /// already-`Unresolvable` result pass through unchanged regardless of
 /// source — none of those needs, or benefits from, a SHA check.
 fn resolve_pr_state_for_linked_worktree(
@@ -1808,12 +1824,23 @@ fn resolve_pr_state_for_linked_worktree(
                 )
             }
         }
-        PrState::Open => PrState::Unresolvable(
-            "an upstream-sourced OPEN verdict carries no headRefOid to confirm it is this \
-             worktree's own branch rather than a same-named-branch collision on a third \
-             party's repository"
-                .to_string(),
-        ),
+        PrState::Open { ref head_ref_oid } => {
+            let confirmed = matches!(
+                (local_head_sha, head_ref_oid.as_deref()),
+                (Some(local), Some(remote)) if local == remote
+            );
+            if confirmed {
+                state
+            } else {
+                PrState::Unresolvable(
+                    "an upstream-sourced OPEN verdict's headRefOid does not match this \
+                     worktree's own local branch tip -- refusing to trust what may be a \
+                     same-named-branch collision on a third party's repository rather than \
+                     this worktree's own PR"
+                        .to_string(),
+                )
+            }
+        }
         other => other,
     }
 }
@@ -3425,7 +3452,11 @@ mod tests {
     #[test]
     fn decide_open_and_closed_unmerged_keep() {
         assert!(matches!(
-            decide(&PrState::Open, &Cleanliness::Clean, Ownership::Ours),
+            decide(
+                &PrState::Open { head_ref_oid: None },
+                &Cleanliness::Clean,
+                Ownership::Ours
+            ),
             Verdict::Keep(_)
         ));
         assert!(matches!(
@@ -5827,7 +5858,7 @@ mod tests {
         let state = resolve_pr_state(&repo, branch);
         assert_eq!(
             state,
-            PrState::Open,
+            PrState::Open { head_ref_oid: None },
             "a branch with no PR on origin but a genuinely OPEN PR on upstream must resolve to \
              PrState::Open, not NoPr -- got {state:?}"
         );
