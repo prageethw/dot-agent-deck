@@ -5983,6 +5983,241 @@ mod tests {
         );
     }
 
+    /// Scenario: fork issue #191 round 3 (R1a) -- the mirror case to `089`
+    /// above: same fixture shape (a real repo, `origin` + `upstream`
+    /// remotes, `write_dual_repo_merged_upstream_gh_stub`'s stub), but the
+    /// stub's `headRefOid` genuinely EQUALS the worktree's own local branch
+    /// tip (`git_rev_parse_head`) rather than a forged colliding value.
+    /// `resolve_pr_state_for_linked_worktree` must accept it as
+    /// `PrState::Merged`. This is expected to be GREEN today -- the
+    /// accept-path logic already exists in the function's `confirmed` match
+    /// arm -- the gap this closes is that nothing exercised the accept path
+    /// at all: reverting it back to an unconditional downgrade of every
+    /// `upstream`-sourced `Merged` would leave `089` (and every other
+    /// existing test) green, since none of them cover the SHA-matches case.
+    #[spec("worktree/reclaim/090")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_090_linked_worktree_upstream_merged_verdict_accepted_when_head_ref_oid_matches()
+     {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        add_upstream_remote(&repo, "vfarcic", "dot-agent-deck");
+
+        let branch = "fix/191-matching-head-ref-oid";
+        let local_head_sha = git_rev_parse_head(&repo);
+
+        let bindir = scratch.path().join("bin");
+        write_dual_repo_merged_upstream_gh_stub(
+            &bindir,
+            branch,
+            "test-org/test-repo",
+            "vfarcic/dot-agent-deck",
+            "vfarcic",
+            &local_head_sha,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let state = resolve_pr_state_for_linked_worktree(&repo, branch, Some(&local_head_sha));
+        assert!(
+            matches!(state, PrState::Merged { .. }),
+            "an upstream-sourced MERGED PR whose headRefOid genuinely equals this worktree's \
+             own local branch tip must be accepted as PrState::Merged, not downgraded -- got \
+             {state:?}"
+        );
+    }
+
+    /// Scenario: fork issue #191 round 3 (R1b) -- pins the PRODUCTION
+    /// WIRING, not just the wrapper function in isolation. Builds a real
+    /// linked worktree via `add_worktree` (the same helper `021` already
+    /// uses to drive `examine_worktrees`), adds an `upstream` remote, and
+    /// answers a MERGED upstream PR whose `headRefOid` collides with (does
+    /// not equal) the worktree's own actual branch tip -- `089`'s exact
+    /// scenario, but exercised through `examine_worktrees`, the real call
+    /// site, instead of calling `resolve_pr_state_for_linked_worktree`
+    /// directly. Reviewer's round-2 concern: reverting
+    /// `examine_worktrees`'s call-site switch back to the old
+    /// `resolve_pr_state_with_source(&wt.path, branch).0` -- which never
+    /// even looks at `headRefOid` -- would leave `083`/`087`/`088`/`089`/`090`
+    /// all green, since none of them drives `examine_worktrees` itself. This
+    /// must report `Unresolvable` (label `"unresolvable"`), never `Merged`,
+    /// and a verdict other than `"remove"`.
+    #[spec("worktree/reclaim/091")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_091_examine_worktrees_upstream_merged_collision_stays_unresolvable_through_real_entry_point()
+     {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        add_upstream_remote(&repo, "vfarcic", "dot-agent-deck");
+
+        let local_head_sha = git_rev_parse_head(&repo);
+        let branch = "fix/191-examine-worktrees-collision";
+        let colliding_head_ref_oid = "fedcba9876543210fedcba9876543210fedcba9";
+        assert_ne!(
+            local_head_sha, colliding_head_ref_oid,
+            "sanity: the fixture's forged headRefOid must genuinely differ from the worktree's \
+             own branch tip so this test exercises the mismatch path"
+        );
+
+        let bindir = scratch.path().join("bin");
+        write_dual_repo_merged_upstream_gh_stub(
+            &bindir,
+            branch,
+            "test-org/test-repo",
+            "vfarcic/dot-agent-deck",
+            "vfarcic",
+            colliding_head_ref_oid,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let worktree_dir = scratch.path().join("wt-upstream-collision");
+        add_worktree(&repo, &worktree_dir, branch);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        assert_eq!(
+            reports.len(),
+            1,
+            "expected exactly one linked worktree report, got {reports:?}"
+        );
+        assert_eq!(
+            reports[0].branch,
+            Some(branch.to_string()),
+            "sanity: the examined report must be for the worktree's own branch, got {:?}",
+            reports[0].branch
+        );
+        assert_eq!(
+            reports[0].pr_state, "unresolvable",
+            "an upstream-sourced MERGED PR whose headRefOid collides with (does not match) \
+             this worktree's own actual branch tip must resolve to Unresolvable through \
+             examine_worktrees, the real production call site -- got pr_state={:?} \
+             verdict={:?}",
+            reports[0].pr_state, reports[0].verdict
+        );
+        assert_ne!(
+            reports[0].verdict, "remove",
+            "a name-collision on a third party's upstream repo must never produce a Remove \
+             verdict through the real examine_worktrees call site -- got verdict={:?}",
+            reports[0].verdict
+        );
+    }
+
+    /// A `gh` stub mirroring [`write_dual_repo_merged_upstream_gh_stub`], but
+    /// answering an OPEN PR (not MERGED) that ALSO carries `headRefOid` --
+    /// fork issue #191 round 3 (R2/M1). `query_pr_state` does not read this
+    /// field for an OPEN reply today (only its `Merged` arm captures one),
+    /// but the stub carries it regardless -- GitHub's own `gh pr list --json
+    /// headRefOid` exposes the field uniformly regardless of PR state, so
+    /// the gap is entirely on this crate's parsing side, not in what `gh`
+    /// itself is capable of returning.
+    #[cfg(unix)]
+    fn write_dual_repo_open_upstream_gh_stub(
+        bindir: &Path,
+        branch: &str,
+        origin_slug: &str,
+        upstream_slug: &str,
+        upstream_owner: &str,
+        head_ref_oid: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let gh_script = format!(
+            "#!/bin/sh\n\
+             repo=\"\"\n\
+             prev=\"\"\n\
+             for arg in \"$@\"; do\n\
+             \x20   if [ \"$prev\" = \"--repo\" ]; then repo=\"$arg\"; fi\n\
+             \x20   prev=\"$arg\"\n\
+             done\n\
+             if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n\
+             \x20   if [ \"$repo\" = \"{origin_slug}\" ]; then\n\
+             \x20       printf '%s\\n' '[]'\n\
+             \x20       exit 0\n\
+             \x20   elif [ \"$repo\" = \"{upstream_slug}\" ]; then\n\
+             \x20       printf '%s\\n' '[{{\"state\":\"OPEN\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"{upstream_owner}\"}},\"headRefOid\":\"{head_ref_oid}\"}}]'\n\
+             \x20       exit 0\n\
+             \x20   fi\n\
+             \x20   exit 1\n\
+             fi\n\
+             exit 1\n"
+        );
+        std::fs::create_dir_all(bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Scenario: fork issue #191 round 3 (R2/M1, genuinely RED -- compile
+    /// error). `resolve_pr_state_for_linked_worktree` downgrades EVERY
+    /// `Upstream`-sourced `PrState::Open` to `Unresolvable` unconditionally,
+    /// because `PrState::Open` is a unit variant carrying no `headRefOid` at
+    /// all today -- unlike `Merged`, which already carries one. This means
+    /// issue #191's own headline symptom (an OPEN upstream PR -- all 3 of
+    /// its originally-reported worktrees were OPEN, not merged, at filing)
+    /// can never resolve correctly in production even after this whole PR's
+    /// fix. Builds the same fixture shape as `090` above but the stub
+    /// answers OPEN with a `headRefOid` that genuinely EQUALS the
+    /// worktree's own local branch tip, and matches on `PrState::Open {
+    /// head_ref_oid }`, binding and asserting the field's value equals the
+    /// local branch tip -- mirroring how a `Merged` binding would be
+    /// checked. Deliberately binds the field by name rather than using a
+    /// `{ .. }` wildcard: `{ .. }` alone compiles fine against today's
+    /// zero-field unit variant (clippy's `unneeded_struct_pattern` even
+    /// flags it as such) and would silently downgrade this to a runtime-only
+    /// RED, whereas naming the nonexistent `head_ref_oid` field is a genuine
+    /// compile error today -- "variant `PrState::Open` does not have a field
+    /// named `head_ref_oid`" -- until `PrState::Open` becomes a struct-like
+    /// variant carrying `head_ref_oid: Option<String>`, mirroring `Merged`'s
+    /// own shape exactly.
+    #[spec("worktree/reclaim/092")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_092_linked_worktree_upstream_open_verdict_needs_head_ref_oid_binding_like_merged()
+     {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        add_upstream_remote(&repo, "vfarcic", "dot-agent-deck");
+
+        let branch = "fix/191-open-matching-head-ref-oid";
+        let local_head_sha = git_rev_parse_head(&repo);
+
+        let bindir = scratch.path().join("bin");
+        write_dual_repo_open_upstream_gh_stub(
+            &bindir,
+            branch,
+            "test-org/test-repo",
+            "vfarcic/dot-agent-deck",
+            "vfarcic",
+            &local_head_sha,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let state = resolve_pr_state_for_linked_worktree(&repo, branch, Some(&local_head_sha));
+        match state {
+            PrState::Open { head_ref_oid } => {
+                assert_eq!(
+                    head_ref_oid.as_deref(),
+                    Some(local_head_sha.as_str()),
+                    "an upstream-sourced OPEN PR accepted as PrState::Open must carry the \
+                     matching headRefOid, mirroring Merged's own binding"
+                );
+            }
+            other => panic!(
+                "an upstream-sourced OPEN PR whose headRefOid genuinely equals this worktree's \
+                 own local branch tip must be accepted as PrState::Open, mirroring Merged's own \
+                 headRefOid binding -- got {other:?}"
+            ),
+        }
+    }
+
     /// A `gh` stub answering `gh pr list --head <branch> ...` with a single
     /// canned MERGED reply for `branch`, matching `worktree_reclaim_008`'s
     /// own script shape.
