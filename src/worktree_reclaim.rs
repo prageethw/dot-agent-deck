@@ -5441,6 +5441,112 @@ mod tests {
         );
     }
 
+    /// Add a second remote named `upstream` pointing at a GitHub URL (issue
+    /// #191) -- distinct from `origin`, which `init_repo_with_origin`
+    /// already sets up. Used to build fixtures where a branch's PR lives on
+    /// `upstream`, not `origin`, matching this fork's documented
+    /// upstream-first contribution workflow (CLAUDE.md rule 19).
+    fn add_upstream_remote(dir: &Path, owner: &str, name: &str) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "remote",
+                "add",
+                "upstream",
+                &format!("https://github.com/{owner}/{name}.git"),
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git remote add upstream failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git remote add upstream failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A `gh` stub for issue #191's fixture: answers `gh pr list --head
+    /// <branch> ... --repo <slug>` DIFFERENTLY depending on which `--repo`
+    /// slug it was invoked with -- empty (`[]`) for `origin_slug`, one OPEN
+    /// PR entry (owned by `upstream_owner`) for `upstream_slug`. Unlike
+    /// every other `gh` stub in this module (`write_merged_gh_stub` and
+    /// friends), which answer unconditionally regardless of `--repo`, this
+    /// one must discriminate on it -- that discrimination is the entire
+    /// point of the fixture: proving `resolve_pr_state` is asked about (and
+    /// reacts to) more than one remote's slug for the same branch.
+    #[cfg(unix)]
+    fn write_dual_repo_gh_stub(
+        bindir: &Path,
+        branch: &str,
+        origin_slug: &str,
+        upstream_slug: &str,
+        upstream_owner: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let gh_script = format!(
+            "#!/bin/sh\n\
+             repo=\"\"\n\
+             prev=\"\"\n\
+             for arg in \"$@\"; do\n\
+             \x20   if [ \"$prev\" = \"--repo\" ]; then repo=\"$arg\"; fi\n\
+             \x20   prev=\"$arg\"\n\
+             done\n\
+             if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n\
+             \x20   if [ \"$repo\" = \"{origin_slug}\" ]; then\n\
+             \x20       printf '%s\\n' '[]'\n\
+             \x20       exit 0\n\
+             \x20   elif [ \"$repo\" = \"{upstream_slug}\" ]; then\n\
+             \x20       printf '%s\\n' '[{{\"state\":\"OPEN\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"{upstream_owner}\"}}}}]'\n\
+             \x20       exit 0\n\
+             \x20   fi\n\
+             \x20   exit 1\n\
+             fi\n\
+             exit 1\n"
+        );
+        std::fs::create_dir_all(bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Scenario: A worktree's branch has NO pull request on `origin`
+    /// (`prageethw/dot-agent-deck`) but a genuinely OPEN pull request on
+    /// `upstream` (`vfarcic/dot-agent-deck`) -- the shape this fork's
+    /// documented upstream-first contribution workflow (CLAUDE.md rule 19)
+    /// produces routinely. `resolve_pr_state` must recognize the upstream
+    /// PR and report `PrState::Open`, not `PrState::NoPr` -- reporting
+    /// `NoPr` here is a false reason: a PR genuinely exists, `resolve_pr_state`
+    /// just never asked about the remote it lives on (issue #191).
+    #[spec("worktree/reclaim/083")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_083_resolve_pr_state_finds_upstream_pr_when_origin_has_none() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        add_upstream_remote(&repo, "vfarcic", "dot-agent-deck");
+
+        let branch = "fix/191-upstream-pr-visibility";
+        let bindir = scratch.path().join("bin");
+        write_dual_repo_gh_stub(
+            &bindir,
+            branch,
+            "test-org/test-repo",
+            "vfarcic/dot-agent-deck",
+            "vfarcic",
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let state = resolve_pr_state(&repo, branch);
+        assert_eq!(
+            state,
+            PrState::Open,
+            "a branch with no PR on origin but a genuinely OPEN PR on upstream must resolve to \
+             PrState::Open, not NoPr -- got {state:?}"
+        );
+    }
+
     /// A `gh` stub answering `gh pr list --head <branch> ...` with a single
     /// canned MERGED reply for `branch`, matching `worktree_reclaim_008`'s
     /// own script shape.
