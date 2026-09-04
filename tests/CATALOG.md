@@ -1583,6 +1583,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the examination-time guard itself (already the production behavior in `isolated_clone_report`); the exact wording of the refusal reason; any behavior once the fix genuinely closes the window (that's the GREEN round).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `073`/`081`).
 
+##### worktree/reclaim/084 — Issue #300 blocker 1 (RED). With `DOT_AGENT_DECK_WORKTREE_OWNER` entirely absent but a `gh`-resolvable human login available, `--mine` must NOT immediately refuse the way `033` pins today — it must fall back to attempting human-identity resolution instead, the same seam unmarked rows already use.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly removed from the spawned subprocess's environment and the stub `gh api user` configured to resolve a login.
+- **Agent:** none (one unmarked, human-owned worktree, plus one same-repo worktree marked owned by a different orchestration identity).
+- **Asserts:** the process exits zero (not the `033` refusal); the combined output does not contain the literal "DOT_AGENT_DECK_WORKTREE_OWNER is not set" refusal text; the worktree owned by the different orchestration identity never appears in the output (rules out a wrongly-permissive fix that disables filtering entirely on an absent env var).
+- **Does not assert:** that the unmarked human-owned worktree itself appears in the listing — that also requires blocker 2's independent `is_mine` fix (`085`), which this test does not exercise; the exact wording of any message printed on the empty-result path.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/085 — Issue #300 blocker 2 (RED). `is_mine`'s `owned &&` conjunct structurally excludes every human-owned row, since an unmarked (hand-made) worktree always resolves `owned: false` regardless of whether its resolved identity matches the `--mine` filter.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` (as `worktree/reclaim/030`).
+- **Agent:** none.
+- **Asserts:** `is_mine` returns `true` for a hand-constructed `WorktreeReport` representing an unmarked, human-owned worktree (`owned: false`, `owner_kind: "human"`, `owner: Some("human:alice@laptop")`) filtered against the exact same identity string.
+- **Does not assert:** `owner_disagreements`, which is deliberately restricted to `owner_kind == "agent"` and is unaffected by this fix; the CLI-level `owner_filter` derivation (`084`'s job); the reclaim-eligibility verdict.
+- **Platform coverage:** mac+linux+windows (pure in-memory logic, no filesystem or subprocess).
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.

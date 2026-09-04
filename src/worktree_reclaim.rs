@@ -8507,4 +8507,46 @@ mod tests {
              slug was queried) before the guard's refusal short-circuited it"
         );
     }
+
+    /// Scenario: Issue #300 blocker 2. `is_mine`'s `owned &&` conjunct
+    /// (PR #215 round-1 reviewer F4 / auditor L1 item 3, deliberately
+    /// fail-closed against a marker-forged agent row) structurally excludes
+    /// every human-owned row, since a human-made worktree has no marker at
+    /// all and so always resolves `owned: false` -- even once `owner_filter`
+    /// correctly derives a human identity to filter on (issue #300 blocker
+    /// 1, `worktree/reclaim/084`). A `WorktreeReport` standing in for an
+    /// unmarked, human-owned worktree (`owned: false`, `owner_kind:
+    /// "human"`, `owner: Some("human:alice@laptop")`) must satisfy
+    /// `is_mine(&report, "human:alice@laptop")` -- it does not today, since
+    /// `owned` alone vetoes the row regardless of whether `owner` matches.
+    #[spec("worktree/reclaim/085")]
+    #[test]
+    fn worktree_reclaim_085_is_mine_matches_an_unmarked_human_owned_row() {
+        let report = WorktreeReport {
+            path: PathBuf::from("/repo/wt-human"),
+            branch: Some("feat/human".to_string()),
+            clean: true,
+            owned: false,
+            owner: Some("human:alice@laptop".to_string()),
+            owner_kind: "human".to_string(),
+            owner_reason: None,
+            pr_state: "open".to_string(),
+            verdict: "ask".to_string(),
+            reason: Some("foreign".to_string()),
+            pinned: false,
+            kind: KIND_LINKED.to_string(),
+            real_path: PathBuf::from("/repo/wt-human"),
+            removed_by: None,
+        };
+
+        assert!(
+            is_mine(&report, "human:alice@laptop"),
+            "an unmarked, human-owned worktree whose resolved identity matches the filter must \
+             satisfy `is_mine` -- `owned` answers a DIFFERENT question (may a bare `reclaim` \
+             remove this with no prompt?) than \"does this belong to the caller?\" does, and \
+             conjoining them onto `is_mine` structurally excludes every human row, however \
+             correctly `owner_filter` resolves an identity (issue #300 blocker 2); got: {}",
+            is_mine(&report, "human:alice@laptop")
+        );
+    }
 }

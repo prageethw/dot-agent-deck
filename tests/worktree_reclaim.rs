@@ -72,14 +72,20 @@ mod child_lifetime_bound;
 ///
 /// PRD fork#298: also handles `gh api user --jq .login`, mirroring
 /// `tests/issue_claim.rs`'s own stub byte-for-byte (same branch, same
-/// `$GHSTUB_DIR/login` file, same `stub-user` fallback) — the seam a
-/// `WorktreeOwner::Human` resolution reuses from `issue_claim.rs`'s
-/// `resolve_gh_login`/`gh_current_login_argv` (the PRD's own words: "reusing
-/// issue_claim's resolution shape"), so a caller with no ownership marker
-/// resolves a login without ever depending on this machine's real `gh`
-/// session or shelling out for real.
+/// `$GHSTUB_DIR/login` file, same `stub-user` fallback, and — issue #300 —
+/// the same `$GHSTUB_DIR/fail-api-user` marker `tests/issue_claim.rs` and
+/// `tests/e2e_issue_dispatch.rs` already use to simulate a revoked/expired
+/// token) — the seam a `WorktreeOwner::Human` resolution reuses from
+/// `issue_claim.rs`'s `resolve_gh_login`/`gh_current_login_argv` (the PRD's
+/// own words: "reusing issue_claim's resolution shape"), so a caller with no
+/// ownership marker resolves a login without ever depending on this
+/// machine's real `gh` session or shelling out for real.
 const GH_STUB_SCRIPT: &str = r#"#!/bin/sh
 if [ "$1" = "api" ] && [ "$2" = "user" ]; then
+    if [ -f "$GHSTUB_DIR/fail-api-user" ]; then
+        echo "gh: HTTP 401: Bad credentials (stubbed failure)" 1>&2
+        exit 1
+    fi
     if [ -f "$GHSTUB_DIR/login" ]; then
         cat "$GHSTUB_DIR/login"
     else
@@ -460,6 +466,20 @@ impl Fixture {
     /// machine's actual login.
     fn set_login(&self, login: &str) {
         std::fs::write(self.ghstub.join("login"), format!("{login}\n")).expect("write login");
+    }
+
+    /// Make the stub `gh api user --jq .login` fail from here on, like a
+    /// real revoked/expired token would (issue #300) — the same
+    /// `$GHSTUB_DIR/fail-api-user` marker `tests/issue_claim.rs` and
+    /// `tests/e2e_issue_dispatch.rs` already use. Lets a test represent
+    /// "identity genuinely cannot be resolved by any means" (neither
+    /// `DOT_AGENT_DECK_WORKTREE_OWNER` nor a `gh`-derived human login) rather
+    /// than accidentally exercising the stub's `stub-user` default-success
+    /// fallback, which is a *resolvable* identity and so is a different case
+    /// entirely once `--mine` falls back to human-identity resolution on an
+    /// absent env var.
+    fn fail_login(&self) {
+        std::fs::write(self.ghstub.join("fail-api-user"), b"").expect("write fail-api-user");
     }
 
     /// The scratch tempdir's own root -- for fixtures that need to place a
@@ -1916,7 +1936,12 @@ fn worktree_reclaim_032_mine_matches_after_simulated_restart() {
 /// is missing. It must NOT fall back to listing every worktree (that would
 /// hand one orchestration another's worktrees) and must NOT silently print an
 /// empty list as if the answer were "none owned" (fork #166 M3.0 -- a wrong
-/// answer here is worse than no answer).
+/// answer here is worse than no answer). `fail_login()` (issue #300) keeps
+/// this a genuinely UNRESOLVABLE identity even once `--mine` starts falling
+/// back to `gh`-derived human-identity resolution on an absent env var
+/// (`082`) -- without it, the stub's default `stub-user` login would make
+/// this scenario a RESOLVABLE identity instead, which is a different case
+/// this test was never meant to cover.
 #[spec("worktree/reclaim/033")]
 #[test]
 #[cfg(unix)]
@@ -1925,6 +1950,7 @@ fn worktree_reclaim_033_mine_fails_loudly_when_owner_env_absent() {
     let wt = fx.add_worktree_with_commit("wt-someones", "feat/someones");
     fx.set_pr_state("feat/someones", "OPEN");
     fx.mark_owned_with_creator(&wt, "orchestration:someone");
+    fx.fail_login();
 
     let out = fx.run_with_owner(&["worktree", "list", "--mine"], None);
     assert!(
@@ -3092,5 +3118,60 @@ fn pin_004_pin_a_bare_relative_name_resolves_like_an_absolute_path() {
         content.lines().any(|l| l.trim() == "pinned=true"),
         "the provenance artifact must carry `pinned=true` after a bare-relative-name pin, got:\n\
          {content}"
+    );
+}
+
+/// Scenario: Issue #300 blocker 1. With `DOT_AGENT_DECK_WORKTREE_OWNER`
+/// entirely ABSENT but the stub `gh api user` able to resolve a login (via
+/// `set_login`), `worktree list --mine` must NOT immediately refuse the way
+/// it does today (`033`) -- `owner_filter`'s derivation never even attempts
+/// the same human-identity resolution `resolve_worktree_owner` already uses
+/// for unmarked rows (`resolve_human_owner`), so a human caller at an
+/// interactive terminal with no orchestration env var set can never use
+/// `--mine` at all, which is the whole of what issue #300 reports. A
+/// same-repo worktree marked owned by a DIFFERENT identity
+/// ("orchestration:elsewhere") is also present so a wrongly-permissive fix
+/// -- one that reacts to the absent env var by disabling filtering
+/// entirely (`owner_filter = None`, listing everything) rather than by
+/// resolving a real identity to filter on -- is caught too: that worktree
+/// must never appear in the output. This test deliberately stops short of
+/// asserting the unmarked human-owned worktree itself appears in the
+/// listing -- that also requires issue #300 blocker 2's independent
+/// `is_mine` fix (`085`), which this test does not exercise.
+#[spec("worktree/reclaim/084")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_084_mine_falls_back_to_human_resolution_when_owner_env_absent() {
+    let fx = Fixture::new();
+    let _wt_human = fx.add_worktree_with_commit("wt-human-owner", "feat/human-owner");
+    fx.set_pr_state("feat/human-owner", "OPEN");
+    fx.set_login("alice");
+    // Deliberately NOT marked -- hand-made, the human-identity path.
+
+    let wt_elsewhere = fx.add_worktree_with_commit("wt-elsewhere-agent", "feat/elsewhere-agent");
+    fx.set_pr_state("feat/elsewhere-agent", "OPEN");
+    fx.mark_owned_with_creator(&wt_elsewhere, "orchestration:elsewhere");
+
+    let out = fx.run_with_owner(&["worktree", "list", "--mine"], None);
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "`--mine` with DOT_AGENT_DECK_WORKTREE_OWNER absent must NOT immediately fail just \
+         because the env var is unset -- it must fall back to attempting human-identity \
+         resolution (the same seam unmarked rows already use via `resolve_human_owner`), the \
+         way a human caller at an interactive terminal expects (issue #300 blocker 1); got \
+         {:?} out={text}",
+        out.status
+    );
+    assert!(
+        !text.contains("DOT_AGENT_DECK_WORKTREE_OWNER is not set"),
+        "the old \"env var is not set\" refusal must not fire once a fallback resolution path \
+         exists for an absent env var -- got:\n{text}"
+    );
+    assert!(
+        !text.contains("wt-elsewhere-agent"),
+        "falling back to human-identity resolution must never mean \"stop filtering \
+         altogether\" -- a worktree owned by a DIFFERENT identity must still be excluded; got:\n\
+         {text}"
     );
 }
