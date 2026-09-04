@@ -2676,7 +2676,11 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
 /// same stale-path marker. Re-checking presence would cost one more
 /// `is_file()` call but would not close any window this removal doesn't
 /// already close by re-deriving the five signals that genuinely can change.
-fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), String> {
+fn remove_isolated_clone_dir(
+    worktree_path: &Path,
+    remover: &str,
+    root_repo_slug: Option<&str>,
+) -> Result<(), String> {
     if !worktree_path.join(".git").is_dir() {
         return Err(
             "refusing to remove: no `.git` directory found at this path any more -- it no \
@@ -2720,6 +2724,19 @@ fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), 
         return Err(
             "refusing to remove: the clone now carries a non-empty stash list immediately \
              before deletion -- a stash may have been pushed since it was examined"
+                .to_string(),
+        );
+    }
+    // Fork issue #533: mirrors `isolated_clone_report`'s own slug-equality
+    // guard (auditor B3) at removal time instead of examination time --
+    // `resolve_pr_state` must never be spent against a repo slug the
+    // candidate's own (untrusted) `origin` chose, since that `origin` can
+    // be repointed by a same-uid actor between examination and removal.
+    if !(root_repo_slug.is_some() && derive_repo_slug(worktree_path).as_deref() == root_repo_slug) {
+        return Err(
+            "refusing to remove: the clone's derived repo slug no longer matches the root \
+             checkout's own immediately before deletion -- gh is never queried against a \
+             repository this candidate's own (untrusted) origin chose"
                 .to_string(),
         );
     }
@@ -2885,7 +2902,11 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool, remover: &str) -> Result<ReclaimO
             // how the gating condition happens to line up with `"ask"`
             // today.
             VERDICT_ISOLATED_CLONE_RECLAIMABLE if yes => {
-                match remove_isolated_clone_dir(&r.real_path, remover) {
+                match remove_isolated_clone_dir(
+                    &r.real_path,
+                    remover,
+                    derive_repo_slug(repo_dir).as_deref(),
+                ) {
                     Ok(()) => {
                         let mut r = r;
                         r.removed_by = Some(remover.to_string());
@@ -7260,7 +7281,7 @@ mod tests {
         std::fs::write(clone_dir.join(".git"), b"gitdir: /elsewhere\n").unwrap();
         std::fs::write(clone_dir.join("some-file.txt"), b"still here\n").unwrap();
 
-        let result = remove_isolated_clone_dir(&clone_dir, "test-remover");
+        let result = remove_isolated_clone_dir(&clone_dir, "test-remover", None);
 
         assert!(
             result.is_err(),
@@ -7469,7 +7490,11 @@ mod tests {
         // above -- this is exactly the sequence `run_reclaim` follows
         // internally, with the mutation inserted in the window between its
         // two steps.
-        let result = remove_isolated_clone_dir(&clone_dir, "test-remover");
+        let result = remove_isolated_clone_dir(
+            &clone_dir,
+            "test-remover",
+            derive_repo_slug(&repo).as_deref(),
+        );
 
         assert!(
             result.is_err(),
@@ -7844,7 +7869,11 @@ mod tests {
         // above -- this is exactly the sequence `run_reclaim` follows
         // internally, with the pin inserted in the window between its two
         // steps.
-        let result = remove_isolated_clone_dir(&clone_dir, "test-remover");
+        let result = remove_isolated_clone_dir(
+            &clone_dir,
+            "test-remover",
+            derive_repo_slug(&repo).as_deref(),
+        );
 
         assert!(
             result.is_err(),
