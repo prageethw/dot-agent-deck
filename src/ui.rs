@@ -48244,6 +48244,70 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Issue #497 — `ui.status_message` render seam does not sanitize
+    // ---------------------------------------------------------------------------
+    //
+    // `render_bottom_bar`'s `_` fallback arm (`UiMode::Normal` and every other
+    // mode not explicitly matched) passes `msg.as_str()` straight to
+    // `Line::styled` with no sanitization, so a status message carrying raw
+    // control characters or a bidi override (e.g. interpolated from
+    // subprocess stderr) renders unsanitized on the status bar. Mirrors
+    // `render_bottom_bar_with_update_available_to_buffer` above: `status_message`
+    // is a private `UiState` field neither existing `pub fn *_to_buffer` seam
+    // can set, so this calls `render_bottom_bar` directly from inside this
+    // `#[cfg(test)] mod tests`, which already sees the private field.
+
+    /// Renders `render_bottom_bar` in `UiMode::Normal` (the `_` fallback arm;
+    /// no lock context, `has_pane_control = true`, no extra buttons) with
+    /// `ui.status_message` set to `status_message`, into a `width x 1` buffer.
+    fn render_bottom_bar_with_status_message_to_buffer(status_message: &str, width: u16) -> Buffer {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.status_message = Some((status_message.to_string(), std::time::Instant::now()));
+        terminal
+            .draw(|frame| {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 1,
+                };
+                render_bottom_bar(frame, &mut ui, area, true, &[], None);
+            })
+            .expect("TestBackend draw should succeed");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Scenario: Set `ui.status_message` to text carrying ESC, NUL, CR/LF, DEL,
+    /// a C1 control and a `U+202E` right-to-left override — the same fixture
+    /// `strip_control_and_bidi`'s own tests use — then render the bottom bar in
+    /// `UiMode::Normal` (the `_` fallback arm). The rendered row must not
+    /// contain any of those raw characters, and must match what
+    /// `untrusted_text::strip_control_and_bidi` produces for the same input.
+    #[spec("status/message/001")]
+    #[test]
+    fn message_001_status_message_strips_control_and_bidi_before_render() {
+        let dirty = "ze\x1b[31mta\0-li\u{202e}ve\x7f-\u{0085}77\r\n";
+        let width = 120;
+
+        let buffer = render_bottom_bar_with_status_message_to_buffer(dirty, width);
+        let row = buffer_row_text(&buffer, width);
+
+        let expected = crate::untrusted_text::strip_control_and_bidi(dirty, false);
+        assert!(
+            row.contains(&expected),
+            "sanitized status message must render, got row:\n{row:?} (expected {expected:?})"
+        );
+        assert!(
+            !row.chars()
+                .any(|c| c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+            "no control character or bidi override from an interpolated status message may \
+             reach the terminal, got row:\n{row:?}"
+        );
+    }
+
     /// Reviewer P2 (fork#257): serializes `orchestration/seed/017` and any
     /// future test mutating the same process-global
     /// `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, against EACH OTHER — a

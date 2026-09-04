@@ -902,6 +902,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the runtime half of the fix — that a remediation arm actually returns promptly against a real wedged (`D`-state) child. `SIGKILL` cannot be blocked or ignored by an ordinary process, so no portable, CI-safe test child can be made to reap slowly under `kill()`, and `capture_bounded_async` is hard-wired to the concrete `tokio::process::Child` rather than a swappable trait object (unlike the `SlowReapChild` doubles in `platform/proc/mod.rs`). This test pins the structural shape only — a fix that wraps the exact unbounded pair unchanged inside an outer `timeout(async { .. })` would still read as unbounded to this scan even though it would behave correctly; that gap is accepted deliberately for a test that runs in microseconds and cannot flake.
 - **Platform coverage:** mac+linux (`unix.rs` is `#[cfg(unix)]` throughout; the scan itself is pure string matching with no OS process calls).
 
+#### status/message
+
+##### status/message/001 — `ui.status_message` renders sanitized: control characters and bidi overrides interpolated into the transient status-bar message do not reach the terminal (issue #497).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests` since `status_message` is a private `UiState` field neither existing `pub fn *_to_buffer` seam can set — mirrors `lifecycle/version/002`'s reasoning for `update_available`).
+- **Agent:** none.
+- **Asserts:** with `ui.status_message` set to text carrying ESC, NUL, CR/LF, DEL, a C1 control, and a `U+202E` RIGHT-TO-LEFT OVERRIDE (the same fixture `untrusted_text::strip_control_and_bidi`'s own tests use), rendered through `render_bottom_bar`'s `_` fallback arm (`UiMode::Normal`), the rendered row contains no raw control character or bidi override anywhere, and matches `strip_control_and_bidi`'s own output for the same input byte-for-byte. `status_message` construction sites across `src/ui.rs` interpolate untrusted content (subprocess stderr, error messages, user-typed values) with no sanitization today, and both render call sites (`Line::styled(msg.as_str(), ..)`) pass it straight through.
+- **Does not assert:** the `PaneInput` mode's render arm, an identical unsanitized `Line::styled` call site with no existing seam to reach it (no `_to_buffer` helper threads an arbitrary status message into that arm — the same gap `orchestration/lock/019`'s Scenario records); the other `status_message`-shaped fields in `src/pane.rs`, `src/embedded_pane.rs`, `src/tab.rs`, `src/mode_manager.rs`, `src/daemon_protocol.rs`, which carry their own separate audit; which specific construction site's untrusted content is sanitized (fixed at the render seam, not per call site).
+- **Platform coverage:** mac+linux+windows.
+
 ### Agent protocol
 
 #### agent/readiness
