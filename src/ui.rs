@@ -38785,8 +38785,9 @@ mod tests {
     /// identities/wildcard names, with no equivalent check against this
     /// literal, so nothing warns the user or blocks `[Submit]` before they
     /// walk into it.
+    #[spec("orchestration/identity/039")]
     #[test]
-    fn name_field_literal_unknown_is_treated_as_a_collision() {
+    fn identity_039_name_field_literal_unknown_is_treated_as_a_collision() {
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
         ui.new_pane_form = Some(NewPaneFormState::new(

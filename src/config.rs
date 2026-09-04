@@ -2681,20 +2681,19 @@ prompt = "do the thing"
         assert_eq!(loaded.errors.len(), 1);
     }
 
-    // Issue #222 edge 1 — `validate_task` never bounds `ScheduledTask.name`,
-    // so two names sharing a 185-char prefix collide once
-    // `sanitize_marker_creator` (worktree_reclaim.rs,
-    // `MARKER_CREATOR_MAX_CHARS` = 200) truncates the formatted
-    // `issue-dispatch:{task_name}#{issue}` creator string at 200 chars: the
-    // 15-char `"issue-dispatch:"` prefix plus a 185-char shared name prefix
-    // is exactly the 200-char cutoff, so both entries' markers become
-    // byte-identical and match each other's worktrees under `--mine`. The
-    // issue's preferred fix is a load-time rejection at the producer
-    // (here), not a truncation-collision-avoidance trick at the sink.
-    // `validate_task` currently accepts any name length, so this is
-    // expected RED until `coder` adds the bound.
+    /// Scenario: Issue #222 edge 1 — `validate_task` never bounds
+    /// `ScheduledTask.name`, so two names sharing a 185-char prefix collide
+    /// once `sanitize_marker_creator` (worktree_reclaim.rs,
+    /// `MARKER_CREATOR_MAX_CHARS` = 200) truncates the formatted
+    /// `issue-dispatch:{task_name}#{issue}` creator string at 200 chars: the
+    /// 15-char `"issue-dispatch:"` prefix plus a 185-char shared name prefix
+    /// is exactly the 200-char cutoff, so both entries' markers become
+    /// byte-identical and match each other's worktrees under `--mine`. The
+    /// issue's preferred fix is a load-time rejection at the producer
+    /// (here), not a truncation-collision-avoidance trick at the sink.
+    #[spec("scheduler/config/003")]
     #[test]
-    fn schedules_reject_overlong_task_name_that_would_collide() {
+    fn config_003_schedules_reject_overlong_task_name_that_would_collide() {
         let shared_prefix = "a".repeat(185);
         let name_one = format!("{shared_prefix}{}", "b".repeat(65));
         let name_two = format!("{shared_prefix}{}", "c".repeat(65));

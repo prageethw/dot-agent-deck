@@ -4447,6 +4447,13 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side compound-key comparison over the values sent, which is `orchestration/identity/036`'s own scope; the RESTORE/reconnect call site's own claim `cwd` (unchanged by this PRD's fix, and not exercised by a live spawn); the isolated-clone provisioning outcome itself (covered by `orchestration/workspace/033`-`036`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/039 — Issue #222 edge 2: typing the literal `unknown` into the new-pane form's Name field, with an orchestration selected, resolves (via `orchestration_creator_string`) to `orchestration:unknown` — byte-identical to `ORCHESTRATION_UNKNOWN_SENTINEL` (`src/agent_pty.rs`), the sentinel `run_worktree_list_cli`'s `--mine` refuses outright as "never a real identity" — so an orchestration literally named `unknown` must be treated as a collision, blocking `[Submit]`, rather than silently becoming permanently unmatchable by `--mine`.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** typing `unknown` into a focused, empty Name field with the form's one orchestration selected directly round-trips unmodified into `form.name`; `orchestration_creator_string(&typed)` equals `crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL` (sanity that the literal genuinely resolves to the refused sentinel); and `form.name_collision()` is true for that literal, the same as a live-name collision.
+- **Does not assert:** WHERE the collision is enforced beyond `name_collision()` itself (render-layer warning text, `[Submit]` inertness are covered generically by `orchestration/guard/002`/`003`); any literal other than `unknown` (case variants, whitespace-padded forms); the `--mine` refusal itself, which is a separate CLI-side check this test only proves the Name field now anticipates.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a directory that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140), detected against the live orchestration's REAL reported cwd — the sibling isolated-clone workspace path (fork#544 M2b), never the picked directory itself (issue #605).
@@ -6576,6 +6583,15 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ### Scheduled tasks (PRD #127)
+
+#### scheduler/config
+
+##### scheduler/config/003 — Issue #222 edge 1: `validate_task` bounds `ScheduledTask.name` so two names sharing a 185-char prefix are rejected at load time, rather than loading successfully and later colliding once `sanitize_marker_creator` (`worktree_reclaim.rs`, `MARKER_CREATOR_MAX_CHARS` = 200) truncates the formatted `issue-dispatch:{task_name}#{issue}` creator string at the 200-char cutoff and makes both entries' markers byte-identical under `--mine`.
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::LoadedSchedules::parse`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** two task names sharing a 185-char prefix, differing only in their last 65 bytes, genuinely collide under today's `sanitize_marker_creator` 200-char truncation when formatted as `issue-dispatch:{name}#7` (sanity check); loading a `[[scheduled_tasks]]` TOML document containing both overlong names yields zero loaded tasks and two load errors — the producer rejects both rather than truncation silently aliasing them at the sink.
+- **Does not assert:** the exact byte-length bound `validate_task` enforces beyond "185+65 collides, so the cap must sit below that"; the malformed-entry/missing-command load-error paths (`scheduler/config/001`/`002`, informally numbered in `src/config.rs` but not yet catalog-registered); `sanitize_marker_creator`'s own truncation behavior in isolation (covered separately in `worktree_reclaim.rs`); any daemon-side reload or CLI surface (`scheduler/reload`/`scheduler/cli`).
+- **Platform coverage:** mac+linux+windows.
 
 #### scheduler/reload
 
