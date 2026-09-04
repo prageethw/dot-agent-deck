@@ -2241,3 +2241,138 @@ fn release_cleanup_027_worktree_path_containing_a_newline_is_not_truncated() {
         out.stderr
     );
 }
+
+// -- Issue #669: `run_git` clears only GIT_DIR/GIT_WORK_TREE, leaking the
+//    other 6 ambient git location-discovery vars into fixture invocations --
+
+/// **Write escape — issue #669.** `run_git` (above) `env_remove`s `GIT_DIR`
+/// and `GIT_WORK_TREE` (fork issue #579 fix round) but leaves the other 6
+/// location vars — `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_CEILING_DIRECTORIES`,
+/// `GIT_NAMESPACE` — ambient. `GIT_INDEX_FILE` is the representative for the
+/// 5 of those (all but `GIT_CEILING_DIRECTORIES`, which needs its own test
+/// below — see that test's doc comment): pointed at another repository's
+/// index, `git add` in the fixture stages the file into the AMBIENT repo's
+/// index instead of the fixture's own — measured directly (`repo_state.rs`'s
+/// `mod real_git` tests this same class of leak via `Command::get_envs()`
+/// inspection, which is not available here because `run_git` builds and
+/// runs its `Command` internally without exposing it).
+#[test]
+fn release_cleanup_028_run_git_leaks_ambient_git_index_file() {
+    let root = common::harness_tempdir().expect("tempdir for git-index-file fixture");
+
+    let fixture = root.path().join("fixture");
+    std::fs::create_dir_all(&fixture).expect("mkdir fixture");
+    run_git(&fixture, &["init", "-q", "-b", "main"]);
+    run_git(
+        &fixture,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    run_git(&fixture, &["config", "user.name", "fixture"]);
+    run_git(
+        &fixture,
+        &["commit", "-q", "--allow-empty", "-m", "fixture first"],
+    );
+
+    let ambient = root.path().join("ambient");
+    std::fs::create_dir_all(&ambient).expect("mkdir ambient");
+    run_git(&ambient, &["init", "-q", "-b", "main"]);
+    run_git(
+        &ambient,
+        &["config", "user.email", "ambient@example.invalid"],
+    );
+    run_git(&ambient, &["config", "user.name", "ambient"]);
+    run_git(
+        &ambient,
+        &["commit", "-q", "--allow-empty", "-m", "ambient first"],
+    );
+
+    std::fs::write(fixture.join("file.txt"), "hello\n").expect("write file.txt");
+
+    // `cargo-nextest` runs each test in its own process, so mutating the
+    // process environment here cannot bleed into any other test.
+    unsafe {
+        std::env::set_var("GIT_INDEX_FILE", ambient.join(".git/index"));
+    }
+    run_git(&fixture, &["add", "file.txt"]);
+    unsafe {
+        std::env::remove_var("GIT_INDEX_FILE");
+    }
+
+    let status = run_git(&fixture, &["status", "--porcelain"]);
+    assert_eq!(
+        status.trim(),
+        "?? file.txt",
+        "issue #669: `run_git`'s `git add file.txt` in the fixture, run while an ambient \
+         GIT_INDEX_FILE pointed at a different repository's index, staged the file into \
+         that AMBIENT index instead of the fixture's own — the fixture's real index still \
+         shows the file as untracked instead of staged. `git status --porcelain` reported: \
+         {status:?}"
+    );
+}
+
+/// **Read escape — issue #669, `GIT_CEILING_DIRECTORIES` specifically.**
+/// Unlike the other 5 leaked vars above, the fix here cannot be a blind
+/// `env_remove`: `tests/release_cleanup.rs:1212`'s `run_cleanup` (the SCRIPT
+/// invocation, already correct on this point) documents why — a call site
+/// that runs git in a directory that is not yet a repository needs discovery
+/// to fail closed at cwd, which requires `GIT_CEILING_DIRECTORIES` to be SET
+/// to a bound, not merely cleared (clearing only restores git's default
+/// *unbounded* upward walk).
+///
+/// `run_git` never touches `GIT_CEILING_DIRECTORIES` at all today, so a
+/// fixture command run in a plain subdirectory of a real repository — not
+/// itself a repository — walks straight past it and resolves the outer
+/// repository instead of failing, exactly the escape
+/// `sandbox_git_cannot_discover_a_repository_above_its_root`
+/// (`repo_state.rs`'s `mod real_git`) pins for `Sandbox::git()`.
+///
+/// `run_git` panics (via `assert!`) on a failing invocation rather than
+/// returning a `Result`, so this test drives it under `catch_unwind`: today
+/// it returns `Ok` (the escape — `rev-parse --show-toplevel` wrongly
+/// succeeds from a non-repository candidate), and once `run_git` bounds the
+/// walk it will return `Err` (the invocation fails closed, panicking inside
+/// `run_git` as designed).
+#[test]
+fn release_cleanup_029_run_git_does_not_bound_upward_discovery_with_git_ceiling_directories() {
+    // nextest runs one process per test, so muting the hook cannot swallow
+    // another test's panic output.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let root = common::harness_tempdir().expect("tempdir for git-ceiling-directories fixture");
+    let outer = root.path().join("outer");
+    std::fs::create_dir_all(&outer).expect("mkdir outer");
+    run_git(&outer, &["init", "-q", "-b", "main"]);
+    run_git(&outer, &["config", "user.email", "outer@example.invalid"]);
+    run_git(&outer, &["config", "user.name", "outer"]);
+    run_git(&outer, &["commit", "-q", "--allow-empty", "-m", "outer"]);
+
+    // NOT itself a repository — a plain subdirectory of `outer`.
+    let candidate = outer.join("candidate");
+    std::fs::create_dir_all(&candidate).expect("mkdir candidate");
+
+    let result =
+        std::panic::catch_unwind(|| run_git(&candidate, &["rev-parse", "--show-toplevel"]));
+
+    std::panic::set_hook(previous_hook);
+
+    let outer_canon = std::fs::canonicalize(&outer).unwrap_or(outer);
+    match result {
+        Ok(toplevel) => {
+            assert_eq!(
+                Path::new(toplevel.trim()),
+                outer_canon.as_path(),
+                "issue #669: `run_git`, invoked in `candidate` (not itself a repository), \
+                 escaped upward to an unexpected location instead of `outer`'s own \
+                 repository: {toplevel:?}"
+            );
+        }
+        Err(_) => panic!(
+            "issue #669: expected `run_git` to currently ESCAPE upward past `candidate` \
+             (no repository there) and resolve `outer`'s repository above it, proving \
+             GIT_CEILING_DIRECTORIES is unbounded — instead the invocation failed, which is \
+             the FIXED behaviour this test exists to demand"
+        ),
+    }
+}
