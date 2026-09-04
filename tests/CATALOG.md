@@ -1576,6 +1576,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the CLI surface that sets pin state (`worktree/pin/001`-`003`); the reclaim-eligibility verdict itself (already covered by `075`/`076`/`078`); the JSON serialization key name (that's `worktree/pin/001`/`002`'s job, driven through the real binary).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `078`).
 
+##### worktree/reclaim/082 — fork issue #533 (RED — compile error, new function parameter). `isolated_clone_report` (auditor B3) refuses to spend a `gh` call at all unless the candidate's own derived repo slug equals the root checkout's — but `remove_isolated_clone_dir`'s TOCTOU re-verification calls `resolve_pr_state` directly against the candidate's own (untrusted) `origin`, with no slug-equality guard at removal time. A candidate that is genuinely reclaim-eligible at examination time has its `origin` repointed at a different, attacker-controlled repo slug before removal runs, with a `gh` stub answering a well-formed MERGED PR (matching branch, owner, and `headRefOid`) only for that attacker slug. Calls the intended fixed signature — `remove_isolated_clone_dir(worktree_path, remover, root_repo_slug: Option<&str>)`, mirroring `isolated_clone_report`'s own `repo_slug: Option<&str>` parameter — which does not exist yet.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` — built through the real provisioner, with the candidate's `origin` rewritten via a real `git remote set-url` between examination and removal.
+- **Agent:** none.
+- **Asserts:** `remove_isolated_clone_dir` returns `Err` (refuses) when the candidate's own derived repo slug no longer matches the root checkout's own, even though a stubbed `gh` would otherwise answer merged-with-matching-`headRefOid` for the candidate's (attacker) slug; the candidate directory is left on disk.
+- **Does not assert:** the examination-time guard itself (already the production behavior in `isolated_clone_report`); the exact wording of the refusal reason; any behavior once the fix genuinely closes the window (that's the GREEN round).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `073`/`081`).
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.

@@ -5443,6 +5443,31 @@ mod tests {
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Same shape as [`write_merged_gh_stub_with_head_ref_oid`], additionally
+    /// taking `owner` explicitly instead of hardcoding `"test-org"` -- issue
+    /// #533's fixture needs a merged-PR reply whose `headRepositoryOwner`
+    /// matches a DIFFERENT (attacker) slug's owner, not the root checkout's
+    /// own, to prove `resolve_pr_state` genuinely resolves the reply against
+    /// whichever slug it was asked about.
+    #[cfg(unix)]
+    fn write_merged_gh_stub_with_owner_and_head_ref_oid(
+        bindir: &Path,
+        branch: &str,
+        owner: &str,
+        head_ref_oid: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"{owner}\"}},\"headRefOid\":\"{head_ref_oid}\"}}]'\n    \
+             exit 0\nfi\nexit 1\n"
+        );
+        std::fs::create_dir_all(bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// `git rev-parse HEAD` run inside `dir`, trimmed -- a fixture-only
     /// helper for tests that need to assert on an isolated clone's actual
     /// HEAD SHA (fork#325 M4c), mirroring `worktree_reclaim_054`'s own
@@ -8250,5 +8275,146 @@ mod tests {
                 linked_report.pinned
             );
         }
+    }
+
+    /// Scenario: fork issue #533 -- unlike `isolated_clone_report`, which
+    /// (auditor B3) refuses to spend a `gh` call at all unless the
+    /// candidate's own derived repo slug equals the root checkout's,
+    /// `remove_isolated_clone_dir`'s TOCTOU re-verification calls
+    /// `resolve_pr_state` directly against the candidate's own (untrusted)
+    /// `origin`, with no slug-equality guard at removal time. This test
+    /// simulates the attack the issue describes: a candidate that was
+    /// genuinely reclaim-eligible at examination time has its `origin`
+    /// repointed at a DIFFERENT (attacker-controlled) repo slug before
+    /// removal runs, and a `gh` stub answers a well-formed MERGED PR --
+    /// matching branch, owner and `headRefOid` -- for that attacker slug
+    /// only. `remove_isolated_clone_dir` must refuse when the candidate's
+    /// derived slug no longer equals the root checkout's own, exactly as
+    /// `isolated_clone_report` already does at examination time -- it must
+    /// never query, let alone trust, a `gh` reply resolved against a repo
+    /// slug the untrusted candidate's own `origin` chose. This exercises the
+    /// intended fixed signature (`root_repo_slug: Option<&str>`, mirroring
+    /// `isolated_clone_report`'s own `repo_slug: Option<&str>` parameter),
+    /// which does not exist yet -- this is a compile-error RED, the same
+    /// shape as `worktree_reclaim_081`'s `WorktreeReport.pinned` reference.
+    #[spec("worktree/reclaim/082")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_082_removal_refuses_when_candidate_slug_no_longer_matches_root() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        let root_repo_slug = derive_repo_slug(&repo);
+        assert_eq!(
+            root_repo_slug.as_deref(),
+            Some("test-org/test-repo"),
+            "sanity: init_repo_with_origin's own fixture origin must derive to this slug"
+        );
+
+        let clone_dir = scratch.path().join("repo-isolated-slug-swapped");
+        let creator = "issue-dispatch:slug-swapped#533";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "slug-swapped-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let clone_head_sha = git_rev_parse_head(&clone_dir);
+
+        // Confirm the clone is genuinely eligible at examination time, while
+        // its `origin` still matches the root checkout's own slug -- proves
+        // this is a real attack window, not a fixture that was already
+        // ineligible when handed to the removal primitive.
+        {
+            let bindir = scratch.path().join("bin");
+            write_merged_gh_stub_with_head_ref_oid(&bindir, "slug-swapped-branch", &clone_head_sha);
+            let _path_guard = PathEnvGuard::prepend(&bindir);
+
+            let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+            let clone_report = reports
+                .iter()
+                .find(|r| r.real_path == clone_dir)
+                .expect("the isolated clone must be present in the report");
+            assert_eq!(
+                clone_report.verdict.as_str(),
+                VERDICT_ISOLATED_CLONE_RECLAIMABLE,
+                "sanity: the clone must be reclaim-eligible at examination time, before its \
+                 origin is swapped below, or this test would not be exercising the removal-time \
+                 slug guard at all -- got {:?} (reason: {:?})",
+                clone_report.verdict,
+                clone_report.reason
+            );
+        }
+
+        // Attack: a same-uid actor repoints the candidate's own `origin` at
+        // a DIFFERENT, attacker-controlled repo slug between examination
+        // and removal -- exactly the hazard `isolated_clone_report`'s own
+        // slug-equality guard exists to reject at examination time (auditor
+        // B3), reproduced here at removal time instead.
+        let out = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/attacker-org/evil-repo.git",
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git remote set-url failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git remote set-url failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let swapped_slug = derive_repo_slug(&clone_dir);
+        assert_eq!(
+            swapped_slug.as_deref(),
+            Some("attacker-org/evil-repo"),
+            "sanity: the candidate's own derived slug must now differ from the root checkout's"
+        );
+
+        // A `gh` stub answering a well-formed MERGED PR -- matching branch,
+        // owner, AND headRefOid -- but only for the ATTACKER slug's owner.
+        // If `remove_isolated_clone_dir` queried this at all, it would
+        // resolve as merged-with-matching-head, i.e. exactly the shape that
+        // would otherwise let removal proceed.
+        let bindir = scratch.path().join("bin2");
+        write_merged_gh_stub_with_owner_and_head_ref_oid(
+            &bindir,
+            "slug-swapped-branch",
+            "attacker-org",
+            &clone_head_sha,
+        );
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let result =
+            remove_isolated_clone_dir(&clone_dir, "test-remover", root_repo_slug.as_deref());
+
+        assert!(
+            result.is_err(),
+            "remove_isolated_clone_dir must refuse when the candidate's own derived repo slug \
+             no longer matches the root checkout's, exactly as isolated_clone_report already \
+             does at examination time -- it must never resolve PR state against a repo the \
+             untrusted candidate's own origin chose, got {result:?}"
+        );
+        assert!(
+            clone_dir.exists(),
+            "the candidate directory must be left on disk when the slug-mismatch refusal fires"
+        );
     }
 }
