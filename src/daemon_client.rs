@@ -803,20 +803,6 @@ pub async fn issue_command<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// 64 KiB is far above any real first prompt yet bounds the worst case.
 const MAX_FIRST_PROMPT_BYTES: usize = 65536;
 
-/// Drop ASCII/Unicode control characters from a daemon-supplied string so no
-/// raw control byte (ANSI escape, NUL, DEL, C1) survives into a rendered cell.
-/// Mirrors the `char::is_control` policy `login_shell` / the build-handshake
-/// render seam apply elsewhere on untrusted wire input.
-///
-/// Control-only, deliberately: this is the *hydration* path's scrub, and it
-/// predates bidi (`Cf`) being treated as part of the same threat class. Do
-/// not reuse this for a fresh ingest seam — reach for
-/// [`crate::untrusted_text::strip_control_and_bidi`] instead, which also
-/// strips bidi overrides (issue #562 gap 2's fix uses that, not this).
-fn strip_control_chars(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
-}
-
 /// Truncate `s` to at most `max_bytes`, snapping back to the nearest char
 /// boundary so a multi-byte UTF-8 sequence is never split.
 fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
@@ -848,10 +834,11 @@ pub struct AgentListing {
 
 /// Sanitize a single `AgentRecord` echoed by the daemon before it reaches the
 /// TUI. Defense in depth at the wire boundary (M2.12 fixup auditor #1, PRD
-/// #162 findings #1/#2, issue #562): the daemon validates on `StartAgent` /
-/// `SetAgentLabel` via `is_valid_display_name`, but a malformed or older
-/// daemon (one built before that gate also rejected Unicode `Cf` format
-/// characters) could still echo an untrusted record. Three scrubs:
+/// #162 findings #1/#2, issue #562, issues #664/#665): the daemon validates
+/// on `StartAgent` / `SetAgentLabel` via `is_valid_display_name`, but a
+/// malformed or older daemon (one built before that gate also rejected
+/// Unicode `Cf` format characters, or before `cwd`/prompt scrubbing existed
+/// at all) could still echo an untrusted record. Five scrubs:
 ///
 /// - `display_name`: routed through
 ///   [`crate::untrusted_text::sanitize_display_name`] — the same
@@ -866,23 +853,13 @@ pub struct AgentListing {
 ///   fields directly off `AttachRequest::ListAgents` and bypass this scrub
 ///   (none of them currently render `display_name`, so this is a scope note,
 ///   not a live defect).
+/// - `cwd` (issue #664): routed through
+///   [`crate::untrusted_text::strip_control_and_bidi`] — previously
+///   unscrubbed on this hydration path at all, so a `U+202E`-carrying `cwd`
+///   from a malformed/older daemon reached the `Dir:` line unstripped.
 /// - `tab_membership`: clamped to `None` if the embedded `name` fails
 ///   [`validate_tab_membership`] (logged via `tracing::warn!` — the agent is
 ///   real, we just don't trust the bucketing hint).
-/// - `display_name` (issue #833): scrubbed of control characters AND bidi
-///   overrides and clamped to [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`] via
-///   [`crate::untrusted_text::sanitize_display_name`]; a name with nothing
-///   printable left becomes `None`, which hydration renders as the agent id.
-///   This field is the card TITLE the TUI actually uses — hydration copies it
-///   into `ui.pane_display_names`, the dashboard loop fills `ui.display_names`
-///   from that, and `ui::render_card_grid` prefers that map over the session's
-///   own `display_name` — so it is the string on this record whose scrub the
-///   render most depends on. The daemon does gate it
-///   (`agent_pty::is_valid_display_name`), but that gate lives at the other end
-///   of the wire: a daemon too old to carry the gate's bidi half, or one not
-///   running this code at all, echoes whatever it stored. Same
-///   defense-in-depth argument as `tab_membership` above.
-///
 /// - `cli_name` (issue #856): the daemon-resolved binary name, scrubbed through
 ///   the same [`crate::untrusted_text::sanitize_display_name`] as
 ///   `display_name`, for the same defense-in-depth reason. It is a registry
@@ -891,20 +868,14 @@ pub struct AgentListing {
 ///   it. The value reaches a webview `title` attribute and an overview cell;
 ///   nothing printable left becomes `None`, which renders as nothing.
 ///
-/// NOT scrubbed here, and this list is the whole of what is: `id` and
-/// `pane_id_env` (daemon-minted — `id` is a monotonic counter stringified) and
-/// **`cwd`**. That last one is a real residual rather than a safe omission: the
-/// dashboard renders its basename, and the only thing standing between a
-/// hostile value and a cell is the daemon-side `agent_pty::is_valid_cwd`, whose
-/// byte test admits a bidi override for exactly the reason
-/// `is_valid_display_name`'s did before issue #833 — `U+202E` is three bytes
-/// each above `0x20`. Deliberately out of scope for #833, which names two
-/// seams, and stated here rather than left for the next reader to rediscover.
-/// - `live` snapshot (PRD #162): control bytes are stripped from
-///   `last_user_prompt`, every `first_prompts` entry, and `active_tool.name` /
-///   `.detail`, and each of those strings is length-bounded to
-///   [`MAX_FIRST_PROMPT_BYTES`]; `first_prompts` is additionally clamped to at
-///   most [`crate::state::MAX_FIRST_PROMPTS`] entries. The snapshot is KEPT as
+/// - `live` snapshot (PRD #162, issue #665): `last_user_prompt`, every
+///   `first_prompts` entry, and `active_tool.name` / `.detail` are routed
+///   through [`crate::untrusted_text::strip_control_and_bidi`] (previously
+///   `strip_control_chars`, which only stripped `Cc` controls and let a
+///   `U+202E`-only string with no ASCII control bytes reach the `Prmt:`
+///   line), then length-bounded to [`MAX_FIRST_PROMPT_BYTES`];
+///   `first_prompts` is additionally clamped to at most
+///   [`crate::state::MAX_FIRST_PROMPTS`] entries. The snapshot is KEPT as
 ///   `Some(..)` — the agent is real; only its strings are scrubbed.
 fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
     if let Some(raw) = rec.display_name.take() {
@@ -939,6 +910,16 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
         }
     }
 
+    if let Some(cwd) = rec.cwd.take() {
+        // Issues #664/#665 fix-round LOW 7: collapse an all-`Cf` input's
+        // empty scrub result to `None` rather than `Some("")` — matching
+        // `sanitize_display_name`'s disposition above. `Some("")` still
+        // reads as "has a cwd" downstream and resolves relative to the TUI
+        // process's own working directory instead of failing closed.
+        let scrubbed = crate::untrusted_text::strip_control_and_bidi(&cwd, false);
+        rec.cwd = (!scrubbed.is_empty()).then_some(scrubbed);
+    }
+
     if let Some(tm) = rec.tab_membership.take() {
         let name_len = tm.name().len();
         match validate_tab_membership(tm) {
@@ -955,19 +936,31 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
 
     if let Some(live) = rec.live.as_mut() {
         if let Some(prompt) = live.last_user_prompt.as_mut() {
-            *prompt = clamp_bytes(strip_control_chars(prompt), MAX_FIRST_PROMPT_BYTES);
+            *prompt = clamp_bytes(
+                crate::untrusted_text::strip_control_and_bidi(prompt, false),
+                MAX_FIRST_PROMPT_BYTES,
+            );
         }
         if let Some(tool) = live.active_tool.as_mut() {
-            tool.name = clamp_bytes(strip_control_chars(&tool.name), MAX_FIRST_PROMPT_BYTES);
+            tool.name = clamp_bytes(
+                crate::untrusted_text::strip_control_and_bidi(&tool.name, false),
+                MAX_FIRST_PROMPT_BYTES,
+            );
             if let Some(detail) = tool.detail.as_mut() {
-                *detail = clamp_bytes(strip_control_chars(detail), MAX_FIRST_PROMPT_BYTES);
+                *detail = clamp_bytes(
+                    crate::untrusted_text::strip_control_and_bidi(detail, false),
+                    MAX_FIRST_PROMPT_BYTES,
+                );
             }
         }
         // Clamp the count first, then scrub + length-bound each survivor so we
         // never waste work scrubbing entries we're about to drop.
         live.first_prompts.truncate(crate::state::MAX_FIRST_PROMPTS);
         for prompt in live.first_prompts.iter_mut() {
-            *prompt = clamp_bytes(strip_control_chars(prompt), MAX_FIRST_PROMPT_BYTES);
+            *prompt = clamp_bytes(
+                crate::untrusted_text::strip_control_and_bidi(prompt, false),
+                MAX_FIRST_PROMPT_BYTES,
+            );
         }
     }
 }
@@ -3537,6 +3530,113 @@ mod tests {
         ok.display_name = Some("deployer".into());
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(ok.display_name.as_deref(), Some("deployer"));
+    }
+
+    /// Issue #665: `sanitize_record_tab_membership`'s `live` snapshot scrub
+    /// (`agent_badge_010` above covers `display_name`) routes
+    /// `last_user_prompt`/`first_prompts` through `strip_control_chars`,
+    /// which only strips Unicode `Cc` control characters — not the `Cf`
+    /// bidi/format class `crate::untrusted_text::strip_control_and_bidi`
+    /// also strips. A string with a `U+202E` RIGHT-TO-LEFT OVERRIDE and no
+    /// ASCII control bytes at all therefore survives this scrub unstripped
+    /// today, reaching the `Prmt:` line (`Span::raw` in `src/ui.rs`).
+    #[test]
+    fn sanitize_record_tab_membership_scrubs_bidi_only_user_prompt() {
+        let hostile = "attacker.example\u{202e} then [UNTRUSTED".to_string();
+        let mut rec = AgentRecord {
+            id: "12".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: Some(crate::state::SessionSnapshot {
+                status: crate::state::SessionStatus::Idle,
+                agent_type: None,
+                active_tool: None,
+                tool_count: 0,
+                first_prompts: vec![hostile.clone()],
+                last_user_prompt: Some(hostile.clone()),
+                live_target: None,
+                last_activity_ms: None,
+                shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
+                wait_deferred_revert: false,
+                model: None,
+                agent_report_activity_seen: false,
+            }),
+            spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            cli_name: None,
+            crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        sanitize_record_tab_membership(&mut rec);
+        let live = rec
+            .live
+            .as_ref()
+            .expect("live snapshot must survive scrubbing");
+        let last = live
+            .last_user_prompt
+            .as_deref()
+            .expect("bidi-only prompt has printable content and survives scrubbing");
+        assert!(
+            !last.contains('\u{202e}'),
+            "live.last_user_prompt must have bidi overrides stripped, got {last:?}"
+        );
+        let first = live
+            .first_prompts
+            .first()
+            .expect("first_prompts entry must survive scrubbing");
+        assert!(
+            !first.contains('\u{202e}'),
+            "live.first_prompts entries must have bidi overrides stripped, got {first:?}"
+        );
+    }
+
+    /// Issue #664: `sanitize_record_tab_membership` scrubs `display_name`
+    /// (`agent_badge_010` above) and `live.last_user_prompt`/`first_prompts`,
+    /// but never touches `AgentRecord.cwd` at all — a malformed or older
+    /// daemon can echo a `U+202E` RIGHT-TO-LEFT OVERRIDE straight into
+    /// `rec.cwd`, which reaches the `Dir:` line (`Span::raw` in
+    /// `src/ui.rs`) via `seed_hydrated_session` unscrubbed.
+    #[test]
+    fn sanitize_record_tab_membership_scrubs_cwd_bidi_override() {
+        let mut rec = AgentRecord {
+            id: "13".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: Some("/tmp/\u{202e}gnp.sh".into()),
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
+            cli_name: None,
+            crashed: None,
+            outstanding_delegation: None,
+            silence_watch: None,
+            delegation_commission: None,
+        };
+        sanitize_record_tab_membership(&mut rec);
+        let cwd = rec
+            .cwd
+            .as_deref()
+            .expect("a cwd with printable characters survives scrubbing");
+        assert!(
+            !cwd.contains('\u{202e}'),
+            "rec.cwd must have bidi overrides stripped, got {cwd:?}"
+        );
     }
 
     #[test]

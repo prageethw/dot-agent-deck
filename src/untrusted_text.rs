@@ -25,28 +25,14 @@
 //!
 //! This is now the single implementation of the control+bidi filter.
 //! [`crate::build_version_handshake`] carried a byte-identical copy until issue
-//! #670 and delegates here instead. [`crate::daemon_client`] still has its own
-//! `strip_control_chars`, which drops control characters but NOT bidi — that is
-//! a different seam (the `list_agents` wire boundary, on records the daemon has
-//! already validated) with its own audit, and folding it in here is deliberately
-//! not part of #670. Reach for this module rather than writing a third copy: it
-//! is the divergence between those two that let the bidi half be present on one
-//! untrusted path and absent on another.
-//!
-//! Issue #833 brought ONE field of that seam here — `AgentRecord.display_name`,
-//! which had no filter at all rather than the control-only one. It now goes
-//! through [`sanitize_display_name`], because it is the card title
-//! `ui::render_card_grid` prefers and the daemon-side gate that was supposed to
-//! keep it clean admitted bidi. The live-snapshot strings beside it —
-//! `last_user_prompt`, `first_prompts`, `active_tool` — still use
-//! `daemon_client`'s control-only filter, so that seam is now MIXED rather than
-//! uniformly control-only, and `cwd` on the same record has neither (see
-//! `daemon_client::sanitize_record_tab_membership`'s doc for that residual).
-//! Their live counterparts arriving on the hook socket are the ones this module
-//! covers: `tool_name` / `tool_detail` through [`sanitize_tool_text`], and the
-//! hook's `display_name` metadata through [`sanitize_display_name`].
-//! `user_prompt` at that ingest is scrubbed on neither route and is not part of
-//! #833.
+//! #670 and delegates here instead. [`crate::daemon_client`] used to carry its
+//! own `strip_control_chars` (control characters only, NOT bidi) on the
+//! `list_agents` wire boundary — issues #664/#665 folded that seam into this
+//! module too (`sanitize_record_tab_membership`'s `cwd`/prompt/`active_tool`
+//! scrubs), so the function no longer exists. Reach for this module rather than
+//! writing a third copy: divergence between two near-identical filters is
+//! exactly how the bidi half ends up present on one untrusted path and absent
+//! on another.
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
 use crate::prompt_delivery::truncate_on_char_boundary;
