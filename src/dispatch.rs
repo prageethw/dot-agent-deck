@@ -4229,6 +4229,9 @@ mod tests {
             worktrees: new_worktree_registry(),
             default_command: Some("/definitely-not-a-real-binary-xyz-563".to_string()),
             state: None,
+            // No live caller to report back to: this test asserts on the
+            // dispatch result directly, not on a delegate reply.
+            caller: None,
         };
 
         let result = handle_dispatch(&ctx, "isolated-cleanupfail-unit", "task", None).await;

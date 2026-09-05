@@ -8975,10 +8975,10 @@ mod tests {
     /// from `list_linked_worktrees` by design, so it can never produce a
     /// `KIND_LINKED` row to assert on). References `WorktreeReport.pinned`
     /// directly, which does not exist yet, so this is a compile-error RED.
-    #[spec("worktree/reclaim/083")]
+    #[spec("worktree/reclaim/096")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_083_pinned_field_reflects_pin_state_and_fails_closed_when_unreadable() {
+    fn worktree_reclaim_096_pinned_field_reflects_pin_state_and_fails_closed_when_unreadable() {
         use std::os::unix::fs::PermissionsExt;
 
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -9179,10 +9179,10 @@ mod tests {
     /// `isolated_clone_report`'s own `repo_slug: Option<&str>` parameter),
     /// which does not exist yet -- this is a compile-error RED, the same
     /// shape as `worktree_reclaim_081`'s `WorktreeReport.pinned` reference.
-    #[spec("worktree/reclaim/084")]
+    #[spec("worktree/reclaim/082")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_084_removal_refuses_when_candidate_slug_no_longer_matches_root() {
+    fn worktree_reclaim_082_removal_refuses_when_candidate_slug_no_longer_matches_root() {
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let scratch = tempfile::tempdir().unwrap();

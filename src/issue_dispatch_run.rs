@@ -11999,9 +11999,9 @@ exit 0
     /// shape) twice in a row and asserts the two returned strings differ --
     /// pinning that the disambiguator, once it exists, can never repeat
     /// within one process the way a bare PID does.
-    #[spec("worktree/reclaim/082")]
+    #[spec("worktree/reclaim/095")]
     #[test]
-    fn worktree_reclaim_082_pin_temp_disambiguator_differs_across_same_process_calls() {
+    fn worktree_reclaim_095_pin_temp_disambiguator_differs_across_same_process_calls() {
         let first = pin_temp_disambiguator();
         let second = pin_temp_disambiguator();
         assert_ne!(
