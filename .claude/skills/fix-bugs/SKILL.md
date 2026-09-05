@@ -20,9 +20,19 @@ This query is a **pre-filter only** — `gh --label` is AND-only and has no nega
 
 For each remaining result, also check whether it's already claimed (`in-progress` label) — this is a cheap **pre-filter**, not the check itself: a claimed issue with a worktree that still exists is likely someone else's, so deprioritize it in this pass. The actual check is `worker-agent-deck issue claim <n> --repo prageethw/dot-agent-deck` at step 5.2, which refuses and exits non-zero if another identity already holds the issue (CLAUDE.md rules 14/23) — that refusal, not a label read, is what determines whether the issue is actually available. An issue whose claim's worktree no longer exists is stale and can be taken over via `worker-agent-deck issue claim <n> --repo prageethw/dot-agent-deck --takeover --confirm-stopped`, but only after confirming with the user that the prior orchestration has actually stopped — do not infer this yourself.
 
-## Step 2 — Confirm each is genuine and still relevant
+## Step 2 — Confirm each is genuine and still relevant (mandatory per-candidate check, not a skim)
 
-For each candidate, skim the issue body and check the referenced code paths still look as described (files/functions may have moved since it was filed). Don't assume "filed" means "still true" — a fix elsewhere may have already resolved it. Also check `gh pr list --repo prageethw/dot-agent-deck --state all --search "<keywords>"` (and the same against `vfarcic/dot-agent-deck`) before assuming the defect needs fresh work — CLAUDE.md rule 20's PR half: an issue records that something *should* be done, a PR records that it *has been*, and `gh issue list` never returns PRs. If an open PR already fixes this issue, verify that PR instead of duplicating the work (see `verify-pr` under Related; live example right now: #282 already has PR #431 open against it). If you can't tell from reading, that's what step 5.4 (reproduce) settles definitively; don't gate step 1's inventory on doing a full reproduction for every candidate up front.
+**A checkout that's behind `origin/main` gives false confidence here before any other check runs.** `git fetch origin --quiet`, then check currency with `git merge-base --is-ancestor origin/main HEAD` (exit 0 means current, non-zero means behind) rather than eyeballing two `git log` outputs. **If you're reading from the root checkout — the normal case, since Step 2 runs before Step 5.1 creates any worktree — never fast-forward it to fix a stale result.** CLAUDE.md rule 1 forbids working in the root checkout at all: the daemon and live workers are attached to it and it routinely carries uncommitted state, so a fast-forward there either fails outright or moves code out from under live work. Instead, read the issue's named code straight from the ref, with no working-tree change: `git show origin/main:<path>` for a whole file, or `git grep -n '<symbol>' origin/main -- <path>` for a specific function/const. This is strictly more correct than fast-forwarding, not a workaround — it validates against `origin/main` exactly and works regardless of the root checkout's own state. (A worktree already branched from `origin/main` per Step 5.1 is current by construction — this only matters for reads that happen before one exists.) Validating an issue's code references against a stale ref is worse than not checking at all: it produces the appearance of diligence with none of the substance, and every conclusion drawn from it (still valid, already fixed, file/line still accurate) is unreliable until this is confirmed.
+
+For each candidate, this is a required checkpoint, not an optional pass — do not report a queue as "clear" or move a candidate to Step 3 without having done this:
+
+1. **Read the exact code the issue names**, not just its prose description. If it cites a file:line or function, open that file and confirm the named code still exists in the shape described — line numbers drift constantly (every PR before it in the same file shifts them), so a drifted line number is not itself a reason to doubt the issue, but the *function or mechanism* being gone, renamed beyond recognition, or already doing what the issue asks is. `grep -n` for the function/const/symbol name named in the issue body is normally faster than trusting a stale line number.
+2. **Check whether a *different, newer* issue already covers the same ground more precisely.** An issue can be superseded without being wrong — a later issue filed during a subsequent review round often restates the same defect with current line numbers and a narrower, more accurate scope (this happened this session: issue #670 was closed as superseded by #683, which said the same thing with the file having moved under it). Search by the underlying mechanism/function name, not the older issue's title verbatim: `gh issue list --repo prageethw/dot-agent-deck --state all --search "<mechanism/function name>"`, then read the matches manually — a supersession restates scope, it rarely shares enough keywords to be keyword-detectable, so this search narrows candidates rather than deciding for you.
+3. **Check whether a fix elsewhere already resolved it** — `gh pr list --repo prageethw/dot-agent-deck --state all --search "<keywords>"` (and the same against `vfarcic/dot-agent-deck`) before assuming the defect needs fresh work — CLAUDE.md rule 20's PR half: an issue records that something *should* be done, a PR records that it *has been*, and `gh issue list` never returns PRs. If an open PR already fixes this issue, verify that PR instead of duplicating the work (see `verify-pr` under Related; e.g. #282 was once covered this way — PR #431 fixed it, and both closed once the PR merged).
+
+**Don't assume "filed" means "still true."** If you can't tell from reading, that's what step 5.4 (reproduce) settles definitively — this step doesn't require a full reproduction for every candidate, but it does require an actual look at the current code, not a memory of what the issue said or an assumption that nothing has changed since filing.
+
+**Record one line of evidence per candidate, whichever way it goes — not only for a stale/fixed/superseded conclusion.** For "still genuine, proceed to Step 3": name the symbol you grepped for and where it turned up (`grep -n '<sym>' <file>` → present at `:NNN`, shape as described). For stale/already-fixed/superseded: the PR number, the current code you read and what it shows, or the superseding issue number — the same evidence discipline the `review-issues` skill's Step 3/7 require for a close. Evidence has to run both directions, or "proceed" stays the cheaper answer under time pressure and the check drifts back into a skim wearing a mandatory label. If the queue turns out to need real closes/updates rather than fixes, that's `review-issues`' job (see Related) — do the check here, hand off the classification work there rather than making ad-hoc closes mid-sweep.
 
 ## Step 3 — Determine upstream-code-defect status, at discovery time (rule 19)
 
@@ -68,15 +78,18 @@ Also run `gh issue list --repo prageethw/dot-agent-deck --label bug --label need
 Brief, per the shape this skill was asked for:
 
 ```
-defects fixed        — list, with issue numbers
-root causes           — one line each
-fixes merged           — PR numbers + merge commit SHAs
-validation status      — main's post-merge CI result
-defects still blocked  — exact reason each, not "couldn't get to it"
+defects fixed            — list, with issue numbers
+root causes              — one line each
+fixes merged             — PR numbers + merge commit SHAs
+validation status        — main's post-merge CI result
+defects still blocked    — exact reason each, not "couldn't get to it"
+step 2 validation        — every candidate checked, one evidence line each, against origin/main SHA <sha>; never empty, even when nothing was stale
+stale/superseded/fixed   — issue numbers found obsolete in Step 2, with evidence, and whether you closed them or left that to review-issues
 ```
 
 ## Related
 
 - `reproduce-first` — the per-defect reproduce → fix → confirm discipline this skill applies in a loop.
 - `verify-pr` — if a defect's "fix" turns out to already exist on an open PR from someone else, verify that PR instead of duplicating the work (CLAUDE.md rule 20 — search both trackers, issues *and* PRs, before starting).
+- `review-issues` — the deeper, dedicated version of Step 2's validation check, run across the whole backlog rather than just this sweep's candidates. Reach for it when Step 2 turns up more staleness than this sweep should absorb ad hoc, or when the user asks for a full triage pass rather than a fix sweep.
 - CLAUDE.md rules 1 (worktrees), 5 (CI-only tests), 8 (no automated reviewer — reviewer+auditor are the gate), 14/23 (issue claim), 16 (named suppliers), 20 (search both trackers), 22 (batch pushes), 25 (the merge checklist and its always-ask exclusions), 27 (task list before the first edit/delegation).
