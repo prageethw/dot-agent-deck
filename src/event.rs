@@ -158,12 +158,7 @@ impl AgentType {
         }
         let tokens = tokenize_command(cmd?);
         let idx = skip_env_prefix(&tokens);
-        let basename = tokens.get(idx).map(|token| {
-            std::path::Path::new(token)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(token.as_str())
-        });
+        let basename = tokens.get(idx).map(|token| resolve_basename(token));
         if basename == Some("devbox")
             && tokens.get(idx + 1).map(String::as_str) == Some("run")
             && let Some(script) = tokens.get(idx + 2)
@@ -180,6 +175,16 @@ impl AgentType {
 /// with an explicit budget each `-c` level costs one unit and the chain
 /// terminates safely at `None`.
 const DETECT_RECURSION_BUDGET: usize = 8;
+
+/// Resolve a command token to its executable basename (e.g. `/usr/bin/claude`
+/// -> `claude`), falling back to the token itself if it has no file-name
+/// component (e.g. `.`, `..`, or an empty string).
+fn resolve_basename(token: &str) -> &str {
+    std::path::Path::new(token)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(token)
+}
 
 /// Short options (matched WITH their leading dash) that consume the FOLLOWING
 /// token as their argument for a given launcher, so command detection skips both
@@ -240,10 +245,7 @@ fn skip_env_prefix(tokens: &[String]) -> usize {
         idx += 1;
     }
     if let Some(token) = tokens.get(idx) {
-        let basename = std::path::Path::new(token)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(token.as_str());
+        let basename = resolve_basename(token);
         if basename == "env" || basename == "sudo" {
             idx += 1;
             while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
@@ -271,10 +273,7 @@ fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
             idx += 1;
         }
         let token = tokens.get(idx)?;
-        let basename = std::path::Path::new(token)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(token.as_str());
+        let basename = resolve_basename(token);
 
         // `env` / `sudo` prefix: skip the launcher and any of its own flags,
         // `VAR=VALUE` assignments, and — R20-016 — the ARGUMENT of an
