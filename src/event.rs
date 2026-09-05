@@ -142,7 +142,9 @@ impl AgentType {
 
     /// Like [`from_command`], but ALSO recognizes `devbox run <script>` via
     /// [`crate::agent_registry::detect_from_devbox_script`]'s hyphen-segment
-    /// heuristic. Deliberately SEPARATE from `from_command`: that function's
+    /// heuristic, including through a leading `env`/`sudo` prefix or a
+    /// `sh -c '<script>'`-shaped shell-launcher hop (issue #542 Gap 2).
+    /// Deliberately SEPARATE from `from_command`: that function's
     /// result also feeds `wrap_launch_command`'s wrap-vs-bare decision (see
     /// the documented invariant at `agent_pty.rs:5871-5911`, which names
     /// `devbox run codex-big` as its own "resolves to no agent type"
@@ -153,19 +155,8 @@ impl AgentType {
     /// and must NEVER be used anywhere that decides whether to spawn,
     /// respawn, or wrap a launch command.
     pub fn from_command_including_devbox(cmd: Option<&str>) -> Option<Self> {
-        if let Some(t) = Self::from_command(cmd) {
-            return Some(t);
-        }
         let tokens = tokenize_command(cmd?);
-        let idx = skip_env_prefix(&tokens);
-        let basename = tokens.get(idx).map(|token| resolve_basename(token));
-        if basename == Some("devbox")
-            && tokens.get(idx + 1).map(String::as_str) == Some("run")
-            && let Some(script) = tokens.get(idx + 2)
-        {
-            return crate::agent_registry::detect_from_devbox_script(script);
-        }
-        None
+        from_command_including_devbox_from_tokens(&tokens, DETECT_RECURSION_BUDGET)
     }
 }
 
@@ -175,6 +166,56 @@ impl AgentType {
 /// with an explicit budget each `-c` level costs one unit and the chain
 /// terminates safely at `None`.
 const DETECT_RECURSION_BUDGET: usize = 8;
+
+/// Issue #542 Gap 2: recursive helper backing
+/// [`AgentType::from_command_including_devbox`], threading the same
+/// shell-launcher recursion budget [`detect_from_tokens`] uses (decremented,
+/// never reset, across the recursive call below) so a deeply nested
+/// `sh -c "sh -c …"` wrapping a devbox invocation also terminates safely
+/// rather than recursing unboundedly.
+fn from_command_including_devbox_from_tokens(
+    tokens: &[String],
+    budget: usize,
+) -> Option<AgentType> {
+    if budget == 0 {
+        return None;
+    }
+    if let Some(t) = detect_from_tokens(tokens, budget) {
+        return Some(t);
+    }
+    let idx = skip_env_prefix(tokens);
+    let basename = tokens.get(idx).map(|token| resolve_basename(token));
+    if basename == Some("devbox")
+        && tokens.get(idx + 1).map(String::as_str) == Some("run")
+        && let Some(script) = tokens.get(idx + 2)
+    {
+        return crate::agent_registry::detect_from_devbox_script(script);
+    }
+    // Shell launcher: `sh -c '<script>'`. Recurse into the script argument,
+    // same as `detect_from_tokens`'s shell-launcher hop, so a devbox
+    // invocation wrapped in a shell hop is recognized identically to the
+    // bare `devbox run …` form.
+    if matches!(
+        basename,
+        Some("sh" | "bash" | "zsh" | "dash" | "ksh" | "ash")
+    ) {
+        let mut j = idx + 1;
+        while let Some(arg) = tokens.get(j) {
+            if arg.starts_with('-') {
+                if is_shell_command_flag(arg)
+                    && let Some(script) = tokens.get(j + 1)
+                {
+                    let inner = tokenize_command(script);
+                    return from_command_including_devbox_from_tokens(&inner, budget - 1);
+                }
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    None
+}
 
 /// Resolve a command token to its executable basename (e.g. `/usr/bin/claude`
 /// -> `claude`), falling back to the token itself if it has no file-name
