@@ -4265,6 +4265,13 @@ without depending on the config struct API.
 - **Does not assert:** the exact error wording.
 - **Platform coverage:** mac+linux (unix-only).
 
+##### pane/spawn/005 — Spawning a role into an orchestration that already has an ATTACHED tab open must join that tab, not build a second one (PRD #699 M4).
+- **Layer:** L2/e2e (real TUI driven via PTY, real daemon, real `dot-agent-deck pane spawn reviewer` CLI subprocess). `pane-spawn-live` fixture: one orchestration, roles `orchestrator` [start] + `coder`, both spawned when the tab opens. The RUNNING orchestration's own `.dot-agent-deck.toml` (read back from the daemon's registry, at the isolated-clone cwd its role panes actually run in) is then mutated to add a third role, `reviewer`, never part of the config the tab was opened from — mirroring the "operator edited the config mid-session" scenario `pane/spawn/001` exercises at the handler level.
+- **Agent:** none (`cat` stand-ins for every role).
+- **Asserts:** after invoking the real CLI subcommand with `DOT_AGENT_DECK_PANE_ID` set to the orchestrator's real pane id and `DOT_AGENT_DECK_SOCKET` set to the deck's hook socket, reviewer's card joins the SAME orchestration tab that is still active (this test never sends a tab-switch chord) — rendered as its own bordered box titled `reviewer` — and the tab bar still shows exactly one Dashboard tab + one orchestration tab (divider count on the one-row tab-bar strip), not two orchestration tabs for the same orchestration.
+- **Does not assert:** the daemon-level `pane spawn` verb's own correctness (covered by `pane/spawn/001`-`004`); exact card body/status-badge layout.
+- **Platform coverage:** mac+linux (unix-only, PTY-backed harness).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
