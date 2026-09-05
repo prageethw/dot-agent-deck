@@ -78,7 +78,7 @@ Also run `gh issue list --repo prageethw/dot-agent-deck --label bug --label need
 Brief, per the shape this skill was asked for:
 
 ```
-defects fixed           — list, with issue numbers
+defects fixed            — list, with issue numbers
 root causes              — one line each
 fixes merged             — PR numbers + merge commit SHAs
 validation status        — main's post-merge CI result
