@@ -7545,6 +7545,33 @@ impl AppState {
             .await
     }
 
+    /// Caller validation shared by [`Self::handle_delegate_with_state`] and
+    /// [`Self::handle_restart_role_with_state`] (PRD #699 M2): only a pane the
+    /// daemon holds an orchestration role for — and specifically its
+    /// orchestrator — may act on other panes within that orchestration.
+    /// `verb` names the action in the refusal message (e.g. `"delegate"`,
+    /// `"restart a role"`). Returns the error message to embed in the
+    /// caller's own response type, or `None` when the caller is authorized.
+    fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
+        if !self.pane_role_map.contains_key(pane_id) {
+            warn!(pane_id = %pane_id, verb, "action from unknown pane");
+            return Some(format!(
+                "the daemon holds no orchestration role for pane {pane_id}, so this action \
+                 was routed nowhere. Only a pane spawned as part of an orchestration \
+                 can {verb}."
+            ));
+        }
+        if !self.orchestrator_pane_ids.contains(pane_id) {
+            let role = self.pane_role_map.get(pane_id).cloned().unwrap_or_default();
+            warn!(pane_id = %pane_id, role = %role, verb, "action from non-orchestrator pane");
+            return Some(format!(
+                "pane {pane_id} is the `{role}` role, not this orchestration's orchestrator, \
+                 so it may not {verb}."
+            ));
+        }
+        None
+    }
+
     /// [`Self::handle_delegate`] with a handle on the daemon's own shared state.
     ///
     /// Issue #606: a `clear = true` delegate can now RE-CREATE a worker pane
@@ -7565,31 +7592,9 @@ impl AppState {
         state: Option<&SharedState>,
     ) -> crate::event::DelegateResponse {
         use crate::event::DelegateResponse;
-        if !self.pane_role_map.contains_key(&signal.pane_id) {
-            warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
+        if let Some(error) = self.refuse_unless_orchestrator_caller(&signal.pane_id, "delegate") {
             return DelegateResponse {
-                error: Some(format!(
-                    "the daemon holds no orchestration role for pane {}, so this delegate \
-                     was routed nowhere. Only a pane spawned as part of an orchestration \
-                     can delegate.",
-                    signal.pane_id
-                )),
-                ..Default::default()
-            };
-        }
-        if !self.orchestrator_pane_ids.contains(&signal.pane_id) {
-            let role = self
-                .pane_role_map
-                .get(&signal.pane_id)
-                .cloned()
-                .unwrap_or_default();
-            warn!(pane_id = %signal.pane_id, role = %role, "delegate from non-orchestrator pane");
-            return DelegateResponse {
-                error: Some(format!(
-                    "pane {} is the `{role}` role, not this orchestration's orchestrator, \
-                     so it may not delegate.",
-                    signal.pane_id
-                )),
+                error: Some(error),
                 ..Default::default()
             };
         }
@@ -7807,31 +7812,11 @@ impl AppState {
     ) -> crate::event::RestartRoleResponse {
         use crate::event::RestartRoleResponse;
         let _ = event_tx;
-        if !self.pane_role_map.contains_key(&signal.pane_id) {
-            warn!(pane_id = %signal.pane_id, "restart-role from unknown pane");
+        if let Some(error) =
+            self.refuse_unless_orchestrator_caller(&signal.pane_id, "restart a role")
+        {
             return RestartRoleResponse {
-                error: Some(format!(
-                    "the daemon holds no orchestration role for pane {}, so this restart \
-                     was routed nowhere. Only a pane spawned as part of an orchestration \
-                     can restart a role.",
-                    signal.pane_id
-                )),
-                ..Default::default()
-            };
-        }
-        if !self.orchestrator_pane_ids.contains(&signal.pane_id) {
-            let role = self
-                .pane_role_map
-                .get(&signal.pane_id)
-                .cloned()
-                .unwrap_or_default();
-            warn!(pane_id = %signal.pane_id, role = %role, "restart-role from non-orchestrator pane");
-            return RestartRoleResponse {
-                error: Some(format!(
-                    "pane {} is the `{role}` role, not this orchestration's orchestrator, \
-                     so it may not restart a role.",
-                    signal.pane_id
-                )),
+                error: Some(error),
                 ..Default::default()
             };
         }
