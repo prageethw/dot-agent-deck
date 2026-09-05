@@ -6545,6 +6545,29 @@ fn surface_one_orchestration(
                 {
                     *focused_role_pane_id = Some(role.pane_id.clone());
                 }
+                // PRD #699 M5: the New-Pane-form-opened path (`open_orchestration_tab`)
+                // captures a `SavedPane { orchestration: Some(OrchestrationSnapshot { roles, .. }), .. }`
+                // onto `ui.pane_metadata` keyed by the start role's pane id, which is
+                // what lets `resolve_orchestration_for_restore` rebuild this tab on
+                // restore. That snapshot otherwise freezes at tab-open time — grow it
+                // here too, so a role added via `pane spawn` survives the next session
+                // flush instead of drift-triggering the restore fallback to a plain
+                // pane. Conditional on the entry existing: a tab opened via the batch
+                // daemon-surfacing path never captures `pane_metadata` at all (a
+                // separate, pre-existing gap out of scope here) and must not have one
+                // backfilled.
+                if let Some(Tab::Orchestration {
+                    start_role_index,
+                    role_pane_ids,
+                    ..
+                }) = tab_manager.tabs().get(existing_tab_index)
+                    && let Some(start_pane_id) = role_pane_ids.get(*start_role_index).cloned()
+                    && let Some(saved) = ui.pane_metadata.get_mut(&start_pane_id)
+                    && let Some(snapshot) = saved.orchestration.as_mut()
+                {
+                    snapshot.roles.push(role.role_name.clone());
+                    ui.mark_session_dirty();
+                }
             }
         }
         tracing::info!(
