@@ -3537,13 +3537,11 @@ mod tests {
     ///
     /// Asserts the CORRECT post-rollback behavior, mirroring #473's
     /// shared-checkout assertion: the registry entry must still be present,
-    /// since the isolated clone directory is genuinely still on disk. The
-    /// isolated-clone arm's `cleanup_failed = cleaned_up_by.is_none()`
-    /// computation never updates `should_drop_registry` (unlike the
-    /// shared-checkout `else` arm, which sets `should_drop_registry =
-    /// !remove_failed`) -- it stays at its initial `true` regardless of
-    /// whether cleanup actually succeeded, so today the registry entry is
-    /// dropped anyway even though the directory is still there.
+    /// since the isolated clone directory is genuinely still on disk.
+    /// `dispatch.rs` now sets `should_drop_registry = cleaned_up_by.is_some()`
+    /// in the isolated-clone arm, mirroring the shared-checkout `else` arm's
+    /// `should_drop_registry = !remove_failed`, so the registry entry is only
+    /// dropped when cleanup actually succeeded.
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_rollback_retains_registry_entry_when_isolated_clone_cleanup_fails() {
