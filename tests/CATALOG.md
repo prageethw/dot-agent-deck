@@ -4314,6 +4314,13 @@ without depending on the config struct API.
 - **Does not assert:** the full `ui.rs`/`surface_one_orchestration`/`OrchestrationSurface` broadcast integration — this test calls `TabManager` directly with a proposed additive `orchestration_id: Option<&str>` parameter on `open_orchestration_tab_with_existing_role_panes` and `orchestration_tab_index_for` that does not exist in production yet, so the test file does not compile until the coder delegation threads a per-tab orchestration id through both (the exact parameter shape is a proposal to coordinate on, not a mandate).
 - **Platform coverage:** mac+linux (unix-only).
 
+##### pane/spawn/011 — `pane spawn <role>` refuses a role whose registered pane has crashed with a message naming the role and pointing at `pane restart` (PRD #699 fix-round, reviewer N8/re-review item 4).
+- **Layer:** L1/fast (same in-process technique as `pane/spawn/001`, with the coder stand-in running a short-lived command so it exits and M1's `crashed` marker fires naturally, mirroring `tests/pane_restart.rs`'s own crash precondition).
+- **Agent:** none.
+- **Asserts:** once the coder stand-in's registry record reads `crashed == Some(true)`, `pane spawn coder` reports `spawned: false` with an error naming the role AND containing the literal substring `"pane restart"` — pinning the message `handle_spawn_role_with_state` selects on the crashed branch (as opposed to the flat "already running" wording a healthy pane gets).
+- **Does not assert:** the exact full wording of the message beyond those two substrings; the "already running" (non-crashed) branch, already covered incidentally by `pane/spawn/007`'s refusal-message shape.
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/drift
 
 ##### pane/drift/001 — A role grown into an already-open orchestration tab via `pane spawn` must be captured by the NEXT session snapshot flush, not just the tab-open-time capture (PRD #699 M5).

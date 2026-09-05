@@ -1263,18 +1263,28 @@ impl TabManager {
     /// through to [`Self::open_orchestration_tab_with_existing_role_panes`]
     /// and building a duplicate tab for the same orchestration.
     ///
-    /// **Appends only** — assumes the new role's slot is the next index
-    /// after whatever this tab already has, true for the common case of a
-    /// role appended to the end of `.dot-agent-deck.toml`'s role list after
-    /// the tab was opened. A role inserted in the MIDDLE of the config,
-    /// shifting existing role indices, is a known out-of-scope edge case
-    /// for M4 — not handled here.
+    /// Two outcomes, distinguished in the returned `bool` (`true` = a
+    /// genuinely NEW slot was appended, `false` = an existing same-named
+    /// slot was replaced): the common case is a role appended to the end of
+    /// `.dot-agent-deck.toml`'s role list after the tab was opened, but a
+    /// tab can also already carry a DEAD SLOT for this role name (its pane
+    /// closed while the TUI was detached and reattached with no daemon
+    /// registration to back it) — that slot is replaced in place, not
+    /// duplicated. Fix-round N1 (reviewer/auditor, independently): the
+    /// caller MUST use this bool rather than `.is_ok()` to decide whether to
+    /// push the role name onto the persisted session snapshot — pushing
+    /// unconditionally on the replace path lists the role twice and
+    /// permanently fails `resolve_orchestration_for_restore`'s exact-sequence
+    /// drift guard, which is the exact failure this function's replace path
+    /// exists to prevent. A role inserted in the MIDDLE of the config,
+    /// shifting existing role indices, is a known out-of-scope edge case for
+    /// M4 — not handled here.
     pub fn add_role_to_existing_orchestration(
         &mut self,
         tab_index: usize,
         role_config: OrchestrationRoleConfig,
         pane_id: String,
-    ) -> Result<usize, TabError> {
+    ) -> Result<(usize, bool), TabError> {
         let Some(Tab::Orchestration {
             role_pane_ids,
             role_statuses,
@@ -1296,7 +1306,14 @@ impl TabManager {
         if let Some(existing_index) = config.roles.iter().position(|r| r.name == role_config.name) {
             role_pane_ids[existing_index] = pane_id;
             role_statuses[existing_index] = OrchestrationRoleStatus::Working;
-            return Ok(existing_index);
+            // Reviewer N6: keep the FRESH role_config the caller just
+            // resolved rather than the tab's stale one — otherwise a role
+            // whose `command`/`agent` was edited in `.dot-agent-deck.toml`
+            // after the tab was opened comes back through `pane spawn` with
+            // the tab still holding the pre-edit config, while the daemon
+            // spawned the child from the current one.
+            config.roles[existing_index] = role_config;
+            return Ok((existing_index, false));
         }
 
         let role_index = config.roles.len();
@@ -1316,7 +1333,7 @@ impl TabManager {
         // handling, there's no `None` case here since M3's spawn only ever
         // calls this on a real, just-spawned agent.
         role_statuses.push(OrchestrationRoleStatus::Working);
-        Ok(role_index)
+        Ok((role_index, true))
     }
 
     /// PRD #92 F4: close a mode or orchestration tab and return a

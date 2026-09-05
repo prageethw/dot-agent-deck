@@ -23,7 +23,9 @@
 
 use std::time::Duration;
 
-use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership};
+use dot_agent_deck::agent_pty::{
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+};
 use dot_agent_deck::event::{SpawnRoleResponse, SpawnRoleSignal};
 use dot_agent_deck::state::{OrchestrationIdentity, handle_spawn_role_with_state};
 use spec::spec;
@@ -65,11 +67,17 @@ struct Fixture {
     coder_agent_id: String,
 }
 
-/// Spawn an orchestrator + a `coder` worker, register both roles. The
-/// `.dot-agent-deck.toml` also declares a third role, `reviewer`, that is
-/// deliberately never spawned or registered — the "configured but unspawned
-/// role" M3 targets.
-async fn fixture() -> Fixture {
+/// Spawn an orchestrator + a `coder` worker running `coder_command`,
+/// register both roles. The `.dot-agent-deck.toml` also declares a third
+/// role, `reviewer`, that is deliberately never spawned or registered — the
+/// "configured but unspawned role" M3 targets. `coder_command` mirrors
+/// `tests/pane_restart.rs`'s own `fixture()` parameter: `"cat"` keeps the
+/// coder healthy for the life of the test, a short-lived command (e.g.
+/// `"sleep 0.2"`) lets it exit on its own so M1's naturally-exited-worker
+/// marker (`crashed == Some(true)`) fires while its role registration is
+/// left untouched — the precondition the fix-round's M3 refusal message
+/// targets.
+async fn fixture(coder_command: &str) -> Fixture {
     let daemon = common::spawn_inprocess_daemon().await;
     let dir = common::race_safe_tempdir();
     std::fs::write(dir.path().join(".dot-agent-deck.toml"), config())
@@ -90,7 +98,7 @@ async fn fixture() -> Fixture {
     let coder_agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some("cat"),
+            command: Some(coder_command),
             cwd: Some(&cwd),
             display_name: Some(CODER_ROLE),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), CODER_PANE.to_string())],
@@ -147,6 +155,24 @@ async fn spawn_role(fx: &Fixture, caller_pane_id: &str, role: &str) -> SpawnRole
     .await
 }
 
+/// Poll until `agent_id`'s registry record is `crashed == Some(true)`, the
+/// same bounded-deadline idiom `tests/pane_restart.rs`'s own waiter uses.
+async fn wait_for_crashed(registry: &AgentPtyRegistry, agent_id: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if registry
+            .agent_record_any(agent_id)
+            .is_some_and(|r| r.crashed == Some(true))
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Scenario: a role declared in `.dot-agent-deck.toml` (`reviewer`) was never
 /// spawned into this orchestration instance. The orchestrator pane asks the
 /// daemon to spawn it. The response must report success with no error, and
@@ -156,7 +182,7 @@ async fn spawn_role(fx: &Fixture, caller_pane_id: &str, role: &str) -> SpawnRole
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/spawn/001")]
 async fn pane_spawn_001_spawns_a_configured_but_unspawned_role_and_it_becomes_reachable() {
-    let fx = fixture().await;
+    let fx = fixture("cat").await;
 
     let before = fx
         .daemon
@@ -213,7 +239,7 @@ async fn pane_spawn_001_spawns_a_configured_but_unspawned_role_and_it_becomes_re
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/spawn/002")]
 async fn pane_spawn_002_refuses_a_role_already_live_in_this_instance() {
-    let fx = fixture().await;
+    let fx = fixture("cat").await;
 
     let records_before = fx.daemon.registry.agent_records().len();
 
@@ -251,7 +277,7 @@ async fn pane_spawn_002_refuses_a_role_already_live_in_this_instance() {
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/spawn/003")]
 async fn pane_spawn_003_refuses_a_role_not_in_config() {
-    let fx = fixture().await;
+    let fx = fixture("cat").await;
 
     let response = spawn_role(&fx, ORCH_PANE, UNKNOWN_ROLE).await;
     assert!(
@@ -273,7 +299,7 @@ async fn pane_spawn_003_refuses_a_role_not_in_config() {
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/spawn/004")]
 async fn pane_spawn_004_refuses_from_a_non_orchestrator_pane() {
-    let fx = fixture().await;
+    let fx = fixture("cat").await;
 
     let response = spawn_role(&fx, CODER_PANE, REVIEWER_ROLE).await;
     assert!(
@@ -424,7 +450,7 @@ async fn pane_spawn_006_injects_registration_generation_and_daemon_boot_id_into_
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/spawn/007")]
 async fn pane_spawn_007_refuses_to_spawn_its_own_start_role() {
-    let fx = fixture().await;
+    let fx = fixture("cat").await;
     let records_before = fx.daemon.registry.agent_records().len();
 
     let response = spawn_role(&fx, ORCH_PANE, "orchestrator").await;
@@ -464,7 +490,7 @@ async fn pane_spawn_007_refuses_to_spawn_its_own_start_role() {
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/spawn/008")]
 async fn pane_spawn_008_concurrent_spawns_of_the_same_role_never_leave_two_live_panes() {
-    let fx = fixture().await;
+    let fx = fixture("cat").await;
 
     let signal_a = SpawnRoleSignal {
         pane_id: ORCH_PANE.to_string(),
@@ -507,5 +533,53 @@ async fn pane_spawn_008_concurrent_spawns_of_the_same_role_never_leave_two_live_
         "two concurrent `pane spawn reviewer` calls must never leave more than one live pane \
          registered for the role — response_a = {response_a:?}, response_b = {response_b:?}, \
          targets = {targets:?}"
+    );
+}
+
+/// Scenario: PRD #699 fix-round M3 (`findings-699-reviewer.md`'s re-review,
+/// "M3 — RESOLVED" / N8 — flagged as unpinned and "the one most likely to
+/// regress silently, since it is a user-visible string an orchestrator agent
+/// is expected to act on"). The `coder` worker exits on its own shortly
+/// after boot (M1's naturally-exited-worker marker fires, `crashed ==
+/// Some(true)`) while its role registration is left in place — the "already
+/// live" oracle still resolves it. The orchestrator asks to `pane spawn
+/// coder`. The refusal must name the crashed role AND point the operator at
+/// `pane restart` as the remedy, not the flat "already running" wording
+/// that fires for a genuinely healthy pane.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/spawn/011")]
+async fn pane_spawn_011_refuses_a_crashed_roles_spawn_with_a_pane_restart_pointer() {
+    let fx = fixture("sleep 0.2").await;
+
+    let crashed = wait_for_crashed(
+        &fx.daemon.registry,
+        &fx.coder_agent_id,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        crashed,
+        "precondition: the coder stand-in never got marked crashed; record = {:?}",
+        fx.daemon.registry.agent_record_any(&fx.coder_agent_id)
+    );
+
+    let response = spawn_role(&fx, ORCH_PANE, CODER_ROLE).await;
+
+    assert!(
+        !response.spawned,
+        "spawning an already-registered-but-crashed role must be refused; response = {response:?}"
+    );
+    let error = response
+        .error
+        .as_deref()
+        .expect("a refused spawn must carry an error message");
+    assert!(
+        error.contains(CODER_ROLE),
+        "the refusal must name the crashed role; error = {error:?}"
+    );
+    assert!(
+        error.contains("pane restart"),
+        "the refusal must point the operator at `pane restart` as the remedy, not the flat \
+         'already running' wording; error = {error:?}"
     );
 }

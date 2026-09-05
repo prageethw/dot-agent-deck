@@ -8237,7 +8237,19 @@ pub async fn handle_spawn_role_with_state(
             state_guard.delegate_targets(&signal.pane_id, std::slice::from_ref(&signal.role));
         if !still_live.is_empty() {
             drop(state_guard);
-            let _ = registry.close_agent(&agent_id);
+            // Fix-round N2 (reviewer): `close_agent` runs the synchronous
+            // SIGTERM-with-grace loop, which blocks for up to
+            // `AGENT_TERMINATE_GRACE` on `std::thread::sleep`. This function
+            // is awaited directly on the daemon's hook-connection task, so
+            // calling it inline would block a Tokio worker thread for the
+            // duration — the same rule `daemon_protocol.rs`'s attach-close
+            // path already follows (PRD #92 F8, auditor #1). Hop it onto
+            // `spawn_blocking` here too.
+            let registry_for_close = registry.clone();
+            let id_for_close = agent_id.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || registry_for_close.close_agent(&id_for_close))
+                    .await;
             return SpawnRoleResponse {
                 spawned: false,
                 error: Some(format!(

@@ -1013,6 +1013,10 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
 ///   reasoning in full.
 /// - **L2:** `cwd` drives `load_project_config` and is the bucket key, so it
 ///   must be a valid ABSOLUTE orchestration cwd → reject otherwise.
+/// - **N3 (PRD #699 fix-round, reviewer):** `orchestration_id` is a ROUTING
+///   key with the same semantics as [`TabMembership::Orchestration`]'s field
+///   of the same name → an invalid value rejects the whole surface, matching
+///   [`validate_tab_membership`] rather than being nulled out.
 ///
 /// A surface left with no roles after the per-role drops is rejected: an
 /// orchestration always has ≥1 role, and a zero-role surface can only build a
@@ -1028,6 +1032,19 @@ pub fn validate_orchestration_surface(
     // `cwd` drives `load_project_config` and keys the bucket; require a valid
     // absolute path free of control bytes.
     if !is_valid_orchestration_cwd(&surface.cwd) {
+        return None;
+    }
+    // Fix-round N3 (reviewer): `orchestration_id` has the identical
+    // routing-key semantics `validate_tab_membership` already guards for
+    // its own `orchestration_id` field (PRD #140 M1.1) — it decides which
+    // tab a role pane joins, flows into `OrchestrationHydrationBucket::identity()`
+    // and `dead_slot_pane_id`'s synthetic pane id, and is logged. Same
+    // treatment: reject the whole surface rather than null it out, since
+    // nulling would merge two same-`(name, cwd)` instances back into one
+    // routing group and reintroduce the cross-delivery this PRD fixes.
+    if let Some(id) = surface.orchestration_id.as_deref()
+        && !is_valid_display_name(id)
+    {
         return None;
     }
     // fork#192: no longer purely cosmetic (feeds the new-pane uniqueness

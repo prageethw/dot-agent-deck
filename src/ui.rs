@@ -6483,6 +6483,23 @@ fn surface_one_orchestration(
         // failed to attach or grow.
         let mut grew_any = false;
         for role in &surface.roles {
+            // Fix-round F5 (auditor, folded into N1's fix): `validate_orchestration_surface`
+            // deliberately admits an empty `role_name` from a hostile/buggy
+            // daemon (a legitimate case for the reconnect-synthesis path's
+            // `role-{i}` fallback), but an empty entry pushed onto
+            // `snapshot.roles` below can never equal a config role name and
+            // would permanently fail the restore drift guard, exactly like
+            // N1's duplicate-push. Skip the whole growth attempt for this
+            // role rather than push a value that can never round-trip.
+            if role.role_name.is_empty() {
+                tracing::debug!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    pane_id = %role.pane_id,
+                    "live orchestration surface: role has empty role_name while growing existing tab; dropping role"
+                );
+                continue;
+            }
             if role.role_index >= orch_config.roles.len() {
                 tracing::error!(
                     cwd = %surface.cwd,
@@ -6509,14 +6526,11 @@ fn surface_one_orchestration(
                 );
                 continue;
             }
-            if tab_manager
-                .add_role_to_existing_orchestration(
-                    existing_tab_index,
-                    role_config.clone(),
-                    role.pane_id.clone(),
-                )
-                .is_ok()
-            {
+            if let Ok((_role_index, was_new)) = tab_manager.add_role_to_existing_orchestration(
+                existing_tab_index,
+                role_config.clone(),
+                role.pane_id.clone(),
+            ) {
                 grew_any = true;
                 // PRD #110 followup precedent (`insert_role_placeholder_sessions`,
                 // the New Agent form's own live-open path): a role pane needs an
@@ -6587,6 +6601,17 @@ fn surface_one_orchestration(
                 // daemon-surfacing path never captures `pane_metadata` at all (a
                 // separate, pre-existing gap out of scope here) and must not have one
                 // backfilled.
+                //
+                // Fix-round N1 (reviewer/auditor, independently): push the role
+                // name onto the snapshot only when `add_role_to_existing_orchestration`
+                // reports a genuine APPEND (`was_new`) — the ordinary
+                // respawn-into-existing-role path REPLACES an already-listed
+                // slot, and pushing unconditionally there duplicates the role
+                // name and permanently fails the restore drift guard.
+                // `mark_session_dirty()` stays unconditional on both outcomes:
+                // a replace still changes which pane backs the role, which is
+                // worth persisting even though the role LIST itself didn't
+                // change.
                 if let Some(Tab::Orchestration {
                     start_role_index,
                     role_pane_ids,
@@ -6596,7 +6621,9 @@ fn surface_one_orchestration(
                     && let Some(saved) = ui.pane_metadata.get_mut(&start_pane_id)
                     && let Some(snapshot) = saved.orchestration.as_mut()
                 {
-                    snapshot.roles.push(role.role_name.clone());
+                    if was_new {
+                        snapshot.roles.push(role.role_name.clone());
+                    }
                     ui.mark_session_dirty();
                 }
             }

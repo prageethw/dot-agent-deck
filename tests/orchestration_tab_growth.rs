@@ -143,7 +143,7 @@ fn pane_spawn_009_growing_a_dead_slot_replaces_it_instead_of_appending_a_duplica
         )
         .expect("open a tab with reviewer as a dead slot");
 
-    let grown_role_index = tabs
+    let (grown_role_index, _was_new) = tabs
         .add_role_to_existing_orchestration(
             tab_index,
             role("reviewer", false),
@@ -278,7 +278,7 @@ fn pane_spawn_010_two_same_name_cwd_instances_do_not_cross_wire_on_growth() {
          (instance A); got tab {resolved_for_b}, A = {tab_a}, B = {tab_b}"
     );
 
-    let grown_role_index = tabs
+    let (grown_role_index, _was_new) = tabs
         .add_role_to_existing_orchestration(
             resolved_for_b,
             role("coder", false),
