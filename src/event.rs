@@ -1053,6 +1053,12 @@ pub enum DaemonMessage {
     /// connection, like `GetSeed`/`ListTargets`/`Delegate`.
     #[serde(rename = "restart_role")]
     RestartRole(RestartRoleSignal),
+    /// PRD #699 M3: an orchestrator asks the daemon to spawn a role that is
+    /// declared in `.dot-agent-deck.toml` but was never spawned into this
+    /// running orchestration instance. Answered on the same connection, like
+    /// `RestartRole`.
+    #[serde(rename = "spawn_role")]
+    SpawnRole(SpawnRoleSignal),
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -1276,6 +1282,53 @@ impl RestartRoleResponse {
     /// restart-role response. See [`Self::kind`].
     pub fn is_restart_role_reply(&self) -> bool {
         self.kind.as_deref() == Some(RESTART_ROLE_RESPONSE_KIND)
+    }
+}
+
+/// Signal sent by the orchestrator via `dot-agent-deck pane spawn <role>`
+/// (PRD #699 M3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnRoleSignal {
+    pub pane_id: String,
+    pub role: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// The daemon's reply to a [`DaemonMessage::SpawnRole`], one JSON line back on
+/// the hook-socket connection (the [`RestartRoleResponse`] pattern).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnRoleResponse {
+    /// Affirmative discriminator, always [`SPAWN_ROLE_RESPONSE_KIND`] on a
+    /// reply this daemon wrote — see [`DelegateResponse::kind`] for why this
+    /// must be checked rather than trusting an all-`#[serde(default)]`
+    /// struct's ability to parse ANY JSON object.
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub spawned: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The value [`SpawnRoleResponse::kind`] carries on every reply this daemon
+/// writes. See [`DELEGATE_RESPONSE_KIND`] for why this is a distinct value
+/// checked on every parse rather than inferred from a plausible-looking body.
+pub const SPAWN_ROLE_RESPONSE_KIND: &str = "spawn_role";
+
+impl Default for SpawnRoleResponse {
+    fn default() -> Self {
+        Self {
+            kind: Some(SPAWN_ROLE_RESPONSE_KIND.to_string()),
+            spawned: false,
+            error: None,
+        }
+    }
+}
+
+impl SpawnRoleResponse {
+    /// Whether this parsed reply positively identifies itself as a
+    /// spawn-role response. See [`Self::kind`].
+    pub fn is_spawn_role_reply(&self) -> bool {
+        self.kind.as_deref() == Some(SPAWN_ROLE_RESPONSE_KIND)
     }
 }
 

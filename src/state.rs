@@ -10,8 +10,8 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, GuardedSendDetail};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, RestartRoleSignal, WaitOutcome, WorkDoneSignal,
-    WorktreeKeptNotice, Writable,
+    LiveTarget, OrchestrationSurface, OrchestrationSurfaceRole, RestartRoleSignal, SpawnRoleSignal,
+    WaitOutcome, WorkDoneSignal, WorktreeKeptNotice, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -7941,7 +7941,180 @@ impl AppState {
             },
         }
     }
+}
 
+/// PRD #699 M3: handle `dot-agent-deck pane spawn <role>` — an
+/// orchestrator asking the daemon to spawn a role that is declared in
+/// `.dot-agent-deck.toml` but was never spawned into this running
+/// orchestration instance (e.g. the config gained a role mid-session).
+///
+/// Same caller-validation and "same orchestration" rules as
+/// [`AppState::handle_delegate_with_state`] /
+/// [`AppState::handle_restart_role_with_state`].
+///
+/// **Locking**: unlike those two, this is a plain async FREE FUNCTION
+/// taking the [`SharedState`] handle directly rather than an already-held
+/// read guard — every successful spawn needs
+/// [`AppState::register_orchestration_role`] (a write lock) on the MAIN
+/// path, since deferring it (the way `handle_restart_role_with_state`
+/// defers its rare re-registration case into a detached task) would let
+/// the response claim `spawned: true` before a `delegate` to the new role
+/// could actually reach it. A short-lived READ guard resolves caller
+/// validation, cwd/identity, the "already live" check, and the role
+/// config lookup, then drops BEFORE `registry.spawn_agent(...)` runs (no
+/// state-lock dependency of its own — never hold a guard across it, since
+/// that would block every other daemon connection for the spawn's
+/// duration). A fresh WRITE guard is acquired only for the registration
+/// call, after the spawn has already succeeded.
+pub async fn handle_spawn_role_with_state(
+    signal: SpawnRoleSignal,
+    state: &SharedState,
+    registry: &Arc<AgentPtyRegistry>,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+) -> crate::event::SpawnRoleResponse {
+    use crate::event::SpawnRoleResponse;
+
+    struct ResolvedSpawn {
+        cwd: Option<String>,
+        identity: OrchestrationIdentity,
+        role_index: usize,
+        role_config: OrchestrationRoleConfig,
+    }
+
+    let resolved = {
+        let guard = state.read().await;
+        if let Some(error) =
+            guard.refuse_unless_orchestrator_caller(&signal.pane_id, "spawn a role")
+        {
+            return SpawnRoleResponse {
+                error: Some(error),
+                ..Default::default()
+            };
+        }
+
+        let cwd = guard.orchestration_cwd_of(&signal.pane_id, registry);
+        let identity = guard.pane_orchestration_map.get(&signal.pane_id).cloned();
+
+        // Same routing rule `handle_delegate_with_state` /
+        // `handle_restart_role_with_state` use: same orchestration, role
+        // name match. A non-empty result means the role already has a
+        // live worker pane in this instance.
+        let already_live =
+            guard.delegate_targets(&signal.pane_id, std::slice::from_ref(&signal.role));
+        if !already_live.is_empty() {
+            return SpawnRoleResponse {
+                error: Some(format!(
+                    "role `{}` is already running in this orchestration",
+                    signal.role
+                )),
+                ..Default::default()
+            };
+        }
+
+        let role_config_indexed = match (cwd.as_deref(), identity.as_ref()) {
+            (Some(c), Some(identity)) => {
+                lookup_orchestration_role_indexed(c, identity.name(), &signal.role)
+            }
+            _ => None,
+        };
+        let Some((role_index, role_config)) = role_config_indexed else {
+            return SpawnRoleResponse {
+                error: Some(format!(
+                    "could not resolve role `{}` in this project's .dot-agent-deck.toml, so \
+                         there is no command to spawn it with",
+                    signal.role
+                )),
+                ..Default::default()
+            };
+        };
+
+        let Some(identity) = identity else {
+            return SpawnRoleResponse {
+                error: Some(format!(
+                    "the daemon holds no orchestration identity for pane {}, so role `{}` \
+                         cannot be spawned",
+                    signal.pane_id, signal.role
+                )),
+                ..Default::default()
+            };
+        };
+
+        ResolvedSpawn {
+            cwd,
+            identity,
+            role_index,
+            role_config,
+        }
+        // Read guard drops here — never held across `spawn_agent` below.
+    };
+
+    let pane_id = crate::agent_pty::mint_pane_id();
+    let orchestration_id = match &resolved.identity {
+        OrchestrationIdentity::Instance { id, .. } => Some(id.clone()),
+        OrchestrationIdentity::NameCwd { .. } => None,
+    };
+    let spawn_result = registry.spawn_agent(crate::agent_pty::SpawnOptions {
+        command: Some(resolved.role_config.command.as_str()),
+        cwd: resolved.cwd.as_deref(),
+        display_name: Some(&signal.role),
+        env: vec![(
+            crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+            pane_id.clone(),
+        )],
+        tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+            name: resolved.identity.name().to_string(),
+            role_index: resolved.role_index,
+            role_name: signal.role.clone(),
+            is_start_role: false,
+            orchestration_cwd: resolved.cwd.clone(),
+            display_title: None,
+            orchestration_id,
+        }),
+        agent_type: resolved.role_config.resolved_agent_type(),
+        ..crate::agent_pty::SpawnOptions::default()
+    });
+
+    if let Err(e) = spawn_result {
+        return SpawnRoleResponse {
+            spawned: false,
+            error: Some(format!("failed to spawn role `{}`: {e}", signal.role)),
+            ..Default::default()
+        };
+    }
+
+    let orchestration_name = resolved.identity.name().to_string();
+    state.write().await.register_orchestration_role(
+        &pane_id,
+        &signal.role,
+        false,
+        resolved.identity,
+        resolved.cwd.as_deref(),
+    );
+
+    // Best-effort, like `surface_spawned_orchestration`'s own
+    // `let _ = event_tx.send(...)` (`src/spawn.rs`): a live TUI merging
+    // this into an already-open orchestration tab is PRD #699 M4's job,
+    // not this one's — this just needs to emit the broadcast correctly.
+    let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
+        name: orchestration_name,
+        cwd: resolved.cwd.clone().unwrap_or_default(),
+        display_title: None,
+        roles: vec![OrchestrationSurfaceRole {
+            pane_id: pane_id.clone(),
+            role_index: resolved.role_index,
+            role_name: signal.role.clone(),
+            is_start_role: false,
+        }],
+    }));
+
+    SpawnRoleResponse {
+        spawned: true,
+        error: None,
+        ..Default::default()
+    }
+}
+
+impl AppState {
     /// Handle a worker's work-done signal: write the per-role summary file
     /// and inject a one-liner pointing the orchestrator pane at it.
     ///

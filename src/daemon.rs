@@ -2611,6 +2611,34 @@ async fn run_hook_loop(
                                         let _ = write_half.flush().await;
                                     }
                                 }
+                                DaemonMessage::SpawnRole(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        role = %signal.role,
+                                        "Received spawn-role signal"
+                                    );
+                                    // PRD #699 M3: same reply-on-same-connection
+                                    // pattern as `RestartRole` above. Unlike
+                                    // that handler, `handle_spawn_role_with_state`
+                                    // is a free function that takes the
+                                    // `SharedState` handle directly — it
+                                    // manages its own short-lived read/write
+                                    // lock acquisitions internally, so `&state`
+                                    // is passed here rather than an
+                                    // already-held read guard.
+                                    let resp = crate::state::handle_spawn_role_with_state(
+                                        signal,
+                                        &state,
+                                        &pty_registry,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
                                 DaemonMessage::Dispatch(signal) => {
                                     info!(
                                         pane_id = %signal.pane_id,

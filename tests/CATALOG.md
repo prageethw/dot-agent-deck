@@ -4235,6 +4235,36 @@ without depending on the config struct API.
 - **Does not assert:** the exact error wording.
 - **Platform coverage:** mac+linux (unix-only).
 
+#### pane/spawn
+
+##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (PRD #699 M3).
+- **Layer:** L1/fast (in-process — the real free function `handle_spawn_role_with_state` against a daemon-owned `cat`-orchestrator with an orchestrator and a `coder` worker registered, and a third `reviewer` role declared in `.dot-agent-deck.toml` but never spawned; no daemon socket, no LLM).
+- **Agent:** none (a `cat` stand-in).
+- **Asserts:** `delegate_targets` resolves nothing for `reviewer` before the call; calling the handler from the orchestrator pane for `reviewer` reports `spawned: true` and no error; afterward `delegate_targets` resolves exactly one pane for `reviewer`, and that pane has a live agent in the registry.
+- **Does not assert:** the CLI/socket layer (`dot-agent-deck pane spawn`) — this calls the handler directly, bypassing it.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/002 — Spawning a role already live in this instance is refused (PRD #699 M3).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler for `coder` (already spawned and registered) reports `spawned: false` and an error naming both that it is already running and the role name; the coder pane's agent id is unchanged and no new agent record is created.
+- **Does not assert:** the exact error wording beyond containing "already" and the role name (case-insensitively).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/003 — Spawning a role name not in the config is refused and names the unknown role (PRD #699 M3).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler with a role name absent from `.dot-agent-deck.toml` reports `spawned: false` and an error containing the literal unknown role name.
+- **Does not assert:** the exact error wording beyond containing the role name.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/004 — Only the orchestrator pane of an orchestration may spawn one of its roles (PRD #699 M3).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler from the WORKER's own pane (not the orchestrator) reports `spawned: false` with an error, and `reviewer` remains unreachable via `delegate_targets` afterward — the same anti-spoofing guard `pane/restart/005` pins for `restart`.
+- **Does not assert:** the exact error wording.
+- **Platform coverage:** mac+linux (unix-only).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
