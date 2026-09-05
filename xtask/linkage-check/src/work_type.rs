@@ -476,6 +476,12 @@ pub fn derive_work_type(
 /// [`WorkTypeError::BaseUnresolvable`] — never a silent success — when the
 /// ref does not exist in `repo_dir` (E1: `ci.yml:132`'s depth-1
 /// `pull_request` checkout has no `origin/main` ref at all).
+///
+/// [`SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`] cleared alongside (issue #683,
+/// the read-path sibling of issue #669's [`run_git`] fix): without it, an
+/// ambient `GIT_DIR`/`GIT_WORK_TREE` outranks `current_dir` and silently
+/// redirects the merge-base computation onto whatever repository those
+/// vars name instead of `repo_dir`.
 pub fn resolve_base(explicit: Option<&str>, repo_dir: &Path) -> Result<String, WorkTypeError> {
     let base = explicit.unwrap_or(DEFAULT_BASE).to_string();
     let to_err = |detail: String| WorkTypeError::BaseUnresolvable {
@@ -483,9 +489,13 @@ pub fn resolve_base(explicit: Option<&str>, repo_dir: &Path) -> Result<String, W
         detail,
     };
 
-    let out = Command::new("git")
-        .args(["merge-base", "HEAD", &base])
-        .current_dir(repo_dir)
+    let mut cmd = Command::new("git");
+    cmd.args(["merge-base", "HEAD", &base])
+        .current_dir(repo_dir);
+    for var in SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR {
+        cmd.env_remove(var);
+    }
+    let out = cmd
         .output()
         .map_err(|e| to_err(format!("invoke git merge-base HEAD {base}: {e}")))?;
     if !out.status.success() {
@@ -974,16 +984,19 @@ fn describe_success(
 
 /// Ambient git location- and config-injection environment variables that
 /// must never leak into a `--self-test` scratch-repo `git` invocation
-/// (issue #669) — shared by [`run_git`] (production, below) and `mod
-/// tests`'s own `git()` fixture helper, since both build scratch repos the
-/// same way and need the same treatment.
+/// (issue #669) — shared by [`run_git`] (production, below), `mod
+/// tests`'s own `git()` fixture helper, and [`resolve_base`] (issue #683),
+/// since all three must guarantee the `git` process they spawn actually
+/// targets the directory they pass as `current_dir`, not wherever an
+/// ambient `GIT_DIR`/`GIT_WORK_TREE`/etc. redirects it.
 ///
 /// Plain removal (not a bound, unlike `GIT_CEILING_DIRECTORIES` in
 /// `repo_state.rs`'s `Sandbox::git`) is correct for all 11: every caller's
-/// `dir` — all 21 production call sites via [`init_self_test_repo`], and
-/// every fixture call site in `mod tests` — targets a directory already
-/// made a repository by an immediately-preceding `git init`, never a walk
-/// that could resolve past `dir` into nothing.
+/// `dir` — all 21 production call sites via [`init_self_test_repo`], every
+/// fixture call site in `mod tests`, and [`resolve_base`]'s `repo_dir` —
+/// targets a directory that is already a real, addressable repository
+/// (freshly `git init`'d, or the real checkout `resolve_base` is asked
+/// about), never a walk that could resolve past `dir` into nothing.
 ///
 /// The first 8 mirror `list_tests.rs:808`'s own `GIT_ENV_VARS_TO_CLEAR`
 /// byte-for-byte — not reused directly here because that one backs
