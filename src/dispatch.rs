@@ -1006,14 +1006,16 @@ pub async fn handle_dispatch(
             // with no error surfaced, since the delete itself succeeds
             // against the wrong repository (auditor A1, verified
             // empirically).
-            // issue #473: `should_drop_registry` tracks whether the
-            // worktree was actually removed from disk -- the isolated-clone
-            // arm's cleanup is unconditional (see its own comment below), but
-            // the shared-checkout arm's `remove_worktree` can genuinely fail
-            // (e.g. a locked worktree), and dropping the registry entry in
-            // that case would lose the only record that the worktree is
-            // still on disk.
-            let mut should_drop_registry = true;
+            // issue #473 (shared-checkout arm) / issue #563 (isolated-clone
+            // arm): `should_drop_registry` tracks whether the worktree was
+            // actually removed from disk -- the isolated-clone arm's cleanup
+            // attempt is unconditional (see its own comment below), but the
+            // attempt itself can still fail (`attempt_isolated_clone_cleanup`
+            // returning `None`), just as the shared-checkout arm's
+            // `remove_worktree` can genuinely fail (e.g. a locked worktree).
+            // Dropping the registry entry in either failure case would lose
+            // the only record that the worktree is still on disk.
+            let should_drop_registry;
             let cleanup_failed = if has_live_sibling {
                 // The clone directory IS `paths.worktree_dir` -- remove it
                 // with the same helper `provision_isolated_clone_sync`'s own
@@ -1042,6 +1044,10 @@ pub async fn handle_dispatch(
                         .await
                         .ok()
                         .flatten();
+                // issue #563: mirror the shared-checkout arm below --
+                // cleanup failing here must retain the registry entry too,
+                // since it's the only record the clone is still on disk.
+                should_drop_registry = cleaned_up_by.is_some();
                 cleaned_up_by.is_none()
             } else {
                 // Match the outcome instead of discarding it (`let _ = ...`)
