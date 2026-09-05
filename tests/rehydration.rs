@@ -1790,6 +1790,246 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
 }
 
 // ---------------------------------------------------------------------------
+// PRD #699 M5: the reconnect-hydration half of the config-drift question.
+// `route_002` above proves reattach handles two ALREADY-live tabs correctly;
+// this proves the narrower case PRD #699 M5 asks about directly: a role
+// spawned via `pane spawn` while NO TUI was ever attached (a purely headless
+// daemon + CLI session) must still hydrate correctly the first time a TUI
+// ever connects. Unlike the save/restore path (`pane/drift/001`,
+// `tests/e2e_pane_spawn_live.rs`), the reconnect-hydration bounds check in
+// `ui.rs` (`role_index >= orch_config.roles.len()`) re-resolves
+// `resolve_orch_config_for_hydration` from the LOCAL, freshly-re-read
+// `.dot-agent-deck.toml` on every hydration pass rather than from any
+// snapshot frozen at an earlier point in time — and `handle_spawn_role_with_state`
+// (M3) assigns a headlessly-spawned role's `role_index` from that same
+// on-disk role list (`lookup_orchestration_role_indexed`). So the two sides
+// agree by construction as long as the config file itself hasn't changed
+// between spawn and reconnect, and this test is expected to pass GREEN
+// today, not RED — this milestone's own regression coverage for the ALREADY-
+// correct half of the two paths it investigates.
+// ---------------------------------------------------------------------------
+
+/// Scenario: Write a real `.dot-agent-deck.toml` declaring THREE roles
+/// (`orchestrator`, `coder`, `reviewer`) — `pane spawn`'s own precondition is
+/// that the target role is already declared on disk, just not yet live
+/// (Decision: "Not-yet-live role config entries only"). Spawn only the first
+/// two roles into a warm in-process daemon (standing in for an orchestration
+/// that was opened, then fully detached from — no TUI attached at all), then
+/// spawn `reviewer` the same way `handle_spawn_role_with_state` would: tagged
+/// with `TabMembership::Orchestration { role_index: 2, .. }`, the position
+/// `lookup_orchestration_role_indexed` would resolve it to in that same
+/// on-disk config. With no TUI ever having been attached, build a FRESH
+/// `EmbeddedPaneController` and hydrate — the reconnect-hydration cold start —
+/// then mirror `ui.rs`'s own hydration loop exactly: re-resolve the config
+/// from disk via `resolve_orch_config_for_hydration`, bounds-check every
+/// role slot against `orch_config.roles.len()`, and rebuild the tab. Asserts
+/// every role, including `reviewer` (spawned while headless), lands within
+/// bounds and the rebuilt tab carries all three role panes.
+#[spec("pane/drift/002")]
+#[test]
+fn drift_002_role_spawned_while_headless_hydrates_within_bounds() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(drift_002_role_spawned_while_headless_hydrates_within_bounds_inner());
+}
+
+async fn drift_002_role_spawned_while_headless_hydrates_within_bounds_inner() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    let orchestration_name = "headless-grow";
+    let cwd_dir = server._dir.path().to_path_buf();
+    let cwd = cwd_dir.to_string_lossy().into_owned();
+
+    // The on-disk config already declares all three roles -- `pane spawn`'s
+    // own precondition -- even though only two of them ever got a live pane
+    // before the (only) TUI in this scenario attaches.
+    std::fs::write(
+        cwd_dir.join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"headless-grow\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+         [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"cat\"\n\n\
+         [[orchestrations.roles]]\nname = \"reviewer\"\ncommand = \"cat\"\n",
+    )
+    .expect("write fixture .dot-agent-deck.toml");
+
+    // The orchestration is live with just the first two roles -- as if opened
+    // by a TUI (or a headless CLI/dispatch session) that has since detached.
+    let mut spawned_ids: Vec<String> = Vec::new();
+    for (role_index, role_name, is_start_role) in
+        [(0usize, "orchestrator", true), (1, "coder", false)]
+    {
+        let id = client
+            .start_agent(StartAgentOptions {
+                command: Some("sh -c 'sleep 30'".to_string()),
+                cwd: Some(cwd.clone()),
+                display_name: Some(role_name.to_string()),
+                env: vec![(
+                    "DOT_AGENT_DECK_PANE_ID".to_string(),
+                    format!("pane-{role_name}"),
+                )],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: orchestration_name.to_string(),
+                    role_index,
+                    role_name: role_name.to_string(),
+                    is_start_role,
+                    orchestration_cwd: Some(cwd.clone()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("start_agent should succeed");
+        spawned_ids.push(id);
+    }
+
+    // WHILE NO TUI IS ATTACHED AT ALL, `reviewer` -- already declared on disk
+    // but never live -- gets spawned, exactly `pane spawn reviewer`'s effect:
+    // `handle_spawn_role_with_state` would resolve it to role_index 2 (its
+    // position in the on-disk role list).
+    let reviewer_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("sh -c 'sleep 30'".to_string()),
+            cwd: Some(cwd.clone()),
+            display_name: Some("reviewer".to_string()),
+            env: vec![(
+                "DOT_AGENT_DECK_PANE_ID".to_string(),
+                "pane-reviewer".to_string(),
+            )],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: orchestration_name.to_string(),
+                role_index: 2,
+                role_name: "reviewer".to_string(),
+                is_start_role: false,
+                orchestration_cwd: Some(cwd.clone()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("start_agent should succeed");
+    spawned_ids.push(reviewer_id);
+
+    // ---- The FIRST TUI ever attaches: reconnect-hydration cold start.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        hydrated.len(),
+        3,
+        "all three roles, including the one spawned entirely headless, must \
+         hydrate as panes; got {hydrated:?}"
+    );
+
+    let partition = partition_hydrated_panes(&hydrated);
+    assert!(
+        partition.dashboard_pane_ids.is_empty(),
+        "no orchestration role pane should fall through to the dashboard; got {:?}",
+        partition.dashboard_pane_ids
+    );
+    assert_eq!(
+        partition.orchestration_buckets.len(),
+        1,
+        "all three roles share one orchestration identity and must bucket \
+         together; got {:?}",
+        partition
+            .orchestration_buckets
+            .iter()
+            .map(|b| b.role_slots.len())
+            .collect::<Vec<_>>()
+    );
+    let bucket = &partition.orchestration_buckets[0];
+    assert_eq!(
+        bucket.role_slots.len(),
+        3,
+        "bucket must own all three role panes"
+    );
+
+    // ---- Mirror `ui.rs`'s own reconnect-hydration loop exactly: re-resolve
+    // the config from the LOCAL, freshly-re-read `.dot-agent-deck.toml`, then
+    // bounds-check every role slot before placing it.
+    let cfg = dot_agent_deck::project_config::load_project_config(&cwd_dir)
+        .expect("load project config")
+        .expect("a .dot-agent-deck.toml must be present");
+    let local_orch_config = cfg
+        .orchestrations
+        .into_iter()
+        .find(|o| o.name == orchestration_name);
+    assert!(
+        local_orch_config.is_some(),
+        "the on-disk orchestration must resolve by name"
+    );
+
+    let orch_config = resolve_orch_config_for_hydration(local_orch_config, bucket);
+    assert_eq!(
+        orch_config.roles.len(),
+        3,
+        "the re-read on-disk config must carry all three declared roles; got {orch_config:?}"
+    );
+
+    let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
+    for slot in &bucket.role_slots {
+        assert!(
+            slot.role_index < orch_config.roles.len(),
+            "role_index {} out of range for a role spawned headless while no \
+             TUI was attached -- a bounds mismatch here is exactly the PRD \
+             #699 M5 regression this test guards against",
+            slot.role_index
+        );
+        role_pane_ids[slot.role_index] = Some(slot.pane_id.clone());
+    }
+    assert!(
+        role_pane_ids.iter().all(Option::is_some),
+        "every role slot, including the one (`reviewer`) spawned entirely \
+         headless, must be filled by reconnect-hydration; got {role_pane_ids:?}"
+    );
+
+    // ---- And the tab actually builds end-to-end from those role panes.
+    let mut tab_manager = dot_agent_deck::tab::TabManager::new(ctrl.clone());
+    tab_manager
+        .open_orchestration_tab_with_existing_role_panes(&orch_config, &cwd, role_pane_ids, None)
+        .expect("rebuilding the orchestration tab from a headlessly-grown role set should succeed");
+    let orchestration_tabs: Vec<&dot_agent_deck::tab::Tab> = tab_manager
+        .tabs()
+        .iter()
+        .filter(|t| matches!(t, dot_agent_deck::tab::Tab::Orchestration { .. }))
+        .collect();
+    assert_eq!(
+        orchestration_tabs.len(),
+        1,
+        "exactly one orchestration tab must be rebuilt"
+    );
+    if let dot_agent_deck::tab::Tab::Orchestration { role_pane_ids, .. } = orchestration_tabs[0] {
+        assert_eq!(
+            role_pane_ids.len(),
+            3,
+            "the rebuilt tab must carry all three role panes, including the \
+             headlessly-spawned reviewer"
+        );
+    } else {
+        panic!("filtered tab must be an Orchestration variant");
+    }
+
+    drop(tab_manager);
+    drop(ctrl);
+    for id in &spawned_ids {
+        let _ = server.registry.close_agent(id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PRD #104 R1 (reviewer): the M4 reproducer in `tests/snapshot_replay_dims.rs`
 // pins `parser_init_dims` in isolation, but a regression that swapped the
 // helper out for hard-coded `24, 80` at the `hydrate_from_daemon` call-site

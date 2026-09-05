@@ -4272,6 +4272,22 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-level `pane spawn` verb's own correctness (covered by `pane/spawn/001`-`004`); exact card body/status-badge layout.
 - **Platform coverage:** mac+linux (unix-only, PTY-backed harness).
 
+#### pane/drift
+
+##### pane/drift/001 — A role grown into an already-open orchestration tab via `pane spawn` must be captured by the NEXT session snapshot flush, not just the tab-open-time capture (PRD #699 M5).
+- **Layer:** L2/e2e (real TUI driven via PTY, real daemon, real `dot-agent-deck pane spawn reviewer` CLI subprocess, `DOT_AGENT_DECK_SESSION` redirected to a test-owned path). Same `pane-spawn-live` fixture and growth sequence as `pane/spawn/005`, extended: after `reviewer`'s card joins the already-open tab, a plain (non-orchestration) dashboard pane is spawned purely to force the next coalesced snapshot flush — `surface_one_orchestration`'s M4 growth branch never calls `ui.mark_session_dirty()`, so nothing else would trigger a fresh write after the spawn.
+- **Agent:** none (`cat`/`sleep` stand-ins for every role).
+- **Asserts:** the leading-edge snapshot (written when the tab first opened with two roles) already carries `[panes.orchestration]` naming `orchestrator` and `coder`; after growing the tab to three roles and forcing one more flush, the re-serialized `[panes.orchestration]` role list includes `reviewer` too — i.e. the snapshot writer reads the tab's own live, M4-grown role list rather than a copy frozen at tab-open time.
+- **Does not assert:** the restore-side consequence of a stale snapshot (a `resolve_orchestration_for_restore` drift-guard false positive) — that would need a further daemon-empty restart cycle this test does not drive; it pins the write side, which is the actual point of divergence.
+- **Platform coverage:** mac+linux (unix-only, PTY-backed harness).
+
+##### pane/drift/002 — A role spawned via `pane spawn` while NO TUI was attached at all must still hydrate within bounds the first time a TUI connects (PRD #699 M5).
+- **Layer:** L2/synthetic (in-process real daemon via `start_real_server`/`DaemonClient`, no PTY, no real binary spawn — same technique as `session/restore/007`/`orchestration/route/002`). A real `.dot-agent-deck.toml` on disk declares three roles (`orchestrator`, `coder`, `reviewer`); only the first two are ever given a live daemon-registered pane before a THIRD role (`reviewer`, tagged with `role_index: 2` exactly as `handle_spawn_role_with_state` would resolve it) is spawned — the whole test never constructs a TUI/`EmbeddedPaneController` until after all three roles are already live, standing in for "spawned while headless."
+- **Agent:** none (`sh -c 'sleep 30'` stand-ins for every role).
+- **Asserts:** a freshly-built `EmbeddedPaneController`'s cold-start `hydrate_from_daemon` returns all three role panes bucketed into one orchestration; re-resolving the config from the on-disk `.dot-agent-deck.toml` via `resolve_orch_config_for_hydration` (mirroring `ui.rs`'s own reconnect-hydration loop) yields all three declared roles, every role slot's `role_index` (including `reviewer`'s) is within bounds of that re-resolved config, and `TabManager::open_orchestration_tab_with_existing_role_panes` rebuilds one orchestration tab carrying all three role panes.
+- **Does not assert:** the CLI/daemon-handler correctness of `pane spawn` itself (covered by `pane/spawn/001`-`004`) — this test hand-constructs the daemon-registered agents directly rather than invoking the CLI, to isolate the reconnect-hydration bounds-check specifically.
+- **Platform coverage:** mac+linux (unix-only, in-process daemon harness).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
