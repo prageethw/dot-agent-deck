@@ -142,7 +142,9 @@ impl AgentType {
 
     /// Like [`from_command`], but ALSO recognizes `devbox run <script>` via
     /// [`crate::agent_registry::detect_from_devbox_script`]'s hyphen-segment
-    /// heuristic. Deliberately SEPARATE from `from_command`: that function's
+    /// heuristic, including through a leading `env`/`sudo` prefix or a
+    /// `sh -c '<script>'`-shaped shell-launcher hop (issue #542 Gap 2).
+    /// Deliberately SEPARATE from `from_command`: that function's
     /// result also feeds `wrap_launch_command`'s wrap-vs-bare decision (see
     /// the documented invariant at `agent_pty.rs:5871-5911`, which names
     /// `devbox run codex-big` as its own "resolves to no agent type"
@@ -153,17 +155,8 @@ impl AgentType {
     /// and must NEVER be used anywhere that decides whether to spawn,
     /// respawn, or wrap a launch command.
     pub fn from_command_including_devbox(cmd: Option<&str>) -> Option<Self> {
-        if let Some(t) = Self::from_command(cmd) {
-            return Some(t);
-        }
         let tokens = tokenize_command(cmd?);
-        if tokens.first().map(String::as_str) == Some("devbox")
-            && tokens.get(1).map(String::as_str) == Some("run")
-            && let Some(script) = tokens.get(2)
-        {
-            return crate::agent_registry::detect_from_devbox_script(script);
-        }
-        None
+        from_command_including_devbox_from_tokens(&tokens, DETECT_RECURSION_BUDGET)
     }
 }
 
@@ -173,6 +166,66 @@ impl AgentType {
 /// with an explicit budget each `-c` level costs one unit and the chain
 /// terminates safely at `None`.
 const DETECT_RECURSION_BUDGET: usize = 8;
+
+/// Issue #542 Gap 2: recursive helper backing
+/// [`AgentType::from_command_including_devbox`], threading the same
+/// shell-launcher recursion budget [`detect_from_tokens`] uses (decremented,
+/// never reset, across the recursive call below) so a deeply nested
+/// `sh -c "sh -c …"` wrapping a devbox invocation also terminates safely
+/// rather than recursing unboundedly.
+fn from_command_including_devbox_from_tokens(
+    tokens: &[String],
+    budget: usize,
+) -> Option<AgentType> {
+    if budget == 0 {
+        return None;
+    }
+    if let Some(t) = detect_from_tokens(tokens, budget) {
+        return Some(t);
+    }
+    let idx = skip_env_prefix(tokens);
+    let basename = tokens.get(idx).map(|token| resolve_basename(token));
+    if basename == Some("devbox")
+        && tokens.get(idx + 1).map(String::as_str) == Some("run")
+        && let Some(script) = tokens.get(idx + 2)
+    {
+        return crate::agent_registry::detect_from_devbox_script(script);
+    }
+    // Shell launcher: `sh -c '<script>'`. Recurse into the script argument,
+    // same as `detect_from_tokens`'s shell-launcher hop, so a devbox
+    // invocation wrapped in a shell hop is recognized identically to the
+    // bare `devbox run …` form.
+    if matches!(
+        basename,
+        Some("sh" | "bash" | "zsh" | "dash" | "ksh" | "ash")
+    ) {
+        let mut j = idx + 1;
+        while let Some(arg) = tokens.get(j) {
+            if arg.starts_with('-') {
+                if is_shell_command_flag(arg)
+                    && let Some(script) = tokens.get(j + 1)
+                {
+                    let inner = tokenize_command(script);
+                    return from_command_including_devbox_from_tokens(&inner, budget - 1);
+                }
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a command token to its executable basename (e.g. `/usr/bin/claude`
+/// -> `claude`), falling back to the token itself if it has no file-name
+/// component (e.g. `.`, `..`, or an empty string).
+fn resolve_basename(token: &str) -> &str {
+    std::path::Path::new(token)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(token)
+}
 
 /// Short options (matched WITH their leading dash) that consume the FOLLOWING
 /// token as their argument for a given launcher, so command detection skips both
@@ -219,6 +272,31 @@ fn is_env_assignment(token: &str) -> bool {
     }
 }
 
+/// Skip a leading bare `VAR=VALUE` assignment run, then — if what follows is
+/// an `env`/`sudo` launcher hop (matched by basename, same as
+/// [`detect_from_tokens`]) — skip that hop's own name and any `VAR=VALUE`
+/// assignments it introduces. Returns the index of the first token that is
+/// neither. Used by [`AgentType::from_command_including_devbox`]'s
+/// devbox-run recognition, which — unlike `detect_from_tokens` — has no need
+/// for the option-argument-consuming logic `env`/`sudo` flags like `-u root`
+/// require, so that part is deliberately not duplicated here.
+fn skip_env_prefix(tokens: &[String]) -> usize {
+    let mut idx = 0;
+    while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
+        idx += 1;
+    }
+    if let Some(token) = tokens.get(idx) {
+        let basename = resolve_basename(token);
+        if basename == "env" || basename == "sudo" {
+            idx += 1;
+            while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
+                idx += 1;
+            }
+        }
+    }
+    idx
+}
+
 /// Resolve the agent type from an already-tokenized command, looking through
 /// `env`/`sudo`/shell-launcher prefixes. See [`AgentType::from_command`].
 fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
@@ -236,10 +314,7 @@ fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
             idx += 1;
         }
         let token = tokens.get(idx)?;
-        let basename = std::path::Path::new(token)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(token.as_str());
+        let basename = resolve_basename(token);
 
         // `env` / `sudo` prefix: skip the launcher and any of its own flags,
         // `VAR=VALUE` assignments, and — R20-016 — the ARGUMENT of an
@@ -1850,6 +1925,44 @@ mod tests {
         assert_eq!(
             AgentType::from_command_including_devbox(Some("claude")),
             Some(AgentType::ClaudeCode)
+        );
+        // Issue #542: the devbox hop above matches the FIRST TOKEN literally
+        // against `"devbox"`, unlike `detect_from_tokens` three lines away
+        // (used by `from_command`), which resolves the basename via
+        // `Path::file_name`. So an absolute-path invocation of the exact same
+        // devbox script must be recognized identically to the bare form.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some(
+                "/usr/local/bin/devbox run claude-sonnet-devbox"
+            )),
+            Some(AgentType::ClaudeCode),
+            "an absolute-path `devbox` invocation must resolve the same as a bare \
+             `devbox run …` — the devbox hop must compare basenames, not literal tokens"
+        );
+        // Same gap, reached via a leading `env FOO=1` prefix rather than a
+        // path — `detect_from_tokens`'s `env`/`sudo`-skipping logic is not
+        // shared by this devbox-only branch at all today.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some(
+                "env FOO=1 devbox run claude-sonnet-devbox"
+            )),
+            Some(AgentType::ClaudeCode),
+            "a devbox invocation prefixed with a leading `env VAR=value` assignment must \
+             still be recognized, matching the prefix-skipping `from_command` already does \
+             for ordinary (non-devbox) commands"
+        );
+        // Issue #542 Gap 2, third unrecognized form: a shell-launcher hop
+        // (`sh -c '…'`) wrapping the devbox invocation. `skip_env_prefix` only
+        // ever skips `env`/`sudo` hops, so tokens `["sh", "-c", "devbox run
+        // claude-sonnet-devbox"]` never get the inner script parsed out — the
+        // basename check compares `"sh"` against `"devbox"` and fails.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some(
+                "sh -c 'devbox run claude-sonnet-devbox'"
+            )),
+            Some(AgentType::ClaudeCode),
+            "a devbox invocation wrapped in a `sh -c '…'` shell-launcher hop must be \
+             recognized the same as the bare `devbox run …` form"
         );
     }
 

@@ -1064,3 +1064,73 @@ fn restore_015_flushed_warning_escapes_control_characters_in_pane_name() {
          forged an extra line of deck output.\nWarning line:\n{warning_line:?}\nStream:\n{stream:?}"
     );
 }
+
+/// Scenario: Stage a saved plain pane whose command is `devbox run
+/// claude-sonnet-devbox`, with a fake `devbox` script placed ahead on `PATH`
+/// so the spawn succeeds without a real devbox install, then launch with no
+/// `--continue` flag against an empty daemon. The restored card must
+/// immediately show "Starting…", the same badge a FRESH spawn of the
+/// identical command already shows, rather than reverting to "No agent".
+#[spec("session/restore/021")]
+#[test]
+#[cfg(unix)]
+fn restore_021_devbox_wrapped_restore_shows_starting_not_no_agent() {
+    let session_dir = common::race_safe_tempdir();
+    let bin_dir = common::race_safe_tempdir();
+    let fake_devbox = bin_dir.path().join("devbox");
+    std::fs::write(&fake_devbox, "#!/bin/sh\nsleep 600\n").expect("write fake devbox script");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_devbox, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake devbox script");
+    }
+    // Bare `devbox` (no path) so PATH resolution reaches the fake script above
+    // while the literal command text staged in the snapshot — and later parsed
+    // by `AgentType::from_command`/`from_command_including_devbox` — stays
+    // exactly `devbox run claude-sonnet-devbox`, isolating this test from
+    // issue #542's separate basename-vs-literal-token gap.
+    let path = format!(
+        "{}:{}",
+        bin_dir.path().display(),
+        std::env::var("PATH").expect("test runner PATH")
+    );
+
+    let session_file = session_dir.path().join("session.toml");
+    stage_session_snapshot(
+        &session_file,
+        session_dir.path(),
+        &[("restored-devbox", "devbox run claude-sonnet-devbox")],
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("PATH", path)
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("minimal");
+
+    deck.wait_for_string("restored-devbox");
+
+    let starting = common::wait_until(Duration::from_secs(10), || {
+        let grid = deck.snapshot_grid();
+        let lines: Vec<&str> = grid.lines().collect();
+        lines.iter().enumerate().any(|(i, line)| {
+            i > 0 && line.contains("restored-devbox") && lines[i - 1].contains("Starting…")
+        })
+    });
+    assert!(
+        starting,
+        "issue #542: a restored pane whose command is a devbox-wrapped recognized agent \
+         (`devbox run claude-sonnet-devbox`) must show the 'Starting…' badge before its first \
+         hook event fires, exactly like a FRESH spawn of the identical command already does — \
+         not 'No agent'.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        !deck.snapshot_grid().contains("No agent"),
+        "issue #542: the restored devbox-wrapped pane must not show the genuinely-empty \
+         'No agent' status.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}

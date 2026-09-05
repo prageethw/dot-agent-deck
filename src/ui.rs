@@ -3966,6 +3966,32 @@ fn dashboard_restore_pane_dims(
     )
 }
 
+/// Issue #542: shared by all three restore-path call sites that spawn a
+/// placeholder session for a restored pane. `expects_agent_report` must be
+/// derived from the devbox-widened `from_command_including_devbox`, mirroring
+/// the fresh-spawn call sites — a restored pane whose saved command is
+/// `devbox run <agent-script>` must show "Starting…" immediately, not "No
+/// agent".
+fn register_restored_pane_placeholder(
+    state: &SharedState,
+    pane_id: String,
+    dir: String,
+    cmd: Option<&str>,
+    agent_type: Option<AgentType>,
+    agent_id: Option<String>,
+) {
+    let expects_agent_report = AgentType::from_command_including_devbox(cmd).is_some();
+    let mut st = state.blocking_write();
+    st.register_pane(pane_id.clone());
+    st.insert_placeholder_session_awaiting_report(
+        pane_id,
+        Some(dir),
+        agent_type,
+        agent_id,
+        expects_agent_report,
+    );
+}
+
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
     sessions.sort_by(|(_, a), (_, b)| {
@@ -14805,16 +14831,14 @@ pub fn run_tui(
                     // `pane_agent_id` only touches the controller's panes
                     // mutex.
                     let new_agent_id = pane.pane_agent_id(&new_id);
-                    {
-                        let mut st = state.blocking_write();
-                        st.register_pane(new_id.clone());
-                        st.insert_placeholder_session(
-                            new_id.clone(),
-                            Some(saved_pane.dir.clone()),
-                            agent_type,
-                            new_agent_id,
-                        );
-                    }
+                    register_restored_pane_placeholder(
+                        &state,
+                        new_id.clone(),
+                        saved_pane.dir.clone(),
+                        cmd,
+                        agent_type,
+                        new_agent_id,
+                    );
                     if !saved_pane.name.is_empty() {
                         if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
                             ui.session_warnings.push(format!(
@@ -15011,16 +15035,14 @@ pub fn run_tui(
                                     // pane sites — placeholder needs the
                                     // daemon agent_id.
                                     let fb_agent_id = pane.pane_agent_id(&fb_id);
-                                    {
-                                        let mut st = state.blocking_write();
-                                        st.register_pane(fb_id.clone());
-                                        st.insert_placeholder_session(
-                                            fb_id.clone(),
-                                            Some(saved_pane.dir.clone()),
-                                            fb_agent_type,
-                                            fb_agent_id,
-                                        );
-                                    }
+                                    register_restored_pane_placeholder(
+                                        &state,
+                                        fb_id.clone(),
+                                        saved_pane.dir.clone(),
+                                        cmd,
+                                        fb_agent_type,
+                                        fb_agent_id,
+                                    );
                                     if !saved_pane.name.is_empty() {
                                         let _ = pane.rename_pane(&fb_id, &saved_pane.name);
                                         ui.pane_display_names
@@ -15083,16 +15105,14 @@ pub fn run_tui(
                             // PRD #110 followup: outer-error fallback —
                             // same agent_id plumbing as the inner fallback.
                             let fb_agent_id = pane.pane_agent_id(&fb_id);
-                            {
-                                let mut st = state.blocking_write();
-                                st.register_pane(fb_id.clone());
-                                st.insert_placeholder_session(
-                                    fb_id.clone(),
-                                    Some(saved_pane.dir.clone()),
-                                    fb_agent_type,
-                                    fb_agent_id,
-                                );
-                            }
+                            register_restored_pane_placeholder(
+                                &state,
+                                fb_id.clone(),
+                                saved_pane.dir.clone(),
+                                cmd,
+                                fb_agent_type,
+                                fb_agent_id,
+                            );
                             if !saved_pane.name.is_empty() {
                                 let _ = pane.rename_pane(&fb_id, &saved_pane.name);
                                 ui.pane_display_names
