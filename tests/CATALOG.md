@@ -5596,6 +5596,13 @@ without depending on the config struct API.
 - **Does not assert:** the private `resolve_orchestration_for_restore` re-resolution itself — config drift/tamper checks, the `project_path`-vs-`saved_dir` anti-tampering guard — which is not `pub` and stays L1-only (`session/restore/016`–`019`); a real `SavedSession` save → process-exit → reload cycle (`session/restore/019` covers the TOML round trip); the `should_apply_snapshot` daemon-empty gate (`session/restore/005`); LLM-agent behaviour.
 - **Platform coverage:** mac+linux.
 
+##### session/restore/021 — A restored pane whose command is a devbox-wrapped recognized agent (`devbox run claude-sonnet-devbox`) shows "Starting…" immediately, not "No agent" (issue #542).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (a test-owned executable named `devbox`, placed ahead on `PATH`, runs `sleep 600`; no LLM or hook event).
+- **Asserts:** restoring a saved plain pane whose command is the bare literal `devbox run claude-sonnet-devbox` immediately renders the "Starting…" badge before any hook event — the same badge a FRESH spawn of the identical command already shows — rather than reverting to the genuinely-empty `No agent` placeholder.
+- **Does not assert:** the separate literal-token-vs-basename gap in `AgentType::from_command_including_devbox` (unit-pinned in `src/event.rs`'s `from_command_including_devbox_recognizes_devbox_run`) — this test deliberately stages the bare `devbox` token so PATH resolution finds the fake script while the parsed command text is unaffected by that gap; a devbox-wrapped MODE-tab or role-wiring restore path (separate call sites in `run_tui`); real devbox behaviour.
+- **Platform coverage:** mac+linux.
+
 ### Live session status on reconnect (PRD #162)
 
 These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must attach the live, event-derived session state (a `SessionSnapshot` on each `AgentRecord`) so reconnected cards show real status instead of `Idle`/"No agent". The data already exists in `AppState.sessions` (built by `apply_event`, unchanged); this PRD only exposes it. The wire field `live: Option<SessionSnapshot>` is additive/optional — no `PROTOCOL_VERSION` bump.

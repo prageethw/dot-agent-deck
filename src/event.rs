@@ -1851,6 +1851,31 @@ mod tests {
             AgentType::from_command_including_devbox(Some("claude")),
             Some(AgentType::ClaudeCode)
         );
+        // Issue #542: the devbox hop above matches the FIRST TOKEN literally
+        // against `"devbox"`, unlike `detect_from_tokens` three lines away
+        // (used by `from_command`), which resolves the basename via
+        // `Path::file_name`. So an absolute-path invocation of the exact same
+        // devbox script must be recognized identically to the bare form.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some(
+                "/usr/local/bin/devbox run claude-sonnet-devbox"
+            )),
+            Some(AgentType::ClaudeCode),
+            "an absolute-path `devbox` invocation must resolve the same as a bare \
+             `devbox run …` — the devbox hop must compare basenames, not literal tokens"
+        );
+        // Same gap, reached via a leading `env FOO=1` prefix rather than a
+        // path — `detect_from_tokens`'s `env`/`sudo`-skipping logic is not
+        // shared by this devbox-only branch at all today.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some(
+                "env FOO=1 devbox run claude-sonnet-devbox"
+            )),
+            Some(AgentType::ClaudeCode),
+            "a devbox invocation prefixed with a leading `env VAR=value` assignment must \
+             still be recognized, matching the prefix-skipping `from_command` already does \
+             for ordinary (non-devbox) commands"
+        );
     }
 
     // Regression guard for `spawn_007_hook_learned_badge_does_not_change_respawn_launch`
