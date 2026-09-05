@@ -39855,6 +39855,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let _daemon = with_crafted_response_daemon(
             tmp.path(),
@@ -41160,6 +41161,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -41221,6 +41223,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -41285,6 +41288,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let colliding_record = crate::agent_pty::AgentRecord {
             id: "2".into(),
@@ -41310,6 +41314,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -41367,6 +41372,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let colliding_record = crate::agent_pty::AgentRecord {
             id: "2".into(),
@@ -41392,6 +41398,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(

@@ -219,6 +219,7 @@ async fn handle_connection(
                 outstanding_delegation: None,
                 silence_watch: None,
                 delegation_commission: None,
+                crashed: None,
             });
             write_resp(
                 &mut stream,
@@ -309,6 +310,7 @@ fn mode_record(fixture: &str, mode: &str, agent_id: &str, pane_id: &str) -> Agen
         outstanding_delegation: None,
         silence_watch: None,
         delegation_commission: None,
+        crashed: None,
     }
 }
 

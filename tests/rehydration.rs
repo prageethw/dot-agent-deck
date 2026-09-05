@@ -2678,6 +2678,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                     outstanding_delegation: None,
                     silence_watch: None,
                     delegation_commission: None,
+                    crashed: None,
                 };
                 let resp = AttachResponse {
                     ok: true,
@@ -2961,6 +2962,7 @@ fn live_020_resync_never_reverts_agent_report_activity_seen() {
         outstanding_delegation: None,
         silence_watch: None,
         delegation_commission: None,
+        crashed: None,
     };
 
     state.resync_hydrated_sessions(&[record]);
@@ -3474,6 +3476,7 @@ async fn live_016_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
         outstanding_delegation: None,
         silence_watch: None,
         delegation_commission: None,
+        crashed: None,
     };
     // The paired `ShellIdle`, shaped the way `run_shell_activity_monitor`
     // stamps it: neutral agent type, the owning `agent_id` (so
@@ -3780,6 +3783,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
         outstanding_delegation: None,
         silence_watch: None,
         delegation_commission: None,
+        crashed: None,
     }));
 
     let (dir, path, listener) = {

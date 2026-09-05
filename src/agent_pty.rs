@@ -1779,6 +1779,12 @@ fn pump_reader(
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
     }
+    // PRD #699 M1: must run regardless of whether `pane_id_env` is set — a
+    // dashboard pane crashes just as much as an orchestration one, and the
+    // block below (release/sweep/notify) only fires when a pane id exists.
+    if let Some(registry) = registry.upgrade() {
+        registry.mark_agent_crashed(&agent_id);
+    }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
@@ -2323,6 +2329,14 @@ pub struct RunningAgent {
     /// lifetime. No "which duration is this?" flag is needed, because the two
     /// answers come from two different records.
     pub spawned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// PRD #699 M1: set to `Some(true)` when `pump_reader`'s EOF branch
+    /// observes this agent's child exiting NATURALLY (the registry entry was
+    /// still present at that moment — nothing had removed it in anticipation,
+    /// as `close_agent`/`respawn_agent_for_pane` both do before their own
+    /// kill). `None` for a still-running agent, and irrelevant for a
+    /// deliberately-closed/respawned one since its whole entry is removed
+    /// before this could ever be set.
+    pub crashed: Option<bool>,
 }
 
 impl RunningAgent {
@@ -2578,6 +2592,16 @@ pub struct AgentRecord {
     /// above for the join and backwards-compatibility rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_commission: Option<CommissionSnapshot>,
+    /// PRD #699 M1: `Some(true)` when the agent's process exited NATURALLY
+    /// (crashed) rather than via a deliberate `close_agent`/
+    /// `respawn_agent_for_pane` teardown. `None` for a running agent, an
+    /// older daemon that predates this field, or (moot, since the whole
+    /// entry is removed) a deliberately-closed one. `skip_serializing_if`
+    /// keeps the wire shape backwards-compatible, matching every other
+    /// optional field on this struct (`pane_id_env`, `display_name`, `cwd`,
+    /// `tab_membership`, `agent_type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crashed: Option<bool>,
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -5107,6 +5131,23 @@ impl AgentPtyRegistry {
         self.inner.lock().unwrap().agents.contains_key(agent_id)
     }
 
+    /// Marks `agent_id`'s entry as crashed if it is still registered — a
+    /// no-op if the entry has already been removed (a deliberate
+    /// `close_agent`/`respawn_agent_for_pane` teardown, which removes the
+    /// entry before its own kill completes, same as
+    /// `is_agent_still_registered`'s own doc explains). Folds the
+    /// check-and-set into a single lock acquisition so there is no
+    /// TOCTOU gap between "is this still a natural exit" and "mark it" —
+    /// deliberately NOT implemented as a separate `is_agent_still_registered`
+    /// call followed by a second locked mutation, which would reopen exactly
+    /// the race this method exists to avoid.
+    fn mark_agent_crashed(&self, agent_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(agent) = inner.agents.get_mut(agent_id) {
+            agent.crashed = Some(true);
+        }
+    }
+
     /// Deliver the "worker exited without work-done" notice for
     /// one [`OutstandingDelegation`] [`Self::sweep_delegations_on_exit`] just
     /// swept off `worker_pane_id`. Follows exactly the guarded-write path PRD
@@ -6152,6 +6193,8 @@ impl AgentPtyRegistry {
             // PRD #745 M11: the ONLY site that records a spawn instant, because
             // it is the only site that performs a spawn.
             spawned_at: Some(spawned_at),
+            // PRD #699 M1: a fresh spawn hasn't exited yet, natural or not.
+            crashed: None,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -7063,6 +7106,10 @@ impl AgentPtyRegistry {
             // is what makes a restarted worker report its CURRENT iteration
             // while an unrestarted role reports its whole lifetime.
             spawned_at: _,
+            // PRD #699 M1: deliberately dropped, not carried over — the fresh
+            // child hasn't crashed, and `spawn_agent` initializes its own
+            // entry to `None` regardless.
+            crashed: _,
         } = removed;
 
         // Drop this reference to the writer Arc; the slave half closes
@@ -7594,6 +7641,7 @@ impl AgentPtyRegistry {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: agent.crashed,
         })
     }
 
@@ -7899,6 +7947,7 @@ impl AgentPtyRegistry {
                 outstanding_delegation: None,
                 silence_watch: None,
                 delegation_commission: None,
+                crashed: agent.crashed,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -8202,6 +8251,8 @@ impl AgentPtyRegistry {
                 // `Utc::now()` that would make the synthetic agent look like it
                 // had just been started by us.
                 spawned_at: None,
+                // PRD #699 M1: synthetic test agent hasn't exited.
+                crashed: None,
             },
         );
         id
@@ -12719,6 +12770,7 @@ mod spawn_tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -12769,6 +12821,7 @@ mod spawn_tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -13029,6 +13082,7 @@ mod spawn_tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -14974,6 +15028,7 @@ mod spawn_tests {
                 seed_delivered_native: false,
                 pane_handed_over: false,
                 spawned_at: None,
+                crashed: None,
             };
             (agent, log, pid)
         }

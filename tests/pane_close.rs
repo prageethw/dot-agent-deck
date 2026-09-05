@@ -348,6 +348,7 @@ async fn handle_connection(
                         outstanding_delegation: None,
                         silence_watch: None,
                         delegation_commission: None,
+                        crashed: None,
                     }]
                 })
                 .unwrap_or_default();
