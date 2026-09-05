@@ -4032,4 +4032,116 @@ mod tests {
              HEAD moved from {ambient_head_before} to {ambient_head_after}"
         );
     }
+
+    // -- Issue #683: `resolve_base` (line ~479) is the READ-path sibling
+    //    issue #669 didn't touch — it still shells out to `git merge-base`
+    //    with no ambient-env isolation at all --------------------------------
+
+    /// **Read escape — issue #683.** [`resolve_base`] (line ~479) runs `git
+    /// merge-base HEAD <base>` with only `.current_dir(repo_dir)` and no
+    /// `env_remove` treatment at all — unlike [`run_git`] (fixed by #669),
+    /// it doesn't even clear the ambient-location vars in
+    /// [`SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`]. Under an ambient `GIT_DIR`
+    /// (left behind by, e.g., a `pre-commit` hook or a `git rebase --exec`
+    /// parent — this module's own named threat model), `GIT_DIR` outranks
+    /// `current_dir`, so the merge-base is computed against whatever
+    /// repository `GIT_DIR` names instead of `repo_dir` — silently handing a
+    /// wrong SHA downstream to every caller (`derive_work_type_for`,
+    /// `self_test`'s B1 skip, `run_in`'s diff base).
+    ///
+    /// Scenario: build a fixture repo (`repo_dir`) with `origin/main` one
+    /// commit behind `HEAD`, and a separate ambient/victim repo with its own
+    /// unrelated `origin/main`/`HEAD` history. Compute the fixture's true
+    /// merge-base directly (with no ambient env set) as the expected value,
+    /// then set ambient `GIT_DIR` to the victim repo's `.git` and call
+    /// `resolve_base(None, &fixture)`. Asserts the returned SHA still equals
+    /// the fixture's own merge-base — today it instead returns the victim
+    /// repo's merge-base, so this test is RED until coder adds the same
+    /// env-clearing treatment `run_git` already carries.
+    #[test]
+    fn resolve_base_leaks_ambient_git_dir() {
+        fn merge_base_of(dir: &Path, base: &str) -> String {
+            let out = Command::new("git")
+                .args(["merge-base", "HEAD", base])
+                .current_dir(dir)
+                .output()
+                .unwrap_or_else(|e| panic!("git merge-base HEAD {base} in {dir:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git merge-base HEAD {base} in {dir:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // The real repo `resolve_base` is asked about.
+        let fixture = root.join("fixture");
+        std::fs::create_dir_all(&fixture).expect("mkdir fixture");
+        git(&["init", "-q", "-b", "main"], &fixture);
+        git(&["config", "user.email", "test@example.com"], &fixture);
+        git(&["config", "user.name", "test"], &fixture);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "fixture base"],
+            &fixture,
+        );
+        git(
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            &fixture,
+        );
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "fixture feature"],
+            &fixture,
+        );
+        let expected_base_sha = merge_base_of(&fixture, "origin/main");
+
+        // An unrelated repo whose ambient GIT_DIR must never be consulted.
+        let victim = root.join("victim");
+        std::fs::create_dir_all(&victim).expect("mkdir victim");
+        git(&["init", "-q", "-b", "main"], &victim);
+        git(&["config", "user.email", "test@example.com"], &victim);
+        git(&["config", "user.name", "test"], &victim);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "victim base"],
+            &victim,
+        );
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"], &victim);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "victim feature"],
+            &victim,
+        );
+        let victim_base_sha = merge_base_of(&victim, "origin/main");
+        assert_ne!(
+            expected_base_sha, victim_base_sha,
+            "fixture and victim must resolve to different merge-base SHAs or this test \
+             cannot distinguish a leak from correct behaviour"
+        );
+
+        // `cargo-nextest` runs each test in its own process, so mutating the
+        // process environment here cannot bleed into any other test.
+        unsafe {
+            std::env::set_var("GIT_DIR", victim.join(".git"));
+        }
+        let result = resolve_base(None, &fixture);
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+        }
+
+        let actual_base_sha = result.unwrap_or_else(|e| {
+            panic!(
+                "resolve_base(None, {fixture:?}) under ambient GIT_DIR should still \
+                 succeed either way — a failure here is a broken fixture, not the leak \
+                 this test exists to demand a fix for: {e}"
+            )
+        });
+
+        assert_eq!(
+            actual_base_sha, expected_base_sha,
+            "issue #683: `resolve_base` leaked ambient GIT_DIR into `git merge-base`, \
+             returning the victim repo's merge-base ({victim_base_sha}) instead of the \
+             real target repo's own merge-base ({expected_base_sha})"
+        );
+    }
 }
