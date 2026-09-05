@@ -2736,6 +2736,68 @@ mod tests {
         FakeGitOnPathGuard { prev_path }
     }
 
+    /// Prepend a fake `git` to `PATH` that lets `git clone` genuinely
+    /// succeed, then plants a chmod-500 subdirectory inside the freshly
+    /// cloned `.git/` containing one file -- an entry `attempt_isolated_clone_cleanup`'s
+    /// later `remove_dir_all` cannot unlink, forcing that call to genuinely
+    /// fail (issue #563) without disturbing provisioning itself. Every
+    /// OTHER invocation (the branch probes, the checkout, the origin
+    /// fixup) passes straight through to the real `git`, and none of them
+    /// ever touches this planted subdirectory, so provisioning completes
+    /// exactly as it would without this stub -- only the LATER cleanup
+    /// attempt, which has no git subprocess of its own to shim (unlike the
+    /// shared-checkout arm's `git worktree remove`), fails.
+    ///
+    /// Word-scanned rather than positional, mirroring
+    /// `with_git_clone_failing_with_hostile_stderr`'s own reasoning: matches
+    /// wherever the literal word `clone` appears anywhere in argv (the
+    /// `-c core.fsmonitor=` hardening `spawn_git_status_child` prepends to
+    /// every call through `provision_isolated_clone_sync`'s shared core
+    /// shifts `clone` off any fixed positional index), and reads the clone
+    /// destination off the LAST argument, matching `git clone`'s own
+    /// invocation shape (`clone --origin origin -- <source> <dest>`).
+    #[cfg(unix)]
+    fn with_git_clone_leaving_an_unremovable_entry(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-clone-unremovable-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 is_clone=0\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$a\" = clone ]; then is_clone=1; fi\n\
+                 done\n\
+                 if [ \"$is_clone\" = 1 ]; then\n\
+                 \x20\x20{real_git} \"$@\"\n\
+                 \x20\x20status=$?\n\
+                 \x20\x20if [ \"$status\" -eq 0 ]; then\n\
+                 \x20\x20\x20\x20dest=\"\"\n\
+                 \x20\x20\x20\x20for a in \"$@\"; do dest=\"$a\"; done\n\
+                 \x20\x20\x20\x20mkdir -p \"$dest/.git/dad-563-unremovable\"\n\
+                 \x20\x20\x20\x20: > \"$dest/.git/dad-563-unremovable/blocker\"\n\
+                 \x20\x20\x20\x20chmod 500 \"$dest/.git/dad-563-unremovable\"\n\
+                 \x20\x20fi\n\
+                 \x20\x20exit \"$status\"\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
     /// Prepend a fake `git` to `PATH` that LOCKS a worktree the instant `git
     /// worktree add` creates it -- synchronously, inside the same subprocess
     /// call `create_worktree`'s `run_status_killable_args` awaits, so there
@@ -3453,6 +3515,110 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&paths.worktree_dir);
+    }
+
+    /// Scenario: issue #563. The isolated-clone twin of
+    /// `spawn_rollback_retains_registry_entry_when_force_removal_fails`
+    /// (#473): trips the `has_live_sibling` gate exactly as
+    /// `spawn_rollback_force_removes_the_isolated_clone_when_nothing_else_roots_it`
+    /// does, so `handle_dispatch` provisions a fresh isolated clone before
+    /// spawn fails, then forces the rollback's `attempt_isolated_clone_cleanup`
+    /// to genuinely fail via `with_git_clone_leaving_an_unremovable_entry` --
+    /// a chmod-500 subdirectory planted inside the freshly cloned `.git/`
+    /// right after the real clone succeeds, never touched by any later
+    /// provisioning step, so only the LATER cleanup attempt (not
+    /// provisioning itself) fails.
+    ///
+    /// Asserts the CORRECT post-rollback behavior, mirroring #473's
+    /// shared-checkout assertion: the registry entry must still be present,
+    /// since the isolated clone directory is genuinely still on disk. The
+    /// isolated-clone arm's `cleanup_failed = cleaned_up_by.is_none()`
+    /// computation never updates `should_drop_registry` (unlike the
+    /// shared-checkout `else` arm, which sets `should_drop_registry =
+    /// !remove_failed`) -- it stays at its initial `true` regardless of
+    /// whether cleanup actually succeeded, so today the registry entry is
+    /// dropped anyway even though the directory is still there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_rollback_retains_registry_entry_when_isolated_clone_cleanup_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        // Trips the has_live_sibling GATE, same as
+        // `spawn_rollback_force_removes_the_isolated_clone_when_nothing_else_roots_it`.
+        let live_sibling_dir = tmp.path().join("repo-existing-live-orchestration");
+        create_worktree(
+            &repo,
+            &live_sibling_dir,
+            "agent/existing-live-orchestration",
+            false,
+            Creator::dispatch("existing-live-orchestration"),
+        )
+        .await
+        .expect("provision the pre-existing live sibling worktree");
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![live_orchestration_record(
+                &live_sibling_dir,
+            )]),
+        );
+
+        let paths = derive_dispatch_paths(&repo, "isolated-cleanupfail-unit");
+        let _git_stub = with_git_clone_leaving_an_unremovable_entry(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-563".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "isolated-cleanupfail-unit", "task", None).await;
+
+        // Restore the blocker directory's permissions before any assertion
+        // can panic, so this test's own tempdir can still be cleaned up on
+        // drop regardless of outcome.
+        let _ = std::fs::set_permissions(
+            paths.worktree_dir.join(".git").join("dad-563-unremovable"),
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached: {}",
+            result.message
+        );
+        assert!(
+            paths.worktree_dir.exists(),
+            "cleanup was forced to fail (an unremovable entry planted inside `.git`) -- the \
+             isolated clone directory must still be on disk: {}",
+            result.message
+        );
+        assert!(
+            ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "issue #563: the registry entry for {} must still be present -- \
+             attempt_isolated_clone_cleanup genuinely failed (the directory is still on \
+             disk), so dropping the entry anyway loses the only record that this isolated \
+             clone is still there: {}",
+            paths.worktree_dir.display(),
+            result.message
+        );
+        assert!(
+            result.message.contains("cleanup failed"),
+            "the rollback must report cleanup as having failed: {}",
+            result.message
+        );
     }
 
     /// Scenario: issue #490 fix round 2, item 3. The isolated clone's
