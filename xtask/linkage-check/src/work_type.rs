@@ -501,7 +501,10 @@ pub fn derive_work_type(
 /// not a mistake — pinning `GIT_CONFIG_GLOBAL=/dev/null` would also discard
 /// the user's `safe.directory` entries, turning a fine checkout into a
 /// `dubious ownership` failure in exactly the shared/container/CI-runner
-/// setups that need those entries.
+/// setups that need those entries. Callers must pass an absolute
+/// `repo_dir` — the canonicalize-fallback path degrades to a relative or
+/// empty ceiling that git silently ignores, which is unreachable today only
+/// because every current caller already passes an absolute path.
 pub fn resolve_base(explicit: Option<&str>, repo_dir: &Path) -> Result<String, WorkTypeError> {
     let base = explicit.unwrap_or(DEFAULT_BASE).to_string();
     let to_err = |detail: String| WorkTypeError::BaseUnresolvable {
@@ -515,9 +518,10 @@ pub fn resolve_base(explicit: Option<&str>, repo_dir: &Path) -> Result<String, W
     for var in SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR {
         cmd.env_remove(var);
     }
-    if let Some(parent) = repo_dir.parent() {
-        let ceiling = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-        cmd.env("GIT_CEILING_DIRECTORIES", ceiling);
+    let canonical_repo_dir =
+        std::fs::canonicalize(repo_dir).unwrap_or_else(|_| repo_dir.to_path_buf());
+    if let Some(parent) = canonical_repo_dir.parent() {
+        cmd.env("GIT_CEILING_DIRECTORIES", parent);
     }
     let out = cmd
         .output()
@@ -4188,6 +4192,85 @@ mod tests {
              returning the victim repo's merge-base ({victim_base_sha}) instead of the \
              real target repo's own merge-base ({expected_base_sha})"
         );
+    }
+
+    /// Reviewer C4b / auditor C3 (issue #683 confirm round): the
+    /// `GIT_CEILING_DIRECTORIES` re-bind at `resolve_base` (line ~518) — this
+    /// round's headline fix — is itself pinned by no test. The
+    /// `if let Some(parent) = …` block could be deleted outright, reverting
+    /// to "cleared along with the rest of
+    /// [`SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`]" (the exact defect A2/F2
+    /// fixed), and the workspace would stay green:
+    /// [`resolve_base_leaks_ambient_git_dir`] doesn't exercise a non-repo
+    /// `repo_dir` at all, and
+    /// [`scratch_repo_git_env_vars_to_clear_is_exactly_the_documented_eleven`]
+    /// pins only the const's list, not this re-bind's behaviour.
+    ///
+    /// Scenario: build a real ancestor repo, then a non-repo `repo_dir`
+    /// nested under it (once as a plain subdirectory, once reached through a
+    /// symlink — reviewer C1b: canonicalizing the *parent* of a symlinked
+    /// `repo_dir` computes the physical parent of the link's own location,
+    /// which is not a prefix of git's actual, physically-resolved cwd once
+    /// it chdirs through the symlink, so a symlinked `repo_dir` silently
+    /// reopens the ceiling this round exists to close — a real case for
+    /// this project's own shape, e.g. macOS's `/tmp -> /private/tmp`).
+    /// Asserts both calls return `Err(BaseUnresolvable)` rather than the
+    /// ancestor repo's own merge-base SHA.
+    #[test]
+    fn resolve_base_fails_closed_for_non_repo_dir_nested_under_an_ancestor_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // The ancestor repo whose history must never leak into a non-repo
+        // `repo_dir` nested inside it.
+        let ancestor = root.join("ancestor");
+        std::fs::create_dir_all(&ancestor).expect("mkdir ancestor");
+        git(&["init", "-q", "-b", "main"], &ancestor);
+        git(&["config", "user.email", "test@example.com"], &ancestor);
+        git(&["config", "user.name", "test"], &ancestor);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "ancestor base"],
+            &ancestor,
+        );
+        git(
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            &ancestor,
+        );
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "ancestor feature"],
+            &ancestor,
+        );
+
+        // Plain non-repo `repo_dir`, nested directly under the ancestor.
+        let plain = ancestor.join("sub").join("repo_dir");
+        std::fs::create_dir_all(&plain).expect("mkdir plain repo_dir");
+        match resolve_base(None, &plain) {
+            Err(WorkTypeError::BaseUnresolvable { .. }) => {}
+            other => panic!(
+                "resolve_base(None, {plain:?}) should fail closed at the non-repo \
+                 directory instead of silently resolving the ancestor repo's own \
+                 merge-base — got {other:?}"
+            ),
+        }
+
+        // Same, but `repo_dir` is reached through a symlink (C1b).
+        let real_target = ancestor.join("real");
+        std::fs::create_dir_all(&real_target).expect("mkdir real_target");
+        let linked = root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &linked).expect("symlink linked -> real_target");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real_target, &linked)
+            .expect("symlink linked -> real_target");
+
+        match resolve_base(None, &linked) {
+            Err(WorkTypeError::BaseUnresolvable { .. }) => {}
+            other => panic!(
+                "resolve_base(None, {linked:?}) (a symlink into a non-repo directory \
+                 nested under the ancestor repo) should fail closed instead of \
+                 silently resolving the ancestor repo's own merge-base — got {other:?}"
+            ),
+        }
     }
 
     /// Auditor A3 (issue #683 review): nothing pinned
