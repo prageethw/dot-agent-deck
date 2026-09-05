@@ -476,6 +476,35 @@ pub fn derive_work_type(
 /// [`WorkTypeError::BaseUnresolvable`] — never a silent success — when the
 /// ref does not exist in `repo_dir` (E1: `ci.yml:132`'s depth-1
 /// `pull_request` checkout has no `origin/main` ref at all).
+///
+/// [`SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`] cleared alongside (issue #683,
+/// the read-path sibling of issue #669's [`run_git`] fix), with one
+/// exception: unlike every other user of that const, `repo_dir` here is not
+/// guaranteed to already be a git repository — it comes from `repo_root()`,
+/// which locates the workspace root by its `Cargo.toml`, never by checking
+/// for a `.git` (`main.rs`'s own comment names "not a git repository at
+/// all" as a live, expected case). So instead of clearing
+/// `GIT_CEILING_DIRECTORIES` along with the rest of the list, it is bound to
+/// `repo_dir`'s parent — `release_cleanup.rs`'s `try_run_git` policy — so a
+/// non-repo `repo_dir` nested under an unrelated ancestor repository fails
+/// discovery closed at `repo_dir` instead of silently resolving the
+/// ancestor's base (binding `repo_dir` itself would be a no-op: git always
+/// searches `current_dir` regardless of the ceiling list, so the ceiling
+/// has to name the directory git must not walk up *into*). Every other var
+/// in the list is a pure hijack channel with no such caveat, so clearing
+/// those still applies unchanged: without it, an ambient
+/// `GIT_DIR`/`GIT_WORK_TREE` outranks `current_dir` and silently redirects
+/// the merge-base computation onto whatever repository those vars name
+/// instead of `repo_dir`. `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are
+/// deliberately left unpinned here too (unlike [`run_git`]): `repo_dir` is
+/// a real developer checkout, where honouring `~/.gitconfig` is correct,
+/// not a mistake — pinning `GIT_CONFIG_GLOBAL=/dev/null` would also discard
+/// the user's `safe.directory` entries, turning a fine checkout into a
+/// `dubious ownership` failure in exactly the shared/container/CI-runner
+/// setups that need those entries. Callers must pass an absolute
+/// `repo_dir` — the canonicalize-fallback path degrades to a relative or
+/// empty ceiling that git silently ignores, which is unreachable today only
+/// because every current caller already passes an absolute path.
 pub fn resolve_base(explicit: Option<&str>, repo_dir: &Path) -> Result<String, WorkTypeError> {
     let base = explicit.unwrap_or(DEFAULT_BASE).to_string();
     let to_err = |detail: String| WorkTypeError::BaseUnresolvable {
@@ -483,9 +512,18 @@ pub fn resolve_base(explicit: Option<&str>, repo_dir: &Path) -> Result<String, W
         detail,
     };
 
-    let out = Command::new("git")
-        .args(["merge-base", "HEAD", &base])
-        .current_dir(repo_dir)
+    let mut cmd = Command::new("git");
+    cmd.args(["merge-base", "HEAD", "--end-of-options", &base])
+        .current_dir(repo_dir);
+    for var in SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR {
+        cmd.env_remove(var);
+    }
+    let canonical_repo_dir =
+        std::fs::canonicalize(repo_dir).unwrap_or_else(|_| repo_dir.to_path_buf());
+    if let Some(parent) = canonical_repo_dir.parent() {
+        cmd.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    let out = cmd
         .output()
         .map_err(|e| to_err(format!("invoke git merge-base HEAD {base}: {e}")))?;
     if !out.status.success() {
@@ -974,16 +1012,25 @@ fn describe_success(
 
 /// Ambient git location- and config-injection environment variables that
 /// must never leak into a `--self-test` scratch-repo `git` invocation
-/// (issue #669) — shared by [`run_git`] (production, below) and `mod
-/// tests`'s own `git()` fixture helper, since both build scratch repos the
-/// same way and need the same treatment.
+/// (issue #669) — shared by [`run_git`] (production, below), `mod
+/// tests`'s own `git()` fixture helper, and [`resolve_base`] (issue #683),
+/// since all three must guarantee the `git` process they spawn actually
+/// targets the directory they pass as `current_dir`, not wherever an
+/// ambient `GIT_DIR`/`GIT_WORK_TREE`/etc. redirects it.
 ///
 /// Plain removal (not a bound, unlike `GIT_CEILING_DIRECTORIES` in
-/// `repo_state.rs`'s `Sandbox::git`) is correct for all 11: every caller's
-/// `dir` — all 21 production call sites via [`init_self_test_repo`], and
-/// every fixture call site in `mod tests` — targets a directory already
-/// made a repository by an immediately-preceding `git init`, never a walk
-/// that could resolve past `dir` into nothing.
+/// `repo_state.rs`'s `Sandbox::git`) is correct for 10 of the 11: every
+/// scratch-repo caller's `dir` — all 21 production call sites via
+/// [`init_self_test_repo`] and every fixture call site in `mod tests` —
+/// targets a directory that is already a real, addressable repository
+/// (freshly `git init`'d), never a walk that could resolve past `dir` into
+/// nothing. **`GIT_CEILING_DIRECTORIES` is the one exception**:
+/// [`resolve_base`]'s `repo_dir` does *not* carry that guarantee — it comes
+/// from `repo_root()`, which locates the workspace root by its
+/// `Cargo.toml`, never by checking for a `.git` — so [`resolve_base`]
+/// re-sets `GIT_CEILING_DIRECTORIES` to `repo_dir`'s parent after this
+/// list's removal loop runs, rather than leaving it cleared; see
+/// [`resolve_base`]'s own doc comment for why.
 ///
 /// The first 8 mirror `list_tests.rs:808`'s own `GIT_ENV_VARS_TO_CLEAR`
 /// byte-for-byte — not reused directly here because that one backs
@@ -993,7 +1040,9 @@ fn describe_success(
 /// worth the coupling in an already-large diff. `GIT_CEILING_DIRECTORIES`
 /// (one of those first 8) is cleared here — unlike `repo_state.rs`'s
 /// `Sandbox::git`, which *sets* it via `Sandbox::ceiling` — because neither
-/// of the two helpers sharing this list has a ceiling bound. The last 3 —
+/// of the two scratch-repo helpers sharing this list has a ceiling bound
+/// ([`resolve_base`] is the third user of the list and does have one, per
+/// above). The last 3 —
 /// `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`/`GIT_DISCOVERY_ACROSS_FILESYSTEM`
 /// — mirror what `repo_state.rs`'s `Sandbox`'s `AMBIENT_LOCATION_VARS`
 /// carries beyond those 8 (issue #579, PR #663), and close the channel
@@ -4030,6 +4079,228 @@ mod tests {
              `#[cfg(test)]`-only `git()` helper) leaked ambient GIT_DIR/GIT_WORK_TREE, so \
              a commit run \"in\" the fixture landed in the ambient repo instead — ambient \
              HEAD moved from {ambient_head_before} to {ambient_head_after}"
+        );
+    }
+
+    // -- Issue #683: `resolve_base` (line ~479) is the READ-path sibling
+    //    issue #669 didn't touch — it still shells out to `git merge-base`
+    //    with no ambient-env isolation at all --------------------------------
+
+    /// **Read escape — issue #683.** [`resolve_base`] (line ~479) runs `git
+    /// merge-base HEAD <base>` with only `.current_dir(repo_dir)` and no
+    /// `env_remove` treatment at all — unlike [`run_git`] (fixed by #669),
+    /// it doesn't even clear the ambient-location vars in
+    /// [`SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`]. Under an ambient `GIT_DIR`
+    /// (left behind by, e.g., a `pre-commit` hook or a `git rebase --exec`
+    /// parent — this module's own named threat model), `GIT_DIR` outranks
+    /// `current_dir`, so the merge-base is computed against whatever
+    /// repository `GIT_DIR` names instead of `repo_dir` — silently handing a
+    /// wrong SHA downstream to every caller (`derive_work_type_for`,
+    /// `self_test`'s B1 skip, `run_in`'s diff base).
+    ///
+    /// Scenario: build a fixture repo (`repo_dir`) with `origin/main` one
+    /// commit behind `HEAD`, and a separate ambient/victim repo with its own
+    /// unrelated `origin/main`/`HEAD` history. Compute the fixture's true
+    /// merge-base directly (with no ambient env set) as the expected value,
+    /// then set ambient `GIT_DIR` to the victim repo's `.git` and call
+    /// `resolve_base(None, &fixture)`. Asserts the returned SHA still equals
+    /// the fixture's own merge-base — today it instead returns the victim
+    /// repo's merge-base, so this test is RED until coder adds the same
+    /// env-clearing treatment `run_git` already carries.
+    #[test]
+    fn resolve_base_leaks_ambient_git_dir() {
+        fn merge_base_of(dir: &Path, base: &str) -> String {
+            let out = Command::new("git")
+                .args(["merge-base", "HEAD", base])
+                .current_dir(dir)
+                .output()
+                .unwrap_or_else(|e| panic!("git merge-base HEAD {base} in {dir:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git merge-base HEAD {base} in {dir:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // The real repo `resolve_base` is asked about.
+        let fixture = root.join("fixture");
+        std::fs::create_dir_all(&fixture).expect("mkdir fixture");
+        git(&["init", "-q", "-b", "main"], &fixture);
+        git(&["config", "user.email", "test@example.com"], &fixture);
+        git(&["config", "user.name", "test"], &fixture);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "fixture base"],
+            &fixture,
+        );
+        git(
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            &fixture,
+        );
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "fixture feature"],
+            &fixture,
+        );
+        let expected_base_sha = merge_base_of(&fixture, "origin/main");
+
+        // An unrelated repo whose ambient GIT_DIR must never be consulted.
+        let victim = root.join("victim");
+        std::fs::create_dir_all(&victim).expect("mkdir victim");
+        git(&["init", "-q", "-b", "main"], &victim);
+        git(&["config", "user.email", "test@example.com"], &victim);
+        git(&["config", "user.name", "test"], &victim);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "victim base"],
+            &victim,
+        );
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"], &victim);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "victim feature"],
+            &victim,
+        );
+        let victim_base_sha = merge_base_of(&victim, "origin/main");
+        assert_ne!(
+            expected_base_sha, victim_base_sha,
+            "fixture and victim must resolve to different merge-base SHAs or this test \
+             cannot distinguish a leak from correct behaviour"
+        );
+
+        // `cargo-nextest` runs each test in its own process, so mutating the
+        // process environment here cannot bleed into any other test.
+        unsafe {
+            std::env::set_var("GIT_DIR", victim.join(".git"));
+        }
+        let result = resolve_base(None, &fixture);
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+        }
+
+        let actual_base_sha = result.unwrap_or_else(|e| {
+            panic!(
+                "resolve_base(None, {fixture:?}) under ambient GIT_DIR should still \
+                 succeed either way — a failure here is a broken fixture, not the leak \
+                 this test exists to demand a fix for: {e}"
+            )
+        });
+
+        assert_eq!(
+            actual_base_sha, expected_base_sha,
+            "issue #683: `resolve_base` leaked ambient GIT_DIR into `git merge-base`, \
+             returning the victim repo's merge-base ({victim_base_sha}) instead of the \
+             real target repo's own merge-base ({expected_base_sha})"
+        );
+    }
+
+    /// Reviewer C4b / auditor C3 (issue #683 confirm round): the
+    /// `GIT_CEILING_DIRECTORIES` re-bind at `resolve_base` (line ~518) — this
+    /// round's headline fix — is itself pinned by no test. The
+    /// `if let Some(parent) = …` block could be deleted outright, reverting
+    /// to "cleared along with the rest of
+    /// [`SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`]" (the exact defect A2/F2
+    /// fixed), and the workspace would stay green:
+    /// [`resolve_base_leaks_ambient_git_dir`] doesn't exercise a non-repo
+    /// `repo_dir` at all, and
+    /// [`scratch_repo_git_env_vars_to_clear_is_exactly_the_documented_eleven`]
+    /// pins only the const's list, not this re-bind's behaviour.
+    ///
+    /// Scenario: build a real ancestor repo, then a non-repo `repo_dir`
+    /// nested under it (once as a plain subdirectory, once reached through a
+    /// symlink — reviewer C1b: canonicalizing the *parent* of a symlinked
+    /// `repo_dir` computes the physical parent of the link's own location,
+    /// which is not a prefix of git's actual, physically-resolved cwd once
+    /// it chdirs through the symlink, so a symlinked `repo_dir` silently
+    /// reopens the ceiling this round exists to close — a real case for
+    /// this project's own shape, e.g. macOS's `/tmp -> /private/tmp`).
+    /// Asserts both calls return `Err(BaseUnresolvable)` rather than the
+    /// ancestor repo's own merge-base SHA.
+    #[test]
+    fn resolve_base_fails_closed_for_non_repo_dir_nested_under_an_ancestor_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // The ancestor repo whose history must never leak into a non-repo
+        // `repo_dir` nested inside it.
+        let ancestor = root.join("ancestor");
+        std::fs::create_dir_all(&ancestor).expect("mkdir ancestor");
+        git(&["init", "-q", "-b", "main"], &ancestor);
+        git(&["config", "user.email", "test@example.com"], &ancestor);
+        git(&["config", "user.name", "test"], &ancestor);
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "ancestor base"],
+            &ancestor,
+        );
+        git(
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            &ancestor,
+        );
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "ancestor feature"],
+            &ancestor,
+        );
+
+        // Plain non-repo `repo_dir`, nested directly under the ancestor.
+        let plain = ancestor.join("sub").join("repo_dir");
+        std::fs::create_dir_all(&plain).expect("mkdir plain repo_dir");
+        match resolve_base(None, &plain) {
+            Err(WorkTypeError::BaseUnresolvable { .. }) => {}
+            other => panic!(
+                "resolve_base(None, {plain:?}) should fail closed at the non-repo \
+                 directory instead of silently resolving the ancestor repo's own \
+                 merge-base — got {other:?}"
+            ),
+        }
+
+        // Same, but `repo_dir` is reached through a symlink (C1b).
+        let real_target = ancestor.join("real");
+        std::fs::create_dir_all(&real_target).expect("mkdir real_target");
+        let linked = root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &linked).expect("symlink linked -> real_target");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real_target, &linked)
+            .expect("symlink linked -> real_target");
+
+        match resolve_base(None, &linked) {
+            Err(WorkTypeError::BaseUnresolvable { .. }) => {}
+            other => panic!(
+                "resolve_base(None, {linked:?}) (a symlink into a non-repo directory \
+                 nested under the ancestor repo) should fail closed instead of \
+                 silently resolving the ancestor repo's own merge-base — got {other:?}"
+            ),
+        }
+    }
+
+    /// Auditor A3 (issue #683 review): nothing pinned
+    /// [`SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR`]'s exact contents — 9 of its 11
+    /// entries could be deleted today with the whole workspace staying
+    /// green, since [`production_run_git_leaks_ambient_git_dir_and_git_work_tree`]
+    /// and [`resolve_base_leaks_ambient_git_dir`] each pin only one or two
+    /// entries by behaviour. Pin the full list explicitly so a future edit
+    /// that narrows it fails a test instead of silently regressing.
+    #[test]
+    fn scratch_repo_git_env_vars_to_clear_is_exactly_the_documented_eleven() {
+        assert_eq!(
+            SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR,
+            &[
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_NAMESPACE",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT",
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            ],
+            "SCRATCH_REPO_GIT_ENV_VARS_TO_CLEAR's contents changed — this test exists to \
+             make that a deliberate, reviewed edit rather than a silent narrowing; update \
+             both this assertion and the const's doc comment together if the change is \
+             intentional"
         );
     }
 }
