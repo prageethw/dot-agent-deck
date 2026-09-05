@@ -8,7 +8,9 @@ use crate::agent_pty::TabMembership;
 use crate::event::{AgentType, EventType};
 use crate::mode_manager::{ModeManager, ModeManagerError};
 use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, close_panes_concurrently};
-use crate::project_config::{ModeConfig, OrchestrationConfig, resolve_orchestration_name};
+use crate::project_config::{
+    ModeConfig, OrchestrationConfig, OrchestrationRoleConfig, resolve_orchestration_name,
+};
 use crate::state::SessionState;
 
 // ---------------------------------------------------------------------------
@@ -1223,6 +1225,43 @@ impl TabManager {
         Ok((index, role_pane_ids_flat))
     }
 
+    /// PRD #699 M4: grow an already-open orchestration tab in place with a
+    /// newly-spawned role, instead of `surface_one_orchestration` falling
+    /// through to [`Self::open_orchestration_tab_with_existing_role_panes`]
+    /// and building a duplicate tab for the same orchestration.
+    ///
+    /// **Appends only** — assumes the new role's slot is the next index
+    /// after whatever this tab already has, true for the common case of a
+    /// role appended to the end of `.dot-agent-deck.toml`'s role list after
+    /// the tab was opened. A role inserted in the MIDDLE of the config,
+    /// shifting existing role indices, is a known out-of-scope edge case
+    /// for M4 — not handled here.
+    pub fn add_role_to_existing_orchestration(
+        &mut self,
+        tab_index: usize,
+        role_config: OrchestrationRoleConfig,
+        pane_id: String,
+    ) -> Result<usize, TabError> {
+        let Some(Tab::Orchestration {
+            role_pane_ids,
+            role_statuses,
+            config,
+            ..
+        }) = self.tabs.get_mut(tab_index)
+        else {
+            return Err(TabError::IndexOutOfBounds(tab_index));
+        };
+        let role_index = config.roles.len();
+        config.roles.push(role_config);
+        role_pane_ids.push(pane_id);
+        // A freshly-spawned role is a live agent, not a dead slot — unlike
+        // `open_orchestration_tab_with_existing_role_panes`'s dead-slot
+        // handling, there's no `None` case here since M3's spawn only ever
+        // calls this on a real, just-spawned agent.
+        role_statuses.push(OrchestrationRoleStatus::Working);
+        Ok(role_index)
+    }
+
     /// PRD #92 F4: close a mode or orchestration tab and return a
     /// [`CloseTabOutcome`] capturing per-pane close results. Pre-F4
     /// this returned `Vec<String>` of "managed pane IDs" with every
@@ -1444,6 +1483,19 @@ impl TabManager {
             }
         }
         None
+    }
+
+    /// PRD #699 M4: find an already-open orchestration tab by its `(cwd,
+    /// name)` identity — the same legacy tuple `surface_one_orchestration`
+    /// already uses elsewhere, since the daemon's `OrchestrationSurface`
+    /// broadcast carries no per-tab token. Lets a mid-session spawn (whose
+    /// broadcast carries only the brand-new role's never-before-seen pane
+    /// id, so `tab_index_for_pane` can't find it) join the tab that's
+    /// already open instead of building a duplicate.
+    pub fn orchestration_tab_index_for(&self, cwd: &str, name: &str) -> Option<usize> {
+        self.tabs.iter().position(
+            |t| matches!(t, Tab::Orchestration { cwd: c, name: n, .. } if c == cwd && n == name),
+        )
     }
 
     /// Find the mode tab that has this pane as its agent pane.

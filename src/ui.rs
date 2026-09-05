@@ -6458,6 +6458,53 @@ fn surface_one_orchestration(
     }
     let orch_config = resolve_orch_config_for_hydration(local, &bucket);
 
+    // PRD #699 M4: the `already_built` guard above only catches a duplicate
+    // re-broadcast of an EXISTING tab's own roles — it's always false for
+    // `pane spawn`'s broadcast, which carries only the one brand-new role's
+    // never-before-seen pane id. Check by (cwd, name) identity instead: if
+    // this orchestration already has a tab open, grow it in place rather
+    // than falling through to the tab-creation path below, which would
+    // otherwise build a duplicate tab for the same orchestration.
+    if let Some(existing_tab_index) =
+        tab_manager.orchestration_tab_index_for(&surface.cwd, &surface.name)
+    {
+        for role in &surface.roles {
+            if role.role_index >= orch_config.roles.len() {
+                tracing::error!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    role_index = role.role_index,
+                    role_count = orch_config.roles.len(),
+                    "live orchestration surface: role_index out of range while growing existing tab; dropping role"
+                );
+                continue;
+            }
+            if embedded.hydrate_pane(&role.pane_id)
+                && let Ok(_) = tab_manager.add_role_to_existing_orchestration(
+                    existing_tab_index,
+                    orch_config.roles[role.role_index].clone(),
+                    role.pane_id.clone(),
+                )
+            {
+                let mut st = state.blocking_write();
+                st.register_pane(role.pane_id.clone());
+                st.pane_role_map
+                    .insert(role.pane_id.clone(), role.role_name.clone());
+                st.pane_cwd_map
+                    .insert(role.pane_id.clone(), surface.cwd.clone());
+                if role.is_start_role {
+                    st.orchestrator_pane_ids.insert(role.pane_id.clone());
+                }
+            }
+        }
+        tracing::info!(
+            cwd = %surface.cwd,
+            orchestration = %surface.name,
+            "live orchestration surface: grew existing tab with newly-spawned role(s)"
+        );
+        return;
+    }
+
     // Attach each role's live daemon PTY (by its DOT_AGENT_DECK_PANE_ID) and
     // place it in the role-slot vector, mirroring the reconnect partition.
     let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
