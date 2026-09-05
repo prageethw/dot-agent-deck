@@ -1,4 +1,4 @@
-//! PRD #699 fix-round RED tests for the `TabManager`-level half of M4's
+//! PRD #699 fix-round tests for the `TabManager`-level half of M4's
 //! "grow an already-open orchestration tab" path
 //! (`TabManager::add_role_to_existing_orchestration` /
 //! `TabManager::orchestration_tab_index_for`), driven directly against a
@@ -7,26 +7,20 @@
 //! `tests/pane_close.rs`'s own `DelayedCloseController` technique for
 //! testing `TabManager` in isolation.
 //!
-//! Two orchestrator-review findings live here:
+//! Two orchestrator-review findings live here, both GREEN as of the fix
+//! round's second pass (head `1083d85d`):
 //!
 //! - `pane/spawn/009` (M4 / auditor F4): growing a tab that already carries
-//!   a DEAD SLOT for the role being spawned appends a second entry instead
-//!   of replacing the dead one. This test compiles and runs today — it is a
-//!   genuine behavioral RED against the code as it exists now.
-//! - `pane/spawn/010` (B2 / auditor F1): `orchestration_tab_index_for`
-//!   matches on the bare `(cwd, name)` tuple, so two orchestration tabs that
-//!   share both (told apart only by their PRD #140 `Instance` orchestration
-//!   id) are indistinguishable and a role meant for one gets grown into the
-//!   other. Fixing this needs a per-tab `orchestration_id` the `Tab`/
-//!   `TabManager` API does not carry today, so this test deliberately calls
+//!   a DEAD SLOT for the role being spawned replaces that slot instead of
+//!   appending a second entry — fixed, and pinned here including the
+//!   `was_new == false` half of the returned tuple and that the replaced
+//!   slot's config reflects the freshly-spawned role, not the stale one.
+//! - `pane/spawn/010` (B2 / auditor F1): `orchestration_tab_index_for` now
+//!   takes a per-tab `orchestration_id: Option<&str>` (added on
 //!   `open_orchestration_tab_with_existing_role_panes` and
-//!   `orchestration_tab_index_for` with an extra `orchestration_id`
-//!   argument neither accepts yet — this file does NOT compile until the
-//!   coder delegation adds it, exactly the same "RED that fails to compile"
-//!   pattern already established elsewhere in this PRD (see
-//!   `tests/pane_spawn.rs`'s own module doc history). The additive shape
-//!   chosen here (`Option<&str>`, trailing parameter) is a proposal, not a
-//!   mandate — coordinate with whatever shape the fix actually takes.
+//!   `orchestration_tab_index_for` alike) so two orchestration tabs sharing
+//!   the same `(cwd, name)` — told apart only by their PRD #140 `Instance`
+//!   orchestration id — no longer cross-wire on growth.
 
 #![cfg(unix)]
 
@@ -115,18 +109,21 @@ fn new_tab_manager() -> TabManager {
     TabManager::new(Arc::new(NoopPaneController))
 }
 
-/// Scenario: PRD #699 M4 (`findings-699-reviewer.md` "M4") / auditor F4.
-/// Open an orchestration tab whose `reviewer` role has no live pane (a dead
-/// slot — the shape produced when a role's pane closed while the TUI was
-/// detached and gets reattached with no daemon registration to back it).
-/// Grow that tab with a genuinely NEW `reviewer` pane, exactly the call
-/// `pane spawn`'s daemon broadcast handler makes today. The tab must end up
-/// with exactly ONE `reviewer` role entry — the dead slot's pane id
-/// replaced and its status flipped from `Failed` to `Working` — not a
-/// second `reviewer` entry appended alongside the dead one. RED today:
-/// `add_role_to_existing_orchestration` always appends, so `config.roles`
-/// ends up naming `reviewer` twice and `role_pane_ids` grows to 3 entries
-/// for a 2-role config.
+/// Scenario: PRD #699 M4 (`findings-699-reviewer.md` "M4") / auditor F4,
+/// plus the second fix round's N1 (replace leg) and N6 (fresh-config
+/// overwrite) pinning. Open an orchestration tab whose `reviewer` role has
+/// no live pane (a dead slot — the shape produced when a role's pane closed
+/// while the TUI was detached and gets reattached with no daemon
+/// registration to back it). Grow that tab with a genuinely NEW `reviewer`
+/// pane carrying a freshly-loaded role config (distinct `command` from the
+/// tab's stale copy), exactly the call `pane spawn`'s daemon broadcast
+/// handler makes. The tab must end up with exactly ONE `reviewer` role
+/// entry — the dead slot's pane id replaced, its status flipped from
+/// `Failed` to `Working`, its config overwritten with the FRESH role config
+/// (not the stale one the tab originally opened with) — not a second
+/// `reviewer` entry appended alongside the dead one, and the returned
+/// `was_new` flag must report `false` since this is a replace, not an
+/// append.
 #[spec("pane/spawn/009")]
 #[test]
 fn pane_spawn_009_growing_a_dead_slot_replaces_it_instead_of_appending_a_duplicate() {
@@ -143,13 +140,22 @@ fn pane_spawn_009_growing_a_dead_slot_replaces_it_instead_of_appending_a_duplica
         )
         .expect("open a tab with reviewer as a dead slot");
 
-    let (grown_role_index, _was_new) = tabs
+    let fresh_reviewer_config = OrchestrationRoleConfig {
+        command: "fresh-reviewer-cmd".to_string(),
+        ..role("reviewer", false)
+    };
+
+    let (grown_role_index, was_new) = tabs
         .add_role_to_existing_orchestration(
             tab_index,
-            role("reviewer", false),
+            fresh_reviewer_config.clone(),
             "fresh-reviewer-pane".to_string(),
         )
         .expect("grow the tab with a freshly-spawned reviewer");
+    assert!(
+        !was_new,
+        "replacing a dead slot must report was_new == false"
+    );
 
     let Tab::Orchestration {
         role_pane_ids,
@@ -208,6 +214,12 @@ fn pane_spawn_009_growing_a_dead_slot_replaces_it_instead_of_appending_a_duplica
         "the returned role_index must name the REPLACED slot's position (1), not a freshly \
          appended index (2)"
     );
+    assert_eq!(
+        grown_config.roles[grown_role_index].command, fresh_reviewer_config.command,
+        "the replaced slot's role config must reflect the FRESH config passed to the growth \
+         call, not the stale one the tab originally opened with; roles = {:?}",
+        grown_config.roles
+    );
 }
 
 /// Scenario: PRD #699 B2 (`findings-699-reviewer.md` "B2") / auditor F1 —
@@ -223,12 +235,12 @@ fn pane_spawn_009_growing_a_dead_slot_replaces_it_instead_of_appending_a_duplica
 /// tab instead. Build both tabs, resolve the lookup for instance B's id,
 /// grow whichever tab that resolves to, then assert instance A's tab is
 /// completely untouched (role count, pane ids) while instance B's tab is
-/// the one that grew. Deliberately calls
-/// `open_orchestration_tab_with_existing_role_panes` and
-/// `orchestration_tab_index_for` with an extra `orchestration_id: Option<&str>`
-/// argument neither accepts today — this file does not compile until the
-/// coder delegation threads a per-tab orchestration id through both, which
-/// is the fix this test exists to pin. RED (as a compile failure) today.
+/// the one that grew. Calls `open_orchestration_tab_with_existing_role_panes`
+/// and `orchestration_tab_index_for` with the per-tab `orchestration_id:
+/// Option<&str>` argument the fix added to both. The role grown onto
+/// instance B (`coder`) is genuinely new to that tab, so the growth call's
+/// returned `was_new` flag must also report `true` — the append-leg mirror
+/// of `pane_spawn_009`'s replace-leg `was_new == false` pin.
 #[spec("pane/spawn/010")]
 #[test]
 fn pane_spawn_010_two_same_name_cwd_instances_do_not_cross_wire_on_growth() {
@@ -278,7 +290,7 @@ fn pane_spawn_010_two_same_name_cwd_instances_do_not_cross_wire_on_growth() {
          (instance A); got tab {resolved_for_b}, A = {tab_a}, B = {tab_b}"
     );
 
-    let (grown_role_index, _was_new) = tabs
+    let (grown_role_index, was_new) = tabs
         .add_role_to_existing_orchestration(
             resolved_for_b,
             role("coder", false),
@@ -286,6 +298,7 @@ fn pane_spawn_010_two_same_name_cwd_instances_do_not_cross_wire_on_growth() {
         )
         .expect("grow instance B's tab with a new coder role");
     assert_eq!(grown_role_index, 2);
+    assert!(was_new, "a genuinely new role must report was_new == true");
 
     let Tab::Orchestration {
         role_pane_ids: a_pane_ids,

@@ -9972,6 +9972,17 @@ mod spawn_tests {
         assert!(validate_orchestration_surface(surface).is_none());
     }
 
+    // N3 (PRD #699 fix-round, reviewer): orchestration_id is a routing key
+    // with the same semantics as validate_tab_membership's own field of the
+    // same name — a control-byte value rejects the whole surface, mirroring
+    // validate_orchestration_surface_rejects_name_with_ansi_escape above.
+    #[test]
+    fn validate_orchestration_surface_rejects_orchestration_id_with_ansi_escape() {
+        let mut surface = well_formed_surface();
+        surface.orchestration_id = Some("\x1b[31mpwn".into());
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
     // M1: role_name flows to the role card/label like name does — drop a role
     // whose non-empty role_name smuggles control bytes.
     #[test]
