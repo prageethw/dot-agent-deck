@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -1492,10 +1493,24 @@ impl TabManager {
     /// broadcast carries only the brand-new role's never-before-seen pane
     /// id, so `tab_index_for_pane` can't find it) join the tab that's
     /// already open instead of building a duplicate.
+    ///
+    /// `name` must be compared against the tab's CANONICAL identity, not its
+    /// stored `name` field — that field is a cosmetic display title (PRD
+    /// #107: "the user's form name … routed to the tab TITLE only … The
+    /// orchestration IDENTITY … is ALWAYS derived from
+    /// `resolve_orchestration_name(&config.name, cwd)`", `open_orchestration_tab_with_isolated_clone_origin`
+    /// above) and can differ from it — exactly the case here, where the
+    /// live-opened tab's title is the New Agent form's typed name while
+    /// `OrchestrationSurface.name` (this `name` param) is the canonical
+    /// resolved identity. Recompute the same canonical name from the tab's
+    /// own stored `config` so both sides compare like with like.
     pub fn orchestration_tab_index_for(&self, cwd: &str, name: &str) -> Option<usize> {
-        self.tabs.iter().position(
-            |t| matches!(t, Tab::Orchestration { cwd: c, name: n, .. } if c == cwd && n == name),
-        )
+        self.tabs.iter().position(|t| match t {
+            Tab::Orchestration { cwd: c, config, .. } => {
+                c == cwd && resolve_orchestration_name(&config.name, Path::new(c)) == name
+            }
+            _ => false,
+        })
     }
 
     /// Find the mode tab that has this pane as its agent pane.
