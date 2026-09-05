@@ -10,7 +10,8 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, GuardedSendDetail};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, WaitOutcome, WorkDoneSignal, WorktreeKeptNotice, Writable,
+    LiveTarget, OrchestrationSurface, RestartRoleSignal, WaitOutcome, WorkDoneSignal,
+    WorktreeKeptNotice, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -7775,6 +7776,177 @@ impl AppState {
             delivered,
             unresolved_roles,
             ..Default::default()
+        }
+    }
+
+    /// PRD #699 M2: handle `dot-agent-deck pane restart <role>` — an
+    /// orchestrator asking the daemon to restart one of its own worker roles
+    /// on demand. Recovery for a role M1 marked `crashed` (the ordinary case),
+    /// and with `force: true`, a deliberate restart of a still-healthy role.
+    ///
+    /// Same caller-validation and target-resolution rules as
+    /// [`Self::handle_delegate_with_state`] (same orchestration, only the
+    /// orchestrator may call it), since this is the same trust boundary: a
+    /// pane may only reach into panes belonging to its own orchestration.
+    ///
+    /// **Locking**: called through an already-acquired READ guard (`self` IS
+    /// that guard, exactly like `handle_delegate_with_state`), so the
+    /// `recreated: true` re-registration case below must not take a WRITE
+    /// lock on the same `SharedState` synchronously — that deadlocks, since
+    /// nothing drops this method's own read guard until it returns. Follow
+    /// `dispatch_one_owned`'s precedent (`src/state.rs`, the `recreated`
+    /// branch inside the `clear = true` respawn arm): do the re-registration
+    /// inside a detached `tokio::spawn`ed task, after this method has already
+    /// returned and released the guard.
+    pub async fn handle_restart_role_with_state(
+        &self,
+        signal: RestartRoleSignal,
+        registry: &Arc<AgentPtyRegistry>,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+        state: Option<&SharedState>,
+    ) -> crate::event::RestartRoleResponse {
+        use crate::event::RestartRoleResponse;
+        let _ = event_tx;
+        if !self.pane_role_map.contains_key(&signal.pane_id) {
+            warn!(pane_id = %signal.pane_id, "restart-role from unknown pane");
+            return RestartRoleResponse {
+                error: Some(format!(
+                    "the daemon holds no orchestration role for pane {}, so this restart \
+                     was routed nowhere. Only a pane spawned as part of an orchestration \
+                     can restart a role.",
+                    signal.pane_id
+                )),
+                ..Default::default()
+            };
+        }
+        if !self.orchestrator_pane_ids.contains(&signal.pane_id) {
+            let role = self
+                .pane_role_map
+                .get(&signal.pane_id)
+                .cloned()
+                .unwrap_or_default();
+            warn!(pane_id = %signal.pane_id, role = %role, "restart-role from non-orchestrator pane");
+            return RestartRoleResponse {
+                error: Some(format!(
+                    "pane {} is the `{role}` role, not this orchestration's orchestrator, \
+                     so it may not restart a role.",
+                    signal.pane_id
+                )),
+                ..Default::default()
+            };
+        }
+
+        // Same routing rule `handle_delegate_with_state` uses: same
+        // orchestration, never the orchestrator's own pane. `delegate_targets`
+        // sorts and de-duplicates; this codebase's `role_pane_ids` model is
+        // 1:1, so a non-empty result names exactly one pane for the role.
+        let targets = self.delegate_targets(&signal.pane_id, std::slice::from_ref(&signal.role));
+        let Some((_, pane_id)) = targets.into_iter().next() else {
+            return RestartRoleResponse {
+                error: Some(format!(
+                    "no worker pane in this orchestration is registered for role `{}`",
+                    signal.role
+                )),
+                ..Default::default()
+            };
+        };
+
+        let target_agent_id = registry.pane_current_agent_id(&pane_id);
+        let crashed = target_agent_id
+            .as_deref()
+            .and_then(|id| registry.agent_record_any(id))
+            .is_some_and(|record| record.crashed == Some(true));
+        if !crashed && !signal.force {
+            return RestartRoleResponse {
+                error: Some(format!(
+                    "pane {pane_id} (role `{}`) has not crashed; pass --force to restart \
+                     a healthy pane",
+                    signal.role
+                )),
+                ..Default::default()
+            };
+        }
+
+        let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
+        let cwd = self.orchestration_cwd_of(&signal.pane_id, registry);
+        let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
+            (Some(c), Some(identity)) => {
+                lookup_orchestration_role_indexed(c, identity.name(), &signal.role)
+            }
+            _ => None,
+        };
+        let Some((role_index, role_config)) = role_config_indexed else {
+            return RestartRoleResponse {
+                error: Some(format!(
+                    "could not resolve role `{}` in this project's .dot-agent-deck.toml, so \
+                     there is no command to restart it with",
+                    signal.role
+                )),
+                ..Default::default()
+            };
+        };
+
+        let recreate_identity = crate::agent_pty::PaneRecreateIdentity {
+            cwd: cwd.clone(),
+            display_name: Some(signal.role.clone()),
+            tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                name: orchestration
+                    .as_ref()
+                    .map(|identity| identity.name().to_string())
+                    .unwrap_or_default(),
+                role_index,
+                role_name: signal.role.clone(),
+                // A worker, by construction: this handler already refused
+                // above when the caller named its own orchestrator pane.
+                is_start_role: false,
+                orchestration_cwd: cwd.clone(),
+                display_title: None,
+                orchestration_id: match orchestration.as_ref() {
+                    Some(OrchestrationIdentity::Instance { id, .. }) => Some(id.clone()),
+                    _ => None,
+                },
+            }),
+            agent_type: role_config.resolved_agent_type(),
+            env: vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                pane_id.clone(),
+            )],
+        };
+
+        match registry
+            .respawn_or_recreate_agent_for_pane(&pane_id, &role_config.command, &recreate_identity)
+            .await
+        {
+            Ok(crate::agent_pty::PaneRespawn { recreated, .. }) => {
+                if recreated && let (Some(state), Some(identity)) = (state, orchestration.clone()) {
+                    // See the locking note on this method: `state` is cloned
+                    // and the write lock is taken inside a DETACHED task, only
+                    // after this method (and the read guard it runs under)
+                    // has returned — never synchronously here.
+                    let state = state.clone();
+                    let role = signal.role.clone();
+                    let pane_id = pane_id.clone();
+                    tokio::spawn(async move {
+                        state.write().await.register_orchestration_role(
+                            &pane_id,
+                            &role,
+                            false,
+                            identity,
+                            cwd.as_deref(),
+                        );
+                    });
+                }
+                RestartRoleResponse {
+                    restarted: true,
+                    error: None,
+                    ..Default::default()
+                }
+            }
+            Err(e) => RestartRoleResponse {
+                restarted: false,
+                error: Some(format!("failed to restart role `{}`: {e}", signal.role)),
+                ..Default::default()
+            },
         }
     }
 

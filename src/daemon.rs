@@ -2583,6 +2583,34 @@ async fn run_hook_loop(
                                         let _ = write_half.flush().await;
                                     }
                                 }
+                                DaemonMessage::RestartRole(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        role = %signal.role,
+                                        force = signal.force,
+                                        "Received restart-role signal"
+                                    );
+                                    // PRD #699 M2: same reply-on-same-connection
+                                    // pattern as `Delegate` above — the caller
+                                    // is a REQUEST, not fire-and-forget, since
+                                    // it is the only place that knows whether
+                                    // the restart actually happened.
+                                    let resp = state
+                                        .read()
+                                        .await
+                                        .handle_restart_role_with_state(
+                                            signal,
+                                            &pty_registry,
+                                            &event_tx,
+                                            Some(&state),
+                                        )
+                                        .await;
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
                                 DaemonMessage::Dispatch(signal) => {
                                     info!(
                                         pane_id = %signal.pane_id,

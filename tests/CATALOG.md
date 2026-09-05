@@ -4198,6 +4198,43 @@ without depending on the config struct API.
 - **Does not assert:** exit-code value beyond success/failure, or the exact wording distinguishing the two roles.
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
 
+#### pane/restart
+
+##### pane/restart/001 — Restarting a crashed worker without `--force` succeeds and the role stays reachable (PRD #699 M2).
+- **Layer:** L1/fast (in-process — the real `AppState::handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + a worker stand-in that exits on its own to simulate a crash; no daemon socket, no LLM).
+- **Agent:** none (synthetic — a `sleep 0.2` worker stand-in whose natural exit is what marks its `AgentRecord` `crashed == Some(true)`, mirroring the M1 precedent test's technique).
+- **Asserts:** with the worker's record marked crashed, calling the handler from the orchestrator pane with `force: false` reports `restarted: true` and no error; the worker pane is now owned by a freshly spawned agent id (not the crashed one); a subsequent `delegate_targets` lookup from the orchestrator still resolves the role to the same pane.
+- **Does not assert:** the CLI/socket layer (`dot-agent-deck pane restart`) — this calls the handler directly, bypassing it.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/002 — Restarting a healthy pane without `--force` is refused (PRD #699 M2).
+- **Layer:** L1/fast (same technique as `pane/restart/001`).
+- **Agent:** none (a `cat` stand-in that never exits).
+- **Asserts:** calling the handler with `force: false` against a never-crashed worker reports `restarted: false` and an error naming that the pane has not crashed; the worker's agent id is unchanged.
+- **Does not assert:** the exact error wording beyond containing "crash" (case-insensitively).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/003 — `--force` restarts a healthy pane anyway (PRD #699 M2).
+- **Layer:** L1/fast (same technique as `pane/restart/001`).
+- **Agent:** none (a `cat` stand-in that never exits).
+- **Asserts:** calling the handler with `force: true` against a never-crashed worker reports `restarted: true` and no error; a fresh agent id now owns the worker pane.
+- **Does not assert:** the CLI/socket layer.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/004 — Restarting a role name the orchestration does not have is refused and names the unknown role (PRD #699 M2).
+- **Layer:** L1/fast (same technique as `pane/restart/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler with a role name absent from the orchestration's registration reports `restarted: false` and an error containing the literal unknown role name.
+- **Does not assert:** the exact error wording beyond containing the role name.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/005 — Only the orchestrator pane of an orchestration may restart one of its roles (PRD #699 M2).
+- **Layer:** L1/fast (same technique as `pane/restart/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler from the WORKER's own pane (not the orchestrator) reports `restarted: false` with an error, and the worker's agent id is unchanged — the same anti-spoofing guard `orchestration/delegate/004`/`006` pin for `delegate`.
+- **Does not assert:** the exact error wording.
+- **Platform coverage:** mac+linux (unix-only).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).

@@ -1046,6 +1046,13 @@ pub enum DaemonMessage {
     /// see [`WaitDoneSignal`]. Fire-and-forget.
     #[serde(rename = "wait_done")]
     WaitDone(WaitDoneSignal),
+    /// PRD #699 M2: an orchestrator asks the daemon to restart one of its own
+    /// worker roles on demand — recovery for a role M1 marked `crashed`
+    /// without requiring a human to reach for the TUI, and (with `force`) a
+    /// deliberate restart of a healthy role too. Answered on the same
+    /// connection, like `GetSeed`/`ListTargets`/`Delegate`.
+    #[serde(rename = "restart_role")]
+    RestartRole(RestartRoleSignal),
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -1216,6 +1223,60 @@ pub struct DelegateSignal {
     /// never rejects, no `PROTOCOL_VERSION` bump.
     #[serde(default)]
     pub subject: Option<String>,
+}
+
+/// Signal sent by the orchestrator via `dot-agent-deck pane restart <role>`
+/// (PRD #699 M2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartRoleSignal {
+    pub pane_id: String,
+    pub role: String,
+    /// Restart even when the target pane's current agent hasn't crashed
+    /// (`AgentRecord::crashed != Some(true)`). Without this, restarting a
+    /// healthy pane is refused — the ordinary case is recovering a crashed
+    /// worker, not interrupting a live one.
+    pub force: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// The daemon's reply to a [`DaemonMessage::RestartRole`], one JSON line back
+/// on the hook-socket connection (the [`GetSeedResponse`]/[`DelegateResponse`]
+/// pattern).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartRoleResponse {
+    /// Affirmative discriminator, always [`RESTART_ROLE_RESPONSE_KIND`] on a
+    /// reply this daemon wrote — see [`DelegateResponse::kind`] for why this
+    /// must be checked rather than trusting an all-`#[serde(default)]`
+    /// struct's ability to parse ANY JSON object, including another verb's
+    /// reply or `{}` from an older daemon that doesn't know this verb.
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub restarted: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The value [`RestartRoleResponse::kind`] carries on every reply this daemon
+/// writes. See [`DELEGATE_RESPONSE_KIND`] for why this is a distinct value
+/// checked on every parse rather than inferred from a plausible-looking body.
+pub const RESTART_ROLE_RESPONSE_KIND: &str = "restart_role";
+
+impl Default for RestartRoleResponse {
+    fn default() -> Self {
+        Self {
+            kind: Some(RESTART_ROLE_RESPONSE_KIND.to_string()),
+            restarted: false,
+            error: None,
+        }
+    }
+}
+
+impl RestartRoleResponse {
+    /// Whether this parsed reply positively identifies itself as a
+    /// restart-role response. See [`Self::kind`].
+    pub fn is_restart_role_reply(&self) -> bool {
+        self.kind.as_deref() == Some(RESTART_ROLE_RESPONSE_KIND)
+    }
 }
 
 /// Daemon → attached-TUI broadcast (PRD #76 M2.17). The daemon publishes
