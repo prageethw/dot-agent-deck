@@ -7851,7 +7851,14 @@ impl AppState {
             };
         };
 
-        let target_agent_id = registry.pane_current_agent_id(&pane_id);
+        // `pane_current_agent_id` filters out exited entries, so it answers
+        // `None` for exactly the pane this handler most needs to see: one
+        // whose agent already crashed. `authorized_occupant` tracks the same
+        // "who currently holds this pane" fact WITHOUT that live-only filter
+        // — set at spawn and overwritten at respawn (`set_authorized_occupant`),
+        // never cleared by a crash — so it still names the crashed agent's id
+        // until a respawn/recreate replaces it.
+        let target_agent_id = registry.authorized_occupant(&pane_id);
         let crashed = target_agent_id
             .as_deref()
             .and_then(|id| registry.agent_record_any(id))
