@@ -13724,6 +13724,55 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: spawns a naturally-exiting agent and a deliberately-closed
+    /// one, then asserts the surviving record for the natural exit carries
+    /// `crashed == Some(true)` while the deliberately-closed agent's record
+    /// is gone entirely (removed by `close_agent` before `pump_reader`'s EOF
+    /// could observe it, so there's nothing left to mark).
+    #[tokio::test]
+    async fn pump_reader_marks_natural_exit_as_crashed_but_not_deliberate_close() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        let natural_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a naturally-exiting agent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && registry.live_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: /usr/bin/true must have exited"
+        );
+        let natural_record = registry
+            .agent_record_any(&natural_id)
+            .expect("a natural exit must leave a queryable record behind");
+        assert_eq!(
+            natural_record.crashed,
+            Some(true),
+            "pump_reader's EOF branch must mark a natural exit as crashed"
+        );
+
+        let closing_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn an agent to close deliberately");
+        registry.close_agent(&closing_id).expect("deliberate close");
+        assert!(
+            registry.agent_record_any(&closing_id).is_none(),
+            "close_agent removes the entry before its kill completes — the natural-exit EOF \
+             that follows must find nothing registered and must not fabricate a crashed record"
+        );
+
+        registry.shutdown_all();
+    }
+
     /// Issue #448: the commission ledger answers "did the orchestrator ask for
     /// this?" on its own, so it counts delegations rather than tracking the newest
     /// — two unanswered delegations are two commissions, and only a completion
