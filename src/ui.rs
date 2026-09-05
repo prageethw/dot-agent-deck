@@ -6525,6 +6525,26 @@ fn surface_one_orchestration(
                     ui.pane_declared_agent
                         .insert(role.pane_id.clone(), declared);
                 }
+                // Bring the newly-spawned role into view — under the default
+                // `Stacked` pane layout only the focused role pane's box is
+                // drawn (every other slot reserves zero rows, PRD #311), so
+                // without this the operator who just spawned a role would see
+                // no visible change at all. Only steal the LIVE embedded focus
+                // when this orchestration's tab is the one currently on
+                // screen; otherwise just remember the intended focus on the
+                // tab itself so switching to it later lands on the role that
+                // was actually just spawned, rather than yanking focus away
+                // from whatever tab the operator is looking at right now.
+                if existing_tab_index == tab_manager.active_index() {
+                    let _ = embedded.focus_pane(&role.pane_id);
+                }
+                if let Some(Tab::Orchestration {
+                    focused_role_pane_id,
+                    ..
+                }) = tab_manager.tabs_mut().get_mut(existing_tab_index)
+                {
+                    *focused_role_pane_id = Some(role.pane_id.clone());
+                }
             }
         }
         tracing::info!(
