@@ -139,6 +139,7 @@ fn pane_spawn_009_growing_a_dead_slot_replaces_it_instead_of_appending_a_duplica
             "/work/dead-slot-cwd",
             vec![Some("orch-pane".to_string()), None],
             None,
+            None,
         )
         .expect("open a tab with reviewer as a dead slot");
 

@@ -1468,6 +1468,15 @@ pub struct OrchestrationSurface {
     /// Optional user-facing tab title; `None` falls back to `name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_title: Option<String>,
+    /// PRD #699 fix-round B2/F1: the PRD #140 per-tab `Instance` orchestration
+    /// id, when the producer has one — additive, so an older daemon's surface
+    /// (or a `NameCwd`-identity orchestration, which has no such token)
+    /// carries `None`. `TabManager::orchestration_tab_index_for` requires this
+    /// to match a candidate tab's own stored id whenever BOTH sides carry one,
+    /// rather than falling back to the bare `(cwd, name)` tuple, which cannot
+    /// tell two same-named same-cwd orchestration instances apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration_id: Option<String>,
     /// The spawned role panes, in role order.
     pub roles: Vec<OrchestrationSurfaceRole>,
 }
@@ -2193,6 +2202,7 @@ mod tests {
             name: "issue-work".into(),
             cwd: "/work/github-issues/.worktrees/issue-1".into(),
             display_title: None,
+            orchestration_id: None,
             roles: vec![
                 OrchestrationSurfaceRole {
                     pane_id: "sched-github-issues-0-r0".into(),

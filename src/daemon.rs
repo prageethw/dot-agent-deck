@@ -2595,16 +2595,20 @@ async fn run_hook_loop(
                                     // is a REQUEST, not fire-and-forget, since
                                     // it is the only place that knows whether
                                     // the restart actually happened.
-                                    let resp = state
-                                        .read()
-                                        .await
-                                        .handle_restart_role_with_state(
-                                            signal,
-                                            &pty_registry,
-                                            &event_tx,
-                                            Some(&state),
-                                        )
-                                        .await;
+                                    //
+                                    // Fix-round M1/F2: `handle_restart_role_with_state`
+                                    // is a free function taking `&state` directly
+                                    // (like `handle_spawn_role_with_state` below), not
+                                    // an `AppState` method called through a pre-held
+                                    // read guard — that guard used to stay locked for
+                                    // the whole respawn. See the function's own doc.
+                                    let resp = crate::state::handle_restart_role_with_state(
+                                        signal,
+                                        &state,
+                                        &pty_registry,
+                                        &event_tx,
+                                    )
+                                    .await;
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;

@@ -158,17 +158,13 @@ async fn restart_role(
         force,
         timestamp: chrono::Utc::now(),
     };
-    fx.daemon
-        .state
-        .read()
-        .await
-        .handle_restart_role_with_state(
-            signal,
-            &fx.daemon.registry,
-            &fx.daemon.event_tx,
-            Some(&fx.daemon.state),
-        )
-        .await
+    dot_agent_deck::state::handle_restart_role_with_state(
+        signal,
+        &fx.daemon.state,
+        &fx.daemon.registry,
+        &fx.daemon.event_tx,
+    )
+    .await
 }
 
 /// Scenario: a worker stand-in exits on its own shortly after boot (M1 marks
@@ -461,17 +457,13 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
         force: true,
         timestamp: chrono::Utc::now(),
     };
-    let response = daemon
-        .state
-        .read()
-        .await
-        .handle_restart_role_with_state(
-            signal,
-            &daemon.registry,
-            &daemon.event_tx,
-            Some(&daemon.state),
-        )
-        .await;
+    let response = dot_agent_deck::state::handle_restart_role_with_state(
+        signal,
+        &daemon.state,
+        &daemon.registry,
+        &daemon.event_tx,
+    )
+    .await;
     assert!(
         response.restarted,
         "instance A's force restart of its own `coder` must succeed; response = {response:?}"

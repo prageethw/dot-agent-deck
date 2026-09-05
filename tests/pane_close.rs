@@ -932,6 +932,7 @@ fn stop_019_tab_close_is_concurrent_and_keeps_pane_order() {
             "/work",
             pane_ids.iter().cloned().map(Some).collect(),
             None,
+            None,
         )
         .expect("open hydrated six-role orchestration");
 

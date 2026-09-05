@@ -2592,11 +2592,14 @@ pub struct AgentRecord {
     /// above for the join and backwards-compatibility rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_commission: Option<CommissionSnapshot>,
-    /// PRD #699 M1: `Some(true)` when the agent's process exited NATURALLY
-    /// (crashed) rather than via a deliberate `close_agent`/
-    /// `respawn_agent_for_pane` teardown. `None` for a running agent, an
-    /// older daemon that predates this field, or (moot, since the whole
-    /// entry is removed) a deliberately-closed one. `skip_serializing_if`
+    /// PRD #699 M1: `Some(true)` when the agent's process exited on its own
+    /// rather than via a deliberate `close_agent`/`respawn_agent_for_pane`
+    /// teardown. The name says "crashed", but the flag fires on ANY natural
+    /// process exit — including a clean `exit 0` — not only a genuine crash;
+    /// `pane restart <role>` without `--force` therefore succeeds equally
+    /// against a role whose command simply finished. `None` for a running
+    /// agent, an older daemon that predates this field, or (moot, since the
+    /// whole entry is removed) a deliberately-closed one. `skip_serializing_if`
     /// keeps the wire shape backwards-compatible, matching every other
     /// optional field on this struct (`pane_id_env`, `display_name`, `cwd`,
     /// `tab_membership`, `agent_type`).
@@ -3746,7 +3749,11 @@ pub struct PaneRespawn {
 /// puts us back at issue #606, where the pane is re-created while its
 /// predecessor's cleanup is still running and the cleanup then deletes the
 /// newcomer's state.
-const PANE_CLOSE_SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
+// PRD #699 fix-round M1: `pub(crate)` rather than private — `hook.rs`'s
+// `RESTART_ROLE_REPLY_TIMEOUT` sizes `pane restart`'s CLI round-trip budget
+// off this same constant (plus `AGENT_TERMINATE_GRACE`), rather than
+// hardcoding a second copy of the respawn's worst-case duration.
+pub(crate) const PANE_CLOSE_SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Poll cadence for [`PANE_CLOSE_SETTLE_TIMEOUT`]. Matches the 50 ms cadence
 /// `terminate_child_with_grace_and_wait` polls `try_wait` at, so the wait
@@ -9839,6 +9846,7 @@ mod spawn_tests {
             name: "issue-work".into(),
             cwd: "/work/github-issues/.worktrees/issue-1".into(),
             display_title: None,
+            orchestration_id: None,
             roles: vec![surface_role(0, "orchestrator"), surface_role(1, "worker")],
         }
     }
@@ -9888,6 +9896,7 @@ mod spawn_tests {
             name: "issue-work".into(),
             cwd: "/work/issue-1".into(),
             display_title: None,
+            orchestration_id: None,
             roles: vec![surface_role(ORCHESTRATION_ROLE_INDEX_MAX + 1, "rogue")],
         };
         assert!(validate_orchestration_surface(surface).is_none());
@@ -9965,6 +9974,7 @@ mod spawn_tests {
             name: "issue-work".into(),
             cwd: "/work/issue-1".into(),
             display_title: None,
+            orchestration_id: None,
             roles: vec![surface_role(0, "")],
         };
         let validated = validate_orchestration_surface(surface).expect("empty role_name accepted");

@@ -1690,6 +1690,7 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
                 &bucket.cwd,
                 role_pane_ids,
                 bucket.display_title.as_deref(),
+                bucket.orchestration_id.as_deref(),
             )
             .expect("rebuilding an orchestration tab from its bucket should succeed");
     }
@@ -1999,7 +2000,13 @@ async fn drift_002_role_spawned_while_headless_hydrates_within_bounds_inner() {
     // ---- And the tab actually builds end-to-end from those role panes.
     let mut tab_manager = dot_agent_deck::tab::TabManager::new(ctrl.clone());
     tab_manager
-        .open_orchestration_tab_with_existing_role_panes(&orch_config, &cwd, role_pane_ids, None)
+        .open_orchestration_tab_with_existing_role_panes(
+            &orch_config,
+            &cwd,
+            role_pane_ids,
+            None,
+            None,
+        )
         .expect("rebuilding the orchestration tab from a headlessly-grown role set should succeed");
     let orchestration_tabs: Vec<&dot_agent_deck::tab::Tab> = tab_manager
         .tabs()

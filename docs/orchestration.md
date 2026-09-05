@@ -481,9 +481,9 @@ A pane carries at most one monitored wait at a time; `wait done`'s `<label>` is 
 
 ## Restarting and spawning worker panes
 
-Two CLI subcommands reach into a **running** orchestration without restarting the whole tab or the deck: `dot-agent-deck pane restart <role>` and `dot-agent-deck pane spawn <role>`. Both are scoped by `DOT_AGENT_DECK_PANE_ID` exactly like [`dot-agent-deck delegate`](#tagging-delegations-with---subject) — callable from any pane inside the orchestration — but the calling pane must be the orchestration's own orchestrator; both commands refuse a call from a non-orchestrator pane.
+Two CLI subcommands reach into a **running** orchestration without restarting the whole tab or the deck: `dot-agent-deck pane restart <role>` and `dot-agent-deck pane spawn <role>`. Both are scoped by `DOT_AGENT_DECK_PANE_ID` exactly like [`dot-agent-deck delegate`](#tagging-delegations-with---subject) — the calling pane must be the orchestration's own orchestrator; both commands refuse a call from a non-orchestrator pane.
 
-`dot-agent-deck pane restart <role>` restarts a worker role's pane within the calling orchestrator's own orchestration. It is refused for a healthy pane unless you pass `--force` — without the flag, restart only succeeds against a pane the daemon has flagged as crashed, so it cannot be used to accidentally force-kill a worker mid-task.
+`dot-agent-deck pane restart <role>` restarts a worker role's pane within the calling orchestrator's own orchestration. It is refused for a healthy pane unless you pass `--force` — without the flag, restart only succeeds against a pane the daemon has flagged as having exited on its own (which includes, but is not limited to, a genuine crash — a role whose command simply finished, even with a clean exit, is equally restartable without `--force`), so it cannot be used to accidentally force-kill a worker mid-task.
 
 `dot-agent-deck pane spawn <role>` spawns a role that is declared in `.dot-agent-deck.toml` but was not yet spawned into the running orchestration — for example, a role you added to the config file after the tab was already open. It is refused if the role is already live in this orchestration instance, or if it is not in the config at all.
 

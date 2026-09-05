@@ -229,12 +229,12 @@ fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
 /// Drive the new-pane dialog to create a plain (non-orchestration) dashboard
 /// pane running `sleep 600`, exactly like `e2e_session_save.rs`'s own
 /// `spawn_plain_pane` helper. Used here purely as a session-dirtying trigger:
-/// `surface_one_orchestration`'s M4 growth branch (unlike every other
-/// meaningful-state-change call site in `ui.rs`) never calls
-/// `ui.mark_session_dirty()`, so growing an orchestration tab alone flushes no
-/// fresh `session.toml` at all — a plain new pane is a proven, independent
-/// way to force the next coalesced write and observe what it actually
-/// contains.
+/// `surface_one_orchestration`'s M4 growth branch calls `ui.mark_session_dirty()`
+/// only conditionally, on the branch where the start role's `pane_metadata`
+/// snapshot already exists (fix-round M5) — so growing an orchestration tab
+/// alone is not a reliable way to flush a fresh `session.toml`, and a plain
+/// new pane is a proven, independent way to force the next coalesced write
+/// and observe what it actually contains.
 fn spawn_plain_pane(deck: &TuiDeck, command: &str) {
     deck.send_keys(b"\x04"); // Ctrl+D toggles between PaneInput and Normal
     deck.send_keys(b"\x0e"); // Ctrl+N -> directory picker

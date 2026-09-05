@@ -828,7 +828,14 @@ pub async fn spawn(
             // role's PTY and builds the tab mid-session. Best-effort: `send`
             // errs only when no TUI is attached (the standalone-daemon case).
             if let Some(tx) = event_tx {
-                surface_spawned_orchestration(tx, &name, &req.working_dir, &roles, &agents);
+                surface_spawned_orchestration(
+                    tx,
+                    &name,
+                    &req.working_dir,
+                    &roles,
+                    &agents,
+                    &orchestration_id,
+                );
                 // …and give every role card its ROLE NAME, the same way the
                 // single-agent branch names its card: a synthetic `SessionStart`
                 // carrying the friendly name as metadata.
@@ -2603,6 +2610,7 @@ fn surface_spawned_orchestration(
     cwd: &str,
     roles: &[RoleSpawn],
     agents: &[SpawnedAgent],
+    orchestration_id: &str,
 ) {
     let surface_roles = roles
         .iter()
@@ -2633,6 +2641,7 @@ fn surface_spawned_orchestration(
         name: name.to_string(),
         cwd: cwd.to_string(),
         display_title,
+        orchestration_id: Some(orchestration_id.to_string()),
         roles: surface_roles,
     };
     let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));

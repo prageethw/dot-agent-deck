@@ -6370,14 +6370,17 @@ fn surface_one_orchestration(
         cwd: surface.cwd.clone(),
         orchestration_name: surface.name.clone(),
         display_title: surface.display_title.clone(),
-        // PRD #140 review: the daemon's `OrchestrationSurface` broadcast carries
-        // no per-tab token, so this path's identity is the legacy `(name, cwd)`
-        // tuple — byte-identical dead-slot ids to before. Safe here because the
-        // only producer (PRD #120 issue dispatch) gives every dispatched
-        // orchestration its own git worktree, hence its own cwd; two surfaces
-        // never share a directory. If that ever changes, plumb the token onto
-        // `OrchestrationSurface` (additive serde field) and set it here.
-        orchestration_id: None,
+        // PRD #140 review, fix-round B2/F1: this used to be hardcoded `None`
+        // with a comment arguing it was safe because the only producer (PRD
+        // #120 issue dispatch) gives every dispatched orchestration its own
+        // git worktree, hence its own cwd, so two surfaces never shared a
+        // directory. Fix-round M3 (`pane spawn`) broke that premise — it
+        // spawns into the CALLING orchestration's own (non-unique) cwd — so
+        // the daemon's `OrchestrationSurface` now carries the PRD #140
+        // per-tab `Instance` token as an additive field (both producers
+        // populate it) and this bucket carries it through, exactly the
+        // remedy this comment used to prescribe for "if that ever changes."
+        orchestration_id: surface.orchestration_id.clone(),
         role_slots: surface
             .roles
             .iter()
@@ -6461,13 +6464,24 @@ fn surface_one_orchestration(
     // PRD #699 M4: the `already_built` guard above only catches a duplicate
     // re-broadcast of an EXISTING tab's own roles — it's always false for
     // `pane spawn`'s broadcast, which carries only the one brand-new role's
-    // never-before-seen pane id. Check by (cwd, name) identity instead: if
+    // never-before-seen pane id. Check by (cwd, name) identity — refined by
+    // fix-round B2/F1 to also require the PRD #140 per-tab instance token to
+    // match whenever both sides carry one, so two parallel same-name,
+    // same-cwd orchestration INSTANCES don't cross-wire (see
+    // `TabManager::orchestration_tab_index_for`'s own doc) — instead: if
     // this orchestration already has a tab open, grow it in place rather
     // than falling through to the tab-creation path below, which would
     // otherwise build a duplicate tab for the same orchestration.
-    if let Some(existing_tab_index) =
-        tab_manager.orchestration_tab_index_for(&surface.cwd, &surface.name)
-    {
+    if let Some(existing_tab_index) = tab_manager.orchestration_tab_index_for(
+        &surface.cwd,
+        &surface.name,
+        surface.orchestration_id.as_deref(),
+    ) {
+        // Fix-round M5: whether anything actually grew, so the "grew
+        // existing tab" info log below only fires when it's true — it used
+        // to fire unconditionally even when every role in this surface
+        // failed to attach or grow.
+        let mut grew_any = false;
         for role in &surface.roles {
             if role.role_index >= orch_config.roles.len() {
                 tracing::error!(
@@ -6480,13 +6494,30 @@ fn surface_one_orchestration(
                 continue;
             }
             let role_config = &orch_config.roles[role.role_index];
-            if embedded.hydrate_pane(&role.pane_id)
-                && let Ok(_) = tab_manager.add_role_to_existing_orchestration(
+            if !embedded.hydrate_pane(&role.pane_id) {
+                // Fix-round M5: this used to be silently dropped — no tab
+                // slot, no card, no dead-slot placeholder, and no log line —
+                // while the daemon holds a live, registered agent that
+                // `delegate --to <role>` will happily route to. Same
+                // level/shape as the batch path's own attach-failure log
+                // below.
+                tracing::debug!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    pane_id = %role.pane_id,
+                    "live orchestration surface: role pane attach failed while growing existing tab; leaving slot as dead"
+                );
+                continue;
+            }
+            if tab_manager
+                .add_role_to_existing_orchestration(
                     existing_tab_index,
                     role_config.clone(),
                     role.pane_id.clone(),
                 )
+                .is_ok()
             {
+                grew_any = true;
                 // PRD #110 followup precedent (`insert_role_placeholder_sessions`,
                 // the New Agent form's own live-open path): a role pane needs an
                 // immediate placeholder session to appear on the card grid at
@@ -6570,11 +6601,13 @@ fn surface_one_orchestration(
                 }
             }
         }
-        tracing::info!(
-            cwd = %surface.cwd,
-            orchestration = %surface.name,
-            "live orchestration surface: grew existing tab with newly-spawned role(s)"
-        );
+        if grew_any {
+            tracing::info!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                "live orchestration surface: grew existing tab with newly-spawned role(s)"
+            );
+        }
         return;
     }
 
@@ -6632,6 +6665,7 @@ fn surface_one_orchestration(
         &surface.cwd,
         role_pane_ids.clone(),
         bucket.display_title.as_deref(),
+        bucket.orchestration_id.as_deref(),
     ) {
         Ok(_) => {
             let mut st = state.blocking_write();
@@ -14462,6 +14496,7 @@ pub fn run_tui(
                 &bucket.cwd,
                 role_pane_ids.clone(),
                 bucket.display_title.as_deref(),
+                bucket.orchestration_id.as_deref(),
             ) {
                 Ok((tab_index, _)) => {
                     if first_orchestration_tab_index.is_none() {
@@ -28110,7 +28145,7 @@ mod tests {
         let mut bad_vec = role_pane_ids.clone();
         bad_vec.truncate(role_pane_ids.len() - 1);
         let result =
-            tm.open_orchestration_tab_with_existing_role_panes(&cfg, "/work", bad_vec, None);
+            tm.open_orchestration_tab_with_existing_role_panes(&cfg, "/work", bad_vec, None, None);
         assert!(
             result.is_err(),
             "test precondition: mismatched-length role_pane_ids must Err"
@@ -28500,6 +28535,7 @@ mod tests {
                 &bucket.cwd,
                 role_pane_ids,
                 bucket.display_title.as_deref(),
+                bucket.orchestration_id.as_deref(),
             )
             .expect("synthesised-config hydration must succeed");
         assert_eq!(tab_index, 1, "first non-dashboard tab is at index 1");
@@ -29028,6 +29064,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
+            orchestration_id: None,
         };
 
         let dashboard = Tab::Dashboard {

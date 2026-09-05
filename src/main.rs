@@ -1799,7 +1799,10 @@ fn main() -> ExitCode {
                     }
                 };
                 use dot_agent_deck::hook::SocketReply;
-                let line = match dot_agent_deck::hook::send_and_await_reply(&json) {
+                // PRD #699 fix-round M1: `pane restart`'s own, larger reply
+                // budget — see `RESTART_ROLE_REPLY_TIMEOUT`'s doc for why
+                // `delegate`'s 5s is too small for a respawn's worst case.
+                let line = match dot_agent_deck::hook::send_and_await_restart_role_reply(&json) {
                     SocketReply::Unreachable => {
                         eprintln!(
                             "Error: could not reach the dot-agent-deck daemon socket, so the \

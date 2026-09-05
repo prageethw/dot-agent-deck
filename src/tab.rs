@@ -41,6 +41,14 @@ pub enum TabError {
         "open_orchestration_tab_with_existing_role_panes: role_pane_ids length {got} does not match config.roles.len() {expected}"
     )]
     MismatchedRoleCount { expected: usize, got: usize },
+    /// PRD #699 fix-round M4 / auditor F4: `add_role_to_existing_orchestration`
+    /// would otherwise append past
+    /// [`crate::agent_pty::ORCHESTRATION_ROLE_INDEX_MAX`] with nothing to
+    /// enforce it — the wire-boundary validators
+    /// (`validate_tab_membership`/`validate_orchestration_surface`) never see
+    /// this in-process append at all.
+    #[error("cannot grow orchestration tab past the maximum of {max} roles")]
+    RoleIndexCapExceeded { max: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +198,15 @@ pub enum Tab {
         /// always returns the full supervisory view. It is pure presentation —
         /// nothing about it reaches the daemon.
         zoomed: bool,
+        /// PRD #699 fix-round B2/F1: the PRD #140 per-tab `Instance`
+        /// orchestration id this tab was opened under, when it has one —
+        /// `None` for a `NameCwd`-identity orchestration or a tab opened
+        /// before this field existed. [`TabManager::orchestration_tab_index_for`]
+        /// requires this to match a candidate surface's own token whenever
+        /// BOTH sides carry one, rather than falling back to the bare
+        /// `(cwd, name)` tuple that cannot tell two same-named, same-cwd
+        /// orchestration instances apart.
+        orchestration_id: Option<String>,
     },
 }
 
@@ -1078,6 +1095,11 @@ impl TabManager {
             // PRD #313: zoom is PER-TAB, so a newly opened tab always starts
             // unzoomed regardless of what any other tab is doing.
             zoomed: false,
+            // PRD #699 fix-round B2: reuse the SAME instance token minted
+            // above and stamped on every role's `TabMembership`, rather
+            // than minting a second one — this tab's identity and its role
+            // panes' daemon-side identity must be the same token.
+            orchestration_id: Some(orchestration_id.clone()),
         });
 
         let index = self.tabs.len() - 1;
@@ -1145,6 +1167,15 @@ impl TabManager {
         // (the pre-fix behaviour). The IDENTITY still derives from
         // `resolve_orchestration_name` below — this is title-only.
         display_title: Option<&str>,
+        // PRD #699 fix-round B2/F1: the PRD #140 per-tab `Instance`
+        // orchestration id this tab's role panes were hydrated/spawned under
+        // — `bucket.orchestration_id` at the hydration/reconnect call sites,
+        // the daemon's `OrchestrationSurface.orchestration_id` at the live
+        // `pane spawn` call site, `None` for a token-less (`NameCwd`)
+        // orchestration or an older daemon. Stored on the built tab so
+        // [`Self::orchestration_tab_index_for`] can match by instance
+        // instead of the bare `(cwd, name)` tuple.
+        orchestration_id: Option<&str>,
     ) -> Result<(usize, Vec<String>), TabError> {
         // M2.12 fixup auditor #3: this is a hydration-oriented API, so
         // mismatched lengths must surface as a `TabError` for the
@@ -1218,6 +1249,7 @@ impl TabManager {
             // PRD #313: zoom is ephemeral view state and is never persisted, so
             // a hydrated/restored tab comes back with the full supervisory view.
             zoomed: false,
+            orchestration_id: orchestration_id.map(str::to_string),
         });
 
         let index = self.tabs.len() - 1;
@@ -1252,7 +1284,31 @@ impl TabManager {
         else {
             return Err(TabError::IndexOutOfBounds(tab_index));
         };
+
+        // Fix-round M4 / auditor F4: a tab can already carry a DEAD SLOT for
+        // this role name — a role whose pane closed while the TUI was
+        // detached and reattached with no daemon registration to back it.
+        // Replace that slot instead of appending a second entry for the
+        // same role, which would otherwise desync `role_index` from the
+        // role's real position in `.dot-agent-deck.toml`, list the role
+        // twice in the persisted session snapshot, and permanently fail
+        // `resolve_orchestration_for_restore`'s exact-sequence drift guard.
+        if let Some(existing_index) = config.roles.iter().position(|r| r.name == role_config.name) {
+            role_pane_ids[existing_index] = pane_id;
+            role_statuses[existing_index] = OrchestrationRoleStatus::Working;
+            return Ok(existing_index);
+        }
+
         let role_index = config.roles.len();
+        // Auditor F4: this in-process append path enforced the role-index
+        // cap nowhere — `validate_tab_membership`/`validate_orchestration_surface`
+        // only apply at the wire boundary, never to a role appended directly
+        // here. Mirror their exact bound rather than silently clamping.
+        if role_index > crate::agent_pty::ORCHESTRATION_ROLE_INDEX_MAX {
+            return Err(TabError::RoleIndexCapExceeded {
+                max: crate::agent_pty::ORCHESTRATION_ROLE_INDEX_MAX,
+            });
+        }
         config.roles.push(role_config);
         role_pane_ids.push(pane_id);
         // A freshly-spawned role is a live agent, not a dead slot — unlike
@@ -1487,12 +1543,28 @@ impl TabManager {
     }
 
     /// PRD #699 M4: find an already-open orchestration tab by its `(cwd,
-    /// name)` identity — the same legacy tuple `surface_one_orchestration`
-    /// already uses elsewhere, since the daemon's `OrchestrationSurface`
-    /// broadcast carries no per-tab token. Lets a mid-session spawn (whose
-    /// broadcast carries only the brand-new role's never-before-seen pane
-    /// id, so `tab_index_for_pane` can't find it) join the tab that's
-    /// already open instead of building a duplicate.
+    /// name)` identity, refined by fix-round B2/F1 to require the PRD #140
+    /// per-tab `Instance` token to match whenever BOTH the caller and the
+    /// candidate tab carry one. Lets a mid-session spawn (whose broadcast
+    /// carries only the brand-new role's never-before-seen pane id, so
+    /// `tab_index_for_pane` can't find it) join the tab that's already open
+    /// instead of building a duplicate — without cross-wiring two parallel
+    /// same-name, same-cwd orchestration INSTANCES, which the bare tuple
+    /// alone cannot tell apart (fix-round B2, `findings-699-reviewer.md`;
+    /// auditor F1, rated the most significant finding in that audit).
+    ///
+    /// Matching rule, by `(orchestration_id, tab's stored orchestration_id)`:
+    /// - `(Some(a), Some(b))` — match iff `a == b`. Never degrade a tokened
+    ///   surface's match into a bare-tuple match; that reopens exactly the
+    ///   cross-wiring hole this fix closes.
+    /// - `(None, None)` — both sides are token-less (an older daemon's
+    ///   surface, or a tab opened before this fix existed): fall back to the
+    ///   legacy `(cwd, name)` match, exactly as before this fix.
+    /// - Otherwise (exactly one side carries a token) — no match. A
+    ///   token-less caller must never be treated as matching a tokened tab
+    ///   (it cannot prove it's the same instance), and a tokened caller
+    ///   matching a token-less tab would silently assume an identity that
+    ///   tab never claimed.
     ///
     /// `name` must be compared against the tab's CANONICAL identity, not its
     /// stored `name` field — that field is a cosmetic display title (PRD
@@ -1504,10 +1576,27 @@ impl TabManager {
     /// `OrchestrationSurface.name` (this `name` param) is the canonical
     /// resolved identity. Recompute the same canonical name from the tab's
     /// own stored `config` so both sides compare like with like.
-    pub fn orchestration_tab_index_for(&self, cwd: &str, name: &str) -> Option<usize> {
+    pub fn orchestration_tab_index_for(
+        &self,
+        cwd: &str,
+        name: &str,
+        orchestration_id: Option<&str>,
+    ) -> Option<usize> {
         self.tabs.iter().position(|t| match t {
-            Tab::Orchestration { cwd: c, config, .. } => {
-                c == cwd && resolve_orchestration_name(&config.name, Path::new(c)) == name
+            Tab::Orchestration {
+                cwd: c,
+                config,
+                orchestration_id: tab_id,
+                ..
+            } => {
+                if c != cwd || resolve_orchestration_name(&config.name, Path::new(c)) != name {
+                    return false;
+                }
+                match (orchestration_id, tab_id.as_deref()) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => true,
+                    _ => false,
+                }
             }
             _ => false,
         })
@@ -1812,6 +1901,7 @@ mod tests {
                 "/work",
                 vec![Some("p0".into()), Some("p1".into())],
                 Some("My Custom Run"),
+                None,
             )
             .expect("reattach with title");
         assert_eq!(tm.tab_labels()[reattach_idx], "My Custom Run");
@@ -1824,6 +1914,7 @@ mod tests {
                 &orch_config("orch"),
                 "/work",
                 vec![Some("p0".into()), Some("p1".into())],
+                None,
                 None,
             )
             .expect("reattach without title");
@@ -2108,6 +2199,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
+            orchestration_id: None,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -2140,6 +2232,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
+            orchestration_id: None,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
