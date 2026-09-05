@@ -1910,6 +1910,19 @@ mod tests {
              still be recognized, matching the prefix-skipping `from_command` already does \
              for ordinary (non-devbox) commands"
         );
+        // Issue #542 Gap 2, third unrecognized form: a shell-launcher hop
+        // (`sh -c '…'`) wrapping the devbox invocation. `skip_env_prefix` only
+        // ever skips `env`/`sudo` hops, so tokens `["sh", "-c", "devbox run
+        // claude-sonnet-devbox"]` never get the inner script parsed out — the
+        // basename check compares `"sh"` against `"devbox"` and fails.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some(
+                "sh -c 'devbox run claude-sonnet-devbox'"
+            )),
+            Some(AgentType::ClaudeCode),
+            "a devbox invocation wrapped in a `sh -c '…'` shell-launcher hop must be \
+             recognized the same as the bare `devbox run …` form"
+        );
     }
 
     // Regression guard for `spawn_007_hook_learned_badge_does_not_change_respawn_launch`
