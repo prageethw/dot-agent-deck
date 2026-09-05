@@ -6479,21 +6479,51 @@ fn surface_one_orchestration(
                 );
                 continue;
             }
+            let role_config = &orch_config.roles[role.role_index];
             if embedded.hydrate_pane(&role.pane_id)
                 && let Ok(_) = tab_manager.add_role_to_existing_orchestration(
                     existing_tab_index,
-                    orch_config.roles[role.role_index].clone(),
+                    role_config.clone(),
                     role.pane_id.clone(),
                 )
             {
+                // PRD #110 followup precedent (`insert_role_placeholder_sessions`,
+                // the New Agent form's own live-open path): a role pane needs an
+                // immediate placeholder session to appear on the card grid at
+                // all — `filter_sessions`/the orchestration deck's card list
+                // reads `AppState.sessions`, not `EmbeddedPaneController`'s
+                // attached-pane set, so a role whose command never emits its
+                // own `SessionStart` (or simply hasn't yet) would otherwise
+                // stay invisible even though its pane is live and hydrated.
+                let agent_id = embedded.pane_agent_id(&role.pane_id);
+                let expects_agent_report = crate::event::AgentType::from_command_including_devbox(
+                    Some(&role_config.command),
+                )
+                .is_some();
                 let mut st = state.blocking_write();
                 st.register_pane(role.pane_id.clone());
+                st.insert_placeholder_session_awaiting_report(
+                    role.pane_id.clone(),
+                    Some(surface.cwd.clone()),
+                    None,
+                    agent_id,
+                    expects_agent_report,
+                );
                 st.pane_role_map
                     .insert(role.pane_id.clone(), role.role_name.clone());
                 st.pane_cwd_map
                     .insert(role.pane_id.clone(), surface.cwd.clone());
                 if role.is_start_role {
                     st.orchestrator_pane_ids.insert(role.pane_id.clone());
+                }
+                drop(st);
+                ui.pane_display_names
+                    .insert(role.pane_id.clone(), role_config.name.clone());
+                ui.pane_names
+                    .insert(role.pane_id.clone(), role_config.name.clone());
+                if let Some(declared) = role_config.declared_agent_type() {
+                    ui.pane_declared_agent
+                        .insert(role.pane_id.clone(), declared);
                 }
             }
         }
