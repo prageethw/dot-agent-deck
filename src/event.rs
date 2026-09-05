@@ -157,9 +157,16 @@ impl AgentType {
             return Some(t);
         }
         let tokens = tokenize_command(cmd?);
-        if tokens.first().map(String::as_str) == Some("devbox")
-            && tokens.get(1).map(String::as_str) == Some("run")
-            && let Some(script) = tokens.get(2)
+        let idx = skip_env_prefix(&tokens);
+        let basename = tokens.get(idx).map(|token| {
+            std::path::Path::new(token)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(token.as_str())
+        });
+        if basename == Some("devbox")
+            && tokens.get(idx + 1).map(String::as_str) == Some("run")
+            && let Some(script) = tokens.get(idx + 2)
         {
             return crate::agent_registry::detect_from_devbox_script(script);
         }
@@ -217,6 +224,34 @@ fn is_env_assignment(token: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// Skip a leading bare `VAR=VALUE` assignment run, then — if what follows is
+/// an `env`/`sudo` launcher hop (matched by basename, same as
+/// [`detect_from_tokens`]) — skip that hop's own name and any `VAR=VALUE`
+/// assignments it introduces. Returns the index of the first token that is
+/// neither. Used by [`AgentType::from_command_including_devbox`]'s
+/// devbox-run recognition, which — unlike `detect_from_tokens` — has no need
+/// for the option-argument-consuming logic `env`/`sudo` flags like `-u root`
+/// require, so that part is deliberately not duplicated here.
+fn skip_env_prefix(tokens: &[String]) -> usize {
+    let mut idx = 0;
+    while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
+        idx += 1;
+    }
+    if let Some(token) = tokens.get(idx) {
+        let basename = std::path::Path::new(token)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(token.as_str());
+        if basename == "env" || basename == "sudo" {
+            idx += 1;
+            while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
+                idx += 1;
+            }
+        }
+    }
+    idx
 }
 
 /// Resolve the agent type from an already-tokenized command, looking through

@@ -14805,14 +14805,22 @@ pub fn run_tui(
                     // `pane_agent_id` only touches the controller's panes
                     // mutex.
                     let new_agent_id = pane.pane_agent_id(&new_id);
+                    // Issue #542: the badge decision must use the
+                    // devbox-widened `from_command_including_devbox`,
+                    // mirroring the fresh-spawn call sites — a restored pane
+                    // whose saved command is `devbox run <agent-script>`
+                    // must show "Starting…" immediately, not "No agent".
+                    let expects_agent_report =
+                        AgentType::from_command_including_devbox(cmd).is_some();
                     {
                         let mut st = state.blocking_write();
                         st.register_pane(new_id.clone());
-                        st.insert_placeholder_session(
+                        st.insert_placeholder_session_awaiting_report(
                             new_id.clone(),
                             Some(saved_pane.dir.clone()),
                             agent_type,
                             new_agent_id,
+                            expects_agent_report,
                         );
                     }
                     if !saved_pane.name.is_empty() {
@@ -15011,14 +15019,19 @@ pub fn run_tui(
                                     // pane sites — placeholder needs the
                                     // daemon agent_id.
                                     let fb_agent_id = pane.pane_agent_id(&fb_id);
+                                    // Issue #542: same devbox-widened badge
+                                    // decision as the plain-restore site above.
+                                    let fb_expects_agent_report =
+                                        AgentType::from_command_including_devbox(cmd).is_some();
                                     {
                                         let mut st = state.blocking_write();
                                         st.register_pane(fb_id.clone());
-                                        st.insert_placeholder_session(
+                                        st.insert_placeholder_session_awaiting_report(
                                             fb_id.clone(),
                                             Some(saved_pane.dir.clone()),
                                             fb_agent_type,
                                             fb_agent_id,
+                                            fb_expects_agent_report,
                                         );
                                     }
                                     if !saved_pane.name.is_empty() {
@@ -15083,14 +15096,19 @@ pub fn run_tui(
                             // PRD #110 followup: outer-error fallback —
                             // same agent_id plumbing as the inner fallback.
                             let fb_agent_id = pane.pane_agent_id(&fb_id);
+                            // Issue #542: same devbox-widened badge decision
+                            // as the other restore-fallback sites above.
+                            let fb_expects_agent_report =
+                                AgentType::from_command_including_devbox(cmd).is_some();
                             {
                                 let mut st = state.blocking_write();
                                 st.register_pane(fb_id.clone());
-                                st.insert_placeholder_session(
+                                st.insert_placeholder_session_awaiting_report(
                                     fb_id.clone(),
                                     Some(saved_pane.dir.clone()),
                                     fb_agent_type,
                                     fb_agent_id,
+                                    fb_expects_agent_report,
                                 );
                             }
                             if !saved_pane.name.is_empty() {
