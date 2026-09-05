@@ -479,6 +479,41 @@ A pane carries at most one monitored wait at a time; `wait done`'s `<label>` is 
 
 **Relationship to CLAUDE.md rule 28.** Rule 28 is a *convention* — how to structure a wait so the deck's existing shell-activity signal shows it. `wait start`/`wait done` is the *mechanical backstop* for the one shape that convention cannot express: a wait that outlives the role's own turn, with no foreground process left to be the evidence. Prefer rule 28's live-process pattern when your wait is a single foreground command within one turn; reach for `wait start`/`wait done` when the waiting genuinely spans turns.
 
+## Restarting and spawning worker panes
+
+Two CLI subcommands reach into a **running** orchestration without restarting the whole tab or the deck: `dot-agent-deck pane restart <role>` and `dot-agent-deck pane spawn <role>`. Both are scoped by `DOT_AGENT_DECK_PANE_ID` exactly like [`dot-agent-deck delegate`](#tagging-delegations-with---subject) — the calling pane must be the orchestration's own orchestrator; both commands refuse a call from a non-orchestrator pane.
+
+`dot-agent-deck pane restart <role>` restarts a worker role's pane within the calling orchestrator's own orchestration. It is refused for a healthy pane unless you pass `--force` — without the flag, restart only succeeds against a pane the daemon has flagged as having exited on its own (which includes, but is not limited to, a genuine crash — a role whose command simply finished, even with a clean exit, is equally restartable without `--force`), so it cannot be used to accidentally force-kill a worker mid-task.
+
+`dot-agent-deck pane spawn <role>` spawns a role that is declared in `.dot-agent-deck.toml` but was not yet spawned into the running orchestration — for example, a role you added to the config file after the tab was already open. It is refused if the role is already live in this orchestration instance, or if it is not in the config at all.
+
+### The self-healing pattern
+
+The primary intended use of `pane restart` is not a human reaching for it from the TUI — it is the orchestrating agent recovering on its own. When a worker pane's agent crashes, the daemon already writes a notice straight into the orchestrator's own pane (fork issue #465's existing `deliver_worker_exited_notice` mechanism, pre-existing and unrelated to this feature):
+
+```
+⚠ delegated worker exited without work-done (dot-agent-deck daemon report): the process
+behind pane <pane-id> ended and no work-done was ever received for its outstanding
+delegation. Check that pane's scrollback for what happened; the daemon log names the
+role and how long it had been delegated.
+```
+
+Before this feature, reading that notice was as far as an orchestrator could go — recovering the pane still needed a human to notice and act from the TUI. `pane restart <role>` closes that gap: the orchestrator reads the notice, identifies the crashed role, and calls `dot-agent-deck pane restart <role>` itself, bringing the worker back without anyone needing to look at the deck. A `prompt_template` line that tells the orchestrator to do exactly that turns a crash into a self-recovering pipeline rather than a human-operator escape hatch:
+
+```
+If you receive a "delegated worker exited without work-done" notice, run
+`dot-agent-deck pane restart <role>` for that role yourself, then re-delegate
+the task it was working on. Only ask the user if the restart itself fails.
+```
+
+`pane spawn` supports the same unattended posture for the other half of the problem: an orchestrator that discovers mid-run it needs a role that was not part of the orchestration at launch — typically because you edited `.dot-agent-deck.toml` while it was already running — can spawn that role itself with `dot-agent-deck pane spawn <role>` and then delegate to it immediately, with no TUI attached.
+
+### Scope of this release
+
+- **Process-exit crash detection only.** The daemon detects a worker's agent process actually exiting; it does not detect a wedged-but-alive agent (one that is running but stuck). That is a separate capability with no existing plumbing behind it.
+- **CLI-only — no TUI keybind.** Both commands are invoked from a pane's shell, typically by the orchestrator's own agent calling out to the CLI; there is no keyboard shortcut for either in this release.
+- **`pane spawn` only brings up a not-yet-live role already declared in the config.** It does not create a genuine second pane under an already-running role name — if you want two reviewers, give the second one its own role name in `.dot-agent-deck.toml` (e.g. `reviewer2`) rather than trying to spawn `reviewer` a second time.
+
 ## Validate your config
 
 Run `dot-agent-deck validate` to check your `.dot-agent-deck.toml` for issues before opening an orchestration tab:

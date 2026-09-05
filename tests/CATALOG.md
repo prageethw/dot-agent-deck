@@ -4284,6 +4284,145 @@ without depending on the config struct API.
 - **Does not assert:** exit-code value beyond success/failure, or the exact wording distinguishing the two roles.
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
 
+#### pane/restart
+
+##### pane/restart/001 — Restarting a crashed worker without `--force` succeeds and the role stays reachable (PRD #699 M2).
+- **Layer:** L1/fast (in-process — the real `AppState::handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + a worker stand-in that exits on its own to simulate a crash; no daemon socket, no LLM).
+- **Agent:** none (synthetic — a `sleep 0.2` worker stand-in whose natural exit is what marks its `AgentRecord` `crashed == Some(true)`, mirroring the M1 precedent test's technique).
+- **Asserts:** with the worker's record marked crashed, calling the handler from the orchestrator pane with `force: false` reports `restarted: true` and no error; the worker pane is now owned by a freshly spawned agent id (not the crashed one); a subsequent `delegate_targets` lookup from the orchestrator still resolves the role to the same pane.
+- **Does not assert:** the CLI/socket layer (`dot-agent-deck pane restart`) — this calls the handler directly, bypassing it.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/002 — Restarting a healthy pane without `--force` is refused (PRD #699 M2).
+- **Layer:** L1/fast (same technique as `pane/restart/001`).
+- **Agent:** none (a `cat` stand-in that never exits).
+- **Asserts:** calling the handler with `force: false` against a never-crashed worker reports `restarted: false` and an error naming that the pane has not crashed; the worker's agent id is unchanged.
+- **Does not assert:** the exact error wording beyond containing "crash" (case-insensitively).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/003 — `--force` restarts a healthy pane anyway (PRD #699 M2).
+- **Layer:** L1/fast (same technique as `pane/restart/001`).
+- **Agent:** none (a `cat` stand-in that never exits).
+- **Asserts:** calling the handler with `force: true` against a never-crashed worker reports `restarted: true` and no error; a fresh agent id now owns the worker pane.
+- **Does not assert:** the CLI/socket layer.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/004 — Restarting a role name the orchestration does not have is refused and names the unknown role (PRD #699 M2).
+- **Layer:** L1/fast (same technique as `pane/restart/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler with a role name absent from the orchestration's registration reports `restarted: false` and an error containing the literal unknown role name.
+- **Does not assert:** the exact error wording beyond containing the role name.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/005 — Only the orchestrator pane of an orchestration may restart one of its roles (PRD #699 M2).
+- **Layer:** L1/fast (same technique as `pane/restart/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler from the WORKER's own pane (not the orchestrator) reports `restarted: false` with an error, and the worker's agent id is unchanged — the same anti-spoofing guard `orchestration/delegate/004`/`006` pin for `delegate`.
+- **Does not assert:** the exact error wording.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/006 — Two orchestration instances sharing the same `name`/`cwd` do not cross-restart each other's same-named role (PRD #699 fix-round, auditor F10 coverage gap — not a live defect: the daemon-side routing this pins is already correct).
+- **Layer:** L1/fast (same in-process technique as `pane/restart/001`, doubled: two full `orchestrator`+`coder` pairs registered under distinct `OrchestrationIdentity::Instance` tokens but the identical orchestration `name` and `cwd`).
+- **Agent:** none (`cat` stand-ins for every pane).
+- **Asserts:** instance A's orchestrator force-restarting its own `coder` succeeds and replaces instance A's worker agent id, while instance B's same-named `coder` pane's agent id is completely unchanged.
+- **Does not assert:** the TUI-tab-side cross-wiring bug this coverage gap sits next to (`pane/spawn/010` pins that — it is a genuine defect, unlike this test).
+- **Platform coverage:** mac+linux (unix-only).
+
+#### pane/spawn
+
+##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (PRD #699 M3).
+- **Layer:** L1/fast (in-process — the real free function `handle_spawn_role_with_state` against a daemon-owned `cat`-orchestrator with an orchestrator and a `coder` worker registered, and a third `reviewer` role declared in `.dot-agent-deck.toml` but never spawned; no daemon socket, no LLM).
+- **Agent:** none (a `cat` stand-in).
+- **Asserts:** `delegate_targets` resolves nothing for `reviewer` before the call; calling the handler from the orchestrator pane for `reviewer` reports `spawned: true` and no error; afterward `delegate_targets` resolves exactly one pane for `reviewer`, and that pane has a live agent in the registry.
+- **Does not assert:** the CLI/socket layer (`dot-agent-deck pane spawn`) — this calls the handler directly, bypassing it.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/002 — Spawning a role already live in this instance is refused (PRD #699 M3).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler for `coder` (already spawned and registered) reports `spawned: false` and an error naming both that it is already running and the role name; the coder pane's agent id is unchanged and no new agent record is created.
+- **Does not assert:** the exact error wording beyond containing "already" and the role name (case-insensitively).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/003 — Spawning a role name not in the config is refused and names the unknown role (PRD #699 M3).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler with a role name absent from `.dot-agent-deck.toml` reports `spawned: false` and an error containing the literal unknown role name.
+- **Does not assert:** the exact error wording beyond containing the role name.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/004 — Only the orchestrator pane of an orchestration may spawn one of its roles (PRD #699 M3).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler from the WORKER's own pane (not the orchestrator) reports `spawned: false` with an error, and `reviewer` remains unreachable via `delegate_targets` afterward — the same anti-spoofing guard `pane/restart/005` pins for `restart`.
+- **Does not assert:** the exact error wording.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/005 — Spawning a role into an orchestration that already has an ATTACHED tab open must join that tab, not build a second one (PRD #699 M4).
+- **Layer:** L2/e2e (real TUI driven via PTY, real daemon, real `dot-agent-deck pane spawn reviewer` CLI subprocess). `pane-spawn-live` fixture: one orchestration, roles `orchestrator` [start] + `coder`, both spawned when the tab opens. The RUNNING orchestration's own `.dot-agent-deck.toml` (read back from the daemon's registry, at the isolated-clone cwd its role panes actually run in) is then mutated to add a third role, `reviewer`, never part of the config the tab was opened from — mirroring the "operator edited the config mid-session" scenario `pane/spawn/001` exercises at the handler level.
+- **Agent:** none (`cat` stand-ins for every role).
+- **Asserts:** after invoking the real CLI subcommand with `DOT_AGENT_DECK_PANE_ID` set to the orchestrator's real pane id and `DOT_AGENT_DECK_SOCKET` set to the deck's hook socket, reviewer's card joins the SAME orchestration tab that is still active (this test never sends a tab-switch chord) — rendered as its own bordered box titled `reviewer` — and the tab bar still shows exactly one Dashboard tab + one orchestration tab (divider count on the one-row tab-bar strip), not two orchestration tabs for the same orchestration.
+- **Does not assert:** the daemon-level `pane spawn` verb's own correctness (covered by `pane/spawn/001`-`004`); exact card body/status-badge layout.
+- **Platform coverage:** mac+linux (unix-only, PTY-backed harness).
+
+##### pane/spawn/006 — A spawned role's actual child environment carries `DOT_AGENT_DECK_REGISTRATION_GENERATION` and `DOT_AGENT_DECK_DAEMON_BOOT_ID` (PRD #699 fix-round, reviewer B1 / auditor corroboration).
+- **Layer:** L1/fast (same in-process technique as `pane/spawn/001`, plus a role command that dumps its own environment).
+- **Agent:** none (`env; exec cat` stand-in for the spawned role, `cat` for the orchestrator).
+- **Asserts:** after `handle_spawn_role_with_state` spawns `reviewer`, the actual PTY output of the spawned child's own `env` dump contains both `DOT_AGENT_DECK_REGISTRATION_GENERATION=` and `DOT_AGENT_DECK_DAEMON_BOOT_ID=` — the same two variables a real worker's `work-done` reads from its own environment to build the compound key `handle_work_done`'s staleness gate checks.
+- **Does not assert:** the exact generation/boot-id VALUES, or driving an actual `work-done` round trip through `handle_work_done` (deliberately avoided — hardcoding an expected value the fix hasn't decided yet would make this test coordinate against something more specific than the actual defect).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/007 — `pane spawn <the orchestration's own start role>` is refused (PRD #699 fix-round, reviewer B3 / auditor F11).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler from the orchestrator pane naming its OWN role (`orchestrator`, `start = true`) reports `spawned: false` with an error naming the role and identifying it as the orchestration's own start role; the registry's agent-record count is unchanged (no second orchestrator-command agent was spawned).
+- **Does not assert:** the exact error wording beyond containing "orchestrator" and either "start" or "own".
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/008 — Two concurrent `pane spawn <same role>` calls never leave more than one live pane registered for that role (PRD #699 fix-round, reviewer M6 / auditor F3).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`, driving two `handle_spawn_role_with_state` futures concurrently via `tokio::join!`).
+- **Agent:** none.
+- **Asserts:** after both concurrent spawns of `reviewer` resolve, `delegate_targets` resolves at most (and exactly) ONE pane for the role — the weaker of the two invariants a fix might produce, deliberately, since the fix shape (refuse the loser vs. self-correct to one survivor) isn't dictated by this test.
+- **Does not assert:** which of the two concurrent calls "wins" (returns `spawned: true`) — only the post-condition on live pane count.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/009 — Growing an orchestration tab that already has a DEAD SLOT for the role being spawned replaces that slot instead of appending a duplicate (PRD #699 fix-round, reviewer M4 / auditor F4; N1 replace-leg and N6 fresh-config pinning added in the final test-pinning pass).
+- **Layer:** L1/fast (`TabManager` driven directly against a trivial no-op `PaneController` — no daemon, no PTY, no `ui.rs`).
+- **Agent:** none.
+- **Asserts:** `TabManager::add_role_to_existing_orchestration` called against a tab whose `reviewer` role has no live pane (a dead slot) results in exactly one `reviewer` entry in `config.roles` (count unchanged at 2, not grown to 3), `role_pane_ids` replaced at the dead slot's index with the newly-spawned pane id, that slot's status flipped from `Failed` to `Working`, the returned `role_index` naming the replaced slot's position rather than a freshly appended one, the returned `was_new` flag reporting `false` (a replace, not an append), and the replaced slot's role config carrying the FRESH `command` value passed to the growth call rather than the stale one the tab originally opened with.
+- **Does not assert:** the `ui.rs`/`surface_one_orchestration` integration that calls this function in production (out of scope for a `TabManager`-level unit test); the batch tab-creation path's own dead-slot handling (already correct, per reviewer M5's contrast).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/010 — Two orchestration tabs sharing the same `name`/`cwd` do not cross-wire on `pane spawn`'s tab-growth path (PRD #699 fix-round, reviewer B2 / auditor F1 — the audit's highest-rated finding; `was_new == true` append-leg pinning added in the final test-pinning pass).
+- **Layer:** L1/fast (same `TabManager`-direct technique as `pane/spawn/009`).
+- **Agent:** none.
+- **Asserts:** with two `Tab::Orchestration` entries sharing `(cwd, name)` but distinct PRD #140 `Instance` orchestration ids, `orchestration_tab_index_for` resolves the tab matching the CALLER's own orchestration id (not just the first same-`(cwd, name)` match); growing the resolved tab leaves the OTHER instance's tab completely untouched (role count, pane ids); the returned `was_new` flag reports `true` since the grown role is genuinely new to that tab; a token-less lookup (a pre-PRD#140 legacy caller) matches neither tokened tab.
+- **Does not assert:** the full `ui.rs`/`surface_one_orchestration`/`OrchestrationSurface` broadcast integration — this test calls `TabManager` directly with the `orchestration_id: Option<&str>` parameter the fix added to `open_orchestration_tab_with_existing_role_panes` and `orchestration_tab_index_for`.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/011 — `pane spawn <role>` refuses a role whose registered pane has crashed with a message naming the role and pointing at `pane restart` (PRD #699 fix-round, reviewer N8/re-review item 4).
+- **Layer:** L1/fast (same in-process technique as `pane/spawn/001`, with the coder stand-in running a short-lived command so it exits and M1's `crashed` marker fires naturally, mirroring `tests/pane_restart.rs`'s own crash precondition).
+- **Agent:** none.
+- **Asserts:** once the coder stand-in's registry record reads `crashed == Some(true)`, `pane spawn coder` reports `spawned: false` with an error naming the role AND containing the literal substring `"pane restart"` — pinning the message `handle_spawn_role_with_state` selects on the crashed branch (as opposed to the flat "already running" wording a healthy pane gets).
+- **Does not assert:** the exact full wording of the message beyond those two substrings; the "already running" (non-crashed) branch, already covered incidentally by `pane/spawn/007`'s refusal-message shape.
+- **Platform coverage:** mac+linux (unix-only).
+
+#### pane/drift
+
+##### pane/drift/001 — A role grown into an already-open orchestration tab via `pane spawn` must be captured by the NEXT session snapshot flush, not just the tab-open-time capture (PRD #699 M5).
+- **Layer:** L2/e2e (real TUI driven via PTY, real daemon, real `dot-agent-deck pane spawn reviewer` CLI subprocess, `DOT_AGENT_DECK_SESSION` redirected to a test-owned path). Same `pane-spawn-live` fixture and growth sequence as `pane/spawn/005`, extended: after `reviewer`'s card joins the already-open tab, a plain (non-orchestration) dashboard pane is spawned purely to force the next coalesced snapshot flush — `surface_one_orchestration`'s M4 growth branch never calls `ui.mark_session_dirty()`, so nothing else would trigger a fresh write after the spawn.
+- **Agent:** none (`cat`/`sleep` stand-ins for every role).
+- **Asserts:** the leading-edge snapshot (written when the tab first opened with two roles) already carries `[panes.orchestration]` naming `orchestrator` and `coder`; after growing the tab to three roles and forcing one more flush, the re-serialized `[panes.orchestration]` role list includes `reviewer` too — i.e. the snapshot writer reads the tab's own live, M4-grown role list rather than a copy frozen at tab-open time.
+- **Does not assert:** the restore-side consequence of a stale snapshot (a `resolve_orchestration_for_restore` drift-guard false positive) — that would need a further daemon-empty restart cycle this test does not drive; it pins the write side, which is the actual point of divergence.
+- **Platform coverage:** mac+linux (unix-only, PTY-backed harness).
+
+##### pane/drift/002 — A role spawned via `pane spawn` while NO TUI was attached at all must still hydrate within bounds the first time a TUI connects (PRD #699 M5).
+- **Layer:** L2/synthetic (in-process real daemon via `start_real_server`/`DaemonClient`, no PTY, no real binary spawn — same technique as `session/restore/007`/`orchestration/route/002`). A real `.dot-agent-deck.toml` on disk declares three roles (`orchestrator`, `coder`, `reviewer`); only the first two are ever given a live daemon-registered pane before a THIRD role (`reviewer`, tagged with `role_index: 2` exactly as `handle_spawn_role_with_state` would resolve it) is spawned — the whole test never constructs a TUI/`EmbeddedPaneController` until after all three roles are already live, standing in for "spawned while headless."
+- **Agent:** none (`sh -c 'sleep 30'` stand-ins for every role).
+- **Asserts:** a freshly-built `EmbeddedPaneController`'s cold-start `hydrate_from_daemon` returns all three role panes bucketed into one orchestration; re-resolving the config from the on-disk `.dot-agent-deck.toml` via `resolve_orch_config_for_hydration` (mirroring `ui.rs`'s own reconnect-hydration loop) yields all three declared roles, every role slot's `role_index` (including `reviewer`'s) is within bounds of that re-resolved config, and `TabManager::open_orchestration_tab_with_existing_role_panes` rebuilds one orchestration tab carrying all three role panes.
+- **Does not assert:** the CLI/daemon-handler correctness of `pane spawn` itself (covered by `pane/spawn/001`-`004`) — this test hand-constructs the daemon-registered agents directly rather than invoking the CLI, to isolate the reconnect-hydration bounds-check specifically.
+- **Platform coverage:** mac+linux (unix-only, in-process daemon harness).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).

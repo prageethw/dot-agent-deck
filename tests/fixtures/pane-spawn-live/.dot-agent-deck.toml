@@ -1,0 +1,23 @@
+# Fixture for the L2 PTY-attached `pane spawn` test (pane/spawn/005, PRD #699
+# M4). Declares ONE orchestration with exactly TWO roles — `orchestrator`
+# (start = true) and `coder` — both spawned the instant the New Pane form
+# opens this orchestration, so the running tab starts with two role cards.
+# The test then mutates a COPY of this same `[[orchestrations]]` block
+# (name unchanged) inside the running orchestration's own isolated-clone
+# working directory to add a THIRD role, `reviewer`, mirroring the
+# "operator edited .dot-agent-deck.toml mid-session" scenario `pane_spawn.rs`
+# (M3) already exercises at the handler level — `reviewer` is never listed
+# here, so it never spawns at tab-open time. Every role runs `cat`, which
+# stays alive on stdin so role panes remain open (and rendered as boxed
+# cards) for the whole test. No real LLM tokens spent.
+[[orchestrations]]
+name = "spawn-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat"

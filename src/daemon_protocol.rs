@@ -4586,6 +4586,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -4610,6 +4611,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -4792,6 +4794,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");

@@ -2597,6 +2597,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         }
     }
 

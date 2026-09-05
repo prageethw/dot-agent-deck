@@ -6396,14 +6396,17 @@ fn surface_one_orchestration(
         cwd: surface.cwd.clone(),
         orchestration_name: surface.name.clone(),
         display_title: surface.display_title.clone(),
-        // PRD #140 review: the daemon's `OrchestrationSurface` broadcast carries
-        // no per-tab token, so this path's identity is the legacy `(name, cwd)`
-        // tuple — byte-identical dead-slot ids to before. Safe here because the
-        // only producer (PRD #120 issue dispatch) gives every dispatched
-        // orchestration its own git worktree, hence its own cwd; two surfaces
-        // never share a directory. If that ever changes, plumb the token onto
-        // `OrchestrationSurface` (additive serde field) and set it here.
-        orchestration_id: None,
+        // PRD #140 review, fix-round B2/F1: this used to be hardcoded `None`
+        // with a comment arguing it was safe because the only producer (PRD
+        // #120 issue dispatch) gives every dispatched orchestration its own
+        // git worktree, hence its own cwd, so two surfaces never shared a
+        // directory. Fix-round M3 (`pane spawn`) broke that premise — it
+        // spawns into the CALLING orchestration's own (non-unique) cwd — so
+        // the daemon's `OrchestrationSurface` now carries the PRD #140
+        // per-tab `Instance` token as an additive field (both producers
+        // populate it) and this bucket carries it through, exactly the
+        // remedy this comment used to prescribe for "if that ever changes."
+        orchestration_id: surface.orchestration_id.clone(),
         role_slots: surface
             .roles
             .iter()
@@ -6484,6 +6487,183 @@ fn surface_one_orchestration(
     }
     let orch_config = resolve_orch_config_for_hydration(local, &bucket);
 
+    // PRD #699 M4: the `already_built` guard above only catches a duplicate
+    // re-broadcast of an EXISTING tab's own roles — it's always false for
+    // `pane spawn`'s broadcast, which carries only the one brand-new role's
+    // never-before-seen pane id. Check by (cwd, name) identity — refined by
+    // fix-round B2/F1 to also require the PRD #140 per-tab instance token to
+    // match whenever both sides carry one, so two parallel same-name,
+    // same-cwd orchestration INSTANCES don't cross-wire (see
+    // `TabManager::orchestration_tab_index_for`'s own doc) — instead: if
+    // this orchestration already has a tab open, grow it in place rather
+    // than falling through to the tab-creation path below, which would
+    // otherwise build a duplicate tab for the same orchestration.
+    if let Some(existing_tab_index) = tab_manager.orchestration_tab_index_for(
+        &surface.cwd,
+        &surface.name,
+        surface.orchestration_id.as_deref(),
+    ) {
+        // Fix-round M5: whether anything actually grew, so the "grew
+        // existing tab" info log below only fires when it's true — it used
+        // to fire unconditionally even when every role in this surface
+        // failed to attach or grow.
+        let mut grew_any = false;
+        for role in &surface.roles {
+            // Fix-round F5 (auditor, folded into N1's fix): `validate_orchestration_surface`
+            // deliberately admits an empty `role_name` from a hostile/buggy
+            // daemon (a legitimate case for the reconnect-synthesis path's
+            // `role-{i}` fallback), but an empty entry pushed onto
+            // `snapshot.roles` below can never equal a config role name and
+            // would permanently fail the restore drift guard, exactly like
+            // N1's duplicate-push. Skip the whole growth attempt for this
+            // role rather than push a value that can never round-trip.
+            if role.role_name.is_empty() {
+                tracing::debug!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    pane_id = %role.pane_id,
+                    "live orchestration surface: role has empty role_name while growing existing tab; dropping role"
+                );
+                continue;
+            }
+            if role.role_index >= orch_config.roles.len() {
+                tracing::error!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    role_index = role.role_index,
+                    role_count = orch_config.roles.len(),
+                    "live orchestration surface: role_index out of range while growing existing tab; dropping role"
+                );
+                continue;
+            }
+            let role_config = &orch_config.roles[role.role_index];
+            if !embedded.hydrate_pane(&role.pane_id) {
+                // Fix-round M5: this used to be silently dropped — no tab
+                // slot, no card, no dead-slot placeholder, and no log line —
+                // while the daemon holds a live, registered agent that
+                // `delegate --to <role>` will happily route to. Same
+                // level/shape as the batch path's own attach-failure log
+                // below.
+                tracing::debug!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    pane_id = %role.pane_id,
+                    "live orchestration surface: role pane attach failed while growing existing tab; leaving slot as dead"
+                );
+                continue;
+            }
+            if let Ok((_role_index, was_new)) = tab_manager.add_role_to_existing_orchestration(
+                existing_tab_index,
+                role_config.clone(),
+                role.pane_id.clone(),
+            ) {
+                grew_any = true;
+                // PRD #110 followup precedent (`insert_role_placeholder_sessions`,
+                // the New Agent form's own live-open path): a role pane needs an
+                // immediate placeholder session to appear on the card grid at
+                // all — `filter_sessions`/the orchestration deck's card list
+                // reads `AppState.sessions`, not `EmbeddedPaneController`'s
+                // attached-pane set, so a role whose command never emits its
+                // own `SessionStart` (or simply hasn't yet) would otherwise
+                // stay invisible even though its pane is live and hydrated.
+                let agent_id = embedded.pane_agent_id(&role.pane_id);
+                let expects_agent_report = crate::event::AgentType::from_command_including_devbox(
+                    Some(&role_config.command),
+                )
+                .is_some();
+                let mut st = state.blocking_write();
+                st.register_pane(role.pane_id.clone());
+                st.insert_placeholder_session_awaiting_report(
+                    role.pane_id.clone(),
+                    Some(surface.cwd.clone()),
+                    None,
+                    agent_id,
+                    expects_agent_report,
+                );
+                st.pane_role_map
+                    .insert(role.pane_id.clone(), role.role_name.clone());
+                st.pane_cwd_map
+                    .insert(role.pane_id.clone(), surface.cwd.clone());
+                if role.is_start_role {
+                    st.orchestrator_pane_ids.insert(role.pane_id.clone());
+                }
+                drop(st);
+                ui.pane_display_names
+                    .insert(role.pane_id.clone(), role_config.name.clone());
+                ui.pane_names
+                    .insert(role.pane_id.clone(), role_config.name.clone());
+                if let Some(declared) = role_config.declared_agent_type() {
+                    ui.pane_declared_agent
+                        .insert(role.pane_id.clone(), declared);
+                }
+                // Bring the newly-spawned role into view — under the default
+                // `Stacked` pane layout only the focused role pane's box is
+                // drawn (every other slot reserves zero rows, PRD #311), so
+                // without this the operator who just spawned a role would see
+                // no visible change at all. Only steal the LIVE embedded focus
+                // when this orchestration's tab is the one currently on
+                // screen; otherwise just remember the intended focus on the
+                // tab itself so switching to it later lands on the role that
+                // was actually just spawned, rather than yanking focus away
+                // from whatever tab the operator is looking at right now.
+                if existing_tab_index == tab_manager.active_index() {
+                    let _ = embedded.focus_pane(&role.pane_id);
+                }
+                if let Some(Tab::Orchestration {
+                    focused_role_pane_id,
+                    ..
+                }) = tab_manager.tabs_mut().get_mut(existing_tab_index)
+                {
+                    *focused_role_pane_id = Some(role.pane_id.clone());
+                }
+                // PRD #699 M5: the New-Pane-form-opened path (`open_orchestration_tab`)
+                // captures a `SavedPane { orchestration: Some(OrchestrationSnapshot { roles, .. }), .. }`
+                // onto `ui.pane_metadata` keyed by the start role's pane id, which is
+                // what lets `resolve_orchestration_for_restore` rebuild this tab on
+                // restore. That snapshot otherwise freezes at tab-open time — grow it
+                // here too, so a role added via `pane spawn` survives the next session
+                // flush instead of drift-triggering the restore fallback to a plain
+                // pane. Conditional on the entry existing: a tab opened via the batch
+                // daemon-surfacing path never captures `pane_metadata` at all (a
+                // separate, pre-existing gap out of scope here) and must not have one
+                // backfilled.
+                //
+                // Fix-round N1 (reviewer/auditor, independently): push the role
+                // name onto the snapshot only when `add_role_to_existing_orchestration`
+                // reports a genuine APPEND (`was_new`) — the ordinary
+                // respawn-into-existing-role path REPLACES an already-listed
+                // slot, and pushing unconditionally there duplicates the role
+                // name and permanently fails the restore drift guard.
+                // `mark_session_dirty()` stays unconditional on both outcomes:
+                // a replace still changes which pane backs the role, which is
+                // worth persisting even though the role LIST itself didn't
+                // change.
+                if let Some(Tab::Orchestration {
+                    start_role_index,
+                    role_pane_ids,
+                    ..
+                }) = tab_manager.tabs().get(existing_tab_index)
+                    && let Some(start_pane_id) = role_pane_ids.get(*start_role_index).cloned()
+                    && let Some(saved) = ui.pane_metadata.get_mut(&start_pane_id)
+                    && let Some(snapshot) = saved.orchestration.as_mut()
+                {
+                    if was_new {
+                        snapshot.roles.push(role.role_name.clone());
+                    }
+                    ui.mark_session_dirty();
+                }
+            }
+        }
+        if grew_any {
+            tracing::info!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                "live orchestration surface: grew existing tab with newly-spawned role(s)"
+            );
+        }
+        return;
+    }
+
     // Attach each role's live daemon PTY (by its DOT_AGENT_DECK_PANE_ID) and
     // place it in the role-slot vector, mirroring the reconnect partition.
     let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
@@ -6538,6 +6718,7 @@ fn surface_one_orchestration(
         &surface.cwd,
         role_pane_ids.clone(),
         bucket.display_title.as_deref(),
+        bucket.orchestration_id.as_deref(),
     ) {
         Ok(_) => {
             let mut st = state.blocking_write();
@@ -14368,6 +14549,7 @@ pub fn run_tui(
                 &bucket.cwd,
                 role_pane_ids.clone(),
                 bucket.display_title.as_deref(),
+                bucket.orchestration_id.as_deref(),
             ) {
                 Ok((tab_index, _)) => {
                     if first_orchestration_tab_index.is_none() {
@@ -28020,7 +28202,7 @@ mod tests {
         let mut bad_vec = role_pane_ids.clone();
         bad_vec.truncate(role_pane_ids.len() - 1);
         let result =
-            tm.open_orchestration_tab_with_existing_role_panes(&cfg, "/work", bad_vec, None);
+            tm.open_orchestration_tab_with_existing_role_panes(&cfg, "/work", bad_vec, None, None);
         assert!(
             result.is_err(),
             "test precondition: mismatched-length role_pane_ids must Err"
@@ -28410,6 +28592,7 @@ mod tests {
                 &bucket.cwd,
                 role_pane_ids,
                 bucket.display_title.as_deref(),
+                bucket.orchestration_id.as_deref(),
             )
             .expect("synthesised-config hydration must succeed");
         assert_eq!(tab_index, 1, "first non-dashboard tab is at index 1");
@@ -28938,6 +29121,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
+            orchestration_id: None,
         };
 
         let dashboard = Tab::Dashboard {
@@ -39885,6 +40069,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let _daemon = with_crafted_response_daemon(
             tmp.path(),
@@ -41190,6 +41375,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -41251,6 +41437,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -41315,6 +41502,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let colliding_record = crate::agent_pty::AgentRecord {
             id: "2".into(),
@@ -41340,6 +41528,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(
@@ -41397,6 +41586,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         let colliding_record = crate::agent_pty::AgentRecord {
             id: "2".into(),
@@ -41422,6 +41612,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
 
         let _daemon = with_crafted_response_daemon(

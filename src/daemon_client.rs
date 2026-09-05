@@ -413,6 +413,7 @@ impl DaemonClient {
                 outstanding_delegation: None,
                 silence_watch: None,
                 delegation_commission: None,
+                crashed: None,
             })
             .collect())
     }
@@ -1319,6 +1320,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let scrubbed = rec
@@ -1346,6 +1348,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut oversized);
         assert!(
@@ -1376,6 +1379,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut scrubs_to_nothing);
         assert_eq!(
@@ -1428,6 +1432,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let live = rec
@@ -1476,6 +1481,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let cwd = rec
@@ -1514,6 +1520,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -1543,6 +1550,7 @@ mod tests {
             outstanding_delegation: None,
             silence_watch: None,
             delegation_commission: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(
