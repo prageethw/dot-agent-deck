@@ -337,3 +337,163 @@ async fn pane_restart_005_refuses_from_a_non_orchestrator_pane() {
         "a refused restart must not touch the worker's agent"
     );
 }
+
+/// Scenario: PRD #699 fix-round coverage gap (auditor `findings-699-auditor.md`
+/// "F10") — NOT a live defect: the audit's own headline verdict is that
+/// daemon-side isolation ALREADY HOLDS for `pane restart` (routing goes
+/// through `delegate_targets`' `OrchestrationIdentity` equality, not a bare
+/// `(cwd, name)` tuple — the B2/F1 bug is TUI-tab-side only, pinned in
+/// `tests/orchestration_tab_growth.rs`). This test exists purely as a
+/// regression guard for that already-correct behavior, so future changes to
+/// the restart routing path can't silently reintroduce cross-instance
+/// bleed. Two orchestration instances share the exact same orchestration
+/// `name` and `cwd` — told apart only by their PRD #140 `Instance`
+/// token — each running a role named `coder`. Instance A's orchestrator
+/// force-restarts `coder`; only instance A's worker may be touched.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/006")]
+async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let dir = common::race_safe_tempdir();
+    std::fs::write(dir.path().join(".dot-agent-deck.toml"), config("cat"))
+        .expect("write orchestration config");
+    let cwd = dir.path().to_string_lossy().into_owned();
+
+    const ORCH_PANE_A: &str = "restart-iso-orch-a";
+    const WORKER_PANE_A: &str = "restart-iso-worker-a";
+    const ORCH_PANE_B: &str = "restart-iso-orch-b";
+    const WORKER_PANE_B: &str = "restart-iso-worker-b";
+
+    let worker_agent_id_a = daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            display_name: Some(WORKER_ROLE),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                WORKER_PANE_A.to_string(),
+            )],
+            tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn instance A's worker stand-in");
+    let worker_agent_id_b = daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            display_name: Some(WORKER_ROLE),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                WORKER_PANE_B.to_string(),
+            )],
+            tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn instance B's worker stand-in");
+    daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            display_name: Some("orchestrator"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE_A.to_string())],
+            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn instance A's orchestrator stand-in");
+    daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            display_name: Some("orchestrator"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE_B.to_string())],
+            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn instance B's orchestrator stand-in");
+
+    {
+        let mut state = daemon.state.write().await;
+        let identity_a = OrchestrationIdentity::Instance {
+            id: "restart-iso-instance-a".to_string(),
+            name: ORCHESTRATION.to_string(),
+        };
+        let identity_b = OrchestrationIdentity::Instance {
+            id: "restart-iso-instance-b".to_string(),
+            name: ORCHESTRATION.to_string(),
+        };
+        state.register_orchestration_role(
+            ORCH_PANE_A,
+            "orchestrator",
+            true,
+            identity_a.clone(),
+            Some(&cwd),
+        );
+        state.register_orchestration_role(
+            WORKER_PANE_A,
+            WORKER_ROLE,
+            false,
+            identity_a,
+            Some(&cwd),
+        );
+        state.register_orchestration_role(
+            ORCH_PANE_B,
+            "orchestrator",
+            true,
+            identity_b.clone(),
+            Some(&cwd),
+        );
+        state.register_orchestration_role(
+            WORKER_PANE_B,
+            WORKER_ROLE,
+            false,
+            identity_b,
+            Some(&cwd),
+        );
+    }
+
+    let signal = RestartRoleSignal {
+        pane_id: ORCH_PANE_A.to_string(),
+        role: WORKER_ROLE.to_string(),
+        force: true,
+        timestamp: chrono::Utc::now(),
+    };
+    let response = daemon
+        .state
+        .read()
+        .await
+        .handle_restart_role_with_state(
+            signal,
+            &daemon.registry,
+            &daemon.event_tx,
+            Some(&daemon.state),
+        )
+        .await;
+    assert!(
+        response.restarted,
+        "instance A's force restart of its own `coder` must succeed; response = {response:?}"
+    );
+
+    let agent_id_b_after = daemon
+        .registry
+        .pane_current_agent_id(WORKER_PANE_B)
+        .expect("instance B's worker pane must still have a live agent");
+    assert_eq!(
+        agent_id_b_after, worker_agent_id_b,
+        "instance A's restart of its own same-named `coder` must NEVER touch instance B's \
+         same-name/same-cwd worker pane; response = {response:?}"
+    );
+
+    let agent_id_a_after = daemon
+        .registry
+        .pane_current_agent_id(WORKER_PANE_A)
+        .expect("instance A's worker pane must have a live agent after restart");
+    assert_ne!(
+        agent_id_a_after, worker_agent_id_a,
+        "sanity: instance A's OWN worker must actually have been restarted (a no-op restart \
+         would make the isolation assertion above meaningless)"
+    );
+}

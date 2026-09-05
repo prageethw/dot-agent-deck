@@ -4235,6 +4235,13 @@ without depending on the config struct API.
 - **Does not assert:** the exact error wording.
 - **Platform coverage:** mac+linux (unix-only).
 
+##### pane/restart/006 — Two orchestration instances sharing the same `name`/`cwd` do not cross-restart each other's same-named role (PRD #699 fix-round, auditor F10 coverage gap — not a live defect: the daemon-side routing this pins is already correct).
+- **Layer:** L1/fast (same in-process technique as `pane/restart/001`, doubled: two full `orchestrator`+`coder` pairs registered under distinct `OrchestrationIdentity::Instance` tokens but the identical orchestration `name` and `cwd`).
+- **Agent:** none (`cat` stand-ins for every pane).
+- **Asserts:** instance A's orchestrator force-restarting its own `coder` succeeds and replaces instance A's worker agent id, while instance B's same-named `coder` pane's agent id is completely unchanged.
+- **Does not assert:** the TUI-tab-side cross-wiring bug this coverage gap sits next to (`pane/spawn/010` pins that — it is a genuine defect, unlike this test).
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (PRD #699 M3).
@@ -4271,6 +4278,41 @@ without depending on the config struct API.
 - **Asserts:** after invoking the real CLI subcommand with `DOT_AGENT_DECK_PANE_ID` set to the orchestrator's real pane id and `DOT_AGENT_DECK_SOCKET` set to the deck's hook socket, reviewer's card joins the SAME orchestration tab that is still active (this test never sends a tab-switch chord) — rendered as its own bordered box titled `reviewer` — and the tab bar still shows exactly one Dashboard tab + one orchestration tab (divider count on the one-row tab-bar strip), not two orchestration tabs for the same orchestration.
 - **Does not assert:** the daemon-level `pane spawn` verb's own correctness (covered by `pane/spawn/001`-`004`); exact card body/status-badge layout.
 - **Platform coverage:** mac+linux (unix-only, PTY-backed harness).
+
+##### pane/spawn/006 — A spawned role's actual child environment carries `DOT_AGENT_DECK_REGISTRATION_GENERATION` and `DOT_AGENT_DECK_DAEMON_BOOT_ID` (PRD #699 fix-round, reviewer B1 / auditor corroboration).
+- **Layer:** L1/fast (same in-process technique as `pane/spawn/001`, plus a role command that dumps its own environment).
+- **Agent:** none (`env; exec cat` stand-in for the spawned role, `cat` for the orchestrator).
+- **Asserts:** after `handle_spawn_role_with_state` spawns `reviewer`, the actual PTY output of the spawned child's own `env` dump contains both `DOT_AGENT_DECK_REGISTRATION_GENERATION=` and `DOT_AGENT_DECK_DAEMON_BOOT_ID=` — the same two variables a real worker's `work-done` reads from its own environment to build the compound key `handle_work_done`'s staleness gate checks.
+- **Does not assert:** the exact generation/boot-id VALUES, or driving an actual `work-done` round trip through `handle_work_done` (deliberately avoided — hardcoding an expected value the fix hasn't decided yet would make this test coordinate against something more specific than the actual defect).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/007 — `pane spawn <the orchestration's own start role>` is refused (PRD #699 fix-round, reviewer B3 / auditor F11).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`).
+- **Agent:** none.
+- **Asserts:** calling the handler from the orchestrator pane naming its OWN role (`orchestrator`, `start = true`) reports `spawned: false` with an error naming the role and identifying it as the orchestration's own start role; the registry's agent-record count is unchanged (no second orchestrator-command agent was spawned).
+- **Does not assert:** the exact error wording beyond containing "orchestrator" and either "start" or "own".
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/008 — Two concurrent `pane spawn <same role>` calls never leave more than one live pane registered for that role (PRD #699 fix-round, reviewer M6 / auditor F3).
+- **Layer:** L1/fast (same technique as `pane/spawn/001`, driving two `handle_spawn_role_with_state` futures concurrently via `tokio::join!`).
+- **Agent:** none.
+- **Asserts:** after both concurrent spawns of `reviewer` resolve, `delegate_targets` resolves at most (and exactly) ONE pane for the role — the weaker of the two invariants a fix might produce, deliberately, since the fix shape (refuse the loser vs. self-correct to one survivor) isn't dictated by this test.
+- **Does not assert:** which of the two concurrent calls "wins" (returns `spawned: true`) — only the post-condition on live pane count.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/009 — Growing an orchestration tab that already has a DEAD SLOT for the role being spawned replaces that slot instead of appending a duplicate (PRD #699 fix-round, reviewer M4 / auditor F4).
+- **Layer:** L1/fast (`TabManager` driven directly against a trivial no-op `PaneController` — no daemon, no PTY, no `ui.rs`).
+- **Agent:** none.
+- **Asserts:** `TabManager::add_role_to_existing_orchestration` called against a tab whose `reviewer` role has no live pane (a dead slot) results in exactly one `reviewer` entry in `config.roles` (count unchanged at 2, not grown to 3), `role_pane_ids` replaced at the dead slot's index with the newly-spawned pane id, that slot's status flipped from `Failed` to `Working`, and the returned `role_index` naming the replaced slot's position rather than a freshly appended one.
+- **Does not assert:** the `ui.rs`/`surface_one_orchestration` integration that calls this function in production (out of scope for a `TabManager`-level unit test); the batch tab-creation path's own dead-slot handling (already correct, per reviewer M5's contrast).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/010 — Two orchestration tabs sharing the same `name`/`cwd` do not cross-wire on `pane spawn`'s tab-growth path (PRD #699 fix-round, reviewer B2 / auditor F1 — the audit's highest-rated finding).
+- **Layer:** L1/fast (same `TabManager`-direct technique as `pane/spawn/009`).
+- **Agent:** none.
+- **Asserts:** with two `Tab::Orchestration` entries sharing `(cwd, name)` but distinct PRD #140 `Instance` orchestration ids, `orchestration_tab_index_for` resolves the tab matching the CALLER's own orchestration id (not just the first same-`(cwd, name)` match); growing the resolved tab leaves the OTHER instance's tab completely untouched (role count, pane ids); a token-less lookup (a pre-PRD#140 legacy caller) matches neither tokened tab.
+- **Does not assert:** the full `ui.rs`/`surface_one_orchestration`/`OrchestrationSurface` broadcast integration — this test calls `TabManager` directly with a proposed additive `orchestration_id: Option<&str>` parameter on `open_orchestration_tab_with_existing_role_panes` and `orchestration_tab_index_for` that does not exist in production yet, so the test file does not compile until the coder delegation threads a per-tab orchestration id through both (the exact parameter shape is a proposal to coordinate on, not a mandate).
+- **Platform coverage:** mac+linux (unix-only).
 
 #### pane/drift
 

@@ -21,6 +21,8 @@
 
 #![cfg(unix)]
 
+use std::time::Duration;
+
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership};
 use dot_agent_deck::event::{SpawnRoleResponse, SpawnRoleSignal};
 use dot_agent_deck::state::{OrchestrationIdentity, handle_spawn_role_with_state};
@@ -293,5 +295,217 @@ async fn pane_spawn_004_refuses_from_a_non_orchestrator_pane() {
     assert!(
         after.is_empty(),
         "a refused spawn must not make reviewer reachable; targets = {after:?}"
+    );
+}
+
+/// Scenario: PRD #699 fix-round B1 (`findings-699-reviewer.md` "B1" —
+/// corroborated by `findings-699-auditor.md`). `handle_spawn_role_with_state`'s
+/// `SpawnOptions.env` overlay carries only `DOT_AGENT_DECK_PANE_ID`; it must
+/// ALSO carry `DOT_AGENT_DECK_REGISTRATION_GENERATION` and
+/// `DOT_AGENT_DECK_DAEMON_BOOT_ID` — the same pair `crate::spawn::pane_env`
+/// injects on the batch-spawn path — because a real worker's `work-done`
+/// reads exactly those two variables (`src/main.rs`'s
+/// `read_registration_context`) to build the compound key
+/// `handle_work_done`'s staleness gate checks. Rather than driving the whole
+/// work-done round trip (which would need to hardcode a generation/boot-id
+/// value the fix hasn't decided yet), spawn `reviewer` with a role command
+/// that dumps its OWN environment to its PTY and assert the daemon's actual
+/// child process really carries both variable names — the same observable
+/// end-state a real `read_registration_context()` call inside that child
+/// depends on. RED today: only `DOT_AGENT_DECK_PANE_ID=` appears in the
+/// dump.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/spawn/006")]
+async fn pane_spawn_006_injects_registration_generation_and_daemon_boot_id_into_spawned_env() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let dir = common::race_safe_tempdir();
+    std::fs::write(
+        dir.path().join(".dot-agent-deck.toml"),
+        format!(
+            "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"{REVIEWER_ROLE}\"\ncommand = \"env; exec cat\"\n"
+        ),
+    )
+    .expect("write orchestration config");
+    let cwd = dir.path().to_string_lossy().into_owned();
+
+    daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            display_name: Some("orchestrator"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn orchestrator stand-in");
+    {
+        let mut state = daemon.state.write().await;
+        state.register_orchestration_role(
+            ORCH_PANE,
+            "orchestrator",
+            true,
+            OrchestrationIdentity::Instance {
+                id: ORCHESTRATION_ID.to_string(),
+                name: ORCHESTRATION.to_string(),
+            },
+            Some(&cwd),
+        );
+    }
+
+    let signal = SpawnRoleSignal {
+        pane_id: ORCH_PANE.to_string(),
+        role: REVIEWER_ROLE.to_string(),
+        timestamp: chrono::Utc::now(),
+    };
+    let response =
+        handle_spawn_role_with_state(signal, &daemon.state, &daemon.registry, &daemon.event_tx)
+            .await;
+    assert!(
+        response.spawned,
+        "precondition: spawning reviewer must succeed; response = {response:?}"
+    );
+
+    let targets = daemon
+        .state
+        .read()
+        .await
+        .delegate_targets(ORCH_PANE, &[REVIEWER_ROLE.to_string()]);
+    assert_eq!(
+        targets.len(),
+        1,
+        "precondition: reviewer must resolve to exactly one pane after spawning; \
+         targets = {targets:?}"
+    );
+    let reviewer_pane_id = targets[0].1.clone();
+    let agent_id = daemon
+        .registry
+        .pane_current_agent_id(&reviewer_pane_id)
+        .expect("the newly-spawned reviewer pane must have a live agent");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let snapshot = loop {
+        let snap =
+            String::from_utf8_lossy(&daemon.registry.snapshot(&agent_id).unwrap_or_default())
+                .into_owned();
+        if snap.contains("DOT_AGENT_DECK_DAEMON_BOOT_ID") || tokio::time::Instant::now() >= deadline
+        {
+            break snap;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert!(
+        snapshot.contains("DOT_AGENT_DECK_REGISTRATION_GENERATION="),
+        "a real worker's `work-done` reads DOT_AGENT_DECK_REGISTRATION_GENERATION straight \
+         from its own environment (src/main.rs's read_registration_context) — the spawned \
+         reviewer's actual `env` dump must contain it, or every work-done it ever sends is \
+         refused as stale (B1). snapshot = {snapshot:?}"
+    );
+    assert!(
+        snapshot.contains("DOT_AGENT_DECK_DAEMON_BOOT_ID="),
+        "same as above for DOT_AGENT_DECK_DAEMON_BOOT_ID — both halves of handle_work_done's \
+         compound staleness key must be present in the child's real environment. \
+         snapshot = {snapshot:?}"
+    );
+}
+
+/// Scenario: PRD #699 fix-round B3 (`findings-699-reviewer.md` "B3" /
+/// `findings-699-auditor.md` "F11"). `handle_spawn_role_with_state`'s
+/// "already live" check reuses `delegate_targets`, which deliberately
+/// EXCLUDES orchestrator panes (so restart can refuse `pane restart
+/// <start-role>`) — reused here it means naming the orchestration's own
+/// start role always resolves empty, so the "already running" refusal never
+/// fires. The orchestrator pane asks to spawn its OWN role. The handler
+/// must refuse explicitly rather than launching a second orchestrator-command
+/// pane registered as a worker. RED today: the call succeeds.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/spawn/007")]
+async fn pane_spawn_007_refuses_to_spawn_its_own_start_role() {
+    let fx = fixture().await;
+    let records_before = fx.daemon.registry.agent_records().len();
+
+    let response = spawn_role(&fx, ORCH_PANE, "orchestrator").await;
+
+    assert!(
+        !response.spawned,
+        "spawning the orchestration's own start role must be refused; response = {response:?}"
+    );
+    assert!(
+        response
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("orchestrator")
+                && (e.to_lowercase().contains("start") || e.to_lowercase().contains("own"))),
+        "the refusal must explain the named role is the orchestration's own start role; \
+         response = {response:?}"
+    );
+    assert_eq!(
+        fx.daemon.registry.agent_records().len(),
+        records_before,
+        "a refused spawn of the start role must not create a second orchestrator-command agent"
+    );
+}
+
+/// Scenario: PRD #699 fix-round M6 (`findings-699-reviewer.md` "M6") / F3
+/// (`findings-699-auditor.md`). `handle_spawn_role_with_state` resolves its
+/// "already live" check under a READ guard that is dropped BEFORE
+/// `registry.spawn_agent`, then re-takes a fresh WRITE guard only to
+/// register — nothing serializes two concurrent spawns of the SAME
+/// not-yet-live role in that window. Fire two concurrent spawns of
+/// `reviewer` at once and assert the weaker of the two invariants the fix
+/// might produce (per the orchestrator's own task notes, either shape is an
+/// acceptable fix): exactly ONE live pane ends up registered for `reviewer`
+/// once both calls resolve — never two. RED today: both calls observe the
+/// role as not-yet-live, both spawn, and `delegate_targets` resolves TWO
+/// panes for one role afterward.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/spawn/008")]
+async fn pane_spawn_008_concurrent_spawns_of_the_same_role_never_leave_two_live_panes() {
+    let fx = fixture().await;
+
+    let signal_a = SpawnRoleSignal {
+        pane_id: ORCH_PANE.to_string(),
+        role: REVIEWER_ROLE.to_string(),
+        timestamp: chrono::Utc::now(),
+    };
+    let signal_b = signal_a.clone();
+
+    // `tokio::spawn` onto the multi-thread runtime's own worker threads,
+    // NOT `tokio::join!` on two unspawned futures polled on this one task —
+    // `join!` only interleaves at `.await` points on a single task, and
+    // `handle_spawn_role_with_state`'s "already live" check → `spawn_agent`
+    // window is a plain synchronous span with no `.await` inside it, so a
+    // same-task `join!` could never actually overlap the two calls there.
+    // Real concurrent OS threads are what actually races the TOCTOU window.
+    let state_a = fx.daemon.state.clone();
+    let registry_a = fx.daemon.registry.clone();
+    let event_tx_a = fx.daemon.event_tx.clone();
+    let handle_a = tokio::spawn(async move {
+        handle_spawn_role_with_state(signal_a, &state_a, &registry_a, &event_tx_a).await
+    });
+    let state_b = fx.daemon.state.clone();
+    let registry_b = fx.daemon.registry.clone();
+    let event_tx_b = fx.daemon.event_tx.clone();
+    let handle_b = tokio::spawn(async move {
+        handle_spawn_role_with_state(signal_b, &state_b, &registry_b, &event_tx_b).await
+    });
+    let (response_a, response_b) =
+        tokio::try_join!(handle_a, handle_b).expect("neither concurrent spawn task should panic");
+
+    let targets = fx
+        .daemon
+        .state
+        .read()
+        .await
+        .delegate_targets(ORCH_PANE, &[REVIEWER_ROLE.to_string()]);
+    assert_eq!(
+        targets.len(),
+        1,
+        "two concurrent `pane spawn reviewer` calls must never leave more than one live pane \
+         registered for the role — response_a = {response_a:?}, response_b = {response_b:?}, \
+         targets = {targets:?}"
     );
 }
