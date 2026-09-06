@@ -166,11 +166,18 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          you delegate to worker B → worker B works → reports → you re-engage worker A.\n\n\
          When a task related to a PRD is fully completed (all workers done, reviews passed), \
          run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n\n\
-         Before waiting on an external result with no live foreground process of your own — a \
-         delegated worker's response you are waiting to be notified about, a CI run, an approval \
-         — run `{bin} wait start <label>` first, and `{bin} wait done <label> --outcome \
-         <success|failure|cancelled|timeout>` once it resolves. This keeps your pane reading \
-         `Working` for the whole span instead of misreading as `Idle`.\n"
+         When the whole wait fits in one foreground command within this turn — a CI check \
+         via `gh run watch`, say — run that command directly instead. Reserve \
+         `{bin} wait start <label>` and `{bin} wait done <label> --outcome \
+         <success|failure|cancelled|timeout>` for waits that genuinely span turns, most often \
+         a delegated worker's response, which arrives as an injected message no foreground \
+         command of yours could ever observe. Pick `<label>` yourself as a short fixed token \
+         (e.g. `ci-check`), never derived from untrusted text, and single-quote it unless it's \
+         already a bare safe token. `wait start` only marks the pane — it does not itself watch \
+         anything, so you still need whatever check actually learns the outcome — and it keeps \
+         the pane reading `Working` only while the wait is outstanding, not indefinitely; call \
+         `wait done ... --outcome cancelled` instead of waiting for the TTL if you stop caring \
+         about the wait before it resolves. (Full detail: `docs/orchestration.md`.)\n"
     ));
 
     content
