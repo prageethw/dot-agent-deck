@@ -316,6 +316,31 @@ mod tests {
         );
     }
 
+    /// Issue #709: an orchestrator waiting on an external result (CI, another
+    /// agent, an approval) has no idea `wait start <label>` / `wait done <label>
+    /// --outcome <...>` (PRD #499) exists unless the binary itself tells it — a
+    /// project's own `.dot-agent-deck.toml` never mentions binary-level CLI verbs.
+    /// Observed directly: without this, orchestrators fall back to constructing
+    /// manual foreground polling loops instead. The guidance must land in the
+    /// "## Important" section, not just anywhere in the context, since that is
+    /// where orchestrator behavior expectations are documented.
+    #[test]
+    fn context_teaches_the_orchestrator_about_the_monitored_wait_cli() {
+        let c = build_orchestrator_context(&config());
+        let important = c
+            .split("## Important")
+            .nth(1)
+            .expect("an '## Important' section exists");
+        assert!(
+            important.contains("wait start"),
+            "the Important section must mention `wait start`, got: {important}"
+        );
+        assert!(
+            important.contains("wait done"),
+            "the Important section must mention `wait done`, got: {important}"
+        );
+    }
+
     /// With a caller task (PRD #220 `dispatch --task`, PRD #120 per-issue prompt)
     /// the task rides INSIDE the file and the one-line pointer tells the
     /// orchestrator to CARRY IT OUT.
