@@ -21,7 +21,8 @@
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
+    DOT_AGENT_DECK_REGISTRATION_GENERATION, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::event::{RestartRoleResponse, RestartRoleSignal};
 use dot_agent_deck::state::OrchestrationIdentity;
@@ -623,5 +624,180 @@ async fn pane_restart_007_recreate_leg_injects_matching_registration_generation(
         injected_boot, daemon_boot_id,
         "the recreated worker's env must carry this daemon's own boot id (issue #706); block = \
          {recreated_block:?}"
+    );
+}
+
+/// Scenario: issue #706 fix-round (reviewer B1 / auditor A1) — the ORDINARY
+/// (non-recreate) respawn leg of `handle_restart_role_with_state`, exercised
+/// with `--force` against a HEALTHY worker pane whose registry record is left
+/// INTACT — the opposite of `pane_restart_007`, which forces `recreated:
+/// true` by closing the record first. A record present means
+/// `respawn_or_recreate_agent_for_pane` never falls through to the recreate
+/// branch, so simply not closing the agent (as this test does, mirroring
+/// `pane_restart_003`'s healthy-pane `--force` technique) selects this leg
+/// deterministically. This handler reserves a fresh registration generation
+/// unconditionally before EVERY respawn attempt — and
+/// `reserve_registration_generation` writes that value into
+/// `pane_registration_generation` immediately, not only once confirmed — but
+/// the respawn itself replays the previous child's `spawn_env` verbatim and
+/// never consumes the freshly reserved generation, and the detached
+/// `confirm_orchestration_role` task only runs `if recreated`. So the map
+/// advances while the live worker's env does not, desynchronizing
+/// `pane_registration_generation` from what that worker's own `work-done`
+/// will report — the same failure #706 fixed, relocated onto `pane restart
+/// --force`'s ordinary (non-recovery) case.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/008")]
+async fn pane_restart_008_ordinary_respawn_leg_keeps_registration_generation_in_sync() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let initial_boot_id = daemon.state.read().await.daemon_boot_id().to_string();
+
+    let script_dir = common::race_safe_tempdir();
+    let script_path = script_dir.path().join("env-dump-worker.sh");
+    let log_path = script_dir.path().join("env-dump.log");
+    write_env_dump_worker(&script_path, &log_path);
+    let worker_command = script_path.to_string_lossy().into_owned();
+
+    let dir = common::race_safe_tempdir();
+    std::fs::write(
+        dir.path().join(".dot-agent-deck.toml"),
+        config(&worker_command),
+    )
+    .expect("write orchestration config");
+    let cwd = dir.path().to_string_lossy().into_owned();
+
+    daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            display_name: Some("orchestrator"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn orchestrator stand-in");
+
+    // The initial worker's env already carries a registration generation and
+    // this daemon's boot id, the same as a REAL production spawn would
+    // (`crate::spawn::spawn`'s `pane_env`, `src/spawn.rs`), which this
+    // in-process fixture bypasses by calling `registry.spawn_agent` directly.
+    // `"1"` is not arbitrary: it is the exact value
+    // `reserve_registration_generation` computes for a pane_id it has never
+    // seen before (`.or_insert(0) += 1`), which is what
+    // `register_orchestration_role` below performs for `WORKER_PANE`. So the
+    // env and the map start out GENUINELY in sync — the precondition an
+    // ordinary respawn is supposed to preserve.
+    let worker_agent_id = daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some(&worker_command),
+            cwd: Some(&cwd),
+            display_name: Some(WORKER_ROLE),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                (
+                    DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+                    "1".to_string(),
+                ),
+                (DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(), initial_boot_id),
+            ],
+            tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn worker stand-in");
+
+    {
+        let mut state = daemon.state.write().await;
+        let identity = OrchestrationIdentity::Instance {
+            id: ORCHESTRATION_ID.to_string(),
+            name: ORCHESTRATION.to_string(),
+        };
+        state.register_orchestration_role(
+            ORCH_PANE,
+            "orchestrator",
+            true,
+            identity.clone(),
+            Some(&cwd),
+        );
+        state.register_orchestration_role(WORKER_PANE, WORKER_ROLE, false, identity, Some(&cwd));
+    }
+
+    let fx = Fixture {
+        daemon,
+        _dir: dir,
+        worker_agent_id,
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while recorded_env_blocks(&log_path).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker stand-in never recorded its initial launch"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .as_deref(),
+        Some(fx.worker_agent_id.as_str()),
+        "precondition: the worker's registry record must stay INTACT through this test — never \
+         closed — which is what selects the ORDINARY respawn leg rather than pane_restart_007's \
+         forced recreate leg"
+    );
+
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    assert!(
+        response.restarted,
+        "force-restarting a healthy pane with an intact registry record must succeed; \
+         response = {response:?}"
+    );
+    assert!(
+        response.error.is_none(),
+        "a successful restart must carry no error; response = {response:?}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while recorded_env_blocks(&log_path).len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "force-restarting a pane with an intact registry record never produced an ordinary \
+             respawn; blocks = {:?}",
+            recorded_env_blocks(&log_path)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let blocks = recorded_env_blocks(&log_path);
+    let respawned_block = blocks.last().expect("a second launch block exists");
+    let field = |name: &str| -> String {
+        respawned_block
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let injected_gen = field("gen");
+
+    // Unlike `pane_restart_007`, the confirmation this handler detaches only
+    // runs `if recreated`, which this is not — so there is no detached task
+    // to wait for; the map is already whatever it is going to be by the time
+    // `restart_role` above returns (the reservation itself is synchronous,
+    // before the spawn).
+    let state = fx.daemon.state.read().await;
+    let map_generation = state.pane_registration_generation.get(WORKER_PANE).copied();
+    drop(state);
+
+    assert_eq!(
+        map_generation,
+        injected_gen.parse::<u64>().ok(),
+        "on the ORDINARY (non-recreate) respawn leg, `pane_registration_generation` must still \
+         equal whatever generation the respawned child's actual (verbatim-replayed) env carries \
+         — the eager, unconditional reservation this handler performs before EVERY respawn \
+         attempt bumps the map regardless of which leg runs, but only the recreate leg's \
+         `confirm_orchestration_role` call keeps it in sync (issue #706 fix-round review B1 / \
+         audit A1); block = {respawned_block:?}, map = {map_generation:?}"
     );
 }

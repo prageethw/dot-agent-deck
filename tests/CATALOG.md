@@ -4291,6 +4291,13 @@ without depending on the config struct API.
 - **Does not assert:** the in-flight-close race itself (`orchestration/delegate/022` owns that); what a real worker's `work-done` does with a mismatched generation (`orchestration/delegate/025`'s and `handle_work_done`'s own staleness-gate coverage); `handle_restart_role_with_state`'s identical recreate branch (`pane/restart/007`).
 - **Platform coverage:** mac+linux (unix-only).
 
+##### orchestration/delegate/045 — A `clear = true` delegate's ORDINARY (non-recreate) respawn leg, against a worker pane whose registry record is left INTACT, must keep `pane_registration_generation` in sync with what the respawned child's actual (verbatim-replayed) env carries (issue #706 fix-round review B1 / audit A1).
+- **Layer:** L1/fast (in-process — the real `dispatch_one_owned` ordinary respawn leg, via `handle_delegate_with_state`, against a daemon-owned `cat`-orchestrator + an env-dumping worker stand-in; no daemon socket, no LLM).
+- **Agent:** none (synthetic — the same env-dumping shell stand-in `orchestration/delegate/044` uses).
+- **Asserts:** with the worker's registry record left intact (never closed — the opposite of `orchestration/delegate/044`) and its initial env already carrying a registration generation/boot id genuinely in sync with `AppState::pane_registration_generation` (mirroring a real production spawn, which this in-process fixture otherwise bypasses), delegating to the role produces an ordinary respawn whose actual env still carries that SAME generation, and `pane_registration_generation` must still equal it — not a bumped value. `dispatch_one_owned` reserves a fresh generation unconditionally before every `clear = true` respawn attempt and writes it into the map immediately, but this leg never calls `confirm_orchestration_role` (that only runs `if recreated`) and the respawned child's env is the PREVIOUS child's `spawn_env` replayed verbatim, so the map and the child's env desynchronize.
+- **Does not assert:** the recreate leg (`orchestration/delegate/044` owns that); `handle_restart_role_with_state`'s identical ordinary leg (`pane/restart/008`).
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/restart
 
 ##### pane/restart/001 — Restarting a crashed worker without `--force` succeeds and the role stays reachable (PRD #699 M2).
@@ -4340,6 +4347,13 @@ without depending on the config struct API.
 - **Agent:** none (synthetic — the same env-dumping shell stand-in `orchestration/delegate/044` uses).
 - **Asserts:** with the worker's registry record closed out from under it (the deterministic `agent_detection.rs::spawn_010_declared_identity_wins_spawn_recreate_and_learning` technique, so the respawn attempt reports `recreated: true`), force-restarting the role succeeds and the recreated worker's actual env carries a non-empty, non-zero `DOT_AGENT_DECK_REGISTRATION_GENERATION` that matches what `AppState::pane_registration_generation` ends up holding for the pane (after the handler's detached re-registration task lands), and a `DOT_AGENT_DECK_DAEMON_BOOT_ID` matching `AppState::daemon_boot_id()` — not just `DOT_AGENT_DECK_PANE_ID`.
 - **Does not assert:** `dispatch_one_owned`'s identical recreate leg (`orchestration/delegate/044` owns that); what a real worker's `work-done` does with a mismatched generation.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/008 — `handle_restart_role_with_state`'s ORDINARY (non-recreate) respawn leg, force-restarting a HEALTHY worker pane whose registry record is left INTACT, must keep `pane_registration_generation` in sync with what the respawned child's actual (verbatim-replayed) env carries (issue #706 fix-round review B1 / audit A1).
+- **Layer:** L1/fast (same in-process technique as `pane/restart/001`, with an env-dumping worker stand-in instead of `cat`/`sleep`).
+- **Agent:** none (synthetic — the same env-dumping shell stand-in `orchestration/delegate/044`/`pane/restart/007` use).
+- **Asserts:** with the worker's registry record left intact (never closed — the opposite of `pane/restart/007`) and its initial env already carrying a registration generation/boot id genuinely in sync with `AppState::pane_registration_generation`, force-restarting the healthy role (mirroring `pane/restart/003`'s technique) succeeds and produces an ordinary respawn whose actual env still carries that SAME generation, and `pane_registration_generation` must still equal it — not a bumped value. This handler reserves a fresh generation unconditionally before every respawn attempt and writes it into the map immediately, but the detached `confirm_orchestration_role` task only runs `if recreated`, and the respawned child's env is the PREVIOUS child's `spawn_env` replayed verbatim, so the map and the child's env desynchronize.
+- **Does not assert:** the recreate leg (`pane/restart/007` owns that); `dispatch_one_owned`'s identical ordinary leg (`orchestration/delegate/045`); what a real worker's `work-done` does with a mismatched generation.
 - **Platform coverage:** mac+linux (unix-only).
 
 #### pane/spawn
