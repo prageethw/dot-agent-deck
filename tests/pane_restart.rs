@@ -588,8 +588,9 @@ async fn pane_restart_007_recreate_leg_injects_matching_registration_generation(
     let injected_boot = field("boot");
 
     // `handle_restart_role_with_state`'s `if recreated { ... }` re-registration
-    // runs in a DETACHED `tokio::spawn` task, so give it a moment to land
-    // before reading the map it writes.
+    // now runs SYNCHRONOUSLY, inside the same `pane_dispatch_lock` scope as
+    // the reservation, so the map is already settled by the time the restart
+    // call returns; this poll loop is vestigial (harmless) rather than load-bearing.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !fx
         .daemon
@@ -640,12 +641,13 @@ async fn pane_restart_007_recreate_leg_injects_matching_registration_generation(
 /// `reserve_registration_generation` writes that value into
 /// `pane_registration_generation` immediately, not only once confirmed — but
 /// the respawn itself replays the previous child's `spawn_env` verbatim and
-/// never consumes the freshly reserved generation, and the detached
-/// `confirm_orchestration_role` task only runs `if recreated`. So the map
-/// advances while the live worker's env does not, desynchronizing
-/// `pane_registration_generation` from what that worker's own `work-done`
-/// will report — the same failure #706 fixed, relocated onto `pane restart
-/// --force`'s ordinary (non-recovery) case.
+/// never consumes the freshly reserved generation. On this leg
+/// (`recreated == false`) the handler restores the map to the
+/// pre-reservation value synchronously, under the same `pane_dispatch_lock`
+/// guard, instead of confirming — keeping `pane_registration_generation` in
+/// sync with what that worker's own `work-done` will report, closing the
+/// same failure #706 fixed on the recovery path, on `pane restart --force`'s
+/// ordinary (non-recovery) case too.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/restart/008")]
 async fn pane_restart_008_ordinary_respawn_leg_keeps_registration_generation_in_sync() {
@@ -781,11 +783,11 @@ async fn pane_restart_008_ordinary_respawn_leg_keeps_registration_generation_in_
     };
     let injected_gen = field("gen");
 
-    // Unlike `pane_restart_007`, the confirmation this handler detaches only
-    // runs `if recreated`, which this is not — so there is no detached task
-    // to wait for; the map is already whatever it is going to be by the time
-    // `restart_role` above returns (the reservation itself is synchronous,
-    // before the spawn).
+    // The handler now confirms/restores the generation synchronously on both
+    // legs (this one is `recreated == false`, so it restores rather than
+    // confirms) — so there is no detached task to wait for either way; the
+    // map is already whatever it is going to be by the time `restart_role`
+    // above returns.
     let state = fx.daemon.state.read().await;
     let map_generation = state.pane_registration_generation.get(WORKER_PANE).copied();
     drop(state);

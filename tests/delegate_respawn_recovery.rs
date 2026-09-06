@@ -687,12 +687,12 @@ async fn delegate_044_recreate_leg_injects_matching_registration_generation() {
 /// writes that value into `pane_registration_generation` immediately, not
 /// only once confirmed — but `respawn_agent_for_pane_declared` replays the
 /// PREVIOUS child's `spawn_env` verbatim and never looks at
-/// `PaneRecreateIdentity::env`, and `confirm_orchestration_role` only runs
-/// inside the `if recreated { ... }` branch. So on this leg the map advances
-/// while the respawned child's actual env does not, desynchronizing
-/// `pane_registration_generation` from what the live worker's own
-/// `work-done` will report — the same failure #706 fixed, relocated onto the
-/// far more common path.
+/// `PaneRecreateIdentity::env`. On this leg (`recreated == false`),
+/// `dispatch_one_owned` restores the map to the pre-reservation value
+/// synchronously, under the same `pane_dispatch_lock` guard, instead of
+/// confirming — so the map stays in sync with what the live worker's own
+/// `work-done` will report, closing the same failure #706 fixed on the
+/// recreate leg, on the far more common ordinary path too.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/045")]
 async fn delegate_045_ordinary_respawn_leg_keeps_registration_generation_in_sync() {

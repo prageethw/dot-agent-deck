@@ -7930,12 +7930,23 @@ impl AppState {
 /// already does: a plain async FREE FUNCTION taking the [`SharedState`]
 /// handle directly. A short-lived READ guard resolves caller validation,
 /// target resolution, the crashed check, and the role config lookup, then
-/// drops BEFORE the respawn — no state-lock dependency held across it. The
-/// `recreated: true` re-registration case still needs a WRITE guard, still
-/// deferred into a detached `tokio::spawn`ed task (issue #606's
-/// `dispatch_one_owned` precedent), since taking it synchronously here would
-/// still park behind any reader queued after this function's own read guard
-/// already dropped.
+/// drops BEFORE the respawn — no state-lock dependency held across it.
+///
+/// **Locking (fix-round #706)**: the `recreated: true` re-registration case
+/// now confirms the generation SYNCHRONOUSLY, inside the same
+/// `pane_dispatch_lock` scope as the reservation, rather than deferring into
+/// a detached `tokio::spawn`ed task the way issue #606's `dispatch_one_owned`
+/// precedent once suggested. That precedent no longer applies here: this
+/// function's own read guard is already dropped well before the dispatch
+/// guard is even acquired (see above), so taking the confirm's WRITE guard
+/// synchronously does not park behind any queued reader — there is nothing
+/// left held to park behind. Confirming inline also closes a fail-open
+/// overtake window the old detached task left open: a later dispatch on the
+/// same pane could confirm a newer generation, and the still-pending
+/// detached task would then stamp the map back to its own, now-stale,
+/// generation. Reserve, spawn, and confirm/restore all now execute before
+/// `_dispatch_guard` is released, so no other dispatch or restart on this
+/// pane can interleave.
 ///
 /// **Locking (fix-round M2)**: also acquires
 /// [`AgentPtyRegistry::pane_dispatch_lock`] for the duration of the respawn —
@@ -8217,10 +8228,12 @@ pub async fn handle_restart_role_with_state(
 /// is a plain async FREE FUNCTION taking the [`SharedState`] handle directly
 /// rather than an already-held read guard — every successful spawn needs
 /// [`AppState::confirm_orchestration_role`] (a write lock) on the MAIN
-/// path, since deferring it (the way `handle_restart_role_with_state`
-/// defers its rare re-registration case into a detached task) would let
-/// the response claim `spawned: true` before a `delegate` to the new role
-/// could actually reach it. A short-lived READ guard resolves caller
+/// path, since deferring it would let the response claim `spawned: true`
+/// before a `delegate` to the new role could actually reach it.
+/// `handle_restart_role_with_state` now confirms its own rare
+/// re-registration case synchronously for exactly the same reason (fix-round
+/// #706), so both functions share the same reserve-then-confirm-inline
+/// pattern. A short-lived READ guard resolves caller
 /// validation, cwd/identity, the "already live" check, and the role
 /// config lookup, then drops BEFORE `registry.spawn_agent(...)` runs (no
 /// state-lock dependency of its own — never hold a guard across it, since
