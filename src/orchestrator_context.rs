@@ -165,7 +165,12 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          will delegate the next hop. The chain you coordinate is: worker A diagnoses → reports → \
          you delegate to worker B → worker B works → reports → you re-engage worker A.\n\n\
          When a task related to a PRD is fully completed (all workers done, reviews passed), \
-         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n"
+         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n\n\
+         Before waiting on an external result with no live foreground process of your own — a \
+         delegated worker's response you are waiting to be notified about, a CI run, an approval \
+         — run `{bin} wait start <label>` first, and `{bin} wait done <label> --outcome \
+         <success|failure|cancelled|timeout>` once it resolves. This keeps your pane reading \
+         `Working` for the whole span instead of misreading as `Idle`.\n"
     ));
 
     content
