@@ -489,3 +489,139 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
          would make the isolation assertion above meaningless)"
     );
 }
+
+/// Issue #706: an env-dumping worker stand-in — logs the vars that decide
+/// whether a recreated worker's `work-done` can pass the daemon's
+/// generation/boot-id staleness gate, then behaves like `cat`.
+fn write_env_dump_worker(path: &std::path::Path, log: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = format!(
+        "#!/bin/sh\n\
+         {{\n\
+         echo \"gen=$DOT_AGENT_DECK_REGISTRATION_GENERATION\"\n\
+         echo \"boot=$DOT_AGENT_DECK_DAEMON_BOOT_ID\"\n\
+         echo \"pane=$DOT_AGENT_DECK_PANE_ID\"\n\
+         echo \"---\"\n\
+         }} >> \"{log}\"\n\
+         exec cat\n",
+        log = log.display()
+    );
+    std::fs::write(path, script).expect("write env-dump worker stand-in");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod env-dump worker stand-in");
+}
+
+/// The env-dump worker's per-invocation blocks (mirrors
+/// `delegate_respawn_recovery.rs`'s `recorded_launches`).
+fn recorded_env_blocks(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .split("---\n")
+        .map(str::trim)
+        .filter(|block| !block.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Scenario: issue #706 — the worker pane's registry record is closed out
+/// from under it (the same deterministic technique `agent_detection.rs`'s
+/// `spawn_010_declared_identity_wins_spawn_recreate_and_learning` fixture
+/// uses to force `recreated: true`, rather than racing an in-flight close),
+/// then the orchestrator force-restarts the role via
+/// `handle_restart_role_with_state`'s recreate branch. The recreated
+/// worker's actual environment must carry the SAME registration generation
+/// and daemon boot id that `pane_registration_generation` ends up holding
+/// for its pane, not just `DOT_AGENT_DECK_PANE_ID`.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/007")]
+async fn pane_restart_007_recreate_leg_injects_matching_registration_generation() {
+    let script_dir = common::race_safe_tempdir();
+    let script_path = script_dir.path().join("env-dump-worker.sh");
+    let log_path = script_dir.path().join("env-dump.log");
+    write_env_dump_worker(&script_path, &log_path);
+
+    let fx = fixture(&script_path.to_string_lossy()).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while recorded_env_blocks(&log_path).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker stand-in never recorded its initial launch"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    fx.daemon
+        .registry
+        .close_agent(&fx.worker_agent_id)
+        .expect("remove the worker's registry record to force the recreate leg (issue #606)");
+
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    assert!(
+        response.restarted,
+        "force-restarting a pane whose registry record is gone must still recreate it; \
+         response = {response:?}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while recorded_env_blocks(&log_path).len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the recreated worker never recorded a second launch; blocks = {:?}",
+            recorded_env_blocks(&log_path)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let blocks = recorded_env_blocks(&log_path);
+    let recreated_block = blocks.last().expect("a second launch block exists");
+    let field = |name: &str| -> String {
+        recreated_block
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let injected_gen = field("gen");
+    let injected_boot = field("boot");
+
+    // `handle_restart_role_with_state`'s `if recreated { ... }` re-registration
+    // runs in a DETACHED `tokio::spawn` task, so give it a moment to land
+    // before reading the map it writes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !fx
+        .daemon
+        .state
+        .read()
+        .await
+        .pane_registration_generation
+        .contains_key(WORKER_PANE)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let state = fx.daemon.state.read().await;
+    let map_generation = state.pane_registration_generation.get(WORKER_PANE).copied();
+    let daemon_boot_id = state.daemon_boot_id().to_string();
+    drop(state);
+
+    assert!(
+        !injected_gen.is_empty() && injected_gen != "0",
+        "the recreated worker's env carried no DOT_AGENT_DECK_REGISTRATION_GENERATION \
+         (issue #706); block = {recreated_block:?}"
+    );
+    assert_eq!(
+        injected_gen.parse::<u64>().ok(),
+        map_generation,
+        "the generation injected into the recreated worker's env must match what \
+         `pane_registration_generation` ends up holding for its pane, or the worker's own \
+         `work-done` fails the daemon's staleness gate (issue #706); block = \
+         {recreated_block:?}, map = {map_generation:?}"
+    );
+    assert_eq!(
+        injected_boot, daemon_boot_id,
+        "the recreated worker's env must carry this daemon's own boot id (issue #706); block = \
+         {recreated_block:?}"
+    );
+}

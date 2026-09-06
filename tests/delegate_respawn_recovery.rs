@@ -542,6 +542,136 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
     );
 }
 
+/// Issue #706: an env-dumping worker stand-in — logs the vars that decide
+/// whether a recreated worker's `work-done` can pass the daemon's
+/// generation/boot-id staleness gate, then behaves like `cat`.
+#[cfg(unix)]
+fn write_env_dump_worker(path: &std::path::Path, log: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = format!(
+        "#!/bin/sh\n\
+         {{\n\
+         echo \"gen=$DOT_AGENT_DECK_REGISTRATION_GENERATION\"\n\
+         echo \"boot=$DOT_AGENT_DECK_DAEMON_BOOT_ID\"\n\
+         echo \"pane=$DOT_AGENT_DECK_PANE_ID\"\n\
+         echo \"---\"\n\
+         }} >> \"{log}\"\n\
+         exec cat\n",
+        log = log.display()
+    );
+    std::fs::write(path, script).expect("write env-dump worker stand-in");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod env-dump worker stand-in");
+}
+
+/// Scenario: issue #706 — `dispatch_one_owned`'s `clear = true` recreate leg
+/// (issue #606's recovery path) is driven by closing the worker's registry
+/// record directly, the same deterministic technique
+/// `agent_detection.rs`'s `spawn_010_declared_identity_wins_spawn_recreate_and_learning`
+/// fixture uses, rather than racing an in-flight close — so the next
+/// delegate's respawn attempt reliably reports `recreated: true`. The
+/// recreated worker's actual environment must carry the SAME registration
+/// generation and daemon boot id that `pane_registration_generation` ends up
+/// holding for its pane, not just `DOT_AGENT_DECK_PANE_ID`.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/044")]
+async fn delegate_044_recreate_leg_injects_matching_registration_generation() {
+    let script_dir = common::race_safe_tempdir();
+    let script_path = script_dir.path().join("env-dump-worker.sh");
+    let log_path = script_dir.path().join("env-dump.log");
+    write_env_dump_worker(&script_path, &log_path);
+    let worker_command = script_path.to_string_lossy().into_owned();
+
+    let fx = fixture(move |_dir: &std::path::Path| worker_command).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while recorded_launches(&log_path).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker stand-in never recorded its initial launch"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .as_deref(),
+        Some(fx.worker_agent_id.as_str()),
+        "precondition: the worker stand-in must still own its pane before it is closed"
+    );
+
+    fx.daemon
+        .registry
+        .close_agent(&fx.worker_agent_id)
+        .expect("remove the worker's registry record to force the recreate leg (issue #606)");
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while recorded_launches(&log_path).len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "delegating to a role whose pane had no registry record left never recreated it \
+             (issue #606); blocks = {:?}",
+            recorded_launches(&log_path)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let blocks = recorded_launches(&log_path);
+    let recreated_block = blocks.last().expect("a second launch block exists");
+    let field = |name: &str| -> String {
+        recreated_block
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let injected_gen = field("gen");
+    let injected_boot = field("boot");
+
+    // The `if recreated { ... }` re-registration in `dispatch_one_owned` runs
+    // inline, before any readiness wait — but poll rather than assume, since
+    // nothing here should depend on that ordering staying true.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !fx
+        .daemon
+        .state
+        .read()
+        .await
+        .pane_registration_generation
+        .contains_key(WORKER_PANE)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let state = fx.daemon.state.read().await;
+    let map_generation = state.pane_registration_generation.get(WORKER_PANE).copied();
+    let daemon_boot_id = state.daemon_boot_id().to_string();
+    drop(state);
+
+    assert!(
+        !injected_gen.is_empty() && injected_gen != "0",
+        "the recreated worker's env carried no DOT_AGENT_DECK_REGISTRATION_GENERATION \
+         (issue #706); block = {recreated_block:?}"
+    );
+    assert_eq!(
+        injected_gen.parse::<u64>().ok(),
+        map_generation,
+        "the generation injected into the recreated worker's env must match what \
+         `pane_registration_generation` ends up holding for its pane, or the worker's own \
+         `work-done` fails the daemon's staleness gate (issue #706); block = \
+         {recreated_block:?}, map = {map_generation:?}"
+    );
+    assert_eq!(
+        injected_boot, daemon_boot_id,
+        "the recreated worker's env must carry this daemon's own boot id (issue #706); block = \
+         {recreated_block:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #584's control: the two spawn paths' respawns, side by side.
 // ---------------------------------------------------------------------------
