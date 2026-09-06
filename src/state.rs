@@ -5377,6 +5377,29 @@ async fn dispatch_one_owned(
         // event sent after `event_tx.subscribe()` — including the
         // new agent's first `SessionStart`.
         let mut event_rx = event_tx.subscribe();
+        // Issue #706: reserve the registration generation and read the daemon
+        // boot id under one write-guard acquisition BEFORE the respawn/recreate
+        // call below, mirroring `handle_spawn_role_with_state`'s fix-round B1
+        // pattern — so both can be injected into `recreate_identity.env` and
+        // land in the recreated child's environment. Without this the
+        // recreated worker's own `work-done` reads neither variable
+        // (`read_registration_context`, `src/main.rs`) and `handle_work_done`'s
+        // compound staleness gate refuses every report it ever sends. Reserved
+        // unconditionally (not only when the leg below turns out to recreate)
+        // because `PaneRecreateIdentity::env` is only ever consumed by
+        // `respawn_or_recreate_agent_for_pane`'s recreate leg — an ordinary
+        // respawn ignores it — so there is no cost to always having it ready.
+        // `None` when this caller has no daemon state (unit fixtures), exactly
+        // like the `register_orchestration_role`/`confirm_orchestration_role`
+        // call further down.
+        let reserved = if let Some(state) = state.as_ref() {
+            let mut state_guard = state.write().await;
+            let generation = state_guard.reserve_registration_generation(&pane_id);
+            let boot_id = state_guard.daemon_boot_id().to_string();
+            Some((generation, boot_id))
+        } else {
+            None
+        };
         // Issue #606: what the pane should come back as if there is no record
         // left to respawn from — a `StopAgent` that removed the entry before
         // spending its termination grace, or a worker that simply died and was
@@ -5413,10 +5436,23 @@ async fn dispatch_one_owned(
             // deriving from the command, where the pane's FROZEN
             // `spawn_agent_type` is not (PRD #225 finding 1).
             agent_type: role.resolved_agent_type(),
-            env: vec![(
-                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
-                pane_id.clone(),
-            )],
+            env: {
+                let mut env = vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane_id.clone(),
+                )];
+                if let Some((generation, boot_id)) = reserved.as_ref() {
+                    env.push((
+                        crate::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+                        generation.to_string(),
+                    ));
+                    env.push((
+                        crate::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(),
+                        boot_id.clone(),
+                    ));
+                }
+                env
+            },
         };
         match registry
             .respawn_or_recreate_agent_for_pane(&pane_id, &role.command, &recreate_identity)
@@ -5434,13 +5470,22 @@ async fn dispatch_one_owned(
                     // delegate to this role resolves no pane at all and is
                     // rejected with `reached no worker for role(s)` — the
                     // permanent breakage issue #606 reports.
-                    if let (Some(state), Some(identity)) = (state.as_ref(), orchestration.clone()) {
-                        state.write().await.register_orchestration_role(
+                    // Issue #706: confirm the generation reserved BEFORE this
+                    // respawn — and already injected into the recreated
+                    // child's env — via `confirm_orchestration_role`, rather
+                    // than `register_orchestration_role`, which would reserve
+                    // a SECOND generation here and desynchronize the map from
+                    // what the child's env actually carries.
+                    if let (Some(state), Some(identity), Some((generation, _))) =
+                        (state.as_ref(), orchestration.clone(), reserved.as_ref())
+                    {
+                        state.write().await.confirm_orchestration_role(
                             &pane_id,
                             &target_role,
                             false,
                             identity,
                             cwd.as_deref(),
+                            *generation,
                         );
                     }
                 }
@@ -7944,6 +7989,24 @@ pub async fn handle_restart_role_with_state(
     let dispatch_mutex = registry.pane_dispatch_lock(&resolved.pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
 
+    // Issue #706: reserve the registration generation and read the daemon
+    // boot id under one write-guard acquisition BEFORE building
+    // `recreate_identity` / calling `respawn_or_recreate_agent_for_pane` —
+    // mirroring `dispatch_one_owned`'s recreate leg and
+    // `handle_spawn_role_with_state`'s fix-round B1 pattern — so both can be
+    // injected into the recreated child's env. This has to happen
+    // synchronously, in this function's own body, before the spawn: the
+    // detached task below only defers the final `confirm_orchestration_role`
+    // call (which needs the write lock after this function's own read guard
+    // is already gone), never the reservation itself, since the reservation
+    // must be visible in the child's env by the time it is spawned.
+    let (reserved_generation, daemon_boot_id) = {
+        let mut state_guard = state.write().await;
+        let generation = state_guard.reserve_registration_generation(&resolved.pane_id);
+        let boot_id = state_guard.daemon_boot_id().to_string();
+        (generation, boot_id)
+    };
+
     let recreate_identity = crate::agent_pty::PaneRecreateIdentity {
         cwd: resolved.cwd.clone(),
         display_name: Some(signal.role.clone()),
@@ -7966,10 +8029,20 @@ pub async fn handle_restart_role_with_state(
             },
         }),
         agent_type: resolved.role_config.resolved_agent_type(),
-        env: vec![(
-            crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
-            resolved.pane_id.clone(),
-        )],
+        env: vec![
+            (
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                resolved.pane_id.clone(),
+            ),
+            (
+                crate::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+                reserved_generation.to_string(),
+            ),
+            (
+                crate::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(),
+                daemon_boot_id.clone(),
+            ),
+        ],
     };
 
     match registry
@@ -7986,17 +8059,27 @@ pub async fn handle_restart_role_with_state(
                 // and the write lock is taken inside a DETACHED task, only
                 // after this function has already returned and released its
                 // own (already-dropped) read guard.
+                //
+                // Issue #706: confirm the SAME `reserved_generation` already
+                // injected into the recreated child's env above, via
+                // `confirm_orchestration_role` rather than
+                // `register_orchestration_role` — which would reserve a
+                // SECOND generation here and desynchronize the map from what
+                // the child's env actually carries. Only this confirmation
+                // needs the detached task; the reservation itself already
+                // happened synchronously, before the spawn.
                 let state = state.clone();
                 let role = signal.role.clone();
                 let pane_id = resolved.pane_id.clone();
                 let cwd = resolved.cwd.clone();
                 tokio::spawn(async move {
-                    state.write().await.register_orchestration_role(
+                    state.write().await.confirm_orchestration_role(
                         &pane_id,
                         &role,
                         false,
                         identity,
                         cwd.as_deref(),
+                        reserved_generation,
                     );
                 });
             }
