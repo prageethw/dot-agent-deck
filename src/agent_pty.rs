@@ -3735,11 +3735,14 @@ pub struct PaneRecreateIdentity {
     ///
     /// A respawn replays the previous child's whole `spawn_env`; a re-creation
     /// has no previous child to read one from, so anything not listed here is
-    /// gone. That costs nothing today — every producer of an orchestration role
-    /// pane (`spawn::spawn`'s `pane_env`, and the TUI's `create_stream_pane`)
-    /// passes the pane id and nothing else, and `spawn_agent` injects the
-    /// registry's own hook socket and agent id itself — but a producer that
-    /// starts supplying role env has to supply it here too.
+    /// gone. `spawn::spawn`'s `pane_env` and the TUI's `create_stream_pane`
+    /// still pass only the pane id; `crate::state`'s `dispatch_one_owned` and
+    /// `handle_restart_role_with_state` (issue #706) additionally pass the
+    /// reserved `DOT_AGENT_DECK_REGISTRATION_GENERATION` and
+    /// `DOT_AGENT_DECK_DAEMON_BOOT_ID` — consumed only by the recreate leg,
+    /// same as the pane id — and `spawn_agent` injects the registry's own
+    /// hook socket and agent id itself. A producer that starts supplying
+    /// further role env has to supply it here too.
     pub env: Vec<(String, String)>,
 }
 

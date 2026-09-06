@@ -5377,6 +5377,45 @@ async fn dispatch_one_owned(
         // event sent after `event_tx.subscribe()` — including the
         // new agent's first `SessionStart`.
         let mut event_rx = event_tx.subscribe();
+        // Issue #706: reserve the registration generation and read the daemon
+        // boot id under one write-guard acquisition BEFORE the respawn/recreate
+        // call below, mirroring `handle_spawn_role_with_state`'s fix-round B1
+        // pattern — so both can be injected into `recreate_identity.env` and
+        // land in the recreated child's environment. Without this the
+        // recreated worker's own `work-done` reads neither variable
+        // (`read_registration_context`, `src/main.rs`) and `handle_work_done`'s
+        // compound staleness gate refuses every report it ever sends. Reserved
+        // unconditionally (not only when the leg below turns out to recreate)
+        // because `PaneRecreateIdentity::env` is only ever consumed by
+        // `respawn_or_recreate_agent_for_pane`'s recreate leg — an ordinary
+        // respawn ignores it. `None` when this caller has no daemon state
+        // (unit fixtures), exactly like the
+        // `register_orchestration_role`/`confirm_orchestration_role` call
+        // further down.
+        //
+        // Fix round 2 (reviewer B1 / auditor A1): the reservation is eager —
+        // it writes `pane_registration_generation` immediately, not only on
+        // confirmation — so the pane's PRIOR value is captured here, under
+        // the same write-guard acquisition, and restored below on every
+        // outcome that does not confirm this exact reservation (the
+        // ordinary, non-recreate respawn — "the overwhelmingly common
+        // outcome" per `respawn_or_recreate_agent_for_pane`'s own doc — and
+        // the `Err(_)` respawn-failure arm). Without the restore, the
+        // reservation's eager write would desynchronize the map from the
+        // unchanged, replayed-verbatim child env on precisely the common
+        // path this fix must not touch.
+        let reserved = if let Some(state) = state.as_ref() {
+            let mut state_guard = state.write().await;
+            let prior_generation = state_guard
+                .pane_registration_generation
+                .get(&pane_id)
+                .copied();
+            let generation = state_guard.reserve_registration_generation(&pane_id);
+            let boot_id = state_guard.daemon_boot_id().to_string();
+            Some((generation, boot_id, prior_generation))
+        } else {
+            None
+        };
         // Issue #606: what the pane should come back as if there is no record
         // left to respawn from — a `StopAgent` that removed the entry before
         // spending its termination grace, or a worker that simply died and was
@@ -5413,10 +5452,23 @@ async fn dispatch_one_owned(
             // deriving from the command, where the pane's FROZEN
             // `spawn_agent_type` is not (PRD #225 finding 1).
             agent_type: role.resolved_agent_type(),
-            env: vec![(
-                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
-                pane_id.clone(),
-            )],
+            env: {
+                let mut env = vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane_id.clone(),
+                )];
+                if let Some((generation, boot_id, _)) = reserved.as_ref() {
+                    env.push((
+                        crate::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+                        generation.to_string(),
+                    ));
+                    env.push((
+                        crate::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(),
+                        boot_id.clone(),
+                    ));
+                }
+                env
+            },
         };
         match registry
             .respawn_or_recreate_agent_for_pane(&pane_id, &role.command, &recreate_identity)
@@ -5434,15 +5486,40 @@ async fn dispatch_one_owned(
                     // delegate to this role resolves no pane at all and is
                     // rejected with `reached no worker for role(s)` — the
                     // permanent breakage issue #606 reports.
-                    if let (Some(state), Some(identity)) = (state.as_ref(), orchestration.clone()) {
-                        state.write().await.register_orchestration_role(
+                    // Issue #706: confirm the generation reserved BEFORE this
+                    // respawn — and already injected into the recreated
+                    // child's env — via `confirm_orchestration_role`, rather
+                    // than `register_orchestration_role`, which would reserve
+                    // a SECOND generation here and desynchronize the map from
+                    // what the child's env actually carries.
+                    if let (Some(state), Some(identity), Some((generation, _, _))) =
+                        (state.as_ref(), orchestration.clone(), reserved.as_ref())
+                    {
+                        state.write().await.confirm_orchestration_role(
                             &pane_id,
                             &target_role,
                             false,
                             identity,
                             cwd.as_deref(),
+                            *generation,
                         );
                     }
+                } else if let (Some(state), Some((_, _, prior_generation))) =
+                    (state.as_ref(), reserved.as_ref())
+                {
+                    // Fix round 2 (reviewer B1 / auditor A1): the ordinary
+                    // respawn leg — "the overwhelmingly common outcome" per
+                    // `respawn_or_recreate_agent_for_pane`'s own doc — replays
+                    // the previous child's `spawn_env` verbatim and never
+                    // consumes `recreate_identity.env`, so the reservation
+                    // above is never confirmed on this leg. Undo its eager
+                    // write here, under the same `_dispatch_guard` scope, so
+                    // the map ends up exactly where it was before this
+                    // respawn attempt — matching the unchanged child env.
+                    state
+                        .write()
+                        .await
+                        .restore_registration_generation(&pane_id, *prior_generation);
                 }
                 // Issue #687: THIS is where the previous generation stops being
                 // the pane's delegated worker, so this is where its silent-worker
@@ -6004,6 +6081,18 @@ async fn dispatch_one_owned(
                 expected_worker_agent_id = Some(new_agent_id);
             }
             Err(e) => {
+                // Fix round 2 (auditor A3): the respawn/recreate call itself
+                // failed, so no child exists to carry the reservation above —
+                // restore the pane's prior generation for the same reason the
+                // `recreated == false` branch does.
+                if let (Some(state), Some((_, _, prior_generation))) =
+                    (state.as_ref(), reserved.as_ref())
+                {
+                    state
+                        .write()
+                        .await
+                        .restore_registration_generation(&pane_id, *prior_generation);
+                }
                 // The respawn failed AFTER the terminate phase
                 // already disposed of the previous child.
                 // Without surfacing the error to the operator,
@@ -7123,6 +7212,33 @@ impl AppState {
         *entry
     }
 
+    /// Fork #706 fix round 2 (reviewer B1 / auditor A1): undo an eager
+    /// [`Self::reserve_registration_generation`] whose reservation was never
+    /// confirmed — the caller's respawn turned out to be the ordinary
+    /// (non-recreate) leg, which replays the previous child's env verbatim
+    /// and therefore never consumes the reserved value, or the respawn/
+    /// recreate call itself failed and no child carrying the reservation
+    /// exists at all. Either way the map must end up exactly where it was
+    /// before the reservation, matching what the (unchanged) child's
+    /// environment actually carries — restores `prior_generation` if the
+    /// pane had one, or removes the entry if it did not (a pane reserving
+    /// its very first generation on a leg that turns out not to need it).
+    pub fn restore_registration_generation(
+        &mut self,
+        pane_id: &str,
+        prior_generation: Option<u64>,
+    ) {
+        match prior_generation {
+            Some(value) => {
+                self.pane_registration_generation
+                    .insert(pane_id.to_string(), value);
+            }
+            None => {
+                self.pane_registration_generation.remove(pane_id);
+            }
+        }
+    }
+
     /// Fork #358 M4: this `AppState` instance's [`DaemonBootId`], read
     /// alongside [`Self::reserve_registration_generation`] at spawn time so
     /// a production spawn call site can inject BOTH into the child's
@@ -7814,12 +7930,23 @@ impl AppState {
 /// already does: a plain async FREE FUNCTION taking the [`SharedState`]
 /// handle directly. A short-lived READ guard resolves caller validation,
 /// target resolution, the crashed check, and the role config lookup, then
-/// drops BEFORE the respawn — no state-lock dependency held across it. The
-/// `recreated: true` re-registration case still needs a WRITE guard, still
-/// deferred into a detached `tokio::spawn`ed task (issue #606's
-/// `dispatch_one_owned` precedent), since taking it synchronously here would
-/// still park behind any reader queued after this function's own read guard
-/// already dropped.
+/// drops BEFORE the respawn — no state-lock dependency held across it.
+///
+/// **Locking (fix-round #706)**: the `recreated: true` re-registration case
+/// now confirms the generation SYNCHRONOUSLY, inside the same
+/// `pane_dispatch_lock` scope as the reservation, rather than deferring into
+/// a detached `tokio::spawn`ed task the way issue #606's `dispatch_one_owned`
+/// precedent once suggested. That precedent no longer applies here: this
+/// function's own read guard is already dropped well before the dispatch
+/// guard is even acquired (see above), so taking the confirm's WRITE guard
+/// synchronously does not park behind any queued reader — there is nothing
+/// left held to park behind. Confirming inline also closes a fail-open
+/// overtake window the old detached task left open: a later dispatch on the
+/// same pane could confirm a newer generation, and the still-pending
+/// detached task would then stamp the map back to its own, now-stale,
+/// generation. Reserve, spawn, and confirm/restore all now execute before
+/// `_dispatch_guard` is released, so no other dispatch or restart on this
+/// pane can interleave.
 ///
 /// **Locking (fix-round M2)**: also acquires
 /// [`AgentPtyRegistry::pane_dispatch_lock`] for the duration of the respawn —
@@ -7944,6 +8071,34 @@ pub async fn handle_restart_role_with_state(
     let dispatch_mutex = registry.pane_dispatch_lock(&resolved.pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
 
+    // Issue #706: reserve the registration generation and read the daemon
+    // boot id under one write-guard acquisition BEFORE building
+    // `recreate_identity` / calling `respawn_or_recreate_agent_for_pane` —
+    // mirroring `dispatch_one_owned`'s recreate leg and
+    // `handle_spawn_role_with_state`'s fix-round B1 pattern — so both can be
+    // injected into the recreated child's env. This has to happen
+    // synchronously, in this function's own body, before the spawn: the
+    // reservation must be visible in the child's env by the time it is
+    // spawned.
+    //
+    // Fix round 2 (reviewer B1 / auditor A1): the reservation is eager — it
+    // writes `pane_registration_generation` immediately — so the pane's
+    // PRIOR value is captured here, under the same write-guard acquisition,
+    // and restored below on every outcome that does not confirm this exact
+    // reservation (the ordinary, non-recreate respawn and the `Err(_)`
+    // respawn-failure arm), so the map ends up exactly where it was before
+    // this restart attempt on those outcomes.
+    let (reserved_generation, daemon_boot_id, prior_generation) = {
+        let mut state_guard = state.write().await;
+        let prior_generation = state_guard
+            .pane_registration_generation
+            .get(&resolved.pane_id)
+            .copied();
+        let generation = state_guard.reserve_registration_generation(&resolved.pane_id);
+        let boot_id = state_guard.daemon_boot_id().to_string();
+        (generation, boot_id, prior_generation)
+    };
+
     let recreate_identity = crate::agent_pty::PaneRecreateIdentity {
         cwd: resolved.cwd.clone(),
         display_name: Some(signal.role.clone()),
@@ -7966,10 +8121,20 @@ pub async fn handle_restart_role_with_state(
             },
         }),
         agent_type: resolved.role_config.resolved_agent_type(),
-        env: vec![(
-            crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
-            resolved.pane_id.clone(),
-        )],
+        env: vec![
+            (
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                resolved.pane_id.clone(),
+            ),
+            (
+                crate::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+                reserved_generation.to_string(),
+            ),
+            (
+                crate::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(),
+                daemon_boot_id.clone(),
+            ),
+        ],
     };
 
     match registry
@@ -7981,24 +8146,50 @@ pub async fn handle_restart_role_with_state(
         .await
     {
         Ok(crate::agent_pty::PaneRespawn { recreated, .. }) => {
-            if recreated && let Some(identity) = resolved.orchestration.clone() {
-                // See this function's own locking note: `state` is cloned
-                // and the write lock is taken inside a DETACHED task, only
-                // after this function has already returned and released its
-                // own (already-dropped) read guard.
-                let state = state.clone();
-                let role = signal.role.clone();
-                let pane_id = resolved.pane_id.clone();
-                let cwd = resolved.cwd.clone();
-                tokio::spawn(async move {
-                    state.write().await.register_orchestration_role(
-                        &pane_id,
-                        &role,
+            if recreated {
+                if let Some(identity) = resolved.orchestration.clone() {
+                    // Fix round 2 (reviewer B2 / auditor A2): confirm
+                    // SYNCHRONOUSLY, inside `_dispatch_guard`'s scope, rather
+                    // than in a detached task — this function's own read
+                    // guard is already dropped by this point (see "Read
+                    // guard drops here" above, well before the dispatch
+                    // guard is even acquired), so taking the write lock here
+                    // cannot deadlock against it. A detached confirmation
+                    // could be overtaken by a later dispatch/restart on the
+                    // SAME pane (which reserves, spawns and confirms a NEWER
+                    // generation while this task is still queued), and would
+                    // then write this call's OLDER, already-superseded
+                    // value back over it — a fail-OPEN race the synchronous
+                    // call removes by construction: everything here runs
+                    // before `_dispatch_guard` is released, so no later
+                    // dispatch on this pane can interleave.
+                    //
+                    // Issue #706: confirm the SAME `reserved_generation`
+                    // already injected into the recreated child's env above,
+                    // via `confirm_orchestration_role` rather than
+                    // `register_orchestration_role` — which would reserve a
+                    // SECOND generation here and desynchronize the map from
+                    // what the child's env actually carries.
+                    state.write().await.confirm_orchestration_role(
+                        &resolved.pane_id,
+                        &signal.role,
                         false,
                         identity,
-                        cwd.as_deref(),
+                        resolved.cwd.as_deref(),
+                        reserved_generation,
                     );
-                });
+                }
+            } else {
+                // Fix round 2 (reviewer B1 / auditor A1): the ordinary
+                // respawn leg never consumes `recreate_identity.env`, so the
+                // reservation above is never confirmed on this leg — undo
+                // its eager write here, still under `_dispatch_guard`, so
+                // the map ends up exactly where it was before this restart
+                // attempt, matching the unchanged child env.
+                state
+                    .write()
+                    .await
+                    .restore_registration_generation(&resolved.pane_id, prior_generation);
             }
             RestartRoleResponse {
                 restarted: true,
@@ -8006,11 +8197,21 @@ pub async fn handle_restart_role_with_state(
                 ..Default::default()
             }
         }
-        Err(e) => RestartRoleResponse {
-            restarted: false,
-            error: Some(format!("failed to restart role `{}`: {e}", signal.role)),
-            ..Default::default()
-        },
+        Err(e) => {
+            // Fix round 2 (auditor A3): the respawn/recreate call itself
+            // failed, so no child exists to carry the reservation above —
+            // restore the pane's prior generation for the same reason the
+            // `recreated == false` branch does.
+            state
+                .write()
+                .await
+                .restore_registration_generation(&resolved.pane_id, prior_generation);
+            RestartRoleResponse {
+                restarted: false,
+                error: Some(format!("failed to restart role `{}`: {e}", signal.role)),
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -8027,10 +8228,12 @@ pub async fn handle_restart_role_with_state(
 /// is a plain async FREE FUNCTION taking the [`SharedState`] handle directly
 /// rather than an already-held read guard — every successful spawn needs
 /// [`AppState::confirm_orchestration_role`] (a write lock) on the MAIN
-/// path, since deferring it (the way `handle_restart_role_with_state`
-/// defers its rare re-registration case into a detached task) would let
-/// the response claim `spawned: true` before a `delegate` to the new role
-/// could actually reach it. A short-lived READ guard resolves caller
+/// path, since deferring it would let the response claim `spawned: true`
+/// before a `delegate` to the new role could actually reach it.
+/// `handle_restart_role_with_state` now confirms its own rare
+/// re-registration case synchronously for exactly the same reason (fix-round
+/// #706), so both functions share the same reserve-then-confirm-inline
+/// pattern. A short-lived READ guard resolves caller
 /// validation, cwd/identity, the "already live" check, and the role
 /// config lookup, then drops BEFORE `registry.spawn_agent(...)` runs (no
 /// state-lock dependency of its own — never hold a guard across it, since
