@@ -165,7 +165,19 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          will delegate the next hop. The chain you coordinate is: worker A diagnoses → reports → \
          you delegate to worker B → worker B works → reports → you re-engage worker A.\n\n\
          When a task related to a PRD is fully completed (all workers done, reviews passed), \
-         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n"
+         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n\n\
+         When the whole wait fits in one foreground command within this turn — a CI check \
+         via `gh run watch`, say — run that command directly instead. Reserve \
+         `{bin} wait start <label>` and `{bin} wait done <label> --outcome \
+         <success|failure|cancelled|timeout>` for waits that genuinely span turns, most often \
+         a delegated worker's response, which arrives as an injected message no foreground \
+         command of yours could ever observe. Pick `<label>` yourself as a short fixed token \
+         (e.g. `ci-check`), never derived from untrusted text, and single-quote it unless it's \
+         already a bare safe token. `wait start` only marks the pane — it does not itself watch \
+         anything, so you still need whatever check actually learns the outcome — and it keeps \
+         the pane reading `Working` only while the wait is outstanding, not indefinitely; call \
+         `wait done ... --outcome cancelled` instead of waiting for the TTL if you stop caring \
+         about the wait before it resolves. (Full detail: `docs/orchestration.md`.)\n"
     ));
 
     content
@@ -313,6 +325,57 @@ mod tests {
         assert!(
             !c.contains("**orchestrator**:"),
             "the start role is the reader, not one of its own available agents"
+        );
+    }
+
+    /// Issue #709: an orchestrator waiting on an external result (CI, another
+    /// agent, an approval) has no idea `wait start <label>` / `wait done <label>
+    /// --outcome <...>` (PRD #499) exists unless the binary itself tells it — a
+    /// project's own `.dot-agent-deck.toml` never mentions binary-level CLI verbs.
+    /// Observed directly: without this, orchestrators fall back to constructing
+    /// manual foreground polling loops instead. The guidance must land in the
+    /// "## Important" section, not just anywhere in the context, since that is
+    /// where orchestrator behavior expectations are documented.
+    ///
+    /// Also pins the scoping condition, not just the two verbs: PR #711 (CLAUDE.md
+    /// rule 28's own version of this guidance) had its first draft rejected twice
+    /// for inverting `docs/orchestration.md`'s documented split — recommending the
+    /// wait CLI unconditionally instead of specifically for waits with no live
+    /// foreground process/command to be the evidence. Without this, the test would
+    /// stay green even if the paragraph were rewritten into "always use `wait
+    /// start` when waiting", which is exactly the regression that matters here.
+    /// Section-slicing is guarded against a role's own `prompt_template`
+    /// (arbitrary project config, embedded earlier in the same string) ever itself
+    /// containing the literal "## Important", which would otherwise make
+    /// `nth(1)` silently pick the wrong slice.
+    #[test]
+    fn context_teaches_the_orchestrator_about_the_monitored_wait_cli() {
+        let c = build_orchestrator_context(&config());
+        let heading_count = c.matches("## Important").count();
+        assert_eq!(
+            heading_count, 1,
+            "expected exactly one '## Important' heading (found {heading_count}); a role's own \
+             prompt_template containing that literal would make split-based slicing below pick \
+             the wrong section"
+        );
+        let important = c
+            .split("## Important")
+            .nth(1)
+            .expect("an '## Important' section exists");
+        assert!(
+            important.contains("wait start"),
+            "the Important section must mention `wait start`, got: {important}"
+        );
+        assert!(
+            important.contains("wait done"),
+            "the Important section must mention `wait done`, got: {important}"
+        );
+        assert!(
+            important.contains("foreground"),
+            "the guidance must scope the wait CLI to waits with no live foreground process/command \
+             of your own, per docs/orchestration.md's documented split between CLAUDE.md rule 28's \
+             live-process convention and the wait CLI's cross-turn backstop — an unscoped rewrite \
+             (e.g. \"always use `wait start` when waiting\") must fail this test; got: {important}"
         );
     }
 
