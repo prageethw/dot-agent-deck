@@ -98,6 +98,54 @@ jobs:
             exit 0
           fi
 
+          # Tier 1 "unexpected-file report" (fork issue #259): group the file
+          # list above by top-level directory and print it to the job summary,
+          # purely for a human to glance at -- non-blocking, no output, no
+          # effect on docs_only/devbox_only/flake_only below. The issue's own
+          # postmortem (PR #219's post-sync rebase silently resurrecting stale
+          # content) found the failure mode was that nobody had the changed-
+          # file list in front of them grouped in a way that made the odd one
+          # out obvious, not that anyone would have argued with it once seen.
+          # Classifying a file as "expected" or "unexpected" would mean
+          # guessing PR intent, which is the false-positive risk the issue's
+          # own follow-up comment gives as the reason that part stays
+          # deferred -- this only lays the list out, it renders no verdict.
+          #
+          # `|| echo "::warning..."` on the whole block is this step's own
+          # fail-safe, mirroring the `|| true` above: a parsing hiccup here
+          # must not take down `changes`, which every other Rust job `needs`.
+          {
+            echo "### Changed files by directory"
+            echo ""
+            echo "| Directory | Files | Names |"
+            echo "|---|---|---|"
+            # Map each line to "<top-level segment>\t<full path>" -- a bare
+            # root-level file (no `/`) buckets as "(root)". `sort` then groups
+            # same-directory lines together for the awk pass below.
+            echo "$files" | awk -F/ '{ print (NF > 1 ? $1 : "(root)") "\t" $0 }' | sort | awk -F'\t' '
+              {
+                dir = $1
+                file = $2
+                count[dir]++
+                # Cap the printed names at 15 per directory so one huge
+                # directory cannot blow out the summary -- the Files column
+                # still reports the true total either way, so nothing is
+                # silently dropped at the directory level, only within a
+                # long list inside one.
+                if (count[dir] <= 15) {
+                  names[dir] = (dir in names) ? names[dir] ", `" file "`" : "`" file "`"
+                } else if (count[dir] == 16) {
+                  names[dir] = names[dir] ", ..."
+                }
+              }
+              END {
+                for (dir in count) print dir "\t" count[dir] "\t" names[dir]
+              }
+            ' | sort | while IFS=$'\t' read -r dir count names; do
+              echo "| $dir | $count | $names |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY" || echo "::warning::unexpected-file report failed to render -- non-blocking, see step log"
+
           # docs_only applies to EVERY PR author, unlike devbox_only/flake_only
           # below -- a doc-only diff can't move most of what the Rust/security/
           # e2e jobs check, whoever wrote it, so there's no equivalent of "the
