@@ -22691,15 +22691,18 @@ fn render_session_card(
         ("Starting…".to_string(), text_primary())
     } else if is_empty_placeholder {
         ("No agent".to_string(), text_primary())
-    } else if session.wait_synthetic_working {
+    } else if session.status == SessionStatus::Working
+        && (session.wait_synthetic_working || session.wait_deferred_revert)
+    {
         // Issue #714: a `Working` currently held up by a monitored external
-        // wait (`worker-agent-deck wait start`), not real agent activity —
-        // render distinctly from ordinary Working so it isn't mistaken for
-        // genuine agent progress.
-        let (label, _style) = status_style(&session.status);
+        // wait (`worker-agent-deck wait start`) or a deferred revert handed
+        // off to it, not real agent activity — render distinctly from
+        // ordinary Working so it isn't mistaken for genuine agent progress.
+        let observing = session.wait_synthetic_working || session.wait_deferred_revert;
+        let (label, style) = status_style(&session.status);
         (
             format!("{label} (observing)"),
-            Style::default().fg(palette::status_color_for(&session.status, true)),
+            style.fg(palette::status_color_for(&session.status, observing)),
         )
     } else {
         let (label, style) = status_style(&session.status);

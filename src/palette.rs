@@ -237,9 +237,15 @@ pub const SELECTED: Color = Color::Reset;
 pub const ROLE_NAME: Color = Color::Indexed(130);
 
 /// Resolve a session status to its centralized border/badge role color. This
-/// is the single source of truth shared by the deck-card render path
-/// (`src/ui.rs`) and the embedded-pane render path (`src/terminal_widget.rs`),
-/// so a given state shows the same border color in both contexts.
+/// is the shared base for the deck-card render path (`src/ui.rs`) and the
+/// embedded-pane render path (`src/terminal_widget.rs`), so a given
+/// state shows the same border color in both contexts — with one deliberate
+/// exception: the deck-card side also calls [`status_color_for`], which
+/// additively promotes an observing `Working` to [`STATUS_OBSERVING`]. The
+/// embedded-pane side does not yet call it, so an observing session's
+/// embedded-pane border currently still shows the plain `Working` color
+/// while its deck card shows the observing color — tracked as issue #719,
+/// not fixed here.
 pub fn status_color(status: &SessionStatus) -> Color {
     match status {
         SessionStatus::Working => STATUS_WORKING,

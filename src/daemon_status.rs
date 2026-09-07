@@ -185,7 +185,7 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                     .unwrap_or(false),
                 wait_synthetic_working: live
                     .as_ref()
-                    .map(|s| s.wait_synthetic_working)
+                    .map(|s| s.wait_synthetic_working || s.wait_deferred_revert)
                     .unwrap_or(false),
                 // Issue #455: project down to the NAME here, at the one place
                 // that crosses from internal state into the CLI's document —
@@ -240,7 +240,7 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
         // external wait (`worker-agent-deck wait start`), not real agent
         // activity. See `wait_synthetic_working`'s doc comment in
         // `src/state.rs`.
-        let status = if a.wait_synthetic_working {
+        let status = if a.wait_synthetic_working && a.status == Some(SessionStatus::Working) {
             format!("{status} (observing)")
         } else {
             status
