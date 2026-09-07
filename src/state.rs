@@ -7374,9 +7374,10 @@ impl AppState {
             // is preserved.
             session.agent_report_activity_seen |= snap.agent_report_activity_seen;
             // Issue #653: mirror `apply_event`'s pairing of these two fields.
-            // Must run after the `|=` above since it reads the merged value,
-            // not just the incoming snapshot's, so a locally-latched `true`
-            // clears `expects_agent_report` even when the snapshot lags.
+            // Placed after the `|=` so it reads the merged value — today the
+            // two agree whenever the local latch is set, but reading the
+            // merged value keeps this correct if a future path ever latches
+            // the flag without clearing its partner.
             if session.agent_report_activity_seen {
                 session.expects_agent_report = false;
             }
