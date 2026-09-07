@@ -99,16 +99,13 @@ pub struct StatusAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SessionStatus>,
     pub shell_synthetic_working: bool,
-    /// Issue #714 (H1 fix): whether a monitored external wait
-    /// (`worker-agent-deck wait start`/`wait done`) is the reason this pane
-    /// currently reads `Working` — either because the wait promoted it from
-    /// idle, or because it is holding open a `Working` that an agent's own
-    /// real completion would otherwise have reverted (`wait_deferred_revert`
-    /// in `state.rs`). NOT a direct passthrough of
-    /// [`crate::state::SessionSnapshot::wait_synthetic_working`], which only
-    /// covers the first case — see [`build_status_agents`]'s projection of
-    /// this field for the OR that broadens it.
-    pub wait_synthetic_working: bool,
+    /// Issue #714: whether a monitored external wait (`worker-agent-deck
+    /// wait start`/`wait done`) is the reason this pane currently reads
+    /// `Working` — either because the wait promoted it from idle, or
+    /// because it is holding open a `Working` that an agent's own real
+    /// completion would otherwise have reverted. Drives the `(observing)`
+    /// marker on both the CLI and TUI surfaces.
+    pub wait_observing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<StatusTool>,
     /// Issue #586 M1/M2: PRD #126's idle-worker watch, if currently armed for
@@ -192,7 +189,7 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                     .as_ref()
                     .map(|s| s.shell_synthetic_working)
                     .unwrap_or(false),
-                wait_synthetic_working: live
+                wait_observing: live
                     .as_ref()
                     .map(|s| s.wait_synthetic_working || s.wait_deferred_revert)
                     .unwrap_or(false),
@@ -246,10 +243,12 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
             status
         };
         // Issue #714: flag a `Working` currently held up by a monitored
-        // external wait (`worker-agent-deck wait start`), not real agent
-        // activity. See `wait_synthetic_working`'s doc comment in
-        // `src/state.rs`.
-        let status = if a.wait_synthetic_working && a.status == Some(SessionStatus::Working) {
+        // external wait (`worker-agent-deck wait start`) rather than real
+        // agent activity — either because the wait promoted the pane from
+        // idle, or because it is holding open a `Working` an agent's own
+        // completion would otherwise have reverted. See `wait_observing`'s
+        // doc comment above.
+        let status = if a.wait_observing && a.status == Some(SessionStatus::Working) {
             format!("{status} (observing)")
         } else {
             status

@@ -222,7 +222,7 @@ dot-agent-deck daemon status --json
       "role": "mode:review",
       "status": "Thinking",
       "shell_synthetic_working": false,
-      "wait_synthetic_working": false
+      "wait_observing": false
     },
     {
       "agent_id": "2",
@@ -231,7 +231,7 @@ dot-agent-deck daemon status --json
       "cwd": "/home/you/src/api",
       "status": "Working",
       "shell_synthetic_working": false,
-      "wait_synthetic_working": false,
+      "wait_observing": false,
       "active_tool": { "name": "Bash" }
     },
     {
@@ -242,7 +242,7 @@ dot-agent-deck daemon status --json
       "role": "coder",
       "status": "Idle",
       "shell_synthetic_working": false,
-      "wait_synthetic_working": false,
+      "wait_observing": false,
       "outstanding_delegation": { "armed_secs_ago": 42, "orchestrator_pane_id": "1" },
       "silence_watch": { "armed_secs_ago": 42, "orchestrator_pane_id": "1" },
       "delegation_commission": {
