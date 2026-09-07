@@ -283,6 +283,89 @@ fn contrast_003_observing_status_clears_non_text_aa_on_light_and_dark_terminals(
     }
 }
 
+/// Scenario: issue #715 — `palette::ROLE_NAME` moved from a fixed
+/// `Color::Indexed(130)` to the named-ANSI `Color::LightRed`, so it needs the
+/// same live contrast guard `theme/contrast/002` gives `STATUS_WAITING`
+/// rather than staying a documentation-only claim. Unlike `STATUS_WAITING`,
+/// `LightRed` can't clear full text AA (4.5:1, SC 1.4.3) on every
+/// theme-matched pairing — its base and bright renderings are identical
+/// (it's already the bright half of red), so its light-terminal pairing
+/// measures 4.00:1, short of 4.5:1, while its dark-terminal pairing measures
+/// 5.25:1 and clears it easily. This guard holds only the dark-terminal
+/// pairing to AA_TEXT and relaxes the other three — including the
+/// light-terminal one — to the AA_NON_TEXT (3:1) floor SC 1.4.11 sets for a
+/// non-text UI element like a deck-card body row, mirroring
+/// `theme/contrast/002`'s per-pairing floor rather than reusing it whole.
+/// This is an accepted, deliberate floor for this specific role (see
+/// `palette::ROLE_NAME`'s own doc comment), not an oversight.
+#[spec("theme/contrast/004")]
+#[test]
+fn contrast_004_role_name_clears_non_text_aa_on_light_and_dark_terminals() {
+    let role_name = palette::ROLE_NAME;
+    let (base, bright) = reference_srgb(role_name).unwrap_or_else(|| {
+        panic!(
+            "ROLE_NAME is {role_name:?}, which has no named-ANSI reference rendering — \
+             a status role must be a named ANSI colour so the terminal's own theme can \
+             remap it (see `theme/contrast/001`)"
+        )
+    });
+
+    for (i, (label, fg, bg, _floor)) in pairings(base, bright).into_iter().enumerate() {
+        let ratio = contrast_ratio(fg, bg);
+        // `pairings()`'s own `_floor` assumes BOTH theme-matched pairings
+        // (base-on-white and bright-on-black) clear full text AA for any
+        // role — true for `STATUS_WAITING` (`theme/contrast/002`). It does
+        // not hold here: `ROLE_NAME` is `Color::LightRed`, whose base and
+        // bright values are the SAME triple, so its light-terminal pairing
+        // (index 0, base slot on white) renders identically to its
+        // mismatched bright-on-white pairing (index 2) and only reaches
+        // 4.00:1 — short of 4.5:1. Its dark-terminal pairing (index 1,
+        // bright slot on black) reaches 5.25:1 and clears it. So the
+        // relaxation is held only where this role's actual numbers need it:
+        // every pairing except index 1 drops to the non-text floor.
+        //
+        // Identified by the pairing's fixed position in `pairings()`'s
+        // returned array (index 1 is always "dark terminal (bright slot on
+        // black)", per that function's own doc), not by comparing `(fg, bg)`
+        // values — for a role whose base and bright renderings are the same
+        // triple (true for `LightRed` today), `fg == bright` matches BOTH
+        // black pairings, which would silently hold the mismatched
+        // base-on-black pairing to the stricter floor too. A positional
+        // check can't misfire regardless of what colours are involved.
+        let floor = if i == 1 { AA_TEXT } else { AA_NON_TEXT };
+        assert!(
+            ratio >= floor,
+            "ROLE_NAME ({role_name:?}) renders at {ratio:.2}:1 on a {label}, below the \
+             {floor}:1 floor — the role-name row on a deck card must stay legible enough \
+             to notice, holding full text AA on the pairing that clears it and the 3:1 \
+             non-text floor on the rest (issue #715)"
+        );
+    }
+
+    // Distinctness: contrast alone would be satisfied by simply reusing
+    // another role's colour, which would make role names unreadable in a
+    // different way. `STATUS_ERROR` is deliberately exempt from THIS check
+    // in spirit — `ROLE_NAME`'s own doc comment records the accepted hue
+    // family collision with it — but `Color::LightRed` and `Color::Red` are
+    // still distinct enum values, so the assertion holds trivially and the
+    // role stays covered like every other one.
+    for (name, other) in [
+        ("STATUS_WORKING", palette::STATUS_WORKING),
+        ("STATUS_THINKING", palette::STATUS_THINKING),
+        ("STATUS_WAITING", palette::STATUS_WAITING),
+        ("STATUS_ERROR", palette::STATUS_ERROR),
+        ("STATUS_IDLE", palette::STATUS_IDLE),
+        ("FOCUSED", palette::FOCUSED),
+        ("SELECTED", palette::SELECTED),
+    ] {
+        assert_ne!(
+            role_name, other,
+            "ROLE_NAME must stay distinct from {name}; a legible colour that collides with \
+             another role still loses the signal"
+        );
+    }
+}
+
 // Unit-guard for the arithmetic above (not a `#[spec]` catalog entry). A
 // contrast test is only worth its floors if the ratios it computes are the ones
 // a contrast checker would report, and a subtly wrong `relative_luminance` would

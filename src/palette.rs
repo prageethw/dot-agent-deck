@@ -231,6 +231,12 @@ pub const SELECTED: Color = Color::Reset;
 /// as [`STATUS_ERROR`], just brighter. That was accepted after visual review,
 /// not stumbled into.
 ///
+/// Measured (xterm reference, `theme/contrast/004`): `LightRed` renders at
+/// **4.00:1 on white** and **5.25:1 on black**. The white pairing falls short
+/// of the 4.5:1 WCAG AA text floor (SC 1.4.3) — a second knowingly accepted
+/// tradeoff alongside the hue collision above — but clears the 3:1 SC 1.4.11
+/// non-text floor that actually applies to a body-row label.
+///
 /// This closes the palette's last non-named-ANSI exception. Originally this
 /// constant was `Color::Indexed(130)` — a 256-cube index chosen (PRD #405 M1)
 /// because named ANSI had no orange and `Indexed(130)` measured the best
