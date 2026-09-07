@@ -191,7 +191,10 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                     .unwrap_or(false),
                 wait_observing: live
                     .as_ref()
-                    .map(|s| s.wait_synthetic_working || s.wait_deferred_revert)
+                    .map(|s| {
+                        s.status == SessionStatus::Working
+                            && (s.wait_synthetic_working || s.wait_deferred_revert)
+                    })
                     .unwrap_or(false),
                 // Issue #455: project down to the NAME here, at the one place
                 // that crosses from internal state into the CLI's document —
