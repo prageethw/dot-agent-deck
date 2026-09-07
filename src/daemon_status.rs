@@ -99,6 +99,7 @@ pub struct StatusAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SessionStatus>,
     pub shell_synthetic_working: bool,
+    pub wait_synthetic_working: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<StatusTool>,
     /// Issue #586 M1/M2: PRD #126's idle-worker watch, if currently armed for
@@ -182,6 +183,10 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                     .as_ref()
                     .map(|s| s.shell_synthetic_working)
                     .unwrap_or(false),
+                wait_synthetic_working: live
+                    .as_ref()
+                    .map(|s| s.wait_synthetic_working)
+                    .unwrap_or(false),
                 // Issue #455: project down to the NAME here, at the one place
                 // that crosses from internal state into the CLI's document —
                 // `detail` never leaves this function.
@@ -228,6 +233,15 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
         // `shell_synthetic_working`'s doc comment in `src/state.rs`.
         let status = if a.shell_synthetic_working {
             format!("{status}*")
+        } else {
+            status
+        };
+        // Issue #714: flag a `Working` currently held up by a monitored
+        // external wait (`worker-agent-deck wait start`), not real agent
+        // activity. See `wait_synthetic_working`'s doc comment in
+        // `src/state.rs`.
+        let status = if a.wait_synthetic_working {
+            format!("{status} (observing)")
         } else {
             status
         };

@@ -180,6 +180,17 @@ pub const STATUS_WAITING: Color = Color::Magenta;
 pub const STATUS_ERROR: Color = Color::Red;
 /// Idle — no current activity (dimmed).
 pub const STATUS_IDLE: Color = Color::DarkGray;
+/// Observing — the pane is held `Working` by a monitored external wait
+/// (`worker-agent-deck wait start`), not real agent activity. Issue #714.
+/// `Color::LightBlue`: measured 4.74:1 on white (clears text AA), 4.43:1
+/// on black (clears the SC 1.4.11 3:1 non-text floor, same shape
+/// STATUS_WAITING already ships with in its own mismatched case). Known,
+/// accepted collision: Devin's `agent_registry::badge_color` is also
+/// `Color::LightBlue` — a Devin pane in a monitored wait shows the same
+/// hue on both its agent badge and its status marker. Accepted
+/// deliberately (issue #714 discussion) rather than giving up
+/// theme-adaptivity for a fixed `Indexed` value.
+pub const STATUS_OBSERVING: Color = Color::LightBlue;
 
 // ---------------------------------------------------------------------------
 // Accent roles (must be distinct from every status color and from each other)
@@ -242,6 +253,21 @@ pub fn status_color(status: &SessionStatus) -> Color {
         // PRD #162 forward-compat: an unknown wire status renders with the
         // neutral idle color so it never masquerades as an active state.
         SessionStatus::Unknown => STATUS_IDLE,
+    }
+}
+
+/// Like [`status_color`], but promotes a `Working` status to
+/// [`STATUS_OBSERVING`] when it is currently held up by a monitored external
+/// wait rather than real agent activity (issue #714). Every other status is
+/// unaffected, even when the flag is stale/true — the flag only ever
+/// modulates `Working`. Additive: `status_color` itself is unchanged, so its
+/// other callers (embedded-pane border, tab aggregation) keep their existing
+/// behavior.
+pub fn status_color_for(status: &SessionStatus, wait_synthetic_working: bool) -> Color {
+    if wait_synthetic_working && *status == SessionStatus::Working {
+        STATUS_OBSERVING
+    } else {
+        status_color(status)
     }
 }
 

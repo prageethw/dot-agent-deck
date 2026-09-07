@@ -22688,11 +22688,22 @@ fn render_session_card(
     // (below) is the one deliberate exception — see its own comment (D4).
     let is_empty_placeholder = is_placeholder && !session.agent_report_activity_seen;
     let (status_label, status_style) = if is_pending {
-        ("Starting…", text_primary())
+        ("Starting…".to_string(), text_primary())
     } else if is_empty_placeholder {
-        ("No agent", text_primary())
+        ("No agent".to_string(), text_primary())
+    } else if session.wait_synthetic_working {
+        // Issue #714: a `Working` currently held up by a monitored external
+        // wait (`worker-agent-deck wait start`), not real agent activity —
+        // render distinctly from ordinary Working so it isn't mistaken for
+        // genuine agent progress.
+        let (label, _style) = status_style(&session.status);
+        (
+            format!("{label} (observing)"),
+            Style::default().fg(palette::status_color_for(&session.status, true)),
+        )
     } else {
-        status_style(&session.status)
+        let (label, style) = status_style(&session.status);
+        (label.to_string(), style)
     };
     let status_color = status_style.fg.unwrap_or(Color::Reset);
 
