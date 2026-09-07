@@ -630,8 +630,8 @@ fn write_env_dump_worker(path: &std::path::Path, log: &std::path::Path) {
 /// generation and daemon boot id that `pane_registration_generation` ends up
 /// holding for its pane, not just `DOT_AGENT_DECK_PANE_ID`.
 #[tokio::test(flavor = "multi_thread")]
-#[spec("orchestration/delegate/044")]
-async fn delegate_044_recreate_leg_injects_matching_registration_generation() {
+#[spec("orchestration/delegate/046")]
+async fn delegate_046_recreate_leg_injects_matching_registration_generation() {
     let script_dir = common::race_safe_tempdir();
     let script_path = script_dir.path().join("env-dump-worker.sh");
     let log_path = script_dir.path().join("env-dump.log");
@@ -730,7 +730,7 @@ async fn delegate_044_recreate_leg_injects_matching_registration_generation() {
 /// Scenario: issue #706 fix-round (reviewer B1 / auditor A1) — the ORDINARY
 /// (non-recreate) respawn leg of a `clear = true` delegate, exercised against
 /// a worker pane whose registry record is left INTACT — the opposite of
-/// `delegate_044_recreate_leg_injects_matching_registration_generation`,
+/// `delegate_046_recreate_leg_injects_matching_registration_generation`,
 /// which deliberately forces `recreated: true` by closing the record first.
 /// `respawn_or_recreate_agent_for_pane`'s own doc calls this the
 /// "overwhelmingly common" outcome: with a record present it never falls
@@ -748,8 +748,8 @@ async fn delegate_044_recreate_leg_injects_matching_registration_generation() {
 /// `work-done` will report, closing the same failure #706 fixed on the
 /// recreate leg, on the far more common ordinary path too.
 #[tokio::test(flavor = "multi_thread")]
-#[spec("orchestration/delegate/045")]
-async fn delegate_045_ordinary_respawn_leg_keeps_registration_generation_in_sync() {
+#[spec("orchestration/delegate/047")]
+async fn delegate_047_ordinary_respawn_leg_keeps_registration_generation_in_sync() {
     let daemon = common::spawn_inprocess_daemon().await;
     let initial_boot_id = daemon.state.read().await.daemon_boot_id().to_string();
 
@@ -848,7 +848,7 @@ async fn delegate_045_ordinary_respawn_leg_keeps_registration_generation_in_sync
             .as_deref(),
         Some(fx.worker_agent_id.as_str()),
         "precondition: the worker's registry record must stay INTACT through this test — never \
-         closed — which is what selects the ORDINARY respawn leg rather than delegate_044's \
+         closed — which is what selects the ORDINARY respawn leg rather than delegate_046's \
          forced recreate leg"
     );
 
@@ -876,7 +876,7 @@ async fn delegate_045_ordinary_respawn_leg_keeps_registration_generation_in_sync
     };
     let injected_gen = field("gen");
 
-    // Unlike `delegate_044`, no detached task confirms anything on this leg —
+    // Unlike `delegate_046`, no detached task confirms anything on this leg —
     // `dispatch_one_owned`'s reservation is synchronous and its
     // `confirm_orchestration_role` call only runs `if recreated`, which this
     // is not — so there is nothing to poll for; the map is already whatever
