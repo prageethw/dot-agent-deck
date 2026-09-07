@@ -111,9 +111,20 @@ jobs:
           # own follow-up comment gives as the reason that part stays
           # deferred -- this only lays the list out, it renders no verdict.
           #
-          # `|| echo "::warning..."` on the whole block is this step's own
+          # `tee -a`, not `>>`: the summary file (`$GITHUB_STEP_SUMMARY`) is
+          # not retrievable through the GitHub API (fork issue #32 -- a
+          # check-run's `output.summary` is `null` for a step-summary write;
+          # see e2e.yml's "Publish flaky and failed e2e tests" step for the
+          # same fix applied there first), so mirroring the same table to
+          # stdout puts it somewhere the job log -- and therefore `gh run
+          # view --job <id> --log` -- can actually read.
+          #
+          # `|| echo "::warning..."` on the whole pipeline is this step's own
           # fail-safe, mirroring the `|| true` above: a parsing hiccup here
           # must not take down `changes`, which every other Rust job `needs`.
+          # `set -o pipefail` (part of this step's `set -euo pipefail`) is
+          # what makes the pipeline's exit status reflect a failure in the
+          # `{ ... }` group rather than `tee`'s own (near-certain) success.
           {
             echo "### Changed files by directory"
             echo ""
@@ -144,7 +155,7 @@ jobs:
             ' | sort | while IFS=$'\t' read -r dir count names; do
               echo "| $dir | $count | $names |"
             done
-          } >> "$GITHUB_STEP_SUMMARY" || echo "::warning::unexpected-file report failed to render -- non-blocking, see step log"
+          } | tee -a "$GITHUB_STEP_SUMMARY" || echo "::warning::unexpected-file report failed to render -- non-blocking, see step log"
 
           # docs_only applies to EVERY PR author, unlike devbox_only/flake_only
           # below -- a doc-only diff can't move most of what the Rust/security/
