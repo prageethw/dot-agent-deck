@@ -99,6 +99,15 @@ pub struct StatusAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SessionStatus>,
     pub shell_synthetic_working: bool,
+    /// Issue #714 (H1 fix): whether a monitored external wait
+    /// (`worker-agent-deck wait start`/`wait done`) is the reason this pane
+    /// currently reads `Working` — either because the wait promoted it from
+    /// idle, or because it is holding open a `Working` that an agent's own
+    /// real completion would otherwise have reverted (`wait_deferred_revert`
+    /// in `state.rs`). NOT a direct passthrough of
+    /// [`crate::state::SessionSnapshot::wait_synthetic_working`], which only
+    /// covers the first case — see [`build_status_agents`]'s projection of
+    /// this field for the OR that broadens it.
     pub wait_synthetic_working: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<StatusTool>,

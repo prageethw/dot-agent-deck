@@ -269,8 +269,13 @@ pub fn status_color(status: &SessionStatus) -> Color {
 /// modulates `Working`. Additive: `status_color` itself is unchanged, so its
 /// other callers (embedded-pane border, tab aggregation) keep their existing
 /// behavior.
-pub fn status_color_for(status: &SessionStatus, wait_synthetic_working: bool) -> Color {
-    if wait_synthetic_working && *status == SessionStatus::Working {
+///
+/// `observing` is the caller's already-broadened predicate (its call site in
+/// `src/ui.rs` passes `session.wait_synthetic_working ||
+/// session.wait_deferred_revert`), not a direct passthrough of the
+/// narrower `SessionSnapshot::wait_synthetic_working` field alone.
+pub fn status_color_for(status: &SessionStatus, observing: bool) -> Color {
+    if observing && *status == SessionStatus::Working {
         STATUS_OBSERVING
     } else {
         status_color(status)
