@@ -588,5 +588,9 @@ mod tests {
             "a non-Working row must never show \"(observing)\" even with both wait flags set; \
              got {line:?}"
         );
+        assert!(
+            !agents[0].wait_observing,
+            "the projected wire value must gate on `status == Working` too, not just the text marker"
+        );
     }
 }
