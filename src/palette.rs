@@ -297,4 +297,29 @@ mod tests {
         assert_eq!(highest_priority_status(&[Error, WaitingForInput]), Error);
         assert_eq!(highest_priority_status(&[]), Idle);
     }
+
+    /// Scenario: issue #714 — `status_color_for` must resolve `STATUS_OBSERVING`
+    /// only when `wait_synthetic_working` is set AND the status is `Working`;
+    /// every other combination (flag off, or flag on but a non-`Working`
+    /// status) must fall back to the plain `status_color` resolution
+    /// unchanged, mirroring the `status == SessionStatus::Working` gate
+    /// `state.rs` already applies to this same flag.
+    #[test]
+    fn status_color_for_resolves_observing_only_when_working_and_flagged() {
+        assert_eq!(
+            status_color_for(&SessionStatus::Working, true),
+            STATUS_OBSERVING,
+            "a wait-promoted Working row must resolve to the observing color"
+        );
+        assert_eq!(
+            status_color_for(&SessionStatus::Working, false),
+            STATUS_WORKING,
+            "an ordinary Working row (no wait promotion) must be unchanged"
+        );
+        assert_eq!(
+            status_color_for(&SessionStatus::Idle, true),
+            STATUS_IDLE,
+            "a stale wait_synthetic_working flag must never override a non-Working status"
+        );
+    }
 }

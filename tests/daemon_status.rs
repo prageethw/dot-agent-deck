@@ -525,6 +525,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "shell_synthetic_working",
             "silence_watch",
             "status",
+            "wait_synthetic_working",
         ]),
         "the current schema version must pin every public field name on a fully populated agent row \
          (issue #586 M1: including the three joined delegation-watch fields); got agent={agent:?}"
@@ -561,6 +562,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "role": format!("mode:{JSON_MODE}"),
             "shell_synthetic_working": false,
             "status": "Working",
+            "wait_synthetic_working": false,
         }),
         "the representative row must pin the value and shape of every base public field"
     );

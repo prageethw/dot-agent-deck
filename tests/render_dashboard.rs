@@ -2545,6 +2545,44 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
     );
 }
 
+/// Scenario: issue #714 — a card whose session is `Working` purely because a
+/// monitored wait is holding it there (`wait_synthetic_working: true`) must
+/// render distinctly from an ordinary Working card: both its badge label
+/// (the `" (observing)"` suffix, matching `daemon status`'s CLI wording) and
+/// its border color (`palette::STATUS_OBSERVING`, not the plain
+/// `STATUS_WORKING` green) must reflect the wait promotion. Both assertions
+/// read the observable rendered buffer, per this harness's convention.
+#[test]
+fn observing_001_wait_promoted_working_card_shows_observing_badge_and_color() {
+    let mut session = palette_session(SessionStatus::Working);
+    session.wait_synthetic_working = true;
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,     // animation tick
+        false, // not selected
+        width,
+        height,
+    );
+    let (border_fg, _modifier) = border_style_at_mid(&buffer);
+    assert_eq!(
+        border_fg,
+        dot_agent_deck::palette::STATUS_OBSERVING,
+        "a wait-promoted Working card's border must resolve through STATUS_OBSERVING, not \
+         plain Working green; got {border_fg:?}"
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("observing"),
+        "a wait-promoted Working card's badge must show the \"(observing)\" marker; got:\n{rendered}"
+    );
+}
+
 /// Scenario: Render a FOCUSED, LIVE (`UiMode::PaneInput`) embedded pane and
 /// assert its border is the dedicated `focused` accent role — Color::Cyan — and
 /// that this color is distinct from every status role
