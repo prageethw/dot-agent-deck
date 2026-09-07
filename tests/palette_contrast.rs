@@ -247,7 +247,12 @@ fn contrast_003_observing_status_clears_non_text_aa_on_light_and_dark_terminals(
         // light-terminal pairing), leaving the other three — including the
         // theme-matched dark one — at the non-text floor, exactly the
         // "relaxation held only where it's actually needed" this role earns.
-        let floor = if label == "light terminal (base slot on white)" {
+        //
+        // Identified by the pairing's actual `(fg, bg)` identity, not by
+        // string-comparing `label` — a label reword (shared with
+        // `contrast_002`) must never be able to silently downgrade this
+        // floor from 4.5:1 to 3:1 while the suite stays green.
+        let floor = if fg == base && bg == LIGHT_BG {
             AA_TEXT
         } else {
             AA_NON_TEXT

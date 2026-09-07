@@ -2551,7 +2551,12 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
 /// (the `" (observing)"` suffix, matching `daemon status`'s CLI wording) and
 /// its border color (`palette::STATUS_OBSERVING`, not the plain
 /// `STATUS_WORKING` green) must reflect the wait promotion. Both assertions
-/// read the observable rendered buffer, per this harness's convention.
+/// read the observable rendered buffer, per this harness's convention. Also
+/// pins the `status == Working` gate the fix round added: a card that is NOT
+/// `Working` (here `WaitingForInput`) but carries both wait flags must show
+/// neither the badge nor the color, and — the worst-case regression reviewer
+/// and auditor called out — must not lose `WaitingForInput`'s own
+/// `Modifier::BOLD` on its status text.
 #[spec("theme/palette/007")]
 #[test]
 fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
@@ -2581,6 +2586,45 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
     assert!(
         rendered.contains("observing"),
         "a wait-promoted Working card's badge must show the \"(observing)\" marker; got:\n{rendered}"
+    );
+
+    // Negative case: both wait flags set, but status is NOT `Working` — the
+    // marker/color must not appear, and `WaitingForInput`'s BOLD must survive.
+    let mut not_working = palette_session(SessionStatus::WaitingForInput);
+    not_working.wait_synthetic_working = true;
+    not_working.wait_deferred_revert = true;
+    let buffer = render_card_to_buffer(
+        &not_working,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,     // animation tick
+        false, // not selected
+        width,
+        height,
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        !rendered.contains("observing"),
+        "a non-Working card must never show the \"(observing)\" marker even with both wait \
+         flags set; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Needs Input"),
+        "the card must still render its real WaitingForInput label unchanged; got:\n{rendered}"
+    );
+    let waiting_color = dot_agent_deck::palette::status_color(&SessionStatus::WaitingForInput);
+    let area = buffer.area();
+    let bold_at_waiting_color = (0..area.width).any(|x| {
+        (0..area.height).any(|y| {
+            let cell = &buffer[(x, y)];
+            cell.fg == waiting_color && cell.modifier.contains(Modifier::BOLD)
+        })
+    });
+    assert!(
+        bold_at_waiting_color,
+        "WaitingForInput's own Modifier::BOLD must survive when the wait flags are set but the \
+         status gate blocks the observing override; got:\n{rendered}"
     );
 }
 
