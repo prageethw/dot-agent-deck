@@ -7373,6 +7373,14 @@ impl AppState {
             // incoming snapshot in instead of replacing, so a local `true`
             // is preserved.
             session.agent_report_activity_seen |= snap.agent_report_activity_seen;
+            // Issue #653: mirror `apply_event`'s pairing of these two fields.
+            // Placed after the `|=` so it reads the merged value — today the
+            // two agree whenever the local latch is set, but reading the
+            // merged value keeps this correct if a future path ever latches
+            // the flag without clearing its partner.
+            if session.agent_report_activity_seen {
+                session.expects_agent_report = false;
+            }
             // PRD #20 blocker-4: the durable live-target lives in
             // `recent_events`, so restamp it ONLY when it actually differs —
             // re-pushing an identical carrier on every reconnect would evict
