@@ -3221,6 +3221,88 @@ fn live_020_resync_never_reverts_agent_report_activity_seen() {
     );
 }
 
+/// Scenario: A TUI-side placeholder minted with `expects_agent_report: true`
+/// (issue #549's shape — a Codex pane spawned but not yet self-identified)
+/// misses the resolving events during a daemon outage. On reconnect,
+/// `AppState::resync_hydrated_sessions` merges a snapshot whose
+/// `agent_report_activity_seen` is `true` (the daemon saw real activity this
+/// TUI missed). Per issue #653, the merge must also clear
+/// `expects_agent_report` — the same invariant `apply_event` enforces in the
+/// same statement — so the card stops showing "Starting…" once it is known to
+/// be live, rather than showing that copy beside what now looks like an
+/// active agent badge.
+#[spec("session/live/021")]
+#[test]
+fn live_021_resync_clears_expects_agent_report_when_activity_seen_resolves_true() {
+    let pane = "pane-resync-awaiting-report";
+    let agent_id = "agent-resync-awaiting-report";
+
+    let mut state = AppState::default();
+    let session_id = state.insert_placeholder_session_awaiting_report(
+        pane.to_string(),
+        None,
+        Some(AgentType::Codex),
+        Some(agent_id.to_string()),
+        true,
+    );
+
+    assert!(
+        state.sessions[&session_id].expects_agent_report,
+        "precondition: the placeholder must be minted still awaiting its first report"
+    );
+    assert!(
+        !state.sessions[&session_id].agent_report_activity_seen,
+        "precondition: no activity has been seen yet"
+    );
+
+    // A daemon snapshot, resynced after an outage, that saw real activity
+    // this TUI-side placeholder missed.
+    let record = AgentRecord {
+        id: agent_id.to_string(),
+        pane_id_env: Some(pane.to_string()),
+        display_name: None,
+        cwd: None,
+        tab_membership: None,
+        agent_type: Some(AgentType::Codex),
+        rows: 0,
+        cols: 0,
+        live: Some(SessionSnapshot {
+            status: state.sessions[&session_id].status.clone(),
+            agent_type: Some(AgentType::Codex),
+            active_tool: None,
+            tool_count: 0,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            shell_synthetic_working: false,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
+            wait_deferred_revert: false,
+            model: None,
+            last_activity_ms: None,
+            agent_report_activity_seen: true,
+        }),
+        spawned_at_ms: None,
+        daemon_boot_id: None,
+        registration_generation: None,
+        outstanding_delegation: None,
+        silence_watch: None,
+        delegation_commission: None,
+        crashed: None,
+    };
+
+    state.resync_hydrated_sessions(&[record]);
+
+    assert!(
+        !state.sessions[&session_id].expects_agent_report,
+        "resync must clear `expects_agent_report` once it learns the daemon \
+         has seen real activity, the same invariant `apply_event` enforces — \
+         otherwise the card renders \"Starting…\" beside what now looks like \
+         a live agent badge"
+    );
+}
+
 /// Scenario: Rehydrate one history-only Codex card and one view-only Codex card
 /// from daemon `SessionSnapshot` JSON after a detach/reconnect. Each rebuilt
 /// session must retain its non-live writability so input remains refused rather

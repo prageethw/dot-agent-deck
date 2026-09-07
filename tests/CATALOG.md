@@ -5916,6 +5916,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** the `seed_hydrated_session` (fresh-hydration) path, which already restores the field unconditionally because a fresh placeholder always starts `false` (`session/live/005`, `dashboard/placeholder/003` per `tests/CATALOG.md:312`); a real socket-level resync round-trip (`resync_after_reconnect` itself, `src/reconnect.rs`); the status-recovery half of `resync_hydrated_sessions` (fork issues #49/#28, untested by name elsewhere but not this test's job).
 - **Platform coverage:** mac+linux (file is `#![cfg(unix)]` throughout — see the file's own doc comment).
 
+##### session/live/021 — A resync must clear `expects_agent_report` once it learns the daemon has seen real activity (issue #653).
+- **Layer:** L1 pure state (one `AppState`, a placeholder minted via `insert_placeholder_session_awaiting_report`, then a direct `AppState::resync_hydrated_sessions` call — no wire round-trip, sibling of `session/live/020`).
+- **Agent:** none (a hand-built `AgentRecord` modelling a daemon snapshot that saw real activity during an outage the TUI-side placeholder missed).
+- **Asserts:** a TUI-side placeholder minted with `expects_agent_report: true` (the Codex pre-first-turn shape from issue #549) that misses the resolving events during a daemon outage/reconnect must have `expects_agent_report` cleared by `resync_hydrated_sessions` once the incoming snapshot's `agent_report_activity_seen` is `true` — the same invariant `AppState::apply_event` enforces in the same statement (`session.expects_agent_report = false; session.agent_report_activity_seen = true;`). Before the fix, the resync only ORs `agent_report_activity_seen` in (`session/live/020`) and never touches `expects_agent_report`, so both flags can end up `true` simultaneously: `is_pending` (driven by `expects_agent_report`) wins the status branch, so the card renders "Starting…" beside what now looks like a live agent badge.
+- **Does not assert:** the `agent_report_activity_seen`-never-reverts invariant itself, covered by `session/live/020`; the `apply_event` path that clears the field on a real untagged event, covered by `dashboard/placeholder/004`; a real socket-level resync round-trip (`src/reconnect.rs`).
+- **Platform coverage:** mac+linux (file is `#![cfg(unix)]` throughout — see the file's own doc comment).
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.
