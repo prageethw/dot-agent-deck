@@ -2588,6 +2588,41 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
         "a wait-promoted Working card's badge must show the \"(observing)\" marker; got:\n{rendered}"
     );
 
+    // Second positive case: the OTHER half of H1's fix — a card that was
+    // already Working when the wait started (`wait_synthetic_working` stays
+    // `false`) and whose own completion was swallowed under the outstanding
+    // wait (`wait_deferred_revert: true`). This is the PRD's own headline
+    // flow (an agent calling `wait start` on itself while already `Working`)
+    // and must render identically to the `wait_synthetic_working`-only case
+    // above: deleting `|| session.wait_deferred_revert` from `src/ui.rs`
+    // must NOT leave this suite green.
+    let mut deferred = palette_session(SessionStatus::Working);
+    deferred.wait_synthetic_working = false;
+    deferred.wait_deferred_revert = true;
+    let buffer = render_card_to_buffer(
+        &deferred,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,     // animation tick
+        false, // not selected
+        width,
+        height,
+    );
+    let (border_fg, _modifier) = border_style_at_mid(&buffer);
+    assert_eq!(
+        border_fg,
+        dot_agent_deck::palette::STATUS_OBSERVING,
+        "a wait-deferred-revert Working card's border must resolve through STATUS_OBSERVING, \
+         not plain Working green; got {border_fg:?}"
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("observing"),
+        "a wait-deferred-revert Working card's badge must show the \"(observing)\" marker; \
+         got:\n{rendered}"
+    );
+
     // Negative case: both wait flags set, but status is NOT `Working` — the
     // marker/color must not appear, and `WaitingForInput`'s BOLD must survive.
     let mut not_working = palette_session(SessionStatus::WaitingForInput);

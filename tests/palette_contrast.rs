@@ -233,7 +233,7 @@ fn contrast_003_observing_status_clears_non_text_aa_on_light_and_dark_terminals(
         )
     });
 
-    for (label, fg, bg, _floor) in pairings(base, bright) {
+    for (i, (label, fg, bg, _floor)) in pairings(base, bright).into_iter().enumerate() {
         let ratio = contrast_ratio(fg, bg);
         // `pairings()`'s own `_floor` assumes BOTH theme-matched pairings
         // (base-on-white and bright-on-black) clear full text AA for any
@@ -248,15 +248,15 @@ fn contrast_003_observing_status_clears_non_text_aa_on_light_and_dark_terminals(
         // theme-matched dark one — at the non-text floor, exactly the
         // "relaxation held only where it's actually needed" this role earns.
         //
-        // Identified by the pairing's actual `(fg, bg)` identity, not by
-        // string-comparing `label` — a label reword (shared with
-        // `contrast_002`) must never be able to silently downgrade this
-        // floor from 4.5:1 to 3:1 while the suite stays green.
-        let floor = if fg == base && bg == LIGHT_BG {
-            AA_TEXT
-        } else {
-            AA_NON_TEXT
-        };
+        // Identified by the pairing's fixed position in `pairings()`'s
+        // returned array (index 0 is always "light terminal (base slot on
+        // white)", per that function's own doc), not by comparing `(fg, bg)`
+        // values — for a role whose base and bright renderings are the same
+        // triple (true for `LightBlue` today), `fg == base` matches BOTH
+        // white pairings, which would silently hold the mismatched
+        // bright-on-white pairing to the stricter floor too. A positional
+        // check can't misfire regardless of what colours are involved.
+        let floor = if i == 0 { AA_TEXT } else { AA_NON_TEXT };
         assert!(
             ratio >= floor,
             "STATUS_OBSERVING ({observing:?}) renders at {ratio:.2}:1 on a {label}, below the \

@@ -6732,9 +6732,9 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### theme/palette/007 — A card whose `Working` status is purely a monitored-wait promotion (issue #714) renders distinctly: `STATUS_OBSERVING` border colour plus an `(observing)` badge suffix.
 - **Layer:** L1 (ratatui `TestBackend`, color-aware capture).
-- **Agent:** none (one live session fixture with `wait_synthetic_working: true`).
-- **Asserts:** rendering an unselected deck card for a `Working` session that carries `wait_synthetic_working: true` resolves its border to `palette::STATUS_OBSERVING`, not the plain Working-status `Color::Green`, and its rendered badge text contains the `"(observing)"` suffix — matching `daemon status`'s CLI wording for the same state.
-- **Does not assert:** the status colour for any other status/flag combination (covered by `status_color_for`'s own unit test); the CLI `daemon status` text surface (covered by `daemon/status` specs); the selected-card variant (covered by `theme/palette/003`, `006`).
+- **Agent:** none (three live session fixtures — two `Working`, one `WaitingForInput`).
+- **Asserts:** rendering an unselected deck card for a `Working` session that carries `wait_synthetic_working: true` resolves its border to `palette::STATUS_OBSERVING`, not the plain Working-status `Color::Green`, and its rendered badge text contains the `"(observing)"` suffix — matching `daemon status`'s CLI wording for the same state; the same holds for a `Working` session that instead carries only `wait_deferred_revert: true` (the PRD's own headline flow, where the wait landed on an already-`Working` card), so the display predicate's `wait_synthetic_working || wait_deferred_revert` union is pinned on the render surface, not only on the CLI's; and a session carrying BOTH wait flags but a non-`Working` status (`WaitingForInput`) renders neither the badge nor `STATUS_OBSERVING` — the `status == Working` gate — while still showing its real "Needs Input" label with `Modifier::BOLD` intact on the status text.
+- **Does not assert:** the status colour for any other status/flag combination not covered above (covered by `status_color_for`'s own unit test); the CLI `daemon status` text surface (covered by `daemon/status` specs); the selected-card variant (covered by `theme/palette/003`, `006`).
 - **Platform coverage:** mac+linux+windows.
 
 ### Mode indication (PRD #341)
