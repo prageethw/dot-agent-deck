@@ -210,13 +210,17 @@ fn contrast_002_waiting_status_is_legible_on_light_and_dark_terminals() {
 /// Scenario: issue #714 — `palette::STATUS_OBSERVING` marks a wait-promoted
 /// `Working` row (a monitored wait holding the pane, not real agent
 /// activity), not the primary "you must act now" signal `STATUS_WAITING`
-/// is, so this guard holds it to the AA_NON_TEXT (3:1) floor SC 1.4.11 sets
-/// for a border glyph/status chip on all four pairings rather than
-/// requiring full text AA (4.5:1) everywhere. Measured against the
-/// reference xterm `LightBlue` (`#5C5CFF`): 4.74:1 on white clears full
-/// text AA, 4.43:1 on black falls just under it — still comfortably above
-/// the 3:1 floor this test actually asserts. Distinctness from every other
-/// role, including `STATUS_WAITING`, is still required.
+/// is, so this guard only relaxes to the AA_NON_TEXT (3:1) floor SC 1.4.11
+/// sets for a border glyph/status chip where the role genuinely can't clear
+/// full text AA — it holds every pairing that DOES clear 4.5:1 to that
+/// stricter bar instead, mirroring `theme/contrast/002`'s per-pairing floor.
+/// Measured against the reference xterm `LightBlue` (`#5C5CFF`, whose base
+/// and bright renderings are identical since it's already the bright half
+/// of blue): 4.74:1 on white clears full text AA and is held to it, while
+/// 4.43:1 on black falls just under AA_TEXT — short by the same
+/// already-bright-slot reason — so that pairing (and the two mismatched
+/// ones) stay at the 3:1 floor. Distinctness from every other role,
+/// including `STATUS_WAITING`, is still required.
 #[spec("theme/contrast/003")]
 #[test]
 fn contrast_003_observing_status_clears_non_text_aa_on_light_and_dark_terminals() {
@@ -231,12 +235,29 @@ fn contrast_003_observing_status_clears_non_text_aa_on_light_and_dark_terminals(
 
     for (label, fg, bg, _floor) in pairings(base, bright) {
         let ratio = contrast_ratio(fg, bg);
+        // `pairings()`'s own `_floor` assumes BOTH theme-matched pairings
+        // (base-on-white and bright-on-black) clear full text AA for any
+        // role — true for `STATUS_WAITING` (`theme/contrast/002`), whose
+        // bright slot is far more saturated than its base. It does not hold
+        // here: `STATUS_OBSERVING` is `Color::LightBlue`, whose base and
+        // bright values are the SAME triple, so its "bright slot on black"
+        // pairing renders identically to its "base slot on black" mismatched
+        // pairing and only reaches 4.43:1 — short of 4.5:1. So this floor is
+        // tightened only where this role's actual numbers clear it (the
+        // light-terminal pairing), leaving the other three — including the
+        // theme-matched dark one — at the non-text floor, exactly the
+        // "relaxation held only where it's actually needed" this role earns.
+        let floor = if label == "light terminal (base slot on white)" {
+            AA_TEXT
+        } else {
+            AA_NON_TEXT
+        };
         assert!(
-            ratio >= AA_NON_TEXT,
+            ratio >= floor,
             "STATUS_OBSERVING ({observing:?}) renders at {ratio:.2}:1 on a {label}, below the \
-             {AA_NON_TEXT}:1 non-text floor — the wait-promoted-Working badge/border must stay \
-             legible enough to notice even on the pairings that fall short of full text AA \
-             (issue #714)"
+             {floor}:1 floor — the wait-promoted-Working badge/border must stay legible enough \
+             to notice, holding full text AA on the pairings that clear it and the 3:1 non-text \
+             floor on the rest (issue #714)"
         );
     }
 

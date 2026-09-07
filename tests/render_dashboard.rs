@@ -2552,8 +2552,9 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
 /// its border color (`palette::STATUS_OBSERVING`, not the plain
 /// `STATUS_WORKING` green) must reflect the wait promotion. Both assertions
 /// read the observable rendered buffer, per this harness's convention.
+#[spec("theme/palette/007")]
 #[test]
-fn observing_001_wait_promoted_working_card_shows_observing_badge_and_color() {
+fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
     let mut session = palette_session(SessionStatus::Working);
     session.wait_synthetic_working = true;
     let width: u16 = 80;
