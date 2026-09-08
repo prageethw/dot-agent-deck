@@ -802,11 +802,17 @@ jobs:
       - name: Upload the desktop assets to the release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: gh release upload "v$RELEASE_VERSION" dist-desktop/* --clobber
+        # `--repo` is load-bearing on every `gh` call in this job: unlike every
+        # other job in this file, `desktop-publish` has no `actions/checkout`,
+        # so there's no git repository for `gh` to infer a target from and it
+        # dies with `failed to run git: fatal: not a git repository` (#712).
+        run: gh release upload "v$RELEASE_VERSION" dist-desktop/* --clobber --repo "$REPO"
       - name: Note the unsigned alpha in the release body
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         # Appended here rather than assembled in `prepare` so the note appears
         # only when the assets it describes actually exist -- a release whose
@@ -814,7 +820,7 @@ jobs:
         run: |
           set -eu
           MARKER="<!-- desktop-alpha -->"
-          BODY=$(gh release view "v$RELEASE_VERSION" --json body -q .body)
+          BODY=$(gh release view "v$RELEASE_VERSION" --repo "$REPO" --json body -q .body)
           case "$BODY" in
             *"$MARKER"*)
               echo "release body already carries the desktop alpha note; nothing to do"
@@ -829,7 +835,7 @@ jobs:
             printf "On macOS, clear the quarantine flag after moving the app to /Applications:\n\n"
             printf "\`\`\`sh\nxattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n\`\`\`\n\n"
             printf "Signing and notarization are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757. Checksums for these assets are in \`checksums-desktop-alpha.txt\`.\n"
-          } | gh release edit "v$RELEASE_VERSION" --notes-file -
+          } | gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file -
 
   # FORK-ONLY GUARD (fork issue #71). Publishing the docs site is upstream's
   # concern: `docs-publish.yml` builds and pushes to the hardcoded
