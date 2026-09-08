@@ -6970,6 +6970,25 @@ impl AppState {
         let session_id = session_id_for_pane(&pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
+
+        let already_resolved = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|s| s.agent_report_activity_seen);
+
+        if expects_agent_report && already_resolved {
+            // Issue #724: a real status-asserting event has already resolved
+            // this session (agent_report_activity_seen == true) — do not
+            // clobber it back to an unresolved "awaiting report" placeholder.
+            // Every other case (vacant entry, an occupied-but-unresolved entry
+            // e.g. `surface_spawned_pane`'s pre-registration forge, or a
+            // plain-constructor call that never sets expects_agent_report)
+            // keeps the original always-overwrite behavior below, which the
+            // SessionEnd restore path (~state.rs:9868-9891) depends on to
+            // carry a dying session's agent_id forward onto a fresh placeholder.
+            return session_id;
+        }
+
         self.sessions.insert(
             session_id.clone(),
             SessionState {

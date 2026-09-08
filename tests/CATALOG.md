@@ -328,6 +328,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `ShellBusy`/`ShellIdle` path, covered by `dashboard/placeholder/005`; the untagged real-hook-event path, covered by `dashboard/placeholder/004`.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/placeholder/007 — A placeholder-insert reaching a pane after its session has already been resolved by a real event must not clobber that resolved state back to "Starting…" territory (issue #724).
+- **Layer:** L1 (direct `AppState` state assertions, no render).
+- **Agent:** none (a single synthetic, non-daemon-synthetic `AgentEvent` of type `SessionStart` — `agent_type: AgentType::None`, `agent_id: None`, no `DISPLAY_NAME_METADATA_KEY` — matching the shape of a real wrapper fork-time `SessionStart`, the opposite of `dashboard/placeholder/006`'s daemon-forged one).
+- **Asserts:** that inserting an "awaiting report" placeholder for a pane whose session already has real, resolved status-asserting activity does not reset `expects_agent_report`/`agent_report_activity_seen` back to their pre-resolution values. `insert_placeholder_session_inner` does an unconditional `self.sessions.insert(...)`, so a placeholder-insert loop reaching an already-resolved pane (the race loser) permanently reclobbers `expects_agent_report` to `true` and `agent_report_activity_seen` to `false`, since nothing else ever clears the flag again — wedging the card at "Starting…" forever.
+- **Does not assert:** the reverse ordering (placeholder-insert-before-event), already covered by `dashboard/placeholder/004`; the daemon-synthetic non-resolution case, covered by `dashboard/placeholder/006`.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/placeholder/008 — A placeholder-insert reaching a pane whose session key is already occupied but not yet resolved must still be able to arm "Starting…" (issue #724 fix-round-2 regression guard).
+- **Layer:** L1 (direct `AppState` state assertions, no render).
+- **Agent:** none (a directly-constructed `SessionState` seeded into `state.sessions`, matching the shape `spawn::surface_spawned_pane`'s daemon-forged `SessionStart` leaves behind before any real wrapper event resolves it: `expects_agent_report: false`, `agent_report_activity_seen: false`).
+- **Asserts:** an occupied-but-unresolved session entry can still be armed to `expects_agent_report=true` by a placeholder insert (`insert_placeholder_session_awaiting_report`) — the fix for #724 must not make this permanently unreachable, since a blanket "skip if occupied" guard would wedge the card at "No agent" instead of "Starting…" for every pane the daemon has forged a session for ahead of the real spawn-time insert.
+- **Does not assert:** the occupied-and-already-resolved case (that must NOT be armed), covered by `dashboard/placeholder/007`.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
