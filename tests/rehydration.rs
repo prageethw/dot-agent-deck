@@ -3612,6 +3612,7 @@ fn live_021_resync_clears_expects_agent_report_when_activity_seen_resolves_true(
         spawned_at_ms: None,
         daemon_boot_id: None,
         registration_generation: None,
+        cli_name: None,
         outstanding_delegation: None,
         silence_watch: None,
         delegation_commission: None,
