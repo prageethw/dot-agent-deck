@@ -84,7 +84,12 @@ jobs:
           # rather than aborting under `set -e`. A failed `changes` job would
           # skip every Rust job via `needs`, which is the one outcome worth
           # engineering against here.
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
+          #
+          # Cached as raw JSON (not just the flattened $files below) so the
+          # unexpected-file report further down can derive its own
+          # filenames-only view without a second API call.
+          pr_files_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate || true)
+          files=$(printf '%s' "$pr_files_json" | jq -r '.[] | .filename, (.previous_filename // empty)' 2>/dev/null || true)
           echo "changed files:"
           echo "$files"
 
@@ -111,6 +116,21 @@ jobs:
           # own follow-up comment gives as the reason that part stays
           # deferred -- this only lays the list out, it renders no verdict.
           #
+          # Deliberately ci.yml-only, not part of e2e.yml's near-duplicate
+          # `changes` job and its "keep in lockstep" comments below -- copying
+          # this block there would print the same table twice per PR for no
+          # added signal.
+          #
+          # Deliberately PR-only: the empty-`PR_NUMBER` `exit 0` above means
+          # this never runs on `push: main` or `workflow_dispatch`, where
+          # there is no PR file list to fetch -- a `git diff` fallback would
+          # need its own base-ref/shallow-clone handling, which this
+          # implementation correctly avoids by staying PR-only. The pre-merge
+          # PR report is where a human can still act on what it shows, which
+          # is why that tradeoff is acceptable even though the post-merge run
+          # on `main` is technically where a resurrected artifact -- this
+          # issue's own motivating case -- becomes permanent.
+          #
           # `tee -a`, not `>>`: the summary file (`$GITHUB_STEP_SUMMARY`) is
           # not retrievable through the GitHub API (fork issue #32 -- a
           # check-run's `output.summary` is `null` for a step-summary write;
@@ -130,13 +150,37 @@ jobs:
             echo ""
             echo "| Directory | Files | Names |"
             echo "|---|---|---|"
+            # Fetch filenames only (drop `.previous_filename`) for this
+            # report: $files above includes both the new and old path for
+            # every renamed file, which docs_only/devbox_only/flake_only
+            # below correctly need (a file moving OUT of a scoped directory
+            # must still be caught), but a report of the diff's current shape
+            # should show a renamed file once, under its current path --
+            # otherwise a same-directory rename inflates the Files count and
+            # a cross-directory rename appears under two rows with nothing
+            # marking it as one file. Reuses the cached $pr_files_json from
+            # above rather than a second API call.
+            report_files=$(printf '%s' "$pr_files_json" | jq -r '.[] | .filename' 2>/dev/null || true)
             # Map each line to "<top-level segment>\t<full path>" -- a bare
-            # root-level file (no `/`) buckets as "(root)". `sort` then groups
-            # same-directory lines together for the awk pass below.
-            echo "$files" | awk -F/ '{ print (NF > 1 ? $1 : "(root)") "\t" $0 }' | sort | awk -F'\t' '
+            # root-level file (no `/`) buckets as "(root)". The `sort` right
+            # after is what makes the 15-name truncation below deterministic
+            # -- it guarantees the names shown are the first 15 alphabetically
+            # rather than an arbitrary API-order slice; the awk pass itself
+            # groups by directory using associative arrays and does not need
+            # sorted input for correctness.
+            printf '%s\n' "$report_files" | awk -F/ '{ print (NF > 1 ? $1 : "(root)") "\t" $0 }' | sort | awk -F'\t' '
               {
                 dir = $1
                 file = $2
+                # Filenames are attacker-controlled (a contributor names
+                # their own files): an unescaped `|` would split this row
+                # across extra table columns, and a backtick would escape
+                # the code span around the name -- escape/strip both before
+                # they reach the rendered table.
+                gsub(/\|/, "\\|", dir)
+                gsub(/`/, "", dir)
+                gsub(/\|/, "\\|", file)
+                gsub(/`/, "", file)
                 count[dir]++
                 # Cap the printed names at 15 per directory so one huge
                 # directory cannot blow out the summary -- the Files column
