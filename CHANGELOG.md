@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.44.6] - 2026-09-08
+
+### Fixed
+
+  A pane reconnecting after a daemon outage or a detach/reattach could show `Starting…` next to what looked like a live, resolved agent badge — the two signals disagreeing on whether the agent had actually reported in. Reconnect resync now clears the "still starting" flag whenever it learns the agent has genuinely reported real activity, matching the behavior already used for a live, uninterrupted session.
+
+
+
 ## [0.44.5] - 2026-09-07
 
 ### Added
