@@ -31050,9 +31050,21 @@ mod tests {
         // the minted `pane-<16hex>-<seq>` shape, per
         // `is_minted_pane_id_rejects_a_value_mint_pane_id_would_not_produce`
         // above) so the later placeholder-insert call, which independently
-        // recomputes that same key, targets the SAME map entry — reproducing
-        // the clobber rather than merely creating a second, harmless entry
-        // beside it.
+        // recomputes that same key, targets the SAME map entry. This is not
+        // an artificial construction to force a collision: it is a faithful
+        // stand-in for a real, two-step production path. The daemon's
+        // `spawn::surface_spawned_pane` forges a session for a freshly-fired
+        // pane under exactly this pane-keyed id before the real wrapper
+        // fork-time `SessionStart` ever arrives; when that real event does
+        // arrive carrying a *different* session id for the same pane, the
+        // same-pane reuse guard in `AppState::apply_event` detects the
+        // existing pane-keyed entry, rewrites the incoming event's session
+        // id onto it, and removes the old id — so the real event resolves
+        // that SAME pane-keyed entry in place rather than creating a
+        // sibling one. A later placeholder-insert reaching that pane then
+        // overwrites the now-resolved entry, reproducing the clobber this
+        // test pins — not merely creating a second, harmless entry beside
+        // it.
         let mut state = AppState::default();
         state.register_pane("1".to_string());
 
@@ -31074,15 +31086,23 @@ mod tests {
             model: None,
         });
 
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "the real SessionStart must resolve the single pane-keyed entry \
+             in place, not create a second one; got {:?}",
+            state.sessions
+        );
         let resolved = state
             .sessions
-            .values()
-            .find(|s| s.pane_id.as_deref() == Some("1"))
-            .expect("the real SessionStart must have created a session");
+            .get("pane-1")
+            .expect("the real SessionStart must have created a session under the pane-keyed id");
         assert!(
             !resolved.expects_agent_report,
-            "a real, non-daemon-synthetic SessionStart must clear \
-             expects_agent_report; got {resolved:?}"
+            "AppState::apply_event seeds expects_agent_report: false at \
+             session-creation time regardless of the event, so a fresh \
+             session from a real SessionStart must start with it false; got \
+             {resolved:?}"
         );
         assert!(
             resolved.agent_report_activity_seen,
@@ -31098,10 +31118,16 @@ mod tests {
             true,
         );
 
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "the placeholder insert must land on the same single pane-keyed \
+             entry, not create a second one; got {:?}",
+            state.sessions
+        );
         let after_placeholder_insert = state
             .sessions
-            .values()
-            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .get("pane-1")
             .expect("pane 1's session must still exist after the placeholder insert");
         assert!(
             !after_placeholder_insert.expects_agent_report,
@@ -31114,6 +31140,76 @@ mod tests {
             "a placeholder insert reaching an already-resolved pane must not \
              reset agent_report_activity_seen back to false; got \
              {after_placeholder_insert:?}"
+        );
+    }
+
+    /// Scenario: A pane's session key is already occupied by an
+    /// UNRESOLVED entry — the shape `spawn::surface_spawned_pane`'s
+    /// daemon-forged `SessionStart` produces before any real hook event has
+    /// fired for that pane (`expects_agent_report: false,
+    /// agent_report_activity_seen: false`) — and the normal spawn-time
+    /// placeholder-insert (`insert_placeholder_session_awaiting_report`)
+    /// then reaches that same key. The insert must still be able to arm
+    /// `expects_agent_report`, since nothing has resolved this session yet;
+    /// a blanket "occupied means skip" guard would wedge the card at "No
+    /// agent" forever instead of "Starting…".
+    #[spec("dashboard/placeholder/008")]
+    #[test]
+    fn dashboard_placeholder_008_placeholder_insert_still_arms_an_unresolved_occupied_entry() {
+        use std::collections::VecDeque;
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+
+        let now = Utc::now();
+        state.sessions.insert(
+            "pane-1".to_string(),
+            SessionState {
+                session_id: "pane-1".to_string(),
+                agent_type: AgentType::None,
+                cwd: Some("/tmp".to_string()),
+                status: SessionStatus::Idle,
+                active_tool: None,
+                started_at: now,
+                last_activity: now,
+                recent_events: VecDeque::new(),
+                tool_count: 0,
+                last_user_prompt: None,
+                first_prompts: Vec::new(),
+                pane_id: Some("1".to_string()),
+                agent_id: None,
+                display_name: None,
+                pending_permission_tool: None,
+                shell_synthetic_working: false,
+                monitored_wait_active: false,
+                wait_synthetic_working: false,
+                shell_descendant_busy: false,
+                wait_deferred_revert: false,
+                model: None,
+                expects_agent_report: false,
+                agent_report_activity_seen: false,
+            },
+        );
+
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        let after_placeholder_insert = state
+            .sessions
+            .get("pane-1")
+            .expect("pane 1's session must still exist after the placeholder insert");
+        assert!(
+            after_placeholder_insert.expects_agent_report,
+            "a placeholder insert reaching an occupied-but-UNRESOLVED pane \
+             must still be able to arm expects_agent_report — the entry has \
+             not been resolved by any real event yet, so it must not be \
+             treated the same as dashboard/placeholder/007's already-resolved \
+             case; got {after_placeholder_insert:?}"
         );
     }
 
