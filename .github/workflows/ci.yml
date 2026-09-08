@@ -84,7 +84,19 @@ jobs:
           # rather than aborting under `set -e`. A failed `changes` job would
           # skip every Rust job via `needs`, which is the one outcome worth
           # engineering against here.
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
+          #
+          # Cached as raw JSON (not just the flattened $files below) so the
+          # unexpected-file report further down can derive its own
+          # filenames-only view without a second API call. Projected down to
+          # {filename, previous_filename} at fetch time -- the full API
+          # payload includes every file's `patch` hunk text, which measured
+          # ~400x more data than this needs on a 28-file PR (251KB vs 623
+          # bytes of filenames). `--jq` runs per page under `--paginate`, so
+          # this is NDJSON (one object per line, not wrapped in an array) --
+          # both consumers below read it with a bare `.filename`/
+          # `.previous_filename`, no `.[] |` needed.
+          pr_files_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | {filename, previous_filename}' || true)
+          files=$(printf '%s' "$pr_files_json" | jq -r '.filename, (.previous_filename // empty)' || true)
           echo "changed files:"
           echo "$files"
 
@@ -97,6 +109,111 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          # Tier 1 "unexpected-file report" (fork issue #259): group the file
+          # list above by top-level directory and print it to the job summary,
+          # purely for a human to glance at -- non-blocking, no output, no
+          # effect on docs_only/devbox_only/flake_only below. The issue's own
+          # postmortem (PR #219's post-sync rebase silently resurrecting stale
+          # content) found the failure mode was that nobody had the changed-
+          # file list in front of them grouped in a way that made the odd one
+          # out obvious, not that anyone would have argued with it once seen.
+          # Classifying a file as "expected" or "unexpected" would mean
+          # guessing PR intent, which is the false-positive risk the issue's
+          # own follow-up comment gives as the reason that part stays
+          # deferred -- this only lays the list out, it renders no verdict.
+          #
+          # Deliberately ci.yml-only, not part of e2e.yml's near-duplicate
+          # `changes` job and that job's own "keep in lockstep" comments --
+          # copying this block there would print the same table twice per PR
+          # for no added signal.
+          #
+          # Deliberately PR-only: the empty-`PR_NUMBER` `exit 0` above means
+          # this never runs on `push: main` or `workflow_dispatch`, where
+          # there is no PR file list to fetch -- a `git diff` fallback would
+          # need its own base-ref/shallow-clone handling, which this
+          # implementation correctly avoids by staying PR-only. The pre-merge
+          # PR report is where a human can still act on what it shows, which
+          # is why that tradeoff is acceptable even though the post-merge run
+          # on `main` is technically where a resurrected artifact -- this
+          # issue's own motivating case -- becomes permanent.
+          #
+          # `tee -a`, not `>>`: the summary file (`$GITHUB_STEP_SUMMARY`) is
+          # not retrievable through the GitHub API (fork issue #32 -- a
+          # check-run's `output.summary` is `null` for a step-summary write;
+          # see e2e.yml's "Publish flaky and failed e2e tests" step for the
+          # same fix applied there first), so mirroring the same table to
+          # stdout puts it somewhere the job log -- and therefore `gh run
+          # view --job <id> --log` -- can actually read.
+          #
+          # `|| echo "::warning..."` on the whole pipeline is this step's own
+          # fail-safe, mirroring the `|| true` above: a parsing hiccup here
+          # must not take down `changes`, which every other Rust job `needs`.
+          # `set -o pipefail` (part of this step's `set -euo pipefail`) is
+          # what makes the pipeline's exit status reflect a failure in the
+          # `{ ... }` group rather than `tee`'s own (near-certain) success.
+          {
+            echo "### Changed files by directory"
+            echo ""
+            echo "| Directory | Files | Names |"
+            echo "|---|---|---|"
+            # Fetch filenames only (drop `.previous_filename`) for this
+            # report: $files above includes both the new and old path for
+            # every renamed file, which docs_only/devbox_only/flake_only
+            # below correctly need (a file moving OUT of a scoped directory
+            # must still be caught), but a report of the diff's current shape
+            # should show a renamed file once, under its current path --
+            # otherwise a same-directory rename inflates the Files count and
+            # a cross-directory rename appears under two rows with nothing
+            # marking it as one file. Reuses the cached $pr_files_json from
+            # above rather than a second API call.
+            report_files=$(printf '%s' "$pr_files_json" | jq -r '.filename' || true)
+            # Map each line to "<top-level segment>\t<full path>" -- a bare
+            # root-level file (no `/`) buckets as "(root)". The `sort` right
+            # after is what makes the 15-name truncation below deterministic
+            # -- it guarantees the names shown are the first 15 alphabetically
+            # rather than an arbitrary API-order slice; the awk pass itself
+            # groups by directory using associative arrays and does not need
+            # sorted input for correctness.
+            printf '%s\n' "$report_files" | awk -F/ '{ print (NF > 1 ? $1 : "(root)") "\t" $0 }' | sort | awk -F'\t' '
+              {
+                dir = $1
+                file = $2
+                # Filenames are attacker-controlled (a contributor names
+                # their own files): an unescaped `|` would split this row
+                # across extra table columns, and a backtick would escape
+                # the code span around the name -- escape/strip both before
+                # they reach the rendered table.
+                gsub(/\|/, "\\|", dir)
+                gsub(/`/, "", dir)
+                gsub(/\|/, "\\|", file)
+                gsub(/`/, "", file)
+                count[dir]++
+                # Cap the printed names at 15 per directory so one huge
+                # directory cannot blow out the summary -- the Files column
+                # still reports the true total either way, so nothing is
+                # silently dropped at the directory level, only within a
+                # long list inside one.
+                if (count[dir] <= 15) {
+                  # Keyed off count[dir], not `dir in names`: mawk/busybox
+                  # awk create the array element for the assignment target
+                  # before evaluating the RHS, which makes `dir in names`
+                  # true even for the first file seen in a directory and prepends a
+                  # stray ", " to every cell. count[dir] was just incremented
+                  # above, so testing it for == 1 is order-independent in
+                  # every awk.
+                  names[dir] = (count[dir] == 1) ? "`" file "`" : names[dir] ", `" file "`"
+                } else if (count[dir] == 16) {
+                  names[dir] = names[dir] ", ..."
+                }
+              }
+              END {
+                for (dir in count) print dir "\t" count[dir] "\t" names[dir]
+              }
+            ' | sort | while IFS=$'\t' read -r dir count names; do
+              echo "| $dir | $count | $names |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY" || echo "::warning::unexpected-file report failed to render -- non-blocking, see step log"
 
           # docs_only applies to EVERY PR author, unlike devbox_only/flake_only
           # below -- a doc-only diff can't move most of what the Rust/security/
