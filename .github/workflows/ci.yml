@@ -87,9 +87,16 @@ jobs:
           #
           # Cached as raw JSON (not just the flattened $files below) so the
           # unexpected-file report further down can derive its own
-          # filenames-only view without a second API call.
-          pr_files_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate || true)
-          files=$(printf '%s' "$pr_files_json" | jq -r '.[] | .filename, (.previous_filename // empty)' 2>/dev/null || true)
+          # filenames-only view without a second API call. Projected down to
+          # {filename, previous_filename} at fetch time -- the full API
+          # payload includes every file's `patch` hunk text, which measured
+          # ~400x more data than this needs on a 28-file PR (251KB vs 623
+          # bytes of filenames). `--jq` runs per page under `--paginate`, so
+          # this is NDJSON (one object per line, not wrapped in an array) --
+          # both consumers below read it with a bare `.filename`/
+          # `.previous_filename`, no `.[] |` needed.
+          pr_files_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | {filename, previous_filename}' || true)
+          files=$(printf '%s' "$pr_files_json" | jq -r '.filename, (.previous_filename // empty)' || true)
           echo "changed files:"
           echo "$files"
 
@@ -117,9 +124,9 @@ jobs:
           # deferred -- this only lays the list out, it renders no verdict.
           #
           # Deliberately ci.yml-only, not part of e2e.yml's near-duplicate
-          # `changes` job and its "keep in lockstep" comments below -- copying
-          # this block there would print the same table twice per PR for no
-          # added signal.
+          # `changes` job and that job's own "keep in lockstep" comments --
+          # copying this block there would print the same table twice per PR
+          # for no added signal.
           #
           # Deliberately PR-only: the empty-`PR_NUMBER` `exit 0` above means
           # this never runs on `push: main` or `workflow_dispatch`, where
@@ -160,7 +167,7 @@ jobs:
             # a cross-directory rename appears under two rows with nothing
             # marking it as one file. Reuses the cached $pr_files_json from
             # above rather than a second API call.
-            report_files=$(printf '%s' "$pr_files_json" | jq -r '.[] | .filename' 2>/dev/null || true)
+            report_files=$(printf '%s' "$pr_files_json" | jq -r '.filename' || true)
             # Map each line to "<top-level segment>\t<full path>" -- a bare
             # root-level file (no `/`) buckets as "(root)". The `sort` right
             # after is what makes the 15-name truncation below deterministic
@@ -188,7 +195,14 @@ jobs:
                 # silently dropped at the directory level, only within a
                 # long list inside one.
                 if (count[dir] <= 15) {
-                  names[dir] = (dir in names) ? names[dir] ", `" file "`" : "`" file "`"
+                  # Keyed off count[dir], not `dir in names`: mawk/busybox
+                  # awk create the array element for an assignment's lvalue
+                  # before evaluating the RHS, which makes `dir in names`
+                  # true even on a directory's first file and prepends a
+                  # stray ", " to every cell. count[dir] was just incremented
+                  # above, so testing it for == 1 is order-independent in
+                  # every awk.
+                  names[dir] = (count[dir] == 1) ? "`" file "`" : names[dir] ", `" file "`"
                 } else if (count[dir] == 16) {
                   names[dir] = names[dir] ", ..."
                 }
