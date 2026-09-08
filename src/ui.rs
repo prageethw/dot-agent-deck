@@ -31025,6 +31025,98 @@ mod tests {
         );
     }
 
+    /// Scenario: A real, non-daemon-forged wrapper fork-time `SessionStart`
+    /// (no `DISPLAY_NAME_METADATA_KEY`) resolves a pane's session via
+    /// `AppState::apply_event`, then the placeholder-insert loop reaches the
+    /// same already-resolved pane afterward
+    /// (`insert_placeholder_session_awaiting_report`, simulating the race
+    /// loser). The already-resolved state must survive, not get clobbered
+    /// back to "Starting…" territory.
+    #[spec("dashboard/placeholder/007")]
+    #[test]
+    fn dashboard_placeholder_007_placeholder_insert_after_real_event_does_not_reclobber() {
+        // Issue #724: `insert_placeholder_session_inner` does an
+        // unconditional `self.sessions.insert(session_id_for_pane(&pane_id),
+        // ...)`, so when the placeholder-insert loop reaches a pane AFTER
+        // that pane's real wrapper fork-time `SessionStart` has already
+        // resolved its session (`expects_agent_report` cleared to `false`,
+        // `agent_report_activity_seen` latched `true`, via
+        // `AppState::apply_event`), the insert clobbers the resolved state
+        // back to `expects_agent_report: true, agent_report_activity_seen:
+        // false` — permanently, since nothing else ever clears it again.
+        //
+        // The event's `session_id` is set to exactly what
+        // `session_id_for_pane("1")` computes ("pane-1" — "1" does not match
+        // the minted `pane-<16hex>-<seq>` shape, per
+        // `is_minted_pane_id_rejects_a_value_mint_pane_id_would_not_produce`
+        // above) so the later placeholder-insert call, which independently
+        // recomputes that same key, targets the SAME map entry — reproducing
+        // the clobber rather than merely creating a second, harmless entry
+        // beside it.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+
+        state.apply_event(AgentEvent {
+            session_id: "pane-1".to_string(),
+            agent_type: AgentType::None,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("1".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let resolved = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("the real SessionStart must have created a session");
+        assert!(
+            !resolved.expects_agent_report,
+            "a real, non-daemon-synthetic SessionStart must clear \
+             expects_agent_report; got {resolved:?}"
+        );
+        assert!(
+            resolved.agent_report_activity_seen,
+            "a real, non-daemon-synthetic SessionStart must latch \
+             agent_report_activity_seen; got {resolved:?}"
+        );
+
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        let after_placeholder_insert = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("pane 1's session must still exist after the placeholder insert");
+        assert!(
+            !after_placeholder_insert.expects_agent_report,
+            "a placeholder insert reaching an already-resolved pane must not \
+             reset expects_agent_report back to true; got \
+             {after_placeholder_insert:?}"
+        );
+        assert!(
+            after_placeholder_insert.agent_report_activity_seen,
+            "a placeholder insert reaching an already-resolved pane must not \
+             reset agent_report_activity_seen back to false; got \
+             {after_placeholder_insert:?}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------

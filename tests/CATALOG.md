@@ -328,6 +328,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `ShellBusy`/`ShellIdle` path, covered by `dashboard/placeholder/005`; the untagged real-hook-event path, covered by `dashboard/placeholder/004`.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/placeholder/007 — A placeholder-insert reaching a pane after its session has already been resolved by a real event must not clobber that resolved state back to "Starting…" territory (issue #724).
+- **Layer:** L1 (direct `AppState` state assertions, no render).
+- **Agent:** none (a single synthetic, non-daemon-synthetic `AgentEvent` of type `SessionStart` — `agent_type: AgentType::None`, `agent_id: None`, no `DISPLAY_NAME_METADATA_KEY` — matching the shape of a real wrapper fork-time `SessionStart`, the opposite of `dashboard/placeholder/006`'s daemon-forged one).
+- **Asserts:** that inserting an "awaiting report" placeholder for a pane whose session already has real, resolved status-asserting activity does not reset `expects_agent_report`/`agent_report_activity_seen` back to their pre-resolution values. `insert_placeholder_session_inner` does an unconditional `self.sessions.insert(...)`, so a placeholder-insert loop reaching an already-resolved pane (the race loser) permanently reclobbers `expects_agent_report` to `true` and `agent_report_activity_seen` to `false`, since nothing else ever clears the flag again — wedging the card at "Starting…" forever.
+- **Does not assert:** the reverse ordering (placeholder-insert-before-event), already covered by `dashboard/placeholder/004`; the daemon-synthetic non-resolution case, covered by `dashboard/placeholder/006`.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
