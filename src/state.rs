@@ -6970,9 +6970,9 @@ impl AppState {
         let session_id = session_id_for_pane(&pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
-        self.sessions.insert(
-            session_id.clone(),
-            SessionState {
+        self.sessions
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionState {
                 session_id: session_id.clone(),
                 agent_type: agent_type.unwrap_or(AgentType::None),
                 cwd,
@@ -6996,8 +6996,7 @@ impl AppState {
                 model: None,
                 expects_agent_report,
                 agent_report_activity_seen: false,
-            },
-        );
+            });
         session_id
     }
 
