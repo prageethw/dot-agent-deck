@@ -196,9 +196,9 @@ jobs:
                 # long list inside one.
                 if (count[dir] <= 15) {
                   # Keyed off count[dir], not `dir in names`: mawk/busybox
-                  # awk create the array element for an assignment's lvalue
+                  # awk create the array element for the assignment target
                   # before evaluating the RHS, which makes `dir in names`
-                  # true even on a directory's first file and prepends a
+                  # true even for the first file seen in a directory and prepends a
                   # stray ", " to every cell. count[dir] was just incremented
                   # above, so testing it for == 1 is order-independent in
                   # every awk.
