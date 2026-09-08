@@ -9,6 +9,8 @@
 
 ### Fixed
 
+  A pane reconnecting after a daemon outage or a detach/reattach could show `Starting…` next to what looked like a live, resolved agent badge — the two signals disagreeing on whether the agent had actually reported in. Reconnect resync now clears the "still starting" flag whenever it learns the agent has genuinely reported real activity, matching the behavior already used for a live, uninterrupted session.
+
   `pane restart <role>` and `pane spawn <role>` now exit non-zero when the daemon never answers or replies with something unparseable, instead of silently exiting 0 as if the restart or spawn had succeeded — a script or agent wrapping either command can no longer read a dead/old daemon as success. The orchestrator's own startup context now also teaches it both commands automatically, alongside `docs/orchestration.md`'s existing "Restarting and spawning worker panes" section, so an orchestrating agent can recover a crashed worker or bring up an unspawned role without a human telling it these commands exist out of band.
 
   Fixes `resolve_pr_state` (used by worktree reclaim's PR-state check) reporting `NoPr` for a branch that genuinely has an open or merged pull request — it queried only the `origin` remote's `gh --repo` slug, so this fork's documented upstream-first contribution workflow (CLAUDE.md rule 19), where the real PR is opened against `upstream` and `origin` never carries one for that branch at all, was invisible to it.
