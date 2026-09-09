@@ -207,6 +207,82 @@ fn contrast_002_waiting_status_is_legible_on_light_and_dark_terminals() {
     }
 }
 
+/// Scenario: issue #714 — `palette::STATUS_OBSERVING` marks a wait-promoted
+/// `Working` row (a monitored wait holding the pane, not real agent
+/// activity), not the primary "you must act now" signal `STATUS_WAITING`
+/// is, so this guard only relaxes to the AA_NON_TEXT (3:1) floor SC 1.4.11
+/// sets for a border glyph/status chip where the role genuinely can't clear
+/// full text AA — it holds every pairing that DOES clear 4.5:1 to that
+/// stricter bar instead, mirroring `theme/contrast/002`'s per-pairing floor.
+/// Measured against the reference xterm `LightBlue` (`#5C5CFF`, whose base
+/// and bright renderings are identical since it's already the bright half
+/// of blue): 4.74:1 on white clears full text AA and is held to it, while
+/// 4.43:1 on black falls just under AA_TEXT — short by the same
+/// already-bright-slot reason — so that pairing (and the two mismatched
+/// ones) stay at the 3:1 floor. Distinctness from every other role,
+/// including `STATUS_WAITING`, is still required.
+#[spec("theme/contrast/003")]
+#[test]
+fn contrast_003_observing_status_clears_non_text_aa_on_light_and_dark_terminals() {
+    let observing = palette::STATUS_OBSERVING;
+    let (base, bright) = reference_srgb(observing).unwrap_or_else(|| {
+        panic!(
+            "STATUS_OBSERVING is {observing:?}, which has no named-ANSI reference rendering — \
+             a status role must be a named ANSI colour so the terminal's own theme can \
+             remap it (see `theme/contrast/001`)"
+        )
+    });
+
+    for (i, (label, fg, bg, _floor)) in pairings(base, bright).into_iter().enumerate() {
+        let ratio = contrast_ratio(fg, bg);
+        // `pairings()`'s own `_floor` assumes BOTH theme-matched pairings
+        // (base-on-white and bright-on-black) clear full text AA for any
+        // role — true for `STATUS_WAITING` (`theme/contrast/002`), whose
+        // bright slot is far more saturated than its base. It does not hold
+        // here: `STATUS_OBSERVING` is `Color::LightBlue`, whose base and
+        // bright values are the SAME triple, so its "bright slot on black"
+        // pairing renders identically to its "base slot on black" mismatched
+        // pairing and only reaches 4.43:1 — short of 4.5:1. So this floor is
+        // tightened only where this role's actual numbers clear it (the
+        // light-terminal pairing), leaving the other three — including the
+        // theme-matched dark one — at the non-text floor, exactly the
+        // "relaxation held only where it's actually needed" this role earns.
+        //
+        // Identified by the pairing's fixed position in `pairings()`'s
+        // returned array (index 0 is always "light terminal (base slot on
+        // white)", per that function's own doc), not by comparing `(fg, bg)`
+        // values — for a role whose base and bright renderings are the same
+        // triple (true for `LightBlue` today), `fg == base` matches BOTH
+        // white pairings, which would silently hold the mismatched
+        // bright-on-white pairing to the stricter floor too. A positional
+        // check can't misfire regardless of what colours are involved.
+        let floor = if i == 0 { AA_TEXT } else { AA_NON_TEXT };
+        assert!(
+            ratio >= floor,
+            "STATUS_OBSERVING ({observing:?}) renders at {ratio:.2}:1 on a {label}, below the \
+             {floor}:1 floor — the wait-promoted-Working badge/border must stay legible enough \
+             to notice, holding full text AA on the pairings that clear it and the 3:1 non-text \
+             floor on the rest (issue #714)"
+        );
+    }
+
+    for (name, other) in [
+        ("STATUS_WORKING", palette::STATUS_WORKING),
+        ("STATUS_THINKING", palette::STATUS_THINKING),
+        ("STATUS_WAITING", palette::STATUS_WAITING),
+        ("STATUS_ERROR", palette::STATUS_ERROR),
+        ("STATUS_IDLE", palette::STATUS_IDLE),
+        ("FOCUSED", palette::FOCUSED),
+        ("SELECTED", palette::SELECTED),
+    ] {
+        assert_ne!(
+            observing, other,
+            "STATUS_OBSERVING must stay distinct from {name}; a legible colour that collides \
+             with another role still loses the signal"
+        );
+    }
+}
+
 // Unit-guard for the arithmetic above (not a `#[spec]` catalog entry). A
 // contrast test is only worth its floors if the ratios it computes are the ones
 // a contrast checker would report, and a subtly wrong `relative_luminance` would
