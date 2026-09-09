@@ -34,7 +34,13 @@
 //!   the sixteen is for, and why `bold`-as-bright was invented on dark
 //!   terminals.) So "light terminal" means the base slot on white and "dark
 //!   terminal" means the bright slot on black. These two are the ordinary case
-//!   and must clear WCAG AA for text, **4.5:1** (SC 1.4.3).
+//!   and must clear WCAG AA for text, **4.5:1** (SC 1.4.3). One deliberate
+//!   exception: `palette::ROLE_NAME` (`theme/contrast/004`) holds only its
+//!   dark-terminal theme-matched pairing to that 4.5:1 text floor and relaxes
+//!   its light-terminal one to the 3:1 non-text floor below, because
+//!   `Color::LightRed`'s base and bright renderings are identical and the
+//!   light-terminal pairing tops out at 4.00:1 — see that test's own comment
+//!   for the arithmetic.
 //! * **Mismatched** — the base palette on a black background, or the bright
 //!   palette on a white one. This is the configuration behind the issue's
 //!   1.07:1 measurement: a light background with a terminal that still brightens
