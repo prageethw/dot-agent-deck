@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.44.7] - 2026-09-09
+
+### Fixed
+
+  The desktop GUI's `.dmg`/`.deb` alpha bundles, introduced in PRD #740, were built successfully on every release from v0.44.4 through v0.44.6 and never actually attached: the publishing job's `gh` calls had no git context to resolve the target repository from, since that job has no checkout, so all three calls (the asset upload and the two release-body edits) failed immediately. Those releases' CLI assets were unaffected. The job's `gh` calls now name the repository explicitly, and a static regression test guards against this recurring.
+  No-Test: pinned by `gh_calls_in_checkoutless_jobs_name_their_repository` in `xtask/linkage-check/src/release_workflow_wiring.rs`, a plain `#[test]` (not `#[spec]`-annotated) since `release.yml` and `xtask/**` are build-time CI configuration and linting, not TUI-observable behavior — matching `451.bugfix.md`/`453.bugfix.md`'s precedent for the same class of change in this same crate.
+  Orchestration panes could wedge permanently at `Starting…` status when a placeholder-insert overwrote a session that had already resolved. Placeholder insertion now skips the overwrite only when the existing session is genuinely already resolved, so an occupied-but-unresolved or vacant entry still gets the full refresh it needs.
+
+
+
 ## [0.44.6] - 2026-09-08
 
 ### Fixed
