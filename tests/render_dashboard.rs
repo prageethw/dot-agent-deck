@@ -4337,6 +4337,90 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
     );
 }
 
+/// Scenario: issue #730 — a role pane whose config DECLARES `agent = "codex"`
+/// (`render_session_card`'s `declared_agent_type`) is spawned but has not yet
+/// been delegated a first task, so it is still in the `expects_agent_report:
+/// true, agent_report_activity_seen: false` shape `#549`/`dashboard/placeholder/001`
+/// pins as "Starting…" for the NO-declaration case. Because `shown_agent_type`
+/// resolves through `declared_agent_type` before `is_placeholder` is computed,
+/// a declared pane's `is_placeholder` is `false` from the moment it is drawn —
+/// unconditionally, regardless of `expects_agent_report` — so `is_pending`
+/// can never fire and the card falls straight through to
+/// `status_style(&session.status)`. This pins that a declared-but-never-
+/// delegated pane must still show "Starting…", not whatever `session.status`
+/// happens to hold (here `Thinking`, matching issue #730's live evidence) for
+/// a session that has never had a single real event applied to it.
+#[spec("dashboard/pane/015")]
+#[test]
+fn pane_015_declared_agent_pending_report_shows_starting_not_live_status() {
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "declared-agent-pending".to_string(),
+        // Codex's own shape: never reports an agent_type before its first
+        // turn completes — indefinitely, for a pane that is never delegated
+        // a task at all.
+        agent_type: AgentType::None,
+        cwd: Some("/home/dev/workspace".to_string()),
+        // Issue #730's live evidence: the daemon held no live SessionSnapshot
+        // at all for these panes (no real event ever applied), yet the
+        // rendered card read "Thinking". Whatever upstream mechanism placed
+        // this value here, the render-layer decision below must not surface
+        // it for a pane that has never had its placeholder resolved.
+        status: SessionStatus::Thinking,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pending_permission_tool: None,
+        pane_id: Some("pane-declared-pending".to_string()),
+        agent_id: Some("agent-declared-pending".to_string()),
+        display_name: Some("reviewer".to_string()),
+        shell_synthetic_working: false,
+        monitored_wait_active: false,
+        wait_synthetic_working: false,
+        shell_descendant_busy: false,
+        wait_deferred_revert: false,
+        model: None,
+        // The Orchestration-tab role-pane shape `insert_placeholder_session_awaiting_report`
+        // produces for a recognized agent CLI, before it has reported in —
+        // never resolved by any real activity.
+        expects_agent_report: true,
+        agent_report_activity_seen: false,
+    };
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_with_declared_agent_to_buffer(
+        &session,
+        Some("reviewer"),
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        Some(&AgentType::Codex),
+        true,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+
+    assert!(
+        rendered.contains("Starting…"),
+        "a declared-Codex pane that has never been delegated a task \
+         (expects_agent_report=true, agent_report_activity_seen=false) must \
+         show 'Starting…', the same placeholder a non-declared pane in this \
+         exact shape shows (dashboard/placeholder/001):\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Thinking"),
+        "a pane that has never had a real event applied must not surface a \
+         leftover/synthetic live status label once a declaration makes \
+         is_placeholder false; got:\n{rendered}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // dashboard/grid — the card grid's joint column/density layout (issue #588)
 // ---------------------------------------------------------------------------
