@@ -99,6 +99,13 @@ pub struct StatusAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SessionStatus>,
     pub shell_synthetic_working: bool,
+    /// Issue #714: whether a monitored external wait (`worker-agent-deck
+    /// wait start`/`wait done`) is the reason this pane currently reads
+    /// `Working` — either because the wait promoted it from idle, or
+    /// because it is holding open a `Working` that an agent's own real
+    /// completion would otherwise have reverted. Drives the `(observing)`
+    /// marker on both the CLI and TUI surfaces.
+    pub wait_observing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<StatusTool>,
     /// Issue #586 M1/M2: PRD #126's idle-worker watch, if currently armed for
@@ -182,6 +189,13 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                     .as_ref()
                     .map(|s| s.shell_synthetic_working)
                     .unwrap_or(false),
+                wait_observing: live
+                    .as_ref()
+                    .map(|s| {
+                        s.status == SessionStatus::Working
+                            && (s.wait_synthetic_working || s.wait_deferred_revert)
+                    })
+                    .unwrap_or(false),
                 // Issue #455: project down to the NAME here, at the one place
                 // that crosses from internal state into the CLI's document —
                 // `detail` never leaves this function.
@@ -228,6 +242,17 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
         // `shell_synthetic_working`'s doc comment in `src/state.rs`.
         let status = if a.shell_synthetic_working {
             format!("{status}*")
+        } else {
+            status
+        };
+        // Issue #714: flag a `Working` currently held up by a monitored
+        // external wait (`worker-agent-deck wait start`) rather than real
+        // agent activity — either because the wait promoted the pane from
+        // idle, or because it is holding open a `Working` an agent's own
+        // completion would otherwise have reverted. See `wait_observing`'s
+        // doc comment above.
+        let status = if a.wait_observing && a.status == Some(SessionStatus::Working) {
+            format!("{status} (observing)")
         } else {
             status
         };
@@ -465,5 +490,107 @@ mod tests {
         // that.
         assert_eq!(parsed["schema_version"], 2);
         assert!(json.contains("json-pane"));
+    }
+
+    /// Scenario: issue #714 — a `Working` row held up purely by a monitored
+    /// wait (`wait_synthetic_working`) must render distinctly from both a
+    /// plain `Working` row and a shell-synthetic one, and the two markers
+    /// must compose when both apply: shell's `*` first (existing ordering),
+    /// then the wait marker's `" (observing)"` after. Also pins the PRD's
+    /// headline flow — `wait_deferred_revert` alone (the H1 fix's OR-broadening,
+    /// `build_status_agents`'s `wait_synthetic_working || wait_deferred_revert`)
+    /// must trigger the same marker — and the negative case: either flag set
+    /// on a row whose status is NOT `Working` must never show the marker
+    /// (the `status == Working` gate added alongside the fix).
+    #[test]
+    fn format_human_marks_wait_synthetic_working_as_observing() {
+        let mut wait_only = snapshot(SessionStatus::Working);
+        wait_only.shell_synthetic_working = false;
+        wait_only.wait_synthetic_working = true;
+        let agents = build_status_agents(vec![record("agent-1", "wait-pane", Some(wait_only))]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("wait-pane"))
+            .unwrap_or_else(|| panic!("no row for wait-pane in {table:?}"));
+        assert!(
+            line.contains("Working (observing)"),
+            "a wait-only synthetic Working row must render \"Working (observing)\"; got {line:?}"
+        );
+
+        let mut shell_only = snapshot(SessionStatus::Working);
+        shell_only.shell_synthetic_working = true;
+        shell_only.wait_synthetic_working = false;
+        let agents = build_status_agents(vec![record("agent-2", "shell-pane", Some(shell_only))]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("shell-pane"))
+            .unwrap_or_else(|| panic!("no row for shell-pane in {table:?}"));
+        assert!(
+            line.contains("Working*") && !line.contains("(observing)"),
+            "a shell-only synthetic Working row must keep rendering exactly \"Working*\", \
+             unchanged (non-regression); got {line:?}"
+        );
+
+        let mut both = snapshot(SessionStatus::Working);
+        both.shell_synthetic_working = true;
+        both.wait_synthetic_working = true;
+        let agents = build_status_agents(vec![record("agent-3", "both-pane", Some(both))]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("both-pane"))
+            .unwrap_or_else(|| panic!("no row for both-pane in {table:?}"));
+        assert!(
+            line.contains("Working* (observing)"),
+            "when both markers apply they must compose as \"Working* (observing)\" — shell's \
+             `*` immediately after the status word, then the wait marker; got {line:?}"
+        );
+
+        // H1 fix: `wait_deferred_revert` alone (no `wait_synthetic_working`)
+        // must trigger the marker too — this exercises `build_status_agents`'s
+        // OR-broadening, which the cases above never reach.
+        let mut deferred_only = snapshot(SessionStatus::Working);
+        deferred_only.wait_synthetic_working = false;
+        deferred_only.wait_deferred_revert = true;
+        let agents = build_status_agents(vec![record(
+            "agent-4",
+            "deferred-pane",
+            Some(deferred_only),
+        )]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("deferred-pane"))
+            .unwrap_or_else(|| panic!("no row for deferred-pane in {table:?}"));
+        assert!(
+            line.contains("Working (observing)"),
+            "a `wait_deferred_revert`-only row (no `wait_synthetic_working`) must still render \
+             \"Working (observing)\" — this is the H1 fix's OR-broadening; got {line:?}"
+        );
+
+        // Negative case: the flag set but the status is NOT `Working` must
+        // never show the marker — the `status == Working` gate added
+        // alongside the fix.
+        let mut not_working = snapshot(SessionStatus::WaitingForInput);
+        not_working.wait_synthetic_working = true;
+        not_working.wait_deferred_revert = true;
+        let agents =
+            build_status_agents(vec![record("agent-5", "waiting-pane", Some(not_working))]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("waiting-pane"))
+            .unwrap_or_else(|| panic!("no row for waiting-pane in {table:?}"));
+        assert!(
+            !line.contains("(observing)") && line.contains("WaitingForInput"),
+            "a non-Working row must never show \"(observing)\" even with both wait flags set; \
+             got {line:?}"
+        );
+        assert!(
+            !agents[0].wait_observing,
+            "the projected wire value must gate on `status == Working` too, not just the text marker"
+        );
     }
 }

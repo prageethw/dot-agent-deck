@@ -180,6 +180,17 @@ pub const STATUS_WAITING: Color = Color::Magenta;
 pub const STATUS_ERROR: Color = Color::Red;
 /// Idle — no current activity (dimmed).
 pub const STATUS_IDLE: Color = Color::DarkGray;
+/// Observing — the pane is held `Working` by a monitored external wait
+/// (`worker-agent-deck wait start`), not real agent activity. Issue #714.
+/// `Color::LightBlue`: measured 4.74:1 on white (clears text AA), 4.43:1
+/// on black (clears the SC 1.4.11 3:1 non-text floor, same shape
+/// STATUS_WAITING already ships with in its own mismatched case). Known,
+/// accepted collision: Devin's `agent_registry::badge_color` is also
+/// `Color::LightBlue` — a Devin pane in a monitored wait shows the same
+/// hue on both its agent badge and its status marker. Accepted
+/// deliberately (issue #714 discussion) rather than giving up
+/// theme-adaptivity for a fixed `Indexed` value.
+pub const STATUS_OBSERVING: Color = Color::LightBlue;
 
 // ---------------------------------------------------------------------------
 // Accent roles (must be distinct from every status color and from each other)
@@ -226,9 +237,15 @@ pub const SELECTED: Color = Color::Reset;
 pub const ROLE_NAME: Color = Color::Indexed(130);
 
 /// Resolve a session status to its centralized border/badge role color. This
-/// is the single source of truth shared by the deck-card render path
-/// (`src/ui.rs`) and the embedded-pane render path (`src/terminal_widget.rs`),
-/// so a given state shows the same border color in both contexts.
+/// is the shared base for the deck-card render path (`src/ui.rs`) and the
+/// embedded-pane render path (`src/terminal_widget.rs`), so a given
+/// state shows the same border color in both contexts — with one deliberate
+/// exception: the deck-card side also calls [`status_color_for`], which
+/// additively promotes an observing `Working` to [`STATUS_OBSERVING`]. The
+/// embedded-pane side does not yet call it, so an observing session's
+/// embedded-pane border currently still shows the plain `Working` color
+/// while its deck card shows the observing color — tracked as issue #719,
+/// not fixed here.
 pub fn status_color(status: &SessionStatus) -> Color {
     match status {
         SessionStatus::Working => STATUS_WORKING,
@@ -242,6 +259,26 @@ pub fn status_color(status: &SessionStatus) -> Color {
         // PRD #162 forward-compat: an unknown wire status renders with the
         // neutral idle color so it never masquerades as an active state.
         SessionStatus::Unknown => STATUS_IDLE,
+    }
+}
+
+/// Like [`status_color`], but promotes a `Working` status to
+/// [`STATUS_OBSERVING`] when it is currently held up by a monitored external
+/// wait rather than real agent activity (issue #714). Every other status is
+/// unaffected, even when the flag is stale/true — the flag only ever
+/// modulates `Working`. Additive: `status_color` itself is unchanged, so its
+/// other callers (embedded-pane border, tab aggregation) keep their existing
+/// behavior.
+///
+/// `observing` is the caller's already-broadened predicate (its call site in
+/// `src/ui.rs` passes `session.wait_synthetic_working ||
+/// session.wait_deferred_revert`), not a direct passthrough of the
+/// narrower `SessionSnapshot::wait_synthetic_working` field alone.
+pub fn status_color_for(status: &SessionStatus, observing: bool) -> Color {
+    if observing && *status == SessionStatus::Working {
+        STATUS_OBSERVING
+    } else {
+        status_color(status)
     }
 }
 
@@ -296,5 +333,30 @@ mod tests {
         assert_eq!(highest_priority_status(&[Unknown, Idle]), Unknown);
         assert_eq!(highest_priority_status(&[Error, WaitingForInput]), Error);
         assert_eq!(highest_priority_status(&[]), Idle);
+    }
+
+    /// Scenario: issue #714 — `status_color_for` must resolve `STATUS_OBSERVING`
+    /// only when `wait_synthetic_working` is set AND the status is `Working`;
+    /// every other combination (flag off, or flag on but a non-`Working`
+    /// status) must fall back to the plain `status_color` resolution
+    /// unchanged, mirroring the `status == SessionStatus::Working` gate
+    /// `state.rs` already applies to this same flag.
+    #[test]
+    fn status_color_for_resolves_observing_only_when_working_and_flagged() {
+        assert_eq!(
+            status_color_for(&SessionStatus::Working, true),
+            STATUS_OBSERVING,
+            "a wait-promoted Working row must resolve to the observing color"
+        );
+        assert_eq!(
+            status_color_for(&SessionStatus::Working, false),
+            STATUS_WORKING,
+            "an ordinary Working row (no wait promotion) must be unchanged"
+        );
+        assert_eq!(
+            status_color_for(&SessionStatus::Idle, true),
+            STATUS_IDLE,
+            "a stale wait_synthetic_working flag must never override a non-Working status"
+        );
     }
 }

@@ -6677,6 +6677,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** which colour the role holds (deliberately — `theme/palette/001-002` own the identity, and asserting identity here is what let an unreadable colour ship); contrast of the other status/accent roles (green 2.16:1 and cyan 1.98:1 on white have the same weakness and are a separate colour decision); how any specific terminal emulator actually resolves the slot.
 - **Platform coverage:** mac+linux+windows.
 
+##### theme/contrast/003 — The wait-promoted-Working `STATUS_OBSERVING` colour clears WCAG non-text AA on light and dark terminals, and full text AA wherever it actually reaches it (WCAG contrast, not colour identity).
+- **Layer:** L1 (pure computation over `palette::STATUS_OBSERVING`; no rendering).
+- **Agent:** none.
+- **Asserts:** `palette::STATUS_OBSERVING`, resolved through the reference xterm ANSI palette (`Color::LightBlue`, base and bright renderings identical), clears WCAG AA for non-text UI components (3:1) on all four pairings — light terminal, dark terminal, and both mismatched bold-as-bright configurations — and is held to the stricter full text AA (4.5:1) on the one pairing that actually clears it: the light terminal (base slot on white), measured at 4.74:1. The role stays a distinct colour from every other palette role, including `STATUS_WAITING`. Unlike `theme/contrast/002`, the other three pairings are NOT held to full text AA — the dark terminal (bright slot on black) measures 4.43:1, just short of 4.5:1, because `Color::LightBlue`'s base and bright renderings are identical (it's already the bright half of blue), unlike `STATUS_WAITING`'s `Magenta` where the bright slot is far more saturated than the base.
+- **Does not assert:** full WCAG text AA (4.5:1) on the dark-terminal or either mismatched pairing (measured short/not attempted, and this role isn't held to that bar there — see above); which colour the role holds beyond distinctness (identity is `theme/palette/001-002`'s to own); how any specific terminal emulator actually resolves the slot.
+- **Platform coverage:** mac+linux+windows.
+
 #### theme/guard
 
 ##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the terminal's own foreground plus a thickened border, not an absolute fill.
@@ -6742,6 +6749,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (one live session fixture per status, rendered selected and unselected in both modes).
 - **Asserts:** for every agent status and in BOTH `UiMode::Normal` and `UiMode::PaneInput`, a SELECTED card's border resolves to `palette::SELECTED` (`Color::Reset`) and never to that status's role colour, thickens its glyph from `│` to `┃`, and never carries `Modifier::DIM`. The CONTROL in the same loop is that the UNSELECTED card is untouched — still its status role, still `│` — so an idle agent keeps receding. Guards issue #442 in both of its reported forms: selection dimmed into the `palette::STATUS_IDLE` band (the original report), and a selected idle card inheriting DarkGray so that thickening its border changed nothing (the follow-up).
 - **Does not assert:** the `▸ ` title marker (covered by `theme/palette/003` / `theme/guard/001`); the BOLD-vs-plain mode emphasis (covered by `mode/deck/001`); embedded-pane borders (covered by `theme/palette/002`, `004`, `005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### theme/palette/007 — A card whose `Working` status is purely a monitored-wait promotion (issue #714) renders distinctly: `STATUS_OBSERVING` border colour plus an `(observing)` badge suffix.
+- **Layer:** L1 (ratatui `TestBackend`, color-aware capture).
+- **Agent:** none (three live session fixtures — two `Working`, one `WaitingForInput`).
+- **Asserts:** rendering an unselected deck card for a `Working` session that carries `wait_synthetic_working: true` resolves its border to `palette::STATUS_OBSERVING`, not the plain Working-status `Color::Green`, and its rendered badge text contains the `"(observing)"` suffix — matching `daemon status`'s CLI wording for the same state; the same holds for a `Working` session that instead carries only `wait_deferred_revert: true` (the PRD's own headline flow, where the wait landed on an already-`Working` card), so the display predicate's `wait_synthetic_working || wait_deferred_revert` union is pinned on the render surface, not only on the CLI's; and a session carrying BOTH wait flags but a non-`Working` status (`WaitingForInput`) renders neither the badge nor `STATUS_OBSERVING` — the `status == Working` gate — while still showing its real "Needs Input" label with `Modifier::BOLD` intact on the status text.
+- **Does not assert:** the status colour for any other status/flag combination not covered above (covered by `status_color_for`'s own unit test); the CLI `daemon status` text surface (covered by `daemon/status` specs); the selected-card variant (covered by `theme/palette/003`, `006`).
 - **Platform coverage:** mac+linux+windows.
 
 ### Mode indication (PRD #341)
