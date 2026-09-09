@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{TuiDeck, commit_fixture};
+use dot_agent_deck::event::AgentType;
 use spec::spec;
 
 #[cfg(unix)]
@@ -373,5 +374,163 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
     assert!(
         codex_badge && no_prompt_event && grid.contains("Idle"),
         "the real script-launched Codex role must render a Codex Idle card before any prompt is submitted; real_launch={real_launch:?}, codex_badge={codex_badge}, no_prompt_event={no_prompt_event}\nFinal grid:\n{grid}"
+    );
+}
+
+/// Click on the first occurrence of `needle` in the deck's rendered grid,
+/// mirroring the row/column math `TuiDeck::visible_text_cell_styles` uses
+/// internally (char count, not byte offset, so a line prefixed with
+/// multi-byte box-drawing borders still resolves the right column).
+#[cfg(unix)]
+fn click_on_grid_text(deck: &TuiDeck, needle: &str) {
+    let grid = deck.snapshot_grid();
+    for (row, line) in grid.lines().enumerate() {
+        if let Some(byte_col) = line.find(needle) {
+            let col = line[..byte_col].chars().count() as u16;
+            deck.click(col, row as u16);
+            return;
+        }
+    }
+    panic!("grid text {needle:?} not found to click on:\n{grid}");
+}
+
+/// Scenario: Select a MODE whose config declares no agent identity, then use the
+/// New Agent form's own "Agent" chip (PRD #20 finding #8 — off the Tab cycle,
+/// click-only) to EXPLICITLY pick Codex before typing a bespoke non-inferable
+/// launcher script wrapping a REAL Codex process. The mode's shell-injection
+/// submit path (`wrap_agent_command`, `src/ui.rs`) now consults the New Agent
+/// form's `agent_selection` (carried forward on `NewPaneRequest.form_agent_type`)
+/// alongside the mode config's static `agent =` declaration via
+/// `resolve_declared_agent_for_wrap` (issue #640) — so the command IS typed in
+/// wrapped: `dot-agent-deck wrap --agent codex --` prefix, per-pane
+/// `codex_spawn_prep`, CODEX_HOME pin, all run. The real, live, fully-booted
+/// interactive Codex session must have its Dashboard card correctly reported as
+/// Codex.
+#[spec("codex/spawn/013")]
+#[test]
+#[cfg(unix)]
+fn spawn_013_form_agent_selection_ignored_by_mode_pane_wrap_decision() {
+    skip_unless!(common::check_codex_available());
+
+    let real_codex = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("codex"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("available Codex binary resolves on PATH");
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 42)
+        .with_env("PATH", path_with_binary_dir())
+        .with_env("REAL_CODEX_BIN", real_codex.to_string_lossy())
+        .with_imported_codex_credentials()
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    let work = deck.workdir().to_path_buf();
+    let launch_record = work.join("real-mode-codex.log");
+    write_executable(
+        &work.join("run-codex.sh"),
+        "#!/bin/sh\nprintf 'REAL_CODEX %s\\n' \"$*\" >> real-mode-codex.log\nexec \"$REAL_CODEX_BIN\" \"$@\"\n",
+    );
+    let command = format!(
+        "./run-codex.sh --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
+        common::codex_test_model(),
+    );
+    std::fs::write(
+        work.join(".dot-agent-deck.toml"),
+        "[[modes]]\n\
+         name = \"undeclared-codex-mode\"\n\
+         reactive_panes = 0\n",
+    )
+    .expect("write undeclared mode config");
+
+    let events = deck.subscribe_events();
+    open_form(&deck);
+    deck.send_keys(b"\x1b[C"); // Mode: select the one custom mode
+
+    // PRD #20 finding #8: the Agent chip is off the Tab cycle — click it to
+    // focus + pick the FIRST registry entry (index 0, ClaudeCode), then cycle
+    // Right three times to reach Codex (registry order: ClaudeCode, OpenCode,
+    // Pi, Codex, Devin — `src/agent_registry.rs::ALL`).
+    click_on_grid_text(&deck, "Agent:");
+    deck.wait_for_string("[ClaudeCode]");
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C");
+    deck.wait_for_string("[Codex]");
+
+    deck.send_keys(b"\r"); // Agent -> Name
+    deck.send_keys(b"\r"); // Name -> Command
+    // Selecting Codex seeded Command with the registry default ("codex" alone
+    // — already inferable by `AgentType::from_command`, not the gap this test
+    // pins). Replace it with the bespoke non-inferable real-Codex launcher so
+    // the EXPLICIT Agent-chip pick is the only signal available.
+    deck.send_keys(&[0x7fu8; 32]);
+    deck.send_keys(command.as_bytes());
+    deck.send_keys(b"\r"); // submit
+
+    common::wait_for_file_containing(&launch_record, "REAL_CODEX", Duration::from_secs(20))
+        .unwrap_or_else(|state| {
+            panic!("the bespoke real-Codex mode launcher never executed: {state}")
+        });
+
+    // Post-fix, this pane's launch line IS wrapped through `dot-agent-deck wrap
+    // --agent codex --`, which pins CODEX_HOME and installs + records scoped
+    // trust for the deck's own hooks before the real Codex process execs (see
+    // `codex_spawn_prep` in `src/wrap.rs`) — the same precondition that lets
+    // `spawn_009`/`spawn_012` (a declared orchestration role's real Codex
+    // launcher) reach their assertions without ever seeing this dialog. This
+    // block is kept purely defensive: it only fires if hook-trust recording
+    // somehow lags or fails in a given environment, or if a live Codex build
+    // shows its own review gate for a reason unrelated to the deck's hooks —
+    // push through it exactly as such a case would need to ("Continue without
+    // trusting"), so the assertions below observe the fully-booted interactive
+    // session rather than an artifact of the trust prompt itself.
+    if deck.wait_for_grid_string_within("Hooks need review", Duration::from_secs(20)) {
+        deck.send_bytes(b"\x1b[B\x1b[B\r"); // Down, Down, Enter -> "Continue without trusting"
+    }
+
+    assert!(
+        deck.wait_for_grid_string_within("Ask Codex", Duration::from_secs(30)),
+        "the real interactive Codex CLI never became ready in the mode pane:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // PRD #84 M4 mode tabs open on their OWN tab, not Dashboard — `Ctrl+D` alone
+    // only leaves pane-typing focus, it does not switch tabs (unlike the
+    // single-pane orchestration path spawn_012 exercises). Left switches to the
+    // previous tab (Dashboard), matching `spawn_011`'s exact pattern.
+    deck.send_bytes(b"\x04");
+    deck.send_bytes(b"\x1b[D");
+    deck.wait_for_string("session(s)");
+    // Fork #339 turned the agent-type badge off by default (deck-global
+    // `m` toggle) — enable it the same way spawn_009/011/012 do so the
+    // panic-message grid dump below shows the badge state too.
+    deck.send_keys(b"m");
+    deck.wait_for_string("Agent badge: shown");
+    // NOTE: unlike spawn_009/011/012's single-focus flow, this mode tab's
+    // Dashboard view renders alongside a still-visible strip of the live
+    // Codex pane's OWN banner ("OpenAI Codex (v0.153.4)"), so a whole-grid
+    // substring search for "Codex" is not a reliable badge check here — it
+    // would pass on that banner text even when the Dashboard card itself
+    // never got a badge. The unambiguous, non-cosmetic signal is whether a
+    // Codex-typed `AgentEvent` ever reached the daemon's broadcast stream —
+    // that only happens via the wrapper's fork-time `SessionStart` or Codex's
+    // own native hooks, both of which require the Wrapper strategy to have
+    // run at all.
+    let grid = deck.snapshot_grid();
+    let codex_event = events
+        .snapshot()
+        .iter()
+        .any(|event| event.agent_type == AgentType::Codex);
+
+    assert!(
+        codex_event,
+        "the New Agent form's explicit Agent: Codex selection (PRD #20 finding #8) must \
+         still wrap a non-inferable mode-pane launcher through the Wrapper strategy — \
+         `wrap_agent_command`'s mode-pane call site only consults the mode config's static \
+         `agent =` declaration, never this form field, so the explicit selection is silently \
+         discarded, no Codex-typed AgentEvent ever reaches the daemon, and a real live Codex \
+         session goes completely unwrapped and unreported; codex_event={codex_event}\n\
+         Final grid:\n{grid}"
     );
 }

@@ -2355,6 +2355,9 @@ impl NewPaneFormState {
             // Selecting an orchestration suggests the next free name in
             // place of whatever was in the field.
             self.suggest_name_if_orchestration_selected();
+            // Issue #640 round 5 (audit finding 2): see
+            // `reset_agent_selection_if_mode_declares_agent`'s doc comment.
+            self.reset_agent_selection_if_mode_declares_agent();
         }
     }
 
@@ -2363,6 +2366,39 @@ impl NewPaneFormState {
         // Symmetric to `select_next_mode` — cycling backward onto an
         // orchestration suggests the next free name too.
         self.suggest_name_if_orchestration_selected();
+        // Issue #640 round 5 (audit finding 2): see
+        // `reset_agent_selection_if_mode_declares_agent`'s doc comment.
+        self.reset_agent_selection_if_mode_declares_agent();
+    }
+
+    /// Issue #640 round 5 (audit finding 2): clears a stale Agent-chip pick
+    /// whenever the just-selected Mode chip itself declares an agent.
+    ///
+    /// `resolve_declared_agent_for_wrap`'s "form wins on conflict"
+    /// precedence assumes the Agent chip is "a deliberate, per-spawn,
+    /// run-time override the user makes at the exact moment they pick what
+    /// THIS pane runs" — but the Agent chip is click-only, off the Tab
+    /// cycle, and rendered unconditionally regardless of which Mode chip is
+    /// selected, and `agent_selection` was never reset on a mode switch.
+    /// Concretely: cycle the Agent chip to Codex while exploring, then
+    /// select a DIFFERENT mode that declares `agent = "claude"` for a real
+    /// policy reason, and submit without touching the Agent chip again —
+    /// the stale Codex pick would otherwise silently outrank the mode's own
+    /// declared identity. Call this after every mode-selection mutation
+    /// (`select_next_mode`, `select_previous_mode`, and the mode-chip click
+    /// handler `Action::FormSelectMode`).
+    ///
+    /// A mode declaring NO agent leaves `agent_selection` untouched — the
+    /// user's explicit pick is still the only signal available for that
+    /// mode and should still apply.
+    fn reset_agent_selection_if_mode_declares_agent(&mut self) {
+        if self
+            .selected_mode()
+            .and_then(|mode| mode.declared_agent_type())
+            .is_some()
+        {
+            self.agent_selection = None;
+        }
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
@@ -2448,6 +2484,20 @@ impl NewPaneFormState {
                 .unwrap_or_else(|| "auto".to_string()),
             None => "auto".to_string(),
         }
+    }
+
+    /// Issue #640: the [`AgentType`] the user EXPLICITLY picked via the Agent
+    /// chip (PRD #20 finding #8), or `None` when nothing was picked (`auto`).
+    /// `agent_selection` indexes [`crate::agent_registry::ALL`], which excludes
+    /// the neutral [`crate::agent_registry::NONE`] placeholder, so every `Some`
+    /// index here names a real, non-`Auto` agent — never a value that itself
+    /// means "no agent". This is the value `NewPaneRequest` carries forward so
+    /// the mode-pane wrap decision can consult it (the chip otherwise only ever
+    /// seeds the Command text and is discarded thereafter).
+    fn selected_agent_type(&self) -> Option<AgentType> {
+        self.agent_selection
+            .and_then(|idx| crate::agent_registry::ALL.get(idx))
+            .map(|spec| spec.agent_type.clone())
     }
 
     /// PRD #20 finding #8: select the agent at `idx` and SEED the Command field
@@ -6195,6 +6245,29 @@ fn deliver_orchestrator_prompt(
 /// emits nothing until its first turn, so the pane reads "No agent" for as long
 /// as the user has not prompted it. `None` (every mode without the key) derives
 /// from the command exactly as before.
+/// Issue #640: resolve the "declared" identity a mode pane's wrap-vs-bare
+/// decision should honor, combining the mode config's static `agent = "…"`
+/// declaration ([`crate::project_config::ModeConfig::declared_agent_type`])
+/// with the New Agent form's own explicit `Agent:` chip selection
+/// ([`NewPaneFormState::selected_agent_type`]).
+///
+/// Precedence: `form_selected` wins over `mode_declared` when both are
+/// present. The mode's `agent =` key is a static, mode-level default set once
+/// in config; the form's Agent chip is a deliberate, per-spawn, run-time
+/// override the user makes at the exact moment they pick what THIS pane runs
+/// (PRD #20 finding #8 — it exists specifically to declare identity for a
+/// launcher command that isn't auto-inferable). The more specific,
+/// more-recent, explicit signal outranks the general one, matching ordinary
+/// override semantics: a user who overrides the mode's own answer means it.
+/// When only one is present it is used outright; when neither is present the
+/// wrap decision falls back to parsing the command, unchanged.
+fn resolve_declared_agent_for_wrap(
+    mode_declared: Option<AgentType>,
+    form_selected: Option<AgentType>,
+) -> Option<AgentType> {
+    form_selected.or(mode_declared)
+}
+
 fn wrap_agent_command(command: &str, declared: Option<AgentType>) -> String {
     match declared.or_else(|| AgentType::from_command(Some(command))) {
         Some(agent_type) => crate::wrap::wrap_launch_command(command, &agent_type),
@@ -6812,6 +6885,15 @@ pub struct NewPaneRequest {
     /// here keeps the authoring session a dashboard card while still delivering
     /// the authoring prompt.
     seed_prompt: Option<String>,
+    /// Issue #640: [`NewPaneFormState::selected_agent_type`] — the agent the
+    /// user EXPLICITLY picked via the form's own Agent chip (PRD #20 finding
+    /// #8), carried forward so the mode-pane wrap decision
+    /// (`wrap_agent_command`'s call site in the `SpawnPane` handler) can
+    /// consult it. Without this the chip only ever seeds the Command text and
+    /// the explicit choice is silently discarded once the request is built —
+    /// exactly the gap issue #640 reports. `None` means the user picked
+    /// nothing (`auto`).
+    form_agent_type: Option<AgentType>,
 }
 
 /// PRD #80: the single action layer. Every keyboard-only command and (from
@@ -9865,6 +9947,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             mode_config: None,
             orchestration_config: None,
             seed_prompt: build_dispatcher_mode(&form.dir).seed_prompt,
+            form_agent_type: form.selected_agent_type(),
         };
     }
     // fork #166 reviewer F1: trimmed once here, at the single place every
@@ -9898,6 +9981,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             mode_config: None,
             orchestration_config: None,
             seed_prompt: Some(build_issue_dispatch_authoring_seed(&form.dir)),
+            form_agent_type: form.selected_agent_type(),
         };
     }
     // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
@@ -9940,6 +10024,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             orchestration_config: None,
             seed_prompt: build_schedule_authoring_mode(form.schedule_existing.as_ref(), &form.dir)
                 .seed_prompt,
+            form_agent_type: form.selected_agent_type(),
         };
     }
     NewPaneRequest {
@@ -9949,6 +10034,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
         seed_prompt: None,
+        form_agent_type: form.selected_agent_type(),
     }
 }
 
@@ -12567,6 +12653,32 @@ fn dispatch_action(
                     // dimensions before the command starts.  This avoids
                     // the process seeing the default 80×24 size.
                     let is_mode = req.mode_config.is_some();
+                    // Issue #640: captured now, before `req.mode_config` is
+                    // moved out in the mode-tab branch below, so the mode-pane
+                    // wrap decision can consult the form's explicit Agent-chip
+                    // pick alongside the mode's own `agent =` declaration
+                    // (`resolve_declared_agent_for_wrap`). Deliberately scoped
+                    // to THAT one call site — `spawn_agent_type` just below
+                    // (badge / daemon-bound identity) and the plain (no-mode)
+                    // wrap decision a few lines down are left untouched; PRD
+                    // #20 finding #8's form selection was never threaded into
+                    // either of those either, but that is a separate,
+                    // unexplored gap, not this issue's fix.
+                    let form_agent_type_for_wrap = req.form_agent_type.clone();
+                    // Issue #640 round 5 (audit finding 1): resolve the
+                    // mode-pane wrap identity ONCE here, so it can be reused
+                    // both at the issue-#308 `pane_declared_agent` badge-cache
+                    // insert just below (the interim Dashboard badge shown
+                    // before the real hook/event arrives) and at the actual
+                    // wrap call site further down — the two must always
+                    // agree, since the badge is only ever a preview of what
+                    // the wrap decision already committed to.
+                    let declared_agent_for_wrap = resolve_declared_agent_for_wrap(
+                        req.mode_config
+                            .as_ref()
+                            .and_then(|mode| mode.declared_agent_type()),
+                        form_agent_type_for_wrap.clone(),
+                    );
                     // PRD #76 M2.13: infer agent_type from the form's command
                     // (the canonical "what runs in this pane" hint) — use
                     // `req.command` directly so it covers both the plain-card
@@ -12713,11 +12825,14 @@ fn dispatch_action(
                             // runs, since that pane's command is typed in this
                             // form rather than written in the config. A plain
                             // dashboard card declares nothing and is unchanged.
-                            if let Some(declared) = req
-                                .mode_config
-                                .as_ref()
-                                .and_then(|mode| mode.declared_agent_type())
-                            {
+                            //
+                            // Issue #640 round 5 (audit finding 1): consult the
+                            // same `declared_agent_for_wrap` resolution used by
+                            // the wrap call site below (rather than only
+                            // `mode.declared_agent_type()`), so a form Agent-chip
+                            // pick also fixes the interim badge shown here, not
+                            // just the actual wrapped launch.
+                            if let Some(declared) = declared_agent_for_wrap.clone() {
                                 ui.pane_declared_agent.insert(new_id.clone(), declared);
                             }
                             let mode_name_for_save =
@@ -12820,9 +12935,26 @@ fn dispatch_action(
                                                 // launch line here. The persisted
                                                 // `saved.command` stays bare (only
                                                 // the injected line is transformed).
+                                                //
+                                                // Issue #640: also consult the New
+                                                // Agent form's own explicit Agent-chip
+                                                // pick, not just the mode's static
+                                                // `agent =` declaration — see
+                                                // `resolve_declared_agent_for_wrap`'s
+                                                // doc comment for the precedence.
+                                                //
+                                                // Issue #640 round 5 (audit finding
+                                                // 1): reuse the SAME resolution
+                                                // (`declared_agent_for_wrap`) already
+                                                // applied to the badge-cache insert
+                                                // above, rather than re-deriving it
+                                                // here from `mode_config` /
+                                                // `form_agent_type_for_wrap` — the
+                                                // badge and the actual wrap must
+                                                // never be able to disagree.
                                                 let launch = wrap_agent_command(
                                                     &agent_cmd,
-                                                    mode_config.declared_agent_type(),
+                                                    declared_agent_for_wrap.clone(),
                                                 );
                                                 let _ = pane.write_to_pane(&new_id, &launch);
                                             }
@@ -13105,6 +13237,13 @@ fn dispatch_action(
                 // arrow keys do — suggest a name if it landed on an
                 // orchestration.
                 form.suggest_name_if_orchestration_selected();
+                // Issue #640 round 5 (audit finding 2): clicking a mode chip
+                // is the same "select this mode" mutation as the Tab-cycle
+                // arrows, so it must clear a stale Agent-chip pick the same
+                // way `select_next_mode`/`select_previous_mode` do — see
+                // `reset_agent_selection_if_mode_declares_agent`'s doc
+                // comment.
+                form.reset_agent_selection_if_mode_declares_agent();
             }
         }
         // [Submit] → spawn the pane from the form values (== Enter on the final
@@ -25621,6 +25760,171 @@ mod tests {
         assert_eq!(payload, base64_encode(b"cargo test-fast\nsecond line"));
     }
 
+    /// Issue #640: [`resolve_declared_agent_for_wrap`]'s precedence table — the
+    /// New Agent form's explicit Agent-chip pick wins over the mode's static
+    /// `agent = "…"` declaration when both are present; either one alone is
+    /// used outright; neither present resolves to `None` (the caller then
+    /// falls back to parsing the command, unchanged).
+    #[test]
+    fn resolve_declared_agent_for_wrap_precedence() {
+        // Neither present.
+        assert_eq!(resolve_declared_agent_for_wrap(None, None), None);
+        // Only the mode's declaration present.
+        assert_eq!(
+            resolve_declared_agent_for_wrap(Some(AgentType::Codex), None),
+            Some(AgentType::Codex)
+        );
+        // Only the form's explicit selection present.
+        assert_eq!(
+            resolve_declared_agent_for_wrap(None, Some(AgentType::Codex)),
+            Some(AgentType::Codex)
+        );
+        // Both present and AGREEING.
+        assert_eq!(
+            resolve_declared_agent_for_wrap(Some(AgentType::Codex), Some(AgentType::Codex)),
+            Some(AgentType::Codex)
+        );
+        // Both present and CONFLICTING — the form's explicit, per-spawn
+        // selection wins over the mode's static, config-level default (see the
+        // function's own doc comment for why).
+        assert_eq!(
+            resolve_declared_agent_for_wrap(Some(AgentType::ClaudeCode), Some(AgentType::Codex)),
+            Some(AgentType::Codex),
+            "the form's explicit Agent-chip pick must win over the mode's static declaration"
+        );
+    }
+
+    /// Issue #640 round 5 (audit finding 2): a stale Agent-chip pick must be
+    /// cleared the moment the user selects a DIFFERENT mode that itself
+    /// declares an agent — otherwise `resolve_declared_agent_for_wrap`'s
+    /// "form wins on conflict" precedence would silently override the mode's
+    /// own declared policy with a pick made for a wholly unrelated reason
+    /// earlier in the same form session. A mode that declares NO agent must
+    /// leave the pick untouched — it is still the only signal available.
+    #[test]
+    fn selecting_a_declaring_mode_clears_a_stale_agent_chip_pick() {
+        let declaring_mode = ModeConfig {
+            agent: Some("claude".to_string()),
+            name: "policy-mode".to_string(),
+            init_command: None,
+            seed_prompt: None,
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        };
+        let undeclared_mode = ModeConfig {
+            agent: None,
+            name: "undeclared-mode".to_string(),
+            init_command: None,
+            seed_prompt: None,
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        };
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp/repo"),
+            String::new(),
+            String::new(),
+            vec![undeclared_mode, declaring_mode],
+            vec![],
+        );
+
+        // Cycle the Agent chip to Codex first — e.g. the user was exploring
+        // a bespoke no-mode launcher, or simply clicking the chip.
+        let codex_idx = crate::agent_registry::ALL
+            .iter()
+            .position(|spec| spec.agent_type == AgentType::Codex)
+            .expect("Codex ships in the registry");
+        f.select_agent(codex_idx);
+        assert_eq!(
+            f.selected_agent_type(),
+            Some(AgentType::Codex),
+            "precondition: the chip is holding an explicit Codex pick"
+        );
+
+        // Selecting the FIRST (undeclared) mode must leave the pick alone —
+        // it is still the only signal available for this mode.
+        f.select_next_mode();
+        assert_eq!(
+            f.selected_mode().map(|m| m.name.as_str()),
+            Some("undeclared-mode")
+        );
+        assert_eq!(
+            f.selected_agent_type(),
+            Some(AgentType::Codex),
+            "an undeclared mode must not clear an explicit chip pick"
+        );
+
+        // Selecting the SECOND mode — which DOES declare `agent = \"claude\"`
+        // — must clear the stale Codex pick. Before the round-5 fix,
+        // `agent_selection` survived the mode switch untouched and
+        // `resolve_declared_agent_for_wrap` would resolve to the stale
+        // Codex pick instead of the mode's declared Claude identity.
+        f.select_next_mode();
+        assert_eq!(
+            f.selected_mode().map(|m| m.name.as_str()),
+            Some("policy-mode"),
+            "test targets the mode that declares an agent"
+        );
+        assert_eq!(
+            f.selected_agent_type(),
+            None,
+            "a stale Agent-chip pick must be cleared once a declaring mode is selected"
+        );
+
+        // The end-to-end consequence: the built request no longer carries a
+        // conflicting form pick, so `resolve_declared_agent_for_wrap` (fed by
+        // `req.form_agent_type` and `req.mode_config`) resolves to the
+        // mode's own declared Claude identity, not the stale Codex one.
+        let req = build_new_pane_request(&f, "claude");
+        assert_eq!(req.form_agent_type, None);
+        assert_eq!(
+            resolve_declared_agent_for_wrap(
+                req.mode_config
+                    .as_ref()
+                    .and_then(|m| m.declared_agent_type()),
+                req.form_agent_type,
+            ),
+            Some(AgentType::ClaudeCode),
+            "the mode's declared identity must win once the stale form pick is cleared"
+        );
+    }
+
+    /// Issue #640: [`NewPaneFormState::selected_agent_type`] maps the chip's
+    /// `agent_selection` index into the real [`AgentType`] it names — `None`
+    /// when nothing was picked (`auto`), the registry entry's type for a valid
+    /// index, and `None` (not a panic) for an out-of-range index rather than
+    /// ever resolving to the neutral "no agent" placeholder (which `ALL`
+    /// excludes by construction).
+    #[test]
+    fn new_pane_form_selected_agent_type_maps_registry_index() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            form.selected_agent_type(),
+            None,
+            "no selection ('auto') must map to None"
+        );
+
+        let codex_idx = crate::agent_registry::ALL
+            .iter()
+            .position(|spec| spec.agent_type == AgentType::Codex)
+            .expect("Codex ships in the registry");
+        form.select_agent(codex_idx);
+        assert_eq!(form.selected_agent_type(), Some(AgentType::Codex));
+
+        // Defensive: an out-of-range index (should never occur via
+        // `select_agent`/`cycle_agent_*`, which both bound-check against
+        // `ALL.len()`) resolves to None rather than panicking.
+        form.agent_selection = Some(crate::agent_registry::ALL.len() + 5);
+        assert_eq!(form.selected_agent_type(), None);
+    }
+
     /// PRD #196: the new-pane Command-field seed resolver honors the fallback
     /// chain — an explicit `default_command` always wins; otherwise the recorded
     /// `last_command` (when present and non-blank); otherwise blank. Also pins
@@ -34529,6 +34833,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("tab-a")),
             seed_prompt: None,
+            form_agent_type: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req_a)),
@@ -34580,6 +34885,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("tab-b")),
             seed_prompt: None,
+            form_agent_type: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req_b)),
@@ -34862,6 +35168,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("shared-orch")),
             seed_prompt: None,
+            form_agent_type: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -37288,6 +37595,52 @@ mod tests {
         );
     }
 
+    /// Issue #640: the form's explicit Agent-chip selection
+    /// (`NewPaneFormState::agent_selection`) must survive into the built
+    /// `NewPaneRequest` for a MODE pane — it is otherwise discarded the moment
+    /// the form closes, leaving the mode-pane wrap decision nothing to consult
+    /// but the mode's own (possibly absent) static `agent = "…"` declaration.
+    #[test]
+    fn build_new_pane_request_carries_form_agent_selection_forward() {
+        let mode = ModeConfig {
+            agent: None,
+            name: "undeclared-mode".to_string(),
+            init_command: None,
+            seed_prompt: None,
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        };
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp/repo"),
+            "name".to_string(),
+            String::new(),
+            vec![mode],
+            vec![],
+        );
+        f.selection_index = 1; // the one custom mode (0 = "No mode")
+        let codex_idx = crate::agent_registry::ALL
+            .iter()
+            .position(|spec| spec.agent_type == AgentType::Codex)
+            .expect("Codex ships in the registry");
+        f.select_agent(codex_idx);
+        // A bespoke, non-inferable launcher — the point of PRD #20 finding #8:
+        // nothing but the explicit chip pick identifies this as Codex.
+        f.command = "./run-codex.sh --flag".to_string();
+
+        let req = build_new_pane_request(&f, "claude");
+        assert_eq!(
+            req.mode_config.as_ref().map(|m| m.name.as_str()),
+            Some("undeclared-mode"),
+            "test targets the one custom, agent-undeclared mode"
+        );
+        assert_eq!(
+            req.form_agent_type,
+            Some(AgentType::Codex),
+            "the form's explicit Agent-chip pick must ride on the built request"
+        );
+    }
+
     // --- PRD #127 M3.3: "Scheduled Tasks" manager dialog pure-data helpers ---
 
     fn make_scheduled_task(name: &str, enabled: bool) -> config::ScheduledTask {
@@ -38818,6 +39171,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -40286,6 +40640,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -41122,6 +41477,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -41202,6 +41558,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -41269,6 +41626,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -41352,6 +41710,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -41899,6 +42258,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -41983,6 +42343,7 @@ mod tests {
                 mode_config: None,
                 orchestration_config: Some(config.clone()),
                 seed_prompt: None,
+                form_agent_type: None,
             };
 
             let pc = Arc::new(CapturingPaneController::new());
@@ -42174,6 +42535,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -42585,6 +42947,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -42692,6 +43055,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -42811,6 +43175,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -43136,6 +43501,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            form_agent_type: None,
         };
         let controller = Arc::new(CapturingPaneController::new());
         let mut tab_manager = TabManager::new(controller.clone());
@@ -43197,6 +43563,7 @@ mod tests {
             mode_config: None,
             orchestration_config: None,
             seed_prompt: None,
+            form_agent_type: None,
         }
     }
 
@@ -43483,6 +43850,7 @@ mod tests {
             mode_config: Some(mode),
             orchestration_config: None,
             seed_prompt: None,
+            form_agent_type: None,
         }
     }
 
@@ -47485,6 +47853,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(lock_test_orch_config(name)),
             seed_prompt: None,
+            form_agent_type: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
