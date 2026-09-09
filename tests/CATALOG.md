@@ -6343,6 +6343,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
 
+##### codex/spawn/013 — The New Agent form's explicit Agent: Codex selection is silently discarded by the mode-pane wrap decision, leaving a real Codex session unwrapped (issue #640 round 3 lead).
+- **Layer:** L2 PTY-attached real-agent mode flow, including a raw SGR mouse click to reach the form's click-only Agent chip; runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
+- **Agent:** real interactive Codex on the cheap test model, launched by a bespoke `run-codex.sh` command typed into a `[[modes]]` agent pane that declares NO `agent` key — after the New Agent form's own Agent chip (PRD #20 finding #8) was explicitly clicked/cycled to `Codex` before the command was replaced.
+- **Asserts:** `wrap_agent_command`'s mode-pane call site (`src/ui.rs`) only consults the mode config's static `agent =` declaration, never the form's `agent_selection` (which exists solely to seed the Command text field and is discarded thereafter) — so even an explicit, user-driven Agent-chip pick of Codex is ignored, the command is typed in bare (no `dot-agent-deck wrap --agent codex --` prefix, no per-pane `codex_spawn_prep`, no `CODEX_HOME` pin), and even once the real Codex CLI is fully booted and interactive, the Dashboard card shows no `Codex` badge and the daemon's broadcast stream carries no `Codex`-typed `AgentEvent` for the session.
+- **Does not assert:** the mode-config-declared positive case (`codex/spawn/011`) or the declared-orchestration positive case (`codex/spawn/009`/`012`); a fix for this gap; the same form-selection-discarded question for a plain (no-mode) new-pane spawn, which is a distinct, unexplored path.
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
+
 #### codex/hooks
 
 ##### codex/hooks/001 — A real launcher-script interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014, §4.3.7). [reel]
