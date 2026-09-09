@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.44.8] - 2026-09-09
+
+### Fixed
+
+  A `Working` status held up by a monitored external wait (`worker-agent-deck wait start`) — not real agent activity — now renders distinctly instead of looking identical to genuine agent progress. `worker-agent-deck daemon status` shows the text marker `Working (observing)` (and its `--json` document's `wait_observing` field, which always serializes, reflects it), and the TUI deck card shows a distinct color and `(observing)` label. This now also covers the PRD's headline flow — an agent calling `wait start` on itself while already `Working` — where the marker previously never appeared at all. It still doesn't appear at the moment `wait start` is called (the pane is genuinely doing real work at that instant); it now correctly appears once the agent's own completion signal arrives and is swallowed by the still-outstanding wait, which is exactly the moment the pane stops being genuinely active and starts being held up by the wait alone.
+  Worker-role labels on deck cards (e.g. `Orchestrator`, `reviewer`) now render in `Color::LightRed` instead of a fixed `Color::Indexed(130)` orange. Unlike the old fixed index, the new colour adapts with the terminal's own theme, closing the palette's last non-named-ANSI exception (issue #715) and giving the role-name row a live WCAG contrast guard (`theme/contrast/004`) instead of a documentation-only claim.
+
+
+
 ## [0.44.7] - 2026-09-09
 
 ### Fixed
