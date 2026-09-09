@@ -398,14 +398,14 @@ fn click_on_grid_text(deck: &TuiDeck, needle: &str) {
 /// New Agent form's own "Agent" chip (PRD #20 finding #8 — off the Tab cycle,
 /// click-only) to EXPLICITLY pick Codex before typing a bespoke non-inferable
 /// launcher script wrapping a REAL Codex process. The mode's shell-injection
-/// submit path (`wrap_agent_command`, `src/ui.rs`) only ever consults the mode
-/// config's static `agent =` declaration — never the form's `agent_selection`,
-/// which exists solely to seed the Command text and is discarded thereafter — so
-/// even though the user explicitly told the deck "this is Codex" through the
-/// form's own dedicated control, the command is typed in bare: no
-/// `dot-agent-deck wrap --agent codex --` prefix, no per-pane `codex_spawn_prep`,
-/// no CODEX_HOME pin. The real, live, fully-booted interactive Codex session must
-/// still leave the Dashboard card unreported.
+/// submit path (`wrap_agent_command`, `src/ui.rs`) now consults the New Agent
+/// form's `agent_selection` (carried forward on `NewPaneRequest.form_agent_type`)
+/// alongside the mode config's static `agent =` declaration via
+/// `resolve_declared_agent_for_wrap` (issue #640) — so the command IS typed in
+/// wrapped: `dot-agent-deck wrap --agent codex --` prefix, per-pane
+/// `codex_spawn_prep`, CODEX_HOME pin, all run. The real, live, fully-booted
+/// interactive Codex session must have its Dashboard card correctly reported as
+/// Codex.
 #[spec("codex/spawn/013")]
 #[test]
 #[cfg(unix)]
@@ -473,12 +473,18 @@ fn spawn_013_form_agent_selection_ignored_by_mode_pane_wrap_decision() {
             panic!("the bespoke real-Codex mode launcher never executed: {state}")
         });
 
-    // Because this pane's CODEX_HOME was never pinned the way the Wrapper
-    // strategy would, Codex falls back to the ambient default home and hits its
-    // own native hook-trust review gate there — push through it exactly as a
-    // user hitting this bug live would ("Continue without trusting"), so the
-    // assertions below observe the fully-booted interactive session rather than
-    // an artifact of the trust prompt itself.
+    // Post-fix, this pane's launch line IS wrapped through `dot-agent-deck wrap
+    // --agent codex --`, which pins CODEX_HOME and installs + records scoped
+    // trust for the deck's own hooks before the real Codex process execs (see
+    // `codex_spawn_prep` in `src/wrap.rs`) — the same precondition that lets
+    // `spawn_009`/`spawn_012` (a declared orchestration role's real Codex
+    // launcher) reach their assertions without ever seeing this dialog. This
+    // block is kept purely defensive: it only fires if hook-trust recording
+    // somehow lags or fails in a given environment, or if a live Codex build
+    // shows its own review gate for a reason unrelated to the deck's hooks —
+    // push through it exactly as such a case would need to ("Continue without
+    // trusting"), so the assertions below observe the fully-booted interactive
+    // session rather than an artifact of the trust prompt itself.
     if deck.wait_for_grid_string_within("Hooks need review", Duration::from_secs(20)) {
         deck.send_bytes(b"\x1b[B\x1b[B\r"); // Down, Down, Enter -> "Continue without trusting"
     }
