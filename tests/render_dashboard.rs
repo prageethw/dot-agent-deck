@@ -606,11 +606,14 @@ fn contrast_001_overlays_reference_frame() {
 /// and never a DIM. A regression that filled any surface with an absolute
 /// background, or that let the selected border fall back to a fixed White/Black
 /// or a low-contrast status colour, would fail one of these assertions (issue
-/// #442). (c) PRD fork#405 auditor S2: on the card surfaces, no cell foreground
-/// is `Color::Rgb(..)` either, and `palette::ROLE_NAME` is the ONLY non-`Reset`,
-/// non-named-ANSI foreground that appears — converting the palette module's
-/// documented WCAG exception (one deliberate `Color::Indexed` constant, and
-/// only one) from prose into an assertion a future diff has to argue with.
+/// #442). (c) on the card surfaces, no cell foreground is `Color::Rgb(..)`
+/// either, and — since issue #715 moved `palette::ROLE_NAME` onto
+/// `Color::LightRed`, itself a named-ANSI colour — there is no longer any
+/// legitimate non-`Reset`, non-named-ANSI foreground anywhere on a card at
+/// all: every cell foreground must be `Color::Reset` or in the named-ANSI
+/// allow-list, full stop. (Before #715 this sweep special-cased `ROLE_NAME`
+/// as the palette's one deliberate `Color::Indexed` exception; that exception
+/// no longer exists.)
 #[spec("theme/guard/001")]
 #[test]
 fn guard_001_no_absolute_backgrounds() {
@@ -678,12 +681,12 @@ fn guard_001_no_absolute_backgrounds() {
         "unselected card must NOT carry the `▸ ` selection prefix"
     );
 
-    // (c) The palette's one deliberate non-named exception, `palette::ROLE_NAME`,
-    //     is the ONLY non-Reset, non-named-ANSI foreground allowed on a card —
-    //     and in particular no cell foreground is an absolute `Color::Rgb(..)`.
+    // (c) Since issue #715, `palette::ROLE_NAME` is itself named-ANSI
+    //     (`Color::LightRed`), so there is no legitimate non-Reset,
+    //     non-named-ANSI foreground anywhere on a card at all — and in
+    //     particular no cell foreground is an absolute `Color::Rgb(..)`.
     //     `placeholder_card` now carries a non-empty display name (see its doc
     //     comment) specifically so the identity row renders into this buffer.
-    let role_name = dot_agent_deck::palette::ROLE_NAME;
     let named_ansi = [
         Color::Black,
         Color::Red,
@@ -706,16 +709,12 @@ fn guard_001_no_absolute_backgrounds() {
         for y in 0..buf.area().height {
             for x in 0..buf.area().width {
                 let fg = buf[(x, y)].fg;
-                if fg == Color::Reset || named_ansi.contains(&fg) {
-                    continue;
-                }
-                assert_eq!(
-                    fg,
-                    role_name,
+                assert!(
+                    fg == Color::Reset || named_ansi.contains(&fg),
                     "surface `{label}` has a non-Reset, non-named-ANSI foreground \
-                     {fg:?} at ({x},{y}) that is not palette::ROLE_NAME — the \
-                     palette's WCAG rationale claims ROLE_NAME is the only \
-                     deliberate exception:\n{}",
+                     {fg:?} at ({x},{y}) — since issue #715, every role in the \
+                     palette is named-ANSI or Reset, so any survivor here is an \
+                     absolute/Indexed regression:\n{}",
                     buffer_to_color_text(buf)
                 );
             }
@@ -2966,12 +2965,13 @@ fn fn_region_handles_nested_and_restricted_visibility_boundaries() {
 /// embedded-pane render path (`src/terminal_widget.rs`): both must reference the
 /// centralized `palette`, the deck-card status mapping (`status_style`) and
 /// border resolver (`render_session_card`) must carry no inline status/accent
-/// `Color::Green/Blue/Yellow/Red/Cyan` literals, and — since PRD fork#405 M1
-/// added the palette's one deliberate non-named exception, `palette::ROLE_NAME
-/// = Color::Indexed(130)` — no inline `Color::Indexed` literal either: an
-/// inline 256-cube index in the card path would be exactly as much of a
+/// `Color::Green/Blue/Yellow/Red/Cyan` literals, and no inline `Color::Indexed`
+/// literal either — even though issue #715 moved `palette::ROLE_NAME` off
+/// `Color::Indexed(130)` onto the named-ANSI `Color::LightRed`, so no role in
+/// the palette needs a 256-cube index any more: an inline `Color::Indexed`
+/// literal in the card path would still be exactly as much of a
 /// single-source-of-truth violation as an inline `Color::Green`, since the
-/// palette is supposed to be the only place that constant is spelled out. The
+/// palette is supposed to be the only place any such constant is spelled out. The
 /// pane path must carry no inline status `Color::Green/Blue/Yellow/Red`
 /// literal, and the stats bar (`render_stats_bar`) must carry no inline status
 /// `Color::Green/Blue/Yellow/Red` literal — its non-status `Cyan`
@@ -3016,10 +3016,11 @@ fn guard_003_render_paths_use_palette_roles() {
 
     // (3) The deck-card border resolver carries no inline accent/status literal
     //     (notably the selection accent, formerly `Color::Cyan`), and no inline
-    //     `Color::Indexed` either — the palette now owns one non-named colour
-    //     (`palette::ROLE_NAME`, PRD fork#405 M1), so an inline 256-cube index
-    //     in this path would be exactly as much of a single-source-of-truth
-    //     violation as an inline `Color::Green`.
+    //     `Color::Indexed` either — since issue #715, no role in the palette
+    //     (including `palette::ROLE_NAME`) needs a 256-cube index any more, so
+    //     an inline `Color::Indexed` literal in this path would be exactly as
+    //     much of a single-source-of-truth violation as an inline
+    //     `Color::Green`.
     let card = fn_region(&ui, "fn render_session_card");
     for lit in [
         "Color::Cyan",
@@ -3276,12 +3277,12 @@ fn row_needle_fg(buffer: &ratatui::buffer::Buffer, y: u16, needle: &str) -> Colo
 /// the agent-type badge toggle ON and OFF. Badge ON: the title row (row 0)
 /// must carry `ClaudeCode (Opus)` and must NOT carry the display name; the
 /// first body row (row 1) must carry the display name in
-/// `palette::ROLE_NAME` (`Color::Indexed(130)`). Badge OFF (the default):
+/// `palette::ROLE_NAME` (`Color::LightRed`, issue #715). Badge OFF (the default):
 /// the title row must carry neither the badge nor the name, while the body
 /// row must STILL carry the name in the same colour — the unconditional
 /// half, and the single most likely thing to regress, so it is asserted
 /// explicitly and independently of the badge-on case. Also asserts
-/// `Color::Indexed(130)` is distinct from every status role colour and every
+/// `Color::LightRed` is distinct from every status role colour and every
 /// registry `badge_color`, and that a card with `display_name: None` falls
 /// back to `id_display` on the same row. Snapshots the badge-on/badge-off
 /// pair with `buffer_to_color_text` so a future colour or placement
@@ -3296,8 +3297,10 @@ fn pane_014_role_name_on_its_own_body_row() {
     let role_name = dot_agent_deck::palette::ROLE_NAME;
     assert_eq!(
         role_name,
-        Color::Indexed(130),
-        "PRD fork#405 M1 chose Indexed(130) on measured contrast — see src/palette.rs"
+        Color::LightRed,
+        "PRD fork#405 M1 chose Indexed(130) because no named-ANSI slot was free at the time; \
+         issue #715 revisited the choice once other roles vacated the slots that made \
+         Color::LightRed unavailable — see src/palette.rs"
     );
 
     let now = chrono::Utc::now();
@@ -3365,7 +3368,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         row_needle_fg(&on, 1, "example-coder"),
         role_name,
         "badge ON: the display name on the body row must render in palette::ROLE_NAME \
-         (Color::Indexed(130))"
+         (Color::LightRed, issue #715)"
     );
     // PRD fork#405 delta-review (reviewer D4): F1's separating space between
     // the badge text and the border fill is a `Reset/Reset`-styled
