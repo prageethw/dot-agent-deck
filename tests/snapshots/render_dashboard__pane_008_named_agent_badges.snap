@@ -4,7 +4,7 @@ expression: named_badges
 ---
 == ClaudeCode / friendly-claude ==
 [Blue/Reset]"┌" [Reset/Reset]" 1 " [Blue/Reset]"─────────────────────────────────────────────────────────────── ● Thinking ┐"
-[Blue/Reset]"│" [Indexed(130)/Reset]"friendly-claude" [Blue/Reset]"│"
+[Blue/Reset]"│" [LightRed/Reset]"friendly-claude" [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                                               " [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
 [Blue/Reset]"│" [Blue/Reset]"│"
@@ -14,7 +14,7 @@ expression: named_badges
 [Blue/Reset]"└──────────────────────────────────────────────────────────" [Reset/Reset]" Last: 0s  Tools: 0 " [Blue/Reset]"┘"
 == OpenCode / friendly-opencode ==
 [Blue/Reset]"┌" [Reset/Reset]" 1 " [Blue/Reset]"─────────────────────────────────────────────────────────────── ● Thinking ┐"
-[Blue/Reset]"│" [Indexed(130)/Reset]"friendly-opencode" [Blue/Reset]"│"
+[Blue/Reset]"│" [LightRed/Reset]"friendly-opencode" [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                                               " [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
 [Blue/Reset]"│" [Blue/Reset]"│"
@@ -24,7 +24,7 @@ expression: named_badges
 [Blue/Reset]"└──────────────────────────────────────────────────────────" [Reset/Reset]" Last: 0s  Tools: 0 " [Blue/Reset]"┘"
 == Pi / friendly-pi ==
 [Blue/Reset]"┌" [Reset/Reset]" 1 " [Blue/Reset]"─────────────────────────────────────────────────────────────── ● Thinking ┐"
-[Blue/Reset]"│" [Indexed(130)/Reset]"friendly-pi" [Blue/Reset]"│"
+[Blue/Reset]"│" [LightRed/Reset]"friendly-pi" [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                                               " [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
 [Blue/Reset]"│" [Blue/Reset]"│"
@@ -34,7 +34,7 @@ expression: named_badges
 [Blue/Reset]"└──────────────────────────────────────────────────────────" [Reset/Reset]" Last: 0s  Tools: 0 " [Blue/Reset]"┘"
 == Codex / friendly-codex ==
 [Blue/Reset]"┌" [Reset/Reset]" 1 " [Blue/Reset]"─────────────────────────────────────────────────────────────── ● Thinking ┐"
-[Blue/Reset]"│" [Indexed(130)/Reset]"friendly-codex" [Blue/Reset]"│"
+[Blue/Reset]"│" [LightRed/Reset]"friendly-codex" [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                                               " [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
 [Blue/Reset]"│" [Blue/Reset]"│"

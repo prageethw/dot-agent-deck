@@ -88,26 +88,14 @@
 //! such colour is up against (issue #579), and `theme/contrast/002` for the
 //! guard that recomputes it.
 //!
-//! [`ROLE_NAME`] is the one deliberate exception: named ANSI has no orange,
-//! and the role-name row (PRD #405 M1) needs a hue distinct from every status
-//! colour that still reads on both a dark and a light background. Measured
-//! contrast (WCAG relative luminance ratio):
-//!
-//! | Colour | vs black | vs white |
-//! |---|---|---|
-//! | `Indexed(208)` `#ff8700` | 8.72:1 | 2.41:1 |
-//! | `Indexed(166)` `#d75f00` | 5.53:1 | 3.80:1 |
-//! | **`Indexed(130)` `#af5f00`** | **4.46:1** | **4.71:1** |
-//!
-//! `Indexed(130)` is the only candidate balanced on both themes; `Indexed(166)`
-//! fails WCAG AA (4.5:1) on light terminals, which would add a second instance
-//! of the bug class issue #312 is already open about. `Color::Yellow` and
-//! `Color::LightRed` are unavailable — they already mean [`STATUS_WAITING`]
-//! and [`STATUS_ERROR`], and a card cannot have one hue meaning two things. A
-//! 256-cube index is nominally remappable but effectively fixed on most
-//! terminals — one tier weaker than the `Color::Rgb` ban, and accepted
-//! deliberately here rather than drifted into. **The `Color::Rgb` ban itself
-//! is unchanged**; `ROLE_NAME` is still not an absolute RGB colour.
+//! As of issue #715, the palette is 100% named-ANSI/`Reset` — there is no
+//! remaining exception. [`ROLE_NAME`] used to be one: from PRD #405 M1 until
+//! #715 it was a 256-cube `Color::Indexed` value, because at the time every
+//! named-ANSI slot with a distinct hue was already spoken for and named ANSI
+//! itself has no orange. Issue #715 freed `Color::LightRed` up for the role
+//! (see [`ROLE_NAME`]'s own doc comment for why), closing that exception for
+//! good — the `Color::Rgb` ban was never relaxed either, so nothing in this
+//! module resolves to an absolute colour any more.
 
 use ratatui::style::Color;
 
@@ -231,10 +219,31 @@ pub const FOCUSED: Color = Color::Cyan;
 pub const SELECTED: Color = Color::Reset;
 
 /// The role-name row on a deck card (PRD #405 M1) — e.g. `Orchestrator`,
-/// beneath the type/model title row. See the module doc above for why this
-/// is the palette's one deliberate non-named-ANSI exception and how
-/// `Indexed(130)` was chosen over `Indexed(166)`/`Indexed(208)`.
-pub const ROLE_NAME: Color = Color::Indexed(130);
+/// beneath the type/model title row.
+///
+/// ## Why `Color::LightRed` (issue #715)
+///
+/// Every other named-ANSI slot was already claimed by a status role or an
+/// agent-type registry `badge_color` by the time this needed one — `LightRed`
+/// was the last true-ANSI candidate left. Its sibling risk was accepted
+/// knowingly rather than overlooked: it is literally `Color::Red`'s own
+/// "bright" reference value, so role names now render in the same hue family
+/// as [`STATUS_ERROR`], just brighter. That was accepted after visual review,
+/// not stumbled into.
+///
+/// Measured (xterm reference, `theme/contrast/004`): `LightRed` renders at
+/// **4.00:1 on white** and **5.25:1 on black**. The white pairing falls short
+/// of the 4.5:1 WCAG AA text floor (SC 1.4.3) — a second knowingly accepted
+/// tradeoff alongside the hue collision above — but clears the 3:1 SC 1.4.11
+/// non-text floor that actually applies to a body-row label.
+///
+/// This closes the palette's last non-named-ANSI exception. Originally this
+/// constant was `Color::Indexed(130)` — a 256-cube index chosen (PRD #405 M1)
+/// because named ANSI had no orange and `Indexed(130)` measured the best
+/// balanced WCAG contrast on both themes among the 256-cube candidates
+/// considered. That reasoning no longer applies now that the constant is
+/// named-ANSI.
+pub const ROLE_NAME: Color = Color::LightRed;
 
 /// Resolve a session status to its centralized border/badge role color. This
 /// is the shared base for the deck-card render path (`src/ui.rs`) and the
