@@ -22799,7 +22799,25 @@ fn render_session_card(
     // that decide WHEN a prompt may be written still read
     // `session.agent_type`, so a declared pane is drawn immediately and still
     // waits for its agent to actually start before anything is typed into it.
-    let shown_agent_type = if session.agent_type == crate::event::AgentType::None {
+    //
+    // Issue #730: `is_pending` (below) must gate on this RAW, OBSERVED
+    // `session.agent_type` — not on `shown_agent_type`/`is_placeholder`,
+    // which a role's config declaration fills from the moment the pane is
+    // drawn, before the agent has done anything at all. That made
+    // "Starting…" categorically unreachable for any declared pane: it fell
+    // straight through to the raw, unvetted `status_style(&session.status)`
+    // instead (in the wild, a stale `Thinking` left over from before the
+    // session ever resolved). Whether a pane has actually started is a
+    // question about the OBSERVED session, not the config declaration, so
+    // `is_untyped_agent` — "the observed agent has not identified itself",
+    // not "not delegated": a delegated, actively-working Codex pane still
+    // has `agent_type == None` until its first turn completes (#549) — is
+    // computed once here and reused below by both `shown_agent_type` (the
+    // badge basis) and `is_pending` (the raw basis); they deliberately read
+    // different bindings past this point (`dashboard/pane/013`: a
+    // declaration still fills the badge).
+    let is_untyped_agent = session.agent_type == crate::event::AgentType::None;
+    let shown_agent_type = if is_untyped_agent {
         declared_agent_type
             .cloned()
             .unwrap_or(crate::event::AgentType::None)
@@ -22807,21 +22825,7 @@ fn render_session_card(
         session.agent_type.clone()
     };
     let is_placeholder = shown_agent_type == crate::event::AgentType::None;
-    // Issue #730: `is_pending` must gate on the RAW `session.agent_type`,
-    // not `shown_agent_type` (`is_placeholder` above). A role's config
-    // declaration fills `shown_agent_type` — and therefore `is_placeholder`
-    // — from the moment the pane is drawn, before the agent has done
-    // anything at all, which made "Starting…" categorically unreachable for
-    // any declared pane: it fell straight through to the raw, unvetted
-    // `status_style(&session.status)` instead (in the wild, a stale
-    // `Thinking` left over from before the session ever resolved). Whether a
-    // pane has actually started is a question about the OBSERVED session,
-    // not the config declaration, so this reads `session.agent_type`
-    // directly. `is_placeholder`/`shown_agent_type` stay as the badge basis
-    // below (`dashboard/pane/013`: a declaration still fills the badge) —
-    // this distinction is deliberately narrower than that one.
-    let is_undelegated = session.agent_type == crate::event::AgentType::None;
-    let is_pending = is_undelegated && session.expects_agent_report;
+    let is_pending = is_untyped_agent && session.expects_agent_report;
     // Issue #549: `is_placeholder` alone can't gate "No agent" here once a
     // pending placeholder has resolved via real activity — it stays true
     // for as long as the producer stays untagged (`shown_agent_type` is
@@ -22841,7 +22845,7 @@ fn render_session_card(
     // (below) is the one deliberate exception — see its own comment (D4).
     //
     // `is_empty_placeholder` stays on `is_placeholder` (shown-based), not
-    // `is_undelegated` (raw-based) like `is_pending` above: a declared pane
+    // `is_untyped_agent` (raw-based) like `is_pending` above: a declared pane
     // must never show "No agent" (`dashboard/pane/013`), only ever
     // "Starting…" or the badge, so the declaration's badge-filling effect
     // has to keep suppressing this specific label.
@@ -23019,6 +23023,11 @@ fn render_session_card(
         // must not draw a dimmed border.
         text_dim()
     } else {
+        // Issue #730 N5: a declared `is_pending` card lands here (not the
+        // `is_empty_placeholder` arm above), so it draws a normal-weight
+        // border while an undeclared pending card draws dim — accepted,
+        // intentional: a declared pane isn't an "empty slot" the way an
+        // undeclared one is.
         Style::default().fg(status_color)
     };
     // Selection ALSO thickens the glyph and, in command mode, adds BOLD — three
@@ -23194,6 +23203,12 @@ fn render_session_card(
         )),
     ]));
 
+    // Issue #730 N6: `ShellBusy` is daemon-synthetic and promotes `status` to
+    // `Working` without clearing `expects_agent_report`, so a declared pane
+    // with a live foreground shell but no agent report yet now reads
+    // "Starting…" here rather than `Working`, masking issue #21's
+    // shell-provenance signal pre-first-report — accepted as the price of
+    // consistency with how undeclared panes already behaved.
     if is_pending {
         lines.push(Line::from(Span::styled(
             "Waiting for agent to report in…",
