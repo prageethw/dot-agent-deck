@@ -41,6 +41,26 @@ ordinary JSONL classification (`classify_and_emit`) still drives the
 dashboard through Thinking -> Idle for the case where delivery genuinely
 lands. A bare confirmation-retry probe (an empty submitted line) does NOT
 satisfy this and starts no turn.
+
+NOTE (issue #737 harness investigation): the `READY_MARKER` line below is
+printed BEFORE the genuine stdin read, deliberately -- the test needs a
+grid-visible way to confirm this script reached that point without touching
+stdin. But `dot-agent-deck wrap`'s `classify_and_emit` (`src/wrap.rs`) tees
+every stdout line of a Codex-identity child through a text classifier, and
+for this stand-in `suppress_text_status` is `false` (this is a plain Python
+script, not real `codex-cli`, so it never fires the native
+`UserPromptSubmit`/`Stop` hooks that would otherwise make the wrapper stand
+the text classifier down) -- so this marker line itself gets classified by
+the generic non-JSON fallback ("any other non-blank output is substantive
+activity") and reaches the daemon as a real `Thinking` AgentEvent, despite
+predating any genuine input. This is expected, independent, already-accepted
+behavior of the wrapper's fallback classifier (see the `CODEX` ruleset's own
+"Accepted risk" doc comment in `src/wrap.rs`) -- not a bug in this script,
+and not something this script can avoid while still proving its own
+readiness on the grid. `tests/e2e_orchestration_seed_synthetic.rs`'s
+`orchestration_seed_019` test tolerates that stray `Thinking` and instead
+asserts on `Idle`, which can only follow this script's own `turn.completed`
+JSONL below -- printed only once a real, non-empty stdin line was read.
 """
 import os
 import sys

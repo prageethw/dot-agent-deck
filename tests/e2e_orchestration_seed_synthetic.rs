@@ -166,12 +166,16 @@ fn open_orchestration(deck: &TuiDeck) {
 /// `SPAWN_TIME_READINESS_BUFFER` (500ms) — then, mirroring a real Codex TUI's
 /// raw-mode transition, explicitly discards whatever accumulated on stdin
 /// before ever reading. Confirm the stand-in genuinely reached that flush
-/// point, then assert the deck's one-shot spawn-time seed write never
-/// reaches it (no stdin log is ever written) and the role never visibly
-/// starts a turn (no "Thinking" on screen or on the daemon's own event
-/// stream) — issue #737's reported symptom: a healthy, idle Codex process
-/// that never received a single byte of input, reproduced from the specific
-/// too-early-write mechanism this file's module doc identifies.
+/// point, then assert the deck's one-shot spawn-time seed write never reaches
+/// it (no stdin log is ever written) and no GENUINE turn is ever confirmed
+/// (no `Idle` AgentEvent, which can only follow the stand-in's own
+/// `turn.completed` JSONL, itself only printed after a real non-empty stdin
+/// read) — issue #737's reported symptom: a healthy, idle Codex process that
+/// never received a single byte of input, reproduced from the specific
+/// too-early-write mechanism this file's module doc identifies. See the
+/// investigation note inline below for why this test does NOT assert on the
+/// mere absence of a "Thinking" status — that status is independently, and
+/// legitimately, sometimes triggered by this synthetic harness itself.
 #[spec("orchestration/seed/019")]
 #[test]
 fn orchestration_seed_019_wrap_fork_time_readiness_loses_a_slow_codex_seed_prompt() {
@@ -241,28 +245,56 @@ fn orchestration_seed_019_wrap_fork_time_readiness_loses_a_slow_codex_seed_promp
         deck.snapshot_grid()
     );
 
-    // The user-visible half of the same fact: with no genuine input ever
-    // received, the role can never start a turn, so the pane never shows
-    // "Thinking" — matching #737's report of a healthy, idle Codex process
-    // that never received a single byte.
+    // INVESTIGATION NOTE (issue #737 harness false-positive, found when this
+    // test first went to CI): an earlier version of this test also asserted
+    // that "Thinking" never appears at all — neither on the rendered grid nor
+    // as an AgentEvent — for the delayed role. That assertion was ITSELF a
+    // false positive and had to be dropped, for a reason independent of
+    // issue #737: `codex_delayed_standin.py` must write its own
+    // `STANDIN-READY` marker to stdout (see above) so this test can observe,
+    // from outside the process, that the stand-in genuinely reached its
+    // ready point — there is no other way to confirm that. But
+    // `dot-agent-deck wrap`'s `classify_and_emit` (`src/wrap.rs`) tees EVERY
+    // line of a Codex-identity child's stdout through a text classifier, and
+    // for this synthetic setup `suppress_text_status` is `false`:
+    // `codex_spawn_prep` installs and trusts the deck's native Codex hooks
+    // (it fires for any Codex-identity pane, `program_is_codex(program) ||
+    // pane_id.is_some()`), but this stand-in is a plain Python script that
+    // never actually invokes those hooks the way real `codex-cli` would, so
+    // no native `UserPromptSubmit`/`Stop` event ever arrives to make the
+    // classifier stand down. With suppression off, `classify_line_with`'s
+    // generic non-JSON fallback ("any other non-blank output is substantive
+    // activity") fires on the READY_MARKER line itself and reaches the
+    // daemon as a genuine `Thinking` AgentEvent — despite that line, by
+    // construction, predating the stand-in's own stdin read. This is real,
+    // independent, and already documented as an accepted tradeoff (the
+    // `CODEX` ruleset's own "Accepted risk" doc comment, `src/wrap.rs`) — it
+    // is not a reproduction of issue #737, and it is not fixable in the
+    // fixture without losing the grid-visible readiness check above (ANY
+    // non-blank line the stand-in must emit before genuinely blocking would
+    // trip the same fallback). So this test tolerates a stray `Thinking` and
+    // instead asserts on a signal that fallback classification cannot
+    // produce: `Idle` here is only ever emitted from the stand-in's own
+    // JSONL (`classify_codex_json`'s `"turn.completed"` -> `Idle` mapping),
+    // which the stand-in only prints after it has genuinely read a
+    // non-empty stdin line — exactly the fact `!log_path.exists()` above
+    // already establishes never happened. A confirmed `Idle` for this pane
+    // would mean the seed write DID land; its absence, together with the
+    // never-created stdin log, is the real proof issue #737's loss
+    // reproduced.
     assert!(
-        !deck.wait_for_grid_string_within("Thinking", Duration::from_secs(4)),
-        "issue #737 did NOT reproduce: the delayed Codex role visibly \
-         entered Thinking even though its stdin log was never created:\n{}",
+        events
+            .try_wait_for(
+                |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
+                Duration::from_secs(4),
+            )
+            .is_none(),
+        "issue #737 did NOT reproduce: the delayed Codex role's stand-in \
+         reported a genuinely completed turn (an Idle AgentEvent) even \
+         though its stdin log was never created — Idle can only follow the \
+         stand-in reading a real, non-empty stdin line: {:?}\nfinal grid:\n{}",
+        events.snapshot(),
         deck.snapshot_grid()
-    );
-    let stray_thinking: Vec<_> = events
-        .snapshot()
-        .into_iter()
-        .filter(|event| {
-            event.agent_type == AgentType::Codex && event.event_type == EventType::Thinking
-        })
-        .collect();
-    assert!(
-        stray_thinking.is_empty(),
-        "issue #737 did NOT reproduce: a Thinking AgentEvent for the delayed \
-         Codex role was observed on the daemon's own event stream even \
-         though its stdin log was never created: {stray_thinking:?}"
     );
 }
 
