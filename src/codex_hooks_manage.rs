@@ -727,20 +727,31 @@ pub fn untrust_deck_hooks_in(home: &Path) -> std::io::Result<usize> {
     Ok(removed)
 }
 
-/// Read `<home>/config.toml`, hand `edit` the `[hooks.state]` table to mutate, and
-/// publish the result atomically — WITHOUT reformatting anything else.
+/// Read `<home>/config.toml`, drill down through `path` as nested tables
+/// (each segment created IMPLICIT when absent, so the file gains only the
+/// deepest header the caller actually needs — no bare intermediate headers
+/// appear in the user's config), hand `edit` the table at the end of `path`
+/// to mutate, and publish the result atomically — WITHOUT reformatting
+/// anything else.
 ///
 /// `toml_edit` (not a `toml`/serde round trip) is what makes this safe on the
 /// user's real `~/.codex/config.toml`: comments, key order, spacing, and every
 /// unrelated table come back byte-identical, and a new table is appended at the
 /// end. A missing file starts from an empty document; an unparseable one is an
 /// error and is left untouched (we never discard a config we don't understand).
-fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> std::io::Result<()> {
+///
+/// Shared mechanics behind [`edit_trust_state`] (`["hooks", "state"]`) and
+/// [`edit_projects_table`] (`["projects"]`) — both just pick the table path.
+fn edit_config_table_at(
+    home: &Path,
+    path: &[&str],
+    edit: impl FnOnce(&mut toml_edit::Table),
+) -> std::io::Result<()> {
     use toml_edit::{DocumentMut, Item, Table};
 
     std::fs::create_dir_all(home)?;
-    let path = home.join(CONFIG_TOML);
-    let existing = match std::fs::read_to_string(&path) {
+    let cfg_path = home.join(CONFIG_TOML);
+    let existing = match std::fs::read_to_string(&cfg_path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
@@ -752,42 +763,34 @@ fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> st
         )
     })?;
 
-    // `[hooks]` / `[hooks.state]` are created IMPLICIT when absent, so the file
-    // gains only the `[hooks.state."<key>"]` header(s) it needs — no bare
-    // `[hooks]` / `[hooks.state]` headers appear in the user's config.
-    let hooks = doc
-        .as_table_mut()
-        .entry("hooks")
-        .or_insert_with(|| {
-            let mut table = Table::new();
-            table.set_implicit(true);
-            Item::Table(table)
-        })
-        .as_table_mut()
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("Codex {CONFIG_TOML}: `hooks` is not a table (left unchanged)"),
-            )
-        })?;
-    let state = hooks
-        .entry("state")
-        .or_insert_with(|| {
-            let mut table = Table::new();
-            table.set_implicit(true);
-            Item::Table(table)
-        })
-        .as_table_mut()
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("Codex {CONFIG_TOML}: `hooks.state` is not a table (left unchanged)"),
-            )
-        })?;
+    let mut table = doc.as_table_mut();
+    for segment in path {
+        table = table
+            .entry(segment)
+            .or_insert_with(|| {
+                let mut table = Table::new();
+                table.set_implicit(true);
+                Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Codex {CONFIG_TOML}: `{segment}` is not a table (left unchanged)"),
+                )
+            })?;
+    }
 
-    edit(state);
+    edit(table);
 
-    crate::agent_hook_config::write_atomic(home, &path, doc.to_string().as_bytes())
+    crate::agent_hook_config::write_atomic(home, &cfg_path, doc.to_string().as_bytes())
+}
+
+/// Read `<home>/config.toml`, hand `edit` the `[hooks.state]` table to mutate, and
+/// publish the result atomically — WITHOUT reformatting anything else. Thin
+/// wrapper over [`edit_config_table_at`]; see there for the shared mechanics.
+fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> std::io::Result<()> {
+    edit_config_table_at(home, &["hooks", "state"], edit)
 }
 
 /// Insert or refresh one `[hooks.state."<key>"] { enabled, trusted_hash }` record.
@@ -812,6 +815,357 @@ fn upsert_trust_record(state: &mut toml_edit::Table, key: &str, hash: &str) {
             record.insert("enabled", value(true));
             record.insert("trusted_hash", value(hash));
             state.insert(key, Item::Table(record));
+        }
+    }
+}
+
+/// How long [`resolve_git_repo_root`]'s `git rev-parse` is given to answer
+/// before the call is abandoned and [`git_repo_root`] falls back to the
+/// literal `cwd` (fix-round F4). `git rev-parse --git-common-dir` is a cheap
+/// local metadata read — no network, no hooks, no index — so this only needs
+/// to guard against a wedged filesystem mount, not a slow remote; mirrors
+/// [`HOOKS_LIST_TIMEOUT`]'s magnitude for the same class of call (local,
+/// normally near-instant, but on the hot per-spawn path so must never hang
+/// indefinitely).
+const GIT_REPO_ROOT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why [`resolve_git_repo_root`] could not resolve a root, distinguished
+/// (fix-round A4) so [`git_repo_root`] can tell the EXPECTED case (`cwd`
+/// genuinely isn't inside a git repository — Codex itself would key on the
+/// literal directory too, so the silent fallback is correct) from a genuine
+/// failure worth a diagnostic (`git` missing from `PATH`, a real git error
+/// such as a "detected dubious ownership" refusal, or a timeout) — the
+/// pre-fix version collapsed all three into one silent fallback with zero
+/// log signal.
+enum RepoRootLookupFailure {
+    NotARepo,
+    Other(String),
+}
+
+/// Resolve the git repository root for `cwd`, falling back to `cwd` itself
+/// when it isn't inside a git repository, `git` isn't on `PATH`, or the call
+/// times out or otherwise fails (never blocks the spawn — see
+/// [`RepoRootLookupFailure`] for how those cases are told apart for logging).
+///
+/// Codex CLI's own directory-trust gate keys on the resolved repo root, not
+/// the literal cwd (verified live against 0.153.4: an already-trusted
+/// ancestor directory does NOT cascade into an untrusted repo beneath it) —
+/// but crucially, from inside a LINKED WORKTREE (`git worktree add`, how
+/// CLAUDE.md rule 1 mandates every fix in this repo happen), the gate keys on
+/// the MAIN checkout's root, NOT the worktree's own root (issue #732 fix-
+/// round A1 — also verified live: Codex's own dialog names the main checkout
+/// explicitly as "the repository root" when launched from a worktree).
+/// [`resolve_git_repo_root`] therefore resolves via git's *common* directory
+/// (`rev-parse --git-common-dir`, whose parent is always the main checkout
+/// root) rather than `--show-toplevel` (which returns the invoking
+/// worktree's own root, and was this function's pre-fix behavior — a no-op
+/// in the dominant, rule-1-mandated case it exists to handle).
+fn git_repo_root(cwd: &Path) -> PathBuf {
+    match resolve_git_repo_root(cwd) {
+        Ok(root) => root,
+        Err(RepoRootLookupFailure::NotARepo) => cwd.to_path_buf(),
+        Err(RepoRootLookupFailure::Other(reason)) => {
+            tracing::debug!(
+                cwd = %cwd.display(),
+                reason,
+                "git_repo_root: could not resolve a repository root for {}; falling back to the \
+                 literal cwd, so trust_project_dir_in's record below may be keyed on a path \
+                 Codex's own trust gate does not check",
+                cwd.display()
+            );
+            cwd.to_path_buf()
+        }
+    }
+}
+
+/// Bounded (fix-round F4) `git rev-parse --git-common-dir` call backing
+/// [`git_repo_root`]. Deliberately its own small spawn/poll/timeout loop
+/// rather than reusing [`crate::issue_dispatch_run::git_common_dir`]: that
+/// helper is itself unbounded by design (tracked as fork issue #388 — no
+/// synchronous capture-with-timeout helper existed when it was written), and
+/// this call sits on the per-Codex-spawn hot path, so it needs a genuine
+/// bound, not a second copy of that same gap.
+///
+/// Tries `--path-format=absolute --git-common-dir` first (git >= 2.31,
+/// always prints an absolute path, so the caller needs no `Path::join`
+/// reconstruction at all), falling back to plain `--git-common-dir` (which
+/// prints a path RELATIVE to `cwd` for the main working tree and an ABSOLUTE
+/// path for a linked worktree / `--separate-git-dir` checkout / submodule —
+/// `Path::join` handles both, since joining onto an absolute path replaces
+/// it outright) only when the flagged attempt itself fails — mirroring
+/// [`crate::issue_dispatch_run::git_common_dir`]'s own flag-preference order
+/// and fallback trigger (any non-success from the flagged call, not a
+/// specific "unknown option" stderr match — that helper doesn't distinguish
+/// either, it just retries flag-less unconditionally). A prior version of
+/// this function used only the un-flagged form on the theory that
+/// `Path::join` made a version-fallback unnecessary; that was wrong — `join`
+/// never canonicalizes a relative `..`-bearing result the way
+/// `--show-toplevel` does, which is exactly the class of mismatch the
+/// flagged form sidesteps by never needing `join` in the first place.
+fn resolve_git_repo_root(cwd: &Path) -> Result<PathBuf, RepoRootLookupFailure> {
+    let (status, stdout, _stderr) =
+        run_git_rev_parse(cwd, &["--path-format=absolute", "--git-common-dir"])?;
+    if status.success() {
+        let raw = stdout.trim();
+        if raw.is_empty() {
+            return Err(RepoRootLookupFailure::Other(
+                "git rev-parse --path-format=absolute --git-common-dir printed no output"
+                    .to_string(),
+            ));
+        }
+        // Already absolute — no `join` needed or wanted.
+        let common_dir = PathBuf::from(raw);
+        return common_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+            RepoRootLookupFailure::Other(format!(
+                "git common dir {common_dir:?} has no parent directory"
+            ))
+        });
+    }
+
+    // Old-git compatibility fallback: `--path-format` needs git >= 2.31 and
+    // an older git rejects the flag outright, which the flagged attempt
+    // above just reported as a non-success exit.
+    let (fb_status, fb_stdout, fb_stderr) = run_git_rev_parse(cwd, &["--git-common-dir"])?;
+    if !fb_status.success() {
+        if fb_stderr.contains("not a git repository") {
+            return Err(RepoRootLookupFailure::NotARepo);
+        }
+        return Err(RepoRootLookupFailure::Other(format!(
+            "git rev-parse --git-common-dir exited {fb_status}: {}",
+            fb_stderr.trim()
+        )));
+    }
+
+    let raw = fb_stdout.trim();
+    if raw.is_empty() {
+        return Err(RepoRootLookupFailure::Other(
+            "git rev-parse --git-common-dir printed no output".to_string(),
+        ));
+    }
+    let common_dir = cwd.join(raw);
+    common_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+        RepoRootLookupFailure::Other(format!(
+            "git common dir {common_dir:?} has no parent directory"
+        ))
+    })
+}
+
+/// Bounded (fix-round F4, extended fix-round A/B for issue #732) single
+/// `git -C <cwd> rev-parse <extra_args>` invocation backing
+/// [`resolve_git_repo_root`] — its own small spawn/poll/timeout loop rather
+/// than reusing [`crate::issue_dispatch_run::git_common_dir`] wholesale:
+/// that helper is itself unbounded by design (tracked as fork issue #388 —
+/// no synchronous capture-with-timeout helper existed when it was written),
+/// and this call sits on the per-Codex-spawn hot path, so it needs a genuine
+/// bound, not a second copy of that same gap. [`resolve_git_repo_root`]
+/// calls this once per attempt (flagged, then the old-git fallback), each
+/// independently bounded by [`GIT_REPO_ROOT_TIMEOUT`] — kept self-contained
+/// here rather than extracted into a cross-file helper because the only
+/// piece worth sharing (spawn + bounded wait + capture) is a poor fit
+/// alongside `issue_dispatch_run`'s different execution model (blocking
+/// `Command::output()` / `tokio::process`, both unbounded there); the
+/// flag-preference *decision* this function makes around it is what's
+/// actually mirrored from that file, not its execution shape.
+fn run_git_rev_parse(
+    cwd: &Path,
+    extra_args: &[&str],
+) -> Result<(std::process::ExitStatus, String, String), RepoRootLookupFailure> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .args(extra_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| RepoRootLookupFailure::Other(format!("failed to spawn git: {e}")))?;
+
+    let deadline = Instant::now() + GIT_REPO_ROOT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RepoRootLookupFailure::Other(format!(
+                        "git rev-parse {extra_args:?} timed out after {GIT_REPO_ROOT_TIMEOUT:?}"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                return Err(RepoRootLookupFailure::Other(format!(
+                    "failed to wait on git rev-parse: {e}"
+                )));
+            }
+        }
+    };
+
+    // `git rev-parse --git-common-dir`'s own stdout is a single short path —
+    // nowhere near the OS pipe-buffer size `spawn_and_wait_sync`'s reader-
+    // thread hardening exists to guard against for a command like `git status
+    // --porcelain` — so reading sequentially after the child has already
+    // exited (rather than draining concurrently on its own thread) cannot
+    // deadlock here.
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+
+    Ok((status, stdout, stderr))
+}
+
+/// Pre-empt Codex CLI's own interactive "Do you trust the contents of this
+/// directory?" gate (issue #732) by writing the same record a human answering
+/// its default "1. Yes, continue" would: `[projects."<repo-root>"]
+/// trust_level = "trusted"` in `<home>/config.toml`.
+///
+/// **This auto-answers a real, persistent, security-relevant confirmation
+/// prompt on the user's behalf** (fix-round F5) — Codex's own trust gate
+/// exists to make a human confirm before it loads project-local
+/// config/hooks/exec-policies from an unfamiliar directory, and this writes
+/// that "yes" into the user's real `~/.codex/config.toml` without asking,
+/// persistently (not just for the current session). This is a deliberate
+/// tradeoff, not an oversight: the alternative is the interactive session
+/// wedging indefinitely with no way for a deck-spawned, non-interactive pane
+/// to ever answer the prompt itself, and the deck only ever does this for a
+/// directory the user already directed it to spawn Codex into.
+///
+/// This is a SEPARATE mechanism from [`trust_deck_hooks_in`]'s scoped hook
+/// trust, confirmed live against Codex CLI 0.153.4: hook trust travels
+/// through a headless `codex app-server` RPC channel this interactive gate
+/// never touches, so a pane can have hooks "correctly registered and
+/// trusted" while the real interactive session still wedges indefinitely at
+/// this untouched prompt — with zero native hook invocations, since the gate
+/// blocks project-local config/hooks/exec-policies from loading at all.
+///
+/// Keyed by [`git_repo_root`], not the literal `cwd`, to match how Codex
+/// itself resolves the prompt's key.
+///
+/// Idempotent and format-preserving like [`trust_deck_hooks_in`]: publishing
+/// is guarded by [`INSTALL_LOCK`], so two concurrent writers *within this
+/// same process* can't interleave, and repeated calls for the same directory
+/// merge into the same record in place rather than duplicating it or
+/// rewriting the rest of the file. `INSTALL_LOCK` is a `Mutex<()>` and so is
+/// PROCESS-LOCAL ONLY (fix-round F3, correcting a prior overclaim here) — it
+/// does NOT serialize a sibling pane's spawn when that pane is a separate
+/// `wrap` process (the normal case for two panes launching Codex
+/// concurrently). Cross-process, only the underlying temp-file+rename
+/// publish (`edit_config_table_at`) is atomic — a concurrent writer from
+/// another process can still race a read-modify-write against this one and
+/// have its update lost, not just interleaved corruption.
+pub fn trust_project_dir_in(home: &Path, cwd: &Path) -> std::io::Result<()> {
+    let root = git_repo_root(cwd);
+    let path_str = root.to_str().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "project directory path is not valid UTF-8: {}",
+                root.display()
+            ),
+        )
+    })?;
+    let key = quoted_toml_key(path_str)?;
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    edit_projects_table(home, |projects| {
+        upsert_project_trust_record(projects, &key);
+    })
+}
+
+/// Build a `[projects."<raw>"]`-style TOML key that ALWAYS renders as a
+/// double-quoted basic string, regardless of platform path separators.
+///
+/// `toml_edit`'s default key formatting picks a single-quoted literal string
+/// instead whenever the decoded value contains a backslash (to avoid needing
+/// to escape it) — which every Windows path does. Left to that default, the
+/// SAME project path would render `[projects.'C:\...']` on Windows but
+/// `[projects."/Users/..."]` on Unix, a platform-dependent quoting style with
+/// no functional difference to a TOML parser (Codex included) but which
+/// breaks anything doing a literal-text match on the double-quoted form.
+/// Forcing basic-string quoting via a hand-escaped [`Key::parse`] round trip
+/// keeps the written record identical in shape across platforms.
+fn quoted_toml_key(raw: &str) -> std::io::Result<toml_edit::Key> {
+    let mut escaped = String::with_capacity(raw.len() + 2);
+    escaped.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\u{8}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{c}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                escaped.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped.push('"');
+
+    toml_edit::Key::parse(&escaped)
+        .map_err(|e| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("could not build a TOML key for {raw:?}: {e}"),
+            )
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("empty TOML key parse for {raw:?}"),
+            )
+        })
+}
+
+/// Read `<home>/config.toml`, hand `edit` the top-level `[projects]` table to
+/// mutate, and publish the result atomically — WITHOUT reformatting anything
+/// else. Thin wrapper over [`edit_config_table_at`]; see there for the shared
+/// mechanics.
+fn edit_projects_table(
+    home: &Path,
+    edit: impl FnOnce(&mut toml_edit::Table),
+) -> std::io::Result<()> {
+    edit_config_table_at(home, &["projects"], edit)
+}
+
+/// Insert or refresh one `[projects."<key>"] { trust_level = "trusted" }`
+/// record.
+///
+/// An existing record for `key` is updated IN PLACE — as a table or as an
+/// inline table, whichever the user (or a previous run) already wrote — so
+/// repeated trust writes are idempotent and never duplicate the table, and
+/// any other field already recorded for that project (Codex may add more
+/// over time) is left untouched. `key` carries its own forced double-quoted
+/// repr ([`quoted_toml_key`]) so a brand-new record's header renders the same
+/// way on every platform.
+fn upsert_project_trust_record(projects: &mut toml_edit::Table, key: &toml_edit::Key) {
+    use toml_edit::{Item, Table, Value as TomlValue, value};
+
+    match projects.get_mut(key.get()) {
+        Some(Item::Table(existing)) => {
+            existing.insert("trust_level", value("trusted"));
+        }
+        Some(Item::Value(TomlValue::InlineTable(existing))) => {
+            existing.insert("trust_level", TomlValue::from("trusted"));
+        }
+        _ => {
+            let mut record = Table::new();
+            record.insert("trust_level", value("trusted"));
+            projects.insert_formatted(key, Item::Table(record));
         }
     }
 }
@@ -1149,6 +1503,246 @@ mod tests {
              command: {command}\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Scenario: issue #732 investigation — live-captured against a real,
+    /// unmodified Codex CLI 0.153.4 session (`codex --ask-for-approval never
+    /// --sandbox read-only`, driven over a real PTY, no fixture/mock): ANY
+    /// directory whose resolved git-repository root is not already recorded
+    /// as `trusted` in `config.toml`'s `[projects."<path>"]` table blocks the
+    /// entire interactive session behind a "Do you trust the contents of
+    /// this directory?" confirmation — and the dialog's own text says why it
+    /// matters: "Trusting the directory allows project-local config, hooks,
+    /// and exec policies to load." Reproduced from a real dot-agent-deck git
+    /// worktree (a linked worktree of a repo whose ROOT had never been
+    /// explicitly trusted): the prompt named the resolved repository root,
+    /// not the worktree's own path, and answering it wrote exactly
+    /// `[projects."<repo-root>"] trust_level = "trusted"` into
+    /// `~/.codex/config.toml` — nothing else changed.
+    ///
+    /// This is a genuine, previously-undocumented mechanism for the #730
+    /// field symptom (two Codex panes wedged at "Thinking" for 8+ hours with
+    /// zero native `SessionStart`/`UserPromptSubmit`/`Stop` hook-invocation
+    /// log entries): a pane stuck at this dialog can NEVER receive a native
+    /// Codex hook, because Codex has not yet loaded hooks for an untrusted
+    /// directory — regardless of how correctly the deck's OWN hook trust
+    /// (`trust_deck_hooks_in`, which runs over `codex app-server`'s headless
+    /// `hooks/list` RPC and is unaffected by this gate — confirmed by a
+    /// separate live probe completing in ~0.26s against this machine's real,
+    /// plugin-heavy `config.toml`) was recorded in `hooks.json`/
+    /// `config.toml`'s `[hooks.state]`. `codex_spawn_prep` (`src/wrap.rs`)
+    /// already resolves the pinned `CODEX_HOME` and calls
+    /// `trust_deck_hooks_in` for exactly this purpose on the HOOK side; it
+    /// has no equivalent for PROJECT trust, so this exact dialog can still
+    /// block every deck-spawned Codex pane's first session in any directory
+    /// (very much including a freshly created git worktree, since every
+    /// worktree is, by CLAUDE.md rule 1, a brand-new path) that has not
+    /// separately been trusted by a human.
+    ///
+    /// RED today: no function in this module records project trust — only
+    /// hook trust. This pins the desired fix surface directly: the deck must
+    /// write the SAME `[projects."<cwd>"] trust_level = "trusted"` record
+    /// Codex itself writes when a human answers "1. Yes, continue", so its
+    /// own confirmation gate never has anything left to ask a deck-spawned
+    /// pane.
+    #[test]
+    fn spawn_prep_trusts_the_project_dir_so_codexs_own_confirmation_gate_never_blocks() {
+        let home = tempfile::tempdir().expect("codex home tempdir");
+        let cwd = tempfile::tempdir().expect("project cwd tempdir");
+        let cwd_key = cwd.path().to_str().expect("utf8 cwd").to_string();
+
+        trust_project_dir_in(home.path(), cwd.path()).expect("trust project dir");
+
+        let contents =
+            std::fs::read_to_string(home.path().join(CONFIG_TOML)).expect("read config.toml");
+        // Must parse as valid TOML — a malformed write is as bad as no write,
+        // and worse than the interactive gate it was meant to preempt. Parsed
+        // structurally (not via a literal-text `contains`) so this assertion
+        // doesn't depend on `quoted_toml_key`'s specific escaping convention
+        // (e.g. backslash-escaping on a Windows `C:\Users\...` path) — only
+        // on the decoded key/value the written record actually carries.
+        let doc: toml_edit::DocumentMut = contents
+            .parse()
+            .expect("config.toml must remain valid TOML after recording project trust");
+        assert_eq!(
+            doc["projects"][cwd_key.as_str()]["trust_level"].as_str(),
+            Some("trusted"),
+            "issue #732: after the deck's own Codex spawn-prep flow runs for \
+             a directory, config.toml must ALSO carry \
+             [projects.\"{cwd_key}\"] trust_level = \"trusted\" — the exact \
+             record a human answering Codex CLI 0.153.4's own \"Do you \
+             trust the contents of this directory?\" prompt with \"1. Yes, \
+             continue\" would write (verified live). Without it, every \
+             deck-spawned Codex session for a never-before-trusted directory \
+             (e.g. a fresh git worktree, rule 1) wedges indefinitely behind \
+             that interactive gate BEFORE Codex loads project-local \
+             config/hooks/exec-policies for it, with zero native hook \
+             invocations ever firing — regardless of how correctly deck HOOK \
+             trust (`trust_deck_hooks_in`) was recorded.\ngot config.toml:\n{contents}"
+        );
+    }
+
+    /// Run `git <args>` in `dir` for this test module's own throwaway-repo
+    /// setup (not the thing under test), with ambient git configuration
+    /// switched off exactly like `xtask/linkage-check`'s earned precedent
+    /// for shelling out to real `git` in tests (CLAUDE.md rule 5) — a
+    /// developer's own `~/.gitconfig` (`commit.gpgsign`, a global
+    /// `core.hooksPath`, `init.defaultBranch`, …) would otherwise leak into
+    /// these scratch repos and make the test flaky for reasons having
+    /// nothing to do with `git_repo_root`.
+    fn run_git(args: &[&str], dir: &Path) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {args:?} in {dir:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} in {dir:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Scenario: issue #732 fix-round A2 — the shipped regression test above
+    /// builds `cwd` from a bare `tempfile::tempdir()`, which is never inside
+    /// a git repository, so `git_repo_root` unconditionally took its
+    /// not-a-repo fallback branch and the test could never exercise (or
+    /// catch a regression in) the actual worktree-root-resolution logic the
+    /// whole fix exists for. This test `git init`s a real throwaway repo,
+    /// adds a LINKED WORKTREE under it (`git worktree add`, exactly how
+    /// CLAUDE.md rule 1 mandates every fix in this repo happen), calls
+    /// `trust_project_dir_in` with the worktree as `cwd`, and asserts the
+    /// written record is keyed on the MAIN repo root — independently
+    /// re-derived via `git rev-parse --show-toplevel` run from the main repo
+    /// itself, not hand-typed — not the worktree's own root, and also
+    /// asserts no record was written under the worktree's own root either
+    /// (a fallback-to-cwd regression would otherwise still pass the first
+    /// assertion vacuously if the test setup happened to produce the same
+    /// string, though it can't here since the two roots are asserted
+    /// distinct as a setup sanity check first).
+    #[test]
+    fn spawn_prep_trusts_the_main_repo_root_from_inside_a_linked_worktree_not_the_worktrees_own_root()
+     {
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let repo_dir = scratch.path().join("main-repo");
+        std::fs::create_dir(&repo_dir).expect("create main repo dir");
+
+        run_git(&["init", "--initial-branch=main"], &repo_dir);
+        run_git(&["config", "user.email", "test@example.com"], &repo_dir);
+        run_git(&["config", "user.name", "Test"], &repo_dir);
+        run_git(&["commit", "--allow-empty", "-m", "init"], &repo_dir);
+
+        let worktree_dir = scratch.path().join("linked-worktree");
+        let worktree_dir_str = worktree_dir.to_str().expect("utf8 worktree path");
+        run_git(
+            &["worktree", "add", "-b", "wt-branch", worktree_dir_str],
+            &repo_dir,
+        );
+
+        // Ground truth for "the main repo root", derived independently of
+        // `git_repo_root`'s own implementation (a different git invocation,
+        // from a different cwd) so this isn't just re-asserting the same
+        // code path under test.
+        let main_root_out = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&repo_dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git rev-parse --show-toplevel in main repo");
+        assert!(main_root_out.status.success());
+        let main_root = String::from_utf8(main_root_out.stdout)
+            .expect("utf8 main repo toplevel")
+            .trim()
+            .to_string();
+
+        let worktree_root_out = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&worktree_dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git rev-parse --show-toplevel in worktree");
+        assert!(worktree_root_out.status.success());
+        let worktree_root = String::from_utf8(worktree_root_out.stdout)
+            .expect("utf8 worktree toplevel")
+            .trim()
+            .to_string();
+        assert_ne!(
+            main_root, worktree_root,
+            "test setup sanity: the worktree's own toplevel must differ from the main repo \
+             root, or this test cannot actually distinguish the two"
+        );
+
+        let home = tempfile::tempdir().expect("codex home tempdir");
+        trust_project_dir_in(home.path(), &worktree_dir).expect("trust project dir from worktree");
+
+        let contents =
+            std::fs::read_to_string(home.path().join(CONFIG_TOML)).expect("read config.toml");
+        let doc: toml_edit::DocumentMut = contents
+            .parse()
+            .expect("config.toml must remain valid TOML after recording project trust");
+
+        assert_eq!(
+            doc["projects"][main_root.as_str()]["trust_level"].as_str(),
+            Some("trusted"),
+            "issue #732 fix-round A1/A2: calling trust_project_dir_in with a LINKED WORKTREE \
+             as cwd must key the written record on the MAIN repository root ({main_root}) — \
+             matching how Codex CLI 0.153.4 itself resolves the trust gate's key from a \
+             worktree cwd — not the worktree's own `--show-toplevel` path ({worktree_root}), \
+             which is what the pre-fix git_repo_root wrote and which Codex's trust gate never \
+             checks.\ngot config.toml:\n{contents}"
+        );
+        // `doc["projects"][worktree_root.as_str()]` (the `Index` operator)
+        // would panic with "index not found" here rather than evaluate to
+        // something `.is_none()`-checkable — `toml_edit`'s `Index` impl for
+        // `Item`/`Table` is `self.get(key).expect("index not found")`, so it
+        // panics unconditionally on a missing key. That's exactly the
+        // outcome a correctly-behaving `trust_project_dir_in` produces here
+        // (no record keyed on the worktree's own root), so the assertion
+        // has to reach for `Table::get` directly instead of the indexing
+        // sugar, or it can never observe a pass.
+        assert!(
+            doc["projects"]
+                .as_table()
+                .and_then(|projects| projects.get(worktree_root.as_str()))
+                .is_none(),
+            "must not ALSO (or instead) key the record on the worktree's own root \
+             ({worktree_root})\ngot config.toml:\n{contents}"
+        );
+    }
+
+    /// Scenario: Pins `quoted_toml_key`'s backslash/quote escaping directly,
+    /// independent of the host platform's own path separator — builds a raw
+    /// key containing a literal backslash and a double-quote (the two
+    /// characters a Windows path like `C:\Users\demo` and TOML basic-string
+    /// syntax both care about), writes it into a table the same way
+    /// `upsert_project_trust_record` does, then re-parses the rendered TOML
+    /// and confirms the decoded key equals the raw input exactly.
+    #[test]
+    fn quoted_toml_key_round_trips_backslashes_and_quotes() {
+        let raw = "C:\\Users\\demo\\the \"trusted\" dir";
+        let key = quoted_toml_key(raw).expect("build quoted key");
+
+        let mut projects = toml_edit::Table::new();
+        let mut record = toml_edit::Table::new();
+        record.insert("trust_level", toml_edit::value("trusted"));
+        projects.insert_formatted(&key, toml_edit::Item::Table(record));
+
+        let mut doc = toml_edit::DocumentMut::new();
+        doc.insert("projects", toml_edit::Item::Table(projects));
+        let rendered = doc.to_string();
+
+        let reparsed: toml_edit::DocumentMut = rendered.parse().expect("re-parse rendered toml");
+        assert_eq!(
+            reparsed["projects"][raw]["trust_level"].as_str(),
+            Some("trusted"),
+            "quoted_toml_key must round-trip a key containing backslashes \
+             and double-quotes through TOML rendering and re-parsing \
+             unchanged\nrendered:\n{rendered}"
         );
     }
 }

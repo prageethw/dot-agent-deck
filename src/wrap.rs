@@ -1227,6 +1227,23 @@ fn codex_spawn_prep(
                  classification"
             ),
         }
+
+        // Pre-empt Codex's OWN interactive "Do you trust the contents of this
+        // directory?" gate (issue #732) — a SEPARATE mechanism from hook trust
+        // above, which travels through a headless `codex app-server` RPC
+        // channel this interactive gate never touches. Without this, a
+        // never-before-trusted repo root (e.g. a fresh worktree, rule 1)
+        // wedges the real interactive session indefinitely with zero native
+        // hook invocations, regardless of how correctly hook trust was
+        // recorded. Fail-open like the hook-trust call above: an error here
+        // must not block the spawn.
+        if let Err(e) = crate::codex_hooks_manage::trust_project_dir_in(home, &cwd) {
+            tracing::warn!(
+                "codex: could not pre-empt the directory-trust confirmation gate ({e}); the \
+                 interactive session may wedge on Codex's own \"Do you trust the contents of \
+                 this directory?\" prompt"
+            );
+        }
     }
 
     CodexSpawnPrep {
