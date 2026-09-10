@@ -6047,6 +6047,7 @@ fn deliver_orchestrator_prompt(
     // `agent_ready` exactly as before, so it is untouched too.
     let mut agent_ready = false;
     let mut strong_interface_seen = false;
+    let mut session_start_seen = false;
     for event in snapshot
         .sessions
         .values()
@@ -6054,6 +6055,7 @@ fn deliver_orchestrator_prompt(
         .flat_map(|session| session.recent_events.iter())
         .filter(|event| event.event_type == EventType::SessionStart)
     {
+        session_start_seen = true;
         if crate::state::session_start_means_ready(event) {
             agent_ready = true;
         }
@@ -6063,6 +6065,33 @@ fn deliver_orchestrator_prompt(
         if event.is_wrapper_interface_ready_session_start() {
             strong_interface_seen = true;
         }
+    }
+    // Issue #737 CI regression (build job, 6 `src/ui.rs` unit tests): the
+    // scan above is authoritative ONLY once it has actually found a
+    // `SessionStart` to judge. A pane can carry a known `agent_type` with
+    // NO `SessionStart` anywhere in `recent_events` for reasons that have
+    // nothing to do with the wrapper fork-time race this gate exists to
+    // guard against: `state.rs::seed_hydrated_session` (the `dot-agent-deck
+    // connect` reconnect path) seeds `agent_type` straight from the
+    // daemon's live snapshot without replaying event history; a long-lived
+    // pane's original `SessionStart` can age out of the 50-event
+    // `recent_events` cap (`MAX_RECENT_EVENTS`); and this same frame can run
+    // before any event has arrived at all. In every one of those cases the
+    // scan finds nothing either way — not "found a bad fact", genuinely
+    // NOTHING to judge — so treating that as a permanent "never ready" is
+    // strictly worse than issue #737's own bug: a healthy pane's one-shot
+    // seed write withheld forever instead of merely raced.
+    //
+    // Falling back to the pre-#737 signal here is safe because it only ever
+    // fires when `recent_events` holds no `SessionStart` at all. The moment
+    // one appears — including the wrapper's own bare fork-time fact that
+    // issue #737 is about — `session_start_seen` goes true and the scan's
+    // verdict above is authoritative again; this fallback never overrides a
+    // `SessionStart` the scan has already judged not-ready.
+    if !session_start_seen {
+        agent_ready = snapshot.sessions.values().any(|s| {
+            s.pane_id.as_deref() == Some(start_pane_id.as_str()) && s.agent_type != AgentType::None
+        });
     }
     let timeout_ready = !agent_ready
         && ui
