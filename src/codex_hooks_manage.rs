@@ -727,20 +727,31 @@ pub fn untrust_deck_hooks_in(home: &Path) -> std::io::Result<usize> {
     Ok(removed)
 }
 
-/// Read `<home>/config.toml`, hand `edit` the `[hooks.state]` table to mutate, and
-/// publish the result atomically — WITHOUT reformatting anything else.
+/// Read `<home>/config.toml`, drill down through `path` as nested tables
+/// (each segment created IMPLICIT when absent, so the file gains only the
+/// deepest header the caller actually needs — no bare intermediate headers
+/// appear in the user's config), hand `edit` the table at the end of `path`
+/// to mutate, and publish the result atomically — WITHOUT reformatting
+/// anything else.
 ///
 /// `toml_edit` (not a `toml`/serde round trip) is what makes this safe on the
 /// user's real `~/.codex/config.toml`: comments, key order, spacing, and every
 /// unrelated table come back byte-identical, and a new table is appended at the
 /// end. A missing file starts from an empty document; an unparseable one is an
 /// error and is left untouched (we never discard a config we don't understand).
-fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> std::io::Result<()> {
+///
+/// Shared mechanics behind [`edit_trust_state`] (`["hooks", "state"]`) and
+/// [`edit_projects_table`] (`["projects"]`) — both just pick the table path.
+fn edit_config_table_at(
+    home: &Path,
+    path: &[&str],
+    edit: impl FnOnce(&mut toml_edit::Table),
+) -> std::io::Result<()> {
     use toml_edit::{DocumentMut, Item, Table};
 
     std::fs::create_dir_all(home)?;
-    let path = home.join(CONFIG_TOML);
-    let existing = match std::fs::read_to_string(&path) {
+    let cfg_path = home.join(CONFIG_TOML);
+    let existing = match std::fs::read_to_string(&cfg_path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
@@ -752,42 +763,34 @@ fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> st
         )
     })?;
 
-    // `[hooks]` / `[hooks.state]` are created IMPLICIT when absent, so the file
-    // gains only the `[hooks.state."<key>"]` header(s) it needs — no bare
-    // `[hooks]` / `[hooks.state]` headers appear in the user's config.
-    let hooks = doc
-        .as_table_mut()
-        .entry("hooks")
-        .or_insert_with(|| {
-            let mut table = Table::new();
-            table.set_implicit(true);
-            Item::Table(table)
-        })
-        .as_table_mut()
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("Codex {CONFIG_TOML}: `hooks` is not a table (left unchanged)"),
-            )
-        })?;
-    let state = hooks
-        .entry("state")
-        .or_insert_with(|| {
-            let mut table = Table::new();
-            table.set_implicit(true);
-            Item::Table(table)
-        })
-        .as_table_mut()
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("Codex {CONFIG_TOML}: `hooks.state` is not a table (left unchanged)"),
-            )
-        })?;
+    let mut table = doc.as_table_mut();
+    for segment in path {
+        table = table
+            .entry(segment)
+            .or_insert_with(|| {
+                let mut table = Table::new();
+                table.set_implicit(true);
+                Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Codex {CONFIG_TOML}: `{segment}` is not a table (left unchanged)"),
+                )
+            })?;
+    }
 
-    edit(state);
+    edit(table);
 
-    crate::agent_hook_config::write_atomic(home, &path, doc.to_string().as_bytes())
+    crate::agent_hook_config::write_atomic(home, &cfg_path, doc.to_string().as_bytes())
+}
+
+/// Read `<home>/config.toml`, hand `edit` the `[hooks.state]` table to mutate, and
+/// publish the result atomically — WITHOUT reformatting anything else. Thin
+/// wrapper over [`edit_config_table_at`]; see there for the shared mechanics.
+fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> std::io::Result<()> {
+    edit_config_table_at(home, &["hooks", "state"], edit)
 }
 
 /// Insert or refresh one `[hooks.state."<key>"] { enabled, trusted_hash }` record.
@@ -870,7 +873,9 @@ pub fn trust_project_dir_in(home: &Path, cwd: &Path) -> std::io::Result<()> {
         )
     })?;
     let key = quoted_toml_key(path_str)?;
-    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     edit_projects_table(home, |projects| {
         upsert_project_trust_record(projects, &key);
     })
@@ -927,50 +932,13 @@ fn quoted_toml_key(raw: &str) -> std::io::Result<toml_edit::Key> {
 
 /// Read `<home>/config.toml`, hand `edit` the top-level `[projects]` table to
 /// mutate, and publish the result atomically — WITHOUT reformatting anything
-/// else. Same format-preserving approach as [`edit_trust_state`], just
-/// rooted at `[projects]` instead of `[hooks.state]`.
+/// else. Thin wrapper over [`edit_config_table_at`]; see there for the shared
+/// mechanics.
 fn edit_projects_table(
     home: &Path,
     edit: impl FnOnce(&mut toml_edit::Table),
 ) -> std::io::Result<()> {
-    use toml_edit::{DocumentMut, Item, Table};
-
-    std::fs::create_dir_all(home)?;
-    let path = home.join(CONFIG_TOML);
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
-    let mut doc = existing.parse::<DocumentMut>().map_err(|e| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("Codex {CONFIG_TOML} is not valid TOML (left unchanged): {e}"),
-        )
-    })?;
-
-    // `[projects]` is created IMPLICIT when absent, so the file gains only the
-    // `[projects."<key>"]` header(s) it needs — no bare `[projects]` header
-    // appears in the user's config.
-    let projects = doc
-        .as_table_mut()
-        .entry("projects")
-        .or_insert_with(|| {
-            let mut table = Table::new();
-            table.set_implicit(true);
-            Item::Table(table)
-        })
-        .as_table_mut()
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("Codex {CONFIG_TOML}: `projects` is not a table (left unchanged)"),
-            )
-        })?;
-
-    edit(projects);
-
-    crate::agent_hook_config::write_atomic(home, &path, doc.to_string().as_bytes())
+    edit_config_table_at(home, &["projects"], edit)
 }
 
 /// Insert or refresh one `[projects."<key>"] { trust_level = "trusted" }`
