@@ -1388,13 +1388,17 @@ mod tests {
         let contents =
             std::fs::read_to_string(home.path().join(CONFIG_TOML)).expect("read config.toml");
         // Must parse as valid TOML — a malformed write is as bad as no write,
-        // and worse than the interactive gate it was meant to preempt.
-        let _: toml_edit::DocumentMut = contents
+        // and worse than the interactive gate it was meant to preempt. Parsed
+        // structurally (not via a literal-text `contains`) so this assertion
+        // doesn't depend on `quoted_toml_key`'s specific escaping convention
+        // (e.g. backslash-escaping on a Windows `C:\Users\...` path) — only
+        // on the decoded key/value the written record actually carries.
+        let doc: toml_edit::DocumentMut = contents
             .parse()
             .expect("config.toml must remain valid TOML after recording project trust");
-        assert!(
-            contents.contains(&format!("[projects.\"{cwd_key}\"]"))
-                && contents.contains("trust_level = \"trusted\""),
+        assert_eq!(
+            doc["projects"][cwd_key.as_str()]["trust_level"].as_str(),
+            Some("trusted"),
             "issue #732: after the deck's own Codex spawn-prep flow runs for \
              a directory, config.toml must ALSO carry \
              [projects.\"{cwd_key}\"] trust_level = \"trusted\" — the exact \
@@ -1407,6 +1411,37 @@ mod tests {
              config/hooks/exec-policies for it, with zero native hook \
              invocations ever firing — regardless of how correctly deck HOOK \
              trust (`trust_deck_hooks_in`) was recorded.\ngot config.toml:\n{contents}"
+        );
+    }
+
+    /// Scenario: Pins `quoted_toml_key`'s backslash/quote escaping directly,
+    /// independent of the host platform's own path separator — builds a raw
+    /// key containing a literal backslash and a double-quote (the two
+    /// characters a Windows path like `C:\Users\demo` and TOML basic-string
+    /// syntax both care about), writes it into a table the same way
+    /// `upsert_project_trust_record` does, then re-parses the rendered TOML
+    /// and confirms the decoded key equals the raw input exactly.
+    #[test]
+    fn quoted_toml_key_round_trips_backslashes_and_quotes() {
+        let raw = "C:\\Users\\demo\\the \"trusted\" dir";
+        let key = quoted_toml_key(raw).expect("build quoted key");
+
+        let mut projects = toml_edit::Table::new();
+        let mut record = toml_edit::Table::new();
+        record.insert("trust_level", toml_edit::value("trusted"));
+        projects.insert_formatted(&key, toml_edit::Item::Table(record));
+
+        let mut doc = toml_edit::DocumentMut::new();
+        doc.insert("projects", toml_edit::Item::Table(projects));
+        let rendered = doc.to_string();
+
+        let reparsed: toml_edit::DocumentMut = rendered.parse().expect("re-parse rendered toml");
+        assert_eq!(
+            reparsed["projects"][raw]["trust_level"].as_str(),
+            Some("trusted"),
+            "quoted_toml_key must round-trip a key containing backslashes \
+             and double-quotes through TOML rendering and re-parsing \
+             unchanged\nrendered:\n{rendered}"
         );
     }
 }
