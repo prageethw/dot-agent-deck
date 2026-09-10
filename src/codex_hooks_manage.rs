@@ -13,10 +13,14 @@
 //! **guarded, silent, and SAFE for the user's real `~/.codex`**. Deliberate
 //! choices vs. Claude:
 //!
-//! - We write a SEPARATE `hooks.json` — Codex's highest-precedence,
-//!   auto-discovered hook source (`$CODEX_HOME/hooks.json`) — rather than
-//!   editing `config.toml`, so the user's real `~/.codex/config.toml` (auth
-//!   references, model, project trust, skills, history) is never touched.
+//! - Hook DEFINITIONS live in a SEPARATE `hooks.json` — Codex's
+//!   highest-precedence, auto-discovered hook source
+//!   (`$CODEX_HOME/hooks.json`) — never `config.toml`. `config.toml` itself
+//!   IS touched, but only for two narrow, deliberate records:
+//!   [`trust_deck_hooks_in`]'s `[hooks.state]` scoped hook trust and
+//!   [`trust_project_dir_in`]'s `[projects."<repo-root>"]` directory trust
+//!   (both below); the user's auth references, model, skills, and history
+//!   are never touched.
 //! - We MERGE, never clobber: pre-existing user hooks are preserved; only prior
 //!   deck-authored entries (identified by the EXACT command signature
 //!   [`HOOK_COMMAND_SUFFIX`], not a loose `dot-agent-deck` substring) are
