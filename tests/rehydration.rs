@@ -3557,9 +3557,9 @@ fn live_021_resync_never_reverts_agent_report_activity_seen() {
 /// same statement — so the card stops showing "Starting…" once it is known to
 /// be live, rather than showing that copy beside what now looks like an
 /// active agent badge.
-#[spec("session/live/021")]
+#[spec("session/live/022")]
 #[test]
-fn live_021_resync_clears_expects_agent_report_when_activity_seen_resolves_true() {
+fn live_022_resync_clears_expects_agent_report_when_activity_seen_resolves_true() {
     let pane = "pane-resync-awaiting-report";
     let agent_id = "agent-resync-awaiting-report";
 
