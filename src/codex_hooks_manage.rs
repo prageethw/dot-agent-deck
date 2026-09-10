@@ -819,31 +819,171 @@ fn upsert_trust_record(state: &mut toml_edit::Table, key: &str, hash: &str) {
     }
 }
 
+/// How long [`resolve_git_repo_root`]'s `git rev-parse` is given to answer
+/// before the call is abandoned and [`git_repo_root`] falls back to the
+/// literal `cwd` (fix-round F4). `git rev-parse --git-common-dir` is a cheap
+/// local metadata read — no network, no hooks, no index — so this only needs
+/// to guard against a wedged filesystem mount, not a slow remote; mirrors
+/// [`HOOKS_LIST_TIMEOUT`]'s magnitude for the same class of call (local,
+/// normally near-instant, but on the hot per-spawn path so must never hang
+/// indefinitely).
+const GIT_REPO_ROOT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why [`resolve_git_repo_root`] could not resolve a root, distinguished
+/// (fix-round A4) so [`git_repo_root`] can tell the EXPECTED case (`cwd`
+/// genuinely isn't inside a git repository — Codex itself would key on the
+/// literal directory too, so the silent fallback is correct) from a genuine
+/// failure worth a diagnostic (`git` missing from `PATH`, a real git error
+/// such as a "detected dubious ownership" refusal, or a timeout) — the
+/// pre-fix version collapsed all three into one silent fallback with zero
+/// log signal.
+enum RepoRootLookupFailure {
+    NotARepo,
+    Other(String),
+}
+
 /// Resolve the git repository root for `cwd`, falling back to `cwd` itself
-/// when it isn't inside a git repository (or `git` isn't on `PATH`).
+/// when it isn't inside a git repository, `git` isn't on `PATH`, or the call
+/// times out or otherwise fails (never blocks the spawn — see
+/// [`RepoRootLookupFailure`] for how those cases are told apart for logging).
 ///
 /// Codex CLI's own directory-trust gate keys on the resolved repo root, not
-/// the literal cwd (verified live against 0.153.4: a worktree's own path is
-/// never what gets recorded, and an already-trusted ancestor directory does
-/// NOT cascade into an untrusted repo beneath it) — this mirrors that exactly
-/// so [`trust_project_dir_in`] writes the same key Codex itself would.
+/// the literal cwd (verified live against 0.153.4: an already-trusted
+/// ancestor directory does NOT cascade into an untrusted repo beneath it) —
+/// but crucially, from inside a LINKED WORKTREE (`git worktree add`, how
+/// CLAUDE.md rule 1 mandates every fix in this repo happen), the gate keys on
+/// the MAIN checkout's root, NOT the worktree's own root (issue #732 fix-
+/// round A1 — also verified live: Codex's own dialog names the main checkout
+/// explicitly as "the repository root" when launched from a worktree).
+/// [`resolve_git_repo_root`] therefore resolves via git's *common* directory
+/// (`rev-parse --git-common-dir`, whose parent is always the main checkout
+/// root) rather than `--show-toplevel` (which returns the invoking
+/// worktree's own root, and was this function's pre-fix behavior — a no-op
+/// in the dominant, rule-1-mandated case it exists to handle).
 fn git_repo_root(cwd: &Path) -> PathBuf {
-    std::process::Command::new("git")
+    match resolve_git_repo_root(cwd) {
+        Ok(root) => root,
+        Err(RepoRootLookupFailure::NotARepo) => cwd.to_path_buf(),
+        Err(RepoRootLookupFailure::Other(reason)) => {
+            tracing::debug!(
+                cwd = %cwd.display(),
+                reason,
+                "git_repo_root: could not resolve a repository root for {}; falling back to the \
+                 literal cwd, so trust_project_dir_in's record below may be keyed on a path \
+                 Codex's own trust gate does not check",
+                cwd.display()
+            );
+            cwd.to_path_buf()
+        }
+    }
+}
+
+/// Bounded (fix-round F4) `git rev-parse --git-common-dir` call backing
+/// [`git_repo_root`]. Deliberately its own small spawn/poll/timeout loop
+/// rather than reusing [`crate::issue_dispatch_run::git_common_dir`]: that
+/// helper is itself unbounded by design (tracked as fork issue #388 — no
+/// synchronous capture-with-timeout helper existed when it was written), and
+/// this call sits on the per-Codex-spawn hot path, so it needs a genuine
+/// bound, not a second copy of that same gap.
+///
+/// Uses plain `--git-common-dir` (no `--path-format=absolute`, which needs
+/// git >= 2.31 and is undocumented anywhere in this repo as a minimum
+/// version) — it prints a path RELATIVE to `cwd` for the main working tree,
+/// and an ABSOLUTE path for a linked worktree / `--separate-git-dir`
+/// checkout / submodule (the exact two shapes
+/// [`crate::issue_dispatch_run::git_common_dir`]'s own no-flag fallback
+/// branch handles the same way); `Path::join` handles both, since joining
+/// onto an absolute path replaces it outright — so no version-fallback dance
+/// is needed here at all.
+fn resolve_git_repo_root(cwd: &Path) -> Result<PathBuf, RepoRootLookupFailure> {
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| PathBuf::from(s.trim()))
-        .unwrap_or_else(|| cwd.to_path_buf())
+        .args(["rev-parse", "--git-common-dir"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| RepoRootLookupFailure::Other(format!("failed to spawn git: {e}")))?;
+
+    let deadline = Instant::now() + GIT_REPO_ROOT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RepoRootLookupFailure::Other(format!(
+                        "git rev-parse --git-common-dir timed out after {GIT_REPO_ROOT_TIMEOUT:?}"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                return Err(RepoRootLookupFailure::Other(format!(
+                    "failed to wait on git rev-parse: {e}"
+                )));
+            }
+        }
+    };
+
+    // `git rev-parse --git-common-dir`'s own stdout is a single short path —
+    // nowhere near the OS pipe-buffer size `spawn_and_wait_sync`'s reader-
+    // thread hardening exists to guard against for a command like `git status
+    // --porcelain` — so reading sequentially after the child has already
+    // exited (rather than draining concurrently on its own thread) cannot
+    // deadlock here.
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+
+    if !status.success() {
+        if stderr.contains("not a git repository") {
+            return Err(RepoRootLookupFailure::NotARepo);
+        }
+        return Err(RepoRootLookupFailure::Other(format!(
+            "git rev-parse --git-common-dir exited {status}: {}",
+            stderr.trim()
+        )));
+    }
+
+    let raw = stdout.trim();
+    if raw.is_empty() {
+        return Err(RepoRootLookupFailure::Other(
+            "git rev-parse --git-common-dir printed no output".to_string(),
+        ));
+    }
+    let common_dir = cwd.join(raw);
+    common_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+        RepoRootLookupFailure::Other(format!(
+            "git common dir {common_dir:?} has no parent directory"
+        ))
+    })
 }
 
 /// Pre-empt Codex CLI's own interactive "Do you trust the contents of this
 /// directory?" gate (issue #732) by writing the same record a human answering
 /// its default "1. Yes, continue" would: `[projects."<repo-root>"]
 /// trust_level = "trusted"` in `<home>/config.toml`.
+///
+/// **This auto-answers a real, persistent, security-relevant confirmation
+/// prompt on the user's behalf** (fix-round F5) — Codex's own trust gate
+/// exists to make a human confirm before it loads project-local
+/// config/hooks/exec-policies from an unfamiliar directory, and this writes
+/// that "yes" into the user's real `~/.codex/config.toml` without asking,
+/// persistently (not just for the current session). This is a deliberate
+/// tradeoff, not an oversight: the alternative is the interactive session
+/// wedging indefinitely with no way for a deck-spawned, non-interactive pane
+/// to ever answer the prompt itself, and the deck only ever does this for a
+/// directory the user already directed it to spawn Codex into.
 ///
 /// This is a SEPARATE mechanism from [`trust_deck_hooks_in`]'s scoped hook
 /// trust, confirmed live against Codex CLI 0.153.4: hook trust travels
@@ -857,10 +997,17 @@ fn git_repo_root(cwd: &Path) -> PathBuf {
 /// itself resolves the prompt's key.
 ///
 /// Idempotent and format-preserving like [`trust_deck_hooks_in`]: publishing
-/// is atomic under [`INSTALL_LOCK`], so a concurrent deck writer for a
-/// sibling pane's spawn can't interleave, and repeated calls for the same
-/// directory merge into the same record in place rather than duplicating it
-/// or rewriting the rest of the file.
+/// is guarded by [`INSTALL_LOCK`], so two concurrent writers *within this
+/// same process* can't interleave, and repeated calls for the same directory
+/// merge into the same record in place rather than duplicating it or
+/// rewriting the rest of the file. `INSTALL_LOCK` is a `Mutex<()>` and so is
+/// PROCESS-LOCAL ONLY (fix-round F3, correcting a prior overclaim here) — it
+/// does NOT serialize a sibling pane's spawn when that pane is a separate
+/// `wrap` process (the normal case for two panes launching Codex
+/// concurrently). Cross-process, only the underlying temp-file+rename
+/// publish (`edit_config_table_at`) is atomic — a concurrent writer from
+/// another process can still race a read-modify-write against this one and
+/// have its update lost, not just interleaved corruption.
 pub fn trust_project_dir_in(home: &Path, cwd: &Path) -> std::io::Result<()> {
     let root = git_repo_root(cwd);
     let path_str = root.to_str().ok_or_else(|| {
@@ -1379,6 +1526,126 @@ mod tests {
              config/hooks/exec-policies for it, with zero native hook \
              invocations ever firing — regardless of how correctly deck HOOK \
              trust (`trust_deck_hooks_in`) was recorded.\ngot config.toml:\n{contents}"
+        );
+    }
+
+    /// Run `git <args>` in `dir` for this test module's own throwaway-repo
+    /// setup (not the thing under test), with ambient git configuration
+    /// switched off exactly like `xtask/linkage-check`'s earned precedent
+    /// for shelling out to real `git` in tests (CLAUDE.md rule 5) — a
+    /// developer's own `~/.gitconfig` (`commit.gpgsign`, a global
+    /// `core.hooksPath`, `init.defaultBranch`, …) would otherwise leak into
+    /// these scratch repos and make the test flaky for reasons having
+    /// nothing to do with `git_repo_root`.
+    fn run_git(args: &[&str], dir: &Path) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {args:?} in {dir:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} in {dir:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Scenario: issue #732 fix-round A2 — the shipped regression test above
+    /// builds `cwd` from a bare `tempfile::tempdir()`, which is never inside
+    /// a git repository, so `git_repo_root` unconditionally took its
+    /// not-a-repo fallback branch and the test could never exercise (or
+    /// catch a regression in) the actual worktree-root-resolution logic the
+    /// whole fix exists for. This test `git init`s a real throwaway repo,
+    /// adds a LINKED WORKTREE under it (`git worktree add`, exactly how
+    /// CLAUDE.md rule 1 mandates every fix in this repo happen), calls
+    /// `trust_project_dir_in` with the worktree as `cwd`, and asserts the
+    /// written record is keyed on the MAIN repo root — independently
+    /// re-derived via `git rev-parse --show-toplevel` run from the main repo
+    /// itself, not hand-typed — not the worktree's own root, and also
+    /// asserts no record was written under the worktree's own root either
+    /// (a fallback-to-cwd regression would otherwise still pass the first
+    /// assertion vacuously if the test setup happened to produce the same
+    /// string, though it can't here since the two roots are asserted
+    /// distinct as a setup sanity check first).
+    #[test]
+    fn spawn_prep_trusts_the_main_repo_root_from_inside_a_linked_worktree_not_the_worktrees_own_root()
+     {
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let repo_dir = scratch.path().join("main-repo");
+        std::fs::create_dir(&repo_dir).expect("create main repo dir");
+
+        run_git(&["init", "--initial-branch=main"], &repo_dir);
+        run_git(&["config", "user.email", "test@example.com"], &repo_dir);
+        run_git(&["config", "user.name", "Test"], &repo_dir);
+        run_git(&["commit", "--allow-empty", "-m", "init"], &repo_dir);
+
+        let worktree_dir = scratch.path().join("linked-worktree");
+        let worktree_dir_str = worktree_dir.to_str().expect("utf8 worktree path");
+        run_git(
+            &["worktree", "add", "-b", "wt-branch", worktree_dir_str],
+            &repo_dir,
+        );
+
+        // Ground truth for "the main repo root", derived independently of
+        // `git_repo_root`'s own implementation (a different git invocation,
+        // from a different cwd) so this isn't just re-asserting the same
+        // code path under test.
+        let main_root_out = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&repo_dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git rev-parse --show-toplevel in main repo");
+        assert!(main_root_out.status.success());
+        let main_root = String::from_utf8(main_root_out.stdout)
+            .expect("utf8 main repo toplevel")
+            .trim()
+            .to_string();
+
+        let worktree_root_out = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&worktree_dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git rev-parse --show-toplevel in worktree");
+        assert!(worktree_root_out.status.success());
+        let worktree_root = String::from_utf8(worktree_root_out.stdout)
+            .expect("utf8 worktree toplevel")
+            .trim()
+            .to_string();
+        assert_ne!(
+            main_root, worktree_root,
+            "test setup sanity: the worktree's own toplevel must differ from the main repo \
+             root, or this test cannot actually distinguish the two"
+        );
+
+        let home = tempfile::tempdir().expect("codex home tempdir");
+        trust_project_dir_in(home.path(), &worktree_dir).expect("trust project dir from worktree");
+
+        let contents =
+            std::fs::read_to_string(home.path().join(CONFIG_TOML)).expect("read config.toml");
+        let doc: toml_edit::DocumentMut = contents
+            .parse()
+            .expect("config.toml must remain valid TOML after recording project trust");
+
+        assert_eq!(
+            doc["projects"][main_root.as_str()]["trust_level"].as_str(),
+            Some("trusted"),
+            "issue #732 fix-round A1/A2: calling trust_project_dir_in with a LINKED WORKTREE \
+             as cwd must key the written record on the MAIN repository root ({main_root}) — \
+             matching how Codex CLI 0.153.4 itself resolves the trust gate's key from a \
+             worktree cwd — not the worktree's own `--show-toplevel` path ({worktree_root}), \
+             which is what the pre-fix git_repo_root wrote and which Codex's trust gate never \
+             checks.\ngot config.toml:\n{contents}"
+        );
+        assert!(
+            doc["projects"][worktree_root.as_str()].is_none(),
+            "must not ALSO (or instead) key the record on the worktree's own root \
+             ({worktree_root})\ngot config.toml:\n{contents}"
         );
     }
 
