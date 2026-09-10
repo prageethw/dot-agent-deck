@@ -1,10 +1,10 @@
 #![cfg(feature = "e2e")]
 #![cfg(unix)]
 
-//! Issue #737: `deliver_orchestrator_prompt`'s spawn-time readiness gate
-//! (`src/ui.rs`) writes the orchestrator's one-shot seed prompt as soon as
-//! `agent_ready` is true — and `agent_ready` is satisfied by ANY event that
-//! sets the pane's observed `agent_type`:
+//! Issue #737 (FIXED): `deliver_orchestrator_prompt`'s spawn-time readiness
+//! gate (`src/ui.rs`) used to write the orchestrator's one-shot seed prompt
+//! as soon as `agent_ready` was true — and `agent_ready` used to be
+//! satisfied by ANY event that set the pane's observed `agent_type`:
 //!
 //! ```ignore
 //! let agent_ready = snapshot.sessions.values().any(|s| {
@@ -13,27 +13,38 @@
 //! ```
 //!
 //! For a Codex-identity pane spawned through `dot-agent-deck wrap`, that
-//! includes the wrapper's own fork-time `SessionStart`
+//! included the wrapper's own fork-time `SessionStart`
 //! (`Emitter::emit_fork_session_start`, `src/wrap.rs`), sent the instant
 //! `cmd.spawn()` returns and explicitly documented there as "a
 //! CARD-SURFACING signal, not a readiness signal" — the child may still be a
 //! launcher for seconds. `state.rs::apply_event` applies that event's
 //! `agent_type` unconditionally (it only excludes wrapper-origin starts from
 //! *moving* an already-established pane generation, not from setting
-//! `agent_type` in the first place), so `agent_ready` can go true within
-//! milliseconds of spawn. `deliver_orchestrator_prompt` then waits only
+//! `agent_type` in the first place), so `agent_ready` could go true within
+//! milliseconds of spawn, and the old gate then waited only
 //! `SPAWN_TIME_READINESS_BUFFER` (500ms, `src/ui.rs`) before writing — far
 //! short of a real agent's startup gap, which the DAEMON-owned delegate path
-//! already prices separately and much higher for exactly this wrapper fact
+//! already priced separately and much higher for exactly this wrapper fact
 //! (`WRAPPER_INTERFACE_READINESS_BUFFER`, 5000ms, `src/state.rs`, issue
-//! #243). That fix was never ported to this TUI-owned spawn-time path.
+//! #243). That fix had never been ported to this TUI-owned spawn-time path.
+//!
+//! It now has: `deliver_orchestrator_prompt` reuses
+//! `state.rs::session_start_means_ready` (made `pub(crate)` for this call
+//! site) to decide whether a pane's recorded `SessionStart`s actually mean
+//! the agent can accept input — a bare wrapper fork-time fact no longer
+//! qualifies for a Wrapper-strategy agent (Codex) — and, once readiness
+//! comes from the wrapper's STRONG interface fact
+//! (`is_wrapper_interface_ready_session_start`), the gate holds for the
+//! shared `wrapper_interface_readiness_buffer()` instead of the short
+//! spawn-time default. `seed/019` below now guards that fix rather than
+//! reproducing its absence.
 //!
 //! Because fork #194 / issue #424 write the seed payload exactly ONCE
 //! (`attempt_writes_payload`, `MAX_PAYLOAD_SUBMISSIONS`), a write lost to
-//! this race is lost for the life of the pane — every later attempt only
-//! probes for confirmation with a bare submit, never retypes the text. The
-//! result is exactly issue #737's report: a healthy, idle Codex process that
-//! has never received a single byte on stdin.
+//! this race would be lost for the life of the pane — every later attempt
+//! only probes for confirmation with a bare submit, never retypes the text.
+//! Before the fix, this reproduced issue #737's report exactly: a healthy,
+//! idle Codex process that had never received a single byte on stdin.
 //!
 //! `codex_delayed_standin.py` (embedded below, written into the fixture's
 //! own workdir at runtime — the same pattern
@@ -48,19 +59,30 @@
 //! the payload is gone — not parked, gone"). Only a genuinely-read,
 //! non-empty line makes it behave like an agent that received a prompt.
 //!
-//! `seed/019`'s delay (3s) only has to outlast `SPAWN_TIME_READINESS_BUFFER`
-//! (500ms) after the wrapper's fork-time fact — confirmed above to be the
-//! fact that actually satisfies `agent_ready` on this path, unlike the
-//! bare/undetected launch issue #737's own report used, where no wrapper
-//! ever runs and `agent_ready` can structurally never go true at all. The
-//! first confirmation-retry floor is pushed out to its maximum test override
-//! (`DOT_AGENT_DECK_TEST_UNCONFIRMED_RETRY_BASE_MS=15000`, issue #531) so a
-//! later bare-CR probe — which this test is not about — cannot land inside
-//! the assertion window and be mistaken for the lost original write.
-//! `seed/020` is the control: an (almost) immediate delay proves the SAME
-//! harness delivers cleanly when the timing gap this issue is about is not
-//! present, isolating the failure to the timing race rather than some other
-//! harness defect.
+//! Note for anyone tempted to widen the stand-in further: this stand-in
+//! never itself clears `ICANON`/`ECHO` — it is a plain Python script that
+//! only flushes and reads stdin, never `tty.setraw`/`tcsetattr` — so the
+//! wrapper's STRONG interface fact structurally never fires for it. Only the
+//! weaker settled-output fact does, roughly `STANDIN_READY_DELAY_MS` plus
+//! the wrapper's own output-settle window after spawn. `seed/019` therefore
+//! exercises the fix's WEAK-fact path specifically (readiness gated on
+//! `session_start_means_ready`, buffer unchanged at
+//! `SPAWN_TIME_READINESS_BUFFER`) rather than the wider
+//! `WRAPPER_INTERFACE_READINESS_BUFFER` path — withholding the write until
+//! at least that weak fact arrives is exactly what makes a 3s-delayed
+//! stand-in now succeed where the old fork-time-only gate lost it, which is
+//! what this test proves.
+//!
+//! `seed/019`'s delay (3s) only has to outlast the wrapper's fork-time fact
+//! by more than `SPAWN_TIME_READINESS_BUFFER` (500ms) for the OLD gate to
+//! have lost it — confirmed above to be the fact that used to satisfy
+//! `agent_ready` on this path, unlike the bare/undetected launch issue
+//! #737's own report used, where no wrapper ever runs and `agent_ready` can
+//! structurally never go true at all. `seed/020` is the control: an
+//! (almost) immediate delay proves the SAME harness delivers cleanly when
+//! the timing gap this issue is about is not present, isolating this test's
+//! coverage to the timing race specifically rather than some other harness
+//! effect.
 
 mod common;
 
@@ -163,22 +185,22 @@ fn open_orchestration(deck: &TuiDeck) {
 /// Scenario: Open an orchestration whose orchestrator (start) role is a real
 /// `dot-agent-deck wrap --agent codex` process around a deterministic stand-in
 /// deliberately deaf to stdin for 3 seconds — well past
-/// `SPAWN_TIME_READINESS_BUFFER` (500ms) — then, mirroring a real Codex TUI's
-/// raw-mode transition, explicitly discards whatever accumulated on stdin
-/// before ever reading. Confirm the stand-in genuinely reached that flush
-/// point, then assert the deck's one-shot spawn-time seed write never reaches
-/// it (no stdin log is ever written) and no GENUINE turn is ever confirmed
-/// (no `Idle` AgentEvent, which can only follow the stand-in's own
-/// `turn.completed` JSONL, itself only printed after a real non-empty stdin
-/// read) — issue #737's reported symptom: a healthy, idle Codex process that
-/// never received a single byte of input, reproduced from the specific
-/// too-early-write mechanism this file's module doc identifies. See the
-/// investigation note inline below for why this test does NOT assert on the
-/// mere absence of a "Thinking" status — that status is independently, and
-/// legitimately, sometimes triggered by this synthetic harness itself.
+/// `SPAWN_TIME_READINESS_BUFFER` (500ms), which is exactly the delay that
+/// used to lose the seed prompt before issue #737's fix. Confirm the
+/// stand-in genuinely reached its ready point, then assert the deck's
+/// one-shot spawn-time seed write DOES reach it once the stand-in starts
+/// genuinely reading stdin (the stdin log is created and contains the exact
+/// seed pointer text) and the role visibly starts and finishes a turn
+/// (`Thinking` then `Idle`, both on the rendered grid and on the daemon's own
+/// event stream) — a permanent regression guard against
+/// `deliver_orchestrator_prompt`'s readiness gate ever again treating the
+/// wrapper's fork-time fact alone as proof of readiness for a
+/// Wrapper-strategy agent. See the investigation note inline below for why
+/// an early, spurious "Thinking" on the grid, if it appears, does not
+/// undermine this assertion.
 #[spec("orchestration/seed/019")]
 #[test]
-fn orchestration_seed_019_wrap_fork_time_readiness_loses_a_slow_codex_seed_prompt() {
+fn orchestration_seed_019_wrap_interface_readiness_delivers_a_slow_codex_seed_prompt() {
     // Independent, per-test private directory for the stand-in's stdin log —
     // see `STANDIN_LOG_PATH_ENV`'s doc comment for why this cannot be a path
     // relative to `deck.workdir()`. Must stay alive for the whole test (like
@@ -198,12 +220,6 @@ fn orchestration_seed_019_wrap_fork_time_readiness_loses_a_slow_codex_seed_promp
             STANDIN_LOG_PATH_ENV,
             log_path.to_str().expect("log path is UTF-8"),
         )
-        // Issue #531 seam: push the first confirmation-retry probe (which
-        // would otherwise land ~10s after the lost write, still inside a
-        // slow CI run's assertion window) out to its maximum override, so a
-        // later bare-CR probe cannot land inside this test's window and be
-        // mistaken for the original payload surviving.
-        .with_env("DOT_AGENT_DECK_TEST_UNCONFIRMED_RETRY_BASE_MS", "15000")
         .launch_with_fixture("minimal");
 
     deck.wait_for_string("No active sessions");
@@ -226,31 +242,34 @@ fn orchestration_seed_019_wrap_fork_time_readiness_loses_a_slow_codex_seed_promp
         deck.wait_for_grid_string_within(STANDIN_READY_MARKER, Duration::from_secs(20)),
         "the delayed Codex stand-in never reached its own ready point within \
          20s of a 3s configured delay — a harness/spawn failure, not the \
-         delivery-timing bug this test exists to catch:\n{}",
+         delivery-timing fix this test exists to guard:\n{}",
         deck.snapshot_grid()
     );
 
-    // The core assertion (issue #737): the deck's one-shot seed write landed
-    // while the stand-in was still asleep and was genuinely discarded —
-    // exactly as a real Codex's own raw-mode transition would discard it —
-    // so the stand-in's stdin log is never created at all.
+    // The core assertion (issue #737, now fixed): the deck's one-shot seed
+    // write is held until at least the wrapper's interface fact — not merely
+    // its fork-time fact — establishes readiness, so it lands only once the
+    // stand-in is genuinely reading stdin, well after the 3s delay. Before
+    // the fix this log was never created at all (the write landed while the
+    // stand-in was still asleep and was genuinely discarded, exactly as a
+    // real Codex's own raw-mode transition would discard it).
     assert!(
-        !log_path.exists(),
-        "issue #737 did NOT reproduce: the delayed Codex stand-in's stdin \
-         log exists at {log_path:?}, meaning the deck's seed write reached \
-         it despite the stand-in staying deaf to stdin for 3s — either the \
-         one-shot write landed later than expected or something else in the \
-         harness changed; contents: {:?}; final grid:\n{}",
+        common::wait_for_file_substr_count(
+            &log_path,
+            DELIVERED_POINTER,
+            1,
+            Duration::from_secs(15)
+        ),
+        "issue #737 regressed: the delayed Codex stand-in never received the \
+         spawn-time seed pointer even after its 3s delay elapsed, meaning \
+         the deck's one-shot write was lost again; observed log contents: \
+         {:?}; final grid:\n{}",
         std::fs::read_to_string(&log_path),
         deck.snapshot_grid()
     );
 
     // INVESTIGATION NOTE (issue #737 harness false-positive, found when this
-    // test first went to CI): an earlier version of this test also asserted
-    // that "Thinking" never appears at all — neither on the rendered grid nor
-    // as an AgentEvent — for the delayed role. That assertion was ITSELF a
-    // false positive and had to be dropped, for a reason independent of
-    // issue #737: `codex_delayed_standin.py` must write its own
+    // test first went to CI): `codex_delayed_standin.py` must write its own
     // `STANDIN-READY` marker to stdout (see above) so this test can observe,
     // from outside the process, that the stand-in genuinely reached its
     // ready point — there is no other way to confirm that. But
@@ -265,36 +284,36 @@ fn orchestration_seed_019_wrap_fork_time_readiness_loses_a_slow_codex_seed_promp
     // classifier stand down. With suppression off, `classify_line_with`'s
     // generic non-JSON fallback ("any other non-blank output is substantive
     // activity") fires on the READY_MARKER line itself and reaches the
-    // daemon as a genuine `Thinking` AgentEvent — despite that line, by
+    // daemon as an EARLY `Thinking` AgentEvent — despite that line, by
     // construction, predating the stand-in's own stdin read. This is real,
     // independent, and already documented as an accepted tradeoff (the
-    // `CODEX` ruleset's own "Accepted risk" doc comment, `src/wrap.rs`) — it
-    // is not a reproduction of issue #737, and it is not fixable in the
-    // fixture without losing the grid-visible readiness check above (ANY
-    // non-blank line the stand-in must emit before genuinely blocking would
-    // trip the same fallback). So this test tolerates a stray `Thinking` and
-    // instead asserts on a signal that fallback classification cannot
-    // produce: `Idle` here is only ever emitted from the stand-in's own
-    // JSONL (`classify_codex_json`'s `"turn.completed"` -> `Idle` mapping),
-    // which the stand-in only prints after it has genuinely read a
-    // non-empty stdin line — exactly the fact `!log_path.exists()` above
-    // already establishes never happened. A confirmed `Idle` for this pane
-    // would mean the seed write DID land; its absence, together with the
-    // never-created stdin log, is the real proof issue #737's loss
-    // reproduced.
+    // `CODEX` ruleset's own "Accepted risk" doc comment, `src/wrap.rs`). It
+    // does not undermine the assertions below, which only require `Thinking`
+    // and `Idle` to appear at SOME point — whether the early stray one or
+    // the genuine one that follows the stand-in's own `turn.started` JSONL —
+    // not that either appears exactly once or in a particular order relative
+    // to the ready marker.
     assert!(
-        events
-            .try_wait_for(
-                |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
-                Duration::from_secs(4),
-            )
-            .is_none(),
-        "issue #737 did NOT reproduce: the delayed Codex role's stand-in \
-         reported a genuinely completed turn (an Idle AgentEvent) even \
-         though its stdin log was never created — Idle can only follow the \
-         stand-in reading a real, non-empty stdin line: {:?}\nfinal grid:\n{}",
-        events.snapshot(),
+        deck.wait_for_grid_string_within("Thinking", Duration::from_secs(10)),
+        "the delayed Codex role never visibly entered Thinking even though \
+         its stdin log shows the seed pointer arrived:\n{}",
         deck.snapshot_grid()
+    );
+    events.wait_for(
+        |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Thinking,
+        Duration::from_secs(10),
+    );
+
+    assert!(
+        deck.wait_for_grid_string_within("Idle", Duration::from_secs(10)),
+        "the delayed Codex role never visibly completed its turn even \
+         though its stdin log shows the seed pointer arrived — issue #737 \
+         may have regressed:\n{}",
+        deck.snapshot_grid()
+    );
+    events.wait_for(
+        |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
+        Duration::from_secs(10),
     );
 }
 
