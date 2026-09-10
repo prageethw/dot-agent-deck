@@ -4337,6 +4337,145 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
     );
 }
 
+/// Scenario: issue #730 — a role pane whose config DECLARES `agent = "codex"`
+/// (`render_session_card`'s `declared_agent_type`) has been spawned but has
+/// no observed `agent_type` yet (`session.agent_type == None`) and has not
+/// been delegated a first task (`expects_agent_report: true,
+/// agent_report_activity_seen: false`). Pins the fix: `is_pending` is now
+/// computed on the raw, observed basis rather than the shown/declared one,
+/// so this shape must render "Starting…" identically to the undeclared case
+/// `dashboard/placeholder/001` already pins — and the declared Codex badge,
+/// and the second `is_pending` use site (the "Waiting for agent to report
+/// in…" body line), must both still hold in this newly-reachable state.
+/// Previously, `shown_agent_type` resolved through `declared_agent_type`
+/// before `is_placeholder` was computed, so a declared pane's
+/// `is_placeholder` was `false` unconditionally and `is_pending` could never
+/// fire, leaking whatever `session.status` happened to hold instead (a
+/// synthetic `Thinking` fixture below, matching issue #730's live evidence,
+/// though the mechanism that actually produces a live `Thinking` for such a
+/// pane in the field is now tracked separately as issue #732 — see
+/// `dashboard/pane/015`'s CATALOG entry). A second case in the same test
+/// covers `status: Idle`, the shape `insert_placeholder_session_inner`
+/// actually seeds and the one most likely to occur in production.
+#[spec("dashboard/pane/015")]
+#[test]
+fn pane_015_declared_agent_pending_report_shows_starting_not_live_status() {
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "declared-agent-pending".to_string(),
+        // Codex's own shape: never reports an agent_type before its first
+        // turn completes — indefinitely, for a pane that is never delegated
+        // a task at all.
+        agent_type: AgentType::None,
+        cwd: Some("/home/dev/workspace".to_string()),
+        // Issue #730's live evidence: the daemon held no live SessionSnapshot
+        // at all for these panes (no real event ever applied), yet the
+        // rendered card read "Thinking". Whatever upstream mechanism placed
+        // this value here, the render-layer decision below must not surface
+        // it for a pane that has never had its placeholder resolved.
+        status: SessionStatus::Thinking,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pending_permission_tool: None,
+        pane_id: Some("pane-declared-pending".to_string()),
+        agent_id: Some("agent-declared-pending".to_string()),
+        display_name: Some("reviewer".to_string()),
+        shell_synthetic_working: false,
+        monitored_wait_active: false,
+        wait_synthetic_working: false,
+        shell_descendant_busy: false,
+        wait_deferred_revert: false,
+        model: None,
+        // The Orchestration-tab role-pane shape `insert_placeholder_session_awaiting_report`
+        // produces for a recognized agent CLI, before it has reported in —
+        // never resolved by any real activity.
+        expects_agent_report: true,
+        agent_report_activity_seen: false,
+    };
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_with_declared_agent_to_buffer(
+        &session,
+        Some("reviewer"),
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        Some(&AgentType::Codex),
+        true,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+
+    assert!(
+        rendered.contains("Starting…"),
+        "a declared-Codex pane that has never been delegated a task \
+         (expects_agent_report=true, agent_report_activity_seen=false) must \
+         show 'Starting…', the same placeholder a non-declared pane in this \
+         exact shape shows (dashboard/placeholder/001):\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Thinking"),
+        "a pane that has never had a real event applied must not surface a \
+         leftover/synthetic live status label once a declaration makes \
+         is_placeholder false; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Codex"),
+        "declared badge must survive in the newly-reachable pending state:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Waiting for agent to report in…"),
+        "the body-line use site must also reach the pending state, not just the status label:\n{rendered}"
+    );
+
+    // Issue #730 N2: the fixture above (`status: Thinking`) exercises the
+    // render-layer branch in isolation, but every same-version production
+    // path that sets `status = Thinking` also clears `expects_agent_report`
+    // in the same event, so that combination is unlikely to occur in the
+    // field. The shape `insert_placeholder_session_inner` actually seeds —
+    // `status: Idle` plus `expects_agent_report: true` plus a declaration —
+    // is the one production reaches, so pin it here too.
+    let mut state = AppState::default();
+    state.register_pane("2".to_string());
+    let idle_session_id = state.insert_placeholder_session_awaiting_report(
+        "2".to_string(),
+        Some("/home/dev/workspace".to_string()),
+        None,
+        Some("agent-declared-pending-idle".to_string()),
+        true,
+    );
+    let idle_session = state
+        .sessions
+        .get(&idle_session_id)
+        .expect("insert_placeholder_session_awaiting_report seeds the session");
+    let idle_buffer = render_card_with_declared_agent_to_buffer(
+        idle_session,
+        Some("reviewer"),
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        Some(&AgentType::Codex),
+        true,
+        80,
+        density.rendered_height(),
+    );
+    let idle_rendered = buffer_to_text(&idle_buffer);
+    assert!(
+        idle_rendered.contains("Starting…"),
+        "the production-reachable shape (status: Idle, expects_agent_report: true, \
+         declared Codex) must also show 'Starting…':\n{idle_rendered}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // dashboard/grid — the card grid's joint column/density layout (issue #588)
 // ---------------------------------------------------------------------------
