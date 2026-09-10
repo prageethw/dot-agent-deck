@@ -1151,4 +1151,77 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    /// Scenario: issue #732 investigation — live-captured against a real,
+    /// unmodified Codex CLI 0.153.4 session (`codex --ask-for-approval never
+    /// --sandbox read-only`, driven over a real PTY, no fixture/mock): ANY
+    /// directory whose resolved git-repository root is not already recorded
+    /// as `trusted` in `config.toml`'s `[projects."<path>"]` table blocks the
+    /// entire interactive session behind a "Do you trust the contents of
+    /// this directory?" confirmation — and the dialog's own text says why it
+    /// matters: "Trusting the directory allows project-local config, hooks,
+    /// and exec policies to load." Reproduced from a real dot-agent-deck git
+    /// worktree (a linked worktree of a repo whose ROOT had never been
+    /// explicitly trusted): the prompt named the resolved repository root,
+    /// not the worktree's own path, and answering it wrote exactly
+    /// `[projects."<repo-root>"] trust_level = "trusted"` into
+    /// `~/.codex/config.toml` — nothing else changed.
+    ///
+    /// This is a genuine, previously-undocumented mechanism for the #730
+    /// field symptom (two Codex panes wedged at "Thinking" for 8+ hours with
+    /// zero native `SessionStart`/`UserPromptSubmit`/`Stop` hook-invocation
+    /// log entries): a pane stuck at this dialog can NEVER receive a native
+    /// Codex hook, because Codex has not yet loaded hooks for an untrusted
+    /// directory — regardless of how correctly the deck's OWN hook trust
+    /// (`trust_deck_hooks_in`, which runs over `codex app-server`'s headless
+    /// `hooks/list` RPC and is unaffected by this gate — confirmed by a
+    /// separate live probe completing in ~0.26s against this machine's real,
+    /// plugin-heavy `config.toml`) was recorded in `hooks.json`/
+    /// `config.toml`'s `[hooks.state]`. `codex_spawn_prep` (`src/wrap.rs`)
+    /// already resolves the pinned `CODEX_HOME` and calls
+    /// `trust_deck_hooks_in` for exactly this purpose on the HOOK side; it
+    /// has no equivalent for PROJECT trust, so this exact dialog can still
+    /// block every deck-spawned Codex pane's first session in any directory
+    /// (very much including a freshly created git worktree, since every
+    /// worktree is, by CLAUDE.md rule 1, a brand-new path) that has not
+    /// separately been trusted by a human.
+    ///
+    /// RED today: no function in this module records project trust — only
+    /// hook trust. This pins the desired fix surface directly: the deck must
+    /// write the SAME `[projects."<cwd>"] trust_level = "trusted"` record
+    /// Codex itself writes when a human answers "1. Yes, continue", so its
+    /// own confirmation gate never has anything left to ask a deck-spawned
+    /// pane.
+    #[test]
+    fn spawn_prep_trusts_the_project_dir_so_codexs_own_confirmation_gate_never_blocks() {
+        let home = tempfile::tempdir().expect("codex home tempdir");
+        let cwd = tempfile::tempdir().expect("project cwd tempdir");
+        let cwd_key = cwd.path().to_str().expect("utf8 cwd").to_string();
+
+        trust_project_dir_in(home.path(), cwd.path()).expect("trust project dir");
+
+        let contents =
+            std::fs::read_to_string(home.path().join(CONFIG_TOML)).expect("read config.toml");
+        // Must parse as valid TOML — a malformed write is as bad as no write,
+        // and worse than the interactive gate it was meant to preempt.
+        let _: toml_edit::DocumentMut = contents
+            .parse()
+            .expect("config.toml must remain valid TOML after recording project trust");
+        assert!(
+            contents.contains(&format!("[projects.\"{cwd_key}\"]"))
+                && contents.contains("trust_level = \"trusted\""),
+            "issue #732: after the deck's own Codex spawn-prep flow runs for \
+             a directory, config.toml must ALSO carry \
+             [projects.\"{cwd_key}\"] trust_level = \"trusted\" — the exact \
+             record a human answering Codex CLI 0.153.4's own \"Do you \
+             trust the contents of this directory?\" prompt with \"1. Yes, \
+             continue\" would write (verified live). Without it, every \
+             deck-spawned Codex session for a never-before-trusted directory \
+             (e.g. a fresh git worktree, rule 1) wedges indefinitely behind \
+             that interactive gate BEFORE Codex loads project-local \
+             config/hooks/exec-policies for it, with zero native hook \
+             invocations ever firing — regardless of how correctly deck HOOK \
+             trust (`trust_deck_hooks_in`) was recorded.\ngot config.toml:\n{contents}"
+        );
+    }
 }
