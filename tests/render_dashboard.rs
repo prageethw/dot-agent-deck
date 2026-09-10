@@ -4338,18 +4338,25 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
 }
 
 /// Scenario: issue #730 — a role pane whose config DECLARES `agent = "codex"`
-/// (`render_session_card`'s `declared_agent_type`) is spawned but has not yet
-/// been delegated a first task, so it is still in the `expects_agent_report:
-/// true, agent_report_activity_seen: false` shape `#549`/`dashboard/placeholder/001`
-/// pins as "Starting…" for the NO-declaration case. Because `shown_agent_type`
-/// resolves through `declared_agent_type` before `is_placeholder` is computed,
-/// a declared pane's `is_placeholder` is `false` from the moment it is drawn —
-/// unconditionally, regardless of `expects_agent_report` — so `is_pending`
-/// can never fire and the card falls straight through to
-/// `status_style(&session.status)`. This pins that a declared-but-never-
-/// delegated pane must still show "Starting…", not whatever `session.status`
-/// happens to hold (here `Thinking`, matching issue #730's live evidence) for
-/// a session that has never had a single real event applied to it.
+/// (`render_session_card`'s `declared_agent_type`) has been spawned but has
+/// no observed `agent_type` yet (`session.agent_type == None`) and has not
+/// been delegated a first task (`expects_agent_report: true,
+/// agent_report_activity_seen: false`). Pins the fix: `is_pending` is now
+/// computed on the raw, observed basis rather than the shown/declared one,
+/// so this shape must render "Starting…" identically to the undeclared case
+/// `dashboard/placeholder/001` already pins — and the declared Codex badge,
+/// and the second `is_pending` use site (the "Waiting for agent to report
+/// in…" body line), must both still hold in this newly-reachable state.
+/// Previously, `shown_agent_type` resolved through `declared_agent_type`
+/// before `is_placeholder` was computed, so a declared pane's
+/// `is_placeholder` was `false` unconditionally and `is_pending` could never
+/// fire, leaking whatever `session.status` happened to hold instead (a
+/// synthetic `Thinking` fixture below, matching issue #730's live evidence,
+/// though the mechanism that actually produces a live `Thinking` for such a
+/// pane in the field is now tracked separately as issue #732 — see
+/// `dashboard/pane/015`'s CATALOG entry). A second case in the same test
+/// covers `status: Idle`, the shape `insert_placeholder_session_inner`
+/// actually seeds and the one most likely to occur in production.
 #[spec("dashboard/pane/015")]
 #[test]
 fn pane_015_declared_agent_pending_report_shows_starting_not_live_status() {
@@ -4418,6 +4425,54 @@ fn pane_015_declared_agent_pending_report_shows_starting_not_live_status() {
         "a pane that has never had a real event applied must not surface a \
          leftover/synthetic live status label once a declaration makes \
          is_placeholder false; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Codex"),
+        "declared badge must survive in the newly-reachable pending state:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Waiting for agent to report in…"),
+        "the body-line use site must also reach the pending state, not just the status label:\n{rendered}"
+    );
+
+    // Issue #730 N2: the fixture above (`status: Thinking`) exercises the
+    // render-layer branch in isolation, but every same-version production
+    // path that sets `status = Thinking` also clears `expects_agent_report`
+    // in the same event, so that combination is unlikely to occur in the
+    // field. The shape `insert_placeholder_session_inner` actually seeds —
+    // `status: Idle` plus `expects_agent_report: true` plus a declaration —
+    // is the one production reaches, so pin it here too.
+    let mut state = AppState::default();
+    state.register_pane("2".to_string());
+    let idle_session_id = state.insert_placeholder_session_awaiting_report(
+        "2".to_string(),
+        Some("/home/dev/workspace".to_string()),
+        None,
+        Some("agent-declared-pending-idle".to_string()),
+        true,
+    );
+    let idle_session = state
+        .sessions
+        .get(&idle_session_id)
+        .expect("insert_placeholder_session_awaiting_report seeds the session");
+    let idle_buffer = render_card_with_declared_agent_to_buffer(
+        idle_session,
+        Some("reviewer"),
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        Some(&AgentType::Codex),
+        true,
+        80,
+        density.rendered_height(),
+    );
+    let idle_rendered = buffer_to_text(&idle_buffer);
+    assert!(
+        idle_rendered.contains("Starting…"),
+        "the production-reachable shape (status: Idle, expects_agent_report: true, \
+         declared Codex) must also show 'Starting…':\n{idle_rendered}"
     );
 }
 
