@@ -3955,7 +3955,16 @@ fn lookup_orchestration_role_indexed(
 /// * **Everything unmarked is readiness** — native hooks, an OLDER wrapper build,
 ///   the scheduler's synthetic card-surfacing event — which is exactly today's
 ///   behaviour.
-fn session_start_means_ready(event: &AgentEvent) -> bool {
+///
+/// Issue #737: `pub(crate)` because `src/ui.rs`'s TUI-owned
+/// `deliver_orchestrator_prompt` (the spawn-time orchestrator role-prompt
+/// gate) reuses this exact predicate rather than re-deriving it. That gate
+/// had its own, independent copy of the same bug this function exists to
+/// fix — it treated `agent_type != AgentType::None` alone as readiness,
+/// which a bare wrapper fork-time fact satisfies just as easily as a
+/// genuine interface fact. Sharing the predicate means the two gates can
+/// never silently drift onto different answers for the same event.
+pub(crate) fn session_start_means_ready(event: &AgentEvent) -> bool {
     if !event.is_wrapper_session_start() {
         return true;
     }

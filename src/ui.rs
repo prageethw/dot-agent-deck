@@ -6019,9 +6019,51 @@ fn deliver_orchestrator_prompt(
         return;
     }
 
-    let agent_ready = snapshot.sessions.values().any(|s| {
-        s.pane_id.as_deref() == Some(start_pane_id.as_str()) && s.agent_type != AgentType::None
-    });
+    // Issue #737: `agent_ready` used to be `s.agent_type != AgentType::None`
+    // alone, which a wrapper's own fork-time `SessionStart`
+    // (`WRAPPER_FORK_SESSION_START_ORIGIN`) satisfies within milliseconds of
+    // spawn — that event is documented at its emit site as a card-surfacing
+    // signal, not a readiness one. For a Wrapper-strategy agent (Codex
+    // today) the real TUI can still be seconds away, so the fixed
+    // `SPAWN_TIME_READINESS_BUFFER` below had nothing meaningful to measure
+    // from and the one-shot seed write (`MAX_PAYLOAD_SUBMISSIONS`, issue
+    // #424) was lost for the life of the pane.
+    //
+    // Issue #243 already solved exactly this for the daemon-owned
+    // delegate/scheduler dispatch path in `state.rs`:
+    // `session_start_means_ready` treats a bare wrapper fork-time fact as
+    // readiness only for an agent whose pre-prompt readiness could not be
+    // resolved any other way, and treats either of the wrapper's INTERFACE
+    // facts — the weaker output-settled guess
+    // (`is_wrapper_interface_settled_session_start`) or the stronger
+    // observed-raw-mode fact (`is_wrapper_interface_ready_session_start`) —
+    // as readiness for everyone else. Reused here unchanged (made
+    // `pub(crate)` for this call site) rather than re-derived, so this gate
+    // and the daemon's agree on what counts as a genuine readiness fact. A
+    // native `SessionStart` (Claude Code, Devin) is untouched: it carries no
+    // wrapper-origin marker, so `session_start_means_ready` returns `true`
+    // immediately, exactly as `agent_type != AgentType::None` already did —
+    // and the 10s `timeout_ready` fallback below is computed from
+    // `agent_ready` exactly as before, so it is untouched too.
+    let mut agent_ready = false;
+    let mut strong_interface_seen = false;
+    for event in snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(start_pane_id.as_str()))
+        .flat_map(|session| session.recent_events.iter())
+        .filter(|event| event.event_type == EventType::SessionStart)
+    {
+        if crate::state::session_start_means_ready(event) {
+            agent_ready = true;
+        }
+        // Issue #243's STRONG fact — the wrapper watched the child clear
+        // `ICANON`/`ECHO`, not merely inferred it from a quiet period. Only
+        // this fact earns the wider buffer below; see its own doc.
+        if event.is_wrapper_interface_ready_session_start() {
+            strong_interface_seen = true;
+        }
+    }
     let timeout_ready = !agent_ready
         && ui
             .orchestration_prompt_anchor_at
@@ -6030,10 +6072,32 @@ fn deliver_orchestrator_prompt(
     if agent_ready {
         ui.orchestration_ready_since.entry(tab_id).or_insert(now);
     }
+    // Issue #737: price the wait the same way issue #243 prices the
+    // daemon-owned delegate path's identical fact. Once readiness came from
+    // the wrapper's STRONG interface fact, hold for
+    // `WRAPPER_INTERFACE_READINESS_BUFFER` (5000ms, measured in `state.rs`
+    // against a real codex-cli's raw-mode-to-repaint gap) — shared with
+    // `state.rs` rather than re-measured here, so the two paths can never
+    // drift onto different numbers for the same underlying fact. Every
+    // other release — native, the wrapper's weaker settled-output fact
+    // alone, and the 10s timeout fallback — keeps
+    // `SPAWN_TIME_READINESS_BUFFER` unchanged, mirroring `state.rs`'s own
+    // "scoped to the strong fact ALONE" reasoning there: a wrapped agent
+    // that never leaves cooked mode has no full-screen initialisation for
+    // the wider buffer to cover, so pricing it the same as a native
+    // `SessionStart` is correct, not an oversight.
+    let readiness_buffer = if strong_interface_seen {
+        crate::state::wrapper_interface_readiness_buffer()
+    } else {
+        SPAWN_TIME_READINESS_BUFFER
+    };
     let buffer_elapsed = if timeout_ready {
         true
     } else {
-        should_inject_spawn_time_prompt(ui.orchestration_ready_since.get(&tab_id).copied(), now)
+        ui.orchestration_ready_since
+            .get(&tab_id)
+            .copied()
+            .is_none_or(|t| now.saturating_duration_since(t) >= readiness_buffer)
     };
     let backed_off = ui
         .send_retry_backoff
