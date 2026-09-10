@@ -886,20 +886,95 @@ fn git_repo_root(cwd: &Path) -> PathBuf {
 /// this call sits on the per-Codex-spawn hot path, so it needs a genuine
 /// bound, not a second copy of that same gap.
 ///
-/// Uses plain `--git-common-dir` (no `--path-format=absolute`, which needs
-/// git >= 2.31 and is undocumented anywhere in this repo as a minimum
-/// version) — it prints a path RELATIVE to `cwd` for the main working tree,
-/// and an ABSOLUTE path for a linked worktree / `--separate-git-dir`
-/// checkout / submodule (the exact two shapes
-/// [`crate::issue_dispatch_run::git_common_dir`]'s own no-flag fallback
-/// branch handles the same way); `Path::join` handles both, since joining
-/// onto an absolute path replaces it outright — so no version-fallback dance
-/// is needed here at all.
+/// Tries `--path-format=absolute --git-common-dir` first (git >= 2.31,
+/// always prints an absolute path, so the caller needs no `Path::join`
+/// reconstruction at all), falling back to plain `--git-common-dir` (which
+/// prints a path RELATIVE to `cwd` for the main working tree and an ABSOLUTE
+/// path for a linked worktree / `--separate-git-dir` checkout / submodule —
+/// `Path::join` handles both, since joining onto an absolute path replaces
+/// it outright) only when the flagged attempt itself fails — mirroring
+/// [`crate::issue_dispatch_run::git_common_dir`]'s own flag-preference order
+/// and fallback trigger (any non-success from the flagged call, not a
+/// specific "unknown option" stderr match — that helper doesn't distinguish
+/// either, it just retries flag-less unconditionally). A prior version of
+/// this function used only the un-flagged form on the theory that
+/// `Path::join` made a version-fallback unnecessary; that was wrong — `join`
+/// never canonicalizes a relative `..`-bearing result the way
+/// `--show-toplevel` does, which is exactly the class of mismatch the
+/// flagged form sidesteps by never needing `join` in the first place.
 fn resolve_git_repo_root(cwd: &Path) -> Result<PathBuf, RepoRootLookupFailure> {
+    let (status, stdout, _stderr) =
+        run_git_rev_parse(cwd, &["--path-format=absolute", "--git-common-dir"])?;
+    if status.success() {
+        let raw = stdout.trim();
+        if raw.is_empty() {
+            return Err(RepoRootLookupFailure::Other(
+                "git rev-parse --path-format=absolute --git-common-dir printed no output"
+                    .to_string(),
+            ));
+        }
+        // Already absolute — no `join` needed or wanted.
+        let common_dir = PathBuf::from(raw);
+        return common_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+            RepoRootLookupFailure::Other(format!(
+                "git common dir {common_dir:?} has no parent directory"
+            ))
+        });
+    }
+
+    // Old-git compatibility fallback: `--path-format` needs git >= 2.31 and
+    // an older git rejects the flag outright, which the flagged attempt
+    // above just reported as a non-success exit.
+    let (fb_status, fb_stdout, fb_stderr) = run_git_rev_parse(cwd, &["--git-common-dir"])?;
+    if !fb_status.success() {
+        if fb_stderr.contains("not a git repository") {
+            return Err(RepoRootLookupFailure::NotARepo);
+        }
+        return Err(RepoRootLookupFailure::Other(format!(
+            "git rev-parse --git-common-dir exited {fb_status}: {}",
+            fb_stderr.trim()
+        )));
+    }
+
+    let raw = fb_stdout.trim();
+    if raw.is_empty() {
+        return Err(RepoRootLookupFailure::Other(
+            "git rev-parse --git-common-dir printed no output".to_string(),
+        ));
+    }
+    let common_dir = cwd.join(raw);
+    common_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+        RepoRootLookupFailure::Other(format!(
+            "git common dir {common_dir:?} has no parent directory"
+        ))
+    })
+}
+
+/// Bounded (fix-round F4, extended fix-round A/B for issue #732) single
+/// `git -C <cwd> rev-parse <extra_args>` invocation backing
+/// [`resolve_git_repo_root`] — its own small spawn/poll/timeout loop rather
+/// than reusing [`crate::issue_dispatch_run::git_common_dir`] wholesale:
+/// that helper is itself unbounded by design (tracked as fork issue #388 —
+/// no synchronous capture-with-timeout helper existed when it was written),
+/// and this call sits on the per-Codex-spawn hot path, so it needs a genuine
+/// bound, not a second copy of that same gap. [`resolve_git_repo_root`]
+/// calls this once per attempt (flagged, then the old-git fallback), each
+/// independently bounded by [`GIT_REPO_ROOT_TIMEOUT`] — kept self-contained
+/// here rather than extracted into a cross-file helper because the only
+/// piece worth sharing (spawn + bounded wait + capture) is a poor fit
+/// alongside `issue_dispatch_run`'s different execution model (blocking
+/// `Command::output()` / `tokio::process`, both unbounded there); the
+/// flag-preference *decision* this function makes around it is what's
+/// actually mirrored from that file, not its execution shape.
+fn run_git_rev_parse(
+    cwd: &Path,
+    extra_args: &[&str],
+) -> Result<(std::process::ExitStatus, String, String), RepoRootLookupFailure> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(["rev-parse", "--git-common-dir"])
+        .arg("rev-parse")
+        .args(extra_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -915,7 +990,7 @@ fn resolve_git_repo_root(cwd: &Path) -> Result<PathBuf, RepoRootLookupFailure> {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(RepoRootLookupFailure::Other(format!(
-                        "git rev-parse --git-common-dir timed out after {GIT_REPO_ROOT_TIMEOUT:?}"
+                        "git rev-parse {extra_args:?} timed out after {GIT_REPO_ROOT_TIMEOUT:?}"
                     )));
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -945,28 +1020,7 @@ fn resolve_git_repo_root(cwd: &Path) -> Result<PathBuf, RepoRootLookupFailure> {
         let _ = pipe.read_to_string(&mut stderr);
     }
 
-    if !status.success() {
-        if stderr.contains("not a git repository") {
-            return Err(RepoRootLookupFailure::NotARepo);
-        }
-        return Err(RepoRootLookupFailure::Other(format!(
-            "git rev-parse --git-common-dir exited {status}: {}",
-            stderr.trim()
-        )));
-    }
-
-    let raw = stdout.trim();
-    if raw.is_empty() {
-        return Err(RepoRootLookupFailure::Other(
-            "git rev-parse --git-common-dir printed no output".to_string(),
-        ));
-    }
-    let common_dir = cwd.join(raw);
-    common_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
-        RepoRootLookupFailure::Other(format!(
-            "git common dir {common_dir:?} has no parent directory"
-        ))
-    })
+    Ok((status, stdout, stderr))
 }
 
 /// Pre-empt Codex CLI's own interactive "Do you trust the contents of this
@@ -1642,8 +1696,20 @@ mod tests {
              which is what the pre-fix git_repo_root wrote and which Codex's trust gate never \
              checks.\ngot config.toml:\n{contents}"
         );
+        // `doc["projects"][worktree_root.as_str()]` (the `Index` operator)
+        // would panic with "index not found" here rather than evaluate to
+        // something `.is_none()`-checkable — `toml_edit`'s `Index` impl for
+        // `Item`/`Table` is `self.get(key).expect("index not found")`, so it
+        // panics unconditionally on a missing key. That's exactly the
+        // outcome a correctly-behaving `trust_project_dir_in` produces here
+        // (no record keyed on the worktree's own root), so the assertion
+        // has to reach for `Table::get` directly instead of the indexing
+        // sugar, or it can never observe a pass.
         assert!(
-            doc["projects"][worktree_root.as_str()].is_none(),
+            doc["projects"]
+                .as_table()
+                .and_then(|projects| projects.get(worktree_root.as_str()))
+                .is_none(),
             "must not ALSO (or instead) key the record on the worktree's own root \
              ({worktree_root})\ngot config.toml:\n{contents}"
         );
