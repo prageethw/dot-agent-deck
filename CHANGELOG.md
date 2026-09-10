@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.44.9] - 2026-09-10
+
+### Fixed
+
+  Picking an agent from the New Agent form's `Agent:` chip (used to declare identity for a mode-pane launcher command that isn't auto-inferable, e.g. a bespoke Codex wrapper script) is no longer silently discarded once the pane spawns. The form's explicit selection now drives the mode-pane wrap decision alongside the mode's own `agent = "…"` declaration, so a launcher the user explicitly told the deck was Codex is wrapped through the Wrapper strategy (`dot-agent-deck wrap --agent codex --`) and reported as Codex on the Dashboard card, instead of running bare with the card stuck on "No agent" (issue #640). The same resolved selection now also drives the interim Dashboard badge shown immediately at spawn (before the real hook/event arrives), so that preview and the actual wrapped launch always agree; and switching to a different Mode chip that declares its own agent identity clears a stale Agent-chip pick from an earlier selection, so it can no longer silently override the mode's own declared policy.
+  A declared-agent pane (e.g. a role with `agent = "codex"` in `.dot-agent-deck.toml`) that has never reported in now shows "Starting…" like an undeclared pane in the same state, instead of falling through to a raw, unvetted status. Note: this closes a render-layer inconsistency; the live-event-emission question behind issue #730's original report is tracked separately in #732/#733.
+  Codex CLI's own interactive "Do you trust the contents of this directory?" gate — which blocks all project-local config, hooks, and exec-policy loading until answered — is now pre-empted for a deck-spawned Codex session, by writing the same directory-trust record Codex's own default "Yes, continue" answer would (issue #732). Previously, a never-before-trusted git repository root (for example, a fresh worktree) could wedge a real interactive Codex session indefinitely with zero native hook invocations, even when the deck's own scoped hook trust had already been recorded correctly — the two are separate trust mechanisms, and only the hook-trust one was pre-answered before this fix. The trust record is keyed on the resolved git repository root rather than the literal spawn directory, so it lands on the correct key even when the deck spawns Codex from inside a linked git worktree (worker-agent-deck's own default working shape) rather than a repository's main checkout. This auto-answers a real, persistent, security-relevant confirmation prompt on the user's behalf, persistently, into their real `~/.codex/config.toml` — a deliberate tradeoff (the alternative is an indefinite wedge with no way for a non-interactive spawn to ever answer the prompt itself), stated explicitly here rather than left implicit.
+  No-Test: a regression test already pins this exact behavior (`spawn_prep_trusts_the_project_dir_so_codexs_own_confirmation_gate_never_blocks` in `src/codex_hooks_manage.rs`, added in this PR's prior commit), but it is a plain `#[test]`, matching every other test in that file today (none of which carry `#[spec(...)]`) — so R3's spec-test-delta scan does not see it. The test is tester-owned in this PR; retagging it with `#[spec(...)]` is out of scope for this change.
+
+
+
 ## [0.44.8] - 2026-09-09
 
 ### Fixed
