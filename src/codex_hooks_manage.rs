@@ -860,7 +860,7 @@ fn git_repo_root(cwd: &Path) -> PathBuf {
 /// or rewriting the rest of the file.
 pub fn trust_project_dir_in(home: &Path, cwd: &Path) -> std::io::Result<()> {
     let root = git_repo_root(cwd);
-    let key = root.to_str().ok_or_else(|| {
+    let path_str = root.to_str().ok_or_else(|| {
         io::Error::new(
             ErrorKind::InvalidData,
             format!(
@@ -869,10 +869,60 @@ pub fn trust_project_dir_in(home: &Path, cwd: &Path) -> std::io::Result<()> {
             ),
         )
     })?;
+    let key = quoted_toml_key(path_str)?;
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     edit_projects_table(home, |projects| {
-        upsert_project_trust_record(projects, key);
+        upsert_project_trust_record(projects, &key);
     })
+}
+
+/// Build a `[projects."<raw>"]`-style TOML key that ALWAYS renders as a
+/// double-quoted basic string, regardless of platform path separators.
+///
+/// `toml_edit`'s default key formatting picks a single-quoted literal string
+/// instead whenever the decoded value contains a backslash (to avoid needing
+/// to escape it) — which every Windows path does. Left to that default, the
+/// SAME project path would render `[projects.'C:\...']` on Windows but
+/// `[projects."/Users/..."]` on Unix, a platform-dependent quoting style with
+/// no functional difference to a TOML parser (Codex included) but which
+/// breaks anything doing a literal-text match on the double-quoted form.
+/// Forcing basic-string quoting via a hand-escaped [`Key::parse`] round trip
+/// keeps the written record identical in shape across platforms.
+fn quoted_toml_key(raw: &str) -> std::io::Result<toml_edit::Key> {
+    let mut escaped = String::with_capacity(raw.len() + 2);
+    escaped.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\u{8}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{c}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                escaped.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped.push('"');
+
+    toml_edit::Key::parse(&escaped)
+        .map_err(|e| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("could not build a TOML key for {raw:?}: {e}"),
+            )
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("empty TOML key parse for {raw:?}"),
+            )
+        })
 }
 
 /// Read `<home>/config.toml`, hand `edit` the top-level `[projects]` table to
@@ -930,11 +980,13 @@ fn edit_projects_table(
 /// inline table, whichever the user (or a previous run) already wrote — so
 /// repeated trust writes are idempotent and never duplicate the table, and
 /// any other field already recorded for that project (Codex may add more
-/// over time) is left untouched.
-fn upsert_project_trust_record(projects: &mut toml_edit::Table, key: &str) {
+/// over time) is left untouched. `key` carries its own forced double-quoted
+/// repr ([`quoted_toml_key`]) so a brand-new record's header renders the same
+/// way on every platform.
+fn upsert_project_trust_record(projects: &mut toml_edit::Table, key: &toml_edit::Key) {
     use toml_edit::{Item, Table, Value as TomlValue, value};
 
-    match projects.get_mut(key) {
+    match projects.get_mut(key.get()) {
         Some(Item::Table(existing)) => {
             existing.insert("trust_level", value("trusted"));
         }
@@ -944,7 +996,7 @@ fn upsert_project_trust_record(projects: &mut toml_edit::Table, key: &str) {
         _ => {
             let mut record = Table::new();
             record.insert("trust_level", value("trusted"));
-            projects.insert(key, Item::Table(record));
+            projects.insert_formatted(key, Item::Table(record));
         }
     }
 }
