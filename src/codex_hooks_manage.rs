@@ -816,6 +816,139 @@ fn upsert_trust_record(state: &mut toml_edit::Table, key: &str, hash: &str) {
     }
 }
 
+/// Resolve the git repository root for `cwd`, falling back to `cwd` itself
+/// when it isn't inside a git repository (or `git` isn't on `PATH`).
+///
+/// Codex CLI's own directory-trust gate keys on the resolved repo root, not
+/// the literal cwd (verified live against 0.153.4: a worktree's own path is
+/// never what gets recorded, and an already-trusted ancestor directory does
+/// NOT cascade into an untrusted repo beneath it) — this mirrors that exactly
+/// so [`trust_project_dir_in`] writes the same key Codex itself would.
+fn git_repo_root(cwd: &Path) -> PathBuf {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| PathBuf::from(s.trim()))
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// Pre-empt Codex CLI's own interactive "Do you trust the contents of this
+/// directory?" gate (issue #732) by writing the same record a human answering
+/// its default "1. Yes, continue" would: `[projects."<repo-root>"]
+/// trust_level = "trusted"` in `<home>/config.toml`.
+///
+/// This is a SEPARATE mechanism from [`trust_deck_hooks_in`]'s scoped hook
+/// trust, confirmed live against Codex CLI 0.153.4: hook trust travels
+/// through a headless `codex app-server` RPC channel this interactive gate
+/// never touches, so a pane can have hooks "correctly registered and
+/// trusted" while the real interactive session still wedges indefinitely at
+/// this untouched prompt — with zero native hook invocations, since the gate
+/// blocks project-local config/hooks/exec-policies from loading at all.
+///
+/// Keyed by [`git_repo_root`], not the literal `cwd`, to match how Codex
+/// itself resolves the prompt's key.
+///
+/// Idempotent and format-preserving like [`trust_deck_hooks_in`]: publishing
+/// is atomic under [`INSTALL_LOCK`], so a concurrent deck writer for a
+/// sibling pane's spawn can't interleave, and repeated calls for the same
+/// directory merge into the same record in place rather than duplicating it
+/// or rewriting the rest of the file.
+pub fn trust_project_dir_in(home: &Path, cwd: &Path) -> std::io::Result<()> {
+    let root = git_repo_root(cwd);
+    let key = root.to_str().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "project directory path is not valid UTF-8: {}",
+                root.display()
+            ),
+        )
+    })?;
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    edit_projects_table(home, |projects| {
+        upsert_project_trust_record(projects, key);
+    })
+}
+
+/// Read `<home>/config.toml`, hand `edit` the top-level `[projects]` table to
+/// mutate, and publish the result atomically — WITHOUT reformatting anything
+/// else. Same format-preserving approach as [`edit_trust_state`], just
+/// rooted at `[projects]` instead of `[hooks.state]`.
+fn edit_projects_table(
+    home: &Path,
+    edit: impl FnOnce(&mut toml_edit::Table),
+) -> std::io::Result<()> {
+    use toml_edit::{DocumentMut, Item, Table};
+
+    std::fs::create_dir_all(home)?;
+    let path = home.join(CONFIG_TOML);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut doc = existing.parse::<DocumentMut>().map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Codex {CONFIG_TOML} is not valid TOML (left unchanged): {e}"),
+        )
+    })?;
+
+    // `[projects]` is created IMPLICIT when absent, so the file gains only the
+    // `[projects."<key>"]` header(s) it needs — no bare `[projects]` header
+    // appears in the user's config.
+    let projects = doc
+        .as_table_mut()
+        .entry("projects")
+        .or_insert_with(|| {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            Item::Table(table)
+        })
+        .as_table_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("Codex {CONFIG_TOML}: `projects` is not a table (left unchanged)"),
+            )
+        })?;
+
+    edit(projects);
+
+    crate::agent_hook_config::write_atomic(home, &path, doc.to_string().as_bytes())
+}
+
+/// Insert or refresh one `[projects."<key>"] { trust_level = "trusted" }`
+/// record.
+///
+/// An existing record for `key` is updated IN PLACE — as a table or as an
+/// inline table, whichever the user (or a previous run) already wrote — so
+/// repeated trust writes are idempotent and never duplicate the table, and
+/// any other field already recorded for that project (Codex may add more
+/// over time) is left untouched.
+fn upsert_project_trust_record(projects: &mut toml_edit::Table, key: &str) {
+    use toml_edit::{Item, Table, Value as TomlValue, value};
+
+    match projects.get_mut(key) {
+        Some(Item::Table(existing)) => {
+            existing.insert("trust_level", value("trusted"));
+        }
+        Some(Item::Value(TomlValue::InlineTable(existing))) => {
+            existing.insert("trust_level", TomlValue::from("trusted"));
+        }
+        _ => {
+            let mut record = Table::new();
+            record.insert("trust_level", value("trusted"));
+            projects.insert(key, Item::Table(record));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PRD #20 §4.2.1 — command-agnostic install + trust at daemon/TUI startup
 // ---------------------------------------------------------------------------
