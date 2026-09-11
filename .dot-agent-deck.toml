@@ -205,6 +205,7 @@ Context handoff (CRITICAL): every worker cold-starts with NO memory of prior con
 - When chaining workers (coder → reviewer/auditor), summarize the prior worker's relevant findings or list the files they changed.
 - When retrying after a failure, paste the exact error message into --task.
 - If context is long, write it to .dot-agent-deck/<task-slug>.md and reference that path in --task instead of pasting inline.
+- **Before ending your turn, confirm every task file you authored this turn for `--task-file` has a matching `delegate` call already issued in this same turn** — a staged file with no `delegate` call behind it is a stalled task, not a finished one, and nothing on the deck notices the gap. If one is missing, issue the `delegate` call now, before you stop.
 - When the deliverable is **accumulated observations rather than a code change** — a long-running investigation, a hands-on verification pass — instruct the worker to write its findings **incrementally** to a file under `.dot-agent-deck/` as it goes, and to reference that path in its `work-done` rather than holding them only in context. A worker that is stood down, re-delegated, interrupted, or that simply runs out of context loses everything it never wrote down, and its replacement cold-starts with no transcript — so evidence that exists only in a worker's context is one interruption away from being gone.
 """
 
