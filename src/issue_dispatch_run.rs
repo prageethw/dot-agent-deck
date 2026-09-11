@@ -3448,13 +3448,12 @@ fn fetch_origin(clone_dir: &Path) -> Result<(), String> {
 /// [`sync_merged_workspace_to_main`] — its own `Debug` output is what
 /// `orchestration/workspace/020`-`022` match against.
 ///
-/// `#[allow(dead_code)]`: the `reason` field is only ever constructed by
-/// [`sync_merged_workspace_to_main`], which carries its own
-/// `#[allow(dead_code)]` for the same "no caller yet" reason — without this,
-/// dead-code analysis treats the field as unread because nothing reachable
-/// from the crate root ever constructs it outside tests.
+/// Fork issue #744 wired [`sync_merged_workspace_to_main`] into a real call
+/// site (`dot-agent-deck worktree sync`, via
+/// [`crate::worktree_reclaim::run_sync`]), which reads `reason` off
+/// `LeftUntouched` to report it — no `#[allow(dead_code)]` needed here
+/// anymore.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum PostMergeSyncOutcome {
     /// Both preconditions held: local `<default_branch>` now sits exactly
     /// at `origin/<default_branch>`'s SHA, and the workspace is checked out
@@ -3513,11 +3512,12 @@ pub(crate) enum PostMergeSyncOutcome {
 /// `Err` result may ever leave the workspace anywhere other than where it
 /// started.
 ///
-/// `#[allow(dead_code)]`: PRD fork#544 M7 ships no CLI/caller wiring yet,
-/// the same honest state [`forget_isolated_workspace`]'s own
-/// `#[allow(dead_code)]` documents — this function is exercised directly by
-/// `orchestration/workspace/020`-`022` and nothing else calls it today.
-#[allow(dead_code)]
+/// Wired into a real call site by fork issue #744: `dot-agent-deck worktree
+/// sync` calls this for every sibling isolated clone whose own branch is
+/// confirmed MERGED, via [`crate::worktree_reclaim::run_sync`]. Directly
+/// exercised by `orchestration/workspace/020`-`022`/`028`/`030`/`032`, and
+/// indirectly by `orchestration/workspace/033`-`035` through that CLI
+/// surface.
 pub(crate) fn sync_merged_workspace_to_main(
     clone_dir: &Path,
     default_branch: &str,
@@ -3873,10 +3873,11 @@ pub(crate) fn sync_merged_workspace_to_main(
 /// only a proactive, read-only fetch runs — see [`fetch_origin`] for what
 /// that does and does not touch.
 ///
-/// `#[allow(dead_code)]`: same honest state as
-/// [`sync_merged_workspace_to_main`] above — exercised directly by
-/// `orchestration/workspace/023` and nothing else calls it today.
-#[allow(dead_code)]
+/// Wired into a real call site by fork issue #744: `dot-agent-deck worktree
+/// sync` calls this for every sibling isolated clone whose own branch is
+/// NOT known to be merged, via [`crate::worktree_reclaim::run_sync`].
+/// Directly exercised by `orchestration/workspace/023`, and indirectly by
+/// `orchestration/workspace/033`-`035` through that CLI surface.
 pub(crate) fn fetch_other_live_workspace(clone_dir: &Path) -> Result<(), String> {
     fetch_origin(clone_dir)
 }
