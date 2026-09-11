@@ -3365,6 +3365,236 @@ pub fn format_reclaim_error_for_cli(e: &str) -> String {
     format!("worktree reclaim: {}", sanitize_for_terminal_display(e))
 }
 
+// ---------------------------------------------------------------------------
+// `dot-agent-deck worktree sync` (fork issue #744) -- wires PRD fork#544 M7's
+// `sync_merged_workspace_to_main`/`fetch_other_live_workspace` to a real call
+// site for the first time (both previously shipped `#[allow(dead_code)]`,
+// exercised only by their own direct unit tests, `orchestration/workspace/
+// 020`-`023`/`028`/`030`/`032`). See `docs/develop/shared-clone-architecture.md`'s
+// "Post-merge sync (M7)" section for the full design history.
+// ---------------------------------------------------------------------------
+
+/// One examined isolated clone's outcome under `dot-agent-deck worktree
+/// sync` (fork issue #744).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SyncRowOutcome {
+    /// The clone's own branch was confirmed MERGED, and every one of
+    /// [`crate::issue_dispatch_run::sync_merged_workspace_to_main`]'s own
+    /// safety preconditions held: it now sits on the resolved default
+    /// branch, fast-forwarded to match `origin/<default branch>` exactly.
+    SwitchedToMain,
+    /// The clone's own branch was confirmed MERGED, but at least one of
+    /// `sync_merged_workspace_to_main`'s own preconditions failed (an
+    /// uncommitted change, or a local commit the merge never captured) --
+    /// nothing was touched. `reason` is that function's own explanation, or
+    /// (rarer) a hard operational failure (`fetch`/`merge` itself erroring)
+    /// it returned as an `Err` instead.
+    LeftUntouched { reason: String },
+    /// The clone's branch is not (yet) known to be merged -- only a
+    /// read-only `git fetch origin` ran ([`crate::issue_dispatch_run::fetch_other_live_workspace`]),
+    /// keeping `origin/<default branch>` current for later reference; the
+    /// checked-out branch and working tree are completely untouched.
+    Fetched,
+    /// The read-only fetch itself failed (e.g. network, auth, or `origin`
+    /// misconfigured).
+    FetchFailed { reason: String },
+}
+
+/// One row of a `worktree sync` run's report.
+#[derive(Debug)]
+pub struct SyncRow {
+    pub path: PathBuf,
+    /// The isolated clone's own orchestration Name, read directly off its
+    /// M4b provenance artifact's `name=` field via
+    /// [`isolated_clone_name`] -- `None` when the artifact is absent or
+    /// unreadable (purely cosmetic; never gates the outcome above).
+    pub name: Option<String>,
+    pub outcome: SyncRowOutcome,
+}
+
+/// The full outcome of a `worktree sync` run.
+pub struct SyncReport {
+    pub default_branch: String,
+    pub rows: Vec<SyncRow>,
+}
+
+/// Best-effort name for an isolated clone (fork issue #744) -- read directly
+/// from its own M4b provenance artifact's `name=` field, the same artifact
+/// [`isolated_clone_pin_state`] above reads for its `pinned=` field. Purely
+/// cosmetic (a `worktree sync` report column), so any read/parse failure
+/// (missing artifact, I/O error) collapses to `None` rather than
+/// propagating -- unlike `isolated_clone_pin_state`'s security-relevant
+/// fail-closed contract, an absent name never widens or narrows what
+/// [`run_sync`] acts on, it only decorates the report.
+fn isolated_clone_name(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(
+        crate::issue_dispatch_run::isolated_clone_provenance_path(path),
+    )
+    .ok()?;
+    crate::issue_dispatch_run::isolated_clone_provenance_field(&content, "name")
+}
+
+/// Resolve the repository's actual default branch via `gh repo view --repo
+/// <slug> --json defaultBranchRef` (fork issue #744) -- never assumed to be
+/// `main` locally, matching [`query_pr_state`]'s own `--repo`-pinned,
+/// JSON-parsed shape and fail-closed error style. An `Err` here fails the
+/// whole `worktree sync` run before touching any clone -- there is no safe
+/// guessed branch name to fast-forward a merged clone onto instead.
+fn resolve_default_branch(repo_dir: &Path, repo_slug: &str) -> Result<String, String> {
+    let out = Command::new("gh")
+        .current_dir(repo_dir)
+        .args([
+            "repo",
+            "view",
+            "--repo",
+            repo_slug,
+            "--json",
+            "defaultBranchRef",
+        ])
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Err(format!("gh unavailable: {e}")),
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "gh repo view failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("could not parse gh output: {e}"))?;
+    value
+        .get("defaultBranchRef")
+        .and_then(|v| v.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "gh repo view returned no defaultBranchRef.name".to_string())
+}
+
+/// Run `dot-agent-deck worktree sync` (fork issue #744): examine every
+/// sibling isolated clone exactly as `worktree list`/`reclaim` already do
+/// (via [`examine_worktrees`] -- never reimplemented), resolve the
+/// repository's actual default branch via [`resolve_default_branch`], and
+/// for each isolated clone either auto-switch it onto that branch (its own
+/// PR is MERGED --
+/// [`crate::issue_dispatch_run::sync_merged_workspace_to_main`]) or leave it
+/// fetched-but-untouched (its own PR is not known to be merged --
+/// [`crate::issue_dispatch_run::fetch_other_live_workspace`]). Linked
+/// worktree rows (`kind == "linked"`) are skipped entirely -- this command
+/// only ever acts on isolated clones, the same restriction `reclaim`'s own
+/// `VERDICT_ISOLATED_CLONE_RECLAIMABLE` arm observes for removal.
+///
+/// "Merged" is read directly off each row's own `pr_state` field
+/// (`"merged"`) -- the exact `gh pr list --json
+/// state,headRefName,headRepositoryOwner,headRefOid` resolution
+/// [`examine_worktrees`]/[`isolated_clone_report`] already performed for
+/// this same row via `resolve_pr_state_for_isolated_clone`, never git
+/// ancestry (squash-merges never enter `main`'s ancestry) and never a
+/// second, independently-resolved `gh` call. Unlike `reclaim`'s
+/// `isolated_clone_reclaimable` verdict, this deliberately does NOT also
+/// require a clean tree/single branch/empty stash/`headRefOid` match --
+/// `sync_merged_workspace_to_main` already enforces its own safety
+/// preconditions (no uncommitted changes, no local commit the merge never
+/// captured) and reports `LeftUntouched` rather than mutating anything when
+/// they don't hold, so gating the call itself on the same conditions would
+/// only turn a safe, informative `LeftUntouched` row into a silently
+/// skipped one.
+pub fn run_sync(repo_dir: &Path) -> Result<SyncReport, String> {
+    let reports = examine_worktrees(repo_dir)?;
+    let repo_slug = derive_repo_slug(repo_dir).ok_or_else(|| {
+        "could not derive --repo from the origin remote (missing, or not a parseable GitHub \
+         URL)"
+            .to_string()
+    })?;
+    let default_branch = resolve_default_branch(repo_dir, &repo_slug)?;
+
+    let mut rows = Vec::new();
+    for r in reports {
+        if r.kind != KIND_ISOLATED_CLONE {
+            continue;
+        }
+        let name = isolated_clone_name(&r.real_path);
+        let outcome = if r.pr_state == "merged" {
+            match crate::issue_dispatch_run::sync_merged_workspace_to_main(
+                &r.real_path,
+                &default_branch,
+            ) {
+                Ok(crate::issue_dispatch_run::PostMergeSyncOutcome::SwitchedToMain) => {
+                    SyncRowOutcome::SwitchedToMain
+                }
+                Ok(crate::issue_dispatch_run::PostMergeSyncOutcome::LeftUntouched { reason }) => {
+                    SyncRowOutcome::LeftUntouched { reason }
+                }
+                Err(e) => SyncRowOutcome::LeftUntouched {
+                    reason: format!("sync failed: {e}"),
+                },
+            }
+        } else {
+            match crate::issue_dispatch_run::fetch_other_live_workspace(&r.real_path) {
+                Ok(()) => SyncRowOutcome::Fetched,
+                Err(e) => SyncRowOutcome::FetchFailed { reason: e },
+            }
+        };
+        rows.push(SyncRow {
+            path: r.real_path,
+            name,
+            outcome,
+        });
+    }
+
+    Ok(SyncReport {
+        default_branch,
+        rows,
+    })
+}
+
+/// Render the `worktree sync` human report -- one line per examined isolated
+/// clone, matching [`format_reclaim_human`]'s plain per-row shape (a leading
+/// `- <path>` bullet, the resolved name in parens when known, the outcome
+/// and any reason trailing it). No pending/confirmation section: unlike
+/// `reclaim`, this command never asks for `--yes` (see [`run_sync`]'s own
+/// doc comment for why there is nothing here for a confirmation flag to
+/// gate).
+pub fn format_sync_human(report: &SyncReport) -> String {
+    if report.rows.is_empty() {
+        return format!(
+            "no isolated clones found (default branch: {})\n",
+            sanitize_for_terminal_display(&report.default_branch)
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "default branch: {}\n",
+        sanitize_for_terminal_display(&report.default_branch)
+    ));
+    for r in &report.rows {
+        let path = display_path(&r.path);
+        let label = match &r.name {
+            Some(n) => format!(" ({})", sanitize_for_terminal_display(n)),
+            None => String::new(),
+        };
+        match &r.outcome {
+            SyncRowOutcome::SwitchedToMain => out.push_str(&format!(
+                "  - {path}{label}: switched to {}\n",
+                sanitize_for_terminal_display(&report.default_branch)
+            )),
+            SyncRowOutcome::LeftUntouched { reason } => out.push_str(&format!(
+                "  - {path}{label}: left untouched ({})\n",
+                sanitize_for_terminal_display(reason)
+            )),
+            SyncRowOutcome::Fetched => out.push_str(&format!("  - {path}{label}: fetched\n")),
+            SyncRowOutcome::FetchFailed { reason } => out.push_str(&format!(
+                "  - {path}{label}: fetch failed ({})\n",
+                sanitize_for_terminal_display(reason)
+            )),
+        }
+    }
+    out
+}
+
 /// Renders the marker-write-warning surfaced when a newly created worktree's
 /// `dot-agent-deck-owner` ownership marker could not be written (issue
 /// #164) -- creation itself already succeeded (see [`mark_worktree_owned`]'s
