@@ -288,14 +288,38 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
          rendered orchestration surface\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
+    // Fork issue #513: DAEMON_CLAUSE and the untrusted-report frame both sit
+    // LATER than UNSOLICITED_NEEDLE inside the one composed, one-shot
+    // `write_all` payload (`compose_work_done_feedback`'s `head` then
+    // `tail` in `src/state.rs`) — the daemon never writes them separately,
+    // so there is no product-side staggering here. But rendering this
+    // payload onto the grid is NOT atomic from this test's point of view:
+    // the daemon's write reaches `cat`'s stdin as one pane-write, `cat`
+    // echoes it, and a background thread reads THAT output off the PTY and
+    // feeds it into the vt100 parser this file reads via
+    // `deck.snapshot_grid()`) across however many `read()`s that takes —
+    // under heavy CI parallelism, a fully-appeared *prefix* of the message
+    // (enough for `wait_for_pane_string` above to see UNSOLICITED_NEEDLE)
+    // does not guarantee the *rest* of the same message has been read and
+    // parsed yet. A bare, non-retrying `pane_contains` immediately after
+    // that wait was exactly this false assumption, and is what made CI run
+    // 34551298486 fail at 124.638s on this exact assertion while its own
+    // panic-message grid dump (a SECOND, slightly later `snapshot_grid()`
+    // call) showed the content already present — proof the content was
+    // still arriving, not missing. Every positive needle check here now
+    // waits like UNSOLICITED_NEEDLE's already does; only the ABSENCE
+    // checks below stay one-shot, since nothing here makes an absent
+    // pointer/file start existing over time.
     assert!(
-        pane_contains(&deck, DAEMON_CLAUSE),
+        wait_for_pane_string(&deck, DAEMON_CLAUSE, Duration::from_secs(20)),
         "the label must identify itself as a daemon report, not as a message from a person or an \
          agent\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
     assert!(
-        pane_contains(&deck, REPORT_FRAME_NEEDLE) && pane_contains(&deck, SENTINEL),
+        common::wait_until(Duration::from_secs(20), || {
+            pane_contains(&deck, REPORT_FRAME_NEEDLE) && pane_contains(&deck, SENTINEL)
+        }),
         "the worker's own report must still reach the orchestrator, framed as untrusted \
          data\nFinal grid:\n{}",
         deck.snapshot_grid()
