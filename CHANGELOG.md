@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.44.11] - 2026-09-11
+
+### Fixed
+
+  A wrapped agent's fork-time `SessionStart` — the card-surfacing signal `dot-agent-deck wrap` sends the instant it spawns the wrapped child, seconds before that child has done any real work — could permanently mark a pane as having reported real activity, defeating worker-agent-deck's "Starting…" vs. resolved-status placeholder distinction for every wrapped agent (issue #733, split out of #730's Codex reviewer/auditor pane wedge). `AgentEvent::is_daemon_synthetic()` now also excludes a `SessionStart` whose `AgentEvent::is_wrapper_session_start()` is true — covering all three wrapper-origin markers (fork-time, interface-ready, interface-settled), since none of them is evidence the wrapped agent did real reported work, only that the wrapper observed its own child's process/interface state.
+  The orchestrator role prompt in `.dot-agent-deck.toml` now carries an explicit turn-ending self-check: before ending its turn, confirm every task file it authored that turn for `--task-file` has a matching `delegate` call already issued in the same turn, and issue it now if not (issue #747). This closes a real failure mode — an orchestrator pane that wrote a task file intended for `delegate --task-file <path>` but never actually called `delegate` looked ordinary-idle rather than stalled, and a research pass on #747 found no reliable deck-side mechanical way to detect a "pending" staging file from every other `.md` artifact already living in `.dot-agent-deck/`. The fix is deliberately the cheap, low-risk option: a self-check in the prompt text itself, not a new mechanical detector.
+  No-Test: this is a pure prompt-text change to `.dot-agent-deck.toml` — an orchestrator role's instructions to itself — with no corresponding Rust code path to exercise; there is no `#[spec(...)]` test surface this change could add or modify, since the orchestrator role's prompt is consumed by an LLM, not by code under test.
+
+### Miscellaneous
+
+  `.github/workflows/e2e.yml`'s `e2e` job now installs Tauri's Linux build dependencies (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libxdo-dev`) right after its `taiki-e/install-action` step, matching the fix `ci.yml`'s `build` job already carried.
+  Before this, `cargo nextest run --workspace --features e2e --retries 2` failed to even compile on the runner: `--workspace` pulls in `desktop/src-tauri` (`dot-agent-deck-desktop`), which needs GTK/glib system libraries this job never installed, so every run died on `gobject-sys`'s build script (`gobject-2.0 required by crate gobject-sys was not found`) before a single test executed.
+  Added `dot-agent-deck worktree sync` — a new batch subcommand, alongside `worktree list`/`reclaim`/`pin`/`unpin`, that catches up every sibling isolated clone after a merge lands. No path argument: it discovers every isolated clone the same way `reclaim` already does, resolves the repository's real default branch via `gh repo view`, and for each clone either auto-switches it onto that branch (when its own branch's PR is confirmed merged and doing so is safe) or runs a read-only fetch to keep it current (everything else).
+  This wires up PRD fork#544 M7's `sync_merged_workspace_to_main`/`fetch_other_live_workspace` functions to a real call site for the first time — both shipped fully tested but with no caller (`#[allow(dead_code)]`), which is how a named workspace could sit ~18 commits behind `main` for a long time even after its own branch safely merged, with nothing ever catching it up. `.dot-agent-deck.toml`'s orchestrator (Merge phase) and `release` role prompts now both instruct running `worker-agent-deck worktree sync` right after a successful `gh pr merge`.
+
+
+
 ## [0.44.10] - 2026-09-11
 
 ### Fixed
