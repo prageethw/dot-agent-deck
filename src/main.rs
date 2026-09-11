@@ -550,6 +550,21 @@ enum WorktreeCmd {
         /// Path to the isolated clone to unpin.
         path: std::path::PathBuf,
     },
+    /// Catch up every sibling isolated clone after a merge (fork issue #744,
+    /// wiring PRD fork#544 M7's `sync_merged_workspace_to_main` /
+    /// `fetch_other_live_workspace` to a real call site for the first time).
+    /// No path argument — like `reclaim`, it discovers every isolated clone
+    /// on its own via the same [`dot_agent_deck::worktree_reclaim::examine_worktrees`]
+    /// enumeration `list`/`reclaim` already use. For each one: if its own
+    /// branch's PR is MERGED (resolved the same way `reclaim`'s M4c
+    /// auto-reclaim rule already does — `gh pr list`, never git ancestry),
+    /// auto-switch it onto the repository's real default branch (resolved
+    /// via `gh repo view`) when doing so is safe — `sync_merged_workspace_to_main`
+    /// refuses on its own when the tree carries anything beyond the merge,
+    /// so this command needs no confirmation flag the way `reclaim` does.
+    /// Every other isolated clone gets a read-only `git fetch origin` only,
+    /// leaving its checked-out branch and working tree untouched.
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -2035,6 +2050,7 @@ fn main() -> ExitCode {
             WorktreeCmd::Reclaim { yes } => run_worktree_reclaim_cli(yes),
             WorktreeCmd::Pin { path } => run_worktree_pin_cli(path),
             WorktreeCmd::Unpin { path } => run_worktree_unpin_cli(path),
+            WorktreeCmd::Sync => run_worktree_sync_cli(),
         },
         Some(Commands::Issue { cmd }) => match cmd {
             IssueCmd::Claim {
@@ -3125,6 +3141,51 @@ fn run_worktree_unpin_cli(path: std::path::PathBuf) -> ExitCode {
                 sanitize_path_for_terminal_display(&path),
                 sanitize_for_terminal_display(&e.to_string())
             );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `dot-agent-deck worktree sync` (fork issue #744) — no path argument,
+/// batch operation over every sibling isolated clone, same shape as
+/// [`run_worktree_reclaim_cli`] above. Wires PRD fork#544 M7's
+/// `sync_merged_workspace_to_main`/`fetch_other_live_workspace` to a real
+/// call site for the first time — see
+/// [`dot_agent_deck::worktree_reclaim::run_sync`]'s own doc comment for the
+/// full per-clone decision. Deliberately no `--yes`/confirmation flag the
+/// way `reclaim` has: `sync_merged_workspace_to_main` already refuses on its
+/// own (no discard, no data loss) whenever the workspace carries anything
+/// beyond the merge, so there is nothing here for a confirmation flag to
+/// gate.
+fn run_worktree_sync_cli() -> ExitCode {
+    use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
+    use dot_agent_deck::worktree_reclaim::{format_sync_human, run_sync};
+
+    // Same rationale as `run_worktree_reclaim_cli`'s own `init_logging_from_env`
+    // call: `sync_merged_workspace_to_main`'s failed-merge restore path logs
+    // via `tracing::warn!`, which is silently dropped without a subscriber
+    // installed, and this is a distinct top-level `Commands::Worktree` arm
+    // that can never double-install one.
+    init_logging_from_env();
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "worktree sync: failed to resolve current directory: {}",
+                sanitize_for_terminal_display(&e.to_string())
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match run_sync(&cwd) {
+        Ok(report) => {
+            print!("{}", format_sync_human(&report));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("worktree sync: {}", sanitize_for_terminal_display(&e));
             ExitCode::FAILURE
         }
     }

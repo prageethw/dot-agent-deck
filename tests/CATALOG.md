@@ -5652,6 +5652,27 @@ without depending on the config struct API.
 - **Does not assert:** the physically-spelled in-repo-root-symlink shape, already covered by `035` (this test adds the extra ancestor-symlink layer on top of it); the ordinary nested-pick case, covered by `033`; real daemon/PTY spawn (a stub `PaneController` records the cwd without spawning a process).
 - **Platform coverage:** mac+linux+windows, matching `035` — the symlink creation itself is `#[cfg(unix)]`/`#[cfg(not(unix))]`-gated per `same_cwd_guard_sees_through_a_symlinked_alias`'s own precedent.
 
+##### orchestration/workspace/037 — `dot-agent-deck worktree sync` (fork issue #744) wires PRD fork#544 M7's `sync_merged_workspace_to_main`/`fetch_other_live_workspace` to a real CLI call site for the first time: given two sibling isolated clones, one whose own branch is confirmed MERGED (a real fast-forward merge onto the root repository's own `main`) and clean, and one whose own branch is not known to be merged (no PR fixture at all), a single `worktree sync` run auto-switches the first onto the resolved default branch while only running a read-only fetch against the second, leaving its checked-out branch and working tree completely untouched.
+- **Layer:** L1 (CLI-subprocess — the real compiled binary spawned against two real isolated-clone git repositories, a synthetic `gh` stub answering both `pr list` and the new `repo view --json defaultBranchRef`, and a `GIT_SSH_COMMAND` fake-transport script that makes a `git@github.com:...`-shaped `origin` remote genuinely fetchable against a real local repository with no actual network access — see `tests/worktree_sync.rs`'s own header for why that technique is needed; no PTY, no daemon, no real agent).
+- **Agent:** none.
+- **Asserts:** after `worktree sync` exits 0, the merged clone is checked out on `main` with its local `main` fast-forwarded to exactly match the root repository's real, independently-verified advanced SHA, and the merged content is present in its working tree; the not-yet-merged clone's checked-out branch and HEAD commit are byte-identical to before the run; the human report names the merged clone as switched to `main` and the other as only fetched, never switched.
+- **Does not assert:** the M4c heuristic auto-reclaim eligibility gate (`worktree reclaim`'s own `isolated_clone_reclaimable` verdict, unaffected by this command); the refusal path for local-only work on a merged clone (`038`); a failed default-branch resolution (`039`); the underlying `sync_merged_workspace_to_main`/`fetch_other_live_workspace` functions' own direct-call behavior, already pinned by `020`-`023`/`028`/`030`/`032`.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — the fixture's fake-SSH transport is a POSIX shell script `GIT_SSH_COMMAND` invokes; a `git@github.com:...`-shaped remote that is genuinely fetchable locally has no Windows-compatible equivalent in this harness).
+
+##### orchestration/workspace/038 — A `worktree sync` row whose branch's PR is confirmed MERGED but whose workspace carries local-only work the merge never captured — a genuine uncommitted change, the same shape `orchestration/workspace/021` already pins for `sync_merged_workspace_to_main` directly — must be left completely untouched by the CLI, not silently switched or its edit discarded.
+- **Layer:** L1 (CLI-subprocess, same harness as `037`).
+- **Agent:** none.
+- **Asserts:** after `worktree sync` exits 0 against a clone whose branch is MERGED but which carries an uncommitted file written after the simulated merge landed, the clone stays checked out on its own original branch, its HEAD commit is untouched, the uncommitted file's content survives byte-for-byte, and the human report names this row as left untouched.
+- **Does not assert:** the extra-local-commit variant of the same refusal (already pinned directly against `sync_merged_workspace_to_main` by `orchestration/workspace/022`); the not-yet-merged fetch-only path (`037`).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `037`).
+
+##### orchestration/workspace/039 — When the new `gh repo view` default-branch resolution `worktree sync` adds fails (simulating `gh` being absent, unauthenticated, or otherwise unable to resolve the repository), the whole run must fail cleanly under the `worktree sync:` error prefix before touching any clone, rather than guessing a branch name to fast-forward a merged clone onto.
+- **Layer:** L1 (CLI-subprocess, same harness as `037`, with the stub `gh`'s `repo view` handler forced to fail via a marker file).
+- **Agent:** none.
+- **Asserts:** with a genuinely merged, clean isolated clone present, `worktree sync` exits non-zero, stderr starts with `worktree sync:`, and the clone's checked-out branch and HEAD commit are completely unchanged from before the run.
+- **Does not assert:** a `gh pr list` failure for one specific clone (fails that clone's own row closed via the existing `Unresolvable`/fail-closed `PrState` handling `worktree list`/`reclaim` already exercise, not this command's own new default-branch precondition); which exact wording accompanies the error beyond the required prefix.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `037`).
+
 #### orchestration/hydration
 
 ##### orchestration/hydration/001 — Renaming an orchestration in the local `.dot-agent-deck.toml` while its tab is live surfaces an on-screen drift warning naming the orchestration when the TUI reattaches to the still-running daemon (fork issue #314 / upstream #554).
