@@ -31659,6 +31659,103 @@ mod tests {
         );
     }
 
+    /// Scenario: A placeholder explicitly awaiting an agent report (the
+    /// Codex/orchestration-role shape from `dashboard/placeholder/001`)
+    /// receives ONLY the wrapper's own fork-time `SessionStart` — the event
+    /// `Emitter::emit_fork_session_start` (`src/wrap.rs`) fires unconditionally
+    /// the instant `cmd.spawn()` returns, seconds before the wrapped child has
+    /// done anything. `agent_report_activity_seen` must stay `false` and
+    /// `expects_agent_report` must stay `true` — this event must not resolve
+    /// the placeholder.
+    #[spec("dashboard/placeholder/009")]
+    #[test]
+    fn dashboard_placeholder_009_wrapper_fork_session_start_never_resolves_awaiting_report() {
+        // Issue #733: `emit_fork_session_start`'s own doc comment calls this a
+        // "CARD-SURFACING signal, not a readiness signal" — the wrapped child
+        // is typically still a launcher (`devbox`, a shell) at this point. But
+        // `AppState::apply_event`'s `EventType::SessionStart` arm always
+        // asserts a status (`asserted_status == true`), and before this fix
+        // `AgentEvent::is_daemon_synthetic()` recognized only
+        // `ShellBusy`/`ShellIdle`/`MonitoredWaitStart`/`MonitoredWaitDone`, the
+        // delivery-notice `Error`, and a daemon-forged `SessionStart` carrying
+        // `DISPLAY_NAME_METADATA_KEY` — nothing that recognized a
+        // WRAPPER-origin `SessionStart`. So this fork-time event alone
+        // permanently latched `agent_report_activity_seen` and cleared
+        // `expects_agent_report`, before the wrapped agent had done any real
+        // work — one of the mechanisms behind issue #730's Codex
+        // reviewer/auditor panes wedging pre-task with zero real hook events.
+        //
+        // This test is state-level only (no render), like
+        // `dashboard/placeholder/007`: `resolve_agent_type` gives
+        // `dot-agent-deck wrap -- codex` a KNOWN `agent_type: Codex` on every
+        // event it emits, including this one, so `session.agent_type` becomes
+        // `Codex` the moment this event lands regardless of this fix — that
+        // independently flips `render_session_card`'s raw-agent_type-gated
+        // `is_pending`/`is_empty_placeholder` false, so a render assertion
+        // here would pin an unrelated mechanism, not this one. What this fix
+        // actually pins is the flag itself, which other readers depend on
+        // directly: the reconnect/hydration OR-in invariant
+        // (`session/live/020`/`021`), the resolved-vs-empty-placeholder
+        // distinction once a producer stays untagged
+        // (`dashboard/placeholder/004`), and the model-badge anti-collision
+        // guard (`dashboard/agent-badge/008`).
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(AgentEvent {
+            session_id: "wrapper-fork-1".to_string(),
+            // The wrapper knows its own agent identity at fork time (it is
+            // handed the agent type on the command line), so this is not
+            // `AgentType::None` in production — unlike the untagged-hook
+            // shape `dashboard/placeholder/004` pins. The bug does not
+            // depend on this either way; Codex is the identity issue #730
+            // names.
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("1".to_string()),
+            agent_id: Some("d-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("the fork-time SessionStart must have kept (or created) a session");
+        assert!(
+            !session.agent_report_activity_seen,
+            "a wrapper fork-time SessionStart alone must never latch \
+             agent_report_activity_seen — it is a card-surfacing signal, not \
+             evidence the wrapped agent has done real work; got {session:?}"
+        );
+        assert!(
+            session.expects_agent_report,
+            "a wrapper fork-time SessionStart alone must not resolve the \
+             'awaiting report' placeholder; got {session:?}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------

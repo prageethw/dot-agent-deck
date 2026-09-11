@@ -1052,6 +1052,31 @@ impl AgentEvent {
     /// key is, or must be treated as, an authentication marker (auditor) — a
     /// forged raw `Error`/`SessionStart` without its key marks a card exactly
     /// as it did before.
+    ///
+    /// Issue #733: a fourth member, [`Self::is_wrapper_session_start`] — ANY
+    /// `SessionStart` `dot-agent-deck wrap` authored about its own child,
+    /// covering all three [`SESSION_START_ORIGIN_METADATA_KEY`] values
+    /// ([`WRAPPER_FORK_SESSION_START_ORIGIN`],
+    /// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`],
+    /// [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`]), not only the
+    /// fork-time one. All three are the wrapper observing process
+    /// startup/interface state — "a child process exists", "the child's
+    /// interface came up", "the child went quiet after writing something" —
+    /// never evidence the wrapped agent did real reported work; a genuine
+    /// `Thinking`/`ToolUse`/etc. event never carries this metadata, so
+    /// excluding all three costs that path nothing. The fork-time marker is
+    /// the one issue #733 names directly (it fires at `cmd.spawn()`, before
+    /// the child has done anything at all), but the two interface facts carry
+    /// the identical defect for the identical reason: issue #243 documents
+    /// both as readiness/boot-provenance signals, not turn-completion ones,
+    /// and [`Self::is_wrapper_session_start`]'s own doc already treats all
+    /// three as one "is this the wrapper talking about its own child"
+    /// question for the generation-binding seam directly above this one —
+    /// splitting them apart here, to exclude only the fork-time fact, would
+    /// leave the interface-ready/settled facts still able to latch
+    /// `agent_report_activity_seen` off nothing but the wrapper watching its
+    /// own child's terminal settle, which is exactly the same
+    /// card-surfacing-not-readiness gap for a different origin value.
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(
             self.event_type,
@@ -1062,6 +1087,7 @@ impl AgentEvent {
         ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
             || (self.event_type == EventType::SessionStart
                 && self.metadata.contains_key(DISPLAY_NAME_METADATA_KEY))
+            || self.is_wrapper_session_start()
     }
 }
 
