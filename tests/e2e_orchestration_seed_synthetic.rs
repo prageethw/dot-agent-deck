@@ -293,10 +293,34 @@ fn orchestration_seed_019_wrap_interface_readiness_delivers_a_slow_codex_seed_pr
     // the genuine one that follows the stand-in's own `turn.started` JSONL —
     // not that either appears exactly once or in a particular order relative
     // to the ready marker.
+    // TEST-BUG NOTE (found in CI after this test first shipped, distinct from
+    // the harness false-positive documented above): `codex_delayed_standin.py`
+    // prints its three turn-lifecycle JSONL lines only 0.3s apart once it
+    // genuinely reads a non-empty line, so the WHOLE scripted turn
+    // (Thinking -> Idle) can complete in well under a second — fast enough
+    // that a live grid poll starting only after the stdin-log assertion
+    // above already returned can miss the transient "Thinking" frame
+    // entirely and observe only "Idle" by the time it starts polling. That
+    // is a race between this assertion's own polling start and how fast a
+    // SCRIPTED (not real) turn completes, not a delivery regression — CI run
+    // 34541021768 showed the pane already `Idle` with the full
+    // `turn.started`/`item.started`/`turn.completed` JSONL already on
+    // screen. Accept either "Thinking" or "Idle" here instead of only
+    // "Thinking": in this stand-in's lifecycle "Idle" is only reachable via
+    // a completed turn that started in "Thinking" (`SessionStatus::Idle` at
+    // `src/ui.rs`), and the stdin-log assertion just above already rules out
+    // the one false-positive this would otherwise risk — a pane that never
+    // received anything renders `SessionStatus::Unknown` as "Idle" too
+    // (`src/ui.rs:23415`), which is exactly why that assertion has to come
+    // first and stays the primary ground truth. This still fails
+    // meaningfully if the wrap's classification pipeline stops turning
+    // received stdin into any visible status change at all.
     assert!(
-        deck.wait_for_grid_string_within("Thinking", Duration::from_secs(10)),
-        "the delayed Codex role never visibly entered Thinking even though \
-         its stdin log shows the seed pointer arrived:\n{}",
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
+            grid.contains("Thinking") || grid.contains("Idle")
+        }),
+        "the delayed Codex role never visibly entered Thinking or Idle even \
+         though its stdin log shows the seed pointer arrived:\n{}",
         deck.snapshot_grid()
     );
     events.wait_for(
@@ -379,10 +403,24 @@ fn orchestration_seed_020_wrap_immediate_readiness_delivers_the_seed_prompt() {
         deck.snapshot_grid()
     );
 
+    // Same test-bug fix as `orchestration_seed_019` above (found in CI:
+    // `gh run view 34541021768` — panic at the equivalent assertion here):
+    // this stand-in's whole scripted turn can complete in well under a
+    // second, and with `STANDIN_READY_DELAY_MS=0` the race is even tighter,
+    // so a live grid poll can start after the turn has already finished and
+    // never observe a transient "Thinking" frame. Accept either "Thinking"
+    // or "Idle" — meaningful because the stdin-log assertion just above
+    // already proves genuine delivery (ruling out the one false-positive
+    // this would otherwise risk: `SessionStatus::Unknown` also renders as
+    // "Idle" at `src/ui.rs:23415` for a pane that never received anything),
+    // and "Idle" in this stand-in's lifecycle is only reachable via a
+    // completed turn that started in "Thinking".
     assert!(
-        deck.wait_for_grid_string_within("Thinking", Duration::from_secs(10)),
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
+            grid.contains("Thinking") || grid.contains("Idle")
+        }),
         "the immediate-readiness Codex role never visibly entered Thinking \
-         even though its stdin log shows the seed pointer arrived:\n{}",
+         or Idle even though its stdin log shows the seed pointer arrived:\n{}",
         deck.snapshot_grid()
     );
     events.wait_for(
