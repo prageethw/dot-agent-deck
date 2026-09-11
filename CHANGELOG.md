@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.44.10] - 2026-09-11
+
+### Fixed
+
+  A Codex-backed orchestration pane's seed prompt could be silently lost, leaving the pane stuck permanently on "Starting…" with a healthy, idle Codex process that had never received any input (issue #737). `deliver_orchestrator_prompt`'s spawn-time readiness gate treated a `dot-agent-deck wrap`-launched Codex pane's early fork-time fact — sent milliseconds after spawn, well before the real Codex TUI is actually reading stdin — as sufficient readiness, then waited only 500ms before writing the pane's one-shot seed prompt. Issue #243 already fixed this exact defect class for the daemon-owned delegate path by distinguishing the wrapper's weak fork-time fact from its strong raw-mode-observed fact and pricing a much longer buffer (5000ms, measured against real Codex CLI) for the strong fact; that same distinction is now ported into this TUI-owned spawn-time path.
+  This fixes the race for any Codex pane launched through the deck's own wrapper. It does not cover a Codex role configured with a bare, unwrapped command (one that never matches `dot-agent-deck wrap`'s Codex detection) — issue #737 stays open for that narrower, structurally different case.
+
+
+
 ## [0.44.9] - 2026-09-10
 
 ### Fixed
