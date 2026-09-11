@@ -6080,6 +6080,18 @@ fn deliver_orchestrator_prompt(
     // below is untouched, so a start role whose producer announces nothing still
     // gets its remit after 10 s.
     let agent_ready = spawn_time_agent_ready(snapshot, &start_pane_id);
+    // Issue #243's STRONG fact — the wrapper watched the child clear
+    // `ICANON`/`ECHO`, not merely inferred it from a quiet period. Only this
+    // fact earns the wider buffer below (issue #737); see its own doc.
+    // Computed independently of `agent_ready` above (#1005), which no longer
+    // scans `recent_events` for this pane's `SessionStart`s itself.
+    let strong_interface_seen = snapshot
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(start_pane_id.as_str()))
+        .flat_map(|session| session.recent_events.iter())
+        .filter(|event| event.event_type == EventType::SessionStart)
+        .any(|event| event.is_wrapper_interface_ready_session_start());
     let timeout_ready = !agent_ready
         && ui
             .orchestration_prompt_anchor_at
@@ -6088,10 +6100,32 @@ fn deliver_orchestrator_prompt(
     if agent_ready {
         ui.orchestration_ready_since.entry(tab_id).or_insert(now);
     }
+    // Issue #737: price the wait the same way issue #243 prices the
+    // daemon-owned delegate path's identical fact. Once readiness came from
+    // the wrapper's STRONG interface fact, hold for
+    // `WRAPPER_INTERFACE_READINESS_BUFFER` (5000ms, measured in `state.rs`
+    // against a real codex-cli's raw-mode-to-repaint gap) — shared with
+    // `state.rs` rather than re-measured here, so the two paths can never
+    // drift onto different numbers for the same underlying fact. Every
+    // other release — native, the wrapper's weaker settled-output fact
+    // alone, and the 10s timeout fallback — keeps
+    // `SPAWN_TIME_READINESS_BUFFER` unchanged, mirroring `state.rs`'s own
+    // "scoped to the strong fact ALONE" reasoning there: a wrapped agent
+    // that never leaves cooked mode has no full-screen initialisation for
+    // the wider buffer to cover, so pricing it the same as a native
+    // `SessionStart` is correct, not an oversight.
+    let readiness_buffer = if strong_interface_seen {
+        crate::state::wrapper_interface_readiness_buffer()
+    } else {
+        SPAWN_TIME_READINESS_BUFFER
+    };
     let buffer_elapsed = if timeout_ready {
         true
     } else {
-        should_inject_spawn_time_prompt(ui.orchestration_ready_since.get(&tab_id).copied(), now)
+        ui.orchestration_ready_since
+            .get(&tab_id)
+            .copied()
+            .is_none_or(|t| now.saturating_duration_since(t) >= readiness_buffer)
     };
     let backed_off = ui
         .send_retry_backoff
