@@ -214,6 +214,8 @@ max_per_run = 5                       # hard cap on how many issues a single fir
 # label = "agent-eligible"            # optional: only issues carrying this label
 # query = "is:open no:assignee"       # optional: advanced gh search override
 # triage = true                       # optional: opt in to per-issue triage — see "Opt-in triage" below
+# repo_allowlist = ["vfarcic/dot-ai"] # optional: see "Repo allowlist" below — must include `repo` when set
+# dry_run = true                      # optional: see "Dry run" below — try a new schedule with no writes
 ```
 
 > **`command` is optional to load, and only matters for orchestration-less clones**
@@ -240,6 +242,8 @@ dot-agent-deck schedule add \
 A malformed `--repo` (not an `owner/name` slug) is rejected before anything is written. The CLI validates, writes the global config atomically, and triggers a live daemon reload — exactly as for a plain task.
 
 `--triage` is a bare flag (present = on) and, like `--max-per-run` / `--label` / `--query`, is only meaningful alongside `--repo`; it maps onto the `triage` field described below.
+
+`repo_allowlist` and `dry_run` (both described below) have no `schedule add` flag yet — hand-edit the sub-table to set either one, matching this fork's existing pattern for advanced knobs added without a matching CLI flag.
 
 ### What a fire does, issue by issue
 
@@ -302,6 +306,18 @@ Two things this deliberately does **not** do, so nobody infers a behavior that i
 
 - It does not triage your whole backlog — only the issues a fire actually dispatches ever get labeled or see the instruction.
 - Recording a priority does not currently affect dispatch order. `max_per_run` still takes issues in the order `gh` returns them; nothing sorts by `priority-*` yet.
+
+### Repo allowlist
+
+Set `repo_allowlist = ["owner/name", ...]` in the `[scheduled_tasks.issue_dispatch]` sub-table to restrict which repo this task is permitted to write to. It is **unset by default** (`None`), which is unchanged behaviour — a hand-written config that never names this key dispatches exactly as before.
+
+When set, `repo` must be a member of the list. If it isn't, the fire refuses to do **any** work for this config entry at all — no `gh` or `git` invocation of any kind, not merely the writes — and logs why. This is a fail-closed guard against a copy-pasted or hand-edited `repo` value quietly pointing a task at a repo it was never meant to touch.
+
+### Dry run
+
+Set `dry_run = true` in the `[scheduled_tasks.issue_dispatch]` sub-table to try a new schedule with no side effects. It is **off by default**.
+
+On a dry-run fire, each candidate issue still goes through the same reads and the same idempotency decision (worktree/label/open-PR checks) a real run would, and the outcome — dispatch or skip, and why — is still reported. Once an issue's decision resolves to "dispatch," the fire stops right there: no worktree is created, no branch, no agent is spawned, and no `gh` WRITE (claim comment, `in-progress`/triage label, assignee best-effort) happens. This is deliberately earlier than skipping only the writes — creating the worktree is itself a write a later *real* fire's idempotency check would see, so a dry run that got that far would poison the next real dispatch of the same issue by making it look already claimed. A dry run can therefore never leave anything behind for a real run to trip over.
 
 ### Cleanup: closing a tab tries to remove its worktree
 

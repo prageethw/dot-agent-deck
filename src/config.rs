@@ -568,13 +568,20 @@ pub struct IssueDispatchConfig {
     /// rather than guess" contract rather than trying to partially proceed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_allowlist: Option<Vec<String>>,
-    /// Issue #171: when true, every `gh` WRITE this module would otherwise
-    /// perform (the claim comment, the `in-progress`/triage label creation,
-    /// the assignee best-effort) is logged with what it would have done and
-    /// skipped rather than executed — the natural way to try a new schedule
-    /// safely. Reads (`gh issue list`, `gh pr list`, `gh issue view`, `gh api
-    /// user`) and the local repo clone/fetch still happen, so a dry run still
-    /// reports genuine dispatch/skip decisions. Off by default.
+    /// Issue #171: when true, a run makes exactly the same idempotency
+    /// decision a real run would (the reads: `gh issue list`, `gh pr list`,
+    /// `gh issue view`, `gh api user`, plus the worktree/label/open-PR
+    /// checks), reports it, and then returns immediately once that decision
+    /// resolves to `Dispatch` — performing no worktree creation, no branch,
+    /// no agent spawn, and no `gh` WRITE (claim comment, `in-progress`/triage
+    /// label, assignee best-effort) at all. This stops strictly before
+    /// `create_worktree`, deliberately: that call would leave the same
+    /// on-disk `created-by:` marker and registry entry a real dispatch
+    /// leaves, which a later real run's idempotency check (`worktree_exists`)
+    /// would then read as "already claimed" and silently skip — poisoning
+    /// the next real fire. Stopping earlier makes that impossible rather
+    /// than merely avoided by convention. The natural way to try a new
+    /// schedule safely. Off by default.
     #[serde(default)]
     pub dry_run: bool,
 }
