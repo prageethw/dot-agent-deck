@@ -1896,6 +1896,8 @@ fn drain_pre_write_events(
             Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::DelegationArmed(_)
+                | BroadcastMsg::DelegationRetired(_)
                 | BroadcastMsg::Unknown,
             ) => {
                 continue;

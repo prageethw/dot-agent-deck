@@ -168,8 +168,13 @@ pub const STATUS_WAITING: Color = Color::Magenta;
 pub const STATUS_ERROR: Color = Color::Red;
 /// Idle — no current activity (dimmed).
 pub const STATUS_IDLE: Color = Color::DarkGray;
-/// Observing — the pane is held `Working` by a monitored external wait
-/// (`worker-agent-deck wait start`), not real agent activity. Issue #714.
+/// Observing — the raw status is not the whole story: either the pane is
+/// held `Working` by a monitored external wait (`worker-agent-deck wait
+/// start`), not real agent activity (issue #714), or it reads `Idle`/
+/// `Unknown` while the daemon still has a `delegate` armed against it with no
+/// `work-done` yet (issue #755) — both a "trust this label a little less"
+/// signal rather than two unrelated colors, the same way `Compacting` shares
+/// `Thinking`'s color above instead of getting its own.
 /// `Color::LightBlue`: measured 4.74:1 on white (clears text AA), 4.43:1
 /// on black (clears the SC 1.4.11 3:1 non-text floor, same shape
 /// STATUS_WAITING already ships with in its own mismatched case). Known,

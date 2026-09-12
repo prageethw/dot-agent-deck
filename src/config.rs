@@ -3556,6 +3556,8 @@ repo = "vfarcic/dot-ai"
                     label: None,
                     query: None,
                     triage: false,
+                    repo_allowlist: None,
+                    dry_run: false,
                 }),
             },
         ];

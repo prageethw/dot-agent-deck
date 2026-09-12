@@ -1743,6 +1743,8 @@ impl EventCollector {
                     Ok(
                         BroadcastMsg::OrchestrationSurface(_)
                         | BroadcastMsg::WorktreeKept(_)
+                        | BroadcastMsg::DelegationArmed(_)
+                        | BroadcastMsg::DelegationRetired(_)
                         | BroadcastMsg::Unknown,
                     ) => {}
                     // A lagged receiver has lost events it will never see again;
@@ -3882,6 +3884,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                             subject: None,
                         },
                         &harness.registry,
+                        Some(&harness.event_tx),
                     )
                     .await;
                 tokio::time::sleep(Duration::from_millis(900)).await;
@@ -3917,6 +3920,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                         subject: None,
                     },
                     &harness.registry,
+                    Some(&harness.event_tx),
                 )
                 .await;
             let notice = wait_for_silence_notice(
@@ -4006,6 +4010,7 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                             subject: Some(hostile_echo.to_string()),
                         },
                         &harness.registry,
+                        Some(&harness.event_tx),
                     )
                     .await;
 
@@ -4113,6 +4118,7 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                             subject: Some(oversized_echo),
                         },
                         &harness.registry,
+                        Some(&harness.event_tx),
                     )
                     .await;
 
@@ -4745,6 +4751,7 @@ fn delegate_032_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         subject: None,
                     },
                     &registry,
+                    None,
                 )
                 .await;
             state
@@ -4759,6 +4766,7 @@ fn delegate_032_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         subject: None,
                     },
                     &registry,
+                    None,
                 )
                 .await;
 
@@ -4926,6 +4934,7 @@ async fn run_two_work_done_calls(
                 subject: None,
             },
             &registry,
+            None,
         )
         .await;
     let after_first = wait_for_snapshot_needle(
@@ -4968,6 +4977,7 @@ async fn run_two_work_done_calls(
                 subject: None,
             },
             &registry,
+            None,
         )
         .await;
     let after_second = wait_for_second_occurrence(
@@ -5090,6 +5100,7 @@ fn delegate_035_third_collision_destroys_the_first_archived_report() {
                             subject: None,
                         },
                         &registry,
+                        None,
                     )
                     .await;
             }

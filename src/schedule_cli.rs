@@ -447,6 +447,8 @@ mod tests {
             label: None,
             query: None,
             triage: false,
+            repo_allowlist: None,
+            dry_run: false,
         });
         let err = add(&mut tasks, args).expect_err("shape + repo must be refused");
         assert!(

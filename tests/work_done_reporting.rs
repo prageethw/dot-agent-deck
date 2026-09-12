@@ -254,6 +254,7 @@ impl WorkDoneHarness {
                     subject: None,
                 },
                 &self.registry,
+                Some(&self.event_tx),
             )
             .await;
     }
@@ -868,6 +869,7 @@ impl DispatchReturnHarness {
                     subject: None,
                 },
                 &self.registry,
+                None,
             )
             .await;
     }

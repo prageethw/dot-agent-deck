@@ -246,6 +246,18 @@ impl AgentView {
             }
             BroadcastMsg::OrchestrationSurface(_) => self.mark(FetchReason::OrchestrationSurface),
             BroadcastMsg::WorktreeKept(_) => self.mark(FetchReason::WorktreeKept),
+            // Issue #755: applied directly to the fold, exactly like the
+            // `Event` arm above — `outstanding_delegation` lives on
+            // `SessionState`, which this fold already owns, so there is no
+            // metadata gap a fetch needs to close (see
+            // `AppState::apply_delegation_armed`/`apply_delegation_retired`'s
+            // own doc, and `src/reconnect.rs`'s identical TUI-side handling).
+            BroadcastMsg::DelegationArmed(notice) => {
+                self.fold.apply_delegation_armed(notice.clone())
+            }
+            BroadcastMsg::DelegationRetired(notice) => {
+                self.fold.apply_delegation_retired(notice.clone())
+            }
             // PRD #741 M8 (issue #801 item 3): a broadcast kind this build does
             // not know. It marks a fetch for the same reason the two above do —
             // this view is a FOLD, and a message it could not read is a hole in
@@ -347,6 +359,7 @@ impl AgentView {
                 record.agent_type.clone(),
                 Some(record.id.clone()),
                 record.live.as_ref(),
+                record.outstanding_delegation.clone(),
             );
         }
         self.fold = fold;
