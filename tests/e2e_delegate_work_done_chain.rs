@@ -146,7 +146,7 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
 
     // Register the orchestration maps `handle_delegate`/`handle_work_done`
     // read, exactly as StartAgent would for a live orchestration tab.
-    {
+    let daemon_boot_id = {
         let mut st = daemon.state.write().await;
         st.pane_role_map
             .insert(ORCH_PANE.to_string(), "orchestrator".to_string());
@@ -164,7 +164,13 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
         st.pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
         common::insert_pane_registration_generation(&mut st, WORKER_PANE);
-    }
+        // Issue #567: `handle_delegate_with_state` now guards on the SENDING
+        // pane's (ORCH_PANE) generation the same way `handle_work_done`
+        // already guards on the worker's — reserve one here too, or the
+        // delegate below is refused as "no registration on file".
+        common::insert_pane_registration_generation(&mut st, ORCH_PANE);
+        st.daemon_boot_id().to_string()
+    };
 
     // Let the interactive agent reach input-readiness before delegating.
     common::wait_until_agent_output_settled(
@@ -182,6 +188,8 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
             .to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id,
         subject: None,
     };
     daemon
@@ -403,7 +411,7 @@ async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inne
         })
         .expect("spawn worker stub");
 
-    {
+    let daemon_boot_id = {
         let mut st = daemon.state.write().await;
         st.pane_role_map
             .insert(ORCH_PANE.to_string(), "orchestrator".to_string());
@@ -425,13 +433,20 @@ async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inne
         // here), but registering it anyway keeps this fixture shaped like a
         // real registration — see `AppState::register_orchestration_role`.
         common::insert_pane_registration_generation(&mut st, WORKER_PANE);
-    }
+        // Issue #567: `handle_delegate_with_state` now guards on the
+        // SENDING pane's (ORCH_PANE) generation too — reserve one, or the
+        // delegate below is refused as "no registration on file".
+        common::insert_pane_registration_generation(&mut st, ORCH_PANE);
+        st.daemon_boot_id().to_string()
+    };
 
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id,
         subject: None,
     };
     daemon

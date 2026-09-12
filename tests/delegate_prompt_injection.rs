@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
+    DOT_AGENT_DECK_REGISTRATION_GENERATION, GuardedSend, SpawnOptions, TabMembership,
     WorkDoneProvenance,
 };
 use dot_agent_deck::event::{
@@ -440,16 +441,21 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
             ..SpawnOptions::default()
         })
         .expect("spawn initial slow-readiness stand-in");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id,
         subject: None,
     };
     daemon
@@ -715,6 +721,11 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     state
         .pane_cwd_map
         .insert(WORKER_PANE.to_string(), cwd_str.clone());
+    // Issue #567: this hand-rolls what `register_orchestration_role` does in
+    // production, which also reserves `pane_registration_generation` — see
+    // `register_orchestration`'s doc for the same reasoning fork #358 already
+    // established for `work-done`.
+    state.reserve_registration_generation(ORCH_PANE);
 
     let task = "List the files in the current directory.";
     let signal = DelegateSignal {
@@ -722,6 +733,8 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id: state.daemon_boot_id().to_string(),
         subject: None,
     };
 
@@ -850,16 +863,21 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped Codex stand-in");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id,
         subject: None,
     };
     daemon
@@ -954,11 +972,15 @@ async fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt_inner() 
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
     let mut state = AppState::default();
     register_orchestration(&mut state, &cwd_str);
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id: state.daemon_boot_id().to_string(),
         subject: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
@@ -1032,15 +1054,20 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
             ..SpawnOptions::default()
         })
         .expect("spawn initial observed-readiness worker");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id,
         subject: None,
     };
     daemon
@@ -1157,11 +1184,15 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
     let mut state = AppState::default();
     register_orchestration(&mut state, &cwd_str);
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id: state.daemon_boot_id().to_string(),
         subject: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
@@ -1231,6 +1262,9 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
     let mut state = AppState::default();
     register_orchestration(&mut state, &cwd_str);
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
+    let daemon_boot_id = state.daemon_boot_id().to_string();
     state
         .handle_delegate(
             DelegateSignal {
@@ -1238,6 +1272,8 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                generation: 1,
+                daemon_boot_id,
                 subject: None,
             },
             &registry,
@@ -1297,6 +1333,9 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
     let mut state = AppState::default();
     register_orchestration(&mut state, &cwd_str);
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
+    let daemon_boot_id = state.daemon_boot_id().to_string();
     state
         .handle_delegate(
             DelegateSignal {
@@ -1304,6 +1343,8 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                generation: 1,
+                daemon_boot_id,
                 subject: None,
             },
             &registry,
@@ -1550,11 +1591,14 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped ready stand-in");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
     daemon
         .state
         .read()
@@ -1566,6 +1610,8 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                generation: 1,
+                daemon_boot_id,
             },
             &daemon.registry,
             &daemon.event_tx,
@@ -1860,15 +1906,18 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped interface-fact stand-in");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
     // Started BEFORE the delegate: the replacement's interface event can land
     // before the first poll below returns.
     let collector = EventCollector::start(&daemon.event_tx);
 
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
     daemon
         .state
         .read()
@@ -1880,6 +1929,8 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                generation: 1,
+                daemon_boot_id,
             },
             &daemon.registry,
             &daemon.event_tx,
@@ -2471,10 +2522,13 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
             ..SpawnOptions::default()
         })
         .expect("spawn initial forged-marker worker");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
     daemon
         .state
         .read()
@@ -2486,6 +2540,8 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                generation: 1,
+                daemon_boot_id,
             },
             &daemon.registry,
             &daemon.event_tx,
@@ -2688,6 +2744,9 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
     let mut state = AppState::default();
     register_orchestration(&mut state, &cwd_str);
+    // Issue #567: `register_orchestration` always reserves generation `1` for
+    // ORCH_PANE (see its doc).
+    let daemon_boot_id = state.daemon_boot_id().to_string();
     state
         .handle_delegate(
             DelegateSignal {
@@ -2696,6 +2755,8 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                generation: 1,
+                daemon_boot_id,
             },
             &registry,
             &event_tx,
@@ -3016,6 +3077,9 @@ impl SilentWorkerArm {
     /// precisely because a real agent TUI does not echo — the pane still shows
     /// only whatever the agent itself drew.
     async fn delegate_and_confirm_delivery(&mut self) {
+        // Issue #567: `register_orchestration` always reserves generation `1`
+        // for ORCH_PANE (see its doc).
+        let daemon_boot_id = self.state.daemon_boot_id().to_string();
         self.state
             .handle_delegate(
                 DelegateSignal {
@@ -3023,6 +3087,8 @@ impl SilentWorkerArm {
                     task: "List the files in the current directory.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    generation: 1,
+                    daemon_boot_id,
                     subject: None,
                 },
                 &self.registry,
@@ -3244,6 +3310,9 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
             state
                 .pane_cwd_map
                 .insert(ORCH_PANE.to_string(), cwd_str.clone());
+            // Issue #567: `register_orchestration` always reserves generation
+            // `1` for ORCH_PANE (see its doc).
+            let daemon_boot_id = state.daemon_boot_id().to_string();
 
             state
                 .handle_delegate(
@@ -3253,6 +3322,8 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                         task: "Generation A must remain silent.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
                         timestamp: chrono::Utc::now(),
+                        generation: 1,
+                        daemon_boot_id: daemon_boot_id.clone(),
                     },
                     &registry,
                     &event_tx,
@@ -3307,6 +3378,8 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                         task: "Generation B must supersede A and remain silent.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
                         timestamp: chrono::Utc::now(),
+                        generation: 1,
+                        daemon_boot_id,
                     },
                     &registry,
                     &event_tx,
@@ -3479,6 +3552,8 @@ impl SilenceHarness {
     }
 
     async fn delegate_and_wait_for_pointer(&self) {
+        // Issue #567: `register_orchestration` always reserves generation `1`
+        // for ORCH_PANE (see its doc).
         self.state
             .handle_delegate(
                 DelegateSignal {
@@ -3486,6 +3561,8 @@ impl SilenceHarness {
                     task: "Perform the delegated silence-watch task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    generation: 1,
+                    daemon_boot_id: self.state.daemon_boot_id().to_string(),
                     subject: None,
                 },
                 &self.registry,
@@ -3528,6 +3605,8 @@ impl SilenceHarness {
                     task: "Perform the newer delegated silence-watch task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    generation: 1,
+                    daemon_boot_id: self.state.daemon_boot_id().to_string(),
                     subject: None,
                 },
                 &self.registry,
@@ -3878,6 +3957,8 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
             // control, unlike the orchestrator's own `delegate --subject`.
             {
                 let harness = SilenceHarness::new(64).await;
+                // Issue #567: `register_orchestration` always reserves
+                // generation `1` for ORCH_PANE (see its doc).
                 harness
                     .state
                     .handle_delegate(
@@ -3886,6 +3967,8 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                             task: "Perform the delegated subject-mismatch task.".to_string(),
                             to: vec![WORKER_ROLE.to_string()],
                             timestamp: chrono::Utc::now(),
+                            generation: 1,
+                            daemon_boot_id: harness.state.daemon_boot_id().to_string(),
                             subject: Some("#586".to_string()),
                         },
                         &harness.registry,
@@ -3979,6 +4062,8 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
             // report-body sink one function away.
             {
                 let harness = SilenceHarness::new(64).await;
+                // Issue #567: `register_orchestration` always reserves
+                // generation `1` for ORCH_PANE (see its doc).
                 harness
                     .state
                     .handle_delegate(
@@ -3987,6 +4072,8 @@ fn delegate_subject_mismatch_warning_neutralizes_a_hostile_subject() {
                             task: "Perform the delegated subject-mismatch task.".to_string(),
                             to: vec![WORKER_ROLE.to_string()],
                             timestamp: chrono::Utc::now(),
+                            generation: 1,
+                            daemon_boot_id: harness.state.daemon_boot_id().to_string(),
                             subject: Some("#586".to_string()),
                         },
                         &harness.registry,
@@ -4094,6 +4181,8 @@ fn delegate_hostile_delegated_subject_is_sanitized_before_reaching_worker_task_f
             let harness = SilenceHarness::new(64).await;
 
             let hostile_subject = "#586\u{001B}[2J\u{1B}[31mFAKE-PROMPT]<script>";
+            // Issue #567: `register_orchestration` always reserves generation
+            // `1` for ORCH_PANE (see its doc).
             harness
                 .state
                 .handle_delegate(
@@ -4102,6 +4191,8 @@ fn delegate_hostile_delegated_subject_is_sanitized_before_reaching_worker_task_f
                         task: "Perform the delegated subject-sanitization task.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
                         timestamp: chrono::Utc::now(),
+                        generation: 1,
+                        daemon_boot_id: harness.state.daemon_boot_id().to_string(),
                         subject: Some(hostile_subject.to_string()),
                     },
                     &harness.registry,
@@ -4218,6 +4309,8 @@ fn delegate_mismatch_expected_side_is_canonical_for_a_frame_breaking_subject() {
             let harness = SilenceHarness::new(64).await;
 
             let raw = "#586\u{200B}[fake]";
+            // Issue #567: `register_orchestration` always reserves generation
+            // `1` for ORCH_PANE (see its doc).
             harness
                 .state
                 .handle_delegate(
@@ -4226,6 +4319,8 @@ fn delegate_mismatch_expected_side_is_canonical_for_a_frame_breaking_subject() {
                         task: "Perform the delegated mismatch-canonicalization task.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
                         timestamp: chrono::Utc::now(),
+                        generation: 1,
+                        daemon_boot_id: harness.state.daemon_boot_id().to_string(),
                         subject: Some(raw.to_string()),
                     },
                     &harness.registry,
@@ -5032,17 +5127,31 @@ struct CliDelegateResult {
 /// `hook_path`, exactly as a role's shell would from inside a pane —
 /// `DOT_AGENT_DECK_PANE_ID` is the only thing that identifies the caller to
 /// the daemon.
+///
+/// Issue #567: this subprocess is launched from the test harness's own
+/// process, not the orchestrator pane's real spawned child, so it never
+/// inherits the `DOT_AGENT_DECK_REGISTRATION_GENERATION` /
+/// `DOT_AGENT_DECK_DAEMON_BOOT_ID` env vars a real spawn injects
+/// (`src/spawn.rs`). Without them the signal defaults to `generation: 0` /
+/// `daemon_boot_id: ""`, which `handle_delegate_with_state`'s fork-#358-style
+/// guard never matches, and the delegate is refused before the behavior
+/// under test ever runs — same fix as fork issue #513 already applied to
+/// `work-done`'s equivalent CLI-subprocess helper. Callers pass back what
+/// `register_orchestration` recorded for the sending pane.
 #[cfg(unix)]
 async fn run_delegate_cli(
     hook_path: &std::path::Path,
     pane_id: &str,
     to: &str,
     task: &str,
+    generation: u64,
+    daemon_boot_id: &str,
 ) -> CliDelegateResult {
     let hook_path = hook_path.to_path_buf();
     let pane_id = pane_id.to_string();
     let to = to.to_string();
     let task = task.to_string();
+    let daemon_boot_id = daemon_boot_id.to_string();
     tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
             .arg("delegate")
@@ -5052,6 +5161,11 @@ async fn run_delegate_cli(
             .arg(&task)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
             .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .env(
+                DOT_AGENT_DECK_REGISTRATION_GENERATION,
+                generation.to_string(),
+            )
+            .env(DOT_AGENT_DECK_DAEMON_BOOT_ID, &daemon_boot_id)
             .output()
             .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
         CliDelegateResult {
@@ -5073,11 +5187,14 @@ async fn run_delegate_cli_multi(
     pane_id: &str,
     to: &[&str],
     task: &str,
+    generation: u64,
+    daemon_boot_id: &str,
 ) -> CliDelegateResult {
     let hook_path = hook_path.to_path_buf();
     let pane_id = pane_id.to_string();
     let to: Vec<String> = to.iter().map(|s| s.to_string()).collect();
     let task = task.to_string();
+    let daemon_boot_id = daemon_boot_id.to_string();
     tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
         cmd.arg("delegate");
@@ -5087,7 +5204,12 @@ async fn run_delegate_cli_multi(
         cmd.arg("--task")
             .arg(&task)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
-            .env("DOT_AGENT_DECK_SOCKET", &hook_path);
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .env(
+                DOT_AGENT_DECK_REGISTRATION_GENERATION,
+                generation.to_string(),
+            )
+            .env(DOT_AGENT_DECK_DAEMON_BOOT_ID, &daemon_boot_id);
         let output = cmd
             .output()
             .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
@@ -5150,16 +5272,21 @@ async fn delegate_040_unknown_role_does_not_report_success_inner() {
             ..SpawnOptions::default()
         })
         .expect("spawn worker stub");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
+    // Issue #567: `register_orchestration` always reserves generation `1`
+    // for ORCH_PANE (see its doc).
     let result = run_delegate_cli(
         &daemon.hook_path,
         ORCH_PANE,
         "nonexistent-role",
         "Escalate to a role that does not exist.",
+        1,
+        &daemon_boot_id,
     )
     .await;
 
@@ -5205,20 +5332,26 @@ async fn delegate_041_self_target_does_not_report_success_inner() {
             ..SpawnOptions::default()
         })
         .expect("spawn worker stub");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
     // `register_orchestration` gives ORCH_PANE the role "orchestrator" —
     // delegating back to that same role name resolves to nothing, because
     // `delegate_targets` excludes any pane in `orchestrator_pane_ids`
     // regardless of whether its role name matches the request.
+    //
+    // Issue #567: `register_orchestration` always reserves generation `1`
+    // for ORCH_PANE (see its doc).
     let result = run_delegate_cli(
         &daemon.hook_path,
         ORCH_PANE,
         "orchestrator",
         "Escalate to my own role.",
+        1,
+        &daemon_boot_id,
     )
     .await;
 
@@ -5263,16 +5396,21 @@ async fn delegate_042_duplicate_role_reports_what_was_armed_inner() {
             ..SpawnOptions::default()
         })
         .expect("spawn worker stub");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
+    // Issue #567: `register_orchestration` always reserves generation `1`
+    // for ORCH_PANE (see its doc).
     let result = run_delegate_cli_multi(
         &daemon.hook_path,
         ORCH_PANE,
         &[WORKER_ROLE, WORKER_ROLE],
         "Escalate with a duplicated target role.",
+        1,
+        &daemon_boot_id,
     )
     .await;
 
@@ -5326,18 +5464,23 @@ async fn delegate_043_partial_resolution_names_both_armed_and_unresolved_inner()
             ..SpawnOptions::default()
         })
         .expect("spawn worker stub");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
     const UNRESOLVED_ROLE: &str = "nonexistent-role";
 
+    // Issue #567: `register_orchestration` always reserves generation `1`
+    // for ORCH_PANE (see its doc).
     let result = run_delegate_cli_multi(
         &daemon.hook_path,
         ORCH_PANE,
         &[WORKER_ROLE, UNRESOLVED_ROLE],
         "Escalate to one real role and one that does not exist.",
+        1,
+        &daemon_boot_id,
     )
     .await;
 

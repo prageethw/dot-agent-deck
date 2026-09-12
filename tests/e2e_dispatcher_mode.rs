@@ -357,12 +357,29 @@ fn run_delegate(deck: &TuiDeck, pane_id: &str, role: &str, task: &str) -> std::p
 /// [`run_delegate`] with the repeatable `--to` in its general form, for the
 /// fan-out cases — in particular the partially-resolvable one, where some roles
 /// have a worker pane and some do not.
+///
+/// Issue #567: this subprocess is launched from the test harness's own
+/// process, not `pane_id`'s real spawned child, so it never inherits the
+/// `DOT_AGENT_DECK_REGISTRATION_GENERATION` / `DOT_AGENT_DECK_DAEMON_BOOT_ID`
+/// env vars a real spawn injects — same fork-#358-style gap this repo's
+/// `work-done` CLI-subprocess helpers already close for the worker side.
+/// Query the daemon's own `ListAgents` for the values it assigned `pane_id`.
 fn run_delegate_to(
     deck: &TuiDeck,
     pane_id: &str,
     roles: &[&str],
     task: &str,
 ) -> std::process::Output {
+    let caller_record = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+        .expect("the caller pane must still be present in ListAgents");
+    let caller_generation = caller_record
+        .registration_generation
+        .expect("the caller pane must carry a registration_generation once registered");
+    let caller_boot_id = caller_record
+        .daemon_boot_id
+        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
     cmd.arg("delegate");
     for role in roles {
@@ -371,6 +388,11 @@ fn run_delegate_to(
     cmd.args(["--task", task])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", pane_id)
+        .env(
+            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
+            caller_generation.to_string(),
+        )
+        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", caller_boot_id)
         .output()
         .expect("the delegate CLI should run")
 }

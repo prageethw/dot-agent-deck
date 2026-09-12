@@ -340,11 +340,30 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
     deck.wait_for_string("worker");
 
     let (orchestrator_pane, _worker_pane) = orchestration_panes(&deck);
+    // Issue #567 (mirrors fork issue #513's `work-done` precedent exactly —
+    // see `tests/e2e_work_done_reporting.rs`): this signal is hand-built and
+    // injected directly over the hook socket, not sent through the real
+    // `dot-agent-deck delegate` CLI, so it never inherits the
+    // `DOT_AGENT_DECK_REGISTRATION_GENERATION` / `DOT_AGENT_DECK_DAEMON_BOOT_ID`
+    // env vars a real spawn injects. Query the daemon's own `ListAgents` for
+    // the values it just assigned this pane.
+    let orchestrator_record = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(orchestrator_pane.as_str()))
+        .expect("the orchestrator pane must still be present in ListAgents");
+    let generation = orchestrator_record
+        .registration_generation
+        .expect("the orchestrator pane must carry a registration_generation once registered");
+    let daemon_boot_id = orchestrator_record
+        .daemon_boot_id
+        .expect("ListAgents must report a daemon_boot_id");
     let message = DaemonMessage::Delegate(DelegateSignal {
         pane_id: orchestrator_pane,
         task: "Remain silent so the idle detector can surface its prompt.".to_string(),
         to: vec!["worker".to_string()],
         timestamp: chrono::Utc::now(),
+        generation,
+        daemon_boot_id,
         subject: None,
     });
     let line = serde_json::to_string(&message).expect("serialize Delegate hook message");

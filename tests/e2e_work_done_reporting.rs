@@ -369,6 +369,14 @@ const SUBJECT_MISMATCH_NEEDLE: &str = "SUBJECT MISMATCH";
 /// technique `e2e_dispatcher_mode.rs`'s `run_delegate_to` already uses,
 /// reimplemented locally because integration tests cannot import one
 /// another's helpers across a compiled-test-binary boundary.
+///
+/// Issue #567: this subprocess is launched from the test harness's own
+/// process, not `caller_pane`'s real spawned child, so it never inherits the
+/// `DOT_AGENT_DECK_REGISTRATION_GENERATION` / `DOT_AGENT_DECK_DAEMON_BOOT_ID`
+/// env vars a real spawn injects — same fork-#358-style gap
+/// `run_work_done_cli_with_subject` below already closes for the worker side.
+/// Query the daemon's own `ListAgents` for the values it assigned
+/// `caller_pane`, the same technique `worker_fail_closed_identity` uses.
 fn run_delegate_cli_with_subject(
     deck: &TuiDeck,
     caller_pane: &str,
@@ -376,6 +384,16 @@ fn run_delegate_cli_with_subject(
     task: &str,
     subject: &str,
 ) -> std::process::Output {
+    let caller_record = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(caller_pane))
+        .expect("the caller pane must still be present in ListAgents");
+    let caller_generation = caller_record
+        .registration_generation
+        .expect("the caller pane must carry a registration_generation once registered");
+    let caller_boot_id = caller_record
+        .daemon_boot_id
+        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
     std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .arg("delegate")
         .arg("--to")
@@ -386,6 +404,11 @@ fn run_delegate_cli_with_subject(
         .arg(subject)
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", caller_pane)
+        .env(
+            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
+            caller_generation.to_string(),
+        )
+        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", caller_boot_id)
         .output()
         .expect("run the real `dot-agent-deck delegate` CLI")
 }

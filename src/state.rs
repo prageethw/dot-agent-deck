@@ -7753,6 +7753,46 @@ impl AppState {
             };
         }
 
+        // Issue #567 (mirrors fork #358 M4's `handle_work_done` guard exactly —
+        // see `DelegateSignal::generation`/`daemon_boot_id` for the full
+        // reasoning): refuse a `delegate` whose sending pane was re-registered
+        // (worktree teardown + reuse) or whose daemon has restarted since this
+        // signal was produced, BEFORE any routing/dispatch below runs — a
+        // stale `Delegate` from a pane the daemon has since moved on from must
+        // never fan out into whatever now occupies that pane_id. Read directly
+        // from `pane_registration_generation` (not derived from `pane_role_map`
+        // alone) for the same reason `handle_work_done` does: it is the
+        // compound `(generation, daemon_boot_id)` key that distinguishes a
+        // stale signal from a live one, not mere presence in the role map.
+        let current_generation = self
+            .pane_registration_generation
+            .get(&signal.pane_id)
+            .copied();
+        let current_boot_id = self.daemon_boot_id();
+        if current_generation != Some(signal.generation) || current_boot_id != signal.daemon_boot_id
+        {
+            warn!(
+                pane_id = %signal.pane_id,
+                role = ?self.pane_role_map.get(&signal.pane_id),
+                signal_generation = signal.generation,
+                current_generation = ?current_generation,
+                signal_boot_id = %signal.daemon_boot_id,
+                current_boot_id = %current_boot_id,
+                "delegate: refusing stale signal — pane was re-registered or the \
+                 daemon restarted since this signal was produced (generation/boot id \
+                 mismatch)"
+            );
+            return DelegateResponse {
+                error: Some(format!(
+                    "pane {} was re-registered or the daemon restarted since this delegate \
+                     signal was produced (registration generation/boot id mismatch); refusing \
+                     rather than risk routing a stale delegate into a reused pane/worktree.",
+                    signal.pane_id
+                )),
+                ..Default::default()
+            };
+        }
+
         let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
         // PRD #126 + #140: the cwd of the `.dot-agent-deck.toml` that DEFINES this
         // orchestration, for resolving `worker_response_timeout_minutes`. Read
@@ -12694,6 +12734,15 @@ clear = false
         state
             .pane_orchestration_map
             .insert(pane_id.to_string(), identity);
+        // Issue #567: a real registration always reserves a
+        // `pane_registration_generation` entry (`register_orchestration_role`
+        // does this for every pane, orchestrator included) — this hand-rolled
+        // fixture must too, now that `handle_delegate_with_state` enforces the
+        // same generation/boot-id compound key `handle_work_done` already did
+        // (fork #358), or every test built on this helper would have its
+        // delegate refused as "no registration on file" regardless of what it
+        // actually means to exercise.
+        state.reserve_registration_generation(pane_id);
     }
 
     fn instance(id: &str) -> OrchestrationIdentity {
@@ -12843,6 +12892,16 @@ clear = false
     ) -> crate::event::DelegateResponse {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
+        // Issue #567: echo back whatever registration this pane currently
+        // holds on file (absent for an unregistered pane, exactly like an
+        // old CLI's default) so tests that are NOT about the generation guard
+        // itself don't spuriously trip it.
+        let generation = state
+            .pane_registration_generation
+            .get(pane_id)
+            .copied()
+            .unwrap_or(0);
+        let daemon_boot_id = state.daemon_boot_id().to_string();
         state
             .handle_delegate(
                 DelegateSignal {
@@ -12850,6 +12909,8 @@ clear = false
                     task: "probe".to_string(),
                     to: to.iter().map(|s| s.to_string()).collect(),
                     timestamp: Utc::now(),
+                    generation,
+                    daemon_boot_id,
                     subject: None,
                 },
                 &registry,
@@ -12940,6 +13001,254 @@ clear = false
             resp.unresolved_roles,
             vec!["tester".to_string()],
             "the tester resolved to no pane and must be named as unresolved"
+        );
+    }
+
+    /// Issue #567 (mirrors `handle_work_done_refuses_a_stale_cross_orchestration_
+    /// signal_after_pane_reuse` exactly, for the `delegate` verb instead of
+    /// `work-done`): a pane_id reused across a teardown+re-registration must
+    /// refuse a `Delegate` signal produced under the PRIOR registration, even
+    /// though `refuse_unless_orchestrator_caller` alone would happily accept
+    /// it — that check only asks "is this pane currently an orchestrator",
+    /// which is true for both A's and B's occupant of "P". This test is RED
+    /// against pre-fix `handle_delegate_with_state`: with no
+    /// generation/boot-id field on `DelegateSignal` at all, there is nothing
+    /// to compare, and the stale signal is routed into whatever orchestration
+    /// now owns "P".
+    #[tokio::test]
+    async fn handle_delegate_refuses_a_stale_signal_after_pane_reuse() {
+        let identity_a = instance("orch-a-567");
+        let identity_b = instance("orch-b-567");
+
+        let mut state = AppState::default();
+        state.register_orchestration_role("P", "orchestrator", true, identity_a, None);
+        let generation_a = *state
+            .pane_registration_generation
+            .get("P")
+            .expect("registering a pane must record its generation");
+
+        // The teardown-and-reuse: same pane_id "P", different orchestration.
+        state.register_orchestration_role("P", "orchestrator", true, identity_b, None);
+        assert_ne!(
+            *state
+                .pane_registration_generation
+                .get("P")
+                .expect("re-registering must still record a generation"),
+            generation_a,
+            "sanity: re-registering pane P must advance its generation past A's"
+        );
+
+        // A's delegate signal, produced back when "P" belonged to A — it
+        // carries A's now-stale generation. Same `AppState` throughout, so
+        // `daemon_boot_id` never changes here — this test is specifically
+        // about the intra-process pane-reuse case the generation mismatch
+        // alone already catches.
+        let stale_signal = DelegateSignal {
+            pane_id: "P".to_string(),
+            task: "A's delegate — must never reach B's orchestration".to_string(),
+            to: vec!["coder".to_string()],
+            timestamp: Utc::now(),
+            generation: generation_a,
+            daemon_boot_id: state.daemon_boot_id().to_string(),
+            subject: None,
+        };
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let resp = state
+            .handle_delegate(stale_signal, &registry, &event_tx)
+            .await;
+
+        let error = resp.error.as_deref().expect(
+            "A's stale delegate signal (generation mismatch after pane reuse) must be \
+             refused rather than routed into B's orchestration: today's \
+             `handle_delegate_with_state` has no generation check and would have \
+             delivered it there",
+        );
+        assert!(
+            error.contains('P'),
+            "the refusal must name the pane it refused: {error}"
+        );
+        assert!(
+            resp.delivered.is_empty(),
+            "nothing can have been delivered for a refused signal"
+        );
+    }
+
+    /// Issue #567 (mirrors `handle_work_done_delivers_when_signal_carries_the_
+    /// reserved_generation` exactly): reserve a registration generation for
+    /// orchestrator pane "P", confirm the registration with that SAME
+    /// reserved value (read back, never retyped), register a `coder` worker
+    /// pane in the same orchestration, build a `DelegateSignal` carrying that
+    /// same reserved generation and the state's own `daemon_boot_id`, and
+    /// assert the delegate is delivered — proving the
+    /// reserve→confirm→signal→`handle_delegate_with_state` chain is genuinely
+    /// wired end to end, not merely that two hand-copied literals happen to
+    /// match.
+    #[tokio::test]
+    async fn handle_delegate_delivers_when_signal_carries_the_reserved_generation() {
+        let identity = instance("orch-chain-567");
+
+        let mut state = AppState::default();
+        let reserved = state.reserve_registration_generation("P");
+        state.confirm_orchestration_role(
+            "P",
+            "orchestrator",
+            true,
+            identity.clone(),
+            None,
+            reserved,
+        );
+        state.register_orchestration_role("P_coder", "coder", false, identity, None);
+
+        let signal = DelegateSignal {
+            pane_id: "P".to_string(),
+            task: "delegate carrying the reserved generation".to_string(),
+            to: vec!["coder".to_string()],
+            timestamp: Utc::now(),
+            generation: reserved,
+            daemon_boot_id: state.daemon_boot_id().to_string(),
+            subject: None,
+        };
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let resp = state.handle_delegate(signal, &registry, &event_tx).await;
+
+        assert_eq!(
+            resp.error, None,
+            "a delegate signal carrying the SAME generation \
+             reserve_registration_generation returned (read back, not retyped) \
+             must not be refused: {:?}",
+            resp.error
+        );
+        assert_eq!(
+            resp.delivered,
+            vec!["coder".to_string()],
+            "the coder must be reported as delivered"
+        );
+    }
+
+    /// Issue #567 (mirrors `handle_work_done_refuses_a_stale_signal_from_
+    /// before_a_daemon_restart` exactly, construction technique included, for
+    /// the `delegate` verb instead of `work-done`): model a daemon restart as
+    /// two SEPARATE `AppState` instances — a restart is a fresh process with
+    /// fresh in-memory state, not one state reused twice. Register pane "P"
+    /// for orchestration A in `state_before` via the real reserve→confirm
+    /// path production spawn uses, capture the generation A's orchestrator
+    /// would carry, then build a brand-new `state_after` — nothing carries
+    /// over, exactly like every in-memory registration resetting on a real
+    /// daemon restart — and register the SAME pane_id "P" there for a
+    /// different orchestration B, simulating the post-restart tenant that
+    /// reused it. Deliver A's pre-restart signal to `state_after` and assert
+    /// it is refused.
+    ///
+    /// This is the `daemon_boot_id` half of the guard specifically: both
+    /// independently-started `AppState`s assign pane "P" the SAME first
+    /// generation (sanity-checked below), so `generation` ALONE cannot
+    /// distinguish a pre-restart registration from a post-restart one that
+    /// happens to reuse the pane_id — only pairing it with the daemon's own
+    /// `daemon_boot_id` (which two independent `AppState` constructions are
+    /// guaranteed to mint differently, also sanity-checked below) catches
+    /// it. `handle_delegate_refuses_a_stale_signal_after_pane_reuse` above
+    /// only ever touches ONE `AppState`, so `daemon_boot_id` never changes
+    /// across it and that test cannot tell this half of the guard apart from
+    /// a generation-only check — this test is RED against a
+    /// `handle_delegate_with_state` that compares `generation` alone.
+    #[tokio::test]
+    async fn handle_delegate_refuses_a_stale_signal_from_before_a_daemon_restart() {
+        let cwd_before = tempfile::tempdir().expect("tempdir");
+        let cwd_after = tempfile::tempdir().expect("tempdir");
+        let identity_before = instance("orch-before-restart-567");
+        let identity_after = instance("orch-after-restart-567");
+
+        // Pre-restart daemon: register "P" the way production spawn does —
+        // reserve the generation (so it can be injected into the child's env
+        // BEFORE spawn), then confirm once "spawn" has succeeded.
+        let mut state_before = AppState::default();
+        let generation_before = state_before.reserve_registration_generation("P");
+        state_before.confirm_orchestration_role(
+            "P",
+            "orchestrator",
+            true,
+            identity_before,
+            Some(cwd_before.path().to_str().expect("utf8 cwd")),
+            generation_before,
+        );
+
+        // The signal a real orchestrator spawned under state_before would
+        // have sent — stamped with the generation it was actually spawned
+        // under and ITS daemon's boot id, both read back rather than
+        // hand-typed.
+        let stale_signal = DelegateSignal {
+            pane_id: "P".to_string(),
+            task: "pre-restart delegate — must never reach the post-restart \
+                   tenant's orchestration"
+                .to_string(),
+            to: vec!["coder".to_string()],
+            timestamp: Utc::now(),
+            generation: generation_before,
+            daemon_boot_id: state_before.daemon_boot_id().to_string(),
+            subject: None,
+        };
+
+        // Post-restart daemon: a FRESH AppState — nothing carries over,
+        // exactly like a real process restart. Pane "P" is reused (small
+        // daemon-scoped integers recycle, #358's motivating scenario) for a
+        // different orchestration.
+        let mut state_after = AppState::default();
+        let generation_after = state_after.reserve_registration_generation("P");
+        state_after.confirm_orchestration_role(
+            "P",
+            "orchestrator",
+            true,
+            identity_after,
+            Some(cwd_after.path().to_str().expect("utf8 cwd")),
+            generation_after,
+        );
+
+        // Sanity: two independent AppState instances (simulating a daemon
+        // restart) must both start pane P's generation at the same value —
+        // closing that collision with `generation` alone is impossible, which
+        // is exactly why `daemon_boot_id` has to do the work in this test.
+        assert_eq!(
+            generation_before, generation_after,
+            "sanity: two independent AppState instances (simulating a daemon \
+             restart) must both start pane P's generation at the same value"
+        );
+        // Sanity: the actual mechanism under test. Two independently
+        // constructed `AppState`s must mint DIFFERENT `daemon_boot_id`s — the
+        // compound key is only a real fix if this holds; if it didn't, the
+        // refusal below would be unreachable by construction.
+        assert_ne!(
+            state_before.daemon_boot_id(),
+            state_after.daemon_boot_id(),
+            "sanity: two independent AppState instances (simulating a daemon \
+             restart) must mint DIFFERENT daemon_boot_id values — this is what \
+             lets the compound key catch a collision the generation alone \
+             cannot"
+        );
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let resp = state_after
+            .handle_delegate(stale_signal, &registry, &event_tx)
+            .await;
+
+        let error = resp.error.as_deref().expect(
+            "a delegate signal produced before a daemon restart (matching generation, \
+             mismatched daemon_boot_id) must be refused by the post-restart daemon rather \
+             than routed into the post-restart tenant's orchestration: an in-memory \
+             generation counter alone cannot distinguish a pre-restart registration from a \
+             post-restart one that happens to reuse the same pane_id (mirrors fork #358 M4)",
+        );
+        assert!(
+            error.contains('P'),
+            "the refusal must name the pane it refused: {error}"
+        );
+        assert!(
+            resp.delivered.is_empty(),
+            "nothing can have been delivered for a refused signal"
         );
     }
 

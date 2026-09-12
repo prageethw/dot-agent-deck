@@ -106,12 +106,31 @@ impl SyntheticAgent {
 
     /// Build the [`DelegateSignal`] this agent (as an orchestrator) would send
     /// via `dot-agent-deck delegate --to <role> --task <text>`.
-    pub fn delegate(&self, task: impl Into<String>, to: &[&str]) -> DelegateSignal {
+    ///
+    /// Issue #567: `handle_delegate_with_state` now refuses on a
+    /// generation/boot-id mismatch (mirroring fork #358's `work-done` guard),
+    /// so this reads both back from `state` — `pane_registration_generation`
+    /// for this agent's own pane (set by [`Self::register_role`], which now
+    /// reserves one) and `state.daemon_boot_id()`, which is never
+    /// hand-rollable (minted fresh per `AppState` instance).
+    pub fn delegate(
+        &self,
+        state: &AppState,
+        task: impl Into<String>,
+        to: &[&str],
+    ) -> DelegateSignal {
+        let generation = state
+            .pane_registration_generation
+            .get(&self.pane_id)
+            .copied()
+            .unwrap_or(0);
         DelegateSignal {
             pane_id: self.pane_id.clone(),
             task: task.into(),
             to: to.iter().map(|r| r.to_string()).collect(),
             timestamp: chrono::Utc::now(),
+            generation,
+            daemon_boot_id: state.daemon_boot_id().to_string(),
             subject: None,
         }
     }
@@ -173,5 +192,11 @@ impl SyntheticAgent {
         state
             .pane_cwd_map
             .insert(self.pane_id.clone(), cwd.to_string());
+        // Issue #567: a real registration always reserves a
+        // `pane_registration_generation` entry — this hand-rolled fixture
+        // must too, now that `handle_delegate_with_state` enforces the same
+        // generation/boot-id compound key `handle_work_done` already did
+        // (fork #358). See [`Self::delegate`] for the read-back side.
+        state.reserve_registration_generation(&self.pane_id);
     }
 }
