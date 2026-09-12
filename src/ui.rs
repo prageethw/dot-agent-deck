@@ -1309,12 +1309,24 @@ fn live_orchestration_occupies(form_cwd: &Path, live_cwd: &str, live_name: &str)
     }
     let segment = sanitize_workspace_segment(live_name);
     let live_cwd_path = Path::new(live_cwd);
+    // Fork issue #607: the real formula (`resolve_orchestration_workspace`)
+    // now folds the relative subpath into the segment before deriving
+    // `worktree_path` (`disambiguate_workspace_segment`) — mirror that here
+    // too, or this scan would keep matching a live occupant's OLD,
+    // undisambiguated path shape and never recognize the real (now
+    // subpath-qualified) one, silently reopening this exact drift class for
+    // the nested case (reviewer B1's original concern for this function).
     let scan = |scan_cwd: &Path| {
         scan_cwd.ancestors().any(|ancestor| {
-            let candidate = resolve_workspace_path(ancestor, &segment);
-            let candidate = match scan_cwd.strip_prefix(ancestor) {
-                Ok(rel) if !rel.as_os_str().is_empty() => candidate.join(rel),
-                _ => candidate,
+            let rel = match scan_cwd.strip_prefix(ancestor) {
+                Ok(rel) if !rel.as_os_str().is_empty() => Some(rel),
+                _ => None,
+            };
+            let candidate =
+                resolve_workspace_path(ancestor, &disambiguate_workspace_segment(&segment, rel));
+            let candidate = match rel {
+                Some(rel) => candidate.join(rel),
+                None => candidate,
             };
             candidate == live_cwd_path
         })
@@ -10179,6 +10191,27 @@ fn resolve_workspace_path(dir: &Path, segment: &str) -> PathBuf {
     dir.with_file_name(format!("{dir_name}-{segment}"))
 }
 
+/// Fork issue #607 (accepted residual of PRD fork#603, auditor finding A1):
+/// `resolve_workspace_path`'s physical-clone naming input, folding in the
+/// picked directory's own `relative_subpath` under the resolved toplevel
+/// (when nested) so two different nested picks that happen to suggest the
+/// identical `segment` — e.g. `<repo>/team-a/proj` and `<repo>/team-b/proj`,
+/// both suggesting `proj-orchestrator-1` — still derive distinct physical
+/// clone directories instead of silently collapsing onto one shared clone.
+/// A no-op (returns `segment` unchanged) whenever there is no relative
+/// subpath — picking directly at a toplevel, or a non-git directory — which
+/// is deliberate: the ordinary, non-colliding common case must keep
+/// deriving exactly the same path it did before this fix.
+fn disambiguate_workspace_segment(segment: &str, relative_subpath: Option<&Path>) -> String {
+    match relative_subpath.filter(|rel| !rel.as_os_str().is_empty()) {
+        Some(rel) => format!(
+            "{segment}-{}",
+            sanitize_workspace_segment(&rel.to_string_lossy())
+        ),
+        None => segment.to_string(),
+    }
+}
+
 /// PRD fork#603 fix round (reviewer B1/H1, auditor A1/A3): the pieces
 /// [`resolve_orchestration_workspace`] derives for a pick — the actual git
 /// toplevel (or the picked directory itself, when it isn't nested inside
@@ -10231,7 +10264,12 @@ fn resolve_orchestration_workspace(
         .as_ref()
         .map(|(_, prefix)| prefix.clone())
         .filter(|prefix| !prefix.as_os_str().is_empty());
-    let mut worktree_path = resolve_workspace_path(resolved_root_dir, segment);
+    // Fork issue #607: fold `relative_subpath` into the segment used to
+    // derive the physical clone name — see `disambiguate_workspace_segment`.
+    let mut worktree_path = resolve_workspace_path(
+        resolved_root_dir,
+        &disambiguate_workspace_segment(segment, relative_subpath.as_deref()),
+    );
     // Fork issue #595 fix round 3 (auditor R1) / round 4 (reviewer N7 /
     // auditor S1): a picked directory reached via a symlinked ancestor (or
     // an in-repo symlink pointing back at the repo's own root) can
@@ -10254,7 +10292,10 @@ fn resolve_orchestration_workspace(
         };
         if canonical_worktree_path.starts_with(&canonical_toplevel) {
             resolved_root_dir = toplevel.as_path();
-            worktree_path = resolve_workspace_path(resolved_root_dir, segment);
+            worktree_path = resolve_workspace_path(
+                resolved_root_dir,
+                &disambiguate_workspace_segment(segment, relative_subpath.as_deref()),
+            );
         }
     }
     OrchestrationWorkspaceResolution {
@@ -12243,8 +12284,19 @@ fn dispatch_action(
                         .resolved_root_dir
                         .canonicalize()
                         .unwrap_or_else(|_| workspace_resolution.resolved_root_dir.clone());
-                    let mut orchestration_claim_cwd_path =
-                        resolve_workspace_path(&canonical_root, &segment);
+                    // Fork issue #607: fold the relative subpath into the
+                    // segment here too, identically to
+                    // `resolve_orchestration_workspace` itself, so this
+                    // pre-provisioning claim `cwd` names the SAME physical
+                    // clone directory provisioning will actually create
+                    // below rather than a stale, undisambiguated guess.
+                    let mut orchestration_claim_cwd_path = resolve_workspace_path(
+                        &canonical_root,
+                        &disambiguate_workspace_segment(
+                            &segment,
+                            workspace_resolution.relative_subpath.as_deref(),
+                        ),
+                    );
                     if let Some(rel) = &workspace_resolution.relative_subpath {
                         orchestration_claim_cwd_path = orchestration_claim_cwd_path.join(rel);
                     }
@@ -43488,7 +43540,14 @@ mod tests {
             .resolved_root_dir
             .canonicalize()
             .expect("resolved_root_dir already exists on disk (it's the git toplevel)");
-        let mut expected_cwd = resolve_workspace_path(&canonical_root, &segment);
+        // Fork issue #607: the real call site now folds `relative_subpath`
+        // into the segment before deriving the sibling path -- mirror that
+        // here too, or this "read back the real formula" test would itself
+        // regress to asserting the pre-fix, undisambiguated shape.
+        let mut expected_cwd = resolve_workspace_path(
+            &canonical_root,
+            &disambiguate_workspace_segment(&segment, resolution.relative_subpath.as_deref()),
+        );
         if let Some(rel) = &resolution.relative_subpath {
             expected_cwd = expected_cwd.join(rel);
         }
