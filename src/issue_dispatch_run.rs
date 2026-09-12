@@ -70,11 +70,10 @@ use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
     CLAIM_COMMENT_PREFIX, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
     IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, TRIAGE_LABELS, TYPE_LABELS,
-    claim_comment_body, derive_issue_paths, dispatch_decision, gh_current_login_argv,
-    issue_comment_argv, issue_edit_add_label_argv, issue_edit_assignee_argv, issue_list_argv,
-    issue_view_comments_argv, label_create_argv, parse_current_assignees,
-    parsed_claim_from_comment_json, pr_list_for_issue_argv, substitute_issue_number,
-    triage_instruction, validate_gh_login,
+    build_dispatch_prompt, claim_comment_body, derive_issue_paths, dispatch_decision,
+    gh_current_login_argv, issue_comment_argv, issue_edit_add_label_argv, issue_edit_assignee_argv,
+    issue_list_argv, issue_view_comments_argv, label_create_argv, parse_current_assignees,
+    parsed_claim_from_comment_json, pr_list_for_issue_argv, validate_gh_login,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnKind, SpawnRequest, spawn};
@@ -890,11 +889,12 @@ async fn dispatch_one_issue(
     // substituted prompt so the dispatched agent applies its own labels. Only
     // the issues actually dispatched here ever see it; a skipped issue never
     // reaches this point.
-    let mut prompt = substitute_issue_number(prompt_template, issue);
-    if cfg.triage {
-        prompt.push_str("\n\n");
-        prompt.push_str(&triage_instruction());
-    }
+    // Issue #172 — `build_dispatch_prompt` also fires an audit record (issue,
+    // repo, timestamp, the instruction template itself — never the issue's
+    // own untrusted body/comments) every time it appends the triage
+    // instruction, so every dispatch that grants it leaves a durable trace
+    // behind regardless of what the agent then does with it.
+    let prompt = build_dispatch_prompt(prompt_template, issue, &cfg.repo, cfg.triage);
     let req = SpawnRequest {
         task_name: task_name.to_string(),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
