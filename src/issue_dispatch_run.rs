@@ -4020,10 +4020,18 @@ pub(crate) enum ResumeRejection {
     /// (when present) names a DIFFERENT identity than the one making this
     /// call (PRD fork#544 review-findings fix round, reviewer B2):
     /// `sanitize_workspace_segment`/`resolve_workspace_path` aren't
-    /// injective, so two distinct orchestration Names (`fix/544` and
+    /// injective, so two distinct typed Worktree slugs (`fix/544` and
     /// `fix-544`, say) can sanitize to the identical derived path — the
-    /// SECOND Name's open must not silently attach to the FIRST Name's
+    /// SECOND slug's open must not silently attach to the FIRST slug's
     /// directory as though it were the same workspace.
+    ///
+    /// PRD fork#760 fix round (reviewer B2): `creator` is now derived from
+    /// the resolved `segment` (the typed slug, or the auto-generated
+    /// `orchestrator-N` when blank) — never from the typed Name — so
+    /// reopening under the IDENTICAL slug with a DIFFERENT Name resumes
+    /// correctly rather than tripping this variant; the variant still
+    /// exists for the genuine case above, where the SLUGS themselves
+    /// differ but happen to sanitize/derive to the same path.
     NameCollision,
 }
 
@@ -4037,11 +4045,12 @@ impl ResumeRejection {
         match self {
             Self::Stranger => {
                 "a directory already exists there but was not created by this deck (no \
-                 ownership evidence found) — remove it manually, or pick a different Name"
+                 ownership evidence found) — remove it manually, or pick a different Worktree \
+                 slug"
             }
             Self::AncestryMismatch => {
                 "the existing directory's history does not match this project (wrong repo, or \
-                 stale) — remove it manually, or pick a different Name"
+                 stale) — remove it manually, or pick a different Worktree slug"
             }
             Self::AncestryUnverifiable => {
                 "the existing directory's history could not be compared against this project \
@@ -4054,10 +4063,11 @@ impl ResumeRejection {
             }
             Self::Contested => "another request just resumed it first — try again",
             Self::NameCollision => {
-                "a different orchestration Name already opened the workspace at this location \
-                 (its provenance record names a different creator) — the two Names sanitize to \
-                 the same directory; pick a different Name instead of this one. It may still be \
-                 in use by the orchestration that opened it — do not remove it"
+                "a different orchestration already opened the workspace at this location under \
+                 a different Worktree slug (its provenance record names a different creator) — \
+                 the two slugs sanitize to the same directory; pick a different Worktree slug \
+                 instead of retyping the Name, which no longer changes where this resolves. It \
+                 may still be in use by the orchestration that opened it — do not remove it"
             }
         }
     }

@@ -86,18 +86,30 @@ fn isolated_clone_sibling_path_matches_production_formula_for_known_inputs() {
     // second, sanitized copy of `dir_name` to exercise: the expected value is
     // simply `"{basename}-orchestrator-1"` for every basename below,
     // sanitized or not, since `dir_name` is used exactly once, raw.
-    let cases: &[&str] = &[
+    //
+    // PRD fork#760 fix round (reviewer M6): the expected column below is
+    // HAND-TRACED, written as a literal string per case — NOT computed via
+    // `format!("{basename}-orchestrator-1")` at test-run time, which is the
+    // exact same rule `isolated_clone_sibling_path` itself applies and would
+    // make this assertion tautological (unable to fail for ANY input, since
+    // both sides always agree by construction). A literal table can still
+    // fail if a future change alters the formula on either side — sanitizing
+    // `dir_name`, changing the separator, reintroducing the pre-fork#760
+    // double-embedding, or anything else that would silently drift into a
+    // real-agent trust-dialog failure nothing else in CI can observe (this
+    // whole file's own doc comment explains why).
+    let cases: &[(&str, &str)] = &[
         // The only shape this harness's own callers actually produce today.
-        ".tmpUxkQzS",
+        (".tmpUxkQzS", ".tmpUxkQzS-orchestrator-1"),
         // Basenames that mattered under the retired double-embedding
         // formula — kept here so a future regression back toward that shape
         // would be caught by this table too.
-        " myproj",
-        "my..proj",
-        "a\\b",
+        (" myproj", " myproj-orchestrator-1"),
+        ("my..proj", "my..proj-orchestrator-1"),
+        ("a\\b", "a\\b-orchestrator-1"),
     ];
 
-    for basename in cases {
+    for (basename, expected) in cases {
         let work = std::path::Path::new("/tmp/dad-e2e-fixture-root").join(basename);
         let predicted = common::isolated_clone_sibling_path(&work, 1);
         let got = predicted
@@ -105,11 +117,11 @@ fn isolated_clone_sibling_path_matches_production_formula_for_known_inputs() {
             .expect("predicted sibling path has a file name")
             .to_str()
             .expect("predicted sibling path is UTF-8");
-        let expected = format!("{basename}-orchestrator-1");
         assert_eq!(
-            got, expected,
+            got, *expected,
             "isolated_clone_sibling_path({basename:?}, 1) diverged from production's \
-             auto-generate formula (PRD fork#760 Part A)"
+             auto-generate formula (PRD fork#760 Part A) -- expected the HAND-TRACED literal \
+             {expected:?}, not one derived from the same formula the code under test applies"
         );
     }
 }
