@@ -807,7 +807,7 @@ const CARRY_OUT_TASK_POINTER: &str = "Then carry out that task";
 #[cfg(unix)]
 fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() {
     let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
-    let (socket, pane_id, agent_id, log, _role_cwd) = open_and_confirm_initial_delivery(&deck);
+    let (socket, pane_id, agent_id, log, role_cwd) = open_and_confirm_initial_delivery(&deck);
 
     // Seed a `## Your task` section onto the context file the interactive
     // spawn path (`open_orchestration`) just wrote with none — reproducing,
@@ -815,9 +815,15 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
     // Some(task))` leaves on disk for a `dispatch --task` orchestration
     // (`src/spawn.rs`), without needing a second, separately-launched fixture
     // for the daemon dispatch path.
+    //
+    // PRD fork#544 M2b made orchestrator-role isolation unconditional: the
+    // role's `cwd` is its own isolated clone, not `deck.workdir()` (the
+    // fixture source dir) — same reason `remit_003` reads/writes its trigger
+    // markers via `role_cwd` rather than `deck.workdir()` above. This context
+    // file is written by `prepare_orchestrator_prompt` relative to that same
+    // pane cwd, so it must be located the same way.
     const TASK_SENTINEL: &str = "SENTINEL-TASK-remit007: verify PR #500 and report.";
-    let context_path = deck
-        .workdir()
+    let context_path = role_cwd
         .join(".dot-agent-deck")
         .join("orchestrator-context.md");
     let mut seeded =
