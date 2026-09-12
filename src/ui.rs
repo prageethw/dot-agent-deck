@@ -40259,30 +40259,41 @@ mod tests {
     /// Scenario: PRD fork#603 reviewer finding B1 — build a new-pane form for
     /// a NESTED pick (`/tmp/myrepo/team-a/proj`, a subdirectory of the git
     /// repo rooted at `/tmp/myrepo`) whose only live orchestration identity
-    /// carries the real nested-pick provisioning shape issue #595 produces:
-    /// `<toplevel>-<segment>/<relative-subpath>`, i.e.
-    /// `/tmp/myrepo-proj-orchestrator-1/team-a/proj` — the isolated clone
-    /// sibling of the TOPLEVEL, with the picked directory's own relative
-    /// path rejoined underneath, not `resolve_workspace_path` applied to the
-    /// picked directory directly. `live_orchestration_occupies` re-derives
-    /// only the latter (missing the toplevel/rejoin layer entirely), so it
-    /// can never match this shape — the suggestion and collision check must
-    /// still recognize the live orchestration as occupying this directory,
-    /// exactly as `identity_034` pins for the non-nested case.
+    /// carries the real nested-pick provisioning shape issue #595 produces,
+    /// now also folding in fork issue #607's relative-subpath disambiguation:
+    /// `<toplevel>-<segment>-<disambiguated relative subpath>/<relative
+    /// subpath>` — the isolated clone sibling of the TOPLEVEL, named with
+    /// the picked directory's own relative subpath baked into the segment
+    /// (so a different nested pick sharing the same segment would derive a
+    /// DIFFERENT sibling), with that same relative path rejoined underneath.
+    /// Built via the real `resolve_workspace_path`/`disambiguate_workspace_segment`
+    /// helpers rather than a hand-transcribed literal, so this fixture can't
+    /// quietly drift from what the production formula actually computes.
+    /// `live_orchestration_occupies` must still recognize this shape as
+    /// occupying the picked directory — exactly as `identity_034` pins for
+    /// the non-nested case.
     #[spec("orchestration/identity/035")]
     #[test]
     fn identity_035_production_shaped_sibling_live_cwd_is_recognized_nested() {
+        let toplevel = PathBuf::from("/tmp/myrepo");
+        let relative_subpath = PathBuf::from("team-a").join("proj");
+        let live_segment = "proj-orchestrator-1";
+        let live_cwd = resolve_workspace_path(
+            &toplevel,
+            &disambiguate_workspace_segment(live_segment, Some(relative_subpath.as_path())),
+        )
+        .join(&relative_subpath)
+        .display()
+        .to_string();
+
         let mut form = NewPaneFormState::new(
-            PathBuf::from("/tmp/myrepo/team-a/proj"),
+            toplevel.join(&relative_subpath),
             "proj".to_string(),
             String::new(),
             vec![],
             vec![make_orchestration("review")],
         )
-        .with_live_orchestration_identities(vec![(
-            "/tmp/myrepo-proj-orchestrator-1/team-a/proj".to_string(),
-            "proj-orchestrator-1".to_string(),
-        )]);
+        .with_live_orchestration_identities(vec![(live_cwd, live_segment.to_string())]);
 
         assert_eq!(
             form.suggest_orchestration_name(),
