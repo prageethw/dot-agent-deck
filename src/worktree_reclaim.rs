@@ -2042,11 +2042,14 @@ struct IsolatedCloneCandidate {
 /// genuinely doesn't run.) This is a known, **accepted** residual — decided
 /// 2026-09-12 (issue #519), not an open design question: see
 /// `docs/develop/shared-clone-architecture.md`'s "Discovering isolated
-/// clones" section for the full reasoning (same-uid only; reachable only
-/// through the discovery/reporting path, never automated removal; closing
-/// it would mean either fragile per-driver `-c` overrides or refusing to
-/// run `git status` in an untrusted directory at all, both rejected as
-/// disproportionate for now).
+/// clones" section for the full reasoning (same-uid only; reachable both
+/// from the discovery/reporting call sites and from `remove_isolated_clone_dir`'s
+/// pre-deletion re-verification — the M4c `--yes` auto-reclaim path — so a
+/// destructive `remove_dir_all` genuinely can follow, but only ever against
+/// the attacker's own candidate directory, adding no capability beyond the
+/// RCE itself; closing it would mean either fragile per-driver `-c`
+/// overrides or refusing to run `git status` in an untrusted directory at
+/// all, both rejected as disproportionate for now).
 fn git_in_untrusted_dir(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir).args(["-c", "core.fsmonitor="]);
