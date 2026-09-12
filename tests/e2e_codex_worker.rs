@@ -136,6 +136,10 @@ async fn codex_worker_001_inner() {
             .pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
         common::insert_pane_registration_generation(&mut state, WORKER_PANE);
+        // Issue #567: `handle_delegate_with_state` now guards on the
+        // SENDING pane's (ORCH_PANE) generation too — reserve one, or the
+        // delegate below is refused as "no registration on file".
+        common::insert_pane_registration_generation(&mut state, ORCH_PANE);
     }
 
     common::wait_until_agent_output_settled(
@@ -153,6 +157,8 @@ async fn codex_worker_001_inner() {
         ),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id: daemon.state.read().await.daemon_boot_id().to_string(),
         subject: None,
     };
     daemon

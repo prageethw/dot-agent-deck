@@ -131,7 +131,11 @@ async fn delegate_005_pi_orchestrator_delegate_routes_to_worker_inner() {
         .pane_cwd_map
         .insert(WORKER_PANE.to_string(), cwd_str.clone());
 
-    let signal = pi.delegate("List the files in the current directory.", &[WORKER_ROLE]);
+    let signal = pi.delegate(
+        &state,
+        "List the files in the current directory.",
+        &[WORKER_ROLE],
+    );
     state.handle_delegate(signal, &registry, &event_tx).await;
 
     let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
@@ -206,7 +210,11 @@ async fn delegate_006_pi_worker_delegate_is_rejected_by_role_guard_inner() {
         .pane_cwd_map
         .insert(WORKER_PANE.to_string(), cwd_str.clone());
 
-    let signal = pi_worker.delegate("Escalate: do the orchestrator's job.", &[WORKER_ROLE]);
+    let signal = pi_worker.delegate(
+        &state,
+        "Escalate: do the orchestrator's job.",
+        &[WORKER_ROLE],
+    );
     state.handle_delegate(signal, &registry, &event_tx).await;
 
     // handle_delegate rejects a non-orchestrator sender synchronously (before

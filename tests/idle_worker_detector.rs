@@ -341,11 +341,18 @@ impl IdleHarness {
     }
 
     async fn delegate(&self, roles: &[&str]) {
+        // Issue #567 (mirrors fork #358 M4's `work_done` reasoning below,
+        // exactly): read the harness's own daemon_boot_id so the signal
+        // matches; the generation matches the `1` the harness records at
+        // setup for ORCH_PANE, which is never re-registered mid-test.
+        let daemon_boot_id = self.state.read().await.daemon_boot_id().to_string();
         let signal = DelegateSignal {
             pane_id: ORCH_PANE.to_string(),
             task: "Perform the delegated test task.".to_string(),
             to: roles.iter().map(|role| (*role).to_string()).collect(),
             timestamp: chrono::Utc::now(),
+            generation: 1,
+            daemon_boot_id,
             subject: None,
         };
         self.state
