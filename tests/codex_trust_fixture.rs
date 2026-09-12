@@ -15,17 +15,14 @@
 //! explicit symlink so the defect is exercised deterministically regardless
 //! of where the test's own tempdir happens to land.
 //!
-//! `common::isolated_clone_sibling_path`'s formula (fork issue #373 R3): it
-//! mirrors, rather than calls, part of `src/ui.rs`'s private
-//! `suggest_orchestration_name`/`sanitize_workspace_segment`/
-//! `resolve_workspace_path` chain, so nothing else pins it against the
-//! production formula it predicts. Pinned here against a table of inputs
-//! all hand-traced to agree exactly with the production chain — the table
-//! proves agreement for those traced cases, not divergence. A separate,
-//! genuinely divergent case (interior whitespace surviving a trim-order
-//! difference between the two chains) is real but is disclosed only in
-//! `isolated_clone_sibling_path`'s own doc comment, not pinned by this
-//! table.
+//! `common::isolated_clone_sibling_path`'s formula (fork issue #373 R3,
+//! reformulated by PRD fork#760 Part A): it mirrors, rather than calls, part
+//! of `src/ui.rs`'s private `auto_generate_worktree_slug`/
+//! `resolve_workspace_path` chain (the blank-Worktree-slug case), so nothing
+//! else pins it against the production formula it predicts. Pinned here
+//! against a table of inputs all hand-traced to agree exactly with the
+//! production chain — the table proves agreement for those traced cases, not
+//! divergence.
 
 mod common;
 
@@ -69,43 +66,38 @@ fn codex_project_trust_canonicalizes_symlinked_project_path() {
 /// Scenario: call `common::isolated_clone_sibling_path` with a table of
 /// directory basenames — the one shape every real-agent orchestration-seed
 /// test actually produces (a bare `tempfile`-generated `.tmpXXXXXX` dir) plus
-/// several adversarial basenames a fork#373 review round traced against
-/// production by hand — and assert each predicted sibling path matches the
-/// value production's `suggest_orchestration_name` +
-/// `sanitize_workspace_segment` + `resolve_workspace_path` chain would
-/// compute for the same directory, so a future change to either side has
-/// something in the fast tier to fail against instead of silently drifting
-/// into a real-agent trust-dialog failure nothing in CI can observe.
+/// a couple of basenames that mattered under the pre-fork#760 formula this
+/// mirror used to predict — and assert each predicted sibling path matches
+/// the value production's `auto_generate_worktree_slug` +
+/// `resolve_workspace_path` chain (PRD fork#760 Part A's blank-Worktree-slug
+/// case) would compute for the same directory, so a future change to either
+/// side has something in the fast tier to fail against instead of silently
+/// drifting into a real-agent trust-dialog failure nothing in CI can
+/// observe.
 #[test]
 fn isolated_clone_sibling_path_matches_production_formula_for_known_inputs() {
-    // (basename, expected sibling basename) — the "expected" column is the
-    // value production's `suggest_orchestration_name` (trims the basename,
-    // then appends "-orchestrator-1") -> `sanitize_workspace_segment` (runs
-    // `sanitize_clone_segment`, then strips a leading '-'/'.') ->
-    // `resolve_workspace_path` (`work.with_file_name("{dir_name}-{segment}")`,
-    // using the ORIGINAL untrimmed dir_name) chain produces, worked by hand
-    // and cross-checked against fork issue #373's review/audit findings.
-    let cases: &[(&str, &str)] = &[
-        // The only shape this harness's own callers actually produce today —
-        // matches the byte-for-byte captured production path in
-        // `isolated_clone_sibling_path`'s own doc comment.
-        (".tmpUxkQzS", ".tmpUxkQzS-tmpUxkQzS-orchestrator-1"),
-        // Adversarial: leading whitespace. Production trims the basename
-        // before building the candidate Name; this mirror's `.trim()` (via
-        // `sanitize_clone_segment`) runs on the already-concatenated
-        // "{dir_name}-orchestrator-1" string, which happens to strip the
-        // same leading whitespace since it sits at the very front.
-        (" myproj", " myproj-myproj-orchestrator-1"),
-        // Adversarial: an interior `..`. `sanitize_clone_segment` strips
-        // every `".."` occurrence, wherever it sits, so this matches
-        // regardless of trim-before-vs-after-concatenation ordering.
-        ("my..proj", "my..proj-myproj-orchestrator-1"),
-        // Adversarial: a backslash, which `sanitize_clone_segment` maps to
-        // `-`.
-        ("a\\b", "a\\b-a-b-orchestrator-1"),
+    // PRD fork#760 Part A's blank-slug formula never sanitizes or re-embeds
+    // `dir_name` — unlike the retired pre-fork#760 formula (PRD fork#544 M2),
+    // which ran the SUGGESTED NAME (itself containing `dir_name`) through
+    // `sanitize_workspace_segment`, then re-embedded the raw `dir_name` a
+    // SECOND time via `resolve_workspace_path`'s own prefix — the shape that
+    // produced this table's old adversarial cases
+    // (`.tmpUxkQzS-tmpUxkQzS-orchestrator-1`, doubled). There is no longer a
+    // second, sanitized copy of `dir_name` to exercise: the expected value is
+    // simply `"{basename}-orchestrator-1"` for every basename below,
+    // sanitized or not, since `dir_name` is used exactly once, raw.
+    let cases: &[&str] = &[
+        // The only shape this harness's own callers actually produce today.
+        ".tmpUxkQzS",
+        // Basenames that mattered under the retired double-embedding
+        // formula — kept here so a future regression back toward that shape
+        // would be caught by this table too.
+        " myproj",
+        "my..proj",
+        "a\\b",
     ];
 
-    for (basename, expected_suffix) in cases {
+    for basename in cases {
         let work = std::path::Path::new("/tmp/dad-e2e-fixture-root").join(basename);
         let predicted = common::isolated_clone_sibling_path(&work, 1);
         let got = predicted
@@ -113,10 +105,11 @@ fn isolated_clone_sibling_path_matches_production_formula_for_known_inputs() {
             .expect("predicted sibling path has a file name")
             .to_str()
             .expect("predicted sibling path is UTF-8");
+        let expected = format!("{basename}-orchestrator-1");
         assert_eq!(
-            got, *expected_suffix,
-            "isolated_clone_sibling_path({basename:?}, 1) diverged from the \
-             hand-traced production formula (fork issue #373 R3)"
+            got, expected,
+            "isolated_clone_sibling_path({basename:?}, 1) diverged from production's \
+             auto-generate formula (PRD fork#760 Part A)"
         );
     }
 }

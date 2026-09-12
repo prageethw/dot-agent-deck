@@ -1,17 +1,23 @@
 #![cfg(feature = "e2e")]
 
-//! L2 real-binary proof of fork #122's worktree-provisioning feature and PRD
-//! fork#544 M2/M2b's naming-derivation and unconditional-isolation
-//! follow-up, the CLAUDE.md rule 4 PTY-attached tests for both.
-//! `orchestration/worktree/002`-`004` (`src/ui.rs` unit tests) each
+//! L2 real-binary proof of fork #122's worktree-provisioning feature, PRD
+//! fork#544 M2/M2b's unconditional-isolation follow-up, and PRD fork#760
+//! Part A's restoration of a dedicated, optional Worktree-slug field as the
+//! path/branch-naming input — the CLAUDE.md rule 4 PTY-attached tests for all
+//! three. `orchestration/worktree/002`-`004` (`src/ui.rs` unit tests) each
 //! characterize one mechanism in isolation — the fail-loud refusal, the
 //! pre-existing cwd-threading, the actual on-disk creation via
 //! `dispatch_action` — but none of them drives the real keyboard path a user
 //! actually types: `Ctrl+n` -> directory picker -> form -> cycle Mode to an
-//! orchestration -> type/clear the Name -> submit. `orchestration/workspace/001`
-//! /`002` below are what drive that path on the real binary post-M2/M2b (the
-//! separate Worktree-slug field `orchestration/worktree/005` used to exercise
-//! is retired outright — Name is now the sole input to the resolved path).
+//! orchestration -> type/clear the Name -> type an identical Worktree slug ->
+//! submit. `orchestration/workspace/001`/`002` below are what drive that path
+//! on the real binary (PRD fork#544 M2 had briefly retired the separate
+//! Worktree-slug field this file's tests type into, deriving the resolved
+//! path from Name alone; PRD fork#760 Part A restores the field as the
+//! ACTUAL path/branch input, with Name staying tab-title/uniqueness-only —
+//! `open_orchestration_with_name` types the identical string into both
+//! fields so this whole test family's predictable-path assertions keep
+//! holding under the restored two-field model).
 //!
 //! Provisioning shells out to real `git`, so the directory the deck is
 //! launched in must be a git repository with at least one commit before the
@@ -106,13 +112,24 @@ fn remote_origin_url(dir: &std::path::Path) -> Option<String> {
 }
 
 /// Drive the new-pane form's real keyboard path to open the `orch-clone-gate`
-/// fixture's one orchestration with a TYPED Name — `Ctrl+n` -> directory
-/// picker -> confirm -> Mode cycled to the orchestration -> clear the
-/// pre-filled suggested Name -> type `name` -> submit directly from Name
-/// (Command is hidden for an orchestration). PRD fork#544 M2 retires the
-/// separate Worktree-slug field this helper used to type into — Name is now
-/// the sole input to the resolved path, so a distinct typed Name is what
-/// this family of tests needs instead of a distinct typed slug.
+/// fixture's one orchestration with a TYPED Name AND an identical typed
+/// Worktree slug — `Ctrl+n` -> directory picker -> confirm -> Mode cycled to
+/// the orchestration -> clear the pre-filled suggested Name -> type `name` ->
+/// Tab to the (now-visible, Command being hidden for an orchestration)
+/// Worktree-slug field -> type the SAME `name` -> submit from there.
+///
+/// PRD fork#760 Part A (restoring issue #521's pre-fork#544 behavior):
+/// leaving the slug blank no longer derives the resolved path/branch from
+/// Name — it auto-generates an `orchestrator-N` segment instead
+/// (`auto_generate_worktree_slug`), independent of whatever Name was typed.
+/// This whole test family's fixtures rely on the resolved
+/// path/branch/creator-identity being predictable from the TYPED value, so
+/// this helper now types the identical string into BOTH fields — Name (still
+/// driving the tab title / `ClaimOrchestrationName` uniqueness / the
+/// ownership-marker creator identity, unchanged) and the Worktree slug (now
+/// the actual path/branch input) — reproducing the exact derived
+/// path/branch/creator shape this family asserted under PRD fork#544 M2,
+/// just sourced from two fields typed identically instead of one.
 fn open_orchestration_with_name(deck: &TuiDeck, name: &str) {
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
@@ -124,7 +141,9 @@ fn open_orchestration_with_name(deck: &TuiDeck, name: &str) {
     // `workspace_001`/`002` below.
     deck.send_keys(&[0x7fu8; 80]);
     deck.send_keys(name.as_bytes());
-    deck.send_keys(b"\r"); // submit
+    deck.send_keys(b"\t"); // Tab: Name -> Worktree slug (Command is hidden)
+    deck.send_keys(name.as_bytes());
+    deck.send_keys(b"\r"); // submit from the Worktree-slug field
 }
 
 /// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
@@ -157,10 +176,11 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
 
     deck.wait_for_string("No active sessions");
 
-    // PRD fork#544 M2: the typed Name is now the sole input to both the
-    // resolved workspace path and the creator/owner identity — no more
-    // reading the pre-filled `<basename>-orchestrator-N` suggestion, since
-    // this helper clears and types over it.
+    // PRD fork#760 Part A: `open_orchestration_with_name` types the identical
+    // literal into BOTH Name (creator/owner identity) and the Worktree slug
+    // (resolved workspace path/branch) — no more reading the pre-filled
+    // `<basename>-orchestrator-N` suggestion, since this helper clears and
+    // types over it.
     let owner_1 = "orchestration:clonegate1".to_string();
     let owner_2 = "orchestration:clonegate2".to_string();
     let second_label = " clonegate2 ";
@@ -390,8 +410,9 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
 
     deck.wait_for_string("No active sessions");
 
-    // PRD fork#544 M2: the typed Name is now the sole input to both the
-    // resolved workspace path and the creator/owner identity.
+    // PRD fork#760 Part A: `open_orchestration_with_name` types the identical
+    // literal into both Name (creator/owner identity) and the Worktree slug
+    // (resolved workspace path/branch).
     let owner_1 = "orchestration:clonegate1".to_string();
     let owner_2 = "orchestration:clonegate2".to_string();
     let owner_3 = "orchestration:clonegate3".to_string();
@@ -798,18 +819,17 @@ fn pwd_for_owner(log_contents: &str, owner: &str) -> Option<PathBuf> {
 /// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
 /// one orchestration exactly ONCE — no concurrent sibling orchestration
 /// exists at all, the PRD's own "1st orchestration against a root checkout"
-/// case. Clear the form's suggested Name and type a distinctive one instead,
-/// then submit directly from the Name field (Command is hidden for an
-/// orchestration, so Enter there submits) with the Worktree-slug field left
-/// untouched/blank. PRD fork#544 M2b retires the Nth-concurrent-only
-/// isolation gate: even this very first orchestration against the root
-/// checkout must land in its own isolated workspace — never a `git worktree
-/// add` sibling sharing the launch directory's own git object store, which
-/// is what today's code still does for a 1st orchestration. M2's naming
-/// derivation says that workspace must be named
-/// `<root-checkout-basename>-<sanitized-name>`, derived from the typed Name
-/// alone — never the separate Worktree-slug field (blank here) and never
-/// `auto_generate_worktree_slug`'s `orchestrator-N` counter.
+/// case. Clear the form's suggested Name and type a distinctive one, Tab to
+/// the (now-visible, Command being hidden for an orchestration) Worktree-slug
+/// field and type the SAME literal there, then submit. PRD fork#544 M2b
+/// retires the Nth-concurrent-only isolation gate: even this very first
+/// orchestration against the root checkout must land in its own isolated
+/// workspace — never a `git worktree add` sibling sharing the launch
+/// directory's own git object store. PRD fork#760 Part A: the typed
+/// Worktree slug — not Name — now drives that workspace's naming
+/// (`<root-checkout-basename>-<sanitized-slug>`); Name stays the tab
+/// title/uniqueness identity only (proven by the `owner` lookup below, which
+/// still keys on Name).
 #[spec("orchestration/workspace/001")]
 #[test]
 fn workspace_001_first_orchestration_gets_named_isolated_workspace() {
@@ -837,7 +857,9 @@ fn workspace_001_first_orchestration_gets_named_isolated_workspace() {
     // `e2e_new_pane_seed.rs`/`e2e_mode_seed_prompt.rs`.
     deck.send_keys(&[0x7fu8; 80]);
     deck.send_keys(NAME.as_bytes());
-    deck.send_keys(b"\r"); // submit directly from Name; Worktree-slug stays blank
+    deck.send_keys(b"\t"); // Tab: Name -> Worktree slug
+    deck.send_keys(NAME.as_bytes()); // type the SAME literal into the slug
+    deck.send_keys(b"\r"); // submit from the Worktree-slug field
 
     deck.wait_for_absence("New Agent"); // form closed -> orchestration tab up
 
@@ -861,11 +883,11 @@ fn workspace_001_first_orchestration_gets_named_isolated_workspace() {
     assert_eq!(
         pwd,
         expected_path,
-        "PRD fork#544 M2: the workspace directory must be derived from the orchestration Name \
-         alone (`<root-checkout-basename>-<sanitized-name>`) — not from the separate \
-         Worktree-slug field (blank here) and not from `orchestrator-N` auto-numbering; today's \
-         code, for a 1st orchestration with a blank slug, leaves the pane rooted in the launch \
-         directory itself ({}) instead",
+        "PRD fork#760 Part A: the workspace directory must be derived from the typed \
+         Worktree slug (`<root-checkout-basename>-<sanitized-slug>`), not from \
+         `orchestrator-N` auto-numbering — the slug was typed identically to Name here, so \
+         the two happen to agree; the owner identity above proves Name is what it is keyed \
+         on, independent of this path ({})",
         work.display()
     );
 
@@ -883,19 +905,20 @@ fn workspace_001_first_orchestration_gets_named_isolated_workspace() {
 }
 
 /// Scenario: run the identical single-orchestration flow `workspace_001`
-/// drives — clear the suggested Name, type one fixed literal, submit with a
-/// blank Worktree-slug — TWICE, as two fully independent scenarios (two
-/// separate `TuiDeck` launches, each its own fresh root checkout with its
-/// own randomly-named tempdir, the second launched only after the first has
-/// been torn down). Both runs type the exact same Name. PRD fork#544 M2's
-/// naming derivation must be a pure function of `(root-checkout-basename,
-/// Name)` — not of any session-local counter state such as
-/// `auto_generate_worktree_slug`'s `orchestrator-N`, which would happily
-/// produce the identical `orchestrator-1` slug on both independent runs too,
-/// so this test's point is specifically the FORMULA holding independently
-/// in each scenario, not merely that some slug repeats. So each run's
-/// resulting workspace directory must resolve to that run's OWN
-/// `<its-own-root-checkout-basename>-<the-shared-typed-name>` — proving the
+/// drives — clear the suggested Name, type one fixed literal, Tab to the
+/// Worktree-slug field and type the SAME literal there, submit — TWICE, as
+/// two fully independent scenarios (two separate `TuiDeck` launches, each
+/// its own fresh root checkout with its own randomly-named tempdir, the
+/// second launched only after the first has been torn down). Both runs type
+/// the exact same Name/slug pair. PRD fork#760 Part A: the naming derivation
+/// must be a pure function of `(root-checkout-basename, typed slug)` — not
+/// of any session-local counter state such as `auto_generate_worktree_slug`'s
+/// `orchestrator-N`, which would happily produce the identical
+/// `orchestrator-1` slug on both independent runs too, so this test's point
+/// is specifically the FORMULA holding independently in each scenario, not
+/// merely that some slug repeats. So each run's resulting workspace
+/// directory must resolve to that run's OWN
+/// `<its-own-root-checkout-basename>-<the-shared-typed-slug>` — proving the
 /// same deterministic rule applies each time, regardless of which root
 /// checkout or how many prior orchestrations either one has seen.
 #[spec("orchestration/workspace/002")]
@@ -923,6 +946,8 @@ fn workspace_002_naming_is_deterministic_from_name_alone_across_separate_runs() 
         deck.send_keys(b"\r");
         deck.send_keys(&[0x7fu8; 80]);
         deck.send_keys(NAME.as_bytes());
+        deck.send_keys(b"\t"); // Tab: Name -> Worktree slug
+        deck.send_keys(NAME.as_bytes()); // type the SAME literal into the slug
         deck.send_keys(b"\r");
 
         deck.wait_for_absence("New Agent");
@@ -972,15 +997,16 @@ fn workspace_002_naming_is_deterministic_from_name_alone_across_separate_runs() 
 
     assert_eq!(
         pwd_1, expected_1,
-        "PRD fork#544 M2: run 1's workspace directory must equal \
-         `<run-1's-own-root-checkout-basename>-{NAME}`"
+        "PRD fork#760 Part A: run 1's workspace directory must equal \
+         `<run-1's-own-root-checkout-basename>-{NAME}` (the typed slug, not Name, drives it — \
+         both were typed identically here)"
     );
     assert_eq!(
         pwd_2, expected_2,
-        "PRD fork#544 M2: run 2's workspace directory must equal \
+        "PRD fork#760 Part A: run 2's workspace directory must equal \
          `<run-2's-own-root-checkout-basename>-{NAME}` — the SAME derivation rule as run 1, \
          applied independently, proving the naming is a pure function of \
-         (root-checkout-basename, Name) rather than of session-local counter state like \
+         (root-checkout-basename, typed slug) rather than of session-local counter state like \
          `orchestrator-N`"
     );
 }
