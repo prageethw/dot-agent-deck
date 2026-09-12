@@ -6948,8 +6948,18 @@ fn compute_bell_needed(
     for (id, session) in sessions {
         let current = &session.status;
         let changed = last_bell_status.get(id) != Some(current);
+        // Issue #755: a pane with a `delegate` still outstanding (no
+        // matching `work-done` yet) must not ring the idle bell just
+        // because its raw, hook-event-derived status reads `Idle` — that
+        // status is exactly the one this badge/bell pair no longer takes at
+        // face value (see `render_session_card`'s matching guard). Scoped to
+        // `Idle` only: it is the sole status `BellConfig::should_bell` rings
+        // on that this field can ever mask (`WaitingForInput`/`Error` are
+        // both asserted by the agent itself and unaffected).
+        let idle_but_delegated =
+            *current == SessionStatus::Idle && session.outstanding_delegation.is_some();
 
-        if changed && bell_config.should_bell(current) {
+        if changed && !idle_but_delegated && bell_config.should_bell(current) {
             need_bell = true;
         }
 
@@ -22948,6 +22958,25 @@ fn render_session_card(
         ("Starting…".to_string(), text_primary())
     } else if is_empty_placeholder {
         ("No agent".to_string(), text_primary())
+    } else if matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown)
+        && session.outstanding_delegation.is_some()
+    {
+        // Issue #755: the daemon still has a `delegate` armed for this pane
+        // (no matching `work-done` has landed yet), but the raw,
+        // hook-event-derived status still reads `Idle`/`Unknown` — the
+        // target may be actively executing a long-running task and simply
+        // hasn't emitted a fresh hook event since, or it may have finished
+        // and not yet called `work-done`. Either way plain "Idle" actively
+        // lies (it is supposed to mean "no outstanding work"), so this
+        // reuses the same "this status is not the whole story" treatment
+        // issue #714 established for a monitored-wait-held `Working`
+        // (`STATUS_OBSERVING` + a parenthetical suffix) rather than
+        // inventing a second visual language for the same underlying idea.
+        let (label, style) = status_style(&session.status);
+        (
+            format!("{label} (delegated)"),
+            style.fg(palette::STATUS_OBSERVING),
+        )
     } else if session.status == SessionStatus::Working
         && (session.wait_synthetic_working || session.wait_deferred_revert)
     {

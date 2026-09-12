@@ -6569,16 +6569,28 @@ impl AppState {
                 continue;
             }
             stats.active += 1;
+            // Issue #755: a pane with a `delegate` still outstanding (no
+            // matching `work-done` yet) must not count toward "N idle" in
+            // the tab bar — that count would otherwise contradict the same
+            // pane's own card, which no longer renders plain `Idle` for this
+            // case (see `render_session_card`'s matching guard). It still
+            // counts toward `active` above, unchanged: the pane may well
+            // have real work in flight, just not visible via a bucket here.
+            let idle_but_delegated =
+                matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown)
+                    && session.outstanding_delegation.is_some();
             match session.status {
                 SessionStatus::Working => stats.working += 1,
                 SessionStatus::Thinking => stats.thinking += 1,
                 SessionStatus::WaitingForInput => stats.waiting += 1,
                 SessionStatus::Error => stats.errors += 1,
-                SessionStatus::Idle => stats.idle += 1,
+                SessionStatus::Idle if !idle_but_delegated => stats.idle += 1,
+                SessionStatus::Idle => {}
                 SessionStatus::Compacting => stats.compacting += 1,
                 // PRD #162 forward-compat: an unknown wire status is bucketed
                 // as idle so it never inflates an active-work tally.
-                SessionStatus::Unknown => stats.idle += 1,
+                SessionStatus::Unknown if !idle_but_delegated => stats.idle += 1,
+                SessionStatus::Unknown => {}
             }
             stats.total_tools += session.tool_count as u64;
         }
