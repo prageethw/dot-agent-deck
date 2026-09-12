@@ -2039,10 +2039,14 @@ struct IsolatedCloneCandidate {
 /// through the very subcommand this module does issue, via a different
 /// config surface than the one already closed. (`core.hooksPath`,
 /// `diff.external`, etc. remain reachable too, by subcommands this module
-/// genuinely doesn't run.) See the audit's A3/B2 findings for the full
-/// scoping and why both are accepted as a same-uid, non-blocker risk
-/// regardless — closing the clean-filter vector would mean not running
-/// `git status` in an untrusted directory at all, an M4b design question.
+/// genuinely doesn't run.) This is a known, **accepted** residual — decided
+/// 2026-09-12 (issue #519), not an open design question: see
+/// `docs/develop/shared-clone-architecture.md`'s "Discovering isolated
+/// clones" section for the full reasoning (same-uid only; reachable only
+/// through the discovery/reporting path, never automated removal; closing
+/// it would mean either fragile per-driver `-c` overrides or refusing to
+/// run `git status` in an untrusted directory at all, both rejected as
+/// disproportionate for now).
 fn git_in_untrusted_dir(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir).args(["-c", "core.fsmonitor="]);
