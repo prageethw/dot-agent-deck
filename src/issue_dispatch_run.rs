@@ -815,6 +815,31 @@ async fn dispatch_one_issue(
         DispatchDecision::Dispatch => {}
     }
 
+    // Issue #171 (auditor F2 fix, PR #753): a DRY RUN stops here, having made
+    // exactly the same idempotency decision a real run would, WITHOUT doing
+    // any of the work a real dispatch does — no worktree, no branch, no agent
+    // spawn, and (as already true before this fix) no `gh` write. This is
+    // deliberately BEFORE `create_worktree`, not merely before `claim_issue`
+    // at the bottom of this function: `create_worktree` writes the exact same
+    // `created-by:` marker and registers the worktree in `WorktreeRegistry` a
+    // real dispatch would, so letting a dry run reach it would leave real
+    // on-disk state behind. The PRIMARY idempotency signal above
+    // (`worktree_exists`, "the worktree is the ledger") would then read that
+    // dry-run-created worktree as "already claimed" on the very next REAL
+    // fire and skip it — silently dropping the real claim comment/label/
+    // assignee for good. Stopping before any disk/process side effect makes
+    // that poisoning structurally impossible rather than merely avoided by
+    // convention: a dry run can never leave anything for a later real run's
+    // ledger to trip over, because it never writes to that ledger at all.
+    if cfg.dry_run {
+        notifier.notify(NotifyEvent::IssueDispatchDryRun {
+            task: task_name.to_string(),
+            repo: cfg.repo.clone(),
+            issue,
+        });
+        return Ok(());
+    }
+
     // M2.2 — create the per-issue worktree on `agent/issue-<n>`. A concurrent
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
@@ -990,6 +1015,13 @@ async fn dispatch_one_issue(
     // longer swallows the failure into `tracing::warn!` alone either — a
     // claim failure is now surfaced through the `Notifier` seam as its own
     // distinguishable event (see [`claim_issue`]).
+    //
+    // `cfg.dry_run` is always `false` by the time control reaches here — the
+    // dry-run early return above (auditor F2 fix) sends every `dry_run` fire
+    // back to the caller long before `create_worktree`/`spawn`. Still passed
+    // through rather than hardcoded to `false`: `claim_issue`'s own dry-run
+    // gating is independently unit-tested and stays correct as a defense in
+    // depth if this call site is ever reordered.
     claim_issue(
         &cfg.repo,
         issue,

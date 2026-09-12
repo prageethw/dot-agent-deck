@@ -97,6 +97,24 @@ pub enum NotifyEvent {
         repo: String,
         message: String,
     },
+    /// Issue #171 (auditor F2 fix, PR #753): a DRY RUN determined this issue
+    /// WOULD be dispatched by a real run. Deliberately its own variant, not a
+    /// dry-run flavor of `IssueDispatched` — a dry run performs NONE of the
+    /// work that variant's own doc comment promises (no worktree/branch, no
+    /// agent spawn, no `gh` write of any kind, not even the label/comment
+    /// writes `claim_issue` already gates on `cfg.dry_run`). Reusing
+    /// `IssueDispatched` for this would be a lie about what happened, and —
+    /// the defect this variant exists to make structurally impossible, not
+    /// just avoid mislabelling — creating the worktree at all in a dry run
+    /// used to leave real on-disk state that a LATER real run's own
+    /// idempotency check (`WorktreeExists`, the PRIMARY signal) would then
+    /// mistake for "already claimed," silently skipping the real claim for
+    /// good. A dry run now only ever reports the decision.
+    IssueDispatchDryRun {
+        task: String,
+        repo: String,
+        issue: u64,
+    },
     /// PRD #421 review C3: an issue was successfully DISPATCHED (the worktree
     /// was created and the agent spawned — `IssueDispatched` already fired),
     /// but writing the `in-progress` label or posting the claim comment
@@ -247,6 +265,12 @@ impl Notifier for StderrNotifier {
             NotifyEvent::IssueDispatched { task, repo, issue } => {
                 eprintln!(
                     "[scheduler] task {task:?}: dispatched issue #{issue} of {repo} (agent/issue-{issue})"
+                );
+            }
+            NotifyEvent::IssueDispatchDryRun { task, repo, issue } => {
+                eprintln!(
+                    "[scheduler] task {task:?}: dry run — would dispatch issue #{issue} of {repo} \
+                     (agent/issue-{issue}); no worktree, branch, agent, or `gh` write performed"
                 );
             }
             NotifyEvent::IssueDispatchSkipped {
