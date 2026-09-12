@@ -43332,6 +43332,57 @@ mod tests {
         }
     }
 
+    /// Scenario: fork issue #607 (accepted residual of PRD fork#603, auditor
+    /// finding A1). Two different picked subdirectories nested under the
+    /// SAME git toplevel (`team-a/proj` and `team-b/proj`) that both
+    /// suggest the identical orchestration Name/segment -- exactly what
+    /// happens when both basenames are literally `proj` and
+    /// `suggest_orchestration_name` derives the same suggestion for both --
+    /// must still provision into distinct physical clones.
+    /// `resolve_orchestration_workspace`'s `worktree_path` is derived from
+    /// `resolved_root_dir` (the shared toplevel for both nested picks) and
+    /// `segment` alone, ignoring which subdirectory was actually picked, so
+    /// both currently collapse onto the identical physical clone directory
+    /// even though their `relative_subpath`s genuinely differ -- silently
+    /// sharing one clone's branch/checkout between what the user believes
+    /// are two independent orchestrations (fork#603's own naming/claim
+    /// layer catches this at the Name-uniqueness layer, per
+    /// `workspace_026`, but never at the physical-clone layer this test
+    /// targets).
+    #[spec("orchestration/workspace/040")]
+    #[test]
+    fn workspace_040_distinct_nested_picks_with_a_colliding_segment_get_distinct_clones() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+        let team_a = repo.join("team-a").join("proj");
+        let team_b = repo.join("team-b").join("proj");
+        std::fs::create_dir_all(&team_a).expect("create team-a/proj");
+        std::fs::create_dir_all(&team_b).expect("create team-b/proj");
+
+        let segment = sanitize_workspace_segment("proj-orchestrator-1");
+        let resolution_a = resolve_orchestration_workspace(&team_a, &segment);
+        let resolution_b = resolve_orchestration_workspace(&team_b, &segment);
+
+        assert_eq!(
+            resolution_a.resolved_root_dir, resolution_b.resolved_root_dir,
+            "setup: sanity -- both picks must share the same resolved toplevel for this to \
+             exercise the collision at all"
+        );
+        assert_ne!(
+            resolution_a.relative_subpath, resolution_b.relative_subpath,
+            "setup: sanity -- the two picks must actually be distinct subdirectories"
+        );
+
+        assert_ne!(
+            resolution_a.worktree_path, resolution_b.worktree_path,
+            "issue #607: two different directories (team-a/proj, team-b/proj) that suggest \
+             the identical segment must not provision into the same physical clone -- got \
+             {:?} for both",
+            resolution_a.worktree_path
+        );
+    }
+
     /// Scenario: PRD fork#603 reviewer finding F2. `identity_036`
     /// (`src/agent_pty.rs`) replicates what each of the two
     /// `ClaimOrchestrationName` call sites is SUPPOSED to compute post-fix,

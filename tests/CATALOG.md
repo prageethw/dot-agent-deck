@@ -5673,6 +5673,13 @@ without depending on the config struct API.
 - **Does not assert:** a `gh pr list` failure for one specific clone (fails that clone's own row closed via the existing `Unresolvable`/fail-closed `PrState` handling `worktree list`/`reclaim` already exercise, not this command's own new default-branch precondition); which exact wording accompanies the error beyond the required prefix.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `037`).
 
+##### orchestration/workspace/040 — Two different picked subdirectories nested under the same git toplevel (`team-a/proj`, `team-b/proj`) that both suggest the identical orchestration Name/segment must still provision into distinct physical clones, not silently collapse onto the same directory (fork issue #607, accepted residual of PRD fork#603 auditor finding A1: `resolve_orchestration_workspace`'s `worktree_path` was derived from the shared toplevel and segment alone, ignoring which subdirectory under it was actually picked).
+- **Layer:** L1 (in-process — a real `git` repository with two nested subdirectories, calling `resolve_orchestration_workspace` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** for two picks (`team-a/proj`, `team-b/proj`) sharing the same resolved toplevel and the same segment but distinct `relative_subpath`s, the resulting `worktree_path` values are distinct.
+- **Does not assert:** the daemon-side `ClaimOrchestrationName` uniqueness/collision layer, already covered by `026`; the resolved pane cwd's exact value, covered by `033`; real daemon/PTY spawn.
+- **Platform coverage:** mac+linux+windows, matching `033`.
+
 #### orchestration/hydration
 
 ##### orchestration/hydration/001 — Renaming an orchestration in the local `.dot-agent-deck.toml` while its tab is live surfaces an on-screen drift warning naming the orchestration when the TUI reattaches to the still-running daemon (fork issue #314 / upstream #554).
