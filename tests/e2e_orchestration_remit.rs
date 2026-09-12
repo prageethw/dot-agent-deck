@@ -1374,7 +1374,7 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
     // retry of that delivery cannot inflate it and there is nothing to count
     // from. Every other test in this file counts [`DELIVERED_POINTER`], which
     // the spawn-time delivery does write, and therefore needs the baseline.
-    let (socket, pane_id, agent_id, log, _baseline, _role_cwd) =
+    let (socket, pane_id, agent_id, log, _baseline, role_cwd) =
         open_and_confirm_initial_delivery(&deck);
 
     // Seed a `## Your task` section onto the context file the interactive
@@ -1383,9 +1383,15 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
     // Some(task))` leaves on disk for a `dispatch --task` orchestration
     // (`src/spawn.rs`), without needing a second, separately-launched fixture
     // for the daemon dispatch path.
+    //
+    // PRD fork#544 M2b made orchestrator-role isolation unconditional: the
+    // role's `cwd` is its own isolated clone, not `deck.workdir()` (the
+    // fixture source dir) — same reason `remit_003` reads/writes its trigger
+    // markers via `role_cwd` rather than `deck.workdir()` above. This context
+    // file is written by `prepare_orchestrator_prompt` relative to that same
+    // pane cwd, so it must be located the same way.
     const TASK_SENTINEL: &str = "SENTINEL-TASK-remit007: verify PR #500 and report.";
-    let context_path = deck
-        .workdir()
+    let context_path = role_cwd
         .join(".dot-agent-deck")
         .join("orchestrator-context.md");
     let mut seeded =
