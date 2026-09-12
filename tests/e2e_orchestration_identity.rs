@@ -361,29 +361,29 @@ fn tab_bar_line(grid: &str) -> &str {
     grid.lines().next().unwrap_or("")
 }
 
-/// Scenario: PRD fork#603's accepted fix (PR #604) keys the claim/comparison
-/// layer on the FULL resolved directory (toplevel + segment + relative
-/// subpath), which is enough to let `team-a/proj` and `team-b/proj` both
-/// succeed as distinctly-claimed, un-refused orchestrations — that much is
-/// already covered by `identity_033`'s tab-label check. What the fix does
-/// NOT do is change physical workspace provisioning:
-/// `resolve_workspace_path` (`src/ui.rs`) still derives the clone location
-/// from toplevel+segment alone, ignoring which subdirectory was picked
-/// (deliberately deferred, tracked as issue #607), so both opens — same
-/// toplevel, same suggested name `proj-orchestrator-1` — provision into the
-/// SAME physical clone directory, as two nested subdirectories rather than
-/// two separate clones. This test seeds the same `team-a/proj` /
-/// `team-b/proj` sibling leaves as `identity_033`, opens an orchestration
-/// in each, then verifies on the real filesystem that the one shared clone
-/// directory `provisioned_sibling_workspaces` observes actually contains
-/// BOTH orchestrations' own working subdirectories (`<clone>/team-a/proj`
-/// and `<clone>/team-b/proj`) as real, distinct, populated directories —
-/// i.e. each orchestration is genuinely working in the subdirectory it was
-/// opened against, not silently aliased to or missing in favor of the
-/// other, even though they share one parent clone. The second open's claim
-/// is confirmed genuinely granted (not silently refused while stale
-/// filesystem state from the shared clone happens to look right anyway) by
-/// waiting on the tab-bar row specifically, rather than the whole grid.
+/// Scenario: fork issue #607 (fix). PRD fork#603's accepted fix (PR #604)
+/// keys the claim/comparison layer on the FULL resolved directory (toplevel
+/// plus segment plus relative subpath), which is enough to let `team-a/proj`
+/// and `team-b/proj` both succeed as distinctly-claimed, un-refused
+/// orchestrations — that much is already covered by `identity_033`'s
+/// tab-label check. At the time, that fix deliberately left physical
+/// workspace provisioning unchanged: `resolve_workspace_path` (`src/ui.rs`)
+/// derived the clone location from toplevel+segment alone, ignoring which
+/// subdirectory was picked, so both opens — same toplevel, same suggested
+/// name `proj-orchestrator-1` — provisioned into the SAME physical clone
+/// directory (documented then as an accepted residual, tracked as issue
+/// #607). `resolve_orchestration_workspace` now also folds each pick's own
+/// relative subpath into the segment (`disambiguate_workspace_segment`), so
+/// the two opens provision into two DISTINCT physical clone directories
+/// instead. This test seeds the same `team-a/proj` / `team-b/proj` sibling
+/// leaves as `identity_033`, opens an orchestration in each, then verifies
+/// on the real filesystem that TWO separate sibling workspace directories
+/// now exist — each its own genuine, independent isolated clone containing
+/// the picked leaf's committed content — rather than one shared clone
+/// housing both. The second open's claim is confirmed genuinely granted
+/// (not silently refused while stale filesystem state happens to look right
+/// anyway) by waiting on the tab-bar row specifically, rather than the
+/// whole grid.
 #[spec("orchestration/identity/037")]
 #[test]
 fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_working_subdirectory()
@@ -523,86 +523,78 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
         tab_bar_line(g).matches(LABEL).count() >= 2
     });
 
-    // The accepted PRD fork#603 design fixes the CLAIM/comparison layer
-    // only — physical workspace provisioning is deliberately unchanged
-    // (issue #607), so both opens still resolve to ONE shared sibling
-    // clone directory rather than two. This is the residual the auditor's
-    // original "must not share one physical workspace" framing predicted
-    // as a bug; it is now the accepted, documented boundary of the fix.
+    // Fork issue #607 (fixed): the two opens must now provision into TWO
+    // DISTINCT physical clone directories, not share one.
     //
     // This filesystem poll is NOT a substitute for the tab-bar wait above —
-    // both `before`/`after_first` and this `after_second` read converge on
-    // the same `expected=1`, because the shared clone's whole committed tree
-    // (both leaf directories) is already on disk after the FIRST open alone;
-    // a silently refused second open would leave this count identical. Its
-    // job is only to locate the one shared clone directory for the
-    // subdirectory checks below, now that the wait above has already proven
-    // the second claim was genuinely granted.
-    let after_second = wait_for_sibling_workspace_count(&parent, &prefix, 1);
+    // it confirms the SECOND open's own new clone has actually finished
+    // provisioning (a silently refused second open would leave this count
+    // at 1 forever), now that the wait above has already proven the second
+    // claim was genuinely granted.
+    let after_second = wait_for_sibling_workspace_count(&parent, &prefix, 2);
     assert_eq!(
         after_second.len(),
-        1,
-        "team-a/proj and team-b/proj are expected to share exactly ONE physical clone \
-         directory under the accepted PRD fork#603 design — the fix corrects the claim/\
-         comparison layer, not physical workspace provisioning (deliberately deferred, issue \
-         #607); found {after_second:?} under {} (after the first open alone: {after_first:?})",
+        2,
+        "fork issue #607: team-a/proj and team-b/proj must provision into TWO DISTINCT \
+         physical clone directories, not share one — found {after_second:?} under {} (after \
+         the first open alone: {after_first:?})",
         parent.display()
     );
-    let clone_dir = parent.join(&after_second[0]);
 
-    // What DOES have to be true under the accepted design: each
-    // orchestration's own working subdirectory inside that shared clone
-    // must genuinely exist, distinctly, as the picked leaf — not aliased
-    // to or missing in favor of the other. This is the concrete, checkable
-    // form of "each orchestration is working in its own directory, not
-    // silently sharing one" that survives the fix, and it exercises the
-    // real provisioning path (reading the filesystem the real `git clone`
-    // populated) rather than a hand-computed formula.
-    let team_a_dir = clone_dir.join("team-a").join("proj");
-    let team_b_dir = clone_dir.join("team-b").join("proj");
-    assert!(
-        team_a_dir.is_dir(),
-        "team-a/proj's orchestration must be working in {} inside the shared clone {} — \
-         directory not found",
-        team_a_dir.display(),
-        clone_dir.display()
-    );
-    assert!(
-        team_b_dir.is_dir(),
-        "team-b/proj's orchestration must be working in {} inside the shared clone {} — \
-         directory not found",
-        team_b_dir.display(),
-        clone_dir.display()
-    );
-
-    let canonical_a = team_a_dir
-        .canonicalize()
-        .expect("team-a/proj's working subdirectory must resolve on disk");
-    let canonical_b = team_b_dir
-        .canonicalize()
-        .expect("team-b/proj's working subdirectory must resolve on disk");
+    // Each clone is a genuine, independent `git clone` of the whole source
+    // repo, so each one's working tree contains BOTH leaves' committed
+    // content regardless of which was picked — what distinguishes the two
+    // clones is which own directory name encodes which pick (via
+    // `disambiguate_workspace_segment`'s sanitized relative-subpath
+    // suffix), not which leaf's content merely exists inside it.
+    let clone_dirs: Vec<std::path::PathBuf> =
+        after_second.iter().map(|name| parent.join(name)).collect();
+    let team_a_clone = clone_dirs
+        .iter()
+        .find(|d| d.to_string_lossy().contains("team-a"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no provisioned clone name encodes team-a's own relative subpath: {after_second:?}"
+            )
+        });
+    let team_b_clone = clone_dirs
+        .iter()
+        .find(|d| d.to_string_lossy().contains("team-b"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no provisioned clone name encodes team-b's own relative subpath: {after_second:?}"
+            )
+        });
     assert_ne!(
-        canonical_a, canonical_b,
-        "team-a/proj and team-b/proj must resolve to two DISTINCT working subdirectories \
-         inside the shared clone — one must never be aliased to (e.g. via a symlink) or stand \
-         in for the other"
+        team_a_clone, team_b_clone,
+        "team-a/proj and team-b/proj must provision into two DIFFERENT physical clone \
+         directories, not the identical one"
     );
 
-    // Each leaf carries its own committed marker file (seeded above and
-    // committed into the fixture repo before either open) — its presence
-    // confirms the real `git clone` provisioning path actually checked out
-    // THIS exact subpath's tracked content, rather than an empty directory
-    // merely existing at the expected name.
-    assert!(
-        team_a_dir.join(".dot-agent-deck.toml").is_file(),
-        "team-a/proj's working subdirectory at {} must contain its own committed \
-         .dot-agent-deck.toml, proving the real clone actually checked out this subpath",
-        team_a_dir.display()
-    );
-    assert!(
-        team_b_dir.join(".dot-agent-deck.toml").is_file(),
-        "team-b/proj's working subdirectory at {} must contain its own committed \
-         .dot-agent-deck.toml, proving the real clone actually checked out this subpath",
-        team_b_dir.display()
-    );
+    // What has to be true of each clone individually: it must genuinely
+    // contain the picked leaf it was named for, as a real, populated
+    // directory — this exercises the real provisioning path (reading the
+    // filesystem the real `git clone` populated) rather than a hand-computed
+    // formula.
+    for (label, clone_dir) in [("team-a", team_a_clone), ("team-b", team_b_clone)] {
+        let leaf_dir = clone_dir.join(label).join("proj");
+        assert!(
+            leaf_dir.is_dir(),
+            "{label}'s own clone at {} must contain its picked leaf at {} — directory not \
+             found",
+            clone_dir.display(),
+            leaf_dir.display()
+        );
+        // The leaf's own committed marker file (seeded above and committed
+        // into the fixture repo before either open) — its presence confirms
+        // the real `git clone` provisioning path actually checked out this
+        // clone's tracked content, rather than an empty directory merely
+        // existing at the expected name.
+        assert!(
+            leaf_dir.join(".dot-agent-deck.toml").is_file(),
+            "{label}'s own clone's leaf at {} must contain its committed .dot-agent-deck.toml, \
+             proving the real clone actually checked out this subpath",
+            leaf_dir.display()
+        );
+    }
 }
