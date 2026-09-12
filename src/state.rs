@@ -7753,10 +7753,45 @@ impl AppState {
             };
         }
 
-        // Issue #567: the registration-generation/boot-id fail-closed guard
-        // (mirroring fork #358 M4's `handle_work_done` guard) lands in the
-        // next commit — this commit adds only the `DelegateSignal` fields
-        // and the tests that pin the guard's absence/presence.
+        // Issue #567 (mirrors fork #358 M4's `handle_work_done` guard exactly —
+        // see `DelegateSignal::generation`/`daemon_boot_id` for the full
+        // reasoning): refuse a `delegate` whose sending pane was re-registered
+        // (worktree teardown + reuse) or whose daemon has restarted since this
+        // signal was produced, BEFORE any routing/dispatch below runs — a
+        // stale `Delegate` from a pane the daemon has since moved on from must
+        // never fan out into whatever now occupies that pane_id. Read directly
+        // from `pane_registration_generation` (not derived from `pane_role_map`
+        // alone) for the same reason `handle_work_done` does: it is the
+        // compound `(generation, daemon_boot_id)` key that distinguishes a
+        // stale signal from a live one, not mere presence in the role map.
+        let current_generation = self
+            .pane_registration_generation
+            .get(&signal.pane_id)
+            .copied();
+        let current_boot_id = self.daemon_boot_id();
+        if current_generation != Some(signal.generation) || current_boot_id != signal.daemon_boot_id
+        {
+            warn!(
+                pane_id = %signal.pane_id,
+                role = ?self.pane_role_map.get(&signal.pane_id),
+                signal_generation = signal.generation,
+                current_generation = ?current_generation,
+                signal_boot_id = %signal.daemon_boot_id,
+                current_boot_id = %current_boot_id,
+                "delegate: refusing stale signal — pane was re-registered or the \
+                 daemon restarted since this signal was produced (generation/boot id \
+                 mismatch)"
+            );
+            return DelegateResponse {
+                error: Some(format!(
+                    "pane {} was re-registered or the daemon restarted since this delegate \
+                     signal was produced (registration generation/boot id mismatch); refusing \
+                     rather than risk routing a stale delegate into a reused pane/worktree.",
+                    signal.pane_id
+                )),
+                ..Default::default()
+            };
+        }
 
         let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
         // PRD #126 + #140: the cwd of the `.dot-agent-deck.toml` that DEFINES this
