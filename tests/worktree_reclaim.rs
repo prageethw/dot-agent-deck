@@ -2695,6 +2695,8 @@ async fn worktree_reclaim_045_issue_dispatch_producer_records_keep_if_dirty() {
         label: None,
         query: None,
         triage: false,
+        repo_allowlist: None,
+        dry_run: false,
     };
 
     dot_agent_deck::issue_dispatch_run::run_issue_dispatch(

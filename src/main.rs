@@ -3528,6 +3528,12 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
                 label,
                 query,
                 triage,
+                // Issue #171: no CLI flag for either yet — a hand-edit of the
+                // resulting TOML is how `repo_allowlist`/`dry_run` get set
+                // today, matching this fork's existing pattern for advanced
+                // knobs added without a matching `schedule add` flag.
+                repo_allowlist: None,
+                dry_run: false,
             });
             schedule_cli::add(
                 &mut tasks,

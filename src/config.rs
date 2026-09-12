@@ -558,6 +558,25 @@ pub struct IssueDispatchConfig {
     /// a required part of dispatch.
     #[serde(default)]
     pub triage: bool,
+    /// Issue #171: opt-in allowlist of `owner/name` slugs this task is
+    /// permitted to write to. `None` (the default, unset) is unchanged
+    /// behaviour — a hand-written config that never names this key keeps
+    /// dispatching exactly as before. `Some(list)` fails CLOSED: when `repo`
+    /// is not a member, the run refuses to do ANY work for this config entry
+    /// (no `gh`/`git` invocation at all, not merely the writes) and logs why,
+    /// mirroring `derive_repo_slug`'s (`src/worktree_reclaim.rs`) "refuse
+    /// rather than guess" contract rather than trying to partially proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_allowlist: Option<Vec<String>>,
+    /// Issue #171: when true, every `gh` WRITE this module would otherwise
+    /// perform (the claim comment, the `in-progress`/triage label creation,
+    /// the assignee best-effort) is logged with what it would have done and
+    /// skipped rather than executed — the natural way to try a new schedule
+    /// safely. Reads (`gh issue list`, `gh pr list`, `gh issue view`, `gh api
+    /// user`) and the local repo clone/fetch still happen, so a dry run still
+    /// reports genuine dispatch/skip decisions. Off by default.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// One `[[scheduled_tasks]]` entry from the global
