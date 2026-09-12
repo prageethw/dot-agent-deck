@@ -2794,10 +2794,14 @@ fn dispatch_033_dry_run_skips_all_gh_writes() {
     // moment a prohibited call appears (catching a regression fast); it only
     // waits out the full timeout when none ever does, mirroring
     // `dispatch_030`'s identical negative-assertion pattern above.
+    // `l.contains("issue comment")`, NOT the looser `contains("issue") &&
+    // contains("comment")`: the claim-issue flow's OWN read
+    // (`issue_view_claim_state_argv`'s "issue view --json
+    // comments,assignees") legitimately contains both substrings
+    // independently and must not be mistaken for the write this asserts
+    // against.
     let wrote_comment = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls()
-            .iter()
-            .any(|l| l.contains("issue") && l.contains("comment"))
+        stub.gh_calls().iter().any(|l| l.contains("issue comment"))
     });
     assert!(
         !wrote_comment,
