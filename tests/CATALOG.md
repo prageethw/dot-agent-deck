@@ -6821,6 +6821,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the status colour for any other status/flag combination not covered above (covered by `status_color_for`'s own unit test); the CLI `daemon status` text surface (covered by `daemon/status` specs); the selected-card variant (covered by `theme/palette/003`, `006`).
 - **Platform coverage:** mac+linux+windows.
 
+##### theme/palette/008 — A card whose raw status is `Idle` but which carries an outstanding, unacknowledged delegation (issue #755) renders distinctly: `STATUS_OBSERVING` border colour plus a `(delegated)` badge suffix.
+- **Layer:** L1 (ratatui `TestBackend`, color-aware capture).
+- **Agent:** none (one live session fixture with `outstanding_delegation: Some(..)`, one genuinely idle control fixture).
+- **Asserts:** rendering an unselected deck card for an `Idle` session whose `outstanding_delegation` is `Some(..)` resolves its border to `palette::STATUS_OBSERVING`, not the plain Idle-status `Color::DarkGray`, and its rendered badge text contains the `"(delegated)"` suffix; a genuinely idle session (`outstanding_delegation: None`) renders completely unaffected — plain `Idle` label, plain `STATUS_IDLE` border — so the new branch cannot leak onto every idle card.
+- **Does not assert:** the bell/tab-bar-aggregate-count consequences of the same field (covered by the plain `#[test]`s alongside `compute_bell_needed` in `src/ui.rs` and `aggregate_stats` in `src/state.rs`, neither of which carries a catalog spec id); the reconnect/hydration plumbing that populates the field (covered by `tests/rehydration.rs`); live-updates between reconnects (not implemented — see `SessionState::outstanding_delegation`'s doc).
+- **Platform coverage:** mac+linux+windows.
+
 ### Mode indication (PRD #341)
 
 #### mode/cursor

@@ -396,6 +396,7 @@ fn make_session(
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     }
 }
 
@@ -2658,6 +2659,7 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
             h.agent_type.clone(),
             Some(h.agent_id.clone()),
             h.live.as_ref(),
+            h.outstanding_delegation.clone(),
         );
     }
 
@@ -2789,6 +2791,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         None, // spawn-time agent_type None — overridden by the snapshot
         Some(agent_id.to_string()),
         Some(&snap),
+        None,
     );
     assert_eq!(
         state
@@ -3096,6 +3099,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
@@ -3117,6 +3121,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         Some(AgentType::ClaudeCode), // spawn-time agent_type — the real one
         Some(agent_id.to_string()),
         Some(&snap),
+        None,
     );
 
     let sessions: Vec<&SessionState> = state
@@ -3336,6 +3341,7 @@ fn live_010_rehydrate_preserves_history_and_view_only_writability() {
             Some(AgentType::Codex),
             Some(format!("agent-{pane_id}")),
             Some(&snapshot),
+            None,
         );
 
         let session = state
@@ -3418,6 +3424,7 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
         pane.agent_type.clone(),
         Some(pane.agent_id.clone()),
         pane.live.as_ref(),
+        pane.outstanding_delegation.clone(),
     );
     let rebuilt = fresh_tui_state
         .sessions
@@ -3583,6 +3590,7 @@ fn live_015_rehydration_preserves_shell_synthetic_working() {
             Some(AgentType::ClaudeCode),
             Some(format!("agent-{pane}")),
             Some(&snapshot),
+            None,
         );
     }
 
@@ -3884,6 +3892,7 @@ async fn live_016_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
                 h.agent_type.clone(),
                 Some(h.agent_id.clone()),
                 h.live.as_ref(),
+                h.outstanding_delegation.clone(),
             );
         }
         assert_eq!(
@@ -4166,6 +4175,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
                 h.agent_type.clone(),
                 Some(h.agent_id.clone()),
                 h.live.as_ref(),
+                h.outstanding_delegation.clone(),
             );
         }
         assert_eq!(
@@ -4335,6 +4345,7 @@ fn live_019_rehydration_preserves_model() {
         Some(AgentType::ClaudeCode),
         Some("agent-model".to_string()),
         Some(&snapshot),
+        None,
     );
 
     let rehydrated = tui

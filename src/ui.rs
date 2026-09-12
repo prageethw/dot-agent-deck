@@ -14350,6 +14350,7 @@ pub fn run_tui(
                 h.agent_type.clone(),
                 Some(h.agent_id.clone()),
                 h.live.as_ref(),
+                h.outstanding_delegation.clone(),
             );
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
@@ -24152,6 +24153,7 @@ pub fn render_orchestration_frame_to_buffer(
                 model: None,
                 expects_agent_report: false,
                 agent_report_activity_seen: false,
+                outstanding_delegation: None,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -27804,6 +27806,7 @@ mod tests {
             tab_membership: membership,
             agent_type: None,
             live: None,
+            outstanding_delegation: None,
         }
     }
 
@@ -29799,6 +29802,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31634,6 +31638,7 @@ mod tests {
                 model: None,
                 expects_agent_report: false,
                 agent_report_activity_seen: false,
+                outstanding_delegation: None,
             },
         );
 
@@ -33669,6 +33674,7 @@ mod tests {
             shell_descendant_busy: false,
             wait_deferred_revert: false,
             model: None,
+            outstanding_delegation: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
         };
@@ -35667,6 +35673,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         }
     }
 
@@ -35721,6 +35728,36 @@ mod tests {
         };
         let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
         assert!(need_bell);
+    }
+
+    /// Issue #755: `bell.on_idle` must not ring for a pane that only LOOKS
+    /// idle because the daemon still has a `delegate` armed against it with
+    /// no `work-done` yet — the same "this Idle isn't the whole story" guard
+    /// `render_session_card`'s badge applies. A transition to Idle with no
+    /// outstanding delegation (the case `bell_respects_config_toggle_on`
+    /// above pins) must still ring exactly as before.
+    #[test]
+    fn bell_suppressed_for_idle_with_outstanding_delegation() {
+        let mut delegated_session = make_session(SessionStatus::Idle);
+        delegated_session.outstanding_delegation = Some(crate::agent_pty::WatchSnapshot {
+            armed_secs_ago: 5,
+            orchestrator_pane_id: "orch-pane".to_string(),
+        });
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), delegated_session);
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(
+            !need_bell,
+            "an Idle transition must not ring bell.on_idle while a delegation is outstanding"
+        );
     }
 
     #[test]
@@ -36192,6 +36229,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
 
         // Spacious: get all 3
@@ -36235,6 +36273,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -36269,6 +36308,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

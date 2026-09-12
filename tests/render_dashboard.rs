@@ -104,6 +104,7 @@ fn pane_004_card_title_row() {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -156,6 +157,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     }
 }
 
@@ -555,6 +557,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -799,6 +802,7 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -897,6 +901,7 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1022,6 +1027,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1365,6 +1371,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let placeholder_on = render_card_for_mode_to_buffer(
         &placeholder,
@@ -1973,6 +1980,7 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         // (raw, `agent_type == AgentType::None`) stays true.
         expects_agent_report: false,
         agent_report_activity_seen: true,
+        outstanding_delegation: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -2288,6 +2296,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     }
 }
 
@@ -2659,6 +2668,78 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
         bold_at_waiting_color,
         "WaitingForInput's own Modifier::BOLD must survive when the wait flags are set but the \
          status gate blocks the observing override; got:\n{rendered}"
+    );
+}
+
+/// Scenario: issue #755 — a card whose raw, hook-event-derived status is
+/// `Idle` but whose daemon-side `outstanding_delegation` is armed (a
+/// `delegate` was sent to this pane and no `work-done` has landed yet) must
+/// render distinctly from a genuinely idle card: both its badge label (an
+/// `" (delegated)"` suffix, mirroring the `" (observing)"` convention
+/// `theme/palette/007` already pins for a wait-held `Working`) and its border
+/// color (`palette::STATUS_OBSERVING`, reused rather than a new role — see
+/// that constant's doc). A genuinely idle card (no outstanding delegation)
+/// must keep rendering plain `Idle` in `STATUS_IDLE` DarkGray unchanged.
+#[spec("theme/palette/008")]
+#[test]
+fn palette_008_idle_card_with_outstanding_delegation_shows_delegated_badge_and_color() {
+    let mut session = palette_session(SessionStatus::Idle);
+    session.outstanding_delegation = Some(dot_agent_deck::agent_pty::WatchSnapshot {
+        armed_secs_ago: 42,
+        orchestrator_pane_id: "orch-pane".to_string(),
+    });
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,     // animation tick
+        false, // not selected
+        width,
+        height,
+    );
+    let (border_fg, _modifier) = border_style_at_mid(&buffer);
+    assert_eq!(
+        border_fg,
+        dot_agent_deck::palette::STATUS_OBSERVING,
+        "an Idle card with an outstanding delegation must resolve its border through \
+         STATUS_OBSERVING, not plain Idle DarkGray; got {border_fg:?}"
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("delegated"),
+        "an Idle card with an outstanding delegation must show the \"(delegated)\" marker; \
+         got:\n{rendered}"
+    );
+
+    // Negative case: a genuinely idle card (no outstanding delegation) must be
+    // completely unaffected — plain "Idle" label, plain STATUS_IDLE border.
+    let genuinely_idle = palette_session(SessionStatus::Idle);
+    assert!(genuinely_idle.outstanding_delegation.is_none());
+    let buffer = render_card_to_buffer(
+        &genuinely_idle,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        height,
+    );
+    let (border_fg, _modifier) = border_style_at_mid(&buffer);
+    assert_eq!(
+        border_fg,
+        dot_agent_deck::palette::STATUS_IDLE,
+        "a genuinely idle card (no outstanding delegation) must keep its plain Idle border; \
+         got {border_fg:?}"
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        !rendered.contains("delegated"),
+        "a genuinely idle card must never show the \"(delegated)\" marker; got:\n{rendered}"
     );
 }
 
@@ -3116,6 +3197,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -3328,6 +3410,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         model: Some("Opus".to_string()),
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -3604,6 +3687,7 @@ fn filled_session() -> SessionState {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     }
 }
 
@@ -4282,6 +4366,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -4396,6 +4481,7 @@ fn pane_015_declared_agent_pending_report_shows_starting_not_live_status() {
         // never resolved by any real activity.
         expects_agent_report: true,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     };
     let density = CardDensityKind::Normal;
     let buffer = render_card_with_declared_agent_to_buffer(
@@ -4523,6 +4609,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     }
 }
 

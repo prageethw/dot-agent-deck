@@ -60,6 +60,16 @@ pub struct HydratedPane {
     /// agent that never emitted an event — falls back to today's placeholder
     /// seeding via [`crate::state::AppState::seed_hydrated_session`].
     pub live: Option<crate::state::SessionSnapshot>,
+    /// Issue #755: this pane's [`AgentRecord::outstanding_delegation`] — the
+    /// daemon's `AgentPtyRegistry::delegation_watch_snapshot` join, sibling to
+    /// `live` above. `Some(..)` means the daemon still owes this pane's
+    /// orchestrator a `work-done`; seeded onto
+    /// [`crate::state::SessionState::outstanding_delegation`] via
+    /// `seed_hydrated_session` so the dashboard badge, idle bell, and
+    /// aggregate idle count can all tell a delegated pane apart from a
+    /// genuinely idle one. `None` for an older daemon, the dummy-state attach
+    /// path, or a pane with nothing outstanding.
+    pub outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
 }
 
 /// Commands the per-pane I/O task drains from `input_rx`. `Input` carries
@@ -1588,6 +1598,7 @@ impl EmbeddedPaneController {
                 tab_membership: record.tab_membership.clone(),
                 agent_type: record.agent_type.clone(),
                 live: record.live.clone(),
+                outstanding_delegation: record.outstanding_delegation.clone(),
             });
         }
         hydrated

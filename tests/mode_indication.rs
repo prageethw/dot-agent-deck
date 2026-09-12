@@ -143,6 +143,7 @@ fn selected_card_fixture() -> SessionState {
         model: None,
         expects_agent_report: false,
         agent_report_activity_seen: false,
+        outstanding_delegation: None,
     }
 }
 
