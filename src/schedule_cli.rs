@@ -444,6 +444,8 @@ mod tests {
                 label: Some("agent-eligible".to_string()),
                 query: Some("is:open label:bug".to_string()),
                 triage,
+                repo_allowlist: None,
+                dry_run: false,
             }),
         }
     }
@@ -530,6 +532,8 @@ mod tests {
                 label: Some("-rf".to_string()),
                 query: None,
                 triage,
+                repo_allowlist: None,
+                dry_run: false,
             });
             assert!(add(&mut tasks, args).is_err());
             assert!(tasks.is_empty());

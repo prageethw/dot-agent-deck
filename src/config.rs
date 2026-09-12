@@ -558,6 +558,32 @@ pub struct IssueDispatchConfig {
     /// a required part of dispatch.
     #[serde(default)]
     pub triage: bool,
+    /// Issue #171: opt-in allowlist of `owner/name` slugs this task is
+    /// permitted to write to. `None` (the default, unset) is unchanged
+    /// behaviour — a hand-written config that never names this key keeps
+    /// dispatching exactly as before. `Some(list)` fails CLOSED: when `repo`
+    /// is not a member, the run refuses to do ANY work for this config entry
+    /// (no `gh`/`git` invocation at all, not merely the writes) and logs why,
+    /// mirroring `derive_repo_slug`'s (`src/worktree_reclaim.rs`) "refuse
+    /// rather than guess" contract rather than trying to partially proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_allowlist: Option<Vec<String>>,
+    /// Issue #171: when true, a run makes exactly the same idempotency
+    /// decision a real run would (the reads: `gh issue list`, `gh pr list`,
+    /// `gh issue view`, `gh api user`, plus the worktree/label/open-PR
+    /// checks), reports it, and then returns immediately once that decision
+    /// resolves to `Dispatch` — performing no worktree creation, no branch,
+    /// no agent spawn, and no `gh` WRITE (claim comment, `in-progress`/triage
+    /// label, assignee best-effort) at all. This stops strictly before
+    /// `create_worktree`, deliberately: that call would leave the same
+    /// on-disk `created-by:` marker and registry entry a real dispatch
+    /// leaves, which a later real run's idempotency check (`worktree_exists`)
+    /// would then read as "already claimed" and silently skip — poisoning
+    /// the next real fire. Stopping earlier makes that impossible rather
+    /// than merely avoided by convention. The natural way to try a new
+    /// schedule safely. Off by default.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// One `[[scheduled_tasks]]` entry from the global

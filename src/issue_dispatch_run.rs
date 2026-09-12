@@ -582,6 +582,32 @@ pub async fn run_issue_dispatch(
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
 ) {
+    // Issue #171 — fail CLOSED, before any `gh`/`git` invocation at all: when
+    // `cfg.repo_allowlist` is configured and `cfg.repo` is not a member,
+    // refuse the entire run for this config entry. Deliberately the very
+    // first check in this function, ahead of even `canonical_workspace` —
+    // this must abort before `provision_repo`'s `gh repo clone`/`git fetch`
+    // and before `list_open_issues`'s `gh issue list`, not merely before the
+    // later claim writes, mirroring `derive_repo_slug`'s (`worktree_reclaim.rs`)
+    // "refuse rather than guess" contract for a misconfigured/over-broad
+    // target rather than letting a partial run touch the wrong repo.
+    if let Some(allowlist) = &cfg.repo_allowlist
+        && !allowlist.iter().any(|allowed| allowed == &cfg.repo)
+    {
+        let message = format!(
+            "repo {:?} is not in the configured repo_allowlist {allowlist:?}; refusing to \
+             dispatch or write (fail-closed, issue #171)",
+            cfg.repo
+        );
+        tracing::warn!(repo = %cfg.repo, task = task_name, "issue-dispatch: {message}");
+        notifier.notify(NotifyEvent::IssueDispatchRepoError {
+            task: task_name.to_string(),
+            repo: cfg.repo.clone(),
+            message,
+        });
+        return;
+    }
+
     // S5 — every derived path (clone, worktree, the spawn's orchestration_cwd)
     // must be absolute: a relative workspace root would double-nest the worktree
     // under `git -C <clone> worktree add <relative>` and drop orchestration_cwd
@@ -638,7 +664,7 @@ pub async fn run_issue_dispatch(
     // vocabulary below, this is NOT gated on `cfg.triage` — the claim itself
     // never is. Best-effort like `claim_issue`: a `gh` failure here must not
     // abort the run.
-    ensure_claim_label(&cfg.repo).await;
+    ensure_claim_label(&cfg.repo, cfg.dry_run).await;
 
     // PRD fork#235 M2: resolve the currently-authenticated `gh` login ONCE
     // per run, beside `ensure_claim_label` above — one `gh api user` call
@@ -653,7 +679,7 @@ pub async fn run_issue_dispatch(
     // failure here must not abort the run or turn a later successful dispatch
     // into a failure.
     if cfg.triage {
-        ensure_labels(&cfg.repo).await;
+        ensure_labels(&cfg.repo, cfg.dry_run).await;
     }
 
     // S2 — `max_per_run` caps the issues CONSIDERED per run (not the number newly
@@ -787,6 +813,31 @@ async fn dispatch_one_issue(
             return Ok(());
         }
         DispatchDecision::Dispatch => {}
+    }
+
+    // Issue #171 (auditor F2 fix, PR #753): a DRY RUN stops here, having made
+    // exactly the same idempotency decision a real run would, WITHOUT doing
+    // any of the work a real dispatch does — no worktree, no branch, no agent
+    // spawn, and (as already true before this fix) no `gh` write. This is
+    // deliberately BEFORE `create_worktree`, not merely before `claim_issue`
+    // at the bottom of this function: `create_worktree` writes the exact same
+    // `created-by:` marker and registers the worktree in `WorktreeRegistry` a
+    // real dispatch would, so letting a dry run reach it would leave real
+    // on-disk state behind. The PRIMARY idempotency signal above
+    // (`worktree_exists`, "the worktree is the ledger") would then read that
+    // dry-run-created worktree as "already claimed" on the very next REAL
+    // fire and skip it — silently dropping the real claim comment/label/
+    // assignee for good. Stopping before any disk/process side effect makes
+    // that poisoning structurally impossible rather than merely avoided by
+    // convention: a dry run can never leave anything for a later real run's
+    // ledger to trip over, because it never writes to that ledger at all.
+    if cfg.dry_run {
+        notifier.notify(NotifyEvent::IssueDispatchDryRun {
+            task: task_name.to_string(),
+            repo: cfg.repo.clone(),
+            issue,
+        });
+        return Ok(());
     }
 
     // M2.2 — create the per-issue worktree on `agent/issue-<n>`. A concurrent
@@ -964,7 +1015,23 @@ async fn dispatch_one_issue(
     // longer swallows the failure into `tracing::warn!` alone either — a
     // claim failure is now surfaced through the `Notifier` seam as its own
     // distinguishable event (see [`claim_issue`]).
-    claim_issue(&cfg.repo, issue, task_name, &identity, login, notifier).await;
+    //
+    // `cfg.dry_run` is always `false` by the time control reaches here — the
+    // dry-run early return above (auditor F2 fix) sends every `dry_run` fire
+    // back to the caller long before `create_worktree`/`spawn`. Still passed
+    // through rather than hardcoded to `false`: `claim_issue`'s own dry-run
+    // gating is independently unit-tested and stays correct as a defense in
+    // depth if this call site is ever reordered.
+    claim_issue(
+        &cfg.repo,
+        issue,
+        task_name,
+        &identity,
+        login,
+        notifier,
+        cfg.dry_run,
+    )
+    .await;
 
     Ok(())
 }
@@ -1010,6 +1077,11 @@ async fn claim_issue(
     identity: &Identity,
     login: Option<&str>,
     notifier: &dyn Notifier,
+    // Issue #171: when true, none of this function's three writes actually
+    // run `gh` — each is logged (what would have been sent) and skipped. The
+    // removal-target READ just below is unaffected: a dry run still reports
+    // what it would have done against genuine current state.
+    dry_run: bool,
 ) {
     // PRD fork#235 FINAL round 5, mirroring `issue_claim::run_issue_claim`'s
     // identical fix on the CLI path: the removal target is `current GitHub
@@ -1039,7 +1111,7 @@ async fn claim_issue(
     let timestamp = chrono::Utc::now().to_rfc3339();
     let body = claim_comment_body(identity, &timestamp, login, None);
     let comment_argv = issue_comment_argv(repo, issue, &body);
-    if let Err(e) = run_status_args("gh", &comment_argv).await {
+    if let Err(e) = run_gh_write(dry_run, &comment_argv, "post the claim comment", repo).await {
         notifier.notify(NotifyEvent::IssueClaimFailed {
             task: task_name.to_string(),
             repo: repo.to_string(),
@@ -1049,7 +1121,7 @@ async fn claim_issue(
     }
 
     let label_argv = issue_edit_add_label_argv(repo, issue, IN_PROGRESS_LABEL);
-    if let Err(e) = run_status_args("gh", &label_argv).await {
+    if let Err(e) = run_gh_write(dry_run, &label_argv, "write the in-progress label", repo).await {
         notifier.notify(NotifyEvent::IssueClaimFailed {
             task: task_name.to_string(),
             repo: repo.to_string(),
@@ -1066,7 +1138,7 @@ async fn claim_issue(
         // (`issue/claim/019`) cannot arise here; no special-case guard
         // needed.
         let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), &remove);
-        if let Err(e) = run_status_args("gh", &assignee_argv).await {
+        if let Err(e) = run_gh_write(dry_run, &assignee_argv, "write the assignee", repo).await {
             notifier.notify(NotifyEvent::IssueClaimFailed {
                 task: task_name.to_string(),
                 repo: repo.to_string(),
@@ -1075,6 +1147,30 @@ async fn claim_issue(
             });
         }
     }
+}
+
+/// Issue #171: execute one `gh` WRITE call — unless `dry_run`, in which case
+/// log what WOULD have run (the full argv, so the log is actionable) and skip
+/// execution, reporting `Ok(())` rather than attempting anything. A dry run
+/// must never surface a write it never attempted as an
+/// `IssueClaimFailed`/label-ensure warning, so this always succeeds.
+async fn run_gh_write(
+    dry_run: bool,
+    argv: &[String],
+    what: &str,
+    repo: &str,
+) -> Result<(), String> {
+    if dry_run {
+        tracing::info!(
+            repo,
+            what,
+            argv = %argv.join(" "),
+            "issue-dispatch: dry-run — would run `gh {}` to {what}, but performing no write",
+            argv.join(" ")
+        );
+        return Ok(());
+    }
+    run_status_args("gh", argv).await
 }
 
 /// PRD fork#235 M2: resolve the currently-authenticated `gh` login ONCE per
@@ -1124,14 +1220,14 @@ async fn resolve_current_login(repo: &str) -> Option<String> {
 /// a `gh` failure here is logged and the run continues; the label being
 /// missing is instead caught (and now reported, via C3) when `claim_issue`'s
 /// own add-label call fails.
-async fn ensure_claim_label(repo: &str) {
+async fn ensure_claim_label(repo: &str, dry_run: bool) {
     let argv = label_create_argv(
         repo,
         IN_PROGRESS_LABEL,
         IN_PROGRESS_LABEL_COLOR,
         IN_PROGRESS_LABEL_DESCRIPTION,
     );
-    if let Err(e) = run_status_args("gh", &argv).await {
+    if let Err(e) = run_gh_write(dry_run, &argv, "ensure the in-progress claim label", repo).await {
         tracing::warn!(
             repo,
             label = IN_PROGRESS_LABEL,
@@ -1152,10 +1248,10 @@ async fn ensure_claim_label(repo: &str) {
 /// reads labels, so this is optional polish rather than something the gate
 /// depends on. (N2: named `ensure_labels`, not `ensure_triage_labels` — it
 /// ensures more than the triage vocabulary now.)
-async fn ensure_labels(repo: &str) {
+async fn ensure_labels(repo: &str, dry_run: bool) {
     for label in TRIAGE_LABELS.into_iter().chain(TYPE_LABELS) {
         let argv = label_create_argv(repo, label.name, label.color, label.description);
-        if let Err(e) = run_status_args("gh", &argv).await {
+        if let Err(e) = run_gh_write(dry_run, &argv, "ensure a triage label", repo).await {
             tracing::warn!(
                 repo,
                 label = label.name,
@@ -5809,6 +5905,7 @@ exit 0
             &identity,
             Some("sameuser"),
             &crate::scheduler::StderrNotifier,
+            false,
         ));
 
         // SAFETY: see the comment on the previous unsafe block.
@@ -5984,6 +6081,7 @@ exit 0
             &identity,
             Some("stub-user"),
             &crate::scheduler::StderrNotifier,
+            false,
         ));
 
         // SAFETY: see the comment on the previous unsafe block.
@@ -6112,6 +6210,7 @@ exit 0
             &identity,
             Some("stub-user"),
             &crate::scheduler::StderrNotifier,
+            false,
         ));
 
         // SAFETY: see the comment on the previous unsafe block.

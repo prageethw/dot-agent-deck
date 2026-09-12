@@ -2672,3 +2672,321 @@ fn dispatch_030_gh_api_user_failure_skips_assignee_without_failing_dispatch() {
         daemon.stderr_text()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #171 — repo allowlist + dry-run
+// ---------------------------------------------------------------------------
+
+/// Scenario: Fire an `issue_dispatch` task whose `[scheduled_tasks.issue_dispatch]`
+/// table carries a `repo_allowlist` that does NOT include the task's own
+/// `repo` — a misconfigured/over-broad schedule pointed at the wrong target.
+/// Assert the run refuses outright, fail-closed: NO `gh` invocation of any
+/// kind is ever made (not the issue enumeration, not the repo clone), no
+/// per-issue worktree is created, and the daemon's stderr names the refusal.
+#[spec("scheduler/dispatch/032")]
+#[test]
+fn dispatch_032_repo_allowlist_refuses_when_repo_not_listed() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    // A fully working fixture (real clone-able remote, a real open issue) so
+    // this test's guard, if it were ever removed, would produce an OBSERVABLE
+    // dispatch (worktree + agent) rather than coincidentally erroring on a
+    // missing fixture — the RED this test pins is about the guard, not about
+    // an incidentally-broken repo.
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[9]);
+
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let mut toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    toml.push_str("repo_allowlist = [\"acme/other\"]\n");
+
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let refused = daemon.wait_for_stderr_contains("repo_allowlist", W);
+    assert!(
+        refused,
+        "a repo excluded from repo_allowlist must be refused with a message naming the \
+         allowlist; stderr:\n{}",
+        daemon.stderr_text()
+    );
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 9);
+    assert!(
+        !paths.worktree_dir.exists(),
+        "a refused repo must never be dispatched into a per-issue worktree"
+    );
+
+    assert!(
+        stub.gh_calls().is_empty(),
+        "a repo excluded by repo_allowlist must produce ZERO `gh` invocations — not even the \
+         issue-enumeration read — since the refusal must happen before any `gh`/`git` call; \
+         observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+}
+
+/// Scenario: Fire an `issue_dispatch` task with `dry_run = true` against a
+/// repo/issue with no other claim signal. Assert the dry run reports a
+/// genuine dispatch decision (a daemon stderr line naming the issue) but
+/// performs NONE of the actual dispatch work — no per-issue worktree or
+/// branch is created on disk, no agent is spawned — and, as before, none of
+/// the three claim writes (`gh issue comment`, `gh issue edit --add-label`,
+/// `gh issue edit --add-assignee`) nor the unconditional `gh label create`
+/// ensure ever reach the stub `gh`. Auditor F2 (PR #753): a dry run that
+/// reached `create_worktree` here would leave real on-disk state — the exact
+/// worktree/branch/marker a real dispatch writes — that a SUBSEQUENT real
+/// run's idempotency check would then mistake for "already claimed";
+/// `scheduler/dispatch/034` pins that two-run scenario end-to-end, and this
+/// test pins the prerequisite it depends on: a dry run must never reach
+/// `create_worktree`/`spawn` at all.
+#[spec("scheduler/dispatch/033")]
+#[test]
+fn dispatch_033_dry_run_reports_decision_without_side_effects() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, false);
+    stub.seed_labels(repo, &[IN_PROGRESS_LABEL]);
+    stub.set_issues(repo, &[11]);
+
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let mut toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    toml.push_str("dry_run = true\n");
+
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let reported = daemon.wait_for_stderr_contains("dry run", W);
+    assert!(
+        reported,
+        "a dry run must report the dispatch decision for issue #11 on stderr; stderr:\n{}",
+        daemon.stderr_text()
+    );
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 11);
+    assert!(
+        !paths.worktree_dir.exists(),
+        "a dry run must never create the per-issue worktree on disk — auditor F2 (PR #753): \
+         that on-disk state is exactly what a later REAL run's idempotency check would mistake \
+         for \"already claimed\""
+    );
+
+    // Give a (regressed) spawn time to land — `wait_until` exits EARLY the
+    // moment one appears (catching a regression fast), mirroring
+    // `dispatch_030`'s identical negative-assertion pattern.
+    let spawned = common::wait_until(Duration::from_secs(3), || {
+        daemon
+            .agent_records()
+            .iter()
+            .any(|r| single_card_in(r, &paths.worktree_dir))
+    });
+    assert!(
+        !spawned,
+        "a dry run must never spawn a real agent into the per-issue worktree"
+    );
+
+    // `l.contains("issue comment")`, NOT the looser `contains("issue") &&
+    // contains("comment")`: the claim-issue flow's OWN read
+    // (`issue_view_claim_state_argv`'s "issue view --json
+    // comments,assignees") legitimately contains both substrings
+    // independently and must not be mistaken for the write this asserts
+    // against. Moot for THIS test now (a dry run never reaches `claim_issue`
+    // at all), kept so a regression that made it reach that far would still
+    // be caught by name rather than only by the worktree/spawn assertions
+    // above.
+    let wrote_comment = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| l.contains("issue comment"))
+    });
+    assert!(
+        !wrote_comment,
+        "dry_run must suppress the claim comment write entirely; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    let wrote_label_add = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| l.contains("--add-label"))
+    });
+    assert!(
+        !wrote_label_add,
+        "dry_run must suppress the `in-progress` label write entirely; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    let wrote_label_create = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("label") && l.contains("create"))
+    });
+    assert!(
+        !wrote_label_create,
+        "dry_run must suppress the unconditional `gh label create` claim-label ensure too; \
+         observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    let assigned = common::wait_until(Duration::from_secs(3), || {
+        !stub.assignees(repo, 11).is_empty()
+    });
+    assert!(
+        !assigned,
+        "dry_run must suppress the assignee write entirely — got assignees {:?}",
+        stub.assignees(repo, 11)
+    );
+
+    assert!(
+        !stub.label_applied(repo, 11, IN_PROGRESS_LABEL),
+        "dry_run must never actually apply the `in-progress` label"
+    );
+}
+
+/// Scenario: Fire an `issue_dispatch` task with `dry_run = true` against a
+/// repo/issue, then fire a SECOND, separate daemon configured with
+/// `dry_run = false` (the default) against the exact same workspace, repo,
+/// and issue. Assert the real run genuinely claims/dispatches the issue — a
+/// per-issue worktree is created, an agent is spawned, and the claim comment
+/// / `in-progress` label are written for real. This is auditor finding F2 on
+/// PR #753, end to end: before the fix, the dry run's `create_worktree` call
+/// left the exact on-disk marker a real dispatch writes, so the PRIMARY
+/// idempotency signal (`worktree_exists`) treated the issue as already
+/// claimed on this second, real fire and silently skipped it — the real
+/// claim comment/label/assignee were never posted. `scheduler/dispatch/033`
+/// pins the prerequisite (a dry run alone never creates the worktree); this
+/// test pins the consequence that actually mattered — a REAL run after a
+/// dry run must still do real work.
+#[spec("scheduler/dispatch/034")]
+#[test]
+fn dispatch_034_dry_run_then_real_run_still_dispatches_for_real() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, false);
+    stub.set_issues(repo, &[21]);
+
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 21);
+
+    // First fire: a dry run against issue #21, over its own daemon.
+    {
+        let mut dry_toml = dispatch_task(
+            "dispatch-task",
+            &work_str,
+            "ISSUEDISPATCH-{{issue_number}}",
+            repo,
+            5,
+        );
+        dry_toml.push_str("dry_run = true\n");
+        let dry_daemon = common::spawn_daemon_serve_with_env(Some(&dry_toml), "0", &env);
+        dry_daemon
+            .run_now("dispatch-task")
+            .expect("run-now dispatch-task (dry run)");
+
+        let reported = dry_daemon.wait_for_stderr_contains("dry run", W);
+        assert!(
+            reported,
+            "the dry run must report a dispatch decision for issue #21; stderr:\n{}",
+            dry_daemon.stderr_text()
+        );
+
+        assert!(
+            !paths.worktree_dir.exists(),
+            "the dry run must never create the per-issue worktree — a subsequent real run's \
+             idempotency check treating it as already-claimed is exactly the auditor F2 defect \
+             this test pins; worktree unexpectedly present at {:?}",
+            paths.worktree_dir
+        );
+
+        // `dry_daemon` (and the agent it must never have spawned) is torn
+        // down here, before the second, real daemon starts against the same
+        // workspace — Drop SIGKILLs its whole process group.
+    }
+
+    // Second fire: a SEPARATE daemon, `dry_run = false` (the default),
+    // against the SAME workspace/repo/issue the dry run above just touched.
+    let real_toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let real_daemon = common::spawn_daemon_serve_with_env(Some(&real_toml), "0", &env);
+    real_daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task (real run)");
+
+    assert!(
+        real_daemon
+            .wait_for_agent_where(|r| single_card_in(r, &paths.worktree_dir), W)
+            .is_some(),
+        "the REAL run after a preceding dry run must still dispatch issue #21 for real — a \
+         dry run must never leave behind on-disk state that a later real run's idempotency \
+         check mistakes for \"already claimed\""
+    );
+
+    let claimed_comment = common::wait_until(W, || {
+        stub.gh_calls().iter().any(|l| l.contains("issue comment"))
+    });
+    assert!(
+        claimed_comment,
+        "the real run must post the claim comment for issue #21 — if this never lands, the \
+         preceding dry run silently poisoned the real run's idempotency ledger; observed gh \
+         calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    assert!(
+        stub.label_applied(repo, 21, IN_PROGRESS_LABEL),
+        "the real run must actually apply the `in-progress` label to issue #21 — a skip caused \
+         by the dry run's leftover worktree would leave this false"
+    );
+
+    // `resolve_current_login` resolves to the stub's default `gh-stub-user`
+    // login (no `GhStub::fail_api_user`/`set_login` armed here), so a
+    // genuinely successful claim also writes the assignee — a fourth
+    // independent signal that this run is a real dispatch, not a skip.
+    let assigned = common::wait_until(W, || !stub.assignees(repo, 21).is_empty());
+    assert!(
+        assigned,
+        "the real run must write the assignee for issue #21 — got assignees {:?}",
+        stub.assignees(repo, 21)
+    );
+}
