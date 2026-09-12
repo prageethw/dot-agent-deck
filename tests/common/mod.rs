@@ -790,20 +790,21 @@ impl TuiDeck {
             // made isolated-clone provisioning the sole spawn path for every
             // orchestration, so the orchestrator's real cwd is a sibling
             // directory `resolve_workspace_path` derives from `work` and the
-            // orchestration's Name (`src/ui.rs`). Every real-agent orchestration
-            // test in this suite opens exactly one, the FIRST, orchestration
-            // against a fresh deck and accepts the form's suggested default
-            // Name rather than typing one, so that Name is deterministically
-            // `"{work-basename}-orchestrator-1"` (`suggest_orchestration_name`'s
-            // `n=1` candidate, always free on a fresh deck with no other live
-            // orchestrations). Pre-trust that predicted sibling path (raw and
+            // (PRD fork#760 Part A) auto-generated Worktree-slug segment
+            // (`src/ui.rs`). Every real-agent orchestration test in this
+            // suite opens exactly one, the FIRST, orchestration against a
+            // fresh deck and leaves BOTH Name and the Worktree-slug field
+            // untyped, so the auto-generated segment is deterministically
+            // `"orchestrator-1"` (`auto_generate_worktree_slug`'s first
+            // candidate, always free on a fresh deck with no prior sibling on
+            // disk). Pre-trust that predicted sibling path (raw and
             // canonicalized) the same way as `work` above — mirroring, not
-            // calling, `sanitize_workspace_segment`/`resolve_workspace_path`,
+            // calling, `auto_generate_worktree_slug`/`resolve_workspace_path`,
             // since both are private to `src/ui.rs` and this harness cannot
-            // depend on that crate's internals. A test that types a different
-            // Name, or opens a second orchestration, needs its own
+            // depend on that crate's internals. A test that types a Worktree
+            // slug, or opens a second orchestration, needs its own
             // `with_claude_project_trust(path)` call for that path — this only
-            // covers the common, default-name, first-orchestration case every
+            // covers the common, blank-slug, first-orchestration case every
             // caller in this suite actually uses.
             let isolated_clone_path = isolated_clone_sibling_path(&work, 1);
             claude_trust_paths.push(isolated_clone_path.to_string_lossy().into_owned());
@@ -5204,43 +5205,37 @@ fn import_claude_plugins_enabled() -> bool {
 }
 
 /// Predict the isolated-clone sibling directory an orchestration's role panes
-/// (the orchestrator role included) actually launch in. Composes with three
-/// production functions rather than fully reimplementing them:
-/// `suggest_orchestration_name` (the form's default Name,
-/// `"{work-basename}-orchestrator-{orchestrator_index}"`, offered when no
-/// other orchestration under that Name is already live) and
-/// `sanitize_workspace_segment` (`src/ui.rs`, private) are still *mirrored*
-/// rather than called — but `sanitize_workspace_segment`'s own first stage,
-/// `sanitize_clone_segment` (`src/issue_dispatch.rs`), is `pub` and is called
-/// directly below rather than re-derived by hand (fork issue #373 R3: the
-/// hand-copied version previously omitted this stage entirely, which is a
-/// real drift hazard even though it happens to be unreachable for every
-/// input this harness can actually produce — see `isolated_clone_sibling_path`'s
-/// pinning test in `tests/codex_trust_fixture.rs`). `resolve_workspace_path`
-/// (`work.with_file_name("{work-basename}-{segment}")`) is still mirrored,
-/// since it is trivial and private.
+/// (the orchestrator role included) actually launch in, for the common case
+/// every caller in this suite uses: a fresh deck's FIRST orchestration,
+/// opened with BOTH the form's default Name AND its (PRD fork#760 Part A)
+/// Worktree-slug field left untyped/blank.
 ///
-/// One stage remains a deliberate, documented gap: `suggest_orchestration_name`
-/// also `.trim()`s the directory basename (fork#192 audit F1b) before this
-/// harness's `typed_name` is built, which this mirror does not do. Every
-/// input this harness produces is a `tempfile`-generated `.tmpXXXXXX`
-/// basename, which has no leading/trailing whitespace, so the omission is
-/// inert for every reachable caller today — a caller that ever changed that
-/// would need this mirror updated too.
+/// PRD fork#760 Part A changed WHICH production formula this predicts.
+/// Before it, a blank Worktree slug fell back to deriving the segment from
+/// the typed/suggested Name (PRD fork#544 M2) — `suggest_orchestration_name`'s
+/// default Name, `"{work-basename}-orchestrator-{orchestrator_index}"`, ran
+/// through `sanitize_workspace_segment`/`sanitize_clone_segment` and then
+/// got embedded a SECOND time (unsanitized) as `resolve_workspace_path`'s own
+/// `dir_name` prefix — the double-basename shape
+/// (`.tmpUxkQzS-tmpUxkQzS-orchestrator-1`) this function used to predict.
+/// PRD fork#760 Part A's blank-slug case no longer touches Name at all: it
+/// auto-generates the segment directly as `"orchestrator-{orchestrator_index}"`
+/// (`auto_generate_worktree_slug` in `src/ui.rs`, scanning for the first `N`
+/// whose resolved sibling doesn't already exist on disk — always `N =
+/// orchestrator_index` for a fresh deck with no prior siblings, which is
+/// every caller here), then resolves via the same `resolve_workspace_path`
+/// (`work.with_file_name("{work-basename}-{segment}")`). Since
+/// `"orchestrator-N"` never needs sanitizing, and `dir_name` is used exactly
+/// ONCE (raw, unsanitized) rather than twice, this mirror is now trivial —
+/// verified against production behavior by `tests/codex_trust_fixture.rs`'s
+/// pinning test, which no longer needs adversarial-basename cases (there is
+/// no second, sanitized copy of `dir_name` left to exercise).
 ///
-/// Fork issue #373: PRD fork#544 M2b made isolated-clone provisioning the SOLE
-/// spawn path for every orchestration, so a real Claude/Codex process
-/// launched via the new-pane orchestration form runs here, not in `work`
-/// itself — verified byte-for-byte against a captured production path,
-/// `/var/tmp/dad-e2e-.../.tmpUxkQzS-tmpUxkQzS-orchestrator-1`, for
-/// `orchestrator_index = 1`.
-///
-/// `orchestrator_index` is the suggested Name's `-orchestrator-N` suffix —
-/// pass `1` for the common case this harness's callers all use today: a
-/// fresh deck's FIRST orchestration, opened with the form's default Name
-/// left untyped. A caller that types its own Name, or opens more than one
-/// orchestration in the same test, is not covered — trust that path
-/// separately with `with_claude_project_trust`.
+/// `orchestrator_index` is the auto-generated `-orchestrator-N` suffix — pass
+/// `1` for the common case this harness's callers all use today. A caller
+/// that types its own Worktree slug, or opens more than one orchestration in
+/// the same test, is not covered — trust that path separately with
+/// `with_claude_project_trust`.
 ///
 /// `pub(crate)`, not private: unlike `src/`'s library functions (which
 /// integration tests link as an external crate, so `pub(crate)` there is
@@ -5252,15 +5247,7 @@ pub(crate) fn isolated_clone_sibling_path(work: &Path, orchestrator_index: usize
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let typed_name = format!("{dir_name}-orchestrator-{orchestrator_index}");
-    let sanitized = dot_agent_deck::issue_dispatch::sanitize_clone_segment(&typed_name);
-    let segment = sanitized.trim_start_matches(['-', '.']);
-    let segment = if segment.is_empty() {
-        "issues"
-    } else {
-        segment
-    };
-    work.with_file_name(format!("{dir_name}-{segment}"))
+    work.with_file_name(format!("{dir_name}-orchestrator-{orchestrator_index}"))
 }
 
 /// Seed the per-test HOME's `~/.claude.json` so a daemon-spawned interactive
