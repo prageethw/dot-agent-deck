@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
+    DOT_AGENT_DECK_REGISTRATION_GENERATION, GuardedSend, SpawnOptions, TabMembership,
     WorkDoneProvenance,
 };
 use dot_agent_deck::event::{
@@ -5126,17 +5127,31 @@ struct CliDelegateResult {
 /// `hook_path`, exactly as a role's shell would from inside a pane —
 /// `DOT_AGENT_DECK_PANE_ID` is the only thing that identifies the caller to
 /// the daemon.
+///
+/// Issue #567: this subprocess is launched from the test harness's own
+/// process, not the orchestrator pane's real spawned child, so it never
+/// inherits the `DOT_AGENT_DECK_REGISTRATION_GENERATION` /
+/// `DOT_AGENT_DECK_DAEMON_BOOT_ID` env vars a real spawn injects
+/// (`src/spawn.rs`). Without them the signal defaults to `generation: 0` /
+/// `daemon_boot_id: ""`, which `handle_delegate_with_state`'s fork-#358-style
+/// guard never matches, and the delegate is refused before the behavior
+/// under test ever runs — same fix as fork issue #513 already applied to
+/// `work-done`'s equivalent CLI-subprocess helper. Callers pass back what
+/// `register_orchestration` recorded for the sending pane.
 #[cfg(unix)]
 async fn run_delegate_cli(
     hook_path: &std::path::Path,
     pane_id: &str,
     to: &str,
     task: &str,
+    generation: u64,
+    daemon_boot_id: &str,
 ) -> CliDelegateResult {
     let hook_path = hook_path.to_path_buf();
     let pane_id = pane_id.to_string();
     let to = to.to_string();
     let task = task.to_string();
+    let daemon_boot_id = daemon_boot_id.to_string();
     tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
             .arg("delegate")
@@ -5146,6 +5161,11 @@ async fn run_delegate_cli(
             .arg(&task)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
             .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .env(
+                DOT_AGENT_DECK_REGISTRATION_GENERATION,
+                generation.to_string(),
+            )
+            .env(DOT_AGENT_DECK_DAEMON_BOOT_ID, &daemon_boot_id)
             .output()
             .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
         CliDelegateResult {
@@ -5167,11 +5187,14 @@ async fn run_delegate_cli_multi(
     pane_id: &str,
     to: &[&str],
     task: &str,
+    generation: u64,
+    daemon_boot_id: &str,
 ) -> CliDelegateResult {
     let hook_path = hook_path.to_path_buf();
     let pane_id = pane_id.to_string();
     let to: Vec<String> = to.iter().map(|s| s.to_string()).collect();
     let task = task.to_string();
+    let daemon_boot_id = daemon_boot_id.to_string();
     tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
         cmd.arg("delegate");
@@ -5181,7 +5204,12 @@ async fn run_delegate_cli_multi(
         cmd.arg("--task")
             .arg(&task)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
-            .env("DOT_AGENT_DECK_SOCKET", &hook_path);
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .env(
+                DOT_AGENT_DECK_REGISTRATION_GENERATION,
+                generation.to_string(),
+            )
+            .env(DOT_AGENT_DECK_DAEMON_BOOT_ID, &daemon_boot_id);
         let output = cmd
             .output()
             .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
@@ -5244,16 +5272,21 @@ async fn delegate_040_unknown_role_does_not_report_success_inner() {
             ..SpawnOptions::default()
         })
         .expect("spawn worker stub");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
+    // Issue #567: `register_orchestration` always reserves generation `1`
+    // for ORCH_PANE (see its doc).
     let result = run_delegate_cli(
         &daemon.hook_path,
         ORCH_PANE,
         "nonexistent-role",
         "Escalate to a role that does not exist.",
+        1,
+        &daemon_boot_id,
     )
     .await;
 
@@ -5299,20 +5332,26 @@ async fn delegate_041_self_target_does_not_report_success_inner() {
             ..SpawnOptions::default()
         })
         .expect("spawn worker stub");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
     // `register_orchestration` gives ORCH_PANE the role "orchestrator" —
     // delegating back to that same role name resolves to nothing, because
     // `delegate_targets` excludes any pane in `orchestrator_pane_ids`
     // regardless of whether its role name matches the request.
+    //
+    // Issue #567: `register_orchestration` always reserves generation `1`
+    // for ORCH_PANE (see its doc).
     let result = run_delegate_cli(
         &daemon.hook_path,
         ORCH_PANE,
         "orchestrator",
         "Escalate to my own role.",
+        1,
+        &daemon_boot_id,
     )
     .await;
 
@@ -5357,16 +5396,21 @@ async fn delegate_042_duplicate_role_reports_what_was_armed_inner() {
             ..SpawnOptions::default()
         })
         .expect("spawn worker stub");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
+    // Issue #567: `register_orchestration` always reserves generation `1`
+    // for ORCH_PANE (see its doc).
     let result = run_delegate_cli_multi(
         &daemon.hook_path,
         ORCH_PANE,
         &[WORKER_ROLE, WORKER_ROLE],
         "Escalate with a duplicated target role.",
+        1,
+        &daemon_boot_id,
     )
     .await;
 
@@ -5420,18 +5464,23 @@ async fn delegate_043_partial_resolution_names_both_armed_and_unresolved_inner()
             ..SpawnOptions::default()
         })
         .expect("spawn worker stub");
-    {
+    let daemon_boot_id = {
         let mut state = daemon.state.write().await;
         register_orchestration(&mut state, &cwd_str);
-    }
+        state.daemon_boot_id().to_string()
+    };
 
     const UNRESOLVED_ROLE: &str = "nonexistent-role";
 
+    // Issue #567: `register_orchestration` always reserves generation `1`
+    // for ORCH_PANE (see its doc).
     let result = run_delegate_cli_multi(
         &daemon.hook_path,
         ORCH_PANE,
         &[WORKER_ROLE, UNRESOLVED_ROLE],
         "Escalate to one real role and one that does not exist.",
+        1,
+        &daemon_boot_id,
     )
     .await;
 
