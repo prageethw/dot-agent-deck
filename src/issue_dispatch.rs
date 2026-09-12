@@ -1376,31 +1376,60 @@ pub fn triage_instruction() -> String {
     )
 }
 
-/// Builds the prompt delivered to a dispatched agent: `{{issue_number}}`
-/// substitution, plus (when `triage` is on) the appended triage instruction.
-/// Extracted from the dispatch-run call site (issue #172) so the triage gate
-/// is unit-testable on its own, without the surrounding `gh`/`git`/spawn
-/// machinery `dispatch_one_issue` needs for everything else it does.
-///
 /// Issue #172 (security audit of PRD #421, finding A11/F11, deliberately kept
 /// out of that PR): the deck deliberately never parses a triage agent's
-/// response — see [`triage_instruction`]'s doc comment — but that currently
-/// leaves no record of what the agent was even ASKED to do, so a `gh` write
-/// the agent was authorised to make is unauditable after the fact. RED
-/// today, pinned by `build_dispatch_prompt_triage_on_records_an_audit_event`
-/// below: nothing here yet leaves any durable trace when the instruction is
-/// appended. `repo` is already plumbed through for that fix.
+/// response — see [`triage_instruction`]'s doc comment — but that leaves no
+/// record of what the agent was even ASKED to do, so a `gh` write the agent
+/// was authorised to make is unauditable after the fact. Call this once, at
+/// the same call site that appends [`triage_instruction`] to a dispatched
+/// prompt, so every dispatch that grants the triage instruction leaves a
+/// durable trace behind (`deck.log` via `tracing`, append-only and mode-0600
+/// hardened — see `open_deck_log_file` in `main.rs`) — never conditional on
+/// whether the agent's own writes succeed or even happen.
+///
+/// Deliberately narrow: this records what was ASKED, not what happened —
+/// observing the agent's actual `gh` calls is the other, out-of-scope half of
+/// #172's proposal. Deliberately carries `instruction` (this module's own
+/// fixed, deck-authored template text) and never the issue's own body/title/
+/// comments — those are third-party text, and folding them into the audit
+/// record would just hand it a second injection/leak sink instead of fixing
+/// the first one.
+pub fn record_triage_instruction_issued(repo: &str, issue: u64) {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let instruction = triage_instruction();
+    // `issue` and `repo` are also folded straight into the message text
+    // (not just carried as structured fields) so this record's issue/repo
+    // are found by a plain substring search of the rendered log line,
+    // independent of how any given `tracing-subscriber` formatter happens to
+    // render a numeric/string field.
+    tracing::info!(
+        target: "dot_agent_deck::triage_audit",
+        repo = %repo,
+        issue,
+        timestamp = %timestamp,
+        instruction = %instruction,
+        "issue-dispatch: triage instruction issued to dispatched agent for issue #{issue} of {repo}"
+    );
+}
+
+/// Builds the prompt delivered to a dispatched agent: `{{issue_number}}`
+/// substitution, plus (when `triage` is on) the appended triage instruction
+/// and its audit record — see [`record_triage_instruction_issued`]. Extracted
+/// from the dispatch-run call site (issue #172) so the triage gate — append
+/// the instruction if and only if an audit record is also fired for it — is
+/// unit-testable on its own, without the surrounding `gh`/`git`/spawn
+/// machinery `dispatch_one_issue` needs for everything else it does.
 pub fn build_dispatch_prompt(
     prompt_template: &str,
     issue: u64,
     repo: &str,
     triage: bool,
 ) -> String {
-    let _ = repo;
     let mut prompt = substitute_issue_number(prompt_template, issue);
     if triage {
         prompt.push_str("\n\n");
         prompt.push_str(&triage_instruction());
+        record_triage_instruction_issued(repo, issue);
     }
     prompt
 }

@@ -889,10 +889,11 @@ async fn dispatch_one_issue(
     // substituted prompt so the dispatched agent applies its own labels. Only
     // the issues actually dispatched here ever see it; a skipped issue never
     // reaches this point.
-    // Issue #172 — extracted into `build_dispatch_prompt` (repo threaded
-    // through already) so the triage-instruction audit record this issue
-    // asks for can be added there next, unit-tested in isolation from the
-    // `gh`/`git`/spawn machinery the rest of this function needs.
+    // Issue #172 — `build_dispatch_prompt` also fires an audit record (issue,
+    // repo, timestamp, the instruction template itself — never the issue's
+    // own untrusted body/comments) every time it appends the triage
+    // instruction, so every dispatch that grants it leaves a durable trace
+    // behind regardless of what the agent then does with it.
     let prompt = build_dispatch_prompt(prompt_template, issue, &cfg.repo, cfg.triage);
     let req = SpawnRequest {
         task_name: task_name.to_string(),
