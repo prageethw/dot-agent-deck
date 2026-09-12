@@ -242,11 +242,18 @@ async fn fixture(worker_command_in_dir: impl FnOnce(&std::path::Path) -> String)
 }
 
 async fn delegate(fx: &Fixture, task: &str) {
+    // Issue #567 (mirrors fork #358 M4's reasoning exactly): ORCH_PANE is
+    // registered exactly once per fixture via `register_orchestration_role`,
+    // which reserves generation `1` for a pane_id it has never seen before —
+    // read the daemon's own `daemon_boot_id` back rather than hand-rolling it.
+    let daemon_boot_id = fx.daemon.state.read().await.daemon_boot_id().to_string();
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id,
         subject: None,
     };
     fx.daemon
@@ -979,11 +986,27 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
 
     // --- delegate on each path and let each replacement announce itself, so
     // neither side pays the production readiness fallback.
+    //
+    // Issue #567: `dispatched_orchestrator` was registered by the REAL
+    // `dot_agent_deck::spawn::spawn` primitive, so read its genuine
+    // generation/boot-id back from `daemon.state` rather than hand-typing a
+    // literal that could silently drift from what that primitive actually
+    // reserved.
+    let (dispatched_generation, dispatched_boot_id) = {
+        let guard = daemon.state.read().await;
+        let generation = *guard
+            .pane_registration_generation
+            .get(&dispatched_orchestrator)
+            .expect("the dispatch spawn primitive must have reserved a generation");
+        (generation, guard.daemon_boot_id().to_string())
+    };
     let signal = DelegateSignal {
         pane_id: dispatched_orchestrator,
         task: "list the files in this directory".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: dispatched_generation,
+        daemon_boot_id: dispatched_boot_id,
         subject: None,
     };
     daemon

@@ -208,6 +208,13 @@ impl WorkDoneHarness {
     /// puts on the hook socket, handled by the real daemon-side handler, so the
     /// commission ledger is armed the way production arms it.
     async fn delegate(&self) {
+        // Issue #567 (mirrors `work_done`'s reasoning below exactly): the
+        // ORCH_PANE registration reserved its own generation in `new` above.
+        let generation = *self
+            .state
+            .pane_registration_generation
+            .get(ORCH_PANE)
+            .expect("the orchestrator pane must have reserved a registration generation");
         self.state
             .handle_delegate(
                 DelegateSignal {
@@ -215,6 +222,8 @@ impl WorkDoneHarness {
                     task: "Perform the delegated test task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    generation,
+                    daemon_boot_id: self.state.daemon_boot_id().to_string(),
                     subject: None,
                 },
                 &self.registry,

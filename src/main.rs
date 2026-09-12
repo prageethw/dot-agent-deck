@@ -1387,11 +1387,18 @@ fn main() -> ExitCode {
             // could not reach.
             let pane_id_for_report = pane_id.clone();
             let signal_roles = to.clone();
+            // Issue #567 (mirrors fork #358 / issue #461's `work-done` read
+            // exactly): see `read_registration_context`'s doc for why these
+            // are read from this process's own env rather than asked of the
+            // live daemon.
+            let (generation, daemon_boot_id) = read_registration_context();
             let signal = dot_agent_deck::event::DelegateSignal {
                 pane_id,
                 task,
                 to,
                 timestamp: chrono::Utc::now(),
+                generation,
+                daemon_boot_id,
                 subject,
             };
             let msg = dot_agent_deck::event::DaemonMessage::Delegate(signal);

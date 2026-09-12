@@ -1324,6 +1324,43 @@ pub struct DelegateSignal {
     /// Role names to delegate to (one or more).
     pub to: Vec<String>,
     pub timestamp: DateTime<Utc>,
+    /// Issue #567 (mirrors fork #358 M2's field on [`WorkDoneSignal::generation`]
+    /// exactly): the `AppState::pane_registration_generation` value the
+    /// SENDING orchestrator pane was actually spawned/registered under. Read
+    /// straight from this process's own `DOT_AGENT_DECK_REGISTRATION_GENERATION`
+    /// environment variable at `delegate` CLI time (same
+    /// `read_registration_context` helper `work-done` already uses), never
+    /// re-derived from live daemon state, for the same reason #358 gives: a
+    /// value re-derived at send time is always whatever the pane's CURRENT
+    /// generation is and can never disagree with itself microseconds later at
+    /// delivery. `handle_delegate_with_state` refuses delivery when this no
+    /// longer matches the sending pane's CURRENT generation — the pane was
+    /// re-registered (worktree teardown + reuse) since this orchestrator was
+    /// spawned, so `pane_role_map`/`pane_orchestration_map` now point at a
+    /// different tenant and a stale `delegate` must not be routed into it.
+    /// `#[serde(default)]` so an older CLI build that doesn't send this field
+    /// still parses (defaulting to `0`, which never matches a real
+    /// registration's generation — those start at `1` — so an old CLI talking
+    /// to a post-#567 daemon has its delegate refused rather than silently
+    /// misrouted; see `changelog.d/567.breaking.md`).
+    #[serde(default)]
+    pub generation: u64,
+    /// Issue #567 (mirrors fork #358 M4's [`WorkDoneSignal::daemon_boot_id`]
+    /// exactly): the `AppState::daemon_boot_id` value in effect when the
+    /// sending pane's registration generation (above) was reserved — read
+    /// from `DOT_AGENT_DECK_DAEMON_BOOT_ID`, injected at spawn time sibling to
+    /// `DOT_AGENT_DECK_REGISTRATION_GENERATION`. Needed for the same reason as
+    /// `work-done`'s: `generation` alone cannot distinguish a pre-restart
+    /// signal from a post-restart pane that reused the same pane_id and
+    /// legitimately carries the same small generation number — pairing it
+    /// with the daemon's own boot id closes that, since a fresh `AppState`
+    /// mints a fresh `daemon_boot_id` on every construction. `#[serde(default)]`
+    /// so an older CLI build that doesn't send this field still parses
+    /// (defaulting to `""`, which no real `daemon_boot_id` is ever minted as,
+    /// so an old CLI's delegate is refused exactly like a bare `generation: 0`
+    /// already was; see `changelog.d/567.breaking.md`).
+    #[serde(default)]
+    pub daemon_boot_id: String,
     /// Issue #586 M4: an optional subject tag (issue/PR number, or a short
     /// opaque token) this delegation is for. `#[serde(default)]` so an older
     /// CLI's payload (no `subject` field) still parses to `None` — additive,
@@ -2231,6 +2268,8 @@ mod tests {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            generation: 1,
+            daemon_boot_id: "boot-abc123".into(),
             subject: None,
         };
         let msg = DaemonMessage::Delegate(signal);

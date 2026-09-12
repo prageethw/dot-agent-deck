@@ -317,7 +317,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     // delegate is accepted as coming from an orchestrator pane); only the pi worker
     // is a real agent. Both share one orchestration + cwd, so the delegate routes
     // to the worker, and the worker's work-done file lands in the shared cwd.
-    {
+    let daemon_boot_id = {
         let mut st = daemon.state.write().await;
         st.pane_role_map
             .insert(ORCH_PANE.to_string(), "orchestrator".to_string());
@@ -337,7 +337,12 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         st.pane_cwd_map
             .insert(ORCH_PANE.to_string(), cwd_str.clone());
         common::insert_pane_registration_generation(&mut st, WORKER_PANE);
-    }
+        // Issue #567: `handle_delegate_with_state` now guards on the
+        // SENDING pane's (ORCH_PANE) generation too — reserve one, or the
+        // delegate below is refused as "no registration on file".
+        common::insert_pane_registration_generation(&mut st, ORCH_PANE);
+        st.daemon_boot_id().to_string()
+    };
 
     // No readiness wait: the `cat` placeholder is a live registry entry the
     // instant `spawn_agent` returns, which is all `respawn_agent_for_pane` needs
@@ -380,6 +385,8 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         task,
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        generation: 1,
+        daemon_boot_id,
         subject: None,
     };
     daemon
