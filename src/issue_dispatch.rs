@@ -1376,6 +1376,35 @@ pub fn triage_instruction() -> String {
     )
 }
 
+/// Builds the prompt delivered to a dispatched agent: `{{issue_number}}`
+/// substitution, plus (when `triage` is on) the appended triage instruction.
+/// Extracted from the dispatch-run call site (issue #172) so the triage gate
+/// is unit-testable on its own, without the surrounding `gh`/`git`/spawn
+/// machinery `dispatch_one_issue` needs for everything else it does.
+///
+/// Issue #172 (security audit of PRD #421, finding A11/F11, deliberately kept
+/// out of that PR): the deck deliberately never parses a triage agent's
+/// response — see [`triage_instruction`]'s doc comment — but that currently
+/// leaves no record of what the agent was even ASKED to do, so a `gh` write
+/// the agent was authorised to make is unauditable after the fact. RED
+/// today, pinned by `build_dispatch_prompt_triage_on_records_an_audit_event`
+/// below: nothing here yet leaves any durable trace when the instruction is
+/// appended. `repo` is already plumbed through for that fix.
+pub fn build_dispatch_prompt(
+    prompt_template: &str,
+    issue: u64,
+    repo: &str,
+    triage: bool,
+) -> String {
+    let _ = repo;
+    let mut prompt = substitute_issue_number(prompt_template, issue);
+    if triage {
+        prompt.push_str("\n\n");
+        prompt.push_str(&triage_instruction());
+    }
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2355,6 +2384,111 @@ mod tests {
         assert_eq!(
             parse_current_assignees(r#"{"comments":[]}"#).unwrap(),
             Vec::<String>::new()
+        );
+    }
+
+    // --- Issue #172: triage instruction audit trail ---
+
+    /// A `MakeWriter` over a shared in-memory buffer, mirroring
+    /// `tests/logging_filter.rs`'s hand-rolled capture (an `Arc<Mutex<W>>`
+    /// isn't directly usable as a `MakeWriter`).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `f` against a thread-local subscriber that captures every emitted
+    /// line (`with_default`, like `tests/logging_filter.rs`, so this stays
+    /// independent of `cargo test`'s threads / `nextest`'s processes) and
+    /// returns everything written.
+    fn capture_tracing(f: impl FnOnce()) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buf)))
+            .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.lock().expect("capture buffer poisoned").clone())
+            .expect("log output is not UTF-8")
+    }
+
+    /// Issue #172: when a dispatch includes the triage instruction,
+    /// `build_dispatch_prompt` must leave a durable audit record behind
+    /// naming the issue, the repo, and the instruction template used — this
+    /// is what makes a triage-authorised `gh` write traceable after the
+    /// fact, since the deck deliberately never parses the agent's response.
+    #[test]
+    fn build_dispatch_prompt_triage_on_records_an_audit_event() {
+        let mut prompt = String::new();
+        let log = capture_tracing(|| {
+            prompt = build_dispatch_prompt(
+                "Work on issue {{issue_number}}",
+                172,
+                "prageethw/dot-agent-deck",
+                true,
+            );
+        });
+
+        // Unchanged behaviour: the triage vocabulary still reaches the agent's
+        // prompt exactly as before this fix.
+        assert!(
+            prompt.contains(&triage_instruction()),
+            "triage instruction must still be appended to the prompt, got: {prompt:?}"
+        );
+
+        // The new behaviour: a durable audit record naming what was asked.
+        assert!(
+            log.contains("triage instruction issued to dispatched agent for issue #172 of prageethw/dot-agent-deck"),
+            "expected an audit record naming the issue and repo, got log: {log:?}"
+        );
+        assert!(
+            log.contains("Triage this issue using the following labels"),
+            "audit record must carry the instruction template used, got log: {log:?}"
+        );
+    }
+
+    /// Issue #172, the negative case: with triage off, `build_dispatch_prompt`
+    /// must neither append the instruction nor emit any audit record for it —
+    /// the audit trail must not fire for a dispatch the triage vocabulary
+    /// never reached.
+    #[test]
+    fn build_dispatch_prompt_triage_off_records_no_audit_event() {
+        let mut prompt = String::new();
+        let log = capture_tracing(|| {
+            prompt = build_dispatch_prompt(
+                "Work on issue {{issue_number}}",
+                172,
+                "prageethw/dot-agent-deck",
+                false,
+            );
+        });
+
+        assert!(
+            !prompt.contains("Triage this issue"),
+            "triage instruction must not be appended when triage is off, got: {prompt:?}"
+        );
+        assert!(
+            log.is_empty(),
+            "no audit record must be emitted when triage is off, got log: {log:?}"
         );
     }
 }
