@@ -8838,7 +8838,7 @@ impl AppState {
                 // already-attached TUI — the symmetric counterpart of the
                 // `DelegationArmed` broadcast in `handle_delegate_with_state`.
                 // Sent ONLY here, on a full `Retired` (not
-                // `RetiredSuperseded` below): that outcome leaves an OLDER
+                // `RetiredSuperseded` below): that outcome leaves the NEWER
                 // delegation still armed on this same pane, so the pane's
                 // `outstanding_delegation` genuinely stays `Some(..)` and
                 // must not be cleared.

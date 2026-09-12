@@ -622,6 +622,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // delivery as state on the pane's card instead of typing a diagnostic line
     // into the agent's input buffer. See `install_delivery_notice_sink`.
     install_delivery_notice_sink(&pty_registry, state.clone(), event_tx.clone());
+    // Issue #755 round 2 (auditor A1): give the idle-watch timeout, a
+    // deliberate pane close, and the agent-exit sweep — the three retirement
+    // paths with no `event_tx` parameter in scope — a way to announce
+    // `BroadcastMsg::DelegationRetired` too. See `install_delegation_retired_sink`.
+    install_delegation_retired_sink(&pty_registry, event_tx.clone());
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
     let scheduler = daemon.scheduler;
@@ -1378,6 +1383,34 @@ fn install_delivery_notice_sink(
             let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
             guard.apply_daemon_report_event(event);
         });
+    }));
+}
+
+/// Issue #755 round 2 (auditor A1): install the daemon's sink for the three
+/// delegation-retirement paths with no `event_tx` parameter in scope — the
+/// idle-watch timeout's take, a deliberate pane close
+/// (`begin_pane_close`/`finish_pane_close`), and the agent-exit sweep
+/// (`sweep_delegations_on_exit`, driven from `pump_reader`, a raw OS thread
+/// with no async context at all reachable from `spawn_agent`'s call sites).
+///
+/// `handle_work_done`'s own `DelegationRetired` broadcast (the full
+/// `DelegationRetirement::Retired` outcome) is unrelated to this sink — it
+/// already receives `event_tx` as a parameter and keeps doing so; this sink
+/// exists only for the paths that structurally cannot.
+///
+/// Much simpler than [`install_delivery_notice_sink`]: the payload is just
+/// the worker pane id, and there is no re-validation to do here — the
+/// registry has already removed the record under its own lock by the time
+/// this fires, which is the same daemon-side fact `ListAgents`/hydration
+/// would now report for that pane. Nothing to race.
+fn install_delegation_retired_sink(
+    registry: &Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) {
+    registry.set_delegation_retired_sink(std::sync::Arc::new(move |pane_id| {
+        let _ = event_tx.send(BroadcastMsg::DelegationRetired(
+            crate::event::DelegationRetiredNotice { pane_id },
+        ));
     }));
 }
 

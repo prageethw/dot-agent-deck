@@ -1320,7 +1320,11 @@ fn idle_worker_022_registry_entry_removed_without_any_sweep_receives_nothing() {
 /// SAME broadcast channel the daemon harness uses, delegates, applies the
 /// `DelegationArmed` push the moment it arrives, and asserts the field flips
 /// to `Some(..)` with zero reconnect involved. Sends work-done and repeats the
-/// check for `DelegationRetired` clearing it back to `None`.
+/// check for `DelegationRetired` clearing it back to `None`. Also builds a
+/// SECOND, wholly unrelated pane/session on the same client and asserts it
+/// never moves — proving the pane-id filter in `apply_delegation_armed`/
+/// `apply_delegation_retired`, not just their presence (auditor round-2
+/// finding A3: a single-pane test would still pass a blindly-applied broadcast).
 #[spec("scheduler/idle-worker/023")]
 #[test]
 fn idle_worker_023_already_attached_client_sees_delegation_live_with_no_reconnect() {
@@ -1329,6 +1333,7 @@ fn idle_worker_023_already_attached_client_sees_delegation_live_with_no_reconnec
     runtime().block_on(async {
         let harness = IdleHarness::new(&["coder"], None).await;
         let worker_pane_id = worker_pane("coder");
+        let unrelated_pane_id = "unrelated-bystander-pane".to_string();
 
         // The "already-attached client": an independent `AppState` that has
         // never hydrated or reconnected. Its only session comes from a real
@@ -1353,17 +1358,53 @@ fn idle_worker_023_already_attached_client_sees_delegation_live_with_no_reconnec
             live_target: None,
             model: None,
         });
+        // A second, unrelated pane/session on the SAME client — no
+        // delegation is ever armed against it. If the pane-id filter in
+        // `apply_delegation_armed`/`apply_delegation_retired` were deleted
+        // (an accidental blind apply-to-every-session), this session's
+        // `outstanding_delegation` would flip to `Some(..)` right alongside
+        // the real worker's below.
+        client.register_pane(unrelated_pane_id.clone());
+        client.apply_event(AgentEvent {
+            session_id: format!("sess-{unrelated_pane_id}"),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(unrelated_pane_id.clone()),
+            agent_id: Some(format!("agent-{unrelated_pane_id}")),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
         let client_session_id = client
             .sessions
             .iter()
             .find(|(_, session)| session.pane_id.as_deref() == Some(worker_pane_id.as_str()))
             .map(|(id, _)| id.clone())
             .expect("the SessionStart event must have created a session for the worker pane");
+        let unrelated_session_id = client
+            .sessions
+            .iter()
+            .find(|(_, session)| session.pane_id.as_deref() == Some(unrelated_pane_id.as_str()))
+            .map(|(id, _)| id.clone())
+            .expect("the SessionStart event must have created a session for the unrelated pane");
         assert!(
             client.sessions[&client_session_id]
                 .outstanding_delegation
                 .is_none(),
             "precondition: the attached client's session starts with no outstanding delegation"
+        );
+        assert!(
+            client.sessions[&unrelated_session_id]
+                .outstanding_delegation
+                .is_none(),
+            "precondition: the unrelated bystander session starts with no outstanding delegation"
         );
 
         // Subscribe to the SAME channel the daemon broadcasts on, exactly the
@@ -1398,6 +1439,14 @@ fn idle_worker_023_already_attached_client_sees_delegation_live_with_no_reconnec
             "the already-attached client must see the outstanding delegation live, with no \
              reconnect"
         );
+        assert!(
+            client.sessions[&unrelated_session_id]
+                .outstanding_delegation
+                .is_none(),
+            "the unrelated bystander session must NOT see this pane's DelegationArmed broadcast \
+             — this is what actually proves the pane-id filter runs, not just that the field \
+             can be set at all"
+        );
 
         harness.work_done("coder").await;
 
@@ -1421,6 +1470,13 @@ fn idle_worker_023_already_attached_client_sees_delegation_live_with_no_reconnec
             "the already-attached client must see the delegation's retirement live too, with no \
              reconnect — otherwise a stale Some(..) would suppress a real idle-completion bell \
              for the rest of the session"
+        );
+        assert!(
+            client.sessions[&unrelated_session_id]
+                .outstanding_delegation
+                .is_none(),
+            "the unrelated bystander session must stay untouched by the DelegationRetired \
+             broadcast too"
         );
     });
 }

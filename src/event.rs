@@ -1514,12 +1514,13 @@ pub enum BroadcastMsg {
     /// `DelegationRetirement::Retired`, from `AppState::handle_work_done`).
     ///
     /// **Deliberately NOT sent on `DelegationRetirement::RetiredSuperseded`**:
-    /// that outcome retires only the newer of two delegations stacked on the
-    /// same worker pane, and the OLDER one stays armed underneath it — the
-    /// pane's `outstanding_delegation` genuinely stays `Some(..)` in that
-    /// case (it should still read as "delegated", just for the older task),
-    /// so announcing a retirement there would be a lie the badge would then
-    /// have to un-tell itself on the next hydration/reconnect.
+    /// that outcome retires only the OLDER (superseded) of two delegations
+    /// stacked on the same worker pane, and the NEWER one stays armed on top
+    /// of it — the pane's `outstanding_delegation` genuinely stays `Some(..)`
+    /// in that case (it should still read as "delegated", just for the
+    /// newer task), so announcing a retirement there would be a lie the
+    /// badge would then have to un-tell itself on the next
+    /// hydration/reconnect.
     ///
     /// This is also what closes the auditor-flagged staleness risk: without
     /// it, a delegation observed once at hydration (`Some(..)`) and then
