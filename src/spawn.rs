@@ -1720,7 +1720,12 @@ fn drain_pre_write_events(
             // Issue #717 / PRD 236: neither variant is evidence about this
             // pane. Grouped rather than wildcarded so a future variant still
             // fails this match and gets considered on its merits.
-            Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_)) => {
+            Ok(
+                BroadcastMsg::OrchestrationSurface(_)
+                | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::DelegationArmed(_)
+                | BroadcastMsg::DelegationRetired(_),
+            ) => {
                 continue;
             }
             // Issue #424 D2 (both reviewers): TERMINAL, where this used to carry

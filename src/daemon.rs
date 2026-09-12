@@ -2832,7 +2832,11 @@ async fn run_hook_loop(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    state.read().await.handle_work_done(signal, &pty_registry).await;
+                                    state
+                                        .read()
+                                        .await
+                                        .handle_work_done(signal, &pty_registry, Some(&event_tx))
+                                        .await;
                                 }
                                 DaemonMessage::WaitStart(signal) => {
                                     // Auditor A3: sanitize + cap BEFORE

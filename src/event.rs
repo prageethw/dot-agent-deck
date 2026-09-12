@@ -1482,6 +1482,87 @@ pub enum BroadcastMsg {
     /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
     #[serde(rename = "worktree_kept")]
     WorktreeKept(WorktreeKeptNotice),
+    /// Issue #755: pushed to every already-attached TUI the moment the daemon
+    /// arms PRD #126's idle-worker watch for a `delegate` target
+    /// (`AgentPtyRegistry::arm_outstanding_delegation`, called from
+    /// `AppState::handle_delegate_with_state`) — the same live-push shape
+    /// `OrchestrationSurface`/`WorktreeKept` already use for "a daemon-side
+    /// fact changed that isn't a hook event, and an attached TUI needs to see
+    /// it without reconnecting." Before this variant existed,
+    /// `SessionState::outstanding_delegation` was populated ONLY at TUI
+    /// bootstrap hydration or at post-reconnect resync, so a pane that stayed
+    /// attached with a healthy subscription through an entire delegation
+    /// never saw its dashboard badge/bell/aggregate-count update — exactly
+    /// issue #755's own reported scenario (a ~27-minute delegation watched
+    /// live with no reconnect). [`AppState::apply_event`]'s new match arm
+    /// consumes this to set `SessionState.outstanding_delegation` directly on
+    /// the matching session(s), independent of the hydration/resync paths
+    /// (which remain in place as the bootstrap/reconnect-recovery seam).
+    ///
+    /// Not sent when arming is refused (detector disabled, no live
+    /// orchestrator agent, or either pane mid-close) — those cases arm no
+    /// registry record at all, so there is nothing to announce.
+    ///
+    /// Adding this variant changes the `KIND_EVENT` payload schema the same
+    /// way `OrchestrationSurface`/`WorktreeKept` did, so it too bumps
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
+    #[serde(rename = "delegation_armed")]
+    DelegationArmed(DelegationArmedNotice),
+    /// Issue #755: symmetric with [`BroadcastMsg::DelegationArmed`] above —
+    /// pushed the moment the daemon fully retires a worker pane's outstanding
+    /// delegation (`AgentPtyRegistry::retire_outstanding_delegation` returning
+    /// `DelegationRetirement::Retired`, from `AppState::handle_work_done`).
+    ///
+    /// **Deliberately NOT sent on `DelegationRetirement::RetiredSuperseded`**:
+    /// that outcome retires only the newer of two delegations stacked on the
+    /// same worker pane, and the OLDER one stays armed underneath it — the
+    /// pane's `outstanding_delegation` genuinely stays `Some(..)` in that
+    /// case (it should still read as "delegated", just for the older task),
+    /// so announcing a retirement there would be a lie the badge would then
+    /// have to un-tell itself on the next hydration/reconnect.
+    ///
+    /// This is also what closes the auditor-flagged staleness risk: without
+    /// it, a delegation observed once at hydration (`Some(..)`) and then
+    /// genuinely retired while the pane stayed attached with no reconnect
+    /// would leave the stale `Some(..)` in place for the rest of the TUI
+    /// session — silently suppressing a *real* idle-completion bell
+    /// indefinitely, not just delaying the badge.
+    ///
+    /// Adding this variant changes the `KIND_EVENT` payload schema the same
+    /// way `OrchestrationSurface`/`WorktreeKept` did, so it too bumps
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
+    #[serde(rename = "delegation_retired")]
+    DelegationRetired(DelegationRetiredNotice),
+}
+
+/// Issue #755: payload for [`BroadcastMsg::DelegationArmed`]. Carries the
+/// worker pane id so `apply_event`'s new match arm can find the matching
+/// session(s), plus the exact [`crate::agent_pty::WatchSnapshot`] the daemon
+/// would also report via `ListAgents`/`daemon status --json` for the same
+/// pane at this instant — reusing that type rather than inventing a second
+/// shape for the identical fact, so a client that already knows how to
+/// consume `AgentRecord.outstanding_delegation` needs no new parsing logic,
+/// only a new place to assign it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationArmedNotice {
+    /// The worker's `DOT_AGENT_DECK_PANE_ID` — matched against
+    /// [`crate::state::SessionState::pane_id`], the same key
+    /// `resync_hydrated_sessions`/`seed_hydrated_session` already use.
+    pub pane_id: String,
+    /// The armed watch snapshot, mirroring
+    /// [`crate::agent_pty::AgentPtyRegistry::delegation_watch_snapshot`]'s
+    /// `outstanding_delegation` half at arm time (`armed_secs_ago: 0`).
+    pub snapshot: crate::agent_pty::WatchSnapshot,
+}
+
+/// Issue #755: payload for [`BroadcastMsg::DelegationRetired`]. Carries only
+/// the worker pane id — the client's response is always to clear the field,
+/// never to merge in data, so no snapshot is needed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationRetiredNotice {
+    /// The worker's `DOT_AGENT_DECK_PANE_ID`, matched the same way
+    /// [`DelegationArmedNotice::pane_id`] is.
+    pub pane_id: String,
 }
 
 /// PRD 236: payload for [`BroadcastMsg::WorktreeKept`] — a dispatched worktree
@@ -2430,6 +2511,51 @@ mod tests {
             notice.error,
             Some("git worktree remove failed (exit 128)".to_string())
         );
+    }
+
+    // Issue #755: the live-push round-trip for `DelegationArmed`/
+    // `DelegationRetired` must ride the same `BroadcastMsg` wire the daemon
+    // forwards over `KIND_EVENT`, and tag itself distinctly from every other
+    // variant — the reason `PROTOCOL_VERSION` bumped 11 → 12.
+    #[test]
+    fn delegation_armed_broadcast_round_trips() {
+        let msg = BroadcastMsg::DelegationArmed(DelegationArmedNotice {
+            pane_id: "worker-pane".into(),
+            snapshot: crate::agent_pty::WatchSnapshot {
+                armed_secs_ago: 0,
+                orchestrator_pane_id: "orch-pane".into(),
+            },
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["kind"], "delegation_armed");
+        assert_eq!(v["pane_id"], "worker-pane");
+        assert_eq!(v["snapshot"]["armed_secs_ago"], 0);
+        assert_eq!(v["snapshot"]["orchestrator_pane_id"], "orch-pane");
+
+        let back: BroadcastMsg = serde_json::from_str(&json).unwrap();
+        let BroadcastMsg::DelegationArmed(notice) = back else {
+            panic!("expected a BroadcastMsg::DelegationArmed");
+        };
+        assert_eq!(notice.pane_id, "worker-pane");
+        assert_eq!(notice.snapshot.orchestrator_pane_id, "orch-pane");
+    }
+
+    #[test]
+    fn delegation_retired_broadcast_round_trips() {
+        let msg = BroadcastMsg::DelegationRetired(DelegationRetiredNotice {
+            pane_id: "worker-pane".into(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["kind"], "delegation_retired");
+        assert_eq!(v["pane_id"], "worker-pane");
+
+        let back: BroadcastMsg = serde_json::from_str(&json).unwrap();
+        let BroadcastMsg::DelegationRetired(notice) = back else {
+            panic!("expected a BroadcastMsg::DelegationRetired");
+        };
+        assert_eq!(notice.pane_id, "worker-pane");
     }
 
     // PRD #201 M1.2 (test-plan row 3): pin the lifecycle-state → EventType

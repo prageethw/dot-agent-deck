@@ -3326,7 +3326,7 @@ pub struct DelegationWatchSnapshot {
 /// or [`SilenceWatchRecord`] — plain `u64` seconds rather than `Duration` or
 /// `Instant`, neither of which can be serialized, mirroring how the rest of
 /// this file already keeps raw internal types off the wire.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WatchSnapshot {
     pub armed_secs_ago: u64,
     pub orchestrator_pane_id: String,
