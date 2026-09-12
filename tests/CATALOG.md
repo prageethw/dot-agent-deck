@@ -5677,8 +5677,15 @@ without depending on the config struct API.
 - **Layer:** L1 (in-process — a real `git` repository with two nested subdirectories, calling `resolve_orchestration_workspace` directly; no daemon, no PTY).
 - **Agent:** none.
 - **Asserts:** for two picks (`team-a/proj`, `team-b/proj`) sharing the same resolved toplevel and the same segment but distinct `relative_subpath`s, the resulting `worktree_path` values are distinct.
-- **Does not assert:** the daemon-side `ClaimOrchestrationName` uniqueness/collision layer, already covered by `026`; the resolved pane cwd's exact value, covered by `033`; real daemon/PTY spawn.
+- **Does not assert:** the daemon-side `ClaimOrchestrationName` uniqueness/collision layer, already covered by `026`; the resolved pane cwd's exact value, covered by `033`; real daemon/PTY spawn; the adversarial differently-segmented pair that defeats a bare (non-length-prefixed) join, covered by `041`.
 - **Platform coverage:** mac+linux+windows, matching `033`.
+
+##### orchestration/workspace/041 — A first version of `disambiguate_workspace_segment`'s `{segment}-{sanitized subpath}` join was not injective: two different `(segment, relative_subpath)` pairs that redistribute identically across the join point (pick A: segment `foo`, subpath `bar/baz`; pick B: segment `foo-bar`, subpath `baz`; both bare-join to `foo-bar-baz`) still collided onto the same physical clone (PR #751 review round, auditor finding 1) — the length-prefixed join fixes this by making the split point between `segment` and the subpath unambiguous regardless of either half's own content.
+- **Layer:** L1 (in-process — a real `git` repository with two nested subdirectories, calling `resolve_orchestration_workspace` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** the adversarial pick pair genuinely defeats a bare `{segment}-{sanitized subpath}` join (setup sanity, computed against the real resolved `relative_subpath` for each pick rather than a hand-transcribed literal); the two picks' resulting `worktree_path` values are nonetheless distinct under the real (length-prefixed) `disambiguate_workspace_segment`.
+- **Does not assert:** the ordinary same-subpath-shape collision, already covered by `040`; the separate, non-blocking residual where `sanitize_clone_segment` itself (not the join) collapses two differently-shaped relative subpaths — e.g. `team-a/proj` vs `team-a-proj` — to the identical sanitized string (reviewer finding on PR #751, explicitly out of scope for this fix, tracked as a fast-follow).
+- **Platform coverage:** mac+linux+windows, matching `040`.
 
 #### orchestration/hydration
 

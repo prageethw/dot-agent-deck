@@ -10198,16 +10198,56 @@ fn resolve_workspace_path(dir: &Path, segment: &str) -> PathBuf {
 /// identical `segment` — e.g. `<repo>/team-a/proj` and `<repo>/team-b/proj`,
 /// both suggesting `proj-orchestrator-1` — still derive distinct physical
 /// clone directories instead of silently collapsing onto one shared clone.
-/// A no-op (returns `segment` unchanged) whenever there is no relative
-/// subpath — picking directly at a toplevel, or a non-git directory — which
-/// is deliberate: the ordinary, non-colliding common case must keep
-/// deriving exactly the same path it did before this fix.
+///
+/// The join is LENGTH-PREFIXED (`"{}-{segment}-{sanitized subpath}"`, the
+/// prefix being `segment.len()`), not a bare `"{segment}-{sanitized
+/// subpath}"`. PR #751 review round (auditor finding 1): a bare join is
+/// **not injective** — `sanitize_clone_segment` collapses `/`/`\` into `-`,
+/// and a typed/suggested segment routinely contains `-` itself, so two
+/// different `(segment, relative_subpath)` pairs can concatenate to the
+/// identical string by redistributing across the join point. Concretely,
+/// pick A (`segment = "foo"`, `relative_subpath = "bar/baz"`, sanitized
+/// `"bar-baz"`) and pick B (`segment = "foo-bar"`, `relative_subpath =
+/// "baz"`, sanitized `"baz"`) both bare-joined to the identical
+/// `"foo-bar-baz"` — the exact #607 collision this function exists to
+/// close, just requiring a rarer, user-typed-Name coincidence to trigger.
+/// Prefixing with `segment.len()` fixes this: a decimal length is always
+/// digits-only, so it can never be confused with the literal `-` written
+/// immediately after it, and reading those leading digits up to that `-`
+/// recovers EXACTLY how many of the following bytes belong to `segment` —
+/// which pins `segment` down exactly (by byte length, regardless of its
+/// content) and therefore the remaining suffix (the sanitized subpath) too.
+/// Two different `(segment, relative_subpath)` pairs can therefore never
+/// produce the same disambiguated string (`orchestration/workspace/041`
+/// pins the exact adversarial pair above).
+///
+/// A no-op (returns `segment` unchanged, with no length-prefix at all)
+/// whenever there is no relative subpath — picking directly at a toplevel,
+/// or a non-git directory — which is deliberate: the ordinary, non-colliding
+/// common case must keep deriving exactly the same path it did before this
+/// fix. This also means a plain (non-nested) segment can never collide with
+/// a disambiguated (nested) one by ordinary accident: every disambiguated
+/// output starts with a decimal-digit length prefix followed by `-`, a
+/// shape no ordinarily-typed Name happens to reproduce at that position.
+///
+/// Known non-blocking residual, NOT closed by this length-prefix fix (PR
+/// #751 review round, reviewer finding): `sanitize_clone_segment` itself
+/// (not this join) collapses distinct `relative_subpath` inputs to the
+/// identical sanitized string whenever one embeds a `/` where the other
+/// embeds a literal `-` — e.g. `relative_subpath = "team-a/proj"` and
+/// `relative_subpath = "team-a-proj"` both sanitize to `"team-a-proj"`.
+/// When two picks share both the same `segment` AND that coincidence, this
+/// function receives byte-identical inputs and no join scheme can
+/// distinguish them — the ambiguity exists upstream of this function
+/// entirely. Narrower than the pre-fix defect (now requires the two
+/// subpaths to *also* sanitize identically, not merely share a segment)
+/// and explicitly flagged as fast-follow, not this fix's job.
 fn disambiguate_workspace_segment(segment: &str, relative_subpath: Option<&Path>) -> String {
     match relative_subpath.filter(|rel| !rel.as_os_str().is_empty()) {
-        Some(rel) => format!(
-            "{segment}-{}",
-            sanitize_workspace_segment(&rel.to_string_lossy())
-        ),
+        Some(rel) => {
+            let sanitized_subpath = sanitize_workspace_segment(&rel.to_string_lossy());
+            format!("{}-{segment}-{sanitized_subpath}", segment.len())
+        }
         None => segment.to_string(),
     }
 }
@@ -43442,6 +43482,74 @@ mod tests {
             "issue #607: two different directories (team-a/proj, team-b/proj) that suggest \
              the identical segment must not provision into the same physical clone -- got \
              {:?} for both",
+            resolution_a.worktree_path
+        );
+    }
+
+    /// Scenario: PR #751 review round (auditor finding 1). A first version
+    /// of `disambiguate_workspace_segment` joined `segment` and the
+    /// sanitized relative subpath with a bare `-`, which is NOT injective:
+    /// two different `(segment, relative_subpath)` pairs can redistribute
+    /// across that join point to the identical string. Pick A
+    /// (`repo/bar/baz`, orchestration Name typed `foo`) and pick B
+    /// (`repo/baz`, orchestration Name typed `foo-bar`) both bare-join to
+    /// `"foo-bar-baz"` — reproducing the exact #607 collision this function
+    /// exists to close, just requiring a user-typed (not purely
+    /// auto-suggested) Name to trigger it. Pins that the length-prefixed
+    /// join used instead keeps these two genuinely distinct.
+    #[spec("orchestration/workspace/041")]
+    #[test]
+    fn workspace_041_adversarial_segment_and_subpath_pair_no_longer_collides() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+        let pick_a = repo.join("bar").join("baz");
+        let pick_b = repo.join("baz");
+        std::fs::create_dir_all(&pick_a).expect("create bar/baz");
+        std::fs::create_dir_all(&pick_b).expect("create baz");
+
+        let segment_a = sanitize_workspace_segment("foo");
+        let segment_b = sanitize_workspace_segment("foo-bar");
+
+        let resolution_a = resolve_orchestration_workspace(&pick_a, &segment_a);
+        let resolution_b = resolve_orchestration_workspace(&pick_b, &segment_b);
+
+        // Setup sanity: confirm this pair genuinely defeats a BARE
+        // `{segment}-{sanitized subpath}` join -- computed via the real
+        // `sanitize_workspace_segment` against the real, resolved
+        // `relative_subpath` for each pick, not a hand-transcribed literal
+        // that might not match what the two picks actually resolve to on
+        // this platform. If this ever stopped holding, this test would no
+        // longer be exercising auditor finding 1 at all.
+        let sanitized_rel_a = sanitize_workspace_segment(
+            &resolution_a
+                .relative_subpath
+                .as_deref()
+                .expect("pick A must be nested under the toplevel")
+                .to_string_lossy(),
+        );
+        let sanitized_rel_b = sanitize_workspace_segment(
+            &resolution_b
+                .relative_subpath
+                .as_deref()
+                .expect("pick B must be nested under the toplevel")
+                .to_string_lossy(),
+        );
+        let bare_join_a = format!("{segment_a}-{sanitized_rel_a}");
+        let bare_join_b = format!("{segment_b}-{sanitized_rel_b}");
+        assert_eq!(
+            bare_join_a, bare_join_b,
+            "setup: sanity -- this pair must collide under a bare '{{segment}}-{{sanitized \
+             subpath}}' join, or this test isn't exercising the adversarial case auditor \
+             finding 1 describes"
+        );
+
+        assert_ne!(
+            resolution_a.worktree_path, resolution_b.worktree_path,
+            "auditor finding 1 (PR #751 review round): pick A (segment {segment_a:?}, subpath \
+             {sanitized_rel_a:?}) and pick B (segment {segment_b:?}, subpath \
+             {sanitized_rel_b:?}) must not provision into the same physical clone merely \
+             because they redistribute identically across a bare join -- got {:?} for both",
             resolution_a.worktree_path
         );
     }
