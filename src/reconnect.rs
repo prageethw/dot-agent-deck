@@ -472,6 +472,18 @@ async fn apply_broadcast(state: &SharedState, msg: BroadcastMsg) {
         // above — the subscriber task can't touch `ui.session_warnings`
         // either, that's render-loop-local state.
         BroadcastMsg::WorktreeKept(notice) => state.write().await.queue_kept_worktree(notice),
+        // Issue #755: applied directly, unlike the two queued variants above
+        // — `outstanding_delegation` lives on `SessionState`, which this
+        // subscriber can already write through `state`, exactly like the
+        // `Event` arm at the top of this match. This is the live-push path
+        // that lets an already-attached, healthily-subscribed TUI see a
+        // delegation arm/retire with no reconnect — see
+        // `SessionState::outstanding_delegation`'s doc for why the
+        // hydration/resync paths alone were not enough.
+        BroadcastMsg::DelegationArmed(notice) => state.write().await.apply_delegation_armed(notice),
+        BroadcastMsg::DelegationRetired(notice) => {
+            state.write().await.apply_delegation_retired(notice)
+        }
     }
 }
 

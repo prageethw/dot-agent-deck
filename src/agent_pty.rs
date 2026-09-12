@@ -3241,6 +3241,22 @@ pub struct AgentPtyRegistry {
     /// `None` for a registry with no owning daemon (in-process unit tests),
     /// where publishing is a silent no-op. See [`DeliveryNotice`].
     delivery_notice_sink: Mutex<Option<DeliveryNoticeSink>>,
+    /// Issue #755 round 2 (auditor A1): where a delegation's retirement is
+    /// announced on the three paths that have no `event_tx` parameter to
+    /// broadcast through directly — the idle-watch timeout take, a deliberate
+    /// pane close (`begin_pane_close`/`finish_pane_close`), and the
+    /// agent-exit sweep (`sweep_delegations_on_exit`, driven from
+    /// `pump_reader`, a raw OS thread with no async context at all). Mirrors
+    /// [`DeliveryNoticeSink`] for the identical reason: publishing needs the
+    /// daemon's broadcast channel, which the registry does not own. `None`
+    /// for a registry with no owning daemon (every in-process unit test),
+    /// where firing is a silent no-op — exactly like the delivery sink.
+    ///
+    /// `handle_work_done`'s own `DelegationRetired` broadcast (the
+    /// `DelegationRetirement::Retired` arm) is deliberately NOT routed
+    /// through this sink — it already has `event_tx` threaded as a parameter
+    /// and stays that way; this sink exists only for the paths that don't.
+    delegation_retired_sink: Mutex<Option<DelegationRetiredSink>>,
     /// PRD #126: delegations that are still awaiting a `work-done` plus the set
     /// of panes currently mid-close. Both live under ONE mutex so "mark this
     /// pane closing AND drop its outstanding records" is a single atomic
@@ -3326,7 +3342,7 @@ pub struct DelegationWatchSnapshot {
 /// or [`SilenceWatchRecord`] — plain `u64` seconds rather than `Duration` or
 /// `Instant`, neither of which can be serialized, mirroring how the rest of
 /// this file already keeps raw internal types off the wire.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WatchSnapshot {
     pub armed_secs_ago: u64,
     pub orchestrator_pane_id: String,
@@ -3976,6 +3992,15 @@ pub struct DeliveryNotice {
 /// broadcast, neither of which the registry owns.
 pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
 
+/// Issue #755 round 2: the daemon's sink for a delegation retiring on a path
+/// with no `event_tx` parameter in scope, installed via
+/// [`AgentPtyRegistry::set_delegation_retired_sink`]. Carries just the
+/// worker pane id — the same payload [`crate::event::DelegationRetiredNotice`]
+/// carries — a closure for the same reason as [`DeliveryNoticeSink`]:
+/// publishing needs the daemon's event broadcast, which the registry does
+/// not own.
+pub type DelegationRetiredSink = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Internal selector for the two public byte-write entrypoints.
 /// `Submit` is the prompt path (payload + `SUBMIT_DELAY` + `\r`);
 /// `Notice` is the visibility path (payload + `\n`, no submit). Kept
@@ -4077,6 +4102,7 @@ impl AgentPtyRegistry {
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
             hook_socket: Mutex::new(None),
             delivery_notice_sink: Mutex::new(None),
+            delegation_retired_sink: Mutex::new(None),
             delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
             orchestration_name_claims: Mutex::new(HashMap::new()),
@@ -4191,6 +4217,29 @@ impl AgentPtyRegistry {
     /// (every in-process unit test) simply drops notices.
     pub fn set_delivery_notice_sink(&self, sink: DeliveryNoticeSink) {
         *self.delivery_notice_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Issue #755 round 2: install the daemon's sink for
+    /// [`BroadcastMsg::DelegationRetired`](crate::event::BroadcastMsg::DelegationRetired)
+    /// announcements on the three paths with no `event_tx` parameter — see
+    /// the field doc on `delegation_retired_sink`. Called once from
+    /// [`crate::daemon::run_daemon_with`]; a registry without one (every
+    /// in-process unit test) simply drops the announcement, which is exactly
+    /// what those tests want (they assert on the registry's own state, not on
+    /// a broadcast).
+    pub fn set_delegation_retired_sink(&self, sink: DelegationRetiredSink) {
+        *self.delegation_retired_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Fire the installed [`DelegationRetiredSink`] (if any) for
+    /// `worker_pane_id`. Called only after a record has actually been
+    /// removed from the tracker, and only for the three paths named on
+    /// `delegation_retired_sink`'s field doc.
+    fn fire_delegation_retired(&self, worker_pane_id: &str) {
+        let sink = self.delegation_retired_sink.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            sink(worker_pane_id.to_string());
+        }
     }
 
     /// Issue #424 (reviewer blocker 3): report a delivery failure against the
@@ -4692,13 +4741,22 @@ impl AgentPtyRegistry {
     ///   and leaves the newer record for the newer timer.
     ///
     /// Nothing is removed when the seq does not match.
+    ///
+    /// Issue #755 round 2 (auditor A1): this is the idle-watch timeout's
+    /// take (`arm_idle_worker_watch` in `src/state.rs`), one of the three
+    /// paths with no `event_tx` in scope — a genuine removal fires
+    /// [`Self::fire_delegation_retired`] so an already-attached client's
+    /// stale `Some(..)` is cleared instead of suppressing that pane's idle
+    /// bell for the rest of the session. Every OTHER caller of this method is
+    /// a test asserting on registry state directly, where firing is a silent
+    /// no-op (no sink installed).
     pub fn take_outstanding_delegation_if(
         &self,
         worker_pane_id: &str,
         seq: u64,
     ) -> Option<OutstandingDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
-        if tracker
+        let removed = if tracker
             .records
             .get(worker_pane_id)
             .is_some_and(|d| d.seq == seq)
@@ -4706,7 +4764,12 @@ impl AgentPtyRegistry {
             tracker.records.remove(worker_pane_id)
         } else {
             None
+        };
+        drop(tracker);
+        if removed.is_some() {
+            self.fire_delegation_retired(worker_pane_id);
         }
+        removed
     }
 
     /// PRD #126: a `work-done` arrived from `worker_pane_id`, so one outstanding
@@ -4795,7 +4858,16 @@ impl AgentPtyRegistry {
                 "pane close: dropped delegation commissions touching this pane"
             );
         }
-        Self::drain_delegations_touching(&mut tracker, pane_id)
+        let dropped = Self::drain_delegations_touching(&mut tracker, pane_id);
+        drop(tracker);
+        // Issue #755 round 2 (auditor A1): announce every retirement this
+        // close swept — including a WORKER pane's record dropped because the
+        // pane closing here was its ORCHESTRATOR, which leaves that worker's
+        // card live with a now-stale `Some(..)` otherwise.
+        for (worker_pane_id, _) in &dropped {
+            self.fire_delegation_retired(worker_pane_id);
+        }
+        dropped.into_iter().map(|(_, record)| record).collect()
     }
 
     /// PRD #126: finish the close transition opened by
@@ -4821,7 +4893,14 @@ impl AgentPtyRegistry {
             );
         }
         tracker.closing_panes.remove(pane_id);
-        swept
+        drop(tracker);
+        // Issue #755 round 2 (auditor A1): same announcement as
+        // `begin_pane_close` — this final sweep can still catch a record
+        // armed inside the close window.
+        for (worker_pane_id, _) in &swept {
+            self.fire_delegation_retired(worker_pane_id);
+        }
+        swept.into_iter().map(|(_, record)| record).collect()
     }
 
     /// PRD #126: whether `pane_id` is between [`Self::begin_pane_close`] and
@@ -4938,10 +5017,16 @@ impl AgentPtyRegistry {
 
     /// Remove every record that names `pane_id` as its worker key or as its
     /// orchestrator target. Caller holds the tracker lock.
+    ///
+    /// Issue #755 round 2: returns each removed record alongside its OWN
+    /// worker-pane key (the map key, which is not necessarily `pane_id` — a
+    /// match via the orchestrator-target arm removes a DIFFERENT worker
+    /// pane's record) so callers can announce
+    /// [`Self::fire_delegation_retired`] against the right pane.
     fn drain_delegations_touching(
         tracker: &mut DelegationTracker,
         pane_id: &str,
-    ) -> Vec<OutstandingDelegation> {
+    ) -> Vec<(String, OutstandingDelegation)> {
         let keys: Vec<String> = tracker
             .records
             .iter()
@@ -4950,8 +5035,11 @@ impl AgentPtyRegistry {
             })
             .map(|(worker_pane, _)| worker_pane.clone())
             .collect();
-        keys.iter()
-            .filter_map(|key| tracker.records.remove(key))
+        keys.into_iter()
+            .filter_map(|key| {
+                let record = tracker.records.remove(&key)?;
+                Some((key, record))
+            })
             .collect()
     }
 
@@ -5016,11 +5104,16 @@ impl AgentPtyRegistry {
     /// earlier occupant of the pane, not the one this delegation is for. It
     /// can still be drained by the ORCHESTRATOR-side arm, which does not
     /// depend on `worker_agent_id` at all. Caller holds the tracker lock.
+    ///
+    /// Issue #755 round 2: like [`Self::drain_delegations_touching`], returns
+    /// each removed record alongside its own worker-pane key so
+    /// [`Self::sweep_delegations_on_exit`] can announce
+    /// [`Self::fire_delegation_retired`] against the right pane.
     fn drain_delegations_touching_for_exit(
         tracker: &mut DelegationTracker,
         pane_id: &str,
         exited_agent_id: &str,
-    ) -> Vec<OutstandingDelegation> {
+    ) -> Vec<(String, OutstandingDelegation)> {
         let keys: Vec<String> = tracker
             .records
             .iter()
@@ -5032,8 +5125,11 @@ impl AgentPtyRegistry {
             })
             .map(|(worker_pane, _)| worker_pane.clone())
             .collect();
-        keys.iter()
-            .filter_map(|key| tracker.records.remove(key))
+        keys.into_iter()
+            .filter_map(|key| {
+                let record = tracker.records.remove(&key)?;
+                Some((key, record))
+            })
             .collect()
     }
 
@@ -5135,6 +5231,7 @@ impl AgentPtyRegistry {
             Self::drain_silence_watches_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
         let swept =
             Self::drain_delegations_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
+        drop(tracker);
         if cancelled_watches > 0 || !swept.is_empty() {
             tracing::debug!(
                 pane_id = %pane_id,
@@ -5143,7 +5240,16 @@ impl AgentPtyRegistry {
                 "pane EOF: retired outstanding delegation/silence-watch records for this pane"
             );
         }
-        swept
+        // Issue #755 round 2 (auditor A1): this is the agent-exit sweep —
+        // `pump_reader` is a raw OS thread with no `event_tx` reachable at
+        // all, hence the sink rather than a threaded parameter (see
+        // `delegation_retired_sink`'s field doc). Fired for every record this
+        // exit swept, worker-key or orchestrator-key match alike, same as
+        // `begin_pane_close`/`finish_pane_close`.
+        for (worker_pane_id, _) in &swept {
+            self.fire_delegation_retired(worker_pane_id);
+        }
+        swept.into_iter().map(|(_, record)| record).collect()
     }
 
     /// Whether `agent_id` still names a live entry in the
@@ -13521,6 +13627,107 @@ mod spawn_tests {
             reg.arm_outstanding_delegation("worker-a", "coder", "orch-1", "agent-7", None)
                 .is_some(),
             "after the transition completes, arming works again"
+        );
+    }
+
+    /// Issue #755 round 2 (auditor A1): the exact scenario the finding named
+    /// — closing the ORCHESTRATOR pane drops a still-live WORKER pane's
+    /// outstanding-delegation record, and until this fix nothing told an
+    /// already-attached client, permanently suppressing that worker's real
+    /// idle bell. `set_delegation_retired_sink` must fire once per dropped
+    /// record, named by the WORKER's own pane id — not the closing
+    /// orchestrator's — since that is what an attached client's session is
+    /// keyed on.
+    #[test]
+    fn begin_pane_close_fires_the_retired_sink_for_a_worker_dropped_via_its_orchestrator() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        reg.arm_outstanding_delegation("worker-a", "coder", "orch-1", "agent-7", None)
+            .expect("arm worker-a");
+        reg.arm_outstanding_delegation("worker-b", "tester", "orch-1", "agent-7", None)
+            .expect("arm worker-b");
+
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let fired_for_sink = fired.clone();
+        reg.set_delegation_retired_sink(Arc::new(move |pane_id| {
+            fired_for_sink.lock().unwrap().push(pane_id);
+        }));
+
+        let dropped = reg.begin_pane_close("orch-1");
+        assert_eq!(dropped.len(), 2);
+
+        let mut fired = fired.lock().unwrap().clone();
+        fired.sort();
+        assert_eq!(
+            fired,
+            vec!["worker-a".to_string(), "worker-b".to_string()],
+            "the sink must fire once per dropped record, keyed by each record's OWN worker \
+             pane id — the closing pane here was the ORCHESTRATOR, not either worker"
+        );
+    }
+
+    /// Issue #755 round 2 (auditor A1): the agent-exit sweep is the other
+    /// path with no `event_tx` in scope (`pump_reader` is a raw OS thread).
+    /// Pins that `sweep_delegations_on_exit` fires the same sink, keyed by
+    /// the worker's own pane id, for a delegation retired by a natural exit.
+    #[test]
+    fn sweep_delegations_on_exit_fires_the_retired_sink() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let armed = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm delegation");
+        reg.bind_delegation_worker_agent_id("worker", armed.seq, "agent-a");
+
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let fired_for_sink = fired.clone();
+        reg.set_delegation_retired_sink(Arc::new(move |pane_id| {
+            fired_for_sink.lock().unwrap().push(pane_id);
+        }));
+
+        let swept = reg.sweep_delegations_on_exit("worker", "agent-a");
+        assert_eq!(swept.len(), 1);
+        assert_eq!(
+            fired.lock().unwrap().as_slice(),
+            &["worker".to_string()],
+            "a natural worker exit must fire the retired sink for its own pane id"
+        );
+    }
+
+    /// Issue #755 round 2 (auditor A1): the idle-watch timeout's
+    /// `take_outstanding_delegation_if` is the third path with no `event_tx`
+    /// in scope. Pins that a genuine take (seq matches) fires the sink, and a
+    /// no-op take (stale seq, nothing removed) does not.
+    #[test]
+    fn take_outstanding_delegation_if_fires_the_retired_sink_only_on_a_genuine_take() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let armed = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm delegation");
+
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let fired_for_sink = fired.clone();
+        reg.set_delegation_retired_sink(Arc::new(move |pane_id| {
+            fired_for_sink.lock().unwrap().push(pane_id);
+        }));
+
+        // A stale seq (as if a newer delegation had already superseded this
+        // one) must not fire the sink — nothing was actually removed.
+        assert!(
+            reg.take_outstanding_delegation_if("worker", armed.seq + 1)
+                .is_none()
+        );
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "a no-op take (stale seq) must not fire the retired sink"
+        );
+
+        assert!(
+            reg.take_outstanding_delegation_if("worker", armed.seq)
+                .is_some()
+        );
+        assert_eq!(
+            fired.lock().unwrap().as_slice(),
+            &["worker".to_string()],
+            "the idle-watch timeout's genuine take must fire the retired sink"
         );
     }
 

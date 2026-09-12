@@ -419,7 +419,18 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// malformed-request error rather than silently mishandling the close
 /// preview. See `docs/develop/fork-sync-workflow.md`'s 2026-09-03 Stage B
 /// section for the full decision record.
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// Fork issue #755 bumps 11 → 12: two new [`crate::event::BroadcastMsg`]
+/// variants, `DelegationArmed`/`DelegationRetired` — the live-push mechanism
+/// that lets an already-attached TUI learn a pane's outstanding-delegation
+/// state changed without a reconnect (mirroring `OrchestrationSurface`'s and
+/// `WorktreeKept`'s reasoning above). `BroadcastMsg` has no `#[serde(other)]`
+/// catch-all, so an older peer receiving either new `kind` tag over
+/// `KIND_EVENT` fails to deserialize the frame — the version bump is what
+/// turns that into an upfront, actionable "protocol mismatch" attach refusal
+/// ([`crate::build_version_handshake::ensure_compatible_daemon_or_die`])
+/// instead of a silent per-event parse failure discovered later.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -4871,6 +4882,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
         let snap = session.live_snapshot();
         assert_eq!(

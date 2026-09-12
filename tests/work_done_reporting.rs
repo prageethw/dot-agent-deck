@@ -252,6 +252,7 @@ impl WorkDoneHarness {
                     subject: None,
                 },
                 &self.registry,
+                Some(&self.event_tx),
             )
             .await;
     }

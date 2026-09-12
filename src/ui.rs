@@ -6960,8 +6960,18 @@ fn compute_bell_needed(
     for (id, session) in sessions {
         let current = &session.status;
         let changed = last_bell_status.get(id) != Some(current);
+        // Issue #755: a pane with a `delegate` still outstanding (no
+        // matching `work-done` yet) must not ring the idle bell just
+        // because its raw, hook-event-derived status reads `Idle` — that
+        // status is exactly the one this badge/bell pair no longer takes at
+        // face value (see `render_session_card`'s matching guard). Scoped to
+        // `Idle` only: it is the sole status `BellConfig::should_bell` rings
+        // on that this field can ever mask (`WaitingForInput`/`Error` are
+        // both asserted by the agent itself and unaffected).
+        let idle_but_delegated =
+            *current == SessionStatus::Idle && session.outstanding_delegation.is_some();
 
-        if changed && bell_config.should_bell(current) {
+        if changed && !idle_but_delegated && bell_config.should_bell(current) {
             need_bell = true;
         }
 
@@ -14442,6 +14452,7 @@ pub fn run_tui(
                 h.agent_type.clone(),
                 Some(h.agent_id.clone()),
                 h.live.as_ref(),
+                h.outstanding_delegation.clone(),
             );
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
@@ -23039,6 +23050,25 @@ fn render_session_card(
         ("Starting…".to_string(), text_primary())
     } else if is_empty_placeholder {
         ("No agent".to_string(), text_primary())
+    } else if matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown)
+        && session.outstanding_delegation.is_some()
+    {
+        // Issue #755: the daemon still has a `delegate` armed for this pane
+        // (no matching `work-done` has landed yet), but the raw,
+        // hook-event-derived status still reads `Idle`/`Unknown` — the
+        // target may be actively executing a long-running task and simply
+        // hasn't emitted a fresh hook event since, or it may have finished
+        // and not yet called `work-done`. Either way plain "Idle" actively
+        // lies (it is supposed to mean "no outstanding work"), so this
+        // reuses the same "this status is not the whole story" treatment
+        // issue #714 established for a monitored-wait-held `Working`
+        // (`STATUS_OBSERVING` + a parenthetical suffix) rather than
+        // inventing a second visual language for the same underlying idea.
+        let (label, style) = status_style(&session.status);
+        (
+            format!("{label} (delegated)"),
+            style.fg(palette::STATUS_OBSERVING),
+        )
     } else if session.status == SessionStatus::Working
         && (session.wait_synthetic_working || session.wait_deferred_revert)
     {
@@ -24244,6 +24274,7 @@ pub fn render_orchestration_frame_to_buffer(
                 model: None,
                 expects_agent_report: false,
                 agent_report_activity_seen: false,
+                outstanding_delegation: None,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -27896,6 +27927,7 @@ mod tests {
             tab_membership: membership,
             agent_type: None,
             live: None,
+            outstanding_delegation: None,
         }
     }
 
@@ -29891,6 +29923,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31726,6 +31759,7 @@ mod tests {
                 model: None,
                 expects_agent_report: false,
                 agent_report_activity_seen: false,
+                outstanding_delegation: None,
             },
         );
 
@@ -33761,6 +33795,7 @@ mod tests {
             shell_descendant_busy: false,
             wait_deferred_revert: false,
             model: None,
+            outstanding_delegation: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
         };
@@ -35759,6 +35794,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         }
     }
 
@@ -35813,6 +35849,36 @@ mod tests {
         };
         let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
         assert!(need_bell);
+    }
+
+    /// Issue #755: `bell.on_idle` must not ring for a pane that only LOOKS
+    /// idle because the daemon still has a `delegate` armed against it with
+    /// no `work-done` yet — the same "this Idle isn't the whole story" guard
+    /// `render_session_card`'s badge applies. A transition to Idle with no
+    /// outstanding delegation (the case `bell_respects_config_toggle_on`
+    /// above pins) must still ring exactly as before.
+    #[test]
+    fn bell_suppressed_for_idle_with_outstanding_delegation() {
+        let mut delegated_session = make_session(SessionStatus::Idle);
+        delegated_session.outstanding_delegation = Some(crate::agent_pty::WatchSnapshot {
+            armed_secs_ago: 5,
+            orchestrator_pane_id: "orch-pane".to_string(),
+        });
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), delegated_session);
+
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(
+            !need_bell,
+            "an Idle transition must not ring bell.on_idle while a delegation is outstanding"
+        );
     }
 
     #[test]
@@ -36284,6 +36350,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
 
         // Spacious: get all 3
@@ -36327,6 +36394,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -36361,6 +36429,7 @@ mod tests {
             model: None,
             expects_agent_report: false,
             agent_report_activity_seen: false,
+            outstanding_delegation: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
