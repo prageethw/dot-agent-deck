@@ -1312,37 +1312,40 @@ fn cwd_matches(form_cwd: &Path, candidate: &str) -> bool {
 /// PRD fork#760 fix round (reviewer M1 / auditor A1): rather than have the
 /// daemon additionally report each live orchestration's segment/slug over
 /// the wire, `scan_by_name` is now backed up by `scan_by_shape` — a check
-/// that needs no wire change because it recognizes the one thing every
-/// sibling workspace this codebase provisions has in common regardless of
-/// what segment produced it: for the NON-nested case (the common one — no
-/// relative subpath to fold in), it always sits directly beside its root
-/// under a name of the exact form `<root-basename>-<anything>`. Given a
-/// candidate root `ancestor`, `scan_by_shape` asks only "is `live_cwd` a
-/// sibling of `ancestor` whose name starts with `<ancestor's own
-/// basename>-`?" — true for `orchestrator-N`, a typed slug, or (still) a
-/// Name-derived segment alike, with no need to know which one actually
-/// produced it. This closes the gap for the default blank-slug case (and
-/// any non-nested typed slug), which is what `identity_013`/`workspace_002`
-/// depend on continuing to bump the suggestion counter correctly.
+/// that needs no wire change because it recognizes the one shape
+/// [`auto_generate_worktree_slug`] can ever actually produce: for the
+/// NON-nested case (the common one — no relative subpath to fold in), the
+/// blank-slug default sits directly beside its root under a name of the
+/// EXACT form `<root-basename>-orchestrator-<digits>`. Given a candidate
+/// root `ancestor`, `scan_by_shape` asks only "is `live_cwd` a sibling of
+/// `ancestor` whose name is `<ancestor's own basename>-orchestrator-N` for
+/// some `N`?". This closes the gap for the default blank-slug case, which is
+/// what `identity_013`/`identity_041`/`workspace_002` depend on continuing
+/// to bump the suggestion counter correctly.
 ///
-/// Deliberately narrower than full precision in two ways, both accepted:
+/// Deliberately narrow, on purpose, in two ways:
 /// (1) only the non-nested shape is recognized this way — a nested pick's
 /// `rel`-disambiguated candidate (the length-prefixed join
 /// [`disambiguate_workspace_segment`] produces) stays covered only by the
-/// legacy `scan_by_name` fallback, so a live peer opened from a NESTED
-/// subpath with a typed slug that doesn't happen to equal
-/// `sanitize_workspace_segment(live_name)` is still under-detected — a
-/// narrower version of the gap this whole comment describes, not a new one.
-/// (2) `scan_by_shape` can also OVER-detect: an unrelated live orchestration
-/// whose OWN root happens to be named `<ancestor's basename>-something` (a
-/// coincidence of two independently-named projects, not two opens of the
-/// same one) will also match. Both directions are accepted for the same
-/// reason the rest of this file favors them elsewhere (e.g. the
-/// `cwd: None` wildcard-degrade in `Action::SpawnPane`): a suggestion/
-/// collision-avoidance heuristic failing toward MORE exclusion/refusal can
-/// only ever over-refuse, never silently let two live orchestrations share
-/// an identity — the fork #74 condition this whole mechanism exists to
-/// prevent.
+/// legacy `scan_by_name` fallback (see `worktree/024`'s own `Does not
+/// assert` note).
+/// (2) the suffix must match the auto-generated `orchestrator-N` shape
+/// EXACTLY, not "any suffix" — an earlier draft of this fix matched any
+/// non-empty suffix (`<basename>-<anything>`), which over-detected: two
+/// independently-named sibling PROJECTS that merely happen to share a
+/// dash-prefix (e.g. `/tmp/proj` and an unrelated `/tmp/proj-b`) were
+/// wrongly treated as the same workspace, breaking `identity_030`'s own
+/// pinned invariant that uniqueness is scoped to `(directory, name)`, not a
+/// name/path coincidence. The narrower digits-only match still recognizes
+/// every blank-slug peer (its segment can ONLY ever be `orchestrator-N`,
+/// never arbitrary text), while a typed-slug peer whose slug doesn't happen
+/// to equal `sanitize_workspace_segment(live_name)` is left to
+/// `scan_by_name` (or, failing that, remains a known, accepted residual —
+/// unchanged from PRD fork#603's own original documented gap, not widened
+/// by this fix). A widened OR can only ever detect MORE occupancy than
+/// either check alone, never less, so this narrowing trades away some of
+/// that "more" specifically to stop the false positive, not to reopen any
+/// case fork#603 already closed.
 ///
 /// The blank-Name case `scan_by_name` still carries: `display_title` is
 /// `(!typed_name.is_empty()).then(|| typed_name.clone())`. When `typed_name`
@@ -1377,8 +1380,18 @@ fn live_orchestration_occupies(form_cwd: &Path, live_cwd: &str, live_name: &str)
                 && live_cwd_path.file_name().is_some_and(|n| {
                     n.to_string_lossy()
                         .strip_prefix(basename.as_str())
-                        .and_then(|rest| rest.strip_prefix('-'))
-                        .is_some_and(|rest| !rest.is_empty())
+                        .and_then(|rest| rest.strip_prefix("-orchestrator-"))
+                        // PRD fork#760 fix round (identity_030 regression):
+                        // the suffix must be exactly the digits
+                        // `auto_generate_worktree_slug` can ever produce —
+                        // NOT "any non-empty suffix", which wrongly matched
+                        // an unrelated sibling PROJECT merely sharing a
+                        // dash-prefixed name (e.g. `proj` vs. `proj-b`). See
+                        // this function's own doc comment for the full
+                        // reasoning.
+                        .is_some_and(|n_str| {
+                            !n_str.is_empty() && n_str.bytes().all(|b| b.is_ascii_digit())
+                        })
                 })
         })
     };
@@ -43822,6 +43835,15 @@ mod tests {
         };
         run_git(&["init", "-q"]);
         std::fs::write(repo.join("README.md"), "worktree_024 fixture\n").expect("write README");
+        // Fork issue #595 fix round 2: git tracks no empty directories, so a
+        // `git clone` of `repo` would silently omit `team-a/proj` entirely
+        // unless it holds at least one TRACKED file -- `resolved_dir`
+        // (`src/ui.rs`) then correctly refuses the open ("was not found
+        // inside the provisioned workspace") rather than handing role panes
+        // a cwd that doesn't exist post-clone. Not what this test is about,
+        // so make the nested pick a real, trackable leaf.
+        std::fs::write(nested.join("marker.txt"), "worktree_024 nested fixture\n")
+            .expect("write nested marker");
         run_git(&["add", "-A"]);
         run_git(&[
             "-c",
