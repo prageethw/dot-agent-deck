@@ -2672,3 +2672,171 @@ fn dispatch_030_gh_api_user_failure_skips_assignee_without_failing_dispatch() {
         daemon.stderr_text()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #171 — repo allowlist + dry-run
+// ---------------------------------------------------------------------------
+
+/// Scenario: Fire an `issue_dispatch` task whose `[scheduled_tasks.issue_dispatch]`
+/// table carries a `repo_allowlist` that does NOT include the task's own
+/// `repo` — a misconfigured/over-broad schedule pointed at the wrong target.
+/// Assert the run refuses outright, fail-closed: NO `gh` invocation of any
+/// kind is ever made (not the issue enumeration, not the repo clone), no
+/// per-issue worktree is created, and the daemon's stderr names the refusal.
+#[spec("scheduler/dispatch/032")]
+#[test]
+fn dispatch_032_repo_allowlist_refuses_when_repo_not_listed() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    // A fully working fixture (real clone-able remote, a real open issue) so
+    // this test's guard, if it were ever removed, would produce an OBSERVABLE
+    // dispatch (worktree + agent) rather than coincidentally erroring on a
+    // missing fixture — the RED this test pins is about the guard, not about
+    // an incidentally-broken repo.
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[9]);
+
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let mut toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    toml.push_str("repo_allowlist = [\"acme/other\"]\n");
+
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let refused = daemon.wait_for_stderr_contains("repo_allowlist", W);
+    assert!(
+        refused,
+        "a repo excluded from repo_allowlist must be refused with a message naming the \
+         allowlist; stderr:\n{}",
+        daemon.stderr_text()
+    );
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 9);
+    assert!(
+        !paths.worktree_dir.exists(),
+        "a refused repo must never be dispatched into a per-issue worktree"
+    );
+
+    assert!(
+        stub.gh_calls().is_empty(),
+        "a repo excluded by repo_allowlist must produce ZERO `gh` invocations — not even the \
+         issue-enumeration read — since the refusal must happen before any `gh`/`git` call; \
+         observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+}
+
+/// Scenario: Fire an `issue_dispatch` task with `dry_run = true` against a
+/// repo that already carries the `in-progress` label. Assert the dispatch
+/// still happens normally (clone, per-issue worktree, spawned agent — reads
+/// are unaffected), but none of the three claim writes (`gh issue comment`,
+/// `gh issue edit --add-label`, `gh issue edit --add-assignee`) nor the
+/// unconditional `gh label create` ensure ever reach the stub `gh` — a dry
+/// run must be a safe way to try a new schedule with zero remote mutation.
+#[spec("scheduler/dispatch/033")]
+#[test]
+fn dispatch_033_dry_run_skips_all_gh_writes() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, false);
+    stub.seed_labels(repo, &[IN_PROGRESS_LABEL]);
+    stub.set_issues(repo, &[11]);
+
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let mut toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    toml.push_str("dry_run = true\n");
+
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 11);
+    assert!(
+        daemon
+            .wait_for_agent_where(|r| single_card_in(r, &paths.worktree_dir), W)
+            .is_some(),
+        "a dry run must still dispatch normally — only the `gh` WRITEs are suppressed, not the \
+         clone/worktree/spawn path"
+    );
+
+    // Give any (incorrect) write time to land — `wait_until` exits EARLY the
+    // moment a prohibited call appears (catching a regression fast); it only
+    // waits out the full timeout when none ever does, mirroring
+    // `dispatch_030`'s identical negative-assertion pattern above.
+    let wrote_comment = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment"))
+    });
+    assert!(
+        !wrote_comment,
+        "dry_run must suppress the claim comment write entirely; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    let wrote_label_add = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| l.contains("--add-label"))
+    });
+    assert!(
+        !wrote_label_add,
+        "dry_run must suppress the `in-progress` label write entirely; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    let wrote_label_create = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("label") && l.contains("create"))
+    });
+    assert!(
+        !wrote_label_create,
+        "dry_run must suppress the unconditional `gh label create` claim-label ensure too; \
+         observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    let assigned = common::wait_until(Duration::from_secs(3), || {
+        !stub.assignees(repo, 11).is_empty()
+    });
+    assert!(
+        !assigned,
+        "dry_run must suppress the assignee write entirely — got assignees {:?}",
+        stub.assignees(repo, 11)
+    );
+
+    assert!(
+        !stub.label_applied(repo, 11, IN_PROGRESS_LABEL),
+        "dry_run must never actually apply the `in-progress` label"
+    );
+}

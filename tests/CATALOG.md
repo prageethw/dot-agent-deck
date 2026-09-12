@@ -7317,6 +7317,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the attempt-count wiring that decides whether a live delivery reaches this branch in production (covered, for the reachable attempt-1 case, by `scheduler/dispatch/018`; the launcher-consumes-attempt-1 recovery this would otherwise also protect is deferred to fork issue #343).
 - **Platform coverage:** mac+linux+windows.
 
+##### scheduler/dispatch/032 — A `repo_allowlist` that excludes the task's configured `repo` refuses the entire run fail-closed: zero `gh` invocations of any kind, no per-issue worktree, and a stderr refusal naming the allowlist (issue #171).
+- **Layer:** L2 (as `scheduler/dispatch/001`).
+- **Agent:** none (run-now; the fixture repo is a real clone-able remote with a real open issue so the guard's absence would produce an OBSERVABLE dispatch rather than an incidental fixture error).
+- **Asserts:** `run_issue_dispatch` refuses before `provision_repo`'s clone/fetch and before `list_open_issues`'s enumeration — the stub `gh` log stays completely empty; no per-issue worktree is created; the daemon's stderr names the refusal (the literal substring `repo_allowlist`) via `NotifyEvent::IssueDispatchRepoError`.
+- **Does not assert:** the `dry_run` write-suppression path, which still performs reads and still dispatches (covered by `scheduler/dispatch/033`); an allowlist that DOES include the configured repo, which is simply every other `scheduler/dispatch/*` test (unset `repo_allowlist` is the default, unchanged-behavior case).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/033 — `dry_run = true` still dispatches normally (clone, per-issue worktree, spawned agent) but suppresses every `gh` WRITE — the claim comment, the `in-progress` label add, the unconditional claim-label `gh label create` ensure, and the assignee write — none ever reach the stub `gh` (issue #171).
+- **Layer:** L2 (as `scheduler/dispatch/010`; the repo is pre-seeded with the `in-progress` label so a real add-label call, if one wrongly fired, would actually succeed against the stub rather than being masked by an unrelated label-resolution failure).
+- **Agent:** none (run-now; observes the dispatched single-agent card, the stub's recorded `gh` invocations, and `GhStub::label_applied`/`GhStub::assignees`).
+- **Asserts:** the dispatch succeeds as normal (worktree + single-agent card present, same as `scheduler/dispatch/001`); no recorded `gh` call ever carries `issue ... comment`, `--add-label`, `label create`, or names an assignee; `GhStub::label_applied` never reports the `in-progress` label as actually applied.
+- **Does not assert:** the exact log line dry-run emits describing what it WOULD have done (this repo's daemon-side `tracing` output is not routed to the captured stderr this harness reads — see `scheduler/dispatch/030`'s stderr-vs-tracing distinction); the `repo_allowlist` refusal path (covered by `scheduler/dispatch/032`); triage-mode dry-run (the seven-label `ensure_labels` path uses the identical suppression mechanism as the single-label `ensure_claim_label` path this test covers, so is not separately re-pinned).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).
