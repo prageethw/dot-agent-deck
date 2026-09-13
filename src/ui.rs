@@ -39610,6 +39610,98 @@ mod tests {
         );
     }
 
+    /// Scenario: with an orchestration selected (Command hidden, Worktree-slug
+    /// visible), a user who types their intended workspace name straight into
+    /// the Name field and presses Enter must land on the Worktree-slug field
+    /// next, NOT submit the form immediately — `build_new_pane_request` reads
+    /// the resolved workspace segment only from `form.worktree_slug`, never
+    /// from `form.name`, so an immediate submit here silently drops what the
+    /// user just typed and the backend falls back to an auto-generated
+    /// `orchestrator-N` segment instead (issue #769).
+    #[spec("orchestration/worktree/033")]
+    #[test]
+    fn worktree_033_enter_on_name_advances_to_slug_field_when_orchestration_selected() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/proj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("config-name")],
+        ));
+
+        // Select the orchestration (Right from "No mode" -> first orchestration
+        // slot). This is what makes Command hidden and Worktree-slug visible.
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui);
+        {
+            let form = ui.new_pane_form.as_ref().unwrap();
+            assert!(
+                !form.command_visible(),
+                "orchestration selected -> Command hidden"
+            );
+            assert!(
+                form.worktree_slug_visible(),
+                "orchestration selected -> Worktree-slug visible"
+            );
+        }
+
+        // Move focus to the Name field.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
+
+        // fork#192 M1.0: selecting the orchestration pre-fills Name with a
+        // suggested `proj-orchestrator-1`. Clear it, as a user overwriting the
+        // suggestion would backspace first, then type the workspace name they
+        // actually want.
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        for c in "features".chars() {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            handle_new_pane_form_key(key, &mut ui);
+        }
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "features");
+
+        // Pressing Enter here must NOT submit the form yet -- the
+        // Worktree-slug field is still blank, and it (not Name) is what
+        // actually drives the resolved workspace segment.
+        let result = handle_new_pane_form_key(enter, &mut ui);
+
+        match result {
+            Action::Continue => {}
+            Action::SpawnPane(req) => {
+                panic!(
+                    "Enter on Name submitted the form immediately instead of \
+                     advancing to the Worktree-slug field; req.worktree_slug = {:?} \
+                     even though the user typed \"features\" into Name (never into \
+                     the slug field) -- issue #769",
+                    req.worktree_slug
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        let form = ui
+            .new_pane_form
+            .as_ref()
+            .expect("form must still be open -- Enter on Name must not submit here");
+        assert_eq!(
+            form.focused,
+            FormField::WorktreeSlug,
+            "Enter on Name must advance focus to the Worktree-slug field when an \
+             orchestration is selected, not submit directly"
+        );
+        assert_eq!(
+            form.name, "features",
+            "the typed name must be preserved across the Enter press"
+        );
+    }
+
     #[test]
     fn unified_form_esc_cancels() {
         let mut ui = default_ui();

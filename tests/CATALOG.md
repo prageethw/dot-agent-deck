@@ -5514,6 +5514,13 @@ without depending on the config struct API.
 - **Does not assert:** the reverse ordering (nested pick first, toplevel pick second) — symmetric by the same mechanism, not independently pinned.
 - **Platform coverage:** mac+linux+windows (no `#[cfg(unix)]`, matching `029`/`030`/`031`).
 
+##### orchestration/worktree/033 — With an orchestration selected (Command hidden, Worktree-slug visible), pressing Enter while focused on Name after typing a slug-like string directly into Name must advance focus to the Worktree-slug field, never submit the form immediately (issue #769: `build_new_pane_request` reads the resolved workspace segment only from `form.worktree_slug`, never `form.name`, so an immediate submit here silently drops what the user typed and the backend falls back to auto-generating an `orchestrator-N` segment instead).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` directly through the Right/Enter/Backspace/Char key sequence a real user's round trip produces; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a form with one orchestration, after selecting it (Right) and moving focus to Name (Enter), backspacing out the suggested name and typing `"features"`, pressing Enter does NOT yield `Action::SpawnPane` (the form must still be open) and instead leaves `form.focused == FormField::WorktreeSlug` with `form.name` still `"features"`.
+- **Does not assert:** the non-orchestration control case, where Command stays visible and Enter on Name advances to Command rather than submitting — already pinned, unaffected by this fix, by `enter_on_name_still_advances_to_command_without_orchestration`; the fix itself (a coder's next step); the daemon-side `worktree_slug` resolution once actually typed into the field (covered by `orchestration/worktree/021`/`022`).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/workspace
 
 ##### orchestration/workspace/001 — The FIRST orchestration ever opened against a root checkout (no concurrent sibling orchestration exists at all) still provisions its own isolated, named workspace — never a `git worktree add` sibling sharing the launch directory's own object store, and never the launch directory itself — at `<root-checkout-basename>-<sanitized-slug>`, derived from the typed Worktree slug (PRD fork#544 M2b: unconditional isolation; PRD fork#760 Part A: the typed Worktree slug — not Name — is the path's naming input, with Name staying the tab-title/uniqueness identity).
