@@ -10735,13 +10735,21 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             FormField::Name if form.command_visible() => {
                 form.focused = FormField::Command;
             }
-            // PRD #106: when the Command field is hidden (orchestration
-            // selected), pressing Enter on Name submits directly. PRD
-            // fork#760 Part A's Worktree-slug field stays out of this chain
-            // deliberately — it's opt-in and rarely used, so it isn't worth
-            // taxing every orchestration launch's Enter-to-submit muscle
-            // memory. The field is still reachable via Tab, and Enter
-            // submits from there too (the match arm right below).
+            // Issue #769: when Command is hidden (orchestration selected),
+            // Worktree-slug is shown instead — route Enter there rather than
+            // falling through to the immediate-submit arm below. Submitting
+            // straight from Name would leave `form.worktree_slug` blank
+            // (`build_new_pane_request` sources the workspace segment only
+            // from `worktree_slug`, never `name`), silently discarding
+            // whatever the user just typed and producing an unwanted
+            // auto-generated `orchestrator-N` workspace name instead.
+            FormField::Name if form.worktree_slug_visible() => {
+                form.focused = FormField::WorktreeSlug;
+            }
+            // PRD #106: when neither Command nor Worktree-slug is visible
+            // (no orchestration selected), pressing Enter on Name submits
+            // directly — the case that originally motivated this shortcut,
+            // before either field existed.
             FormField::Name | FormField::Command | FormField::WorktreeSlug => {
                 // fork#192 M1.0: a name a live orchestration already holds is
                 // REFUSED at submit — no SpawnPane, form stays open. Checked
