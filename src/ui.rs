@@ -43211,8 +43211,27 @@ mod tests {
     /// A plain `create_dir_all`, sufficient before this PRD's M2b, is not
     /// sufficient any more.
     fn init_committed_git_repo(dir: &std::path::Path) {
+        init_committed_git_repo_with_content(dir, "test fixture\n");
+    }
+
+    /// Same as [`init_committed_git_repo`], but with the committed
+    /// `README.md` content as a parameter rather than the fixed
+    /// `"test fixture\n"` literal. A test that builds TWO independently-
+    /// `git init`'d repos in the same run and needs their commits to never
+    /// hash to the same SHA (e.g. a control case asserting a genuinely
+    /// different, unrelated source repository is refused) must give each
+    /// repo distinguishable content here -- two repos with byte-identical
+    /// committed content, same committer identity, and no timestamp
+    /// pinning, committed within the same wall-clock second, produce the
+    /// EXACT SAME commit SHA (git commit hashing has no other entropy at
+    /// 1-second granularity), which silently defeats an ancestry-based
+    /// "must be refused" assertion instead of exercising it. Mirrors
+    /// `orchestration/workspace/007`'s (`src/issue_dispatch_run.rs`)
+    /// `seed_source_repo(dir, seed_content)` pattern, which already avoids
+    /// this trap on purpose.
+    fn init_committed_git_repo_with_content(dir: &std::path::Path, readme_content: &str) {
         init_git_repo(dir);
-        std::fs::write(dir.join("README.md"), "test fixture\n").expect("write README");
+        std::fs::write(dir.join("README.md"), readme_content).expect("write README");
         let run_git = |args: &[&str]| {
             let status = std::process::Command::new("git")
                 .current_dir(dir)
@@ -45798,10 +45817,44 @@ mod tests {
         // Control: releasing the registration and reopening the IDENTICAL
         // clone_dir against a genuinely different, unrelated source
         // repository (still nominally carrying the same legacy-shaped
-        // creator line) must NOT resume.
+        // creator line) must NOT resume. `other_source` is seeded with
+        // content that differs from `repo`'s (rather than reusing
+        // `init_committed_git_repo`'s fixed "test fixture\n" text) so its
+        // initial commit can never hash to the identical SHA as `repo`'s --
+        // two independently-`git init`'d repos with byte-identical
+        // committed content, same committer identity, and no timestamp
+        // pinning, committed within the same wall-clock second, produce
+        // the EXACT SAME commit SHA (git commit hashing has no other
+        // entropy at 1-second granularity), which would make the ancestry
+        // probe this control case relies on spuriously report a match
+        // instead of the mismatch it's meant to exercise. Mirrors
+        // `orchestration/workspace/007`'s `seed_source_repo(&source_a,
+        // "seed-a\n")` / `seed_source_repo(&source_b,
+        // "seed-b-unrelated-history\n")` pattern, which already avoids
+        // this trap on purpose.
         crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&clone_dir);
         let other_source = tmp.path().join("other-source");
-        init_committed_git_repo(&other_source);
+        init_committed_git_repo_with_content(&other_source, "other-source-unrelated-history\n");
+        let repo_head_sha = |dir: &std::path::Path| -> String {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("git rev-parse HEAD must spawn");
+            assert!(
+                out.status.success(),
+                "git rev-parse HEAD failed in {dir:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_ne!(
+            repo_head_sha(&repo),
+            repo_head_sha(&other_source),
+            "setup: sanity -- `repo` and `other_source` must genuinely have distinct commit \
+             SHAs, or the ancestry check below can't tell them apart and this control case \
+             isn't exercising a genuinely different, unrelated source repository at all"
+        );
         let other_today_creator_identity_seed =
             spawn_pane_creator_identity_seed(false, &other_source, None, &segment, &clone_dir);
         let other_today_creator = orchestration_creator_string(&other_today_creator_identity_seed);
