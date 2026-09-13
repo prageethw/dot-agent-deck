@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.47.1] - 2026-09-13
+
+### Fixed
+
+  Reopening an existing isolated-clone workspace picked at the top level of a repository (no nested subdirectory) was being refused as a name collision, even though it was the exact same repository and workspace name that had already been opened before — this affected pre-existing toplevel workspaces created before v0.46.0 (issue #766).
+  The regression was introduced by the fix for issue #760/#761, which changed how the ownership marker's stored identity is computed for a toplevel pick — from a name-derived string to a path-derived one. Every workspace marker written before that change still carries the old, name-derived string, so it no longer matched what today's code computes for the identical workspace, and the resume was refused instead of reused.
+  A toplevel pick now also accepts the old, pre-#760 name-derived format as an equivalent match, but only when the workspace is reopened using the caller's own current identity for that same pick (the same Worktree slug/segment the workspace was originally opened with) AND the stored marker is genuinely shaped like that old format — this closes the collision the original fix round in this area had left open, where any legacy-formatted marker could be adopted by any unrelated toplevel pick that happened to land on the same directory. The marker is updated to the current format the first time it resumes this way, so this only needs to happen once per workspace. This does not touch or weaken the collision protection for a nested pick (a subdirectory of a repository) that #761 added — two different nested picks typing the same Worktree slug are still correctly refused rather than silently sharing a workspace, and a toplevel pick can no longer adopt (and permanently rewrite) a nested pick's own live workspace either, even when the two happen to resolve to the same physical directory and write the same stored name — only a marker that is genuinely shaped like the old pre-#760 format is ever accepted by this fallback. The `dispatch <name>` CLI path (whose own workspace-identity scheme was never affected by #760/#761 in the first place) never takes this fallback at all.
+
+
+
 ## [0.47.0] - 2026-09-13
 
 ### Changed
