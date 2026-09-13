@@ -42,7 +42,21 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use common::{TuiDeck, commit_fixture, run_git};
+use dot_agent_deck::worktree_reclaim::sanitize_marker_creator;
 use spec::spec;
+
+/// Build the exact owner/creator marker string production code writes for a
+/// resolved workspace path — mirrors `orchestration_creator_string`'s own
+/// computation (`src/ui.rs`, PRD fork#760 third fix round): prefix with
+/// `orchestration:` then run the result through the identical sanitizer the
+/// marker itself passes through ([`sanitize_marker_creator`]), so a test's
+/// expected owner string is never a hand-rolled approximation of what's
+/// actually written to disk (control-char stripping, whitespace trimming,
+/// and the 200-char truncation all apply here too, even though none of
+/// them are expected to fire for an ordinary tempdir-derived path).
+fn expected_owner(resolved_path: &std::path::Path) -> String {
+    sanitize_marker_creator(&format!("orchestration:{}", resolved_path.display()))
+}
 
 /// Resolve `dir`'s git COMMON dir via `git -C dir rev-parse --git-common-dir`
 /// — for a linked worktree this resolves to the MAIN repository's `.git` (the
@@ -181,8 +195,23 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
     // (resolved workspace path/branch) — no more reading the pre-filled
     // `<basename>-orchestrator-N` suggestion, since this helper clears and
     // types over it.
-    let owner_1 = "orchestration:clonegate1".to_string();
-    let owner_2 = "orchestration:clonegate2".to_string();
+    //
+    // PRD fork#760 third fix round: the on-disk creator/owner marker is now
+    // qualified by the FULL resolved workspace path
+    // (`workspace_resolution.worktree_path.display()`), not the bare typed
+    // slug — see `orchestration_creator_string`'s call site in `src/ui.rs`.
+    // Both orchestrations share the SAME launch directory (`work`), so each
+    // one's resolved path is `<work's-basename>-<typed-slug>`, matching
+    // `resolve_workspace_path`.
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path_1 = work.with_file_name(format!("{launch_dir_basename}-clonegate1"));
+    let expected_path_2 = work.with_file_name(format!("{launch_dir_basename}-clonegate2"));
+    let owner_1 = expected_owner(&expected_path_1);
+    let owner_2 = expected_owner(&expected_path_2);
     let second_label = " clonegate2 ";
 
     open_orchestration_with_name(&deck, "clonegate1");
@@ -413,9 +442,25 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
     // PRD fork#760 Part A: `open_orchestration_with_name` types the identical
     // literal into both Name (creator/owner identity) and the Worktree slug
     // (resolved workspace path/branch).
-    let owner_1 = "orchestration:clonegate1".to_string();
-    let owner_2 = "orchestration:clonegate2".to_string();
-    let owner_3 = "orchestration:clonegate3".to_string();
+    //
+    // PRD fork#760 third fix round: the on-disk creator/owner marker is now
+    // qualified by the FULL resolved workspace path
+    // (`workspace_resolution.worktree_path.display()`), not the bare typed
+    // slug — see `orchestration_creator_string`'s call site in `src/ui.rs`.
+    // All three orchestrations share the SAME launch directory (`work`), so
+    // each one's resolved path is `<work's-basename>-<typed-slug>`, matching
+    // `resolve_workspace_path`.
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path_1 = work.with_file_name(format!("{launch_dir_basename}-clonegate1"));
+    let expected_path_2 = work.with_file_name(format!("{launch_dir_basename}-clonegate2"));
+    let expected_path_3 = work.with_file_name(format!("{launch_dir_basename}-clonegate3"));
+    let owner_1 = expected_owner(&expected_path_1);
+    let owner_2 = expected_owner(&expected_path_2);
+    let owner_3 = expected_owner(&expected_path_3);
     let second_label = " clonegate2 ";
     let third_label = " clonegate3 ";
 
@@ -872,14 +917,22 @@ fn workspace_001_first_orchestration_gets_named_isolated_workspace() {
         )
     });
 
+    // PRD fork#760 third fix round: the on-disk creator/owner marker is now
+    // qualified by the FULL resolved workspace path
+    // (`workspace_resolution.worktree_path.display()`), not the bare typed
+    // Name/slug — see `orchestration_creator_string`'s call site in
+    // `src/ui.rs`. Compute the expected resolved path FIRST so `owner` can
+    // be built from the identical string the production code derives its
+    // marker from, rather than from `NAME` alone.
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+
     let contents =
         std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
-    let owner = format!("orchestration:{NAME}");
+    let owner = expected_owner(&expected_path);
     let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
         panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
     });
 
-    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
     assert_eq!(
         pwd,
         expected_path,
@@ -961,9 +1014,17 @@ fn workspace_002_naming_is_deterministic_from_name_alone_across_separate_runs() 
             )
         });
 
+        // PRD fork#760 third fix round: the on-disk creator/owner marker is
+        // qualified by the FULL resolved workspace path, not the bare typed
+        // Name/slug — compute the expected resolved path from `work` and
+        // `basename_out` (already known here) and build `owner` from that,
+        // matching `orchestration_creator_string`'s call site in
+        // `src/ui.rs`.
+        let expected_path = work.with_file_name(format!("{basename_out}-{NAME}"));
+
         let contents =
             std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
-        let owner = format!("orchestration:{NAME}");
+        let owner = expected_owner(&expected_path);
         *pwd_out = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
             panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
         });
@@ -1053,7 +1114,11 @@ fn workspace_003_reopening_same_name_resumes_existing_workspace_preserving_local
     });
     let contents =
         std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
-    let owner = format!("orchestration:{NAME}");
+    // PRD fork#760 third fix round: the on-disk creator/owner marker is
+    // qualified by the FULL resolved workspace path, not the bare typed
+    // Name — build `owner` from `expected_path` (already computed above),
+    // matching `orchestration_creator_string`'s call site in `src/ui.rs`.
+    let owner = expected_owner(&expected_path);
     let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
         panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
     });
@@ -1181,6 +1246,18 @@ fn workspace_004_resume_fetches_read_only_and_leaves_checked_out_branch_untouche
     commit_fixture(&work);
     let default_branch = current_branch(&work);
 
+    // PRD fork#760 third fix round: the on-disk creator/owner marker is
+    // qualified by the FULL resolved workspace path, not the bare typed
+    // Name — compute it up front so `owner` below can be built from the
+    // identical string `orchestration_creator_string` derives its marker
+    // from (`src/ui.rs`), matching `workspace_001`/`003`.
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{NAME}"));
+
     // A REAL, separately-advanceable local repository as `origin` — unlike
     // the other tests in this family, this one is a genuine local clone the
     // resumed workspace's own `git fetch origin` can actually reach, not an
@@ -1225,7 +1302,7 @@ fn workspace_004_resume_fetches_read_only_and_leaves_checked_out_branch_untouche
     });
     let contents =
         std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
-    let owner = format!("orchestration:{NAME}");
+    let owner = expected_owner(&expected_path);
     let pwd = pwd_for_owner(&contents, &owner).unwrap_or_else(|| {
         panic!("no line in {log_path:?} for owner {owner:?}; got: {contents:?}")
     });
