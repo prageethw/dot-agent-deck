@@ -25,13 +25,28 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// for a cwd absent from the daemon's live orchestration records and then for
 /// a `/work/already-live`-picked directory whose one live orchestration's
 /// ACTUAL reported cwd is the sibling workspace path
-/// `/work/already-live-already-live-orchestrator-1` — the production shape
-/// isolated-clone provisioning (fork#544 M2b) always produces, never the
-/// picked directory itself (issue #605; the previous fixture injected a cwd
-/// literally identical to the picked directory, a shape production can no
-/// longer produce, so it silently passed against dead code). Only the
-/// collision warns that the working tree is shared and points the user at a
-/// worktree, without blocking the form.
+/// `/work/already-live-already-live-orchestrator-1` (issue #605; the
+/// previous fixture injected a cwd literally identical to the picked
+/// directory, a shape production can no longer produce, so it silently
+/// passed against dead code). Only the collision warns that the working
+/// tree is shared and points the user at a worktree, without blocking the
+/// form.
+///
+/// PRD fork#760 fix round correction (reviewer N10 / auditor N11): the
+/// doubled-basename shape this fixture injects is
+/// [`crate::live_orchestration_occupies`]'s LEGACY `scan_by_name`
+/// reconstruction shape (`<dir-basename>-<sanitize(live-Name)>`) — it is
+/// what production emits ONLY when a live peer's Name happens to sanitize
+/// to `<dir-basename>-orchestrator-N` (a coincidence, not the common case),
+/// never what a BLANK-slug open (the default, most common path) produces.
+/// A blank-slug open's real cwd is the single, non-doubled
+/// `<dir-basename>-orchestrator-N` shape (`/work/already-live-orchestrator-1`
+/// here, not doubled) — recognized by the newer, structural `scan_by_shape`
+/// half of the same function, pinned separately by
+/// `orchestration/identity/041` in `src/ui.rs`, not by this test. This test
+/// exercises `scan_by_name` alone; it is a real, still-reachable case (a
+/// typed Name coincidentally matching the auto-generated shape), not the
+/// shape production "always" produces.
 #[spec("orchestration/guard/001")]
 #[test]
 fn guard_001_warns_for_same_cwd_live_orchestration_only() {
