@@ -44221,17 +44221,36 @@ mod tests {
         ]);
 
         let config = make_orchestration("review");
-        // The clean shape `disambiguate_workspace_segment` unconditionally
+        // Read back what the real call site's own shared primitive
+        // (`resolve_orchestration_workspace`) computes for this fixture,
+        // rather than hand-building the expected path from `repo` --
+        // `resolve_git_toplevel`'s own output (`git rev-parse
+        // --show-toplevel`) does not always textually match a hand-typed
+        // reconstruction of the SAME physical directory: on Windows, git
+        // reports the toplevel with forward slashes and the long-form
+        // username, which can differ from a picked-up 8.3 short-name
+        // spelling of the temp root's own path; on macOS, `/var` is itself
+        // a symlink to `/private/var`, which git's toplevel resolution
+        // follows. Calling the exact same primitive here, against the
+        // exact same fixture directory, means both sides can only ever
+        // agree or disagree for a REAL reason, never a platform
+        // path-spelling coincidence (mirrors `identity_038`'s own
+        // "read back the real formula" technique).
+        let resolution = resolve_orchestration_workspace(&nested, SLUG);
+        let resolved_root_dir = resolution.resolved_root_dir.clone();
+        let relative_subpath = resolution
+            .relative_subpath
+            .clone()
+            .expect("the nested pick must have a non-empty relative subpath");
+        // The clean shape a typed Worktree slug now produces (this fix).
+        let expected = resolve_workspace_path(&resolved_root_dir, SLUG);
+        // The OLD shape `disambiguate_workspace_segment` unconditionally
         // produced before this fix, for comparison in the failure message
         // below.
         let dirty_shape = resolve_workspace_path(
-            &repo,
-            &disambiguate_workspace_segment(SLUG, Some(Path::new("team-a/proj"))),
+            &resolved_root_dir,
+            &disambiguate_workspace_segment(SLUG, Some(relative_subpath.as_path())),
         );
-        let expected = repo.with_file_name(format!(
-            "{}-{SLUG}",
-            repo.file_name().unwrap().to_string_lossy()
-        ));
 
         let daemon_dir = tempdir().expect("tempdir for daemon-stub");
         let _daemon = with_empty_agents_daemon(daemon_dir.path());
@@ -44267,7 +44286,7 @@ mod tests {
             !cwds.is_empty(),
             "the nested typed-slug open must succeed -- got zero spawned panes"
         );
-        let expected_cwd = expected.join("team-a").join("proj");
+        let expected_cwd = expected.join(&relative_subpath);
         for cwd in &cwds {
             assert_eq!(
                 cwd.as_deref(),
@@ -44277,7 +44296,7 @@ mod tests {
                  always-disambiguated shape ({:?}) fork issue #607 introduced for every nested \
                  pick regardless of whether the slug was auto-generated or typed",
                 expected_cwd,
-                dirty_shape.join("team-a").join("proj")
+                dirty_shape.join(&relative_subpath)
             );
         }
         assert!(
@@ -44407,9 +44426,17 @@ mod tests {
             .join("team-a")
             .join("proj")
             .join("marker.txt");
+        // Windows checks committed text out as CRLF by default (no
+        // `.gitattributes` forcing LF in this fixture, deliberately --
+        // that would be a repo-wide policy change out of scope for this
+        // fix); normalize before comparing so this assertion pins the
+        // CONTENT surviving untouched, not the checkout's line-ending
+        // convention.
+        let team_a_marker_contents = std::fs::read_to_string(&team_a_marker)
+            .expect("read back team-a's marker")
+            .replace("\r\n", "\n");
         assert_eq!(
-            std::fs::read_to_string(&team_a_marker).expect("read back team-a's marker"),
-            "team-a\n",
+            team_a_marker_contents, "team-a\n",
             "the first pick's own clone must remain untouched by the refused second pick"
         );
     }
