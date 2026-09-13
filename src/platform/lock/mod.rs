@@ -185,6 +185,12 @@ pub(crate) fn spawn_mutex_name(user_token: &str, lock_path: &Path) -> String {
 /// different builds and must derive the identical lock filename for the same
 /// `worktree_dir` (CLAUDE.md rule 12). `DefaultHasher` would let two builds
 /// silently fail to contend on the same key.
+///
+/// Fork issue #763 fix round (auditor A1 / reviewer F1, BLOCKER): a third
+/// caller, `Action::SpawnPane`'s `creator` identity seed (`src/ui.rs`), for
+/// the identical reason — that value is compared against a `created-by:`
+/// marker PERSISTED to disk, possibly by a different process/build, so both
+/// sides must derive the same digest regardless of toolchain.
 pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {

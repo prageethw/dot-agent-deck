@@ -4283,23 +4283,49 @@ pub(crate) enum ResumeRejection {
     /// is now derived from the full resolved `clone_dir`
     /// (`workspace_resolution.worktree_path`) rather than from the bare
     /// slug or the typed Name — see `orchestration_creator_string`'s own
-    /// doc. That closes the collision above but also makes it UNREACHABLE
-    /// by construction for two slugs colliding to one path: since `creator`
-    /// is purely a function of `clone_dir`, two slugs that sanitize to the
-    /// identical path necessarily compute the identical `creator`, so
-    /// `stored_creator != sanitize_marker_creator(creator)` can never be
-    /// true for that case — there is nothing left for this check to catch
-    /// there, and reopening under the IDENTICAL slug with a DIFFERENT Name
-    /// resumes correctly rather than tripping this variant (the concurrent
-    /// case is refused earlier and separately, by `ClaimOrchestrationName`'s
-    /// own cwd clause, before provisioning is ever reached — see
-    /// `src/agent_pty.rs`'s `claim_orchestration_name`). What this variant
-    /// still catches: the *same* on-disk `clone_dir` carrying a provenance
-    /// marker written by a genuinely DIFFERENT creator producer — e.g. the
-    /// `dispatch <name>` CLI path's `dispatch:<name>` marker
-    /// (`src/dispatch.rs`), or a marker written by a pre-fork#760 build
-    /// whose `creator` was still Name- or bare-segment-derived — being
-    /// reopened by this path's `orchestration:<clone_dir>` producer.
+    /// doc. That closes the collision above and, AT THE TIME, made it
+    /// unreachable by construction for two slugs colliding to one path,
+    /// since `creator` was purely a function of `clone_dir` and reopening
+    /// under the IDENTICAL slug with a DIFFERENT Name resumed correctly
+    /// rather than tripping this variant.
+    ///
+    /// Fork issue #763 (auditor A1/A2, reviewer F1/F2, BLOCKER-class):
+    /// that "unreachable by construction" claim is now FALSE for one
+    /// shape, and this variant is that shape's ENTIRE remaining defense.
+    /// A typed Worktree slug on a nested pick deliberately makes
+    /// `physical_worktree_path` (`src/ui.rs`) diverge from `creator`'s own
+    /// seed, `workspace_resolution.worktree_path` — two DIFFERENT nested
+    /// picks sharing one typed slug now provision into the SAME on-disk
+    /// `clone_dir` while still being two DIFFERENT `creator` identities
+    /// (see that call site's own comment for the digest that keeps them
+    /// distinguishable even under `sanitize_marker_creator`'s 200-char
+    /// truncation). `stored_creator != sanitize_marker_creator(creator)`
+    /// is exactly what now catches the second pick and refuses it here.
+    ///
+    /// This is NOT "refused earlier and separately, by
+    /// `ClaimOrchestrationName`'s own cwd clause, before provisioning is
+    /// ever reached" (the claim this doc used to make, and which was true
+    /// before #763) — the auditor traced it precisely: the two nested
+    /// picks' claim `cwd` values still carry the distinct relative subpath
+    /// appended underneath the now-shared clone directory
+    /// (`orchestration_claim_cwd_path`, `src/ui.rs`), so the two `cwd`
+    /// strings are genuinely DIFFERENT and `claim_orchestration_name`
+    /// (`src/agent_pty.rs`) lets BOTH claims through — the cwd clause never
+    /// arbitrates this collision class at all. What protects it instead,
+    /// end to end: this creator comparison (the load-bearing check), plus
+    /// the cross-process `flock` `acquire_worktree_lock_sync` takes on
+    /// `worktree_attach_lock_path` inside `provision_isolated_clone_sync_resolved`
+    /// for the entire check-then-register sequence, which rules out a
+    /// genuine TOCTOU between the two picks racing to create/resume the
+    /// shared `clone_dir` concurrently.
+    ///
+    /// What this variant also still catches, as before #763: the *same*
+    /// on-disk `clone_dir` carrying a provenance marker written by a
+    /// genuinely DIFFERENT creator producer — e.g. the `dispatch <name>`
+    /// CLI path's `dispatch:<name>` marker (`src/dispatch.rs`), or a marker
+    /// written by a pre-fork#760 build whose `creator` was still Name- or
+    /// bare-segment-derived — being reopened by this path's
+    /// `orchestration:<clone_dir>` producer.
     NameCollision,
 }
 
@@ -4331,11 +4357,13 @@ impl ResumeRejection {
             }
             Self::Contested => "another request just resumed it first — try again",
             Self::NameCollision => {
-                "a different orchestration already opened the workspace at this location under \
-                 a different Worktree slug (its provenance record names a different creator) — \
-                 the two slugs sanitize to the same directory; pick a different Worktree slug \
-                 instead of retyping the Name, which no longer changes where this resolves. It \
-                 may still be in use by the orchestration that opened it — do not remove it"
+                "a different orchestration already opened the workspace at this location (its \
+                 provenance record names a different creator) — either a different Worktree \
+                 slug that sanitizes to the same directory, or the identical Worktree slug \
+                 picked against a different nested subdirectory of the same project; pick a \
+                 different Worktree slug (or reopen the exact same picked directory) instead of \
+                 retyping the Name, which no longer changes where this resolves. It may still \
+                 be in use by the orchestration that opened it — do not remove it"
             }
         }
     }
