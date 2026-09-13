@@ -44537,10 +44537,11 @@ mod tests {
     /// BLOCKER) — the adversarial case `030` cannot reach: a shared
     /// `<parent>/<repo>-<len>-<slug>-` prefix long enough (padded past
     /// `sanitize_marker_creator`'s 200-character cap, via a repo nested
-    /// under one artificially long path component) that the OLD
-    /// creator-identity derivation (`orchestration:` + the always-folded
-    /// `workspace_resolution.worktree_path`, with no digest) would have
-    /// truncated BOTH picks' creators to the byte-identical string —
+    /// under several moderate-length, platform-safe padding directories)
+    /// that the OLD creator-identity derivation (`orchestration:` + the
+    /// always-folded `workspace_resolution.worktree_path`, with no digest)
+    /// would have truncated BOTH picks' creators to the byte-identical
+    /// string —
     /// silently letting the second pick RESUME into the first's live
     /// clone instead of being refused, the exact fork#74 condition this
     /// whole mechanism exists to prevent. Confirms two things, both read
@@ -44556,21 +44557,59 @@ mod tests {
     fn worktree_031_two_nested_picks_sharing_a_prefix_past_the_200_char_creator_cap_the_second_is_still_refused()
      {
         const SLUG: &str = "features";
-        // A single long path component pads every downstream path (the
-        // repo toplevel, and both nested picks' resolved sibling
-        // directory) well past the point where the shared
-        // `<parent>/<repo>-<len>-<slug>-` prefix alone exceeds
-        // `sanitize_marker_creator`'s 200-character cap -- long before
-        // either pick's own distinguishing subpath tail (`team-a-proj` vs
-        // `team-b-proj`) is ever reached. 220 stays comfortably under
-        // every platform's single-path-component limit (255 bytes on
-        // Linux/macOS; Windows long-path support is assumed the same way
-        // the rest of this test suite already assumes it for tempdir-based
-        // fixtures).
-        let long_component: String = "d".repeat(220);
-
         let tmp = tempdir().expect("tempdir");
-        let repo = tmp.path().join(&long_component).join("repo");
+        // Pad the path between the tempdir root and the repo toplevel far
+        // enough that the shared `<parent>/<repo>-<len>-<slug>-` prefix
+        // alone exceeds `sanitize_marker_creator`'s 200-character cap --
+        // long before either pick's own distinguishing subpath tail
+        // (`team-a-proj` vs `team-b-proj`) is ever reached.
+        //
+        // First attempt at this fixture (fix round 1) used ONE single
+        // 220-character path component, which failed `build-windows` in CI
+        // (`git init` there errors `NotADirectory` / "The directory name is
+        // invalid"): Windows enforces a much tighter historical `MAX_PATH`
+        // (~260 characters total, no long-path opt-in assumed) than
+        // Linux/macOS do, and that one component alone, stacked on top of
+        // the CI runner's own tempdir root, already blew past it for the
+        // deepest real path this fixture creates (`team-a/proj/marker.txt`)
+        // -- well before this test ever reached its own assertions.
+        //
+        // Fixed by spreading the SAME total padding across several
+        // moderate-length (`LEVEL_LEN`-character) nested directories
+        // instead of one giant component -- comfortably inside every
+        // platform's per-component limit (Windows' ~255-character NTFS
+        // component cap included) -- and by sizing the padding RELATIVE to
+        // the tempdir root `tempdir()` actually produced on this
+        // platform/runner (`base_len`), not a hardcoded constant: the OS
+        // temp root's own length varies enormously (a short `/tmp` on
+        // Linux, a long `/var/folders/.../T/` on macOS, a short `D:\a\_temp`
+        // or a longer `AppData\Local\Temp` on Windows), and a fixed padding
+        // length tuned for one platform's temp root either falls short of
+        // the 200-character threshold on a long base or blows past
+        // Windows' MAX_PATH on top of a short one. Targeting a fixed
+        // ABSOLUTE length for the padded parent directory instead (`TARGET_PARENT_LEN`)
+        // keeps every real path this fixture creates in a narrow, safe band
+        // on every platform: ~200 + 28 = ~228 characters for the deepest
+        // real path (`<parent>/repo/team-a/proj/marker.txt`), comfortably
+        // under Windows' 260-character ceiling, while the CREATOR STRING
+        // (`orchestration:` + the OLD, always-folded `<parent>/repo-8-features-team-a-proj`)
+        // comes out around 242 characters -- comfortably past the
+        // 200-character truncation cap this fixture exists to cross.
+        const TARGET_PARENT_LEN: usize = 200;
+        const LEVEL_LEN: usize = 40;
+        let base_len = tmp.path().to_string_lossy().chars().count();
+        let mut padded_root = tmp.path().to_path_buf();
+        let mut remaining = TARGET_PARENT_LEN.saturating_sub(base_len);
+        while remaining > 0 {
+            let this_level_len = remaining.clamp(1, LEVEL_LEN);
+            padded_root = padded_root.join("d".repeat(this_level_len));
+            // `+ 1` accounts for the path separator this level itself adds
+            // -- without it, the loop would slightly overshoot
+            // `TARGET_PARENT_LEN` on every iteration but the last.
+            remaining = remaining.saturating_sub(this_level_len + 1);
+        }
+
+        let repo = padded_root.join("repo");
         let team_a = repo.join("team-a").join("proj");
         let team_b = repo.join("team-b").join("proj");
         std::fs::create_dir_all(&team_a).expect("create team-a/proj");
