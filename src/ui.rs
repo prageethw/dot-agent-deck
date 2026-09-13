@@ -12892,14 +12892,21 @@ fn dispatch_action(
                         // Nothing was created yet, so there is no half-open
                         // state to roll back and no claim to release.
                         let reason = match claim_result {
+                            // Issue #760 (reviewer R2 / auditor N1): the daemon's
+                            // claim can now be refused for either a Name
+                            // collision or a resolved-workspace (`cwd`)
+                            // collision, so this defensive fallback (normally
+                            // unreachable — the daemon always sets `error` on
+                            // refusal) must not name "the Name" specifically
+                            // either.
                             Ok(resp) => resp.error.unwrap_or_else(|| {
-                                format!(
-                                    "orchestration name {orchestration_claim_name:?} is already held"
-                                )
+                                "another live orchestration already occupies this workspace \
+                                 (same Worktree slug/directory or same Name in this directory)"
+                                    .to_string()
                             }),
-                            Err(e) => format!(
-                                "could not verify orchestration name availability: {e}"
-                            ),
+                            Err(e) => {
+                                format!("could not verify orchestration name availability: {e}")
+                            }
                         };
                         ui.status_message = Some((
                             format!("Orchestration failed: {reason}"),

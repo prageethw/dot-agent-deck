@@ -845,6 +845,115 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
     }
 }
 
+/// Drive the new-pane form's real keyboard path with DISTINCT typed Name and
+/// Worktree-slug values — unlike [`open_orchestration_with_name`] (which
+/// types the identical literal into both fields so this file's
+/// predictable-path fixtures can derive the resolved path from one string),
+/// issue #760 reviewer R2 / auditor N1's regression is specifically about
+/// two DIFFERENT typed Names sharing the SAME typed slug, so this variant
+/// needs to tell the two fields apart.
+fn open_orchestration_with_name_and_slug(deck: &TuiDeck, name: &str, slug: &str) {
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_keys(b"\x1b[C"); // Right -> [Orch: clone-gate-demo] (the fixture's only orchestration)
+    deck.send_keys(b"\r"); // Mode -> Name
+    // Backspace x80 -> clear the pre-filled suggested Name (fork#192 M1.0).
+    deck.send_keys(&[0x7fu8; 80]);
+    deck.send_keys(name.as_bytes());
+    deck.send_keys(b"\t"); // Tab: Name -> Worktree slug (Command is hidden)
+    deck.send_keys(slug.as_bytes());
+    deck.send_keys(b"\r"); // submit from the Worktree-slug field
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
+/// one orchestration TWICE against the SAME directory with the IDENTICAL
+/// typed Worktree slug but two COMPLETELY DIFFERENT typed Names, the second
+/// one submitted while the first is still live. Issue #760 reviewer R2 /
+/// auditor N1: decoupling the resolved workspace path from Name broke the
+/// daemon's `ClaimOrchestrationName` guard's only conflict test (`k.name ==
+/// name`) — two different Names never collide there, so before this fix the
+/// second open was silently accepted and resumed into the SAME live,
+/// in-use working tree/branch the first orchestration was still actively
+/// using (the fork #74/#325-class two-live-orchestrations-one-worktree
+/// incident, reachable here by ordinary slug reuse rather than by
+/// coincidence). The second open must be REFUSED: the new-pane form must
+/// stay open, no second tab may appear, no second role pane may be
+/// spawned, and the first orchestration's own workspace must remain
+/// completely undisturbed.
+#[spec("orchestration/worktree/028")]
+#[test]
+fn worktree_028_same_slug_different_name_concurrent_open_is_refused() {
+    const SLUG: &str = "sameslug760";
+
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_path = work.with_file_name(format!("{launch_dir_basename}-{SLUG}"));
+
+    // First open — Name "Alpha760", slug SLUG. Stays live for the rest of
+    // this test.
+    open_orchestration_with_name_and_slug(&deck, "Alpha760", SLUG);
+    deck.wait_for_absence("New Agent");
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 1, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "the first role pane must have appended its owner+pwd line to \
+             {log_path:?}: {e}\n=== rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+
+    // Back to Dashboard WITHOUT closing the first orchestration — it stays
+    // live throughout this test.
+    deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode
+    deck.send_keys(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    // Second open — a COMPLETELY DIFFERENT Name, the IDENTICAL slug, while
+    // the first orchestration is still live.
+    open_orchestration_with_name_and_slug(&deck, "Beta760", SLUG);
+
+    // The refusal must be visible on screen — the new-pane form stays open,
+    // never silently closing into a second orchestration tab sharing the
+    // first's live workspace.
+    deck.wait_until_grid(
+        "New Agent form remains open after a live same-slug/different-Name \
+         collision, no second tab opened",
+        |g| g.contains("New Agent"),
+    );
+
+    // Only ONE role pane must ever have appended to the shared log — the
+    // refused second attempt must never have provisioned or spawned
+    // anything at all.
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    assert_eq!(
+        contents.lines().count(),
+        1,
+        "the refused second attempt must never have spawned a role pane at \
+         all — expected exactly 1 line in {log_path:?}, got: {contents:?}"
+    );
+
+    // The first orchestration's own workspace must be completely
+    // undisturbed by the refused second attempt.
+    assert!(
+        expected_path.is_dir(),
+        "the first (still-live) orchestration's workspace at {} must remain \
+         intact",
+        expected_path.display()
+    );
+}
+
 /// Read a `owner pwd` log line written by the `orch-clone-gate` fixture's
 /// `solo` role (`$DOT_AGENT_DECK_WORKTREE_OWNER` followed by `$(pwd)`,
 /// space-separated) and return the `pwd` recorded for `owner`, if any line
