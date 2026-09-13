@@ -158,6 +158,20 @@ mod pin_lockstep;
 /// `.github/scripts/pr_review_common.py`, driven here under `python3`.
 #[cfg(test)]
 mod pr_review_verdict;
+/// Issue #1019 review: `scripts/reap-orphans.sh` SIGKILLs processes selected by
+/// parsing `/proc`, and every property that makes that safe — the never-kill
+/// list, the two-part MCP identification, the stat-field arithmetic past a comm
+/// containing spaces, and the pid-reuse check before escalating — is a RUNTIME
+/// one that no compile step sees. Same argument rule 5 records for
+/// `clean_tmp.rs`. Tests only; driven against a synthetic `PROC_ROOT` with
+/// signals recorded rather than sent, so no test ever signals a real process.
+///
+/// Linux-only by `#[cfg]`, not by a runtime SKIP: the script reads `/proc` and
+/// uses GNU `stat -c`, so there is nothing for it to be correct about on macOS
+/// or Windows and a vacuous pass there would be worse than an absent test. The
+/// installed systemd timer is Linux-only for the same reason.
+#[cfg(all(test, target_os = "linux"))]
+mod reap_orphans;
 /// PRD #740: the job-graph properties in `release.yml` that keep a desktop
 /// bundler failure off the CLI release. Tests only — nothing can run that
 /// workflow outside a tag, so a bad edit is otherwise observable only after a
