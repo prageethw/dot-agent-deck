@@ -12956,31 +12956,24 @@ fn dispatch_action(
                     // FRONT of this seed, not appended after the folded
                     // path — so truncation, if it ever fires, can only ever
                     // drop the (now redundant) folded-path tail, never the
-                    // bytes that make two picks distinguishable.
-                    let creator_identity_seed = if !req.worktree_slug.is_empty()
-                        && workspace_resolution.relative_subpath.is_some()
-                    {
-                        let relative_subpath_str = workspace_resolution
-                            .relative_subpath
-                            .as_deref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default();
-                        let digest = crate::platform::lock::fnv1a64(
-                            format!(
-                                "{}\u{0}{}\u{0}{}",
-                                workspace_resolution.resolved_root_dir.display(),
-                                relative_subpath_str,
-                                segment,
-                            )
-                            .as_bytes(),
-                        );
-                        format!(
-                            "{digest:016x}:{}",
-                            workspace_resolution.worktree_path.display()
-                        )
-                    } else {
-                        workspace_resolution.worktree_path.display().to_string()
-                    };
+                    // bytes that make two picks distinguishable. Extracted
+                    // into its own pure function (`spawn_pane_creator_identity_seed`)
+                    // rather than left inline here so `worktree_031` can
+                    // pin this exact property directly, with two synthetic
+                    // inputs, instead of needing a real on-disk path over
+                    // 200 characters long — which turned out to be
+                    // unreliable to construct on a Windows CI runner at all
+                    // (Windows' own historical `MAX_PATH` makes a
+                    // genuinely long real filesystem path a losing fight
+                    // regardless of how the padding is spread across
+                    // components — see that test's own history comment).
+                    let creator_identity_seed = spawn_pane_creator_identity_seed(
+                        req.worktree_slug.is_empty(),
+                        &workspace_resolution.resolved_root_dir,
+                        workspace_resolution.relative_subpath.as_deref(),
+                        &segment,
+                        &workspace_resolution.worktree_path,
+                    );
                     let creator = orchestration_creator_string(&creator_identity_seed);
                     let orchestration_claim_token = mint_orchestration_claim_token();
                     // `workspace_resolution.resolved_dir()` doesn't exist on
@@ -14496,6 +14489,61 @@ fn orchestration_creator_string(identity_seed: &str) -> String {
         return crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string();
     }
     sanitized
+}
+
+/// Fork issue #763 fix round (auditor A1 / reviewer F1, BLOCKER): computes
+/// the identity seed `Action::SpawnPane` feeds to [`orchestration_creator_string`]
+/// for its `creator` — extracted out of that dispatch arm as its own pure
+/// function purely so `worktree_031` can pin the truncation-survival
+/// property this function exists for directly, with two synthetic inputs,
+/// rather than needing to provision two real isolated clones under a real
+/// filesystem path longer than 200 characters (unreliable to construct at
+/// all on a Windows CI runner — see that test's own doc comment). Behavior is
+/// unchanged from the inline version this replaces; see the call site's own
+/// comment (`src/ui.rs`, the `Action::SpawnPane` arm) for the full
+/// reasoning this only summarizes:
+///
+/// For every case except a typed Worktree slug on a nested pick (the ONE
+/// shape where `physical_worktree_path` — the real, clean directory this
+/// PR now provisions into — diverges from `always_folded_worktree_path`,
+/// this function's last argument), the seed is just
+/// `always_folded_worktree_path` unchanged, exactly as before this PR.
+///
+/// For that one narrow shape, the seed is front-loaded with a `fnv1a64`
+/// digest (fixed constants, stable across Rust versions/builds/platforms —
+/// this value is compared against a marker PERSISTED to disk, possibly by
+/// a different process/build) of `(resolved_root_dir, relative_subpath,
+/// segment)` as STRUCTURED inputs, placed before
+/// `always_folded_worktree_path` — i.e. at the FRONT of the seed, right
+/// after [`orchestration_creator_string`]'s own `"orchestration:"` prefix
+/// once that function adds it — so [`crate::worktree_reclaim::sanitize_marker_creator`]'s
+/// 200-character truncation, if it ever fires, can only ever drop the (now
+/// redundant) folded-path tail, never the digest bytes that keep two
+/// colliding picks distinguishable.
+fn spawn_pane_creator_identity_seed(
+    worktree_slug_is_empty: bool,
+    resolved_root_dir: &Path,
+    relative_subpath: Option<&Path>,
+    segment: &str,
+    always_folded_worktree_path: &Path,
+) -> String {
+    if !worktree_slug_is_empty && relative_subpath.is_some() {
+        let relative_subpath_str = relative_subpath
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let digest = crate::platform::lock::fnv1a64(
+            format!(
+                "{}\u{0}{}\u{0}{}",
+                resolved_root_dir.display(),
+                relative_subpath_str,
+                segment,
+            )
+            .as_bytes(),
+        );
+        format!("{digest:016x}:{}", always_folded_worktree_path.display())
+    } else {
+        always_folded_worktree_path.display().to_string()
+    }
 }
 
 /// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
@@ -44534,129 +44582,75 @@ mod tests {
     }
 
     /// Scenario: fork issue #763 fix round (auditor A1 / reviewer F1,
-    /// BLOCKER) — the adversarial case `030` cannot reach: a shared
-    /// `<parent>/<repo>-<len>-<slug>-` prefix long enough (padded past
-    /// `sanitize_marker_creator`'s 200-character cap, via a repo nested
-    /// under several moderate-length, platform-safe padding directories)
-    /// that the OLD creator-identity derivation (`orchestration:` + the
-    /// always-folded `workspace_resolution.worktree_path`, with no digest)
-    /// would have truncated BOTH picks' creators to the byte-identical
-    /// string —
-    /// silently letting the second pick RESUME into the first's live
-    /// clone instead of being refused, the exact fork#74 condition this
-    /// whole mechanism exists to prevent. Confirms two things, both read
-    /// back from the real shared primitives rather than hand-computed
-    /// (`029`'s own technique): first, that the fixture genuinely reaches
-    /// the adversarial precondition (the two picks' pre-fix creator seeds
-    /// really do agree on their first 200 characters); second, that the
-    /// second pick is still correctly refused now that `creator` is
-    /// front-loaded with a fixed-length digest of the distinguishing
-    /// inputs that truncation can never drop.
+    /// BLOCKER) — pure unit test of the identity-computation property
+    /// `030`'s end-to-end refusal relies on, WITHOUT constructing any real
+    /// filesystem path longer than 200 characters. Two earlier attempts at
+    /// this test
+    /// tried to force the adversarial length through a real on-disk
+    /// directory tree (one giant path component, then several
+    /// moderate-length nested ones) and both failed `build-windows` in CI:
+    /// Windows' own historical `MAX_PATH` (~260 characters, no long-path
+    /// opt-in assumed) makes a genuinely long real filesystem path a losing
+    /// fight regardless of how the padding is spread across components --
+    /// the SECOND attempt got the fixture's own directories under the
+    /// limit but still lost to `git add -A` writing a loose object at
+    /// `<repo>/.git/objects/<2-hex>/<38-hex>`, a path even git itself
+    /// appends well past what any test fixture directly controls. Redirect
+    /// (this attempt): the property that actually matters --
+    /// [`spawn_pane_creator_identity_seed`] producing genuinely distinct
+    /// outputs for two different `(resolved_root_dir, relative_subpath)`
+    /// inputs even when the combined pre-truncation string would exceed
+    /// 200 characters -- is a pure string/hash computation with no
+    /// filesystem access of its own, so it needs no real directory, no
+    /// real git repository, and no real file I/O to test at all: a long
+    /// `PathBuf` built from a string literal is exactly as valid an input
+    /// as one read back from a real toplevel resolution. `030` stays
+    /// responsible for pinning the real, end-to-end refusal behavior at a
+    /// realistic (short) nested depth; this test is responsible for
+    /// proving that behavior keeps working at a length `030`'s own
+    /// tempdir-based fixture cannot safely reach on every platform.
+    ///
+    /// Asserts two things: first, that the adversarial precondition
+    /// genuinely holds for the OLD (pre-#763-fix-round) derivation — the
+    /// two synthetic picks' `orchestration:` + always-folded-path seeds
+    /// agree on their first 200 characters, i.e. would have collided after
+    /// `sanitize_marker_creator`'s truncation; second, that
+    /// [`spawn_pane_creator_identity_seed`]'s digest-fronted seed, run
+    /// through the same [`orchestration_creator_string`] sanitization,
+    /// produces two DISTINCT `creator` identities for those same two
+    /// inputs.
     #[spec("orchestration/worktree/031")]
     #[test]
-    fn worktree_031_two_nested_picks_sharing_a_prefix_past_the_200_char_creator_cap_the_second_is_still_refused()
+    fn worktree_031_creator_identity_seed_survives_the_200_char_truncation_cap_for_two_synthetic_long_picks()
      {
         const SLUG: &str = "features";
-        let tmp = tempdir().expect("tempdir");
-        // Pad the path between the tempdir root and the repo toplevel far
-        // enough that the shared `<parent>/<repo>-<len>-<slug>-` prefix
-        // alone exceeds `sanitize_marker_creator`'s 200-character cap --
-        // long before either pick's own distinguishing subpath tail
-        // (`team-a-proj` vs `team-b-proj`) is ever reached.
-        //
-        // First attempt at this fixture (fix round 1) used ONE single
-        // 220-character path component, which failed `build-windows` in CI
-        // (`git init` there errors `NotADirectory` / "The directory name is
-        // invalid"): Windows enforces a much tighter historical `MAX_PATH`
-        // (~260 characters total, no long-path opt-in assumed) than
-        // Linux/macOS do, and that one component alone, stacked on top of
-        // the CI runner's own tempdir root, already blew past it for the
-        // deepest real path this fixture creates (`team-a/proj/marker.txt`)
-        // -- well before this test ever reached its own assertions.
-        //
-        // Fixed by spreading the SAME total padding across several
-        // moderate-length (`LEVEL_LEN`-character) nested directories
-        // instead of one giant component -- comfortably inside every
-        // platform's per-component limit (Windows' ~255-character NTFS
-        // component cap included) -- and by sizing the padding RELATIVE to
-        // the tempdir root `tempdir()` actually produced on this
-        // platform/runner (`base_len`), not a hardcoded constant: the OS
-        // temp root's own length varies enormously (a short `/tmp` on
-        // Linux, a long `/var/folders/.../T/` on macOS, a short `D:\a\_temp`
-        // or a longer `AppData\Local\Temp` on Windows), and a fixed padding
-        // length tuned for one platform's temp root either falls short of
-        // the 200-character threshold on a long base or blows past
-        // Windows' MAX_PATH on top of a short one. Targeting a fixed
-        // ABSOLUTE length for the padded parent directory instead (`TARGET_PARENT_LEN`)
-        // keeps every real path this fixture creates in a narrow, safe band
-        // on every platform: ~200 + 28 = ~228 characters for the deepest
-        // real path (`<parent>/repo/team-a/proj/marker.txt`), comfortably
-        // under Windows' 260-character ceiling, while the CREATOR STRING
-        // (`orchestration:` + the OLD, always-folded `<parent>/repo-8-features-team-a-proj`)
-        // comes out around 242 characters -- comfortably past the
-        // 200-character truncation cap this fixture exists to cross.
-        const TARGET_PARENT_LEN: usize = 200;
-        const LEVEL_LEN: usize = 40;
-        let base_len = tmp.path().to_string_lossy().chars().count();
-        let mut padded_root = tmp.path().to_path_buf();
-        let mut remaining = TARGET_PARENT_LEN.saturating_sub(base_len);
-        while remaining > 0 {
-            let this_level_len = remaining.clamp(1, LEVEL_LEN);
-            padded_root = padded_root.join("d".repeat(this_level_len));
-            // `+ 1` accounts for the path separator this level itself adds
-            // -- without it, the loop would slightly overshoot
-            // `TARGET_PARENT_LEN` on every iteration but the last.
-            remaining = remaining.saturating_sub(this_level_len + 1);
-        }
+        // A long but entirely SYNTHETIC path -- no real directory needs to
+        // exist on disk for this test, since both
+        // `spawn_pane_creator_identity_seed` and
+        // `orchestration_creator_string` are pure string/hash computations.
+        // 200 `d`s alone already pushes the OLD derivation (below) well
+        // past the 200-character cap once `"orchestration:"` and the
+        // folded sibling name are added on top, with wide margin to spare.
+        let long_root = PathBuf::from(format!("/{}/monorepo", "d".repeat(200)));
+        let subpath_a = Path::new("team-a/proj");
+        let subpath_b = Path::new("team-b/proj");
 
-        let repo = padded_root.join("repo");
-        let team_a = repo.join("team-a").join("proj");
-        let team_b = repo.join("team-b").join("proj");
-        std::fs::create_dir_all(&team_a).expect("create team-a/proj");
-        std::fs::create_dir_all(&team_b).expect("create team-b/proj");
-        let run_git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .current_dir(&repo)
-                .args(args)
-                .status()
-                .expect("run git");
-            assert!(status.success(), "git {args:?} failed in {repo:?}");
-        };
-        run_git(&["init", "-q"]);
-        std::fs::write(repo.join("README.md"), "worktree_031 fixture\n").expect("write README");
-        std::fs::write(team_a.join("marker.txt"), "team-a\n").expect("write team-a marker");
-        std::fs::write(team_b.join("marker.txt"), "team-b\n").expect("write team-b marker");
-        run_git(&["add", "-A"]);
-        run_git(&[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "init",
-        ]);
-
-        // Prove the adversarial precondition genuinely holds, using the
-        // exact same primitives production uses (`resolve_orchestration_workspace`,
-        // `disambiguate_workspace_segment`, `resolve_workspace_path`) --
-        // not a hand-typed guess at how long the padding needs to be, on
-        // whichever platform this test happens to run.
-        let resolution_a = resolve_orchestration_workspace(&team_a, SLUG);
-        let resolution_b = resolve_orchestration_workspace(&team_b, SLUG);
-        let old_folded_a = resolve_workspace_path(
-            &resolution_a.resolved_root_dir,
-            &disambiguate_workspace_segment(SLUG, resolution_a.relative_subpath.as_deref()),
+        // The OLD (pre-#763-fix-round) derivation: `orchestration:` + the
+        // always-folded path, with no digest -- built with the exact same
+        // shared primitives (`disambiguate_workspace_segment`,
+        // `resolve_workspace_path`) production uses, not a hand-typed
+        // reconstruction, so this genuinely proves the adversarial
+        // precondition rather than assuming it.
+        let always_folded_a = resolve_workspace_path(
+            &long_root,
+            &disambiguate_workspace_segment(SLUG, Some(subpath_a)),
         );
-        let old_folded_b = resolve_workspace_path(
-            &resolution_b.resolved_root_dir,
-            &disambiguate_workspace_segment(SLUG, resolution_b.relative_subpath.as_deref()),
+        let always_folded_b = resolve_workspace_path(
+            &long_root,
+            &disambiguate_workspace_segment(SLUG, Some(subpath_b)),
         );
-        let old_seed_a = format!("orchestration:{}", old_folded_a.display());
-        let old_seed_b = format!("orchestration:{}", old_folded_b.display());
+        let old_seed_a = format!("orchestration:{}", always_folded_a.display());
+        let old_seed_b = format!("orchestration:{}", always_folded_b.display());
         const MARKER_CREATOR_MAX_CHARS: usize = 200;
         assert!(
             old_seed_a.chars().count() > MARKER_CREATOR_MAX_CHARS,
@@ -44675,57 +44669,33 @@ mod tests {
              characters (that is the whole point of this fixture) but disagree already"
         );
 
-        let config = make_orchestration("review");
-        let dispatch_typed_slug_open = |dir: &std::path::Path,
-                                        name: &str,
-                                        daemon_dir: &std::path::Path|
-         -> Vec<Option<String>> {
-            let _daemon = with_empty_agents_daemon(daemon_dir);
-            let req = NewPaneRequest {
-                dir: dir.to_path_buf(),
-                name: name.to_string(),
-                command: String::new(),
-                mode_config: None,
-                orchestration_config: Some(config.clone()),
-                seed_prompt: None,
-                form_agent_type: None,
-                worktree_slug: SLUG.to_string(),
-            };
-            let pc = Arc::new(CapturingPaneController::new());
-            let mut tm = TabManager::new(pc.clone());
-            let mut ui = default_ui();
-            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-            let snapshot = AppState::default();
-            let _ = dispatch_action(
-                Action::SpawnPane(Box::new(req)),
-                &mut ui,
-                pc.as_ref(),
-                &state,
-                &mut tm,
-                &snapshot,
-                &[],
-                None,
-                Rect::new(0, 0, 200, 50),
-            );
-            pc.recorded_cwds()
-        };
-
-        let daemon_dir_1 = tempdir().expect("tempdir for first daemon-stub");
-        let first_cwds = dispatch_typed_slug_open(&team_a, "Team A pick", daemon_dir_1.path());
-        assert!(
-            !first_cwds.is_empty(),
-            "the first pick (team-a/proj) must succeed -- got zero spawned panes"
+        // The NEW, digest-fronted derivation this fix introduces, called
+        // directly rather than through the whole `Action::SpawnPane`
+        // dispatch arm.
+        let seed_a = spawn_pane_creator_identity_seed(
+            false,
+            &long_root,
+            Some(subpath_a),
+            SLUG,
+            &always_folded_a,
         );
-
-        let daemon_dir_2 = tempdir().expect("tempdir for second daemon-stub");
-        let second_cwds = dispatch_typed_slug_open(&team_b, "Team B pick", daemon_dir_2.path());
-        assert!(
-            second_cwds.is_empty(),
-            "the second pick (team-b/proj) must be REFUSED even though its OLD creator seed's \
-             first 200 characters are byte-identical to the first pick's -- got spawned panes \
-             with cwds {second_cwds:?}, meaning it silently resumed into team-a/proj's clone \
-             (the exact fork#74 condition the digest-fronted creator identity exists to \
-             prevent)"
+        let seed_b = spawn_pane_creator_identity_seed(
+            false,
+            &long_root,
+            Some(subpath_b),
+            SLUG,
+            &always_folded_b,
+        );
+        let creator_a = orchestration_creator_string(&seed_a);
+        let creator_b = orchestration_creator_string(&seed_b);
+        assert_ne!(
+            creator_a, creator_b,
+            "two different nested picks sharing an identical typed slug, whose OLD \
+             (pre-digest-fix) creator seeds agree on their first {MARKER_CREATOR_MAX_CHARS} \
+             characters, must still compute DISTINCT `creator` identities under the fix -- got \
+             the identical creator {creator_a:?} for both, meaning the second pick would \
+             silently resume into the first's live clone instead of being refused (the exact \
+             fork#74 condition this whole mechanism exists to prevent)"
         );
     }
 
