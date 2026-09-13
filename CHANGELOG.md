@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.47.0] - 2026-09-13
+
+### Changed
+
+  A nested typed-slug workspace provisioned by a build from before this fix lives at the old, always-disambiguated directory name (e.g. `myrepo-8-features-team-a-proj`). Resolution is purely formula-based — nothing looks for that older spelling — so reopening the identical pick (same directory, same typed slug) after upgrading now resolves to the new, clean sibling name (`myrepo-features`) instead, which does not yet exist on disk. Provisioning takes the "create a fresh clone" path rather than resuming the old one, silently: no error, no warning.
+  No data is corrupted or lost — the old directory and anything in it (including uncommitted work) are left completely untouched on disk, just no longer reachable through the New Pane form for that pick. If you have local-only work in an old-style nested workspace, either finish or hand-copy it out manually before reopening that pick, or simply accept that reopening it now starts a fresh clone and clean up the orphaned old directory yourself once you've confirmed nothing in it is needed (`worktree list` will not show it as occupied by a live orchestration once its own tab is closed).
+  A second, separate migration effect: before this fix, a toplevel pick and a nested pick of the same project could both be given the identical typed slug (e.g. `features`) and each got its own workspace, since the nested one's name was always disambiguated by its subpath. After this fix they resolve to the identical clean name. If you already have both from before upgrading, the toplevel pick's workspace already occupies that clean name under its own (non-digest) identity, so reopening the *nested* pick now gets refused permanently regardless of which one you reopen first — it's not a race, the toplevel pick always wins. You'll need to give the nested pick a different slug going forward. Two pre-upgrade *nested* picks (under different subdirectories) sharing an identical typed slug behave differently: neither has priority, so whichever one you happen to reopen first claims the clean name, and the other is then permanently refused under that slug.
+
+### Fixed
+
+  Typing a Worktree slug for an orchestration opened against a nested directory (a subdirectory of a git project, e.g. `myrepo/team-a/proj`) produced an ugly, long directory name instead of the short one the slug field exists to provide — typing `features` there yielded something like `myrepo-8-features-team-a-proj` instead of the expected `myrepo-features` (issue #763).
+  A typed Worktree slug on a nested pick now produces that clean, short name. The disambiguation that folds the picked subdirectory's own position into the workspace name still applies to the auto-generated slug (left blank), since two different nested picks can otherwise land on the identical auto-generated counter — that case is unaffected.
+  One narrow, accepted consequence of the clean name: if two genuinely different nested picks under the same project happen to be given the identical typed slug, they now resolve to the identical directory name. The second one to open is refused rather than silently sharing the first's workspace — pick a different slug for the second one.
+
+
+
 ## [0.46.0] - 2026-09-13
 
 ### Changed
