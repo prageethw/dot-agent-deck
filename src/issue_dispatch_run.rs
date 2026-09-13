@@ -4463,13 +4463,41 @@ fn resume_existing_isolated_clone(
         // `creator=` string, which would still be self-referential and
         // wouldn't close A1 anyway.
         //
-        // Also requires the stored creator to literally carry the
-        // `"orchestration:"` namespace prefix — belt-and-suspenders
-        // alongside [`LegacyFallbackEligibility::Disabled`]'s structural
-        // fix for audit A2 (`src/dispatch.rs`'s own `dispatch:`-namespaced
-        // creator can never legitimately match a legacy ORCHESTRATION
-        // marker, and that path now can't even construct the variant that
-        // would let it try).
+        // Also requires the stored creator to genuinely be LEGACY-SHAPED,
+        // not merely namespace-prefixed — round 2's own review/audit fix
+        // round (reviewer/auditor B1, BLOCKER): a bare
+        // `starts_with("orchestration:")` test does not identify the
+        // legacy format at all, since TODAY's formats carry that same
+        // prefix too (a plain toplevel pick's path-derived creator, and a
+        // nested typed-slug pick's digest-fronted creator —
+        // `spawn_pane_creator_identity_seed`, `src/ui.rs`). Left as a bare
+        // prefix check, a toplevel pick could adopt, then irreversibly
+        // migrate, a CURRENT-format marker written by a nested typed-slug
+        // pick of the same repo typing the same slug — both write the same
+        // `name=` (the bare segment, never folded with the subpath) and can
+        // resolve to the same `clone_dir` (fork issue #763's accepted
+        // residual) — silently merging two live orchestrations into one
+        // physical clone and permanently orphaning the nested pick's own
+        // resume (`Nested` never gets a fallback). See
+        // `workspace_046_toplevel_pick_never_adopts_a_nested_picks_workspace_via_the_legacy_fallback`
+        // (`src/ui.rs`) for the regression this reproduces end to end.
+        //
+        // The shape test below strips the `"orchestration:"` prefix and
+        // runs the remaining suffix through
+        // [`crate::ui::sanitize_workspace_segment`] — the exact
+        // transform a bare typed segment goes through on its way into
+        // `name=` — and requires the result to equal the marker's own
+        // stored `name=` exactly. For a genuine legacy marker the suffix
+        // IS a bare segment, so this is a no-op fixed point and the check
+        // passes. For today's path-derived or digest-fronted suffixes, the
+        // extra structure they carry (path separators, a hex digest and a
+        // colon) essentially never sanitizes down to match a bare `name=`
+        // value — belt-and-suspenders alongside
+        // [`LegacyFallbackEligibility::Disabled`]'s structural fix for
+        // audit A2 (`src/dispatch.rs`'s own `dispatch:`-namespaced creator
+        // can never legitimately match a legacy ORCHESTRATION marker, and
+        // that path now can't even construct the variant that would let it
+        // try).
         //
         // `Nested`/`Disabled` both yield no identity branch at all — a
         // nested pick's legacy format never carried subpath information to
@@ -4478,14 +4506,19 @@ fn resume_existing_isolated_clone(
         // caller with no real identity to offer has nothing this check can
         // validate.
         const ORCHESTRATION_CREATOR_NAMESPACE: &str = "orchestration:";
-        let legacy_match = legacy_fallback.identity_branch().is_some_and(|branch| {
-            stored_creator.starts_with(ORCHESTRATION_CREATOR_NAMESPACE)
-                && marker_content
-                    .as_deref()
-                    .and_then(|content| isolated_clone_provenance_field(content, "name"))
-                    .as_deref()
-                    == Some(crate::worktree_reclaim::sanitize_marker_creator(branch).as_str())
+        let stored_name = marker_content
+            .as_deref()
+            .and_then(|content| isolated_clone_provenance_field(content, "name"));
+        let legacy_shape_ok = stored_name.as_deref().is_some_and(|stored_name| {
+            stored_creator
+                .strip_prefix(ORCHESTRATION_CREATOR_NAMESPACE)
+                .is_some_and(|suffix| crate::ui::sanitize_workspace_segment(suffix) == stored_name)
         });
+        let legacy_match = legacy_shape_ok
+            && legacy_fallback.identity_branch().is_some_and(|branch| {
+                stored_name.as_deref()
+                    == Some(crate::worktree_reclaim::sanitize_marker_creator(branch).as_str())
+            });
         if !legacy_match {
             return Ok(IsolatedCloneOutcome::Rejected(
                 ResumeRejection::NameCollision,

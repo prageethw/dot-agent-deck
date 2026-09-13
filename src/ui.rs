@@ -10367,7 +10367,16 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
 /// every isolated-clone provision silently (`Err` -> status message, zero
 /// panes spawned) — the actual cause behind a wide swath of PRD fork#544's
 /// e2e regressions, not the unborn-HEAD fallback-removal fix alone.
-fn sanitize_workspace_segment(name: &str) -> String {
+///
+/// Fork issue #766, round 2's own review/audit fix round: `pub(crate)` (not
+/// private) so `src/issue_dispatch_run.rs`'s legacy-creator-format
+/// fallback's stored-creator SHAPE check can run the exact same
+/// sanitization a bare segment would get against the suffix of a stored
+/// `orchestration:`-prefixed creator, rather than reimplementing an
+/// equivalent transform by hand a second time (which is exactly the
+/// divergence that let `starts_with("orchestration:")` alone stand in for a
+/// real legacy-shape test in the first place — B1).
+pub(crate) fn sanitize_workspace_segment(name: &str) -> String {
     let segment = crate::issue_dispatch::sanitize_clone_segment(name);
     let stripped = segment.trim_start_matches(['-', '.']);
     if stripped.is_empty() {
@@ -45837,14 +45846,17 @@ mod tests {
                 &today_creator,
             );
         assert!(
-            !matches!(
+            matches!(
                 mismatched_result,
-                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { .. })
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Rejected(
+                    crate::issue_dispatch_run::ResumeRejection::NameCollision
+                ))
             ),
-            "control (fork issue #766 fix round 2, audit A1): a caller whose own current \
-             branch/segment ({mismatched_branch:?}) does not match the legacy marker's stored \
-             name= field ({segment:?}) must be refused as NameCollision even though ancestry \
-             and the orchestration: namespace both check out -- got {mismatched_result:?}"
+            "control (fork issue #766 fix round 2, audit A1 -- reviewer N1): a caller whose own \
+             current branch/segment ({mismatched_branch:?}) does not match the legacy marker's \
+             stored name= field ({segment:?}) must be refused SPECIFICALLY as NameCollision, not \
+             merely 'not Resumed' for some other reason, even though ancestry and the \
+             orchestration: namespace both check out -- got {mismatched_result:?}"
         );
         crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&clone_dir);
 
@@ -46104,6 +46116,197 @@ mod tests {
             error.contains("a different orchestration already opened"),
             "fork issue #766 M3: the refusal must specifically be NameCollision (proving the \
              nested-pick gate is what refused it, not some unrelated failure) -- got {error:?}"
+        );
+    }
+
+    /// Scenario: fork issue #766, round 2 REGRESSION (reviewer B1 / auditor
+    /// B1, both BLOCKER-class). The mirror image of `workspace_044`: that
+    /// test proves a nested pick can never take the legacy-creator-format
+    /// fallback as a CALLER; this one proves a nested pick's own live
+    /// workspace can never be silently adopted, and then irreversibly
+    /// migrated, by a TOPLEVEL pick acting as the caller.
+    ///
+    /// A nested pick with a typed Worktree slug provisions a real workspace
+    /// via `provision_isolated_clone_or_status` (the same function
+    /// `Action::SpawnPane` calls) with its genuine, TODAY-format,
+    /// digest-fronted `creator` (`spawn_pane_creator_identity_seed`, fork
+    /// issue #763) — deliberately NOT overwritten to a legacy string, since
+    /// this is about a CURRENT-format marker, not a pre-#760 one. Because a
+    /// typed slug on a nested pick resolves to the SAME clean sibling
+    /// directory a toplevel pick of the same repo typing the same slug
+    /// would also resolve to (fork issue #763's accepted residual), and
+    /// both write the identical bare-segment `name=` field, a later
+    /// toplevel pick of the same repo typing the same slug: (1) computes a
+    /// creator that does NOT match the stored digest-fronted one (primary
+    /// comparison fails), (2) offers a genuine caller identity via
+    /// `ToplevelWithIdentity` whose sanitized value equals the stored
+    /// `name=` exactly. Before this round's fix, the only remaining guard
+    /// on the STORED creator was `starts_with("orchestration:")` — true for
+    /// the digest-fronted format too — so the fallback fired, the toplevel
+    /// pick was silently `Resumed`, and the migration step then
+    /// permanently rewrote the nested pick's own `creator=` line to the
+    /// toplevel pick's value, merging two distinct orchestrations into one
+    /// physical clone and orphaning the nested pick (which always passes
+    /// `Nested`, and so can never itself take the fallback to recover).
+    ///
+    /// Asserts the toplevel pick is refused specifically as `NameCollision`,
+    /// that the nested pick's on-disk marker is left BYTE-FOR-BYTE
+    /// untouched by the refused attempt (a refusal must never reach
+    /// `migrate_legacy_isolated_clone_creator`), and that the original
+    /// nested pick can still cleanly resume its own workspace afterward —
+    /// proving the fix doesn't merely relocate the corruption rather than
+    /// eliminate it.
+    #[spec("orchestration/workspace/046")]
+    #[test]
+    fn workspace_046_toplevel_pick_never_adopts_a_nested_picks_workspace_via_the_legacy_fallback() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_git_repo(&repo);
+        let nested = repo.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ]);
+
+        let (toplevel, prefix) = crate::issue_dispatch_run::resolve_git_toplevel(&nested)
+            .expect("nested is inside a real git repo");
+
+        let segment = sanitize_workspace_segment("shared-slug");
+        // Both a nested pick with a typed slug and a toplevel pick with the
+        // SAME typed slug resolve to this identical clean sibling directory
+        // -- fork issue #763's accepted residual, and the exact precondition
+        // this regression needs.
+        let worktree_path = resolve_workspace_path(&toplevel, &segment);
+
+        // The nested pick's REAL, TODAY-format creator -- digest-fronted,
+        // exactly what `Action::SpawnPane` computes for a typed slug on a
+        // nested pick right now. `always_folded_worktree_path` mirrors what
+        // `resolve_orchestration_workspace` would have produced for this
+        // pick (the pre-fork#763 folded shape, still used to seed the
+        // digest even though the CLEAN `worktree_path` above is what
+        // actually gets provisioned into).
+        let always_folded_worktree_path = resolve_workspace_path(
+            &toplevel,
+            &disambiguate_workspace_segment(&segment, Some(prefix.as_path())),
+        );
+        let nested_creator_seed = spawn_pane_creator_identity_seed(
+            true,
+            &toplevel,
+            Some(prefix.as_path()),
+            &segment,
+            &always_folded_worktree_path,
+        );
+        let nested_creator = orchestration_creator_string(&nested_creator_seed);
+        assert!(
+            nested_creator.starts_with("orchestration:") && nested_creator.contains(':'),
+            "setup sanity: the nested pick's own creator must be digest-fronted \
+             (orchestration:<hex>:<path>), got {nested_creator:?}"
+        );
+
+        let created = provision_isolated_clone_or_status(
+            &toplevel,
+            Some(prefix.as_path()),
+            &worktree_path,
+            &segment,
+            &nested_creator,
+        );
+        assert!(
+            created.is_ok(),
+            "setup: the nested pick's own clone must succeed, got {created:?}"
+        );
+
+        let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&worktree_path);
+        let content_before = std::fs::read_to_string(&marker_path).expect("read provenance marker");
+        assert!(
+            content_before
+                .lines()
+                .any(|line| line == format!("creator={nested_creator}")),
+            "setup sanity: the nested pick's own marker must carry its real digest-fronted \
+             creator, got {content_before:?}"
+        );
+
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&worktree_path);
+
+        // A TOPLEVEL pick of the SAME repo, typing the SAME slug -- its own
+        // computed creator is plain path-derived (no digest, no nested
+        // subpath), genuinely different from the nested pick's stored one,
+        // but its own current segment/branch identity matches the stored
+        // name= exactly (both picks write the bare segment there).
+        let toplevel_creator_seed =
+            spawn_pane_creator_identity_seed(true, &toplevel, None, &segment, &worktree_path);
+        let toplevel_creator = orchestration_creator_string(&toplevel_creator_seed);
+        assert_ne!(
+            toplevel_creator, nested_creator,
+            "setup: sanity -- the toplevel pick's own computed creator must genuinely differ \
+             from the nested pick's stored digest-fronted one, or this test isn't exercising \
+             fork issue #763's digest-fronted format at all"
+        );
+
+        let adoption_attempt = provision_isolated_clone_or_status(
+            &toplevel,
+            None,
+            &worktree_path,
+            &segment,
+            &toplevel_creator,
+        );
+        assert!(
+            adoption_attempt.is_err(),
+            "fork issue #766 round-2 regression (reviewer/auditor B1): a toplevel pick must \
+             never adopt a nested pick's own current-format, digest-fronted workspace via the \
+             legacy fallback, even though its stored name= exactly matches this caller's own \
+             segment -- got {adoption_attempt:?}"
+        );
+        let adoption_error = adoption_attempt.unwrap_err();
+        assert!(
+            adoption_error.contains("a different orchestration already opened"),
+            "the refusal must specifically be NameCollision (proving the shape check is what \
+             refused it, not some unrelated failure) -- got {adoption_error:?}"
+        );
+
+        // The nested pick's marker must be left COMPLETELY untouched -- a
+        // refusal must never trigger `migrate_legacy_isolated_clone_creator`.
+        let content_after = std::fs::read_to_string(&marker_path).expect("read provenance marker");
+        assert_eq!(
+            content_before, content_after,
+            "fork issue #766 round-2 regression (reviewer/auditor B1): a refused toplevel pick's \
+             adoption attempt must leave the nested pick's marker byte-for-byte untouched, not \
+             migrate its creator= line -- before {content_before:?}, after {content_after:?}"
+        );
+
+        // The original nested pick must not be collaterally orphaned by the
+        // rejected toplevel pick's attempt -- reopening it with its own
+        // real identity must still resume cleanly.
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&worktree_path);
+        let nested_resume = provision_isolated_clone_or_status(
+            &toplevel,
+            Some(prefix.as_path()),
+            &worktree_path,
+            &segment,
+            &nested_creator,
+        );
+        assert!(
+            nested_resume.is_ok(),
+            "the original nested pick must still resume cleanly through its own identity after \
+             the toplevel pick's adoption attempt was refused -- got {nested_resume:?}"
         );
     }
 
