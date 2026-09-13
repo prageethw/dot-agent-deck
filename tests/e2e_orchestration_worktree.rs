@@ -877,10 +877,11 @@ fn open_orchestration_with_name_and_slug(deck: &TuiDeck, name: &str, slug: &str)
 /// in-use working tree/branch the first orchestration was still actively
 /// using (the fork #74/#325-class two-live-orchestrations-one-worktree
 /// incident, reachable here by ordinary slug reuse rather than by
-/// coincidence). The second open must be REFUSED: the new-pane form must
-/// stay open, no second tab may appear, no second role pane may be
-/// spawned, and the first orchestration's own workspace must remain
-/// completely undisturbed.
+/// coincidence). The second open must be REFUSED: no second tab may
+/// appear (the New Pane form itself closes immediately on ANY submit,
+/// refused or not — see the fix-round comment above the tab-bar wait
+/// below), no second role pane may be spawned, and the first
+/// orchestration's own workspace must remain completely undisturbed.
 #[spec("orchestration/worktree/028")]
 #[test]
 fn worktree_028_same_slug_different_name_concurrent_open_is_refused() {
@@ -925,25 +926,44 @@ fn worktree_028_same_slug_different_name_concurrent_open_is_refused() {
 
     // Reviewer round-3 (non-blocking T1): every assertion below this point
     // is satisfiable BEFORE the daemon even answers the claim request — the
-    // form stays on screen and the log/directory state is unchanged either
-    // way while the request is in flight, so without this line the test
-    // would still pass against a reverted `6fff177c`. Wait for the actual
-    // refusal text the daemon-side `cwd` collision produces
-    // (`src/daemon_protocol.rs`'s `ClaimOrchestrationName` refusal, surfaced
-    // via `src/ui.rs`'s `Action::SpawnPane` as `Orchestration failed:
-    // {reason}`) so this test genuinely pins the guard having fired, not
-    // merely a state consistent with it having fired.
+    // log/directory state is unchanged either way while the request is in
+    // flight, so without this line the test would still pass against a
+    // reverted `6fff177c`. Wait for the actual refusal text the daemon-side
+    // `cwd` collision produces (`src/daemon_protocol.rs`'s
+    // `ClaimOrchestrationName` refusal, surfaced via `src/ui.rs`'s
+    // `Action::SpawnPane` as `Orchestration failed: {reason}`) so this test
+    // genuinely pins the guard having fired, not merely a state consistent
+    // with it having fired.
     deck.wait_for_string(
         "Orchestration failed: another live orchestration already occupies this workspace",
     );
 
-    // The refusal must be visible on screen — the new-pane form stays open,
-    // never silently closing into a second orchestration tab sharing the
-    // first's live workspace.
+    // CI investigation (this fix round): the New Pane form does NOT stay
+    // open here — `handle_new_pane_form_key`'s Enter arm sets
+    // `ui.new_pane_form = None` / `ui.mode = UiMode::Normal`
+    // SYNCHRONOUSLY, before the (blocking) daemon round trip that decides
+    // whether to grant or refuse the claim even starts, and nothing in
+    // `Action::SpawnPane`'s handling ever reopens it — that holds for
+    // every refusal branch there alike (an invalid Worktree slug, a
+    // path escaping the provisioned workspace, an already-existing clone
+    // directory, and this `ClaimOrchestrationName` refusal), not just
+    // this one. So by the time the refusal text above is even visible,
+    // the form is already gone and the deck is back on the Dashboard —
+    // an earlier version of this assertion waited for "New Agent" to
+    // still be on screen and could never pass. The property this test can
+    // actually pin is the one that matters: the refused second open never
+    // grows a second tab. The tab bar is always row 0 regardless of any
+    // overlay drawn beneath it (`identity_037`'s own `tab_bar_line`
+    // reasoning in `tests/e2e_orchestration_identity.rs`), so a match
+    // there can only come from a real tab, never the form's own
+    // pre-filled Name field.
     deck.wait_until_grid(
-        "New Agent form remains open after a live same-slug/different-Name \
-         collision, no second tab opened",
-        |g| g.contains("New Agent"),
+        "tab bar still shows only the first orchestration's Alpha760 tab; \
+         no Beta760 tab was ever created by the refused second open",
+        |g| {
+            let tab_row = g.lines().next().unwrap_or("");
+            tab_row.contains("Alpha760") && !tab_row.contains("Beta760")
+        },
     );
 
     // Only ONE role pane must ever have appended to the shared log — the

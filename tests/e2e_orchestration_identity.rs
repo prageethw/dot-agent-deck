@@ -512,12 +512,17 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     // returns "another live orchestration already occupies this workspace
     // (same Worktree slug/directory or same Name in this directory)" (PRD
     // fork#760's fix round; superseded the earlier `orchestration name
-    // {name:?} is already held` wording), and the New Pane form stays open
-    // showing `Orchestration failed: ...`) while tab
-    // 1's own real label plus tab 2's still-open form happen to add up to
-    // two matches anyway". Scoping the match to `tab_bar_line` (row 0 only,
-    // defined above) closes that gap: the form's popup starts at row 10, so
-    // a match on row 0 can only come from a real tab-bar entry, and a
+    // {name:?} is already held` wording), and the SECOND form's own
+    // Name field still renders `LABEL` up until the submit keystroke is
+    // processed) while tab 1's own real label plus tab 2's still-visible
+    // form happen to add up to two matches anyway". (`worktree_028`'s own
+    // investigation established that on submit the form closes and returns
+    // to Normal mode SYNCHRONOUSLY, before the daemon even answers, so it
+    // is never still showing `Orchestration failed: ...` by the time that
+    // text appears — the status message lands on the Dashboard instead.)
+    // Scoping the match to `tab_bar_line` (row 0 only, defined above)
+    // closes that gap regardless: the form's popup starts at row 10, so a
+    // match on row 0 can only come from a real tab-bar entry, and a
     // refused second claim leaves row 0 showing exactly ONE `LABEL`
     // occurrence forever — timing this wait out (with the daemon's refusal
     // text captured in the panic's own final-grid dump) instead of passing
