@@ -12787,16 +12787,22 @@ fn dispatch_action(
                     // SAME `physical_worktree_path` — the clean name is, by
                     // construction, no longer subpath-qualified. The second
                     // one to provision is REFUSED, not silently resumed:
-                    // `creator` (below) stays derived from the
-                    // never-changed, always-folded
-                    // `workspace_resolution.worktree_path`, so
+                    // `creator` (below) is still SEEDED from the
+                    // always-folded `workspace_resolution.worktree_path`
+                    // (whose distinguishing subpath tail differs between
+                    // the two picks), now additionally front-loaded with a
+                    // fixed-length digest of the same distinguishing inputs
+                    // — see `creator`'s own assignment below for why the
+                    // plain folded string alone is not sufficient — so
                     // `resume_existing_isolated_clone`'s stored-vs-computed
-                    // creator comparison
-                    // (`src/issue_dispatch_run.rs`) still sees the two
-                    // picks as genuinely different creators and rejects the
-                    // second with `NameCollision`, even though the
-                    // directory NAME they both resolve to is identical
-                    // (`orchestration/worktree/029`). What this does NOT
+                    // creator comparison (`src/issue_dispatch_run.rs`)
+                    // still sees the two picks as genuinely different
+                    // creators and rejects the second with `NameCollision`,
+                    // even though the directory NAME they both resolve to
+                    // is identical (`orchestration/worktree/030`; the clean
+                    // shape alone is `orchestration/worktree/029`; the
+                    // truncation-adversarial case is
+                    // `orchestration/worktree/031`). What this does NOT
                     // fix: `live_orchestration_occupies`'s `scan_by_shape`/
                     // `scan_by_name` (this file, above) can no longer
                     // reliably recognize a LIVE nested-typed-slug
@@ -12901,9 +12907,81 @@ fn dispatch_action(
                     // `creator_workspace_path_can_never_produce_the_reserved_sentinel`
                     // test) that identity can no longer reach the reserved
                     // sentinel for any segment value regardless).
-                    let creator = orchestration_creator_string(
-                        &workspace_resolution.worktree_path.display().to_string(),
-                    );
+                    // Fork issue #763 fix round (auditor A1 / reviewer F1,
+                    // BLOCKER): the paragraph above narrows the #763
+                    // residual to "the second pick is REFUSED" on the
+                    // strength of `creator` staying keyed off the
+                    // always-folded `workspace_resolution.worktree_path` —
+                    // but that path's ONLY distinguishing bytes between two
+                    // colliding picks are the sanitized relative subpath, at
+                    // the very END of the string, and
+                    // `sanitize_marker_creator` (`worktree_reclaim.rs`)
+                    // truncates at `MARKER_CREATOR_MAX_CHARS` (200)
+                    // KEEPING THE PREFIX. Once the shared parent-path +
+                    // repo + slug prefix alone reaches ~200 characters —
+                    // routine for a real deep monorepo checkout, precisely
+                    // the layout this fix exists to serve — two different
+                    // nested picks typing the identical slug truncate to
+                    // the BYTE-IDENTICAL creator, and
+                    // `resume_existing_isolated_clone`'s stored-vs-computed
+                    // comparison (`src/issue_dispatch_run.rs`) sees no
+                    // difference: the second pick silently RESUMES into the
+                    // first's live clone instead of being refused — two
+                    // orchestrations sharing one working tree, the fork
+                    // #74 condition this whole mechanism exists to prevent.
+                    //
+                    // Issue #763 itself named the fix: derive the identity
+                    // from `(toplevel, relative_subpath, segment)` as
+                    // structured inputs, so a FIXED-LENGTH digest can never
+                    // be truncated away. Narrowed to exactly the case this
+                    // PR introduces — a typed slug on a nested pick, the
+                    // only shape where `physical_worktree_path` (below)
+                    // diverges from this always-folded `worktree_path` —
+                    // rather than changing `creator`'s derivation for every
+                    // other shape (blank/auto-generated slug, a non-nested
+                    // pick), which do not need it and are left byte-for-byte
+                    // unchanged.
+                    //
+                    // Hashed with `fnv1a64` (fixed constants, stable across
+                    // Rust versions/builds/platforms), not `DefaultHasher`
+                    // — same reasoning as its other two callers
+                    // (`platform::lock::spawn_mutex_name`,
+                    // `issue_dispatch_run::worktree_attach_lock_path_from_common_dir`):
+                    // this value is compared against a marker PERSISTED to
+                    // disk, possibly by a different process/build, so both
+                    // sides must derive the identical digest regardless of
+                    // toolchain. The digest goes right after
+                    // `orchestration_creator_string`'s own
+                    // `"orchestration:"` prefix (14 bytes) — i.e. at the
+                    // FRONT of this seed, not appended after the folded
+                    // path — so truncation, if it ever fires, can only ever
+                    // drop the (now redundant) folded-path tail, never the
+                    // bytes that make two picks distinguishable.
+                    let creator_identity_seed = if !req.worktree_slug.is_empty()
+                        && workspace_resolution.relative_subpath.is_some()
+                    {
+                        let relative_subpath_str = workspace_resolution
+                            .relative_subpath
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                        let digest = crate::platform::lock::fnv1a64(
+                            format!(
+                                "{}\u{0}{}\u{0}{}",
+                                workspace_resolution.resolved_root_dir.display(),
+                                relative_subpath_str,
+                                segment,
+                            )
+                            .as_bytes(),
+                        );
+                        format!(
+                            "{digest:016x}:{}",
+                            workspace_resolution.worktree_path.display()
+                        )
+                    } else {
+                        workspace_resolution.worktree_path.display().to_string()
+                    };
+                    let creator = orchestration_creator_string(&creator_identity_seed);
                     let orchestration_claim_token = mint_orchestration_claim_token();
                     // `workspace_resolution.resolved_dir()` doesn't exist on
                     // disk yet (provisioning hasn't run), so canonicalizing
@@ -14388,7 +14466,21 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// **#222**. An absolute workspace path is more likely to be long than a
 /// typed Name was, so this residual is more reachable post-fork#760 than
 /// before it, though still requiring a 200-character-common-prefix
-/// coincidence.
+/// coincidence. Fork issue #763 fix round (auditor A1 / reviewer F1,
+/// BLOCKER): this residual stopped being merely a `worktree reclaim --mine`
+/// matching nuisance the moment `Action::SpawnPane` (`src/ui.rs`) started
+/// letting two genuinely different picks provision into the SAME physical
+/// `clone_dir` for a typed slug on a nested pick — at that point a
+/// truncation collision meant the SAME on-disk marker comparison this
+/// mechanism relies on to keep them apart, and it would fail open. That one
+/// call site's `identity_seed` is now front-loaded with a fixed-length
+/// digest for exactly the narrow case where it matters (see its own call
+/// site comment), closing the residual THERE; it remains open, as
+/// described above, for `identity_seed` in general and for
+/// [`NewPaneFormState::reserved_name_collision`]'s unrelated caller, where
+/// it stays inert exactly as before (a plain typed Name is short enough in
+/// practice, and a collision there is cosmetic, never a shared-clone
+/// hazard).
 fn orchestration_creator_string(identity_seed: &str) -> String {
     const ORCHESTRATION_PREFIX: &str = "orchestration:";
     let raw = if identity_seed.is_empty() {
@@ -44441,6 +44533,261 @@ mod tests {
         );
     }
 
+    /// Scenario: fork issue #763 fix round (auditor A1 / reviewer F1,
+    /// BLOCKER) — the adversarial case `030` cannot reach: a shared
+    /// `<parent>/<repo>-<len>-<slug>-` prefix long enough (padded past
+    /// `sanitize_marker_creator`'s 200-character cap, via a repo nested
+    /// under one artificially long path component) that the OLD
+    /// creator-identity derivation (`orchestration:` + the always-folded
+    /// `workspace_resolution.worktree_path`, with no digest) would have
+    /// truncated BOTH picks' creators to the byte-identical string —
+    /// silently letting the second pick RESUME into the first's live
+    /// clone instead of being refused, the exact fork#74 condition this
+    /// whole mechanism exists to prevent. Confirms two things, both read
+    /// back from the real shared primitives rather than hand-computed
+    /// (`029`'s own technique): first, that the fixture genuinely reaches
+    /// the adversarial precondition (the two picks' pre-fix creator seeds
+    /// really do agree on their first 200 characters); second, that the
+    /// second pick is still correctly refused now that `creator` is
+    /// front-loaded with a fixed-length digest of the distinguishing
+    /// inputs that truncation can never drop.
+    #[spec("orchestration/worktree/031")]
+    #[test]
+    fn worktree_031_two_nested_picks_sharing_a_prefix_past_the_200_char_creator_cap_the_second_is_still_refused()
+     {
+        const SLUG: &str = "features";
+        // A single long path component pads every downstream path (the
+        // repo toplevel, and both nested picks' resolved sibling
+        // directory) well past the point where the shared
+        // `<parent>/<repo>-<len>-<slug>-` prefix alone exceeds
+        // `sanitize_marker_creator`'s 200-character cap -- long before
+        // either pick's own distinguishing subpath tail (`team-a-proj` vs
+        // `team-b-proj`) is ever reached. 220 stays comfortably under
+        // every platform's single-path-component limit (255 bytes on
+        // Linux/macOS; Windows long-path support is assumed the same way
+        // the rest of this test suite already assumes it for tempdir-based
+        // fixtures).
+        let long_component: String = "d".repeat(220);
+
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join(&long_component).join("repo");
+        let team_a = repo.join("team-a").join("proj");
+        let team_b = repo.join("team-b").join("proj");
+        std::fs::create_dir_all(&team_a).expect("create team-a/proj");
+        std::fs::create_dir_all(&team_b).expect("create team-b/proj");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree_031 fixture\n").expect("write README");
+        std::fs::write(team_a.join("marker.txt"), "team-a\n").expect("write team-a marker");
+        std::fs::write(team_b.join("marker.txt"), "team-b\n").expect("write team-b marker");
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        // Prove the adversarial precondition genuinely holds, using the
+        // exact same primitives production uses (`resolve_orchestration_workspace`,
+        // `disambiguate_workspace_segment`, `resolve_workspace_path`) --
+        // not a hand-typed guess at how long the padding needs to be, on
+        // whichever platform this test happens to run.
+        let resolution_a = resolve_orchestration_workspace(&team_a, SLUG);
+        let resolution_b = resolve_orchestration_workspace(&team_b, SLUG);
+        let old_folded_a = resolve_workspace_path(
+            &resolution_a.resolved_root_dir,
+            &disambiguate_workspace_segment(SLUG, resolution_a.relative_subpath.as_deref()),
+        );
+        let old_folded_b = resolve_workspace_path(
+            &resolution_b.resolved_root_dir,
+            &disambiguate_workspace_segment(SLUG, resolution_b.relative_subpath.as_deref()),
+        );
+        let old_seed_a = format!("orchestration:{}", old_folded_a.display());
+        let old_seed_b = format!("orchestration:{}", old_folded_b.display());
+        const MARKER_CREATOR_MAX_CHARS: usize = 200;
+        assert!(
+            old_seed_a.chars().count() > MARKER_CREATOR_MAX_CHARS,
+            "fixture setup failed to reach the adversarial precondition -- the OLD \
+             (pre-digest-fix) creator seed for team-a/proj is only {} characters, need more \
+             than {MARKER_CREATOR_MAX_CHARS} for `sanitize_marker_creator` to even truncate \
+             it: {old_seed_a:?}",
+            old_seed_a.chars().count()
+        );
+        let old_truncated_a: String = old_seed_a.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
+        let old_truncated_b: String = old_seed_b.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
+        assert_eq!(
+            old_truncated_a, old_truncated_b,
+            "fixture setup failed to reach the adversarial precondition -- the two picks' OLD \
+             (pre-digest-fix) creator seeds must agree on their first {MARKER_CREATOR_MAX_CHARS} \
+             characters (that is the whole point of this fixture) but disagree already"
+        );
+
+        let config = make_orchestration("review");
+        let dispatch_typed_slug_open = |dir: &std::path::Path,
+                                        name: &str,
+                                        daemon_dir: &std::path::Path|
+         -> Vec<Option<String>> {
+            let _daemon = with_empty_agents_daemon(daemon_dir);
+            let req = NewPaneRequest {
+                dir: dir.to_path_buf(),
+                name: name.to_string(),
+                command: String::new(),
+                mode_config: None,
+                orchestration_config: Some(config.clone()),
+                seed_prompt: None,
+                form_agent_type: None,
+                worktree_slug: SLUG.to_string(),
+            };
+            let pc = Arc::new(CapturingPaneController::new());
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+            let _ = dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                &mut ui,
+                pc.as_ref(),
+                &state,
+                &mut tm,
+                &snapshot,
+                &[],
+                None,
+                Rect::new(0, 0, 200, 50),
+            );
+            pc.recorded_cwds()
+        };
+
+        let daemon_dir_1 = tempdir().expect("tempdir for first daemon-stub");
+        let first_cwds = dispatch_typed_slug_open(&team_a, "Team A pick", daemon_dir_1.path());
+        assert!(
+            !first_cwds.is_empty(),
+            "the first pick (team-a/proj) must succeed -- got zero spawned panes"
+        );
+
+        let daemon_dir_2 = tempdir().expect("tempdir for second daemon-stub");
+        let second_cwds = dispatch_typed_slug_open(&team_b, "Team B pick", daemon_dir_2.path());
+        assert!(
+            second_cwds.is_empty(),
+            "the second pick (team-b/proj) must be REFUSED even though its OLD creator seed's \
+             first 200 characters are byte-identical to the first pick's -- got spawned panes \
+             with cwds {second_cwds:?}, meaning it silently resumed into team-a/proj's clone \
+             (the exact fork#74 condition the digest-fronted creator identity exists to \
+             prevent)"
+        );
+    }
+
+    /// Scenario: fork issue #763 fix round (auditor A5) — the accepted
+    /// residual isn't limited to two NESTED picks: a TOPLEVEL pick and a
+    /// NESTED pick of the SAME project, typing the identical Worktree
+    /// slug, resolve to the identical clean `physical_worktree_path` too
+    /// (`disambiguate_workspace_segment` was always a no-op for a toplevel
+    /// pick, so its folded and clean shapes already coincide). Confirms
+    /// the same digest-fronted `creator` fix that protects `030`/`031`
+    /// also protects this pairing: opening the toplevel pick first, then
+    /// the nested pick under the identical slug, the second is refused
+    /// rather than silently resumed.
+    #[spec("orchestration/worktree/032")]
+    #[test]
+    fn worktree_032_a_toplevel_pick_and_a_nested_pick_sharing_an_identical_typed_slug_the_second_is_refused()
+     {
+        const SLUG: &str = "features";
+
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("team-a").join("proj");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree_032 fixture\n").expect("write README");
+        std::fs::write(nested.join("marker.txt"), "team-a\n").expect("write nested marker");
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let config = make_orchestration("review");
+        let dispatch_typed_slug_open = |dir: &std::path::Path,
+                                        name: &str,
+                                        daemon_dir: &std::path::Path|
+         -> Vec<Option<String>> {
+            let _daemon = with_empty_agents_daemon(daemon_dir);
+            let req = NewPaneRequest {
+                dir: dir.to_path_buf(),
+                name: name.to_string(),
+                command: String::new(),
+                mode_config: None,
+                orchestration_config: Some(config.clone()),
+                seed_prompt: None,
+                form_agent_type: None,
+                worktree_slug: SLUG.to_string(),
+            };
+            let pc = Arc::new(CapturingPaneController::new());
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+            let _ = dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                &mut ui,
+                pc.as_ref(),
+                &state,
+                &mut tm,
+                &snapshot,
+                &[],
+                None,
+                Rect::new(0, 0, 200, 50),
+            );
+            pc.recorded_cwds()
+        };
+
+        let daemon_dir_1 = tempdir().expect("tempdir for first daemon-stub");
+        let toplevel_cwds = dispatch_typed_slug_open(&repo, "Toplevel pick", daemon_dir_1.path());
+        assert!(
+            !toplevel_cwds.is_empty(),
+            "the toplevel pick must succeed -- got zero spawned panes"
+        );
+
+        let daemon_dir_2 = tempdir().expect("tempdir for second daemon-stub");
+        let nested_cwds = dispatch_typed_slug_open(&nested, "Nested pick", daemon_dir_2.path());
+        assert!(
+            nested_cwds.is_empty(),
+            "the nested pick (team-a/proj, the SAME identical typed slug as the toplevel pick) \
+             must be REFUSED -- got spawned panes with cwds {nested_cwds:?}, meaning it \
+             silently resumed into the toplevel pick's clone instead of being caught as a \
+             NameCollision"
+        );
+    }
+
     /// Scenario: PRD fork#760 fix round (reviewer M2/B5) — dispatch the real
     /// `Action::SpawnPane` with a typed Worktree slug that fails
     /// `is_valid_worktree_slug` (it contains a space and a colon). Before
@@ -45710,6 +46057,13 @@ mod tests {
         let captured_cwds = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
         let _daemon = with_recording_daemon_capturing_claim_cwd(tmp.path(), captured_cwds.clone());
 
+        // Auditor A8 (fork issue #763 review round): this fixture's typed
+        // slug lives in ONE `const`, read by both the request below and the
+        // "read back the real formula" comparison further down — a
+        // hardcoded `bool` mirroring `.is_empty()` separately from this
+        // value cannot actually track it, which is the whole point of
+        // reading the real formula back rather than hand-transcribing it.
+        const TYPED_SLUG: &str = "features";
         let config = make_orchestration("review");
         let pc = Arc::new(CapturingPaneController::new());
         let req = NewPaneRequest {
@@ -45724,7 +46078,7 @@ mod tests {
             // function of `(dir, slug)`, not `(dir, name)` — type the slug
             // equal to `name` so this fixture (and the "read back the real
             // formula" comparison below) stays deterministic.
-            worktree_slug: "features".to_string(),
+            worktree_slug: TYPED_SLUG.to_string(),
         };
 
         let mut tm = TabManager::new(pc.clone());
@@ -45755,7 +46109,7 @@ mod tests {
 
         // Read back what the real call site's own shared primitives compute
         // for this fixture -- NOT a hand-transcribed copy of the formula.
-        let segment = sanitize_workspace_segment("features");
+        let segment = sanitize_workspace_segment(TYPED_SLUG);
         let resolution = resolve_orchestration_workspace(&nested, &segment);
         let canonical_root = resolution
             .resolved_root_dir
@@ -45767,19 +46121,19 @@ mod tests {
         //
         // Fork issue #763: that fold is now conditional on whether the
         // segment came from an EXPLICITLY TYPED Worktree slug, which this
-        // fixture's own `worktree_slug: "features"` is (non-blank) -- a
-        // typed slug is used VERBATIM for the physical name, no fold,
-        // producing the clean `<repo>-features` sibling name instead of the
-        // old, always-disambiguated `<repo>-<len>-features-<subpath>`
-        // shape. Mirror that exact `req.worktree_slug.is_empty()` branch
-        // here too (rather than hand-picking the verbatim half outright),
+        // fixture's own `TYPED_SLUG` is (non-blank) -- a typed slug is used
+        // VERBATIM for the physical name, no fold, producing the clean
+        // `<repo>-features` sibling name instead of the old,
+        // always-disambiguated `<repo>-<len>-features-<subpath>` shape.
+        // Mirror that exact `req.worktree_slug.is_empty()` branch here too,
+        // reading `TYPED_SLUG.is_empty()` directly (auditor A8: a separate
+        // hardcoded `bool` cannot actually track this fixture's own slug),
         // or this "read back the real formula" test would silently drift
         // from the real call site the moment either this fixture's slug or
         // the production condition changes.
-        const TYPED_SLUG_IS_EMPTY: bool = false; // this fixture's own `worktree_slug: "features"`
         let mut expected_cwd = resolve_workspace_path(
             &canonical_root,
-            &if TYPED_SLUG_IS_EMPTY {
+            &if TYPED_SLUG.is_empty() {
                 disambiguate_workspace_segment(&segment, resolution.relative_subpath.as_deref())
             } else {
                 segment.clone()
