@@ -86,7 +86,9 @@ pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 /// Fork #166 M2.4: the exact creator string this orchestration stamped into
 /// its own worktree markers, injected into every pane so `worktree list
 /// --mine` can determine "mine" without a daemon round-trip. Carries
-/// `orchestration:<typed_name>` on the interactive path or
+/// `orchestration:<resolved workspace path>` on the interactive path (as of
+/// PRD fork#760's fix round — see `orchestration_creator_string`'s own doc
+/// in `src/ui.rs`; previously this was `orchestration:<typed_name>`) or
 /// `issue-dispatch:<task>#<issue>` on the dispatch path — the SAME computed
 /// string [`crate::worktree_reclaim::mark_worktree_owned`] writes into the
 /// marker, never a second derivation of it (a daemon-side reconstruction
@@ -4145,12 +4147,32 @@ impl AgentPtyRegistry {
     /// that real id is known (the daemon mints `pane_id` in `StartAgent`,
     /// so no pane id exists yet at form-submit time) and rolls the spawn
     /// back on refusal.
+    ///
+    /// Issue #760 (reviewer R2 / auditor N1): a SECOND, independent
+    /// guard runs alongside the Name-based one above. Since #760 decoupled
+    /// the on-disk workspace path from `name` (a typed Worktree slug can
+    /// now put two *different* Names on the identical resolved `cwd`), the
+    /// Name-based check alone can no longer detect two live orchestrations
+    /// landing in one working tree — concretely, Name `alpha` + slug `fix`
+    /// and Name `beta` + slug `fix` in the same repo resolve to the same
+    /// on-disk directory but never collide on `name`, so the first check
+    /// waves the second one through. The added clause below makes a
+    /// concrete (`Some`) `cwd` an exclusive resource across pane ids
+    /// regardless of `name`: two different `pane_id`s can never
+    /// simultaneously hold a claim scoped to the identical `Some(cwd)`.
+    /// It deliberately mirrors none of the `cwd: None` wildcard semantics
+    /// above — an absent `cwd` on either side means "unknown to this
+    /// caller," never "identical to every other claim," so this clause
+    /// only ever fires when BOTH sides name the same concrete directory.
     pub fn claim_orchestration_name(&self, name: &str, cwd: Option<&str>, pane_id: &str) -> bool {
         let mut claims = self.orchestration_name_claims.lock().unwrap();
         let conflict = claims.iter().any(|(k, holder)| {
-            k.name == name
+            let name_conflict = k.name == name
                 && holder != pane_id
-                && (k.cwd.is_none() || cwd.is_none() || k.cwd.as_deref() == cwd)
+                && (k.cwd.is_none() || cwd.is_none() || k.cwd.as_deref() == cwd);
+            let cwd_conflict =
+                holder != pane_id && k.cwd.is_some() && cwd.is_some() && k.cwd.as_deref() == cwd;
+            name_conflict || cwd_conflict
         });
         if conflict {
             return false;
@@ -10294,46 +10316,107 @@ mod spawn_tests {
     /// Scenario: covers the three non-race edges `identity_021` (its
     /// exclusive-race guarantee) does not touch, all needed by the
     /// production caller `Action::SpawnPane` adds in `src/ui.rs`. (1)
-    /// Distinct names must never cross-block each other, so two orchestrator
-    /// panes with different titles both succeed. (2) A pane re-claiming the
-    /// SAME name it already holds must be idempotent — the `Action::SpawnPane`
-    /// rollback path never re-claims deliberately, but a caller-side retry
-    /// after a lost/ambiguous daemon response must not misread its own
-    /// prior success as a conflict. (3) Releasing a pane id that holds no
-    /// claim (a worker pane, a plain agent, or a rollback double-release)
-    /// must be a silent no-op that leaves every OTHER live claim untouched —
-    /// `StopAgent`'s handler calls `release_orchestration_name`
-    /// unconditionally for every closing pane, claim or not.
+    /// Distinct names in DISTINCT directories must never cross-block each
+    /// other, so two orchestrator panes with different titles both succeed.
+    /// (2) A pane re-claiming the SAME name it already holds must be
+    /// idempotent — the `Action::SpawnPane` rollback path never re-claims
+    /// deliberately, but a caller-side retry after a lost/ambiguous daemon
+    /// response must not misread its own prior success as a conflict. (3)
+    /// Releasing a pane id that holds no claim (a worker pane, a plain
+    /// agent, or a rollback double-release) must be a silent no-op that
+    /// leaves every OTHER live claim untouched — `StopAgent`'s handler calls
+    /// `release_orchestration_name` unconditionally for every closing pane,
+    /// claim or not.
+    ///
+    /// Issue #760 (reviewer R2 / auditor N1) note: edge (1) used a single
+    /// shared directory for both names before this fix round — that stopped
+    /// being a valid "never cross-block" example once a SECOND, `cwd`-keyed
+    /// conflict guard was added alongside the name-based one (two different
+    /// names sharing the identical CONCRETE `cwd` now correctly conflict;
+    /// see `identity_042`). Using two distinct directories here keeps this
+    /// test pinning the property it actually names.
     #[spec("orchestration/identity/022")]
     #[test]
     fn identity_022_daemon_side_name_claim_distinct_names_idempotent_reclaim_and_noop_release() {
-        const DIR: &str = "/tmp/repo";
+        const DIR1: &str = "/tmp/repo-orchestrator-1";
+        const DIR2: &str = "/tmp/repo-orchestrator-2";
         let registry = AgentPtyRegistry::new();
 
-        // (1) distinct names never cross-block.
-        assert!(registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-x"));
-        assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-y"));
+        // (1) distinct names in distinct directories never cross-block.
+        assert!(registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR1), "pane-x"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR2), "pane-y"));
 
         // (2) idempotent re-claim by the SAME holder.
         assert!(
-            registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-x"),
+            registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR1), "pane-x"),
             "a pane re-claiming its own already-held name must succeed, not be refused"
         );
         // A DIFFERENT pane is still refused after that idempotent re-claim —
         // proves the re-claim didn't accidentally release or transfer it.
-        assert!(!registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR), "pane-z"));
+        assert!(!registry.claim_orchestration_name("repo-orchestrator-1", Some(DIR1), "pane-z"));
 
         // (3) releasing a pane with no claim is a no-op, and never touches
         // an unrelated pane's live claim.
         registry.release_orchestration_name("pane-never-claimed-anything");
         assert!(
-            !registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-z"),
+            !registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR2), "pane-z"),
             "an unrelated no-op release must not have freed pane-y's claim"
         );
 
         // Releasing the real holder still works after the no-op release above.
         registry.release_orchestration_name("pane-y");
-        assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR), "pane-z"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR2), "pane-z"));
+    }
+
+    /// Scenario: issue #760 (reviewer R2 / auditor N1) — the daemon-side
+    /// registry's own new guard, in isolation from any e2e/UI plumbing: two
+    /// DIFFERENT pane ids can never simultaneously hold a claim scoped to
+    /// the identical CONCRETE (`Some`) `cwd`, regardless of `name`. Before
+    /// this fix round the conflict predicate was keyed on `name` alone, so
+    /// two different orchestration names claiming the same resolved
+    /// workspace directory never conflicted — exactly what let two live
+    /// orchestrations land in one working tree once #760 decoupled the
+    /// resolved path from the typed Name. `orchestration/worktree/028`
+    /// pins the same property end-to-end through the real PTY/daemon; this
+    /// test isolates the registry-level predicate itself.
+    #[spec("orchestration/identity/042")]
+    #[test]
+    fn identity_042_different_names_sharing_the_identical_concrete_cwd_conflict() {
+        const CWD: &str = "/tmp/proj-fix";
+        let registry = AgentPtyRegistry::new();
+
+        assert!(registry.claim_orchestration_name("alpha", Some(CWD), "pane-a"));
+        assert!(
+            !registry.claim_orchestration_name("beta", Some(CWD), "pane-b"),
+            "a DIFFERENT name claiming the IDENTICAL concrete cwd already \
+             held by a different pane must be refused — the resolved \
+             workspace directory is a single physical resource, whatever \
+             Name each caller typed (issue #760 R2/N1)"
+        );
+
+        // The SAME pane id re-claiming under a different name at the same
+        // cwd is still exempt (idempotent-holder semantics are unaffected
+        // by this guard) -- not asserted here, `identity_022` already pins
+        // idempotent re-claim under a matching name; this test's own scope
+        // is the cross-name/same-cwd conflict alone.
+
+        // A `None` cwd on either side must never trigger this guard -- the
+        // wildcard's existing meaning ("unknown to this caller") must stay
+        // scoped to the name-based check only.
+        let registry2 = AgentPtyRegistry::new();
+        assert!(registry2.claim_orchestration_name("alpha", None, "pane-a"));
+        assert!(
+            registry2.claim_orchestration_name("beta", None, "pane-b"),
+            "two different names both claiming with cwd: None must not \
+             conflict via the new cwd-keyed guard -- it only compares \
+             concrete (Some) cwds"
+        );
+        assert!(
+            registry2.claim_orchestration_name("gamma", Some(CWD), "pane-c"),
+            "a concrete cwd claim must not conflict against an existing \
+             cwd: None claim of a DIFFERENT name via the new guard -- that \
+             cross-conflict remains the name-based check's job alone"
+        );
     }
 
     /// Fork issue #201 redesign (reviewer P2-2/P2-5, auditor A1): the claim

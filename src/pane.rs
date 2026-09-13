@@ -263,7 +263,10 @@ pub struct AgentSpawnOptions<'a> {
     /// for every other pane, which keeps the unchanged PTY-injection path.
     pub seed: Option<String>,
     /// Fork #166 M2.4: the exact creator string this orchestration stamped
-    /// into its own worktree marker (`orchestration:<typed_name>`), injected
+    /// into its own worktree marker (`orchestration:<resolved workspace
+    /// path>` as of PRD fork#760's fix round; previously
+    /// `orchestration:<typed_name>` — see `orchestration_creator_string`'s
+    /// own doc in `src/ui.rs`), injected
     /// into the pane's environment as `DOT_AGENT_DECK_WORKTREE_OWNER` so
     /// `worktree list --mine` can match it. `None` for a pane that is not
     /// part of a worktree-owning orchestration (e.g. a plain dashboard pane).

@@ -4018,12 +4018,36 @@ pub(crate) enum ResumeRejection {
     /// Evidence, ancestry and health all passed, and this call won the
     /// Contested race, but the provenance artifact's own `creator=` field
     /// (when present) names a DIFFERENT identity than the one making this
-    /// call (PRD fork#544 review-findings fix round, reviewer B2):
-    /// `sanitize_workspace_segment`/`resolve_workspace_path` aren't
-    /// injective, so two distinct orchestration Names (`fix/544` and
-    /// `fix-544`, say) can sanitize to the identical derived path — the
-    /// SECOND Name's open must not silently attach to the FIRST Name's
-    /// directory as though it were the same workspace.
+    /// call (PRD fork#544 review-findings fix round, reviewer B2). At the
+    /// time this variant was introduced, `creator` was derived from the
+    /// typed Worktree slug directly, and `sanitize_workspace_segment`/
+    /// `resolve_workspace_path` aren't injective — so two distinct typed
+    /// slugs (`fix/544` and `fix-544`, say) could sanitize to the identical
+    /// derived path while still producing two different `creator` strings,
+    /// and this check caught the second one attaching silently to the
+    /// first's directory.
+    ///
+    /// PRD fork#760 fix round (reviewer B2, then auditor F1/N1): `creator`
+    /// is now derived from the full resolved `clone_dir`
+    /// (`workspace_resolution.worktree_path`) rather than from the bare
+    /// slug or the typed Name — see `orchestration_creator_string`'s own
+    /// doc. That closes the collision above but also makes it UNREACHABLE
+    /// by construction for two slugs colliding to one path: since `creator`
+    /// is purely a function of `clone_dir`, two slugs that sanitize to the
+    /// identical path necessarily compute the identical `creator`, so
+    /// `stored_creator != sanitize_marker_creator(creator)` can never be
+    /// true for that case — there is nothing left for this check to catch
+    /// there, and reopening under the IDENTICAL slug with a DIFFERENT Name
+    /// resumes correctly rather than tripping this variant (the concurrent
+    /// case is refused earlier and separately, by `ClaimOrchestrationName`'s
+    /// own cwd clause, before provisioning is ever reached — see
+    /// `src/agent_pty.rs`'s `claim_orchestration_name`). What this variant
+    /// still catches: the *same* on-disk `clone_dir` carrying a provenance
+    /// marker written by a genuinely DIFFERENT creator producer — e.g. the
+    /// `dispatch <name>` CLI path's `dispatch:<name>` marker
+    /// (`src/dispatch.rs`), or a marker written by a pre-fork#760 build
+    /// whose `creator` was still Name- or bare-segment-derived — being
+    /// reopened by this path's `orchestration:<clone_dir>` producer.
     NameCollision,
 }
 
@@ -4037,11 +4061,12 @@ impl ResumeRejection {
         match self {
             Self::Stranger => {
                 "a directory already exists there but was not created by this deck (no \
-                 ownership evidence found) — remove it manually, or pick a different Name"
+                 ownership evidence found) — remove it manually, or pick a different Worktree \
+                 slug"
             }
             Self::AncestryMismatch => {
                 "the existing directory's history does not match this project (wrong repo, or \
-                 stale) — remove it manually, or pick a different Name"
+                 stale) — remove it manually, or pick a different Worktree slug"
             }
             Self::AncestryUnverifiable => {
                 "the existing directory's history could not be compared against this project \
@@ -4054,10 +4079,11 @@ impl ResumeRejection {
             }
             Self::Contested => "another request just resumed it first — try again",
             Self::NameCollision => {
-                "a different orchestration Name already opened the workspace at this location \
-                 (its provenance record names a different creator) — the two Names sanitize to \
-                 the same directory; pick a different Name instead of this one. It may still be \
-                 in use by the orchestration that opened it — do not remove it"
+                "a different orchestration already opened the workspace at this location under \
+                 a different Worktree slug (its provenance record names a different creator) — \
+                 the two slugs sanitize to the same directory; pick a different Worktree slug \
+                 instead of retyping the Name, which no longer changes where this resolves. It \
+                 may still be in use by the orchestration that opened it — do not remove it"
             }
         }
     }
