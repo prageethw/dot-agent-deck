@@ -45670,6 +45670,151 @@ mod tests {
         );
     }
 
+    /// Scenario: fork issue #766. PR #761 (fork#760) moved the ownership-
+    /// marker `creator` computed for a TOPLEVEL pick (no nested subpath)
+    /// from a Name/segment-derived string (confirmed against
+    /// `58a9b8aa~1:src/ui.rs`'s `let creator =
+    /// orchestration_creator_string(typed_name);`, i.e.
+    /// `orchestration:<typed Name/segment>`) to a resolved-workspace-PATH-
+    /// derived string (today's `orchestration_creator_string(&spawn_pane_creator_identity_seed(..))`,
+    /// which for a toplevel pick reduces to `orchestration:<full resolved
+    /// clone_dir>`) — with no migration for a marker a pre-#761 build
+    /// already wrote to disk. Builds a REAL, healthy, correctly-ancestored
+    /// isolated clone (exactly what a pre-#761 build's own
+    /// `provision_isolated_clone_sync` call already produced for real
+    /// users), then overwrites ONLY its provenance marker's `creator=` line
+    /// with the exact legacy format a pre-#761 build would have written for
+    /// this same typed Name/segment — everything else in the marker
+    /// (schema/root-hash/name/path) is left exactly as the real writer
+    /// produced it. Asserts that reopening the SAME toplevel pick under
+    /// TODAY's code (whose computed creator is path-derived) still
+    /// `Resumed`s the existing workspace rather than being refused as
+    /// `NameCollision`, which is what issue #766 reports happening in
+    /// production (every pre-#761 marker, refused as a collision, every
+    /// time).
+    ///
+    /// Control alongside it: releasing the resume registration and then
+    /// reopening the IDENTICAL clone_dir against a genuinely different,
+    /// unrelated source repository (still nominally sharing the same
+    /// legacy-shaped creator line) must NOT resume — proving this pins the
+    /// creator-format tolerance narrowly, not a wholesale disabling of
+    /// `resume_existing_isolated_clone`'s eligibility checks (here it's
+    /// caught by the pre-existing ancestry check, exactly as
+    /// `orchestration/workspace/007`'s wrong/stale-repo scenario already
+    /// covers independently of this fix).
+    #[spec("orchestration/workspace/042")]
+    #[test]
+    fn workspace_042_legacy_name_derived_creator_marker_resumes_toplevel_pick() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+
+        let segment = sanitize_workspace_segment("legacy-features");
+        let clone_dir = resolve_workspace_path(&repo, &segment);
+
+        // A real, healthy, correctly-ancestored clone -- exactly what a
+        // pre-#761 build's own `provision_isolated_clone_sync` call already
+        // left on disk for real users before this PR ever shipped. The
+        // `creator` argument here is a throwaway placeholder; it gets
+        // overwritten below with the exact legacy-format string a pre-#761
+        // build would actually have computed.
+        let created = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            &segment,
+            "placeholder-creator",
+        );
+        assert!(
+            matches!(
+                created,
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created { .. })
+            ),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        // Overwrite ONLY the `creator=` line with the exact legacy format
+        // (`orchestration:<typed Name/segment>`) -- schema/root-hash/name/
+        // path stay exactly what the real writer just produced.
+        let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
+        let content = std::fs::read_to_string(&marker_path).expect("read provenance marker");
+        let legacy_creator = format!("orchestration:{segment}");
+        let rewritten: String = content
+            .lines()
+            .map(|line| {
+                if line.starts_with("creator=") {
+                    format!("creator={legacy_creator}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(
+            rewritten.contains(&format!("creator={legacy_creator}\n")),
+            "setup: rewritten marker must carry the legacy creator line, got {rewritten:?}"
+        );
+        std::fs::write(&marker_path, &rewritten)
+            .expect("overwrite provenance marker with legacy creator");
+
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&clone_dir);
+
+        // TODAY's computed creator for this exact toplevel pick (no nested
+        // subpath) -- what `Action::SpawnPane` would compute for a second
+        // open of the identical repo/segment under current code.
+        let today_creator_identity_seed =
+            spawn_pane_creator_identity_seed(false, &repo, None, &segment, &clone_dir);
+        let today_creator = orchestration_creator_string(&today_creator_identity_seed);
+        assert_ne!(
+            today_creator, legacy_creator,
+            "setup: sanity -- today's path-derived creator must genuinely differ from the \
+             legacy Name-derived one on disk, or this test isn't exercising fork#760's format \
+             change at all"
+        );
+
+        let resumed = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            &segment,
+            &today_creator,
+        );
+        assert!(
+            matches!(
+                resumed,
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { .. })
+            ),
+            "fork issue #766: a pre-#761 legacy Name-derived creator marker ({legacy_creator:?}) \
+             must still resume under today's path-derived creator ({today_creator:?}) for the \
+             SAME toplevel pick, not be refused as a NameCollision -- got {resumed:?}"
+        );
+
+        // Control: releasing the registration and reopening the IDENTICAL
+        // clone_dir against a genuinely different, unrelated source
+        // repository (still nominally carrying the same legacy-shaped
+        // creator line) must NOT resume.
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&clone_dir);
+        let other_source = tmp.path().join("other-source");
+        init_committed_git_repo(&other_source);
+        let other_today_creator_identity_seed =
+            spawn_pane_creator_identity_seed(false, &other_source, None, &segment, &clone_dir);
+        let other_today_creator = orchestration_creator_string(&other_today_creator_identity_seed);
+        let other_result = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &other_source,
+            &clone_dir,
+            &segment,
+            &other_today_creator,
+        );
+        assert!(
+            !matches!(
+                other_result,
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { .. })
+            ),
+            "control: a genuinely different, unrelated source repository must not resume into \
+             the FIRST repo's already-resumed clone_dir merely because a legacy-shaped creator \
+             line is present there -- got {other_result:?}"
+        );
+    }
+
     /// Scenario: fork issue #595 fix round 2 (reviewer F1 BLOCKER / F4
     /// MAJOR). Exercises `provision_isolated_clone_or_status` directly —
     /// the function `Action::SpawnPane`'s orchestration branch actually
