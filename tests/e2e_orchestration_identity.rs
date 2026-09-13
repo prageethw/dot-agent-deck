@@ -509,8 +509,11 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     // refuse the second claim. It therefore cannot distinguish "the second
     // claim was granted" from "the second open was silently refused (the
     // daemon's `ClaimOrchestrationName` handler in `src/daemon_protocol.rs`
-    // returns `orchestration name {name:?} is already held`, and the New
-    // Pane form stays open showing `Orchestration failed: ...`) while tab
+    // returns "another live orchestration already occupies this workspace
+    // (same Worktree slug/directory or same Name in this directory)" (PRD
+    // fork#760's fix round; superseded the earlier `orchestration name
+    // {name:?} is already held` wording), and the New Pane form stays open
+    // showing `Orchestration failed: ...`) while tab
     // 1's own real label plus tab 2's still-open form happen to add up to
     // two matches anyway". Scoping the match to `tab_bar_line` (row 0 only,
     // defined above) closes that gap: the form's popup starts at row 10, so

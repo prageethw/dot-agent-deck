@@ -12741,15 +12741,17 @@ fn dispatch_action(
                     let workspace_resolution = resolve_orchestration_workspace(&req.dir, &segment);
                     // Fork #166 M2.4: the exact string passed to
                     // `provision_isolated_clone_or_status` below is the one
-                    // every role pane's env var carries too.
-                    // `orchestration_creator_string` is the single shared
-                    // computation the restore path also calls, so the two
-                    // can't drift apart. Every isolate path now needs a
-                    // creator identity for the ownership marker (tester
-                    // finding for PRD fork#544: previously only computed
-                    // inside the Nth-concurrent branch — the 1st-orchestration
-                    // branch fell through to `dir_str` without ever
-                    // assigning one).
+                    // every role pane's env var carries too, computed via
+                    // `orchestration_creator_string`. The restore path does
+                    // NOT call this function — it passes the persisted
+                    // `orch_snap.owner` straight through unchanged (see that
+                    // function's own doc for the full reasoning why the two
+                    // never need to be compared). Every isolate path now
+                    // needs a creator identity for the ownership marker
+                    // (tester finding for PRD fork#544: previously only
+                    // computed inside the Nth-concurrent branch — the
+                    // 1st-orchestration branch fell through to `dir_str`
+                    // without ever assigning one).
                     //
                     // PRD fork#760 THIRD fix round (auditor F1, CRITICAL —
                     // supersedes the SECOND fix round's `&segment`, which

@@ -86,7 +86,9 @@ pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 /// Fork #166 M2.4: the exact creator string this orchestration stamped into
 /// its own worktree markers, injected into every pane so `worktree list
 /// --mine` can determine "mine" without a daemon round-trip. Carries
-/// `orchestration:<typed_name>` on the interactive path or
+/// `orchestration:<resolved workspace path>` on the interactive path (as of
+/// PRD fork#760's fix round — see `orchestration_creator_string`'s own doc
+/// in `src/ui.rs`; previously this was `orchestration:<typed_name>`) or
 /// `issue-dispatch:<task>#<issue>` on the dispatch path — the SAME computed
 /// string [`crate::worktree_reclaim::mark_worktree_owned`] writes into the
 /// marker, never a second derivation of it (a daemon-side reconstruction

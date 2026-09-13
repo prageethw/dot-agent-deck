@@ -923,6 +923,20 @@ fn worktree_028_same_slug_different_name_concurrent_open_is_refused() {
     // the first orchestration is still live.
     open_orchestration_with_name_and_slug(&deck, "Beta760", SLUG);
 
+    // Reviewer round-3 (non-blocking T1): every assertion below this point
+    // is satisfiable BEFORE the daemon even answers the claim request — the
+    // form stays on screen and the log/directory state is unchanged either
+    // way while the request is in flight, so without this line the test
+    // would still pass against a reverted `6fff177c`. Wait for the actual
+    // refusal text the daemon-side `cwd` collision produces
+    // (`src/daemon_protocol.rs`'s `ClaimOrchestrationName` refusal, surfaced
+    // via `src/ui.rs`'s `Action::SpawnPane` as `Orchestration failed:
+    // {reason}`) so this test genuinely pins the guard having fired, not
+    // merely a state consistent with it having fired.
+    deck.wait_for_string(
+        "Orchestration failed: another live orchestration already occupies this workspace",
+    );
+
     // The refusal must be visible on screen — the new-pane form stays open,
     // never silently closing into a second orchestration tab sharing the
     // first's live workspace.

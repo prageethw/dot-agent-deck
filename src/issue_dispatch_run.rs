@@ -4018,20 +4018,36 @@ pub(crate) enum ResumeRejection {
     /// Evidence, ancestry and health all passed, and this call won the
     /// Contested race, but the provenance artifact's own `creator=` field
     /// (when present) names a DIFFERENT identity than the one making this
-    /// call (PRD fork#544 review-findings fix round, reviewer B2):
-    /// `sanitize_workspace_segment`/`resolve_workspace_path` aren't
-    /// injective, so two distinct typed Worktree slugs (`fix/544` and
-    /// `fix-544`, say) can sanitize to the identical derived path — the
-    /// SECOND slug's open must not silently attach to the FIRST slug's
-    /// directory as though it were the same workspace.
+    /// call (PRD fork#544 review-findings fix round, reviewer B2). At the
+    /// time this variant was introduced, `creator` was derived from the
+    /// typed Worktree slug directly, and `sanitize_workspace_segment`/
+    /// `resolve_workspace_path` aren't injective — so two distinct typed
+    /// slugs (`fix/544` and `fix-544`, say) could sanitize to the identical
+    /// derived path while still producing two different `creator` strings,
+    /// and this check caught the second one attaching silently to the
+    /// first's directory.
     ///
-    /// PRD fork#760 fix round (reviewer B2): `creator` is now derived from
-    /// the resolved `segment` (the typed slug, or the auto-generated
-    /// `orchestrator-N` when blank) — never from the typed Name — so
-    /// reopening under the IDENTICAL slug with a DIFFERENT Name resumes
-    /// correctly rather than tripping this variant; the variant still
-    /// exists for the genuine case above, where the SLUGS themselves
-    /// differ but happen to sanitize/derive to the same path.
+    /// PRD fork#760 fix round (reviewer B2, then auditor F1/N1): `creator`
+    /// is now derived from the full resolved `clone_dir`
+    /// (`workspace_resolution.worktree_path`) rather than from the bare
+    /// slug or the typed Name — see `orchestration_creator_string`'s own
+    /// doc. That closes the collision above but also makes it UNREACHABLE
+    /// by construction for two slugs colliding to one path: since `creator`
+    /// is purely a function of `clone_dir`, two slugs that sanitize to the
+    /// identical path necessarily compute the identical `creator`, so
+    /// `stored_creator != sanitize_marker_creator(creator)` can never be
+    /// true for that case — there is nothing left for this check to catch
+    /// there, and reopening under the IDENTICAL slug with a DIFFERENT Name
+    /// resumes correctly rather than tripping this variant (the concurrent
+    /// case is refused earlier and separately, by `ClaimOrchestrationName`'s
+    /// own cwd clause, before provisioning is ever reached — see
+    /// `src/agent_pty.rs`'s `claim_orchestration_name`). What this variant
+    /// still catches: the *same* on-disk `clone_dir` carrying a provenance
+    /// marker written by a genuinely DIFFERENT creator producer — e.g. the
+    /// `dispatch <name>` CLI path's `dispatch:<name>` marker
+    /// (`src/dispatch.rs`), or a marker written by a pre-fork#760 build
+    /// whose `creator` was still Name- or bare-segment-derived — being
+    /// reopened by this path's `orchestration:<clone_dir>` producer.
     NameCollision,
 }
 
