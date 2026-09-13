@@ -45640,6 +45640,15 @@ mod tests {
     /// `worktree_path`) rejoined with `resolve_workspace_path` and the
     /// relative subpath — the exact shared primitives `Action::SpawnPane`
     /// itself calls, read back rather than reimplemented.
+    ///
+    /// Fork issue #763 fix round: this fixture types a Worktree slug
+    /// (`"features"`, non-blank), so the real call site now derives the
+    /// claim cwd from the segment VERBATIM (no subpath fold) rather than
+    /// the always-disambiguated shape it used before that fix — the
+    /// "read back the real formula" comparison inside the test body
+    /// mirrors that exact conditional rather than hardcoding either shape,
+    /// so this test keeps pinning whatever `Action::SpawnPane` actually
+    /// does, not a snapshot of it from before #763.
     #[spec("orchestration/identity/038")]
     #[test]
     fn identity_038_live_spawn_claim_sends_the_real_resolved_workspace_cwd_for_a_nested_pick() {
@@ -45725,13 +45734,29 @@ mod tests {
             .resolved_root_dir
             .canonicalize()
             .expect("resolved_root_dir already exists on disk (it's the git toplevel)");
-        // Fork issue #607: the real call site now folds `relative_subpath`
-        // into the segment before deriving the sibling path -- mirror that
-        // here too, or this "read back the real formula" test would itself
-        // regress to asserting the pre-fix, undisambiguated shape.
+        // Fork issue #607: the real call site used to UNCONDITIONALLY fold
+        // `relative_subpath` into the segment before deriving the sibling
+        // path.
+        //
+        // Fork issue #763: that fold is now conditional on whether the
+        // segment came from an EXPLICITLY TYPED Worktree slug, which this
+        // fixture's own `worktree_slug: "features"` is (non-blank) -- a
+        // typed slug is used VERBATIM for the physical name, no fold,
+        // producing the clean `<repo>-features` sibling name instead of the
+        // old, always-disambiguated `<repo>-<len>-features-<subpath>`
+        // shape. Mirror that exact `req.worktree_slug.is_empty()` branch
+        // here too (rather than hand-picking the verbatim half outright),
+        // or this "read back the real formula" test would silently drift
+        // from the real call site the moment either this fixture's slug or
+        // the production condition changes.
+        const TYPED_SLUG_IS_EMPTY: bool = false; // this fixture's own `worktree_slug: "features"`
         let mut expected_cwd = resolve_workspace_path(
             &canonical_root,
-            &disambiguate_workspace_segment(&segment, resolution.relative_subpath.as_deref()),
+            &if TYPED_SLUG_IS_EMPTY {
+                disambiguate_workspace_segment(&segment, resolution.relative_subpath.as_deref())
+            } else {
+                segment.clone()
+            },
         );
         if let Some(rel) = &resolution.relative_subpath {
             expected_cwd = expected_cwd.join(rel);
