@@ -4,9 +4,10 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    IsolatedCloneOutcome, RemovalPolicy, RemoveOutcome, WorktreeCreation, WorktreeRegistry,
-    attempt_isolated_clone_cleanup, create_worktree, provision_isolated_clone_sync_resolved,
-    record_worktree, remove_worktree, run_status, worktree_still_in_use,
+    IsolatedCloneOutcome, LegacyFallbackEligibility, RemovalPolicy, RemoveOutcome,
+    WorktreeCreation, WorktreeRegistry, attempt_isolated_clone_cleanup, create_worktree,
+    provision_isolated_clone_sync_resolved, record_worktree, remove_worktree, run_status,
+    worktree_still_in_use,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -584,18 +585,24 @@ pub async fn handle_dispatch(
         let branch = paths.branch.clone();
         let creator_for_clone = creator.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            // Fork issue #766: this ad hoc `dispatch <name>` CLI path has no
-            // nested-relative-subpath concept of its own -- `clone_target`
-            // IS the whole pick, exactly like a TOPLEVEL directory pick
-            // through `Action::SpawnPane` -- so `None` here is what makes
-            // `resume_existing_isolated_clone`'s legacy-creator-format
-            // fallback correctly reachable from this path too.
+            // Fork issue #766, fix round 2 (audit A2): this ad hoc
+            // `dispatch <name>` CLI path's own creator namespace is
+            // `dispatch:<name>` (see `Creator::dispatch` below), never
+            // `orchestration:`-prefixed -- fork#760/#761's format change
+            // never affected it, so it has nothing to gain from the legacy-
+            // creator-format fallback. Passing `Disabled` structurally
+            // rules the fallback out for this path entirely, rather than
+            // leaving it reachable-but-unhelpful the way passing `None`
+            // used to (audit A2: that could let this path adopt, then
+            // irreversibly rewrite, an unrelated pre-#761 ORCHESTRATION
+            // marker that happened to collide with this dispatch's own
+            // derived path).
             provision_isolated_clone_sync_resolved(
                 &source_dir,
                 &clone_target,
                 &branch,
                 &creator_for_clone,
-                None,
+                LegacyFallbackEligibility::Disabled,
             )
         })
         .await;

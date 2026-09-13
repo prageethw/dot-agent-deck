@@ -1769,13 +1769,104 @@ pub(crate) fn provision_isolated_clone_sync(
     let resolved_source_dir = resolve_git_toplevel(source_dir)
         .map(|(toplevel, _prefix)| toplevel)
         .unwrap_or_else(|| source_dir.to_path_buf());
-    // Fork issue #766: this entry point never resolves or tracks a nested
-    // relative subpath of its own — every real caller of it (this module's
-    // own tests) treats `clone_dir` itself as the whole pick, exactly like
-    // a TOPLEVEL directory pick through the real `Action::SpawnPane` path.
-    // `None` here is what makes `resume_existing_isolated_clone`'s legacy-
-    // creator-format fallback reachable from these tests at all.
-    provision_isolated_clone_sync_resolved(&resolved_source_dir, clone_dir, branch, creator, None)
+    // Fork issue #766 fix round 2 (audit A1/A2): this entry point's own
+    // callers are all test fixtures that never claim to reproduce a real
+    // orchestration pick's identity, so the legacy-creator-format fallback
+    // stays structurally `Disabled` here — the same variant
+    // `src/dispatch.rs`'s own call site now passes. A test that
+    // deliberately wants to exercise the fallback uses
+    // [`provision_isolated_clone_sync_with_legacy_fallback`] instead, which
+    // supplies a real branch rather than silently inheriting one from this
+    // wrapper's default.
+    provision_isolated_clone_sync_resolved(
+        &resolved_source_dir,
+        clone_dir,
+        branch,
+        creator,
+        LegacyFallbackEligibility::Disabled,
+    )
+}
+
+/// Fork issue #766 fix round 2 test helper: identical to
+/// [`provision_isolated_clone_sync`] except it enables the legacy-creator-
+/// format fallback for a toplevel pick, supplying `branch` itself as the
+/// caller's real identity ([`LegacyFallbackEligibility::ToplevelWithIdentity`])
+/// — the same string a genuine `Action::SpawnPane` toplevel pick would pass.
+/// Exists so a test that deliberately wants to exercise the fallback opts in
+/// explicitly rather than relying on [`provision_isolated_clone_sync`]'s
+/// default, which is `Disabled` precisely so ~30 unrelated existing tests
+/// using that wrapper never accidentally reach it.
+#[cfg(test)]
+pub(crate) fn provision_isolated_clone_sync_with_legacy_fallback(
+    source_dir: &Path,
+    clone_dir: &Path,
+    branch: &str,
+    creator: &str,
+) -> Result<IsolatedCloneOutcome, String> {
+    let resolved_source_dir = resolve_git_toplevel(source_dir)
+        .map(|(toplevel, _prefix)| toplevel)
+        .unwrap_or_else(|| source_dir.to_path_buf());
+    provision_isolated_clone_sync_resolved(
+        &resolved_source_dir,
+        clone_dir,
+        branch,
+        creator,
+        LegacyFallbackEligibility::ToplevelWithIdentity(branch),
+    )
+}
+
+/// Fork issue #766 fix round 2 (audit A1/A2 — replaces the original fix
+/// round's bare `relative_subpath: Option<&Path>` parameter to
+/// [`provision_isolated_clone_sync_resolved`]/[`resume_existing_isolated_clone`]).
+/// The original parameter conflated two questions that turned out not to be
+/// the same question at all: "is this pick nested under its git toplevel"
+/// (a structural fact about the CURRENT pick, correctly gates out a nested
+/// pick — fork issue #763's collision the digest-fronted creator format
+/// exists to prevent) and "may this call accept a pre-fork#760 legacy
+/// Name-derived `creator=` marker as a match" (a question about the
+/// CALLER's own identity, which the bare boolean never carried at all —
+/// audit A1: every legacy-shaped marker was accepted by every toplevel-
+/// shaped caller, regardless of whether that caller's own Name/segment had
+/// anything to do with the marker on disk). This enum keeps the two
+/// questions answerable independently while making it impossible for a
+/// caller to enable the fallback without also supplying the real identity
+/// [`resume_existing_isolated_clone`] needs to check it against.
+pub(crate) enum LegacyFallbackEligibility<'a> {
+    /// The picked directory is nested under its git toplevel. The fallback
+    /// is never reachable regardless of anything else — the legacy format
+    /// never carried subpath information to compare against, and widening
+    /// it here would silently reopen the exact collision fork issue #763
+    /// closed.
+    Nested,
+    /// The picked directory IS its own git toplevel (or isn't inside a git
+    /// repository at all), and the caller supplies its own current
+    /// branch/segment value for THIS pick — the exact string that would be
+    /// written into the marker's `name=` field were this call instead
+    /// creating a fresh clone right now (see `write_isolated_clone_provenance`'s
+    /// `name` parameter). Only a genuine `Action::SpawnPane` toplevel pick
+    /// (or a test that deliberately wants to exercise the fallback via
+    /// [`provision_isolated_clone_sync_with_legacy_fallback`]) should ever
+    /// construct this.
+    ToplevelWithIdentity(&'a str),
+    /// The picked directory IS a toplevel pick (or outside git entirely),
+    /// but this caller's own creator namespace was never affected by fork
+    /// issue #766 in the first place — `src/dispatch.rs`'s `dispatch:`-
+    /// prefixed creator predates fork#760/#761's path-derived format change
+    /// entirely, so the fallback can only ever widen acceptance for that
+    /// path, never help it (audit A2). Structurally disabled rather than
+    /// left reachable-but-unhelpful.
+    Disabled,
+}
+
+impl LegacyFallbackEligibility<'_> {
+    /// The caller-supplied identity to check the legacy marker's `name=`
+    /// field against, when this variant offers one at all.
+    fn identity_branch(&self) -> Option<&str> {
+        match self {
+            Self::ToplevelWithIdentity(branch) => Some(branch),
+            Self::Nested | Self::Disabled => None,
+        }
+    }
 }
 
 /// Fork issue #595 fix round 2: same as [`provision_isolated_clone_sync`],
@@ -1784,19 +1875,18 @@ pub(crate) fn provision_isolated_clone_sync(
 /// unaffected either way). See that function's doc comment for why a
 /// second entry point exists.
 ///
-/// `relative_subpath` (fork issue #766): `None` when the caller's pick IS
-/// the toplevel (or isn't inside a git repository at all), `Some` for a
-/// nested pick — passed straight through to
-/// [`resume_existing_isolated_clone`], which only ever widens its stored-
-/// vs-computed `creator` comparison to accept the pre-fork#760 legacy
-/// Name-derived format when this is `None`. See that function's own doc
-/// comment for why a nested pick must never take that fallback.
+/// `legacy_fallback` (fork issue #766, fix round 2): passed straight
+/// through to [`resume_existing_isolated_clone`], which only ever widens
+/// its stored-vs-computed `creator` comparison to accept the pre-fork#760
+/// legacy Name-derived format for [`LegacyFallbackEligibility::ToplevelWithIdentity`].
+/// See that function's own doc comment for why a nested pick, and a caller
+/// with no real identity to offer, must never take that fallback.
 pub(crate) fn provision_isolated_clone_sync_resolved(
     resolved_source_dir: &Path,
     clone_dir: &Path,
     branch: &str,
     creator: &str,
-    relative_subpath: Option<&Path>,
+    legacy_fallback: LegacyFallbackEligibility<'_>,
 ) -> Result<IsolatedCloneOutcome, String> {
     ensure_worktree_parent_dir(clone_dir)?;
 
@@ -1830,7 +1920,7 @@ pub(crate) fn provision_isolated_clone_sync_resolved(
             resolved_source_dir,
             clone_dir,
             creator,
-            relative_subpath,
+            legacy_fallback,
         );
     }
 
@@ -4277,15 +4367,15 @@ pub(crate) fn release_resumed_isolated_clone_registration(clone_dir: &Path) {
 /// and resumes; a caller that finds the path already registered lost the
 /// race and is refused as [`ResumeRejection::Contested`] without touching
 /// git again.
-/// `relative_subpath` (fork issue #766): `None` when the caller's pick IS
-/// the toplevel directory (or isn't inside a git repository at all), `Some`
-/// for a nested pick. Read only by the legacy-creator-format fallback
-/// inside the `creator` comparison below — see that block's own comment.
+/// `legacy_fallback` (fork issue #766, fix round 2): see
+/// [`LegacyFallbackEligibility`]'s own doc comment. Read only by the
+/// legacy-creator-format fallback inside the `creator` comparison below —
+/// see that block's own comment.
 fn resume_existing_isolated_clone(
     source_dir: &Path,
     clone_dir: &Path,
     creator: &str,
-    relative_subpath: Option<&Path>,
+    legacy_fallback: LegacyFallbackEligibility<'_>,
 ) -> Result<IsolatedCloneOutcome, String> {
     if !isolated_clone_provenance_path(clone_dir).is_file() {
         return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Stranger));
@@ -4343,36 +4433,60 @@ fn resume_existing_isolated_clone(
     if let Some(stored_creator) = stored_creator.as_deref()
         && stored_creator != crate::worktree_reclaim::sanitize_marker_creator(creator)
     {
-        // Fork issue #766: fork#760 (commit 58a9b8aa) changed a TOPLEVEL
-        // pick's `creator` from a Name/segment-derived string
-        // (`orchestration_creator_string(typed_name)`, pre-#760) to a
-        // path-derived one (`orchestration_creator_string(resolved
+        // Fork issue #766, fix round 2 (audit A1/A2/A3): fork#760 (commit
+        // 58a9b8aa) changed a TOPLEVEL pick's `creator` from a Name/segment-
+        // derived string (`orchestration_creator_string(typed_name)`,
+        // pre-#760) to a path-derived one (`orchestration_creator_string(resolved
         // workspace path)`) — so every marker a pre-#760 build ever wrote
         // for a toplevel pick fails the byte-for-byte comparison above
         // unconditionally, even reopening the IDENTICAL repo/segment under
-        // today's code. Recognize that legacy format as an equivalent
-        // match by recomputing it from the marker's own `name=` field
-        // (written at creation time from the same typed Name/segment a
-        // pre-#760 build would have keyed `creator` on) through
-        // [`crate::ui::orchestration_creator_string`] — the exact function
-        // real callers use, not a hand-rolled reimplementation of its
-        // `"orchestration:"` prefix / sanitize / unknown-sentinel
-        // handling.
+        // today's code.
         //
-        // Restricted to `relative_subpath.is_none()` — a TOPLEVEL pick
-        // only. A nested pick's legacy format never carried subpath
-        // information at all, which is exactly the ambiguity fork issue
-        // #763/#761 closed by making `creator` path-derived (and, for a
-        // typed slug, digest-fronted) in the first place; widening this
-        // fallback to a nested pick would silently reopen that same
-        // collision.
-        let legacy_creator = relative_subpath.is_none().then(|| {
-            marker_content
-                .as_deref()
-                .and_then(|content| isolated_clone_provenance_field(content, "name"))
-                .map(|name| crate::ui::orchestration_creator_string(&name))
+        // The original fix round recognized that legacy format by
+        // recomputing it purely from the marker's OWN `name=` field and
+        // comparing the result against the marker's OWN `creator=` field —
+        // both sides came from the same file, so the check answered only
+        // "is this marker internally self-consistent", never "does the
+        // CALLER resuming it actually own it" (audit A1). Fixed here by
+        // requiring genuine caller-identity equivalence instead:
+        // [`LegacyFallbackEligibility::ToplevelWithIdentity`] carries the
+        // CALLER's own current branch/segment value for THIS pick — the
+        // exact string that would be written into `name=` were this call
+        // instead creating a fresh clone right now — and the fallback only
+        // matches when that, run through the same sanitizer the marker
+        // format already implies, equals what is actually stored as
+        // `name=` for this directory. A legacy marker whose typed Name
+        // needed sanitizing to become its own segment (e.g. `fix/766`,
+        // audit A3) still requires the caller to retype the
+        // already-sanitized form to match — this fix does not attempt to
+        // reverse-engineer the original raw typed Name out of the stored
+        // `creator=` string, which would still be self-referential and
+        // wouldn't close A1 anyway.
+        //
+        // Also requires the stored creator to literally carry the
+        // `"orchestration:"` namespace prefix — belt-and-suspenders
+        // alongside [`LegacyFallbackEligibility::Disabled`]'s structural
+        // fix for audit A2 (`src/dispatch.rs`'s own `dispatch:`-namespaced
+        // creator can never legitimately match a legacy ORCHESTRATION
+        // marker, and that path now can't even construct the variant that
+        // would let it try).
+        //
+        // `Nested`/`Disabled` both yield no identity branch at all — a
+        // nested pick's legacy format never carried subpath information to
+        // compare against in the first place (fork issue #763's collision
+        // the digest-fronted creator format exists to prevent), and a
+        // caller with no real identity to offer has nothing this check can
+        // validate.
+        const ORCHESTRATION_CREATOR_NAMESPACE: &str = "orchestration:";
+        let legacy_match = legacy_fallback.identity_branch().is_some_and(|branch| {
+            stored_creator.starts_with(ORCHESTRATION_CREATOR_NAMESPACE)
+                && marker_content
+                    .as_deref()
+                    .and_then(|content| isolated_clone_provenance_field(content, "name"))
+                    .as_deref()
+                    == Some(crate::worktree_reclaim::sanitize_marker_creator(branch).as_str())
         });
-        if legacy_creator.flatten().as_deref() != Some(stored_creator) {
+        if !legacy_match {
             return Ok(IsolatedCloneOutcome::Rejected(
                 ResumeRejection::NameCollision,
             ));
@@ -9411,6 +9525,85 @@ exit 0
              still be treated as valid ownership evidence — M3's eligibility check (b) must keep \
              passing for it, not reject it as a stranger directory just because it predates the \
              M4 fields, got {result:?}"
+        );
+    }
+
+    /// Scenario: fork issue #766 fix round 2 (audit A2). `src/dispatch.rs`'s
+    /// own `dispatch <name>` CLI call site now always passes
+    /// `LegacyFallbackEligibility::Disabled` — the same variant this test
+    /// constructs directly — to `provision_isolated_clone_sync_resolved`.
+    /// Proves that variant is structurally incapable of taking the
+    /// legacy-creator-format fallback even against a marker that WOULD
+    /// satisfy it under `ToplevelWithIdentity` (same repo, same clone_dir,
+    /// a legacy `orchestration:`-namespaced creator whose `name=` field
+    /// exactly matches the branch this call would otherwise offer as its
+    /// identity) — a mismatched-only test could never distinguish "the
+    /// fallback correctly refused a mismatch" from "the fallback is
+    /// unreachable at all"; this one can, because the marker on disk here
+    /// is a genuine match.
+    #[spec("orchestration/workspace/045")]
+    #[test]
+    fn workspace_045_disabled_legacy_fallback_never_matches_even_a_genuine_legacy_marker() {
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = ws.path().join("state");
+        let _state_guard =
+            ScopedEnvVar::set("DOT_AGENT_DECK_STATE_DIR", state_dir.to_str().unwrap());
+
+        let source = ws.path().join("source");
+        seed_source_repo(&source, "seed\n");
+
+        let clone_dir = ws.path().join("source-disabled-fallback");
+        let created =
+            provision_isolated_clone_sync(&source, &clone_dir, "disabled-fallback", "opener");
+        assert!(
+            matches!(created, Ok(IsolatedCloneOutcome::Created { .. })),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = isolated_clone_provenance_path(&clone_dir);
+        let content = std::fs::read_to_string(&marker_path).expect("read provenance marker");
+        let legacy_creator = "orchestration:disabled-fallback";
+        let rewritten: String = content
+            .lines()
+            .map(|line| {
+                if line.starts_with("creator=") {
+                    format!("creator={legacy_creator}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&marker_path, &rewritten)
+            .expect("overwrite provenance marker with legacy creator");
+
+        release_resumed_isolated_clone_registration(&clone_dir);
+
+        // Exactly the shape `src/dispatch.rs`'s call site constructs:
+        // `LegacyFallbackEligibility::Disabled`, with a `creator` argument
+        // that deliberately differs from the stored legacy creator (so the
+        // primary stored-vs-computed comparison mismatches and the
+        // fallback block would run, if it were ever reachable for this
+        // variant).
+        let result = provision_isolated_clone_sync_resolved(
+            &source,
+            &clone_dir,
+            "disabled-fallback",
+            "todays-computed-creator",
+            LegacyFallbackEligibility::Disabled,
+        );
+        assert!(
+            matches!(
+                result,
+                Ok(IsolatedCloneOutcome::Rejected(
+                    ResumeRejection::NameCollision
+                ))
+            ),
+            "fork issue #766 audit A2: LegacyFallbackEligibility::Disabled -- the variant \
+             src/dispatch.rs's own call site always passes -- must refuse as NameCollision even \
+             against a marker that would satisfy the fallback's caller-identity check exactly, \
+             got {result:?}"
         );
     }
 

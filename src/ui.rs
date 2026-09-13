@@ -11647,12 +11647,23 @@ fn provision_isolated_clone_or_status(
         }
     };
 
+    // Fork issue #766, fix round 2 (audit A1): `branch` is the caller's own
+    // current identity for THIS toplevel pick — the exact string that would
+    // be written into a fresh marker's `name=` field were this call
+    // creating one right now — so it is the right value to offer
+    // `resume_existing_isolated_clone`'s legacy-creator-format fallback as
+    // this genuine `Action::SpawnPane` pick's identity, never a nested
+    // pick's.
+    let legacy_fallback = match relative_subpath {
+        Some(_) => crate::issue_dispatch_run::LegacyFallbackEligibility::Nested,
+        None => crate::issue_dispatch_run::LegacyFallbackEligibility::ToplevelWithIdentity(branch),
+    };
     match crate::issue_dispatch_run::provision_isolated_clone_sync_resolved(
         resolved_root_dir,
         worktree_path,
         branch,
         creator,
-        relative_subpath,
+        legacy_fallback,
     ) {
         Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
             marker_warning,
@@ -14485,12 +14496,16 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// practice, and a collision there is cosmetic, never a shared-clone
 /// hazard).
 ///
-/// Fork issue #766 fix: made `pub(crate)` (was private to this module) so
-/// `src/issue_dispatch_run.rs`'s legacy-creator-format fallback
-/// (`resume_existing_isolated_clone`) can share this exact construction
-/// rather than reimplementing the `"orchestration:"` prefix / sanitize /
-/// unknown-sentinel dance by hand a second time.
-pub(crate) fn orchestration_creator_string(identity_seed: &str) -> String {
+/// Fork issue #766 fix round: briefly made `pub(crate)` so
+/// `src/issue_dispatch_run.rs`'s legacy-creator-format fallback could share
+/// this exact construction rather than reimplementing the
+/// `"orchestration:"` prefix / sanitize / unknown-sentinel dance by hand a
+/// second time. Fix round 2 (audit A1) replaced that fallback's
+/// self-referential recomputation with a direct caller-identity comparison
+/// against [`crate::worktree_reclaim::sanitize_marker_creator`] instead, so
+/// nothing outside this module calls this function anymore — reverted back
+/// to private.
+fn orchestration_creator_string(identity_seed: &str) -> String {
     const ORCHESTRATION_PREFIX: &str = "orchestration:";
     let raw = if identity_seed.is_empty() {
         crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string()
@@ -45713,21 +45728,25 @@ mod tests {
     /// this same typed Name/segment — everything else in the marker
     /// (schema/root-hash/name/path) is left exactly as the real writer
     /// produced it. Asserts that reopening the SAME toplevel pick under
-    /// TODAY's code (whose computed creator is path-derived) still
-    /// `Resumed`s the existing workspace rather than being refused as
+    /// TODAY's code (whose computed creator is path-derived), supplying its
+    /// own real identity via `provision_isolated_clone_sync_with_legacy_fallback`,
+    /// still `Resumed`s the existing workspace rather than being refused as
     /// `NameCollision`, which is what issue #766 reports happening in
     /// production (every pre-#761 marker, refused as a collision, every
     /// time).
     ///
-    /// Control alongside it: releasing the resume registration and then
-    /// reopening the IDENTICAL clone_dir against a genuinely different,
-    /// unrelated source repository (still nominally sharing the same
-    /// legacy-shaped creator line) must NOT resume — proving this pins the
-    /// creator-format tolerance narrowly, not a wholesale disabling of
-    /// `resume_existing_isolated_clone`'s eligibility checks (here it's
-    /// caught by the pre-existing ancestry check, exactly as
-    /// `orchestration/workspace/007`'s wrong/stale-repo scenario already
-    /// covers independently of this fix).
+    /// Control alongside it (fix round 2, audit A1 / reviewer M2): the
+    /// ORIGINAL control released the registration and reopened the
+    /// identical `clone_dir` against a genuinely different, unrelated
+    /// source repository — refused, but only by the pre-existing ancestry
+    /// check running BEFORE the creator comparison is ever reached, so it
+    /// never actually exercised the creator-format tolerance at all. This
+    /// round's control instead reopens the SAME repo/clone_dir (ancestry
+    /// trivially matches) as a caller whose own current branch/segment does
+    /// NOT match the legacy marker's stored `name=` field — proving the
+    /// caller-identity tie the fix round 2 rewrite added is load-bearing,
+    /// not merely a namespace-prefix check that any legacy-shaped marker
+    /// would satisfy.
     #[spec("orchestration/workspace/042")]
     #[test]
     fn workspace_042_legacy_name_derived_creator_marker_resumes_toplevel_pick() {
@@ -45760,7 +45779,11 @@ mod tests {
 
         // Overwrite ONLY the `creator=` line with the exact legacy format
         // (`orchestration:<typed Name/segment>`) -- schema/root-hash/name/
-        // path stay exactly what the real writer just produced.
+        // path stay exactly what the real writer just produced. `name=` was
+        // written as `segment` above (`provision_isolated_clone_sync`'s
+        // `branch` argument), so this legacy line is a perfect
+        // caller-identity match for a resume that also supplies `segment`
+        // as its own branch.
         let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
         let content = std::fs::read_to_string(&marker_path).expect("read provenance marker");
         let legacy_creator = format!("orchestration:{segment}");
@@ -45798,7 +45821,34 @@ mod tests {
              change at all"
         );
 
-        let resumed = crate::issue_dispatch_run::provision_isolated_clone_sync(
+        // Control (fix round 2, audit A1 / reviewer M2): a caller whose own
+        // current branch/segment does NOT match the legacy marker's stored
+        // `name=` field must be refused as `NameCollision`, even though
+        // ancestry trivially matches (same repo, same clone_dir) and the
+        // stored creator carries the `orchestration:` namespace prefix --
+        // proving the fix's caller-identity check is the thing doing the
+        // refusing here, not the ancestry probe running first.
+        let mismatched_branch = format!("{segment}-not-the-real-caller");
+        let mismatched_result =
+            crate::issue_dispatch_run::provision_isolated_clone_sync_with_legacy_fallback(
+                &repo,
+                &clone_dir,
+                &mismatched_branch,
+                &today_creator,
+            );
+        assert!(
+            !matches!(
+                mismatched_result,
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { .. })
+            ),
+            "control (fork issue #766 fix round 2, audit A1): a caller whose own current \
+             branch/segment ({mismatched_branch:?}) does not match the legacy marker's stored \
+             name= field ({segment:?}) must be refused as NameCollision even though ancestry \
+             and the orchestration: namespace both check out -- got {mismatched_result:?}"
+        );
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&clone_dir);
+
+        let resumed = crate::issue_dispatch_run::provision_isolated_clone_sync_with_legacy_fallback(
             &repo,
             &clone_dir,
             &segment,
@@ -45811,67 +45861,249 @@ mod tests {
             ),
             "fork issue #766: a pre-#761 legacy Name-derived creator marker ({legacy_creator:?}) \
              must still resume under today's path-derived creator ({today_creator:?}) for the \
-             SAME toplevel pick, not be refused as a NameCollision -- got {resumed:?}"
+             SAME toplevel pick when the caller's own branch ({segment:?}) matches the marker's \
+             stored name=, not be refused as a NameCollision -- got {resumed:?}"
         );
+    }
 
-        // Control: releasing the registration and reopening the IDENTICAL
-        // clone_dir against a genuinely different, unrelated source
-        // repository (still nominally carrying the same legacy-shaped
-        // creator line) must NOT resume. `other_source` is seeded with
-        // content that differs from `repo`'s (rather than reusing
-        // `init_committed_git_repo`'s fixed "test fixture\n" text) so its
-        // initial commit can never hash to the identical SHA as `repo`'s --
-        // two independently-`git init`'d repos with byte-identical
-        // committed content, same committer identity, and no timestamp
-        // pinning, committed within the same wall-clock second, produce
-        // the EXACT SAME commit SHA (git commit hashing has no other
-        // entropy at 1-second granularity), which would make the ancestry
-        // probe this control case relies on spuriously report a match
-        // instead of the mismatch it's meant to exercise. Mirrors
-        // `orchestration/workspace/007`'s `seed_source_repo(&source_a,
-        // "seed-a\n")` / `seed_source_repo(&source_b,
-        // "seed-b-unrelated-history\n")` pattern, which already avoids
-        // this trap on purpose.
-        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&clone_dir);
-        let other_source = tmp.path().join("other-source");
-        init_committed_git_repo_with_content(&other_source, "other-source-unrelated-history\n");
-        let repo_head_sha = |dir: &std::path::Path| -> String {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .expect("git rev-parse HEAD must spawn");
-            assert!(
-                out.status.success(),
-                "git rev-parse HEAD failed in {dir:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        assert_ne!(
-            repo_head_sha(&repo),
-            repo_head_sha(&other_source),
-            "setup: sanity -- `repo` and `other_source` must genuinely have distinct commit \
-             SHAs, or the ancestry check below can't tell them apart and this control case \
-             isn't exercising a genuinely different, unrelated source repository at all"
-        );
-        let other_today_creator_identity_seed =
-            spawn_pane_creator_identity_seed(false, &other_source, None, &segment, &clone_dir);
-        let other_today_creator = orchestration_creator_string(&other_today_creator_identity_seed);
-        let other_result = crate::issue_dispatch_run::provision_isolated_clone_sync(
-            &other_source,
+    /// Scenario: fork issue #766 fix round 2 (reviewer M4). Once a legacy
+    /// Name-derived creator marker has been accepted via the fallback in
+    /// `orchestration/workspace/042`, `resume_existing_isolated_clone`
+    /// migrates the on-disk marker's `creator=` line to today's format —
+    /// this pins that migration: the `creator=` line changes to exactly
+    /// today's computed creator, every other field (`schema=`/`root-hash=`/
+    /// `name=`/`path=`) survives byte-for-byte, and a SECOND resume
+    /// afterward succeeds via the direct no-fallback-needed path even when
+    /// the fallback is structurally `Disabled` (the same variant
+    /// `src/dispatch.rs`'s own call site always passes) — proving the
+    /// migration genuinely took effect rather than merely resuming once and
+    /// leaving the legacy marker in place to keep re-triggering the
+    /// fallback indefinitely.
+    #[spec("orchestration/workspace/043")]
+    #[test]
+    fn workspace_043_legacy_creator_marker_migrates_to_todays_format_after_resume() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+
+        let segment = sanitize_workspace_segment("legacy-migrate");
+        let clone_dir = resolve_workspace_path(&repo, &segment);
+
+        let created = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
             &clone_dir,
             &segment,
-            &other_today_creator,
+            "placeholder-creator",
         );
         assert!(
-            !matches!(
-                other_result,
+            matches!(
+                created,
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created { .. })
+            ),
+            "setup: the initial clone must succeed, got {created:?}"
+        );
+
+        let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&clone_dir);
+        let content_before_resume =
+            std::fs::read_to_string(&marker_path).expect("read provenance marker");
+        let legacy_creator = format!("orchestration:{segment}");
+        let rewritten: String = content_before_resume
+            .lines()
+            .map(|line| {
+                if line.starts_with("creator=") {
+                    format!("creator={legacy_creator}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&marker_path, &rewritten)
+            .expect("overwrite provenance marker with legacy creator");
+        // What every field OTHER than `creator=` looked like right after the
+        // real writer produced them, so migration's preservation of them can
+        // be checked against the genuine pre-migration content below rather
+        // than a hand-rolled expectation.
+        let content_before_migration = rewritten;
+
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&clone_dir);
+
+        let today_creator_identity_seed =
+            spawn_pane_creator_identity_seed(false, &repo, None, &segment, &clone_dir);
+        let today_creator = orchestration_creator_string(&today_creator_identity_seed);
+
+        let first_resume =
+            crate::issue_dispatch_run::provision_isolated_clone_sync_with_legacy_fallback(
+                &repo,
+                &clone_dir,
+                &segment,
+                &today_creator,
+            );
+        assert!(
+            matches!(
+                first_resume,
                 Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { .. })
             ),
-            "control: a genuinely different, unrelated source repository must not resume into \
-             the FIRST repo's already-resumed clone_dir merely because a legacy-shaped creator \
-             line is present there -- got {other_result:?}"
+            "setup: the fallback-enabled resume must succeed, got {first_resume:?}"
+        );
+
+        let migrated_content =
+            std::fs::read_to_string(&marker_path).expect("read migrated provenance marker");
+        assert!(
+            migrated_content
+                .lines()
+                .any(|line| line == format!("creator={today_creator}")),
+            "fork issue #766 M4: after a successful legacy-fallback resume, the on-disk marker's \
+             creator= line must be rewritten to today's format ({today_creator:?}), got \
+             {migrated_content:?}"
+        );
+        for key in ["schema=", "root-hash=", "name=", "path="] {
+            let before = content_before_migration
+                .lines()
+                .find(|l| l.starts_with(key));
+            let after = migrated_content.lines().find(|l| l.starts_with(key));
+            assert_eq!(
+                before, after,
+                "fork issue #766 M4: migration must leave every field other than creator= \
+                 byte-for-byte untouched -- field prefix {key:?} changed from {before:?} to \
+                 {after:?}"
+            );
+        }
+
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&clone_dir);
+
+        // Second resume: the marker no longer carries the legacy format at
+        // all, so even a call with the fallback structurally `Disabled` --
+        // exactly what `provision_isolated_clone_sync` (and, in
+        // production, `src/dispatch.rs`'s own call site) always passes --
+        // must still succeed via the direct, no-fallback-needed path.
+        let second_resume = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            &segment,
+            &today_creator,
+        );
+        assert!(
+            matches!(
+                second_resume,
+                Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Resumed { .. })
+            ),
+            "fork issue #766 M4: once migrated, a plain resume with the fallback disabled must \
+             still succeed directly (no legacy fallback needed) -- got {second_resume:?}"
+        );
+    }
+
+    /// Scenario: fork issue #766 fix round 2 (reviewer M3). A nested pick
+    /// (a picked directory under, not equal to, its git toplevel) must
+    /// never take the legacy-creator-format fallback, even in the
+    /// adversarial case where an existing marker's stored `name=`/`creator=`
+    /// would satisfy the fallback's caller-identity check exactly, were it
+    /// ever reachable — proving `provision_isolated_clone_or_status`'s own
+    /// `Some(relative_subpath) => LegacyFallbackEligibility::Nested` wiring
+    /// (not just the enum's internal logic) genuinely gates it: deleting
+    /// that gate, or wiring `Some` to `ToplevelWithIdentity` by mistake,
+    /// would turn this red.
+    #[spec("orchestration/workspace/044")]
+    #[test]
+    fn workspace_044_legacy_creator_marker_never_resumes_a_nested_pick() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_git_repo(&repo);
+        let nested = repo.join("baseline").join("intent");
+        std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ]);
+
+        let (toplevel, prefix) = crate::issue_dispatch_run::resolve_git_toplevel(&nested)
+            .expect("nested is inside a real git repo");
+
+        let segment = sanitize_workspace_segment("legacy-nested");
+        let worktree_path = resolve_workspace_path(&toplevel, &segment);
+
+        // Create the clone through the real nested-pick path -- inert for a
+        // create, but exercises the same wiring the resume attempt below
+        // relies on.
+        let created = provision_isolated_clone_or_status(
+            &toplevel,
+            Some(prefix.as_path()),
+            &worktree_path,
+            &segment,
+            "placeholder-creator",
+        );
+        assert!(
+            created.is_ok(),
+            "setup: nested-pick clone must succeed, got {created:?}"
+        );
+
+        // Overwrite the marker's creator= line with the exact legacy format
+        // that would satisfy the fallback's caller-identity check, were it
+        // ever reachable for a nested pick -- `name=` was written as
+        // `segment` above (`provision_isolated_clone_or_status` passes
+        // `branch = segment`, never folded with the subpath).
+        let marker_path = crate::issue_dispatch_run::isolated_clone_provenance_path(&worktree_path);
+        let content = std::fs::read_to_string(&marker_path).expect("read provenance marker");
+        let legacy_creator = format!("orchestration:{segment}");
+        let rewritten: String = content
+            .lines()
+            .map(|line| {
+                if line.starts_with("creator=") {
+                    format!("creator={legacy_creator}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&marker_path, &rewritten)
+            .expect("overwrite provenance marker with legacy creator");
+
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&worktree_path);
+
+        // Reopen the IDENTICAL nested pick -- ancestry matches (same repo),
+        // the stored creator is legacy-shaped AND matches this caller's own
+        // identity exactly, so the ONLY thing standing between this and an
+        // incorrect resume is `relative_subpath.is_some()` structurally
+        // mapping to `LegacyFallbackEligibility::Nested`.
+        let result = provision_isolated_clone_or_status(
+            &toplevel,
+            Some(prefix.as_path()),
+            &worktree_path,
+            &segment,
+            "some-other-placeholder-creator",
+        );
+        assert!(
+            result.is_err(),
+            "fork issue #766 M3: a nested pick must never take the legacy-creator-format \
+             fallback, even when the stored marker's identity matches this caller's own segment \
+             exactly -- got {result:?}"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("a different orchestration already opened"),
+            "fork issue #766 M3: the refusal must specifically be NameCollision (proving the \
+             nested-pick gate is what refused it, not some unrelated failure) -- got {error:?}"
         );
     }
 
