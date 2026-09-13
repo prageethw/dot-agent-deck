@@ -12739,6 +12739,82 @@ fn dispatch_action(
                     // bare `segment` — see that assignment's own comment
                     // for why.
                     let workspace_resolution = resolve_orchestration_workspace(&req.dir, &segment);
+                    // Fork issue #763: `workspace_resolution.worktree_path`
+                    // always runs `segment` through
+                    // `disambiguate_workspace_segment`, which folds the
+                    // picked directory's relative subpath into the PHYSICAL
+                    // name for EVERY nested pick — including a segment the
+                    // user just typed verbatim into the Worktree-slug field
+                    // (PRD fork#760 Part A), defeating that field's whole
+                    // point (`im-8-features-team-proj` instead of the clean
+                    // `im-features`). The fold's own purpose (fork issue
+                    // #607: stop two DIFFERENT nested picks that suggest the
+                    // identical segment from provisioning into the SAME
+                    // physical clone) still matters for the auto-generated
+                    // `orchestrator-N` counter — `auto_generate_worktree_slug`'s
+                    // own existence-probe loop depends on it — so this only
+                    // strips the fold for a segment the user explicitly
+                    // typed (`!req.worktree_slug.is_empty()`, the same
+                    // condition `segment`'s own assignment above already
+                    // branches on — no shape-sniffing of `segment` itself,
+                    // which would misfire both ways: a typed slug that
+                    // happens to look like `orchestrator-N`, and an
+                    // auto-generated candidate can never look like anything
+                    // else). `workspace_resolution.worktree_path` itself is
+                    // deliberately left untouched below (`creator`'s own
+                    // comment explains why): keeping `creator`'s identity
+                    // seed on the OLD, always-folded value — even though the
+                    // PHYSICAL directory below no longer folds — is what
+                    // still catches two different nested picks typing the
+                    // IDENTICAL slug (see `physical_worktree_path`'s own
+                    // doc for the accepted residual this narrows down to,
+                    // and `orchestration/worktree/029`/`030` for the
+                    // regression coverage).
+                    //
+                    // Verified before landing this: `workspace_040`/`041`
+                    // (`orchestration/workspace/040`/`041`) — which pin that
+                    // two different nested picks sharing an identical
+                    // segment must resolve to distinct `worktree_path`
+                    // values — call `resolve_orchestration_workspace`
+                    // directly, never this `Action::SpawnPane` arm, so they
+                    // are completely unaffected by this override existing
+                    // only here.
+                    //
+                    // Accepted residual (fork issue #763, narrower than the
+                    // #607 gap this closes back down to): two DIFFERENT
+                    // nested picks under the SAME toplevel, each typing the
+                    // byte-identical Worktree slug, now resolve to the
+                    // SAME `physical_worktree_path` — the clean name is, by
+                    // construction, no longer subpath-qualified. The second
+                    // one to provision is REFUSED, not silently resumed:
+                    // `creator` (below) stays derived from the
+                    // never-changed, always-folded
+                    // `workspace_resolution.worktree_path`, so
+                    // `resume_existing_isolated_clone`'s stored-vs-computed
+                    // creator comparison
+                    // (`src/issue_dispatch_run.rs`) still sees the two
+                    // picks as genuinely different creators and rejects the
+                    // second with `NameCollision`, even though the
+                    // directory NAME they both resolve to is identical
+                    // (`orchestration/worktree/029`). What this does NOT
+                    // fix: `live_orchestration_occupies`'s `scan_by_shape`/
+                    // `scan_by_name` (this file, above) can no longer
+                    // reliably recognize a LIVE nested-typed-slug
+                    // orchestration as occupying its directory for
+                    // Name-suggestion/collision-UI purposes — both
+                    // reconstruct a candidate path from a NAME or the
+                    // auto-generated shape, neither of which reflects this
+                    // new clean, slug-derived nested shape. This is a
+                    // display/suggestion-quality gap, not a safety one — the
+                    // `NameCollision` refusal above is what actually
+                    // prevents two orchestrations from sharing one physical
+                    // clone — and requires wiring the live typed slug itself
+                    // over the wire to close, which is out of scope here.
+                    let physical_worktree_path = if req.worktree_slug.is_empty() {
+                        workspace_resolution.worktree_path.clone()
+                    } else {
+                        resolve_workspace_path(&workspace_resolution.resolved_root_dir, &segment)
+                    };
                     // Fork #166 M2.4: the exact string passed to
                     // `provision_isolated_clone_or_status` below is the one
                     // every role pane's env var carries too, computed via
@@ -12853,13 +12929,24 @@ fn dispatch_action(
                     // pre-provisioning claim `cwd` names the SAME physical
                     // clone directory provisioning will actually create
                     // below rather than a stale, undisambiguated guess.
-                    let mut orchestration_claim_cwd_path = resolve_workspace_path(
-                        &canonical_root,
-                        &disambiguate_workspace_segment(
-                            &segment,
-                            workspace_resolution.relative_subpath.as_deref(),
-                        ),
-                    );
+                    //
+                    // Fork issue #763: mirrors `physical_worktree_path`'s
+                    // own override above — a typed slug is used VERBATIM
+                    // here too (no fold), so this claim cwd still names the
+                    // SAME physical directory provisioning will create,
+                    // now that provisioning itself no longer folds for a
+                    // typed slug.
+                    let mut orchestration_claim_cwd_path = if req.worktree_slug.is_empty() {
+                        resolve_workspace_path(
+                            &canonical_root,
+                            &disambiguate_workspace_segment(
+                                &segment,
+                                workspace_resolution.relative_subpath.as_deref(),
+                            ),
+                        )
+                    } else {
+                        resolve_workspace_path(&canonical_root, &segment)
+                    };
                     if let Some(rel) = &workspace_resolution.relative_subpath {
                         orchestration_claim_cwd_path = orchestration_claim_cwd_path.join(rel);
                     }
@@ -12964,10 +13051,15 @@ fn dispatch_action(
                     // apart from the other two warnings for the same reason
                     // they're kept apart from each other (see that
                     // function's doc comment).
+                    // Fork issue #763: `physical_worktree_path` (not
+                    // `workspace_resolution.worktree_path`, which stays
+                    // always-folded for `creator`'s benefit above) is the
+                    // directory actually created/resumed on disk for a
+                    // typed slug.
                     let provision_result = provision_isolated_clone_or_status(
                         &workspace_resolution.resolved_root_dir,
                         workspace_resolution.relative_subpath.as_deref(),
-                        &workspace_resolution.worktree_path,
+                        &physical_worktree_path,
                         &segment,
                         &creator,
                     );
@@ -12982,7 +13074,7 @@ fn dispatch_action(
                     // (`src/issue_dispatch_run.rs`) for why this is correct
                     // rather than a weakening of the race protection.
                     crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
-                        &workspace_resolution.worktree_path,
+                        &physical_worktree_path,
                     );
                     let (
                         dir_str,
@@ -44080,6 +44172,245 @@ mod tests {
         assert!(
             Path::new(&first_cwd).is_dir() && Path::new(&second_cwd).is_dir(),
             "both resolved workspace directories must actually exist on disk"
+        );
+    }
+
+    /// Scenario: fork issue #763 — dispatch the real `Action::SpawnPane`
+    /// against a NESTED pick (`repo/team-a/proj`) with a typed Worktree
+    /// slug (`"features"`). Before this fix, `disambiguate_workspace_segment`
+    /// unconditionally folded the picked directory's relative subpath into
+    /// EVERY nested pick's segment, so a typed slug on a nested pick still
+    /// produced the long, disambiguated `<repo>-<len>-features-team-a-proj`
+    /// shape instead of the clean `<repo>-features` the Worktree-slug field
+    /// (PRD fork#760 Part A) exists to provide. Asserts the resolved
+    /// workspace is the clean sibling name, with the relative subpath
+    /// rejoined underneath it (not folded into the directory's own name).
+    #[spec("orchestration/worktree/029")]
+    #[test]
+    fn worktree_029_typed_slug_on_a_nested_pick_gets_the_clean_short_name() {
+        const SLUG: &str = "features";
+
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("team-a").join("proj");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree_029 fixture\n").expect("write README");
+        std::fs::write(nested.join("marker.txt"), "worktree_029 nested fixture\n")
+            .expect("write nested marker");
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let config = make_orchestration("review");
+        // The clean shape `disambiguate_workspace_segment` unconditionally
+        // produced before this fix, for comparison in the failure message
+        // below.
+        let dirty_shape = resolve_workspace_path(
+            &repo,
+            &disambiguate_workspace_segment(SLUG, Some(Path::new("team-a/proj"))),
+        );
+        let expected = repo.with_file_name(format!(
+            "{}-{SLUG}",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+
+        let daemon_dir = tempdir().expect("tempdir for daemon-stub");
+        let _daemon = with_empty_agents_daemon(daemon_dir.path());
+        let req = NewPaneRequest {
+            dir: nested.clone(),
+            name: "Nested typed slug".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+            form_agent_type: None,
+            worktree_slug: SLUG.to_string(),
+        };
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        let cwds = pc.recorded_cwds();
+        assert!(
+            !cwds.is_empty(),
+            "the nested typed-slug open must succeed -- got zero spawned panes"
+        );
+        let expected_cwd = expected.join("team-a").join("proj");
+        for cwd in &cwds {
+            assert_eq!(
+                cwd.as_deref(),
+                Some(expected_cwd.display().to_string().as_str()),
+                "a typed Worktree slug on a nested pick must resolve into the CLEAN sibling \
+                 name ({:?}) with the relative subpath rejoined underneath it -- not the old, \
+                 always-disambiguated shape ({:?}) fork issue #607 introduced for every nested \
+                 pick regardless of whether the slug was auto-generated or typed",
+                expected_cwd,
+                dirty_shape.join("team-a").join("proj")
+            );
+        }
+        assert!(
+            expected.is_dir(),
+            "the clean sibling name itself must exist on disk at {}",
+            expected.display()
+        );
+        assert!(
+            !dirty_shape.exists(),
+            "the OLD, always-disambiguated sibling name must NOT have been created -- got {}",
+            dirty_shape.display()
+        );
+    }
+
+    /// Scenario: fork issue #763 accepted residual — two DIFFERENT nested
+    /// picks under the SAME toplevel (`team-a/proj` and `team-b/proj`),
+    /// each typing the byte-identical Worktree slug, now resolve to the
+    /// SAME clean physical directory name (the fold that used to keep them
+    /// apart is deliberately skipped for a typed slug — see
+    /// `worktree_029`). The first open succeeds; the second must be
+    /// REFUSED as a provisioning error rather than silently resumed into
+    /// the first's still-distinct subdirectory -- `creator` (`src/ui.rs`)
+    /// is deliberately left keyed off the OLD, always-folded
+    /// `workspace_resolution.worktree_path`, so the two picks still compute
+    /// different creator identities even though the directory NAME they
+    /// both resolve to is now identical, and
+    /// `resume_existing_isolated_clone`'s stored-vs-computed creator
+    /// comparison (`src/issue_dispatch_run.rs`) refuses the second as a
+    /// `NameCollision` instead of resuming it.
+    #[spec("orchestration/worktree/030")]
+    #[test]
+    fn worktree_030_two_different_nested_picks_with_an_identical_typed_slug_the_second_is_refused()
+    {
+        const SLUG: &str = "features";
+
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let team_a = repo.join("team-a").join("proj");
+        let team_b = repo.join("team-b").join("proj");
+        std::fs::create_dir_all(&team_a).expect("create team-a/proj");
+        std::fs::create_dir_all(&team_b).expect("create team-b/proj");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree_030 fixture\n").expect("write README");
+        std::fs::write(team_a.join("marker.txt"), "team-a\n").expect("write team-a marker");
+        std::fs::write(team_b.join("marker.txt"), "team-b\n").expect("write team-b marker");
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let config = make_orchestration("review");
+        let dispatch_typed_slug_open = |dir: &std::path::Path,
+                                        name: &str,
+                                        daemon_dir: &std::path::Path|
+         -> Vec<Option<String>> {
+            let _daemon = with_empty_agents_daemon(daemon_dir);
+            let req = NewPaneRequest {
+                dir: dir.to_path_buf(),
+                name: name.to_string(),
+                command: String::new(),
+                mode_config: None,
+                orchestration_config: Some(config.clone()),
+                seed_prompt: None,
+                form_agent_type: None,
+                worktree_slug: SLUG.to_string(),
+            };
+            let pc = Arc::new(CapturingPaneController::new());
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+            let _ = dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                &mut ui,
+                pc.as_ref(),
+                &state,
+                &mut tm,
+                &snapshot,
+                &[],
+                None,
+                Rect::new(0, 0, 200, 50),
+            );
+            pc.recorded_cwds()
+        };
+
+        let daemon_dir_1 = tempdir().expect("tempdir for first daemon-stub");
+        let first_cwds = dispatch_typed_slug_open(&team_a, "Team A pick", daemon_dir_1.path());
+        assert!(
+            !first_cwds.is_empty(),
+            "the first pick (team-a/proj) must succeed -- got zero spawned panes"
+        );
+
+        let daemon_dir_2 = tempdir().expect("tempdir for second daemon-stub");
+        let second_cwds = dispatch_typed_slug_open(&team_b, "Team B pick", daemon_dir_2.path());
+        assert!(
+            second_cwds.is_empty(),
+            "the second pick (team-b/proj, an entirely DIFFERENT nested directory) must be \
+             REFUSED for typing the identical slug as the first -- got spawned panes with \
+             cwds {second_cwds:?}, meaning it silently resumed into team-a/proj's clone \
+             instead of being caught as a NameCollision"
+        );
+
+        // The first pick's own workspace must be left completely undisturbed
+        // by the refused second attempt.
+        let team_a_marker = repo
+            .with_file_name(format!(
+                "{}-{SLUG}",
+                repo.file_name().unwrap().to_string_lossy()
+            ))
+            .join("team-a")
+            .join("proj")
+            .join("marker.txt");
+        assert_eq!(
+            std::fs::read_to_string(&team_a_marker).expect("read back team-a's marker"),
+            "team-a\n",
+            "the first pick's own clone must remain untouched by the refused second pick"
         );
     }
 
