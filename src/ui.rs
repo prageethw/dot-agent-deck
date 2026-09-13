@@ -11652,6 +11652,7 @@ fn provision_isolated_clone_or_status(
         worktree_path,
         branch,
         creator,
+        relative_subpath,
     ) {
         Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
             marker_warning,
@@ -14483,7 +14484,13 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// it stays inert exactly as before (a plain typed Name is short enough in
 /// practice, and a collision there is cosmetic, never a shared-clone
 /// hazard).
-fn orchestration_creator_string(identity_seed: &str) -> String {
+///
+/// Fork issue #766 fix: made `pub(crate)` (was private to this module) so
+/// `src/issue_dispatch_run.rs`'s legacy-creator-format fallback
+/// (`resume_existing_isolated_clone`) can share this exact construction
+/// rather than reimplementing the `"orchestration:"` prefix / sanitize /
+/// unknown-sentinel dance by hand a second time.
+pub(crate) fn orchestration_creator_string(identity_seed: &str) -> String {
     const ORCHESTRATION_PREFIX: &str = "orchestration:";
     let raw = if identity_seed.is_empty() {
         crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string()

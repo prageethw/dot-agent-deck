@@ -584,11 +584,18 @@ pub async fn handle_dispatch(
         let branch = paths.branch.clone();
         let creator_for_clone = creator.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            // Fork issue #766: this ad hoc `dispatch <name>` CLI path has no
+            // nested-relative-subpath concept of its own -- `clone_target`
+            // IS the whole pick, exactly like a TOPLEVEL directory pick
+            // through `Action::SpawnPane` -- so `None` here is what makes
+            // `resume_existing_isolated_clone`'s legacy-creator-format
+            // fallback correctly reachable from this path too.
             provision_isolated_clone_sync_resolved(
                 &source_dir,
                 &clone_target,
                 &branch,
                 &creator_for_clone,
+                None,
             )
         })
         .await;

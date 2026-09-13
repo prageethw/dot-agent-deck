@@ -1769,7 +1769,13 @@ pub(crate) fn provision_isolated_clone_sync(
     let resolved_source_dir = resolve_git_toplevel(source_dir)
         .map(|(toplevel, _prefix)| toplevel)
         .unwrap_or_else(|| source_dir.to_path_buf());
-    provision_isolated_clone_sync_resolved(&resolved_source_dir, clone_dir, branch, creator)
+    // Fork issue #766: this entry point never resolves or tracks a nested
+    // relative subpath of its own — every real caller of it (this module's
+    // own tests) treats `clone_dir` itself as the whole pick, exactly like
+    // a TOPLEVEL directory pick through the real `Action::SpawnPane` path.
+    // `None` here is what makes `resume_existing_isolated_clone`'s legacy-
+    // creator-format fallback reachable from these tests at all.
+    provision_isolated_clone_sync_resolved(&resolved_source_dir, clone_dir, branch, creator, None)
 }
 
 /// Fork issue #595 fix round 2: same as [`provision_isolated_clone_sync`],
@@ -1777,11 +1783,20 @@ pub(crate) fn provision_isolated_clone_sync(
 /// toplevel (or left as-is when it is not inside a git repository at all —
 /// unaffected either way). See that function's doc comment for why a
 /// second entry point exists.
+///
+/// `relative_subpath` (fork issue #766): `None` when the caller's pick IS
+/// the toplevel (or isn't inside a git repository at all), `Some` for a
+/// nested pick — passed straight through to
+/// [`resume_existing_isolated_clone`], which only ever widens its stored-
+/// vs-computed `creator` comparison to accept the pre-fork#760 legacy
+/// Name-derived format when this is `None`. See that function's own doc
+/// comment for why a nested pick must never take that fallback.
 pub(crate) fn provision_isolated_clone_sync_resolved(
     resolved_source_dir: &Path,
     clone_dir: &Path,
     branch: &str,
     creator: &str,
+    relative_subpath: Option<&Path>,
 ) -> Result<IsolatedCloneOutcome, String> {
     ensure_worktree_parent_dir(clone_dir)?;
 
@@ -1811,7 +1826,12 @@ pub(crate) fn provision_isolated_clone_sync_resolved(
         // reports a distinguishable rejection reason. This REPLACES the
         // flat `AlreadyClaimed` this branch used to return; it does not run
         // alongside it.
-        return resume_existing_isolated_clone(resolved_source_dir, clone_dir, creator);
+        return resume_existing_isolated_clone(
+            resolved_source_dir,
+            clone_dir,
+            creator,
+            relative_subpath,
+        );
     }
 
     // Issue #325 auditor A2: `--` end-of-options separator before both
@@ -3253,6 +3273,62 @@ fn write_isolated_clone_provenance(
     })
 }
 
+/// Fork issue #766: rewrites an isolated clone's provenance marker's
+/// `creator=` line in place once [`resume_existing_isolated_clone`]'s
+/// legacy-format fallback has accepted a resume — so a workspace opened
+/// under a pre-fork#760 build only ever needs that fallback once, not on
+/// every subsequent resume. Reads the CURRENT on-disk content itself
+/// (rather than trusting a caller-supplied copy that may have gone stale
+/// between the read that fed the comparison and this write) and replaces
+/// ONLY the line beginning `creator=`, leaving `schema=`/`root-hash=`/
+/// `name=`/`pinned=`/`path=` (present or not, in whatever order a future
+/// schema adds them) byte-for-byte untouched — deliberately not a full
+/// reconstruction like [`write_isolated_clone_provenance`]/
+/// [`set_isolated_clone_pinned`], which would need to already know every
+/// field name that can appear.
+///
+/// Same atomic write-then-rename idiom as its siblings above, and reuses
+/// [`pin_temp_disambiguator`] for the temp-file suffix rather than adding a
+/// third per-process nonce/seq pair for the identical concurrent-rewrite
+/// hazard that helper's own doc comment already describes.
+fn migrate_legacy_isolated_clone_creator(
+    marker_path: &Path,
+    new_creator: &str,
+) -> Result<(), String> {
+    let content = std::fs::read_to_string(marker_path)
+        .map_err(|e| format!("failed to read provenance artifact for migration: {e}"))?;
+    let safe_creator = crate::worktree_reclaim::sanitize_marker_creator(new_creator);
+    let rewritten: String = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("creator=") {
+                format!("creator={safe_creator}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+
+    let parent = marker_path.parent().expect(
+        "isolated_clone_provenance_path always nests under state_dir(), which has a parent",
+    );
+    let file_name = marker_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("provenance");
+    let tmp_path = parent.join(format!("{file_name}.{}.tmp", pin_temp_disambiguator()));
+    std::fs::write(&tmp_path, rewritten.as_bytes()).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to write migrated provenance artifact: {e}")
+    })?;
+    std::fs::rename(&tmp_path, marker_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to finalize migrated provenance artifact: {e}")
+    })
+}
+
 /// Per-process disambiguator for [`set_isolated_clone_pinned`]'s temp-file
 /// suffix (fork issue #597): before this helper existed that suffix was
 /// `std::process::id()` alone, which two concurrent pin/unpin calls against
@@ -4201,10 +4277,15 @@ pub(crate) fn release_resumed_isolated_clone_registration(clone_dir: &Path) {
 /// and resumes; a caller that finds the path already registered lost the
 /// race and is refused as [`ResumeRejection::Contested`] without touching
 /// git again.
+/// `relative_subpath` (fork issue #766): `None` when the caller's pick IS
+/// the toplevel directory (or isn't inside a git repository at all), `Some`
+/// for a nested pick. Read only by the legacy-creator-format fallback
+/// inside the `creator` comparison below — see that block's own comment.
 fn resume_existing_isolated_clone(
     source_dir: &Path,
     clone_dir: &Path,
     creator: &str,
+    relative_subpath: Option<&Path>,
 ) -> Result<IsolatedCloneOutcome, String> {
     if !isolated_clone_provenance_path(clone_dir).is_file() {
         return Ok(IsolatedCloneOutcome::Rejected(ResumeRejection::Stranger));
@@ -4254,14 +4335,65 @@ fn resume_existing_isolated_clone(
     // NameCollision for having won the race in the first place; the other
     // never even reaches this check, refused instead as Contested) rather
     // than both racing to the identical outcome.
-    if let Some(stored_creator) = std::fs::read_to_string(isolated_clone_provenance_path(clone_dir))
-        .ok()
-        .and_then(|content| isolated_clone_provenance_field(&content, "creator"))
+    let marker_path = isolated_clone_provenance_path(clone_dir);
+    let marker_content = std::fs::read_to_string(&marker_path).ok();
+    let stored_creator = marker_content
+        .as_deref()
+        .and_then(|content| isolated_clone_provenance_field(content, "creator"));
+    if let Some(stored_creator) = stored_creator.as_deref()
         && stored_creator != crate::worktree_reclaim::sanitize_marker_creator(creator)
     {
-        return Ok(IsolatedCloneOutcome::Rejected(
-            ResumeRejection::NameCollision,
-        ));
+        // Fork issue #766: fork#760 (commit 58a9b8aa) changed a TOPLEVEL
+        // pick's `creator` from a Name/segment-derived string
+        // (`orchestration_creator_string(typed_name)`, pre-#760) to a
+        // path-derived one (`orchestration_creator_string(resolved
+        // workspace path)`) — so every marker a pre-#760 build ever wrote
+        // for a toplevel pick fails the byte-for-byte comparison above
+        // unconditionally, even reopening the IDENTICAL repo/segment under
+        // today's code. Recognize that legacy format as an equivalent
+        // match by recomputing it from the marker's own `name=` field
+        // (written at creation time from the same typed Name/segment a
+        // pre-#760 build would have keyed `creator` on) through
+        // [`crate::ui::orchestration_creator_string`] — the exact function
+        // real callers use, not a hand-rolled reimplementation of its
+        // `"orchestration:"` prefix / sanitize / unknown-sentinel
+        // handling.
+        //
+        // Restricted to `relative_subpath.is_none()` — a TOPLEVEL pick
+        // only. A nested pick's legacy format never carried subpath
+        // information at all, which is exactly the ambiguity fork issue
+        // #763/#761 closed by making `creator` path-derived (and, for a
+        // typed slug, digest-fronted) in the first place; widening this
+        // fallback to a nested pick would silently reopen that same
+        // collision.
+        let legacy_creator = relative_subpath.is_none().then(|| {
+            marker_content
+                .as_deref()
+                .and_then(|content| isolated_clone_provenance_field(content, "name"))
+                .map(|name| crate::ui::orchestration_creator_string(&name))
+        });
+        if legacy_creator.flatten().as_deref() != Some(stored_creator) {
+            return Ok(IsolatedCloneOutcome::Rejected(
+                ResumeRejection::NameCollision,
+            ));
+        }
+
+        // Fork issue #766: this resume is only reachable via the legacy
+        // fallback above — migrate the on-disk marker's `creator=` field to
+        // today's format now, so this workspace's next resume matches the
+        // fast, no-fallback path directly and this equivalence check does
+        // not need to keep firing for it indefinitely. Best-effort: a
+        // failure here does not fail the resume itself, since the clone is
+        // already fully usable either way — it only means this migration
+        // is retried on the next resume too.
+        if let Err(e) = migrate_legacy_isolated_clone_creator(&marker_path, creator) {
+            tracing::warn!(
+                clone = %clone_dir.display(),
+                error = %e,
+                "issue-dispatch: could not migrate legacy provenance creator field to today's \
+                 format; this workspace will keep matching via the legacy fallback until it does"
+            );
+        }
     }
 
     tracing::info!(
