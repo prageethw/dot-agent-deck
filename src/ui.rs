@@ -7182,8 +7182,9 @@ pub struct NewPaneRequest {
     /// `name` itself is never consulted for the segment either way; it still
     /// drives the tab title and the `ClaimOrchestrationName` uniqueness
     /// claim (and, as of this fork#760 fix round, no longer the
-    /// ownership-marker creator identity, which is now segment-derived too
-    /// — see `Action::SpawnPane`'s `creator` derivation).
+    /// ownership-marker creator identity, which is now derived from the
+    /// fully resolved workspace path — see `Action::SpawnPane`'s `creator`
+    /// derivation via `orchestration_creator_string`).
     worktree_slug: String,
 }
 
@@ -14207,10 +14208,15 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
     state.managed_pane_ids.is_empty()
 }
 
-/// Fork #166 M2.4: the ONE place this precedence is computed, so the
-/// live-create path (`Action::SpawnPane`) and the session-restore path
-/// (`resolve_orchestration_for_restore`'s caller) cannot drift apart — both
-/// call this rather than each inlining the branch.
+/// Fork #166 M2.4: originally the ONE place this precedence was computed,
+/// so the live-create path (`Action::SpawnPane`) and the session-restore
+/// path (`resolve_orchestration_for_restore`'s caller) could not drift
+/// apart — both called this rather than each inlining the branch. The
+/// restore path no longer calls this function at all (see the
+/// "Historically" paragraph below for what it does instead) — it reuses
+/// the previously-persisted identity verbatim, which cannot drift from
+/// whatever this function produced at create time by construction, without
+/// needing to invoke this function a second time.
 ///
 /// PRD fork#760 THIRD fix round (auditor F1 / N10): this function has TWO
 /// live callers today, deliberately passed DIFFERENT kinds of string —
@@ -14235,8 +14241,13 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// worktree marker at creation time, which is what let
 /// `worktree list --mine` still match after a restart (PRD fork-166
 /// M2.4/M3.0). The restore path (`resolve_orchestration_for_restore`'s
-/// caller) is unaffected by the fork#760 change and still passes the
-/// persisted Name.
+/// caller) does NOT call this function at all — it passes
+/// `orch_snap.owner.as_deref()` straight through to
+/// `open_orchestration_tab` (see that call site's own comment), reusing
+/// the previously-persisted `creator`/owner string verbatim, whatever
+/// format it was written in — pre-fork#760 Name-derived or post-fork#760
+/// path-derived — rather than recomputing it. That reuse is what is
+/// unaffected by the fork#760 change; the value it reuses is not.
 ///
 /// PR #215 fixup (reviewer F5 M2 / auditor M2): the config-name fallback
 /// this used to have — `orchestration:<config_name>` when the input was
@@ -43775,8 +43786,10 @@ mod tests {
     /// so a retyped Name made `resume_existing_isolated_clone`'s creator
     /// ladder see a `NameCollision` (a different creator's provenance
     /// record) even though it is genuinely the same workspace. `creator` is
-    /// now derived from the resolved `segment` (the slug) instead, so the
-    /// second open must RESUME, not be refused.
+    /// now derived from the fully resolved workspace path instead (which is
+    /// itself a pure function of the toplevel and the slug, so the retyped
+    /// Name never enters it), so the second open must RESUME, not be
+    /// refused.
     #[spec("orchestration/worktree/023")]
     #[test]
     fn worktree_023_reopening_with_the_same_slug_under_a_different_name_resumes() {
@@ -44304,8 +44317,9 @@ mod tests {
 
     /// Scenario: PRD fork#760 THIRD fix round (auditor F1/B4) — confirm
     /// directly, rather than merely arguing in a comment, that the
-    /// segment-derived creator this fix round introduced cannot reach the
-    /// reserved `ORCHESTRATION_UNKNOWN_SENTINEL` for ANY typed slug,
+    /// resolved-workspace-path-derived creator this fix round introduced
+    /// cannot reach the reserved `ORCHESTRATION_UNKNOWN_SENTINEL` for ANY
+    /// typed slug,
     /// including the literal `unknown` fork #222 was originally filed
     /// against. Before the THIRD fix round `creator` was
     /// `orchestration_creator_string(&segment)` directly, so a typed slug
