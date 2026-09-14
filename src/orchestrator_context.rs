@@ -758,16 +758,16 @@ mod tests {
         // "Wait for direction" is legitimate ONLY in step 5's unresolved-
         // conflict handling — it must not appear anywhere near the dirty
         // (step 1) or behind (step 3) handling.
-        let wait_count = sync.matches("wait for direction").count();
+        let wait_count = sync.matches("Wait for direction").count();
         assert_eq!(
             wait_count, 1,
-            "'wait for direction' must appear exactly once, in step 5's conflict handling, \
+            "'Wait for direction' must appear exactly once, in step 5's conflict handling, \
              got {wait_count} occurrences in: {sync}"
         );
         assert!(
             sync.contains("git merge --abort")
-                && sync[sync.find("git merge --abort").unwrap()..].contains("wait for direction"),
-            "the sole 'wait for direction' instance must be step 5's conflict handling, \
+                && sync[sync.find("git merge --abort").unwrap()..].contains("Wait for direction"),
+            "the sole 'Wait for direction' instance must be step 5's conflict handling, \
              not the dirty-tree step, got: {sync}"
         );
     }
