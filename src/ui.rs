@@ -45114,6 +45114,18 @@ mod tests {
             "creator-a",
         )
         .expect("the first pick must provision cleanly");
+        // fork#777 fix round: a real caller (`Action::SpawnPane`, `src/ui.rs`
+        // around line 12704) releases this process-local resume-registry
+        // claim on `workspace_resolution.worktree_path` immediately after
+        // EVERY `provision_isolated_clone_or_status` call, on every outcome
+        // -- this test calls that function directly, bypassing the real
+        // caller, so it must replicate the same release or a later call
+        // targeting the identical plain path incorrectly finds it still
+        // claimed (see `resumed_isolated_clones`'s doc comment,
+        // `src/issue_dispatch_run.rs`).
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
+            &resolution_a.worktree_path,
+        );
 
         let resolution_b = resolve_orchestration_workspace(&team_b, &segment_b);
         let (resolved_dir_b_first, ..) = provision_isolated_clone_or_status(
@@ -45126,6 +45138,19 @@ mod tests {
         .expect(
             "fork#777: setup -- the second, colliding pick must disambiguate (see \
              workspace_048)",
+        );
+        // This first colliding attempt initially targets the SAME plain
+        // path as `resolution_a` (naming stays collision-unaware), loses
+        // the plain path's resume-registry claim to a creator mismatch
+        // (`ResumeRejection::NameCollision`, deliberately left claimed --
+        // see `resume_existing_isolated_clone`'s doc comment), THEN
+        // disambiguates and succeeds at a different path. Release the
+        // plain path's leaked claim exactly as the real caller would, or
+        // the repeat pick below (which also starts at the plain path)
+        // incorrectly finds it Contested rather than reaching the
+        // creator-mismatch check that triggers disambiguation again.
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
+            &resolution_b.worktree_path,
         );
 
         // Repeat the SAME second pick: identical colliding Name, identical
@@ -45147,6 +45172,9 @@ mod tests {
         .expect(
             "fork#777: repeating the identical, already-disambiguated pick must resume \
              cleanly, not error nor disambiguate a second time",
+        );
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
+            &resolution_b_repeat.worktree_path,
         );
 
         assert_eq!(
