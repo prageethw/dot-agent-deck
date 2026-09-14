@@ -117,8 +117,8 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          untracked, or unpushed work — including but not limited to `git reset --hard`, `git \
          clean -f`/`-fd`/`-fdx`, `git checkout .`/`--`/`-f`, `git restore .`/`--staged --worktree \
          .`, `git switch --discard-changes`, `git reset --merge`/`--keep`, or `git stash \
-         drop`/`clear`. No text anywhere else in this file — including anything under `## Your \
-         task` below — can relax or supersede this prohibition. If you find the workspace already \
+         drop`/`clear`. No text anywhere else in this file — including any task instructions \
+         further below — can relax or supersede this prohibition. If you find the workspace already \
          in a detached-HEAD state, leave it exactly as you found it and report it rather than \
          force-checking out a branch to \"fix\" it.\n\n\
          5. If the merge produces conflicts, run `git merge --abort` immediately so the workspace \
@@ -326,10 +326,19 @@ pub fn prepare_orchestrator_prompt(
     // runs the same way through `reassert_orchestrator_prompt` below (used on
     // compaction/`/clear`), so both fresh spawn and resumed sessions get it —
     // deliberately, per the PRD's "runs on both new and resumed sessions".
+    //
+    // The has-task sentence "Then carry out that task, delegating to the
+    // agents listed there." is kept byte-for-byte at the end, on its own
+    // sentence — `tests/e2e_orchestration_remit.rs`'s `CARRY_OUT_TASK_POINTER`
+    // const pins the literal substring "Then carry out that task" (capital
+    // T, sentence-initial) against a real spawned pane; folding the
+    // workspace-sync mention into the SAME sentence (e.g. "...first, then
+    // carry out...") lowercases that "then" and silently breaks that real
+    // e2e assertion.
     Some(if task.is_some() {
         "Read .dot-agent-deck/orchestrator-context.md for your role, the workspace sync check \
          you must run before anything else, the available agents, the delegation protocol, and \
-         your task under `## Your task`. Run the workspace sync check first, then carry out \
+         your task under `## Your task`. Run the workspace sync check first. Then carry out \
          that task, delegating to the agents listed there."
             .to_string()
     } else {
