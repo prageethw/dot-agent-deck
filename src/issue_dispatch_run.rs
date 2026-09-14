@@ -4253,12 +4253,11 @@ impl ResumeRejection {
         match self {
             Self::Stranger => {
                 "a directory already exists there but was not created by this deck (no \
-                 ownership evidence found) — remove it manually, or pick a different Worktree \
-                 slug"
+                 ownership evidence found) — remove it manually, or pick a different Name"
             }
             Self::AncestryMismatch => {
                 "the existing directory's history does not match this project (wrong repo, or \
-                 stale) — remove it manually, or pick a different Worktree slug"
+                 stale) — remove it manually, or pick a different Name"
             }
             Self::AncestryUnverifiable => {
                 "the existing directory's history could not be compared against this project \
@@ -4271,13 +4270,10 @@ impl ResumeRejection {
             }
             Self::Contested => "another request just resumed it first — try again",
             Self::NameCollision => {
-                "a different orchestration already opened the workspace at this location (its \
-                 provenance record names a different creator) — either a different Worktree \
-                 slug that sanitizes to the same directory, or the identical Worktree slug \
-                 picked against a different nested subdirectory of the same project; pick a \
-                 different Worktree slug (or reopen the exact same picked directory) instead of \
-                 retyping the Name, which no longer changes where this resolves. It may still \
-                 be in use by the orchestration that opened it — do not remove it"
+                "a different orchestration Name already opened the workspace at this location \
+                 (its provenance record names a different creator) — the two Names sanitize to \
+                 the same directory; pick a different Name instead of this one. It may still be \
+                 in use by the orchestration that opened it — do not remove it"
             }
         }
     }

@@ -10197,9 +10197,61 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
 /// equivalent transform by hand a second time (which is exactly the
 /// divergence that let `starts_with("orchestration:")` alone stand in for a
 /// real legacy-shape test in the first place — B1).
+///
+/// Fork issue #771 (revert of #760 Part A) review-findings fix round: also
+/// neutralizes the rest of `git check-ref-format`'s disallowed patterns a
+/// bare typed Name can now reach again — a space or any of `~^:?*[`, a
+/// trailing `.`, and a `.lock` suffix — all of which used to be unreachable
+/// while #760's `is_valid_worktree_slug` allowlist gated the separate
+/// Worktree-slug field this function's segment came from. With that field
+/// gone and Name the sole input once more, an entirely ordinary typed Name
+/// like `fix: login bug` made `git checkout -b <segment>` fail outright.
 pub(crate) fn sanitize_workspace_segment(name: &str) -> String {
     let segment = crate::issue_dispatch::sanitize_clone_segment(name);
-    let stripped = segment.trim_start_matches(['-', '.']);
+    // Fork issue #771 review-findings fix round: `sanitize_clone_segment`
+    // only collapses `/`/`\\`, drops NUL, and strips `..` — none of
+    // `git check-ref-format`'s other disallowed patterns. This segment
+    // doubles as a git branch name (`provision_isolated_clone_or_status` ->
+    // `isolated_clone_checkout_argv`'s bare `Local` argv token), so an
+    // entirely ordinary typed Name containing a space or any of `~^:?*[`
+    // made `git checkout -b <segment>` fail outright, tearing the
+    // just-provisioned clone back down (`handle_isolated_clone_add_error`)
+    // with a raw, confusing git error rather than a readable refusal. This
+    // is deliberately an ADDITIONAL neutralization pass layered on top of
+    // `sanitize_clone_segment`'s own output, rather than a change to that
+    // shared function itself — `sanitize_clone_segment` is also used by the
+    // unrelated issue-dispatch clone-segment path, whose own
+    // `sanitize_clone_segment_passthrough_and_fallback` test asserts a
+    // space is left alone for that caller; only THIS function's use as a
+    // git ref needs the extra safety.
+    let mut ref_safe: String = segment
+        .chars()
+        .map(|c| {
+            if matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    // `git check-ref-format` also refuses a component ending in `.` or in
+    // `.lock`. Strip both, repeatedly, since removing a `.lock` suffix can
+    // expose a fresh trailing dot underneath it (e.g. `"foo.lock."`) and
+    // vice versa.
+    loop {
+        let before_len = ref_safe.len();
+        if let Some(without_lock) = ref_safe.strip_suffix(".lock") {
+            ref_safe = without_lock.to_string();
+        }
+        let trimmed_dots = ref_safe.trim_end_matches('.');
+        if trimmed_dots.len() != ref_safe.len() {
+            ref_safe = trimmed_dots.to_string();
+        }
+        if ref_safe.len() == before_len {
+            break;
+        }
+    }
+    let stripped = ref_safe.trim_start_matches(['-', '.']);
     if stripped.is_empty() {
         "issues".to_string()
     } else {
@@ -22039,10 +22091,8 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
 
 /// Footer-hint string for the unified new-pane form. Factored out so the
 /// focus-dependent wording can be unit-tested without driving a TestBackend.
-/// `name_submits` is true when focus is on Name OR the Worktree-slug field
-/// (PRD fork#760 fix round, reviewer M5) and the Command field is hidden
-/// (orchestration selected) — i.e. Enter from either field submits the
-/// form.
+/// `name_submits` is true when focus is on Name and the Command field is
+/// hidden (orchestration selected) — i.e. Enter from Name submits the form.
 ///
 /// PRD #170 round 2 (reviewer finding 6): the mode-locked schedule form has a
 /// single navigable field (Command), so the generic "Tab: switch field" hint is
@@ -43477,6 +43527,52 @@ mod tests {
             "oops",
             "interleaved leading dashes and dots must all be stripped"
         );
+    }
+
+    /// Scenario: fork issue #771 (revert of #760 Part A) review-findings fix
+    /// round — reviewer S1 / auditor F1. `sanitize_workspace_segment`'s
+    /// output doubles as a git branch name, so it must always be a legal
+    /// `git check-ref-format --branch` component, not just free of `/`/`..`.
+    /// Covers the classes `git check-ref-format` rejects that the sanitizer
+    /// did not previously neutralize: an interior space, a colon, a leading
+    /// `~`, a trailing dot, and a `.lock` suffix. Each candidate is checked
+    /// against a REAL `git check-ref-format` invocation (no repo needed —
+    /// it is a pure syntax check), matching this codebase's existing
+    /// pattern of shelling out to real git where that is the actual
+    /// property under test (e.g. `worktree_027`'s `init_repo` helper).
+    #[test]
+    fn sanitize_workspace_segment_produces_a_git_ref_legal_component() {
+        fn assert_git_ref_legal(candidate: &str) {
+            let status = std::process::Command::new("git")
+                .args(["check-ref-format", "--branch", candidate])
+                .status()
+                .expect("run git check-ref-format");
+            assert!(
+                status.success(),
+                "sanitize_workspace_segment produced {candidate:?}, which `git \
+                 check-ref-format --branch` rejects"
+            );
+        }
+
+        let cases: &[(&str, &str)] = &[
+            ("a space", "fix login bug"),
+            ("a colon", "fix: login bug"),
+            ("a leading tilde", "~oops"),
+            ("a trailing dot", "trailing."),
+            ("a .lock suffix", "oops.lock"),
+            ("a caret", "a^b"),
+            ("a question mark", "a?b"),
+            ("an asterisk", "a*b"),
+            ("a leading bracket", "[oops]"),
+        ];
+        for (label, input) in cases {
+            let segment = sanitize_workspace_segment(input);
+            assert_git_ref_legal(&segment);
+            assert!(
+                !segment.is_empty(),
+                "{label} case ({input:?}) must not sanitize to an empty segment, got {segment:?}"
+            );
+        }
     }
 
     /// Scenario: PRD fork#544 review-findings fix round (reviewer B2).
