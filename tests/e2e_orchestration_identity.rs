@@ -384,6 +384,25 @@ fn tab_bar_line(grid: &str) -> &str {
 /// (not silently refused while stale filesystem state happens to look right
 /// anyway) by waiting on the tab-bar row specifically, rather than the
 /// whole grid.
+///
+/// PRD fork#777 (PR #778) superseded WHICH pick(s) `disambiguate_workspace_segment`
+/// applies to, without touching any of the above: naming is now
+/// deliberately collision-UNAWARE by default (`resolve_orchestration_workspace`
+/// no longer folds a pick's relative subpath into the segment on its own --
+/// see `workspace_040`/`041`/`048`, `src/ui.rs`), and disambiguation only
+/// happens as a provisioning-time retry, only for a pick that actually
+/// collides on disk with an already-provisioned clone. So of the two opens
+/// here, only the SECOND (team-b/proj, opened after team-a/proj already
+/// occupies the plain path) provisions into a name encoding its own
+/// subpath; the FIRST (team-a/proj) provisions into the plain, undecorated
+/// `<basename>-orchestrator-1` name with no subpath encoding at all. The
+/// assertions below were updated to match: they confirm the first clone is
+/// the exact plain path and the second clone's name encodes team-b's own
+/// subpath, rather than expecting both names to self-encode their pick the
+/// way fork#607's original, unconditional-disambiguation contract did. The
+/// underlying property this test exists to pin -- two genuinely distinct,
+/// independently-provisioned clones, each containing its own picked leaf's
+/// committed content -- is unchanged.
 #[spec("orchestration/identity/037")]
 #[test]
 fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_working_subdirectory()
@@ -551,18 +570,26 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
 
     // Each clone is a genuine, independent `git clone` of the whole source
     // repo, so each one's working tree contains BOTH leaves' committed
-    // content regardless of which was picked — what distinguishes the two
-    // clones is which own directory name encodes which pick (via
-    // `disambiguate_workspace_segment`'s sanitized relative-subpath
-    // suffix), not which leaf's content merely exists inside it.
+    // content regardless of which was picked. PRD fork#777 changed which
+    // clone's directory name encodes its pick: naming is now
+    // collision-UNAWARE by default, so only the SECOND, genuinely colliding
+    // pick (team-b/proj, which finds the plain path already occupied by
+    // team-a/proj's clone) gets disambiguated via
+    // `disambiguate_workspace_segment`'s sanitized relative-subpath suffix.
+    // The FIRST pick (team-a/proj) lands on the plain, undecorated
+    // `<basename>-orchestrator-1` name instead — it has no subpath encoded
+    // in it at all, so it can no longer be found by searching for
+    // "team-a" in the name.
     let clone_dirs: Vec<std::path::PathBuf> =
         after_second.iter().map(|name| parent.join(name)).collect();
+    let plain_dir = parent.join(format!("{prefix}proj-orchestrator-1"));
     let team_a_clone = clone_dirs
         .iter()
-        .find(|d| d.to_string_lossy().contains("team-a"))
+        .find(|d| **d == plain_dir)
         .unwrap_or_else(|| {
             panic!(
-                "no provisioned clone name encodes team-a's own relative subpath: {after_second:?}"
+                "fork#777: the FIRST pick (team-a/proj) must provision into the plain, \
+                 undisambiguated name {plain_dir:?} — found {after_second:?}"
             )
         });
     let team_b_clone = clone_dirs
@@ -570,7 +597,9 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
         .find(|d| d.to_string_lossy().contains("team-b"))
         .unwrap_or_else(|| {
             panic!(
-                "no provisioned clone name encodes team-b's own relative subpath: {after_second:?}"
+                "fork#777: the SECOND, genuinely colliding pick (team-b/proj) must provision \
+                 into a disambiguated name encoding its own relative subpath — found \
+                 {after_second:?}"
             )
         });
     assert_ne!(
