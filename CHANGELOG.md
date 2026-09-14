@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.48.0] - 2026-09-14
+
+### Changed
+
+- **Worktree-slug field removed — workspace identity reverts to `(source folder, Name)`**
+  The New Pane form's "Worktree slug" field (restored in the [0.46.0] release) is removed again. Workspace identity is once again derived solely from the orchestration Name you type, matching the design shipped before that release: the isolated-clone workspace directory and branch are `<source-folder-basename>-<sanitized Name>` (`sanitize_workspace_segment`), with no second field to fill in.
+  Leaving the slug blank used to auto-generate an `orchestrator-N` segment independent of Name. That auto-generation is gone — a fresh open now always derives its workspace path directly from whatever Name you type (or accept from the suggested default), exactly as it did before the 0.46.0 release.
+  **`AttachRequest::ClaimOrchestrationName`'s wire shape is unchanged — no `PROTOCOL_VERSION` bump — but what its `cwd` field means for a given orchestration Name changes back.** Since 0.46.0 it was derived from the (Name-independent) Worktree slug; it is now derived from the sanitized Name again (`<repo-basename>-<sanitized Name>`), matching the pre-0.46.0 behavior. As before, a TUI build from before this change and one from after it attaching to the same daemon compute different `cwd` values for an otherwise-identical claim — restart the daemon after upgrading rather than mixing versions.
+  The on-disk `created-by:` ownership marker (and the matching `DOT_AGENT_DECK_WORKTREE_OWNER` env var) keeps the improvement made since 0.46.0: it is derived from the resolved workspace path rather than from Name/segment alone, so two unrelated orchestrations that happen to type the same Name in two different repositories still record distinct owners. This did not need reverting — it protects the same collision regardless of what feeds the workspace segment.
+  The daemon-side guard that refuses two live orchestrations from landing in the same resolved workspace directory, even under different Names, also stays — a coincidental sanitized-segment collision between two typed Names is exactly as reachable now as a colliding typed Worktree slug was before, and the guard covers both.
+  **Whether an existing 0.46.0/0.47.x-era Worktree-slug workspace resumes automatically now depends on whether it was a TOPLEVEL or a NESTED pick.** A toplevel pick's slug-era workspace resumes fine: `creator` is a pure function of the resolved workspace path, so typing the same Name that was used to derive (or auto-generate, as `orchestrator-N`) the original slug reproduces the identical path, and the deck's existing resume-matching logic finds and attaches to it exactly as it did before this change — no manual steps needed. A nested pick's slug-era workspace does not resume automatically, and this is permanent rather than a gap this change could still close — see the next paragraph for why. If a nested-pick workspace doesn't resume, find it manually — it is the sibling directory next to your repo checkout named `<repo-basename>-<the-slug-you-typed>` — and either keep working in it directly or migrate what you need out of it; opening that same orchestration by Name creates a new, differently-named workspace alongside the old one rather than finding it.
+  **A nested pick's short, clean workspace name also reverts.** Issue #763/PR #764 (shipped in 0.47.x) let a nested pick — opening a subdirectory inside an already-checked-out repo rather than its top level — get a short name like `myrepo-features` off a typed Worktree slug, instead of the longer disambiguated form the deck falls back to when it can't trust a segment to be unique on its own. With the Worktree-slug field gone, Name never gets that "typed and thus trusted to be unique" treatment, so every nested pick falls back to the disambiguated long form again — e.g. `myrepo-8-features-team-a-proj` instead of `myrepo-features`. Any nested-pick workspace whose short name depended on a typed Worktree slug reverts to the longer disambiguated name the next time it's opened.
+
+
+
 ## [0.47.1] - 2026-09-13
 
 ### Fixed
