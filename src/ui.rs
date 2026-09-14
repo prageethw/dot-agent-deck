@@ -1309,21 +1309,25 @@ fn live_orchestration_occupies(form_cwd: &Path, live_cwd: &str, live_name: &str)
     }
     let segment = sanitize_workspace_segment(live_name);
     let live_cwd_path = Path::new(live_cwd);
-    // Fork issue #607: the real formula (`resolve_orchestration_workspace`)
-    // now folds the relative subpath into the segment before deriving
-    // `worktree_path` (`disambiguate_workspace_segment`) — mirror that here
-    // too, or this scan would keep matching a live occupant's OLD,
-    // undisambiguated path shape and never recognize the real (now
-    // subpath-qualified) one, silently reopening this exact drift class for
-    // the nested case (reviewer B1's original concern for this function).
+    // PRD fork#777: the real formula (`resolve_orchestration_workspace`) no
+    // longer folds the relative subpath into the segment unconditionally —
+    // naming stays PLAIN by default, and only provisioning disambiguates,
+    // and only on a genuine on-disk collision (see that function's own doc
+    // comment). Mirror the plain form here too, matching the common case.
+    // Known residual, out of this PRD's scope: a live orchestration that
+    // DID hit a genuine collision at provisioning time (and so actually
+    // sits at a disambiguated sibling path) is not recognized as occupying
+    // its picked directory by this scan — the naming layer has no way to
+    // know a collision occurred without re-probing the filesystem, which
+    // this per-frame/per-keystroke path deliberately avoids (see this
+    // function's own doc comment on why it stays git-free).
     let scan = |scan_cwd: &Path| {
         scan_cwd.ancestors().any(|ancestor| {
             let rel = match scan_cwd.strip_prefix(ancestor) {
                 Ok(rel) if !rel.as_os_str().is_empty() => Some(rel),
                 _ => None,
             };
-            let candidate =
-                resolve_workspace_path(ancestor, &disambiguate_workspace_segment(&segment, rel));
+            let candidate = resolve_workspace_path(ancestor, &segment);
             let candidate = match rel {
                 Some(rel) => candidate.join(rel),
                 None => candidate,
@@ -10400,12 +10404,21 @@ fn resolve_orchestration_workspace(
         .as_ref()
         .map(|(_, prefix)| prefix.clone())
         .filter(|prefix| !prefix.as_os_str().is_empty());
-    // Fork issue #607: fold `relative_subpath` into the segment used to
-    // derive the physical clone name — see `disambiguate_workspace_segment`.
-    let mut worktree_path = resolve_workspace_path(
-        resolved_root_dir,
-        &disambiguate_workspace_segment(segment, relative_subpath.as_deref()),
-    );
+    // PRD fork#777: naming is now collision-UNAWARE by default — the plain
+    // `<repo>-<segment>` form (PRD fork#544's original design), for both
+    // toplevel AND nested picks. Fork issue #607's fix (PR #751) folded
+    // `relative_subpath` into the segment here UNCONDITIONALLY, so every
+    // nested pick paid the length-prefix/subpath-join cost even when no
+    // other orchestration was ever contending for the same segment — see
+    // `disambiguate_workspace_segment`'s own doc comment for the join
+    // format, which is unchanged and still used, just no longer invoked
+    // from here. Detecting and resolving a GENUINE collision (two picks
+    // that really do resolve to the same physical directory) moved to
+    // provisioning time — see `provision_isolated_clone_or_status`'s retry
+    // on `ResumeRejection::NameCollision`, which computes and reattempts
+    // this same disambiguated form, but only once provisioning has actual
+    // evidence of a different pick already owning the plain path.
+    let mut worktree_path = resolve_workspace_path(resolved_root_dir, segment);
     // Fork issue #595 fix round 3 (auditor R1) / round 4 (reviewer N7 /
     // auditor S1): a picked directory reached via a symlinked ancestor (or
     // an in-repo symlink pointing back at the repo's own root) can
@@ -10428,10 +10441,7 @@ fn resolve_orchestration_workspace(
         };
         if canonical_worktree_path.starts_with(&canonical_toplevel) {
             resolved_root_dir = toplevel.as_path();
-            worktree_path = resolve_workspace_path(
-                resolved_root_dir,
-                &disambiguate_workspace_segment(segment, relative_subpath.as_deref()),
-            );
+            worktree_path = resolve_workspace_path(resolved_root_dir, segment);
         }
     }
     OrchestrationWorkspaceResolution {
@@ -11398,17 +11408,64 @@ fn provision_isolated_clone_or_status(
     // `resume_existing_isolated_clone`'s legacy-creator-format fallback as
     // this genuine `Action::SpawnPane` pick's identity, never a nested
     // pick's.
-    let legacy_fallback = match relative_subpath {
-        Some(_) => crate::issue_dispatch_run::LegacyFallbackEligibility::Nested,
-        None => crate::issue_dispatch_run::LegacyFallbackEligibility::ToplevelWithIdentity(branch),
-    };
-    match crate::issue_dispatch_run::provision_isolated_clone_sync_resolved(
+    fn legacy_fallback_for<'a>(
+        relative_subpath: Option<&Path>,
+        branch: &'a str,
+    ) -> crate::issue_dispatch_run::LegacyFallbackEligibility<'a> {
+        match relative_subpath {
+            Some(_) => crate::issue_dispatch_run::LegacyFallbackEligibility::Nested,
+            None => {
+                crate::issue_dispatch_run::LegacyFallbackEligibility::ToplevelWithIdentity(branch)
+            }
+        }
+    }
+
+    let mut effective_worktree_path: std::borrow::Cow<'_, Path> =
+        std::borrow::Cow::Borrowed(worktree_path);
+    let mut outcome = crate::issue_dispatch_run::provision_isolated_clone_sync_resolved(
         resolved_root_dir,
-        worktree_path,
+        &effective_worktree_path,
         branch,
         creator,
-        legacy_fallback,
+        legacy_fallback_for(relative_subpath, branch),
+    );
+    // PRD fork#777: naming (`resolve_orchestration_workspace`) stays
+    // collision-UNAWARE by default — this is the ONE place a genuine
+    // collision is actually detected and handled, moved here from the
+    // naming layer per the PRD's Design §2. `ResumeRejection::NameCollision`
+    // is specifically "the plain-named directory that already exists
+    // belongs to a genuinely different pick" (a mismatched provenance
+    // `creator=`, per `resume_existing_isolated_clone`'s own three-part
+    // eligibility check) — the exact signal the PRD's Decisions table names
+    // as "belongs to a genuinely different pick". Every OTHER rejection
+    // (`Stranger`, `AncestryMismatch`, `AncestryUnverifiable`, `Unhealthy`,
+    // `Contested`) is left exactly as before: none of them is proof of a
+    // genuinely different DECK-created pick colliding on the same plain
+    // segment, so retrying under a disambiguated name would risk silently
+    // working around a real problem (an unrelated directory in the way, a
+    // corrupt clone, an in-flight race) rather than resolving an actual
+    // naming collision.
+    if matches!(
+        outcome,
+        Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Rejected(
+            crate::issue_dispatch_run::ResumeRejection::NameCollision
+        ))
     ) {
+        let disambiguated_worktree_path = resolve_workspace_path(
+            resolved_root_dir,
+            &disambiguate_workspace_segment(branch, relative_subpath),
+        );
+        outcome = crate::issue_dispatch_run::provision_isolated_clone_sync_resolved(
+            resolved_root_dir,
+            &disambiguated_worktree_path,
+            branch,
+            creator,
+            legacy_fallback_for(relative_subpath, branch),
+        );
+        effective_worktree_path = std::borrow::Cow::Owned(disambiguated_worktree_path);
+    }
+    let worktree_path: &Path = effective_worktree_path.as_ref();
+    match outcome {
         Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
             marker_warning,
             origin_warning,
@@ -12437,11 +12494,10 @@ fn dispatch_action(
                     // `creator` is qualified with
                     // `workspace_resolution.worktree_path` — the FULL,
                     // already-resolved sibling directory (the toplevel's or
-                    // `req.dir`'s own PARENT, joined with the
-                    // fork#607-disambiguated segment) — instead of the bare
-                    // segment/Name. This reuses the same full-path
-                    // uniqueness property `resolve_orchestration_workspace`/
-                    // `disambiguate_workspace_segment`/the fork#595
+                    // `req.dir`'s own PARENT, joined with the plain segment)
+                    // — instead of the bare segment/Name. This reuses the
+                    // same full-path uniqueness property
+                    // `resolve_orchestration_workspace`/the fork#595
                     // symlink-toplevel guard already rely on elsewhere:
                     // qualifying with just the repo basename would NOT have
                     // been enough (two clones of the identical project
@@ -12453,17 +12509,38 @@ fn dispatch_action(
                     // toplevels without the two picked directories
                     // genuinely resolving to the same physical location.
                     //
+                    // PRD fork#777: `worktree_path` is now PLAIN by
+                    // default (naming stays collision-unaware — see
+                    // `resolve_orchestration_workspace`'s own doc comment),
+                    // so two DIFFERENT nested picks that share a segment
+                    // (issue #607's own collision shape) now resolve to the
+                    // IDENTICAL `worktree_path`. Rejoining
+                    // `relative_subpath` here (when present) keeps `creator`
+                    // distinguishing them anyway — the picked subdirectory
+                    // itself still differs even though the plain sibling
+                    // path they'd both provision into does not. This is
+                    // exactly the signal `provision_isolated_clone_or_status`
+                    // relies on to detect a genuine collision
+                    // (`ResumeRejection::NameCollision`) and disambiguate
+                    // only the second, actually-colliding pick, at
+                    // provisioning time.
+                    //
                     // Stability across repeated opens of the identical
-                    // (toplevel, segment) pair:
+                    // (toplevel, segment, subpath) pick:
                     // `resolve_orchestration_workspace` is a pure function
                     // of `(req.dir, segment)` (modulo the toplevel/symlink
                     // resolution, itself deterministic for an unchanged
-                    // filesystem), so reopening the identical pair
+                    // filesystem), so reopening the identical pick
                     // reproduces the identical `worktree_path` and
-                    // therefore the identical `creator`.
-                    let creator = orchestration_creator_string(
-                        &workspace_resolution.worktree_path.display().to_string(),
-                    );
+                    // `relative_subpath`, and therefore the identical
+                    // `creator`.
+                    let creator = orchestration_creator_string(&{
+                        let mut creator_seed_path = workspace_resolution.worktree_path.clone();
+                        if let Some(rel) = &workspace_resolution.relative_subpath {
+                            creator_seed_path = creator_seed_path.join(rel);
+                        }
+                        creator_seed_path.display().to_string()
+                    });
                     let orchestration_claim_token = mint_orchestration_claim_token();
                     // `workspace_resolution.resolved_dir()` doesn't exist on
                     // disk yet (provisioning hasn't run), so canonicalizing
@@ -12483,19 +12560,24 @@ fn dispatch_action(
                         .resolved_root_dir
                         .canonicalize()
                         .unwrap_or_else(|_| workspace_resolution.resolved_root_dir.clone());
-                    // Fork issue #607: fold the relative subpath into the
-                    // segment here too, identically to
-                    // `resolve_orchestration_workspace` itself, so this
-                    // pre-provisioning claim `cwd` names the SAME physical
-                    // clone directory provisioning will actually create
-                    // below rather than a stale, undisambiguated guess.
-                    let mut orchestration_claim_cwd_path = resolve_workspace_path(
-                        &canonical_root,
-                        &disambiguate_workspace_segment(
-                            &segment,
-                            workspace_resolution.relative_subpath.as_deref(),
-                        ),
-                    );
+                    // PRD fork#777: the plain segment, matching
+                    // `resolve_orchestration_workspace`'s own (now
+                    // collision-unaware) derivation, so this pre-
+                    // provisioning claim `cwd` names the SAME plain
+                    // physical directory provisioning will attempt first —
+                    // any genuine collision is detected and disambiguated
+                    // only later, inside provisioning itself (see
+                    // `provision_isolated_clone_or_status`). The relative
+                    // subpath rejoined below still keeps two colliding
+                    // nested picks' claimed `cwd` values genuinely distinct
+                    // from each other even though their plain base
+                    // directory is now identical — see `creator`'s own
+                    // comment above and `ResumeRejection::NameCollision`'s
+                    // doc comment for why the `ClaimOrchestrationName` cwd
+                    // clause was never the mechanism arbitrating this
+                    // collision class in the first place.
+                    let mut orchestration_claim_cwd_path =
+                        resolve_workspace_path(&canonical_root, &segment);
                     if let Some(rel) = &workspace_resolution.relative_subpath {
                         orchestration_claim_cwd_path = orchestration_claim_cwd_path.join(rel);
                     }
@@ -40587,32 +40669,29 @@ mod tests {
     /// Scenario: PRD fork#603 reviewer finding B1 — build a new-pane form for
     /// a NESTED pick (`/tmp/myrepo/team-a/proj`, a subdirectory of the git
     /// repo rooted at `/tmp/myrepo`) whose only live orchestration identity
-    /// carries the real nested-pick provisioning shape issue #595 produces,
-    /// now also folding in fork issue #607's relative-subpath disambiguation:
-    /// `<toplevel>-<segment>-<disambiguated relative subpath>/<relative
-    /// subpath>` — the isolated clone sibling of the TOPLEVEL, named with
-    /// the picked directory's own relative subpath baked into the segment
-    /// (so a different nested pick sharing the same segment would derive a
-    /// DIFFERENT sibling), with that same relative path rejoined underneath.
-    /// Built via the real `resolve_workspace_path`/`disambiguate_workspace_segment`
-    /// helpers rather than a hand-transcribed literal, so this fixture can't
-    /// quietly drift from what the production formula actually computes.
-    /// `live_orchestration_occupies` must still recognize this shape as
-    /// occupying the picked directory — exactly as `identity_034` pins for
-    /// the non-nested case.
+    /// carries the real nested-pick provisioning shape issue #595 produces:
+    /// `<toplevel>-<segment>/<relative subpath>` — the isolated clone
+    /// sibling of the TOPLEVEL, with the picked directory's own relative
+    /// path rejoined underneath. PRD fork#777 restored the PLAIN form here
+    /// (no fork#607 relative-subpath disambiguation baked into the segment)
+    /// as the production DEFAULT shape — see `resolve_orchestration_workspace`'s
+    /// own doc comment for why a colliding nested pick is no longer
+    /// disambiguated at the naming layer at all. Built via the real
+    /// `resolve_workspace_path` helper rather than a hand-transcribed
+    /// literal, so this fixture can't quietly drift from what the
+    /// production formula actually computes. `live_orchestration_occupies`
+    /// must still recognize this shape as occupying the picked directory —
+    /// exactly as `identity_034` pins for the non-nested case.
     #[spec("orchestration/identity/035")]
     #[test]
     fn identity_035_production_shaped_sibling_live_cwd_is_recognized_nested() {
         let toplevel = PathBuf::from("/tmp/myrepo");
         let relative_subpath = PathBuf::from("team-a").join("proj");
         let live_segment = "proj-orchestrator-1";
-        let live_cwd = resolve_workspace_path(
-            &toplevel,
-            &disambiguate_workspace_segment(live_segment, Some(relative_subpath.as_path())),
-        )
-        .join(&relative_subpath)
-        .display()
-        .to_string();
+        let live_cwd = resolve_workspace_path(&toplevel, live_segment)
+            .join(&relative_subpath)
+            .display()
+            .to_string();
 
         let mut form = NewPaneFormState::new(
             toplevel.join(&relative_subpath),
@@ -44435,26 +44514,27 @@ mod tests {
         }
     }
 
-    /// Scenario: fork issue #607 (accepted residual of PRD fork#603, auditor
-    /// finding A1). Two different picked subdirectories nested under the
-    /// SAME git toplevel (`team-a/proj` and `team-b/proj`) that both
-    /// suggest the identical orchestration Name/segment -- exactly what
-    /// happens when both basenames are literally `proj` and
-    /// `suggest_orchestration_name` derives the same suggestion for both --
-    /// must still provision into distinct physical clones.
-    /// `resolve_orchestration_workspace`'s `worktree_path` is derived from
-    /// `resolved_root_dir` (the shared toplevel for both nested picks) and
-    /// `segment` alone, ignoring which subdirectory was actually picked, so
-    /// both currently collapse onto the identical physical clone directory
-    /// even though their `relative_subpath`s genuinely differ -- silently
-    /// sharing one clone's branch/checkout between what the user believes
-    /// are two independent orchestrations (fork#603's own naming/claim
-    /// layer catches this at the Name-uniqueness layer, per
-    /// `workspace_026`, but never at the physical-clone layer this test
-    /// targets).
+    /// Scenario: PRD fork#777 superseded fork#607's own version of this test
+    /// (accepted residual of PRD fork#603, auditor finding A1). Two
+    /// different picked subdirectories nested under the SAME git toplevel
+    /// (`team-a/proj` and `team-b/proj`) that both suggest the identical
+    /// orchestration Name/segment -- exactly what happens when both
+    /// basenames are literally `proj` and `suggest_orchestration_name`
+    /// derives the same suggestion for both -- are no longer distinguished
+    /// at the NAMING layer at all: `resolve_orchestration_workspace` is now
+    /// deliberately collision-UNAWARE (PRD fork#777 Design §1), so both
+    /// picks resolve to the identical PLAIN `worktree_path` here. The two
+    /// still end up in distinct physical clones once actually
+    /// provisioned -- see `workspace_048`, which drives this exact fixture
+    /// shape through `provision_isolated_clone_or_status` and pins that the
+    /// SECOND, genuinely colliding pick lands on the disambiguated form
+    /// fork#607's `disambiguate_workspace_segment` still produces, now
+    /// applied only as a provisioning-time retry rather than unconditionally
+    /// here.
     #[spec("orchestration/workspace/040")]
     #[test]
-    fn workspace_040_distinct_nested_picks_with_a_colliding_segment_get_distinct_clones() {
+    fn workspace_040_distinct_nested_picks_with_a_colliding_segment_share_the_plain_name_at_naming_time()
+     {
         let tmp = tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         init_committed_git_repo(&repo);
@@ -44477,26 +44557,33 @@ mod tests {
             "setup: sanity -- the two picks must actually be distinct subdirectories"
         );
 
-        assert_ne!(
+        assert_eq!(
             resolution_a.worktree_path, resolution_b.worktree_path,
-            "issue #607: two different directories (team-a/proj, team-b/proj) that suggest \
-             the identical segment must not provision into the same physical clone -- got \
-             {:?} for both",
-            resolution_a.worktree_path
+            "fork#777: naming alone must NOT disambiguate two different directories \
+             (team-a/proj, team-b/proj) that suggest the identical segment -- both must \
+             resolve to the identical PLAIN path; the collision is only detected and resolved \
+             once provisioning actually runs (see workspace_048) -- got {:?} vs {:?}",
+            resolution_a.worktree_path, resolution_b.worktree_path
         );
     }
 
-    /// Scenario: PR #751 review round (auditor finding 1). A first version
-    /// of `disambiguate_workspace_segment` joined `segment` and the
-    /// sanitized relative subpath with a bare `-`, which is NOT injective:
-    /// two different `(segment, relative_subpath)` pairs can redistribute
-    /// across that join point to the identical string. Pick A
-    /// (`repo/bar/baz`, orchestration Name typed `foo`) and pick B
-    /// (`repo/baz`, orchestration Name typed `foo-bar`) both bare-join to
-    /// `"foo-bar-baz"` — reproducing the exact #607 collision this function
-    /// exists to close, just requiring a user-typed (not purely
-    /// auto-suggested) Name to trigger it. Pins that the length-prefixed
-    /// join used instead keeps these two genuinely distinct.
+    /// Scenario: PR #751 review round (auditor finding 1), still relevant
+    /// under PRD fork#777. A first version of `disambiguate_workspace_segment`
+    /// joined `segment` and the sanitized relative subpath with a bare `-`,
+    /// which is NOT injective: two different `(segment, relative_subpath)`
+    /// pairs can redistribute across that join point to the identical
+    /// string. Pick A (`repo/bar/baz`, orchestration Name typed `foo`) and
+    /// pick B (`repo/baz`, orchestration Name typed `foo-bar`) both
+    /// bare-join to `"foo-bar-baz"` — reproducing the exact #607 collision
+    /// this function exists to close, just requiring a user-typed (not
+    /// purely auto-suggested) Name to trigger it. Pins that the
+    /// length-prefixed join used instead keeps these two genuinely
+    /// distinct. PRD fork#777 moved WHEN `disambiguate_workspace_segment`
+    /// is invoked (provisioning-time retry, not unconditionally at naming
+    /// time) but left the join FORMAT itself untouched (Design §"Does the
+    /// length-prefix/subpath join itself change?" -- No), so this test now
+    /// calls it directly rather than through `resolve_orchestration_workspace`,
+    /// which no longer calls it at all.
     #[spec("orchestration/workspace/041")]
     #[test]
     fn workspace_041_adversarial_segment_and_subpath_pair_no_longer_collides() {
@@ -44544,13 +44631,24 @@ mod tests {
              finding 1 describes"
         );
 
+        // fork#777: the disambiguated form is no longer what
+        // `resolve_orchestration_workspace` itself produces (both plain
+        // `worktree_path`s above are now identical) -- call
+        // `disambiguate_workspace_segment` directly, exactly as
+        // `provision_isolated_clone_or_status`'s collision retry now does,
+        // to confirm its join format still keeps this adversarial pair
+        // distinct.
+        let disambiguated_a =
+            disambiguate_workspace_segment(&segment_a, resolution_a.relative_subpath.as_deref());
+        let disambiguated_b =
+            disambiguate_workspace_segment(&segment_b, resolution_b.relative_subpath.as_deref());
         assert_ne!(
-            resolution_a.worktree_path, resolution_b.worktree_path,
+            disambiguated_a, disambiguated_b,
             "auditor finding 1 (PR #751 review round): pick A (segment {segment_a:?}, subpath \
              {sanitized_rel_a:?}) and pick B (segment {segment_b:?}, subpath \
-             {sanitized_rel_b:?}) must not provision into the same physical clone merely \
-             because they redistribute identically across a bare join -- got {:?} for both",
-            resolution_a.worktree_path
+             {sanitized_rel_b:?}) must not disambiguate to the same segment merely because \
+             they redistribute identically across a bare join -- got {disambiguated_a:?} for \
+             both"
         );
     }
 
@@ -45113,12 +45211,11 @@ mod tests {
             .resolved_root_dir
             .canonicalize()
             .expect("resolved_root_dir already exists on disk (it's the git toplevel)");
-        // Fork issue #607: the real call site folds `relative_subpath` into
-        // the segment before deriving the sibling path, unconditionally.
-        let mut expected_cwd = resolve_workspace_path(
-            &canonical_root,
-            &disambiguate_workspace_segment(&segment, resolution.relative_subpath.as_deref()),
-        );
+        // PRD fork#777: the real call site now derives the sibling path
+        // from the PLAIN segment (no fork#607 relative-subpath
+        // disambiguation folded in unconditionally) — see
+        // `resolve_orchestration_workspace`'s own doc comment.
+        let mut expected_cwd = resolve_workspace_path(&canonical_root, &segment);
         if let Some(rel) = &resolution.relative_subpath {
             expected_cwd = expected_cwd.join(rel);
         }
