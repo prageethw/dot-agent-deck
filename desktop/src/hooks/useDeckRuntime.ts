@@ -136,6 +136,17 @@ export function useDeckRuntime(): DeckRuntimeState {
     }
   }, [bridge]);
 
+  /*
+   * Issue #1046: the toast in `App.tsx` renders on `notice || error`, and its
+   * dismiss button could reach `notice` and nothing else — so an error-sourced
+   * message survived the click and the X read as dead. What the button now does
+   * with the two halves is decided there. Clearing is safe because `error` is transient
+   * per-action state, not connection state: `runAction` and `reconnect` already
+   * clear it at the start of each attempt, and what a failed connection leaves
+   * behind for the banner is `snapshot.connection`, which this does not touch.
+   */
+  const clearError = useCallback(() => setError(undefined), []);
+
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
   // Stable for the lifetime of the bridge: `useZoom` holds it across a
   // capture-phase listener whose effect must not be torn down and re-registered
@@ -189,6 +200,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     terminalData: EMPTY_TERMINAL_DATA,
     terminalFeed,
     error,
+    clearError,
     runAction,
     sendTerminalInput,
     resizeTerminal,
