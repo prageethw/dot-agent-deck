@@ -44769,6 +44769,28 @@ mod tests {
         init_committed_git_repo(&repo);
         let nested = repo.join("baseline").join("intent");
         std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested project",
+        ]);
 
         let segment = sanitize_workspace_segment("features");
         let resolution = resolve_orchestration_workspace(&nested, &segment);
@@ -44825,6 +44847,28 @@ mod tests {
         init_committed_git_repo(&repo);
         let nested = repo.join("baseline").join("intent");
         std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested project",
+        ]);
 
         let segment = sanitize_workspace_segment("features");
         let plain_worktree_path = {
@@ -44902,6 +44946,29 @@ mod tests {
         let team_b = repo.join("team-b").join("proj");
         std::fs::create_dir_all(&team_a).expect("create team-a/proj");
         std::fs::create_dir_all(&team_b).expect("create team-b/proj");
+        std::fs::write(team_a.join("marker.txt"), "hi\n").expect("write marker a");
+        std::fs::write(team_b.join("marker.txt"), "hi\n").expect("write marker b");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested projects",
+        ]);
 
         let name_a = "fix/544";
         let name_b = "fix-544";
@@ -45003,6 +45070,29 @@ mod tests {
         let team_b = repo.join("team-b").join("proj");
         std::fs::create_dir_all(&team_a).expect("create team-a/proj");
         std::fs::create_dir_all(&team_b).expect("create team-b/proj");
+        std::fs::write(team_a.join("marker.txt"), "hi\n").expect("write marker a");
+        std::fs::write(team_b.join("marker.txt"), "hi\n").expect("write marker b");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested projects",
+        ]);
 
         let segment_a = sanitize_workspace_segment("fix/544");
         let segment_b = sanitize_workspace_segment("fix-544");
@@ -45096,6 +45186,28 @@ mod tests {
         init_committed_git_repo(&repo);
         let nested = repo.join("baseline").join("intent");
         std::fs::create_dir_all(&nested).expect("create nested project dir");
+        std::fs::write(nested.join("marker.txt"), "hi\n").expect("write marker");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested project",
+        ]);
 
         let segment = sanitize_workspace_segment("features");
         let (toplevel, relative_subpath) = crate::issue_dispatch_run::resolve_git_toplevel(&nested)
