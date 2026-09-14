@@ -3888,18 +3888,18 @@ async fn handle_connection(
                 write_resp(&mut stream, &AttachResponse::ok()).await?;
             } else {
                 // Issue #760 (reviewer R2 / auditor N1): `claim_orchestration_name`
-                // now refuses on EITHER a Name collision OR a resolved-workspace
+                // refuses on EITHER a Name collision OR a resolved-workspace
                 // (`cwd`) collision against a different pane, and the boolean
                 // result doesn't say which branch fired. Word this generically
                 // rather than naming "the Name" specifically — a refusal caused
-                // by the same Worktree slug/directory under a genuinely
-                // different typed Name would otherwise tell the user the wrong
-                // thing is in conflict.
+                // by two different typed Names whose sanitized segments happen
+                // to collide on the same directory would otherwise tell the
+                // user the wrong thing is in conflict.
                 write_resp(
                     &mut stream,
                     &AttachResponse::err(
                         "another live orchestration already occupies this workspace (same \
-                         Worktree slug/directory or same Name in this directory)"
+                         directory or same Name in this directory)"
                             .to_string(),
                     ),
                 )

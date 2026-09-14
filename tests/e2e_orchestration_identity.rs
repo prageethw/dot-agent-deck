@@ -510,9 +510,9 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     // claim was granted" from "the second open was silently refused (the
     // daemon's `ClaimOrchestrationName` handler in `src/daemon_protocol.rs`
     // returns "another live orchestration already occupies this workspace
-    // (same Worktree slug/directory or same Name in this directory)" (PRD
-    // fork#760's fix round; superseded the earlier `orchestration name
-    // {name:?} is already held` wording), and the SECOND form's own
+    // (same directory or same Name in this directory)" (PRD fork#760's fix
+    // round; superseded the earlier `orchestration name {name:?} is
+    // already held` wording), and the SECOND form's own
     // Name field still renders `LABEL` up until the submit keystroke is
     // processed) while tab 1's own real label plus tab 2's still-visible
     // form happen to add up to two matches anyway". (`worktree_028`'s own
