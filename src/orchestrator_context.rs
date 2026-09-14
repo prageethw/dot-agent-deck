@@ -34,14 +34,14 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     }
 
     // 2. Workspace sync (issue #760 Part B). Comes before everything else,
-    // including "## Important"'s wait-for-the-user guidance, because a stale
-    // or dirty workspace makes every subsequent step (delegation, review,
-    // merge) act on the wrong state.
+    // including the "## Important" section's wait-for-the-user guidance,
+    // because a stale or dirty workspace makes every subsequent step
+    // (delegation, review, merge) act on the wrong state.
     let bin_for_sync = crate::platform::paths::binary_name();
     content.push_str(&format!(
         "## Workspace sync\n\n\
-         Before doing anything else — including before \"## Important\"'s instruction to wait \
-         for the user — check that this workspace is safe to touch and caught up with the \
+         Before doing anything else — including before being told to wait for the user further \
+         below — check that this workspace is safe to touch and caught up with the \
          repository's default branch:\n\n\
          1. Inspect the workspace: uncommitted changes, staged changes, untracked files, and \
          local commits not yet on the remote.\n\n\
