@@ -8586,6 +8586,7 @@ mod tests {
                 cols: 80,
                 live: None,
                 spawned_at_ms: None,
+                cli_name: None,
             }
         }
         let instance = |id: &str| OrchestrationIdentity::Instance {

@@ -1833,6 +1833,7 @@ command = "cat"
             cols: 0,
             live: None,
             spawned_at_ms,
+            cli_name: None,
         }
     }
 
