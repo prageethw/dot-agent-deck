@@ -10224,7 +10224,16 @@ pub(crate) fn sanitize_workspace_segment(name: &str) -> String {
     // `sanitize_clone_segment_passthrough_and_fallback` test asserts a
     // space is left alone for that caller; only THIS function's use as a
     // git ref needs the extra safety.
-    let mut ref_safe: String = segment
+    // `git check-ref-format` also refuses any component containing the
+    // two-character sequence `@{` (its reflog-shorthand syntax), even though
+    // a lone `@` or a lone `{` is fine on its own — verified via
+    // `git check-ref-format --branch 'a@{1}'` and `'fix-@{1}-x'`, both
+    // rejected. This can't be expressed in the char-by-char map below (which
+    // only ever sees one `char` at a time), so it's a separate substring
+    // pass first; replacing with `-` can't reintroduce `@` or `{`, so a
+    // single left-to-right pass removes every occurrence.
+    let despecialized = segment.replace("@{", "-");
+    let mut ref_safe: String = despecialized
         .chars()
         .map(|c| {
             if matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[') {
@@ -43535,11 +43544,14 @@ mod tests {
     /// `git check-ref-format --branch` component, not just free of `/`/`..`.
     /// Covers the classes `git check-ref-format` rejects that the sanitizer
     /// did not previously neutralize: an interior space, a colon, a leading
-    /// `~`, a trailing dot, and a `.lock` suffix. Each candidate is checked
-    /// against a REAL `git check-ref-format` invocation (no repo needed —
-    /// it is a pure syntax check), matching this codebase's existing
-    /// pattern of shelling out to real git where that is the actual
-    /// property under test (e.g. `worktree_027`'s `init_repo` helper).
+    /// `~`, a trailing dot, a `.lock` suffix, and (fix round 2) the
+    /// two-character `@{` sequence — verified separately from a lone `@`
+    /// or lone `{`, neither of which `git check-ref-format` objects to on
+    /// its own. Each candidate is checked against a REAL
+    /// `git check-ref-format` invocation (no repo needed — it is a pure
+    /// syntax check), matching this codebase's existing pattern of shelling
+    /// out to real git where that is the actual property under test (e.g.
+    /// `worktree_027`'s `init_repo` helper).
     #[test]
     fn sanitize_workspace_segment_produces_a_git_ref_legal_component() {
         fn assert_git_ref_legal(candidate: &str) {
@@ -43564,6 +43576,7 @@ mod tests {
             ("a question mark", "a?b"),
             ("an asterisk", "a*b"),
             ("a leading bracket", "[oops]"),
+            ("an @{ sequence", "fix-@{1}-x"),
         ];
         for (label, input) in cases {
             let segment = sanitize_workspace_segment(input);

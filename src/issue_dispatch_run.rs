@@ -4271,9 +4271,9 @@ impl ResumeRejection {
             Self::Contested => "another request just resumed it first — try again",
             Self::NameCollision => {
                 "a different orchestration already opened the workspace at this location (its \
-                 provenance record names a different creator) — the two Names sanitize to the \
-                 same directory; pick a different Name instead of this one. It may still be in \
-                 use by the orchestration that opened it — do not remove it"
+                 provenance record names a different creator) — pick a different Name instead \
+                 of this one. It may still be in use by the orchestration that opened it — do \
+                 not remove it"
             }
         }
     }
