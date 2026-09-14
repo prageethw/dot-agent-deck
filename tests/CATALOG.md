@@ -5746,6 +5746,41 @@ without depending on the config struct API.
 - **Does not assert:** a full `dispatch <name>` CLI invocation through a live daemon (unit-level on the parameter only — the production call site's use of `Disabled` is verified by direct code reading, not exercised end-to-end by this test); real daemon/PTY spawn.
 - **Platform coverage:** mac+linux+windows, matching `012`.
 
+##### orchestration/workspace/046 — RED (fork#777 M1a, pending implementation). A fresh nested pick (a real git repo, orchestration Name "features", picked directory two levels below the toplevel) with no other orchestration ever having touched this toplevel/segment before must provision into the PLAIN `<repo>-<name>` workspace directory — no unconditional length-prefix/subpath suffix — restoring PRD fork#544's original naming as the default for the non-colliding common case. Fork issue #607's fix (PR #751, `disambiguate_workspace_segment`) currently applies unconditionally to every nested pick regardless of whether a real collision would ever occur.
+- **Layer:** L1 (in-process — a real `git` repository with a nested project directory, calling `resolve_orchestration_workspace` and `provision_isolated_clone_or_status` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** `resolve_orchestration_workspace`'s `worktree_path` for a fresh nested pick equals the plain `resolve_workspace_path(toplevel, segment)` form (no disambiguation applied); provisioning it actually creates that exact plain-named directory on disk, and it is the only sibling workspace directory present afterward.
+- **Does not assert:** the provisioning-time collision detection itself, covered by `048`; resume of a repeat pick, covered by `047`.
+- **Platform coverage:** mac+linux+windows, matching `040`.
+
+##### orchestration/workspace/047 — RED (fork#777 M1b, pending implementation). A repeat pick of the IDENTICAL (repo, Name, subdirectory) must resume the SAME plain-named workspace directory the first pick provisioned, not disambiguate a second time nor provision a second sibling.
+- **Layer:** L1 (in-process — a real `git` repository with a nested project directory, calling `resolve_orchestration_workspace` and `provision_isolated_clone_or_status` directly, twice; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a second `resolve_orchestration_workspace` call against the identical inputs reproduces the identical plain `worktree_path`; provisioning it a second time resumes (does not error, does not create a new directory) inside the same plain-named folder; exactly one sibling workspace directory exists after both picks.
+- **Does not assert:** the provisioning-time collision path between two genuinely DIFFERENT picks, covered by `048`/`049`.
+- **Platform coverage:** mac+linux+windows, matching `040`.
+
+##### orchestration/workspace/048 — RED (fork#777 M1c, pending implementation). Two picks with DIFFERENT raw Names that sanitize to the identical segment (`"fix/544"` and `"fix-544"`, the PRD's own example of the Name-uniqueness gap issue #607 exploits), targeting DIFFERENT subdirectories of the same repo, must resolve to the identical PLAIN path at the naming layer (naming stays collision-unaware) and only disambiguate the SECOND pick once provisioning discovers the plain-named directory already occupied by a genuinely different pick's clone.
+- **Layer:** L1 (in-process — a real `git` repository with two nested subdirectories, calling `resolve_orchestration_workspace` and `provision_isolated_clone_or_status` directly for each pick; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** both picks' `resolve_orchestration_workspace` outputs equal the plain form and equal each other before provisioning; the first pick provisions cleanly into the plain folder; the second pick's provisioning call succeeds (not refused) and lands on `disambiguate_workspace_segment`'s form for its own segment/subpath, distinct from the first pick's folder; the first pick's own provenance marker (`creator=`) remains untouched by the second pick's provisioning.
+- **Does not assert:** repeating the disambiguated pick, covered by `049`; the legacy-path coexistence case, covered by `050`.
+- **Platform coverage:** mac+linux+windows, matching `040`.
+
+##### orchestration/workspace/049 — RED (fork#777 M1d, pending implementation). Repeating the SECOND (genuinely colliding, now disambiguated) pick from `048` again — same colliding Name, same subdirectory — must resume the disambiguated folder it already provisioned, not disambiguate a second time nor error.
+- **Layer:** L1 (in-process — a real `git` repository with two nested subdirectories, mirroring `048`'s setup, with the second pick's provisioning repeated a second time; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a second `resolve_orchestration_workspace` call for the identical (already-disambiguated) pick reproduces the identical (plain, pre-collision-check) resolution; provisioning it again resumes the exact same disambiguated folder the first collision-retry landed on; exactly two sibling workspace directories exist after both picks plus the repeat (the plain first pick and the one disambiguated second pick — no third from re-disambiguating the repeat).
+- **Does not assert:** the initial collision detection itself, covered by `048`.
+- **Platform coverage:** mac+linux+windows, matching `040`.
+
+##### orchestration/workspace/050 — RED (fork#777 M1e, pending implementation). A workspace already sitting at a legacy disambiguated path (as any pre-fork#777 build would have produced for every nested pick, unconditionally) is not migrated or renamed by this PRD — it must stay resumable at its own existing path, and a genuinely NEW, independent fresh pick for the identical (repo, Name, subdirectory) must land on the plain form and provision its own separate clone, never touching the pre-existing legacy directory.
+- **Layer:** L1 (in-process — a real `git` repository with a nested project directory; a legacy-shaped workspace directory is seeded directly via `disambiguate_workspace_segment` + `provision_isolated_clone_or_status`, simulating pre-fork#777 disk state, before a fresh pick is provisioned and the legacy workspace is resumed again; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** the seeded legacy-shaped directory genuinely differs from the plain form; a fresh pick through the real, current naming/provisioning path resolves to the plain form and provisions independently; the pre-existing legacy workspace remains resumable, unchanged, at its own path; exactly two independent sibling workspace directories exist afterward (the unmigrated legacy one and the fresh plain-named one).
+- **Does not assert:** the "forget this workspace" retirement action or the plain-naming behavior a fresh pick adopts only after that retirement (Design item 4's second half) — not exercised by this test.
+- **Platform coverage:** mac+linux+windows, matching `040`.
+
 
 #### orchestration/hydration
 
