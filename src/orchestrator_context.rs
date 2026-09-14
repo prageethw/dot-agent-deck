@@ -24,6 +24,7 @@ use crate::project_config::OrchestrationConfig;
 /// available-agents list, and delegation protocol instructions.
 pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     let mut content = String::new();
+    let bin = crate::platform::paths::binary_name();
 
     // 1. Orchestrator's own prompt_template.
     if let Some(start_role) = config.roles.iter().find(|r| r.start)
@@ -38,21 +39,19 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     // because a stale or dirty workspace makes every subsequent step
     // (delegation, review, merge) act on the wrong state.
     //
-    // Review/audit fix round (PR #775): the first cut inspected dirty state
-    // in step 1 but never gated on it -- steps 2-6 ran unconditionally, so a
-    // dirty workspace got folded straight into a merge instead of the hard
-    // refusal `sync_merged_workspace_to_main` (`src/issue_dispatch_run.rs`)
-    // already applies in code for the equivalent case. Fixed here: dirty
-    // state now stops BEFORE fetching or merging, mirroring that refusal in
-    // prose. Also fixed: the pointer text in `prepare_orchestrator_prompt`
-    // below now actually names this section (it previously jumped straight
-    // to "wait for instructions"/"carry out that task" with no mention of
-    // it); `git log @{u}..` now tolerates a branch with no upstream (this
-    // project's own CLAUDE.md rule 1 mandates `git branch --unset-upstream`
-    // after every `git worktree add`, so "no upstream" is the STANDARD
-    // shape here, not an edge case); a missing `origin` remote is treated as
-    // expected rather than something to "fix" by re-adding one (isolated
-    // clones deliberately have none -- `remove_isolated_clone_origin_default`,
+    // Review/audit fix round 1 (PR #775): the first cut inspected dirty
+    // state in step 1 but never gated on it -- steps 2-6 ran
+    // unconditionally, so a dirty workspace got folded straight into a
+    // merge. Fixed there: dirty state now stops fetching/merging. Also
+    // fixed: the pointer text in `prepare_orchestrator_prompt` below now
+    // actually names this section (it previously jumped straight to "wait
+    // for instructions"/"carry out that task" with no mention of it);
+    // `git log @{u}..` now tolerates a branch with no upstream (a worktree
+    // created with `git worktree add` and no upstream explicitly set is the
+    // STANDARD shape here, not an edge case -- see this project's own
+    // CLAUDE.md rule 1); a missing `origin` remote is treated as expected
+    // rather than something to "fix" by re-adding one (isolated clones
+    // deliberately have none -- `remove_isolated_clone_origin_default`,
     // issue #325 P1-1); the destructive-command list states the property
     // ("discards work") with examples rather than a bare enumeration a model
     // can route around; the default branch is actually resolved rather than
@@ -64,34 +63,68 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     // is non-interactive (`GIT_TERMINAL_PROMPT=0`), matching the hardening
     // this codebase already applies to the same call shape elsewhere
     // (`src/issue_dispatch_run.rs`, fork #122/#123 P2).
-    let bin_for_sync = crate::platform::paths::binary_name();
+    //
+    // Review/audit fix round 2 (PR #775, reviewer F12 / auditor N1): round 1
+    // made the dirty-workspace check STOP normal orchestration and wait
+    // until a human resolved it. That was wrong on multiple independent
+    // grounds -- it collided with this same function's own "telling the
+    // orchestrator to wait is what leaves a dispatched unit idle forever"
+    // design (see the no-task pointer comment below), with the sibling
+    // no-`origin` branch two paragraphs later which correctly skips the
+    // rest of this section and continues for a strictly *worse* problem
+    // (no remote at all), and with `sync_merged_workspace_to_main`
+    // (`src/issue_dispatch_run.rs`) -- the actual precedent this text
+    // claimed to mirror -- which returns `LeftUntouched` and moves on to
+    // the next workspace rather than refusing the work itself. Fixed: a
+    // dirty workspace now skips the rest of this section (still never
+    // fetches or merges over it -- that data-safety property is unchanged)
+    // and continues with normal orchestration, exactly like the no-`origin`
+    // case. Also in this round: step 3 gained one sentence noting that a
+    // branch with an open pull request may need review/CI re-verification
+    // after a merge moves its SHA (auditor N2); the fork-local `CLAUDE.md`
+    // rule-number citations in the emitted text were replaced with the
+    // underlying criteria stated inline, since this text ships to every
+    // project that uses this tool, not just this one (auditor N6, reviewer
+    // F13); default-branch resolution now says what to do if both commands
+    // come back empty instead of leaving the model to guess `main`
+    // (auditor N3, reviewer F14); the non-interactive-fetch claim no longer
+    // overstates what `GIT_TERMINAL_PROMPT=0` alone prevents (auditor N4);
+    // and the not-a-git-repository escape is now mentioned where the
+    // failure actually first surfaces, step 1, not only in step 2 (auditor
+    // N5, reviewer F14).
     content.push_str(&format!(
         "## Workspace sync\n\n\
          Before doing anything else — including before being told to wait for the user further \
          below — check that this workspace is safe to touch and caught up with the \
          repository's default branch:\n\n\
          1. Inspect the workspace: uncommitted changes, staged changes, untracked files, and \
-         local commits not yet on the remote.\n\n\
+         local commits not yet on the remote. If any command below reports `fatal: not a git \
+         repository`, stop reading this section here: skip the rest of it (never `git init`) \
+         and continue with normal orchestration.\n\n\
          ```bash\n\
          git status --porcelain\n\
          git log --oneline @{{u}}.. 2>/dev/null || echo \"(no upstream configured for this \
-         branch — that is the normal state for a worktree created per this project's own \
-         CLAUDE.md rule 1, not an error; do not set one or push to silence this)\"\n\
+         branch, or that command could not run — check any error above; a worktree with no \
+         upstream explicitly set is a normal shape here, not an error by itself)\"\n\
          ```\n\n\
          **If `git status --porcelain` printed anything at all** — any uncommitted change, \
-         staged change, or untracked file — STOP right here, before fetching or merging \
-         anything below. Report exactly what is dirty and why, then wait: do not proceed past \
-         this step until it is resolved. This mirrors the hard refusal \
-         `{bin_for_sync} worktree sync` itself already applies in code rather than risk folding \
-         in-flight work into a merge. Local commits not yet on the remote are NOT by themselves a \
-         reason to stop here — a later merge just adds a commit on top of them — note them in \
-         what you report, but continue.\n\n\
+         staged change, or untracked file — do not fetch and do not merge anything below; that \
+         could write over work that is not committed yet. Skip the rest of this section, report \
+         exactly what is dirty, and continue with normal orchestration — the sync will run again \
+         next time this section is emitted (the next session, or the next compaction). This \
+         mirrors `{bin} worktree sync`'s own behavior in code: it leaves a workspace it cannot \
+         safely sync untouched — reported, not fetched or merged — and moves on, rather than \
+         refusing the work itself. Local commits not yet on the remote are NOT by themselves a \
+         reason to skip — a later merge just adds a commit on top of them — note them in what \
+         you report, but continue.\n\n\
          2. Only once the workspace is confirmed clean, fetch the default branch's latest state, \
-         non-interactively so a credential or host-key prompt cannot wedge you waiting on input \
-         that will never come:\n\n\
+         non-interactively so a stored-credential prompt cannot wedge you waiting on input that \
+         will never come:\n\n\
          ```bash\n\
          GIT_TERMINAL_PROMPT=0 git fetch origin\n\
          ```\n\n\
+         This does not by itself stop an SSH host-key or passphrase prompt; if the fetch does \
+         not return promptly, stop and report rather than supplying anything at a prompt.\n\n\
          **If this fails because there is no `origin` remote configured, that is an expected, \
          deliberate state for some workspaces here — never run `git remote add origin ...` to \
          \"fix\" it.** Skip the rest of this section, note that you skipped it because there is \
@@ -103,9 +136,12 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || \
          git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'\n\
          ```\n\n\
+         If neither command produces a name, do not guess `main` or anything else — skip the \
+         rest of this section, report that the default branch could not be resolved, and \
+         continue with normal orchestration.\n\n\
          Then check whether you are behind it (`git log --oneline HEAD..origin/<default-branch>`, \
          substituting the name you just resolved). If you are, integrate it into your current \
-         branch yourself. `{bin_for_sync} worktree sync` does **not** do this — it only \
+         branch yourself. `{bin} worktree sync` does **not** do this — it only \
          fast-forwards a workspace onto the default branch once that workspace's own work has \
          already merged, or does a read-only fetch otherwise; it never merges the default branch \
          into an in-progress branch. A plain merge is the safe default unless this repository's \
@@ -113,6 +149,9 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          ```bash\n\
          git merge origin/<default-branch>\n\
          ```\n\n\
+         If this workspace is on a branch with an open pull request, merging is still safe for \
+         your data, but be aware the resulting commit SHA may need review or CI to re-verify it \
+         before anyone relies on it again.\n\n\
          4. NEVER force any of this through with a command that can discard uncommitted, staged, \
          untracked, or unpushed work — including but not limited to `git reset --hard`, `git \
          clean -f`/`-fd`/`-fdx`, `git checkout .`/`--`/`-f`, `git restore .`/`--staged --worktree \
@@ -124,10 +163,10 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          5. If the merge produces conflicts, run `git merge --abort` immediately so the workspace \
          is left exactly as it was before you touched it, THEN STOP normal work: report plainly \
          which files conflict and what is blocking. Wait for direction — do not resolve the \
-         conflict yourself unless CLAUDE.md rule 24's own narrow criteria for resolving in the \
-         fork's favor genuinely apply here (a real bug fix, a missing feature, or a genuine \
-         enhancement on the incoming side — never a preference divergence, and never merely \
-         because a resolution looks unambiguous to you in the moment).\n\n\
+         conflict yourself unless this repository's own documented conflict-resolution policy \
+         (if it has one) clearly and narrowly permits it: a real bug fix, a missing feature, or a \
+         genuine enhancement on the incoming side — never a preference divergence, and never \
+         merely because a resolution looks unambiguous to you in the moment.\n\n\
          6. If the sync completes cleanly (already current, fast-forward, or a clean merge), \
          continue straight into normal orchestration — do not stop to ask \"should I proceed?\".\n\n"
     ));
@@ -174,7 +213,6 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     // unguaranteed permission produces exactly the silent stall #303 is about,
     // so all three branches (file / short plain inline / say you cannot) are now
     // stated outright rather than left to inference.
-    let bin = crate::platform::paths::binary_name();
     content.push_str("\n## Delegation protocol\n\n");
     content.push_str(&format!(
         "To delegate work to an agent, use `delegate` with one command per agent. \
@@ -606,16 +644,22 @@ mod tests {
             .next()
             .expect("the section ends before '## Available agents'");
 
-        // Fix #1: dirty state must STOP before fetching/merging, not be
-        // silently folded into a merge. Unpushed *committed* work alone must
-        // NOT trigger the same stop.
+        // Fix #1 (round 2, reviewer F12 / auditor N1): dirty state must skip
+        // the rest of the section (never fetch/merge over it) and continue
+        // with normal orchestration, not halt and wait for a human. Unpushed
+        // *committed* work alone must NOT trigger the same skip.
         assert!(
-            sync.contains("STOP right here, before fetching or merging"),
-            "a dirty workspace must stop before fetching or merging, not just before merging, \
+            sync.contains("do not fetch and do not merge anything below"),
+            "a dirty workspace must skip fetching or merging, not just skip merging, \
              got: {sync}"
         );
         assert!(
-            sync.contains("NOT by themselves a reason to stop"),
+            sync.contains("continue with normal orchestration — the sync will run again"),
+            "a dirty workspace must continue with normal orchestration rather than halt, \
+             got: {sync}"
+        );
+        assert!(
+            sync.contains("NOT by themselves a reason to skip"),
             "unpushed committed local commits alone must not block the sync, got: {sync}"
         );
 
@@ -654,26 +698,77 @@ mod tests {
              got: {sync}"
         );
 
-        // Fix #7: a conflict must abort the merge before stopping, and the
-        // escape hatch for auto-resolving must point at CLAUDE.md rule 24's
-        // own narrow criteria rather than a vague "unambiguous" test.
+        // Fix #7 (round 2, reviewer F13 / auditor N6): a conflict must abort
+        // the merge before stopping, and the escape hatch for auto-resolving
+        // must state the underlying criteria inline rather than citing this
+        // fork's own CLAUDE.md rule numbers — this text ships to every
+        // project, not just this one.
         assert!(
             sync.contains("git merge --abort"),
             "a conflict must abort the merge before reporting, leaving the workspace clean, \
              got: {sync}"
         );
         assert!(
-            sync.contains("rule 24"),
-            "the conflict-resolution escape hatch must point at CLAUDE.md rule 24's own \
-             criteria rather than a bare 'unambiguous' judgement call, got: {sync}"
+            !sync.contains("rule 24") && !sync.contains("CLAUDE.md"),
+            "the conflict-resolution escape hatch must not cite this fork's own CLAUDE.md rule \
+             numbers — this text ships to every project, got: {sync}"
+        );
+        assert!(
+            sync.contains("a real bug fix, a missing feature, or a genuine")
+                && sync.contains("never a preference divergence"),
+            "the conflict-resolution escape hatch must still state the underlying criteria \
+             inline, got: {sync}"
         );
 
         // Fix #8: the fetch must be hardened against an interactive
-        // credential/host-key prompt wedging the pane.
+        // credential prompt wedging the pane, without overstating that this
+        // also covers an SSH host-key/passphrase prompt (auditor N4).
         assert!(
             sync.contains("GIT_TERMINAL_PROMPT=0"),
             "the fetch must be non-interactive, matching the hardening this codebase already \
              applies to the same call shape elsewhere, got: {sync}"
+        );
+        assert!(
+            sync.contains("does not by itself stop an SSH host-key"),
+            "must not overstate that GIT_TERMINAL_PROMPT=0 alone prevents an SSH host-key or \
+             passphrase prompt, got: {sync}"
+        );
+    }
+
+    /// Round 2 (reviewer F12 / auditor N1): a merely-dirty workspace must
+    /// never tell the orchestrator to wait indefinitely — that is reserved
+    /// for step 5's unresolved-conflict case, which is unchanged. Asserted
+    /// as its own test (rather than folded into the fix-round test above)
+    /// because this is the exact defect both reviewers converged on.
+    #[test]
+    fn context_workspace_sync_section_does_not_wait_on_a_merely_dirty_tree() {
+        let c = build_orchestrator_context(&config());
+        let sync = c
+            .split("## Workspace sync")
+            .nth(1)
+            .expect("a '## Workspace sync' section exists")
+            .split("## Available agents")
+            .next()
+            .expect("the section ends before '## Available agents'");
+
+        assert!(
+            !sync.contains("STOP right here"),
+            "a dirty workspace must not halt the section with a STOP instruction, got: {sync}"
+        );
+        // "Wait for direction" is legitimate ONLY in step 5's unresolved-
+        // conflict handling — it must not appear anywhere near the dirty
+        // (step 1) or behind (step 3) handling.
+        let wait_count = sync.matches("wait for direction").count();
+        assert_eq!(
+            wait_count, 1,
+            "'wait for direction' must appear exactly once, in step 5's conflict handling, \
+             got {wait_count} occurrences in: {sync}"
+        );
+        assert!(
+            sync.contains("git merge --abort")
+                && sync[sync.find("git merge --abort").unwrap()..].contains("wait for direction"),
+            "the sole 'wait for direction' instance must be step 5's conflict handling, \
+             not the dirty-tree step, got: {sync}"
         );
     }
 
@@ -742,7 +837,13 @@ mod tests {
         );
     }
 
-    /// `None` keeps the interactive `Ctrl+n` path byte-for-byte unchanged.
+    /// `None` still writes the full composed context file verbatim (the
+    /// pre-parity behavior for the FILE itself), and the file still has no
+    /// `## Your task` section. The one-line pointer that reaches the
+    /// orchestrator's session is a different string (asserted elsewhere,
+    /// `prepare_orchestrator_prompt_pointer_names_the_workspace_sync_step`)
+    /// and is NOT byte-for-byte unchanged — PR #775 changed it to name the
+    /// workspace-sync step first.
     #[test]
     fn no_task_reproduces_the_pre_parity_prompt_and_file() {
         let tmp = tempfile::tempdir().unwrap();
