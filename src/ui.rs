@@ -30431,8 +30431,10 @@ mod tests {
         };
 
         let content = build_orchestrator_context(&config);
-        // Starts directly with available agents (no template preamble).
-        assert!(content.starts_with("## Available agents"));
+        // With no template preamble, content starts directly with the
+        // framework-generated sections — workspace sync (issue #760 Part B)
+        // first, then available agents.
+        assert!(content.starts_with("## Workspace sync"));
         assert!(content.contains("**worker**: Does work"));
     }
 

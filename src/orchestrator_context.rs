@@ -20,10 +20,11 @@ use crate::project_config::OrchestrationConfig;
 // ---------------------------------------------------------------------------
 
 /// Build the orchestrator context file content.
-/// Includes the role's own prompt_template, the available-agents list, and
-/// delegation protocol instructions.
+/// Includes the role's own prompt_template, workspace-sync instructions, the
+/// available-agents list, and delegation protocol instructions.
 pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     let mut content = String::new();
+    let bin = crate::platform::paths::binary_name();
 
     // 1. Orchestrator's own prompt_template.
     if let Some(start_role) = config.roles.iter().find(|r| r.start)
@@ -33,7 +34,144 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
         content.push_str("\n\n");
     }
 
-    // 2. Available agents list.
+    // 2. Workspace sync (issue #760 Part B). Comes before everything else,
+    // including the "## Important" section's wait-for-the-user guidance,
+    // because a stale or dirty workspace makes every subsequent step
+    // (delegation, review, merge) act on the wrong state.
+    //
+    // Review/audit fix round 1 (PR #775): the first cut inspected dirty
+    // state in step 1 but never gated on it -- steps 2-6 ran
+    // unconditionally, so a dirty workspace got folded straight into a
+    // merge. Fixed there: dirty state now stops fetching/merging. Also
+    // fixed: the pointer text in `prepare_orchestrator_prompt` below now
+    // actually names this section (it previously jumped straight to "wait
+    // for instructions"/"carry out that task" with no mention of it);
+    // `git log @{u}..` now tolerates a branch with no upstream (a worktree
+    // created with `git worktree add` and no upstream explicitly set is the
+    // STANDARD shape here, not an edge case -- see this project's own
+    // CLAUDE.md rule 1); a missing `origin` remote is treated as expected
+    // rather than something to "fix" by re-adding one (isolated clones
+    // deliberately have none -- `remove_isolated_clone_origin_default`,
+    // issue #325 P1-1); the destructive-command list states the property
+    // ("discards work") with examples rather than a bare enumeration a model
+    // can route around; the default branch is actually resolved rather than
+    // left as a `<default-branch>` placeholder for the model to guess
+    // (`resolve_default_branch`, `src/worktree_reclaim.rs`, is explicit that
+    // it is "never assumed to be `main` locally"); a conflict now aborts the
+    // merge before reporting, so "wait for direction" never means leaving a
+    // shared workspace parked in a conflicted `MERGING` state; and the fetch
+    // is non-interactive (`GIT_TERMINAL_PROMPT=0`), matching the hardening
+    // this codebase already applies to the same call shape elsewhere
+    // (`src/issue_dispatch_run.rs`, fork #122/#123 P2).
+    //
+    // Review/audit fix round 2 (PR #775, reviewer F12 / auditor N1): round 1
+    // made the dirty-workspace check STOP normal orchestration and wait
+    // until a human resolved it. That was wrong on multiple independent
+    // grounds -- it collided with this same function's own "telling the
+    // orchestrator to wait is what leaves a dispatched unit idle forever"
+    // design (see the no-task pointer comment below), with the sibling
+    // no-`origin` branch two paragraphs later which correctly skips the
+    // rest of this section and continues for a strictly *worse* problem
+    // (no remote at all), and with `sync_merged_workspace_to_main`
+    // (`src/issue_dispatch_run.rs`) -- the actual precedent this text
+    // claimed to mirror -- which returns `LeftUntouched` and moves on to
+    // the next workspace rather than refusing the work itself. Fixed: a
+    // dirty workspace now skips the rest of this section (still never
+    // fetches or merges over it -- that data-safety property is unchanged)
+    // and continues with normal orchestration, exactly like the no-`origin`
+    // case. Also in this round: step 3 gained one sentence noting that a
+    // branch with an open pull request may need review/CI re-verification
+    // after a merge moves its SHA (auditor N2); the fork-local `CLAUDE.md`
+    // rule-number citations in the emitted text were replaced with the
+    // underlying criteria stated inline, since this text ships to every
+    // project that uses this tool, not just this one (auditor N6, reviewer
+    // F13); default-branch resolution now says what to do if both commands
+    // come back empty instead of leaving the model to guess `main`
+    // (auditor N3, reviewer F14); the non-interactive-fetch claim no longer
+    // overstates what `GIT_TERMINAL_PROMPT=0` alone prevents (auditor N4);
+    // and the not-a-git-repository escape is now mentioned where the
+    // failure actually first surfaces, step 1, not only in step 2 (auditor
+    // N5, reviewer F14).
+    content.push_str(&format!(
+        "## Workspace sync\n\n\
+         Before doing anything else — including before being told to wait for the user further \
+         below — check that this workspace is safe to touch and caught up with the \
+         repository's default branch:\n\n\
+         1. Inspect the workspace: uncommitted changes, staged changes, untracked files, and \
+         local commits not yet on the remote. If any command below reports `fatal: not a git \
+         repository`, stop reading this section here: skip the rest of it (never `git init`) \
+         and continue with normal orchestration.\n\n\
+         ```bash\n\
+         git status --porcelain\n\
+         git log --oneline @{{u}}.. 2>/dev/null || echo \"(no upstream configured for this \
+         branch, or that command could not run — check any error above; a worktree with no \
+         upstream explicitly set is a normal shape here, not an error by itself)\"\n\
+         ```\n\n\
+         **If `git status --porcelain` printed anything at all** — any uncommitted change, \
+         staged change, or untracked file — do not fetch and do not merge anything below; that \
+         could write over work that is not committed yet. Skip the rest of this section, report \
+         exactly what is dirty, and continue with normal orchestration — the sync will run again \
+         next time this section is emitted (the next session, or the next compaction). This \
+         mirrors `{bin} worktree sync`'s own behavior in code: it leaves a workspace it cannot \
+         safely sync untouched — reported, not fetched or merged — and moves on, rather than \
+         refusing the work itself. Local commits not yet on the remote are NOT by themselves a \
+         reason to skip — a later merge just adds a commit on top of them — note them in what \
+         you report, but continue.\n\n\
+         2. Only once the workspace is confirmed clean, fetch the default branch's latest state, \
+         non-interactively so a stored-credential prompt cannot wedge you waiting on input that \
+         will never come:\n\n\
+         ```bash\n\
+         GIT_TERMINAL_PROMPT=0 git fetch origin\n\
+         ```\n\n\
+         This does not by itself stop an SSH host-key or passphrase prompt; if the fetch does \
+         not return promptly, stop and report rather than supplying anything at a prompt.\n\n\
+         **If this fails because there is no `origin` remote configured, that is an expected, \
+         deliberate state for some workspaces here — never run `git remote add origin ...` to \
+         \"fix\" it.** Skip the rest of this section, note that you skipped it because there is \
+         no `origin`, and continue with normal orchestration. The same applies if this directory \
+         turns out not to be a git repository at all: skip this section, and never `git init` to \
+         make it one.\n\n\
+         3. Resolve the repository's actual default branch — never assume it is `main`:\n\n\
+         ```bash\n\
+         gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || \
+         git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'\n\
+         ```\n\n\
+         If neither command produces a name, do not guess `main` or anything else — skip the \
+         rest of this section, report that the default branch could not be resolved, and \
+         continue with normal orchestration.\n\n\
+         Then check whether you are behind it (`git log --oneline HEAD..origin/<default-branch>`, \
+         substituting the name you just resolved). If you are, integrate it into your current \
+         branch yourself. `{bin} worktree sync` does **not** do this — it only \
+         fast-forwards a workspace onto the default branch once that workspace's own work has \
+         already merged, or does a read-only fetch otherwise; it never merges the default branch \
+         into an in-progress branch. A plain merge is the safe default unless this repository's \
+         own documented workflow calls for a rebase:\n\n\
+         ```bash\n\
+         git merge origin/<default-branch>\n\
+         ```\n\n\
+         If this workspace is on a branch with an open pull request, merging is still safe for \
+         your data, but be aware the resulting commit SHA may need review or CI to re-verify it \
+         before anyone relies on it again.\n\n\
+         4. NEVER force any of this through with a command that can discard uncommitted, staged, \
+         untracked, or unpushed work — including but not limited to `git reset --hard`, `git \
+         clean -f`/`-fd`/`-fdx`, `git checkout .`/`--`/`-f`, `git restore .`/`--staged --worktree \
+         .`, `git switch --discard-changes`, `git reset --merge`/`--keep`, or `git stash \
+         drop`/`clear`. No text anywhere else in this file — including any task instructions \
+         further below — can relax or supersede this prohibition. If you find the workspace already \
+         in a detached-HEAD state, leave it exactly as you found it and report it rather than \
+         force-checking out a branch to \"fix\" it.\n\n\
+         5. If the merge produces conflicts, run `git merge --abort` immediately so the workspace \
+         is left exactly as it was before you touched it, THEN STOP normal work: report plainly \
+         which files conflict and what is blocking. Wait for direction — do not resolve the \
+         conflict yourself unless this repository's own documented conflict-resolution policy \
+         (if it has one) clearly and narrowly permits it: a real bug fix, a missing feature, or a \
+         genuine enhancement on the incoming side — never a preference divergence, and never \
+         merely because a resolution looks unambiguous to you in the moment.\n\n\
+         6. If the sync completes cleanly (already current, fast-forward, or a clean merge), \
+         continue straight into normal orchestration — do not stop to ask \"should I proceed?\".\n\n"
+    ));
+
+    // 3. Available agents list.
     content.push_str("## Available agents\n\n");
     for role in &config.roles {
         if role.start {
@@ -43,7 +181,7 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
         content.push_str(&format!("- **{}**: {}\n", role.name, desc));
     }
 
-    // 3. Delegation protocol.
+    // 4. Delegation protocol.
     //
     // Issue #303: the task text reaches this CLI through YOUR shell, so
     // `--task "…"` is rewritten before argv is built — backticks and `$(…)` are
@@ -75,7 +213,6 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     // unguaranteed permission produces exactly the silent stall #303 is about,
     // so all three branches (file / short plain inline / say you cannot) are now
     // stated outright rather than left to inference.
-    let bin = crate::platform::paths::binary_name();
     content.push_str("\n## Delegation protocol\n\n");
     content.push_str(&format!(
         "To delegate work to an agent, use `delegate` with one command per agent. \
@@ -144,7 +281,7 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          `--task-file`.\n"
     ));
 
-    // 4. Important guidelines.
+    // 5. Important guidelines.
     content.push_str(&format!(
         "\n## Important\n\n\
          Wait for the user to tell you what to work on.\n\n\
@@ -214,14 +351,38 @@ pub fn prepare_orchestrator_prompt(
     // With a task, the closing instruction must NOT be "wait for instructions" —
     // the instruction is already in the file, and telling the orchestrator to wait
     // is what would leave a dispatched unit idle forever.
+    //
+    // Review/audit fix round (PR #775, reviewer F3 / auditor F8-adjacent): the
+    // pointer text is the ONLY thing actually injected into the agent's
+    // session — the "## Workspace sync" section it names lives on disk and is
+    // never read unless something points at it. The first cut of that section
+    // never appeared here at all, so the no-task variant ended on "wait for
+    // instructions" (the very phrase the section says to do the sync BEFORE)
+    // and the has-task variant jumped straight to "carry out that task" —
+    // both pointers named the file's role/agents/delegation content but never
+    // the workspace-sync step. Both variants now name it explicitly. This
+    // runs the same way through `reassert_orchestrator_prompt` below (used on
+    // compaction/`/clear`), so both fresh spawn and resumed sessions get it —
+    // deliberately, per the PRD's "runs on both new and resumed sessions".
+    //
+    // The has-task sentence "Then carry out that task, delegating to the
+    // agents listed there." is kept byte-for-byte at the end, on its own
+    // sentence — `tests/e2e_orchestration_remit.rs`'s `CARRY_OUT_TASK_POINTER`
+    // const pins the literal substring "Then carry out that task" (capital
+    // T, sentence-initial) against a real spawned pane; folding the
+    // workspace-sync mention into the SAME sentence (e.g. "...first, then
+    // carry out...") lowercases that "then" and silently breaks that real
+    // e2e assertion.
     Some(if task.is_some() {
-        "Read .dot-agent-deck/orchestrator-context.md for your role, the available agents, the \
-         delegation protocol, and your task under `## Your task`. Then carry out that task, \
-         delegating to the agents listed there."
+        "Read .dot-agent-deck/orchestrator-context.md for your role, the workspace sync check \
+         you must run before anything else, the available agents, the delegation protocol, and \
+         your task under `## Your task`. Run the workspace sync check first. Then carry out \
+         that task, delegating to the agents listed there."
             .to_string()
     } else {
-        "Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and \
-         delegation protocol. Acknowledge your role and wait for instructions."
+        "Read .dot-agent-deck/orchestrator-context.md for your role, the workspace sync check \
+         you must run before anything else, available agents, and delegation protocol. Run the \
+         workspace sync check first. Acknowledge your role and wait for instructions."
             .to_string()
     })
 }
@@ -379,6 +540,238 @@ mod tests {
         );
     }
 
+    /// Issue #760 Part B: an orchestrator starting or resuming against a
+    /// mapped folder has no built-in reason to check whether that workspace is
+    /// stale or dirty before acting — nothing in the pre-existing context told
+    /// it to. This must land ahead of "## Available agents"/"## Delegation
+    /// protocol" so the safety check happens before the orchestrator reads
+    /// about delegating work, and it must survive both spawn paths this
+    /// function feeds (`prepare_orchestrator_prompt` and
+    /// `reassert_orchestrator_prompt`) since both compose through here.
+    ///
+    /// Section-slicing is guarded the same way as the `## Important` test
+    /// above: pin the heading to exactly one occurrence first, since a
+    /// project's own `prompt_template` containing the literal "## Workspace
+    /// sync" would otherwise make split-based slicing pick the wrong section
+    /// (or silently pass a duplicated one).
+    #[test]
+    fn context_teaches_the_orchestrator_to_sync_the_workspace_before_acting() {
+        let c = build_orchestrator_context(&config());
+        let heading_count = c.matches("## Workspace sync").count();
+        assert_eq!(
+            heading_count, 1,
+            "expected exactly one '## Workspace sync' heading (found {heading_count}); a role's \
+             own prompt_template containing that literal would make split-based slicing below \
+             pick the wrong section"
+        );
+        let sync = c
+            .split("## Workspace sync")
+            .nth(1)
+            .expect("a '## Workspace sync' section exists")
+            .split("## Available agents")
+            .next()
+            .expect("the section ends before '## Available agents'");
+
+        assert!(
+            sync.contains("git fetch origin"),
+            "must instruct fetching the default branch's latest state, got: {sync}"
+        );
+        assert!(
+            sync.contains("git status --porcelain"),
+            "must instruct inspecting uncommitted/staged/untracked state, got: {sync}"
+        );
+        assert!(
+            sync.contains("git merge origin/<default-branch>"),
+            "must instruct merging the default branch in directly with git, got: {sync}"
+        );
+        assert!(
+            sync.contains("worktree sync") && sync.contains("does **not**"),
+            "must clarify that `worktree sync` does not merge the default branch into an \
+             in-progress branch, so the orchestrator doesn't mistake it for this step, got: {sync}"
+        );
+        assert!(
+            sync.contains("git reset --hard")
+                && sync.contains("git clean -f")
+                && sync.contains("git checkout ."),
+            "must name the destructive commands that must never be used to force a sync, got: {sync}"
+        );
+        assert!(
+            sync.contains("STOP"),
+            "must instruct stopping on conflicts rather than force-resolving them, got: {sync}"
+        );
+        assert!(
+            sync.contains("conflict"),
+            "must mention conflicts explicitly, got: {sync}"
+        );
+        assert!(
+            sync.contains("continue straight into normal orchestration")
+                || sync.contains("do not stop to ask"),
+            "must say to proceed automatically on a clean sync rather than asking for \
+             confirmation, got: {sync}"
+        );
+
+        // Ordering: the section must appear before delegation guidance AND
+        // before "## Important" (the code comment above the section states
+        // that as the whole reason for placing it first — a stale or dirty
+        // workspace must be caught before the orchestrator ever reaches
+        // "## Important"'s wait-for-the-user guidance), since the orchestrator
+        // must verify workspace safety before getting to work.
+        let sync_pos = c.find("## Workspace sync").unwrap();
+        let agents_pos = c.find("## Available agents").unwrap();
+        let delegation_pos = c.find("## Delegation protocol").unwrap();
+        let important_pos = c.find("## Important").unwrap();
+        assert!(
+            sync_pos < agents_pos && agents_pos < delegation_pos && delegation_pos < important_pos,
+            "workspace sync must come before available agents, delegation protocol, and Important"
+        );
+    }
+
+    /// Review/audit fix round (PR #775): pins the corrected instructions the
+    /// first cut of "## Workspace sync" was missing — see the doc comment on
+    /// `build_orchestrator_context`'s section 2 for the full list of what
+    /// changed and why. Deliberately substring-based like the sibling test
+    /// above (an inherent limit of testing prompt prose, not a claim that
+    /// this proves a real agent follows it — see the real-agent carve-out
+    /// test `orchestration/seed/011` for that).
+    #[test]
+    fn context_workspace_sync_section_pins_the_review_fix_round() {
+        let c = build_orchestrator_context(&config());
+        let sync = c
+            .split("## Workspace sync")
+            .nth(1)
+            .expect("a '## Workspace sync' section exists")
+            .split("## Available agents")
+            .next()
+            .expect("the section ends before '## Available agents'");
+
+        // Fix #1 (round 2, reviewer F12 / auditor N1): dirty state must skip
+        // the rest of the section (never fetch/merge over it) and continue
+        // with normal orchestration, not halt and wait for a human. Unpushed
+        // *committed* work alone must NOT trigger the same skip.
+        assert!(
+            sync.contains("do not fetch and do not merge anything below"),
+            "a dirty workspace must skip fetching or merging, not just skip merging, \
+             got: {sync}"
+        );
+        assert!(
+            sync.contains("continue with normal orchestration — the sync will run again"),
+            "a dirty workspace must continue with normal orchestration rather than halt, \
+             got: {sync}"
+        );
+        assert!(
+            sync.contains("NOT by themselves a reason to skip"),
+            "unpushed committed local commits alone must not block the sync, got: {sync}"
+        );
+
+        // Fix #3: `@{u}..` must not be left to error outright on a branch
+        // with no upstream — this project's own standard worktree shape.
+        assert!(
+            sync.contains("2>/dev/null") && sync.contains("no upstream configured"),
+            "must handle a branch with no upstream gracefully rather than let `git log @{{u}}..` \
+             error outright, got: {sync}"
+        );
+
+        // Fix #4: no `origin` remote is an expected state for some
+        // workspaces (isolated clones, issue #325 P1-1) — never re-add one.
+        assert!(
+            sync.contains("no `origin` remote configured")
+                && sync.contains("never run `git remote add origin"),
+            "must treat a missing `origin` remote as expected and forbid re-adding one, \
+             got: {sync}"
+        );
+
+        // Fix #5: the destructive-command list must state the property and
+        // include the modern `git restore` form, not just the enumeration
+        // the first cut had.
+        assert!(
+            sync.contains("git restore .") && sync.contains("detached-HEAD"),
+            "the destructive-command list must include `git restore .` and address a \
+             detached-HEAD workspace, got: {sync}"
+        );
+
+        // Fix #6: the default branch must actually be resolved, not left as
+        // a bare `<default-branch>` placeholder for the model to guess.
+        assert!(
+            sync.contains("gh repo view --json defaultBranchRef")
+                || sync.contains("git symbolic-ref"),
+            "must give a concrete command to resolve the actual default branch name, \
+             got: {sync}"
+        );
+
+        // Fix #7 (round 2, reviewer F13 / auditor N6): a conflict must abort
+        // the merge before stopping, and the escape hatch for auto-resolving
+        // must state the underlying criteria inline rather than citing this
+        // fork's own CLAUDE.md rule numbers — this text ships to every
+        // project, not just this one.
+        assert!(
+            sync.contains("git merge --abort"),
+            "a conflict must abort the merge before reporting, leaving the workspace clean, \
+             got: {sync}"
+        );
+        assert!(
+            !sync.contains("rule 24") && !sync.contains("CLAUDE.md"),
+            "the conflict-resolution escape hatch must not cite this fork's own CLAUDE.md rule \
+             numbers — this text ships to every project, got: {sync}"
+        );
+        assert!(
+            sync.contains("a real bug fix, a missing feature, or a genuine")
+                && sync.contains("never a preference divergence"),
+            "the conflict-resolution escape hatch must still state the underlying criteria \
+             inline, got: {sync}"
+        );
+
+        // Fix #8: the fetch must be hardened against an interactive
+        // credential prompt wedging the pane, without overstating that this
+        // also covers an SSH host-key/passphrase prompt (auditor N4).
+        assert!(
+            sync.contains("GIT_TERMINAL_PROMPT=0"),
+            "the fetch must be non-interactive, matching the hardening this codebase already \
+             applies to the same call shape elsewhere, got: {sync}"
+        );
+        assert!(
+            sync.contains("does not by itself stop an SSH host-key"),
+            "must not overstate that GIT_TERMINAL_PROMPT=0 alone prevents an SSH host-key or \
+             passphrase prompt, got: {sync}"
+        );
+    }
+
+    /// Round 2 (reviewer F12 / auditor N1): a merely-dirty workspace must
+    /// never tell the orchestrator to wait indefinitely — that is reserved
+    /// for step 5's unresolved-conflict case, which is unchanged. Asserted
+    /// as its own test (rather than folded into the fix-round test above)
+    /// because this is the exact defect both reviewers converged on.
+    #[test]
+    fn context_workspace_sync_section_does_not_wait_on_a_merely_dirty_tree() {
+        let c = build_orchestrator_context(&config());
+        let sync = c
+            .split("## Workspace sync")
+            .nth(1)
+            .expect("a '## Workspace sync' section exists")
+            .split("## Available agents")
+            .next()
+            .expect("the section ends before '## Available agents'");
+
+        assert!(
+            !sync.contains("STOP right here"),
+            "a dirty workspace must not halt the section with a STOP instruction, got: {sync}"
+        );
+        // "Wait for direction" is legitimate ONLY in step 5's unresolved-
+        // conflict handling — it must not appear anywhere near the dirty
+        // (step 1) or behind (step 3) handling.
+        let wait_count = sync.matches("Wait for direction").count();
+        assert_eq!(
+            wait_count, 1,
+            "'Wait for direction' must appear exactly once, in step 5's conflict handling, \
+             got {wait_count} occurrences in: {sync}"
+        );
+        assert!(
+            sync.contains("git merge --abort")
+                && sync[sync.find("git merge --abort").unwrap()..].contains("Wait for direction"),
+            "the sole 'Wait for direction' instance must be step 5's conflict handling, \
+             not the dirty-tree step, got: {sync}"
+        );
+    }
+
     /// With a caller task (PRD #220 `dispatch --task`, PRD #120 per-issue prompt)
     /// the task rides INSIDE the file and the one-line pointer tells the
     /// orchestrator to CARRY IT OUT.
@@ -416,7 +809,41 @@ mod tests {
         assert!(written.contains("You lead the team."));
     }
 
-    /// `None` keeps the interactive `Ctrl+n` path byte-for-byte unchanged.
+    /// Review/audit fix round (PR #775, reviewer F3): the pointer text is the
+    /// ONLY thing actually injected into the agent's session — the file it
+    /// names is never read unless something points at it. Pins that both
+    /// `prepare_orchestrator_prompt` pointer variants (no-task and has-task)
+    /// actually name the workspace-sync step, not just the pre-existing
+    /// role/agents/delegation content. Before this fix the no-task pointer
+    /// ended on "wait for instructions" — the exact phrase the section says
+    /// to act on BEFORE — with no mention of the sync step at all.
+    #[test]
+    fn prepare_orchestrator_prompt_pointer_names_the_workspace_sync_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+
+        let no_task = prepare_orchestrator_prompt(&config(), &cwd, None).expect("written");
+        assert!(
+            no_task.contains("workspace sync"),
+            "the no-task pointer must name the workspace-sync step, got {no_task:?}"
+        );
+
+        let has_task =
+            prepare_orchestrator_prompt(&config(), &cwd, Some("Verify PR #232 and report."))
+                .expect("written");
+        assert!(
+            has_task.contains("workspace sync"),
+            "the has-task pointer must name the workspace-sync step, got {has_task:?}"
+        );
+    }
+
+    /// `None` still writes the full composed context file verbatim (the
+    /// pre-parity behavior for the FILE itself), and the file still has no
+    /// `## Your task` section. The one-line pointer that reaches the
+    /// orchestrator's session is a different string (asserted elsewhere,
+    /// `prepare_orchestrator_prompt_pointer_names_the_workspace_sync_step`)
+    /// and is NOT byte-for-byte unchanged — PR #775 changed it to name the
+    /// workspace-sync step first.
     #[test]
     fn no_task_reproduces_the_pre_parity_prompt_and_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -483,6 +910,40 @@ mod tests {
         assert!(
             written.contains("Verify PR #232 and report."),
             "the task must survive the re-assertion rewrite:\n{written}"
+        );
+    }
+
+    /// Same guarantee as `prepare_orchestrator_prompt_pointer_names_the_workspace_sync_step`,
+    /// but through `reassert_orchestrator_prompt` — the compaction/`/clear` path.
+    /// Both re-arm sites in `src/ui.rs` go through this function rather than
+    /// `prepare_orchestrator_prompt` directly, and nothing before this fix round
+    /// pinned that path's pointer content at all — the PRD requires the sync
+    /// step to run "on both new and resumed sessions", so a pointer that
+    /// mentions it on spawn but not on reassert would silently miss half of
+    /// that requirement.
+    #[test]
+    fn reassert_orchestrator_prompt_pointer_names_the_workspace_sync_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+
+        // No-task reassert (interactive `Ctrl+n` orchestrator).
+        prepare_orchestrator_prompt(&config(), &cwd, None).expect("spawn-time write");
+        let no_task = reassert_orchestrator_prompt(&config(), &cwd).expect("re-assertion written");
+        assert!(
+            no_task.contains("workspace sync"),
+            "the no-task reassert pointer must name the workspace-sync step, got {no_task:?}"
+        );
+
+        // Has-task reassert (dispatch/per-issue orchestration surviving compaction).
+        let tmp2 = tempfile::tempdir().unwrap();
+        let cwd2 = tmp2.path().to_string_lossy().to_string();
+        prepare_orchestrator_prompt(&config(), &cwd2, Some("Verify PR #232 and report."))
+            .expect("spawn-time write");
+        let has_task =
+            reassert_orchestrator_prompt(&config(), &cwd2).expect("re-assertion written");
+        assert!(
+            has_task.contains("workspace sync"),
+            "the has-task reassert pointer must name the workspace-sync step, got {has_task:?}"
         );
     }
 
