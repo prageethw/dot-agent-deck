@@ -42981,7 +42981,7 @@ mod tests {
     /// that merely happen to be named identically) are each opened via the
     /// real `Action::SpawnPane` with the SAME typed orchestration Name — a
     /// routine coincidence (two projects, two orchestrations both called
-    /// "some name"). Before this fix round, `creator` was derived from the
+    /// "some/name"). Before this fix round, `creator` was derived from the
     /// bare Name-sanitized segment alone (identical for both), so both
     /// worktrees recorded the IDENTICAL `created-by:` owner despite being
     /// two live orchestrations in two completely unrelated repositories —
@@ -43034,7 +43034,7 @@ mod tests {
             let config = make_orchestration("review");
             let req = NewPaneRequest {
                 dir: repo.to_path_buf(),
-                name: "some name".to_string(),
+                name: "some/name".to_string(),
                 command: String::new(),
                 mode_config: None,
                 orchestration_config: Some(config.clone()),
@@ -43057,7 +43057,7 @@ mod tests {
                 None,
                 Rect::new(0, 0, 200, 50),
             );
-            let worktree = resolve_workspace_path(repo, &sanitize_workspace_segment("some name"));
+            let worktree = resolve_workspace_path(repo, &sanitize_workspace_segment("some/name"));
             assert!(
                 worktree.is_dir(),
                 "setup: the named open must have created a workspace at {}",
