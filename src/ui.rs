@@ -44040,19 +44040,36 @@ mod tests {
         );
     }
 
-    /// Scenario: fork issue #766 fix round 2 (reviewer M3). A nested pick
-    /// (a picked directory under, not equal to, its git toplevel) must
-    /// never take the legacy-creator-format fallback, even in the
-    /// adversarial case where an existing marker's stored `name=`/`creator=`
-    /// would satisfy the fallback's caller-identity check exactly, were it
-    /// ever reachable — proving `provision_isolated_clone_or_status`'s own
+    /// Scenario: fork issue #766 fix round 2 (reviewer M3), updated for PRD
+    /// fork#777. A nested pick (a picked directory under, not equal to, its
+    /// git toplevel) must never SILENTLY ADOPT an existing marker via the
+    /// legacy-creator-format fallback, even in the adversarial case where an
+    /// existing marker's stored `name=`/`creator=` would satisfy the
+    /// fallback's caller-identity check exactly, were it ever reachable —
+    /// proving `provision_isolated_clone_or_status`'s own
     /// `Some(relative_subpath) => LegacyFallbackEligibility::Nested` wiring
     /// (not just the enum's internal logic) genuinely gates it: deleting
     /// that gate, or wiring `Some` to `ToplevelWithIdentity` by mistake,
-    /// would turn this red.
+    /// would turn this red (the second call would then wrongly `Resume`
+    /// the FIRST clone instead of disambiguating).
+    ///
+    /// Before PRD fork#777, this refusal (`NameCollision`) was the call's
+    /// FINAL outcome — provisioning simply failed. Under fork#777, a
+    /// `NameCollision` refusal at the plain path is no longer final: per
+    /// the PRD's own Design §2 ("Different identity → ... retry ... under
+    /// the disambiguated name"), which draws no nested/legacy carve-out,
+    /// `provision_isolated_clone_or_status` now recovers by disambiguating
+    /// and provisioning a SEPARATE clone for the second, mismatched caller
+    /// — exactly as it would for any other genuine collision (see
+    /// `workspace_048`). This test now pins that the underlying #766 M3
+    /// safety property survives that change intact: the second caller's
+    /// disambiguated clone is owned by ITS OWN identity, never silently
+    /// inheriting the legacy marker, and the original legacy-marked clone
+    /// is left completely untouched.
     #[spec("orchestration/workspace/044")]
     #[test]
-    fn workspace_044_legacy_creator_marker_never_resumes_a_nested_pick() {
+    fn workspace_044_legacy_creator_marker_mismatch_disambiguates_a_nested_pick_instead_of_resuming()
+     {
         let tmp = tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         init_git_repo(&repo);
@@ -44131,7 +44148,11 @@ mod tests {
         // the stored creator is legacy-shaped AND matches this caller's own
         // identity exactly, so the ONLY thing standing between this and an
         // incorrect resume is `relative_subpath.is_some()` structurally
-        // mapping to `LegacyFallbackEligibility::Nested`.
+        // mapping to `LegacyFallbackEligibility::Nested`. Fork#777: that
+        // gate still fires internally -- the plain path is still refused as
+        // `NameCollision` -- but the caller no longer surfaces that as a
+        // final error; it disambiguates and provisions a SEPARATE clone for
+        // this second, mismatched identity instead.
         let result = provision_isolated_clone_or_status(
             &toplevel,
             Some(prefix.as_path()),
@@ -44139,17 +44160,64 @@ mod tests {
             &segment,
             "some-other-placeholder-creator",
         );
-        assert!(
-            result.is_err(),
-            "fork issue #766 M3: a nested pick must never take the legacy-creator-format \
-             fallback, even when the stored marker's identity matches this caller's own segment \
-             exactly -- got {result:?}"
+        let (resumed_dir, ..) = result.expect(
+            "fork#777: a nested pick refused via the legacy-fallback gate is an ordinary \
+             NameCollision like any other -- provisioning must recover by disambiguating and \
+             creating a SEPARATE clone for the second identity, not refuse the whole launch",
         );
-        let error = result.unwrap_err();
+
+        let expected_disambiguated_path = resolve_workspace_path(
+            &toplevel,
+            &disambiguate_workspace_segment(&segment, Some(prefix.as_path())),
+        );
         assert!(
-            error.contains("a different orchestration already opened"),
-            "fork issue #766 M3: the refusal must specifically be NameCollision (proving the \
-             nested-pick gate is what refused it, not some unrelated failure) -- got {error:?}"
+            PathBuf::from(&resumed_dir).starts_with(&expected_disambiguated_path),
+            "fork#777: the second, mismatched-identity pick must land on the disambiguated \
+             form {expected_disambiguated_path:?}, not the original legacy-marked clone -- got \
+             {resumed_dir:?}"
+        );
+        assert!(
+            !PathBuf::from(&resumed_dir).starts_with(&worktree_path),
+            "fork#777: the second pick must NOT reuse/overwrite the original legacy-marked \
+             clone at {worktree_path:?} -- got {resumed_dir:?}"
+        );
+
+        // fork issue #766 M3's underlying safety property survives intact:
+        // the disambiguated clone is owned by the SECOND caller's own
+        // identity, never silently inheriting the legacy marker's
+        // `creator=`.
+        let disambiguated_marker_content = std::fs::read_to_string(
+            crate::issue_dispatch_run::isolated_clone_provenance_path(&expected_disambiguated_path),
+        )
+        .expect("the disambiguated clone's own provenance marker must exist");
+        assert_eq!(
+            crate::issue_dispatch_run::isolated_clone_provenance_field(
+                &disambiguated_marker_content,
+                "creator"
+            )
+            .as_deref(),
+            Some(
+                crate::worktree_reclaim::sanitize_marker_creator("some-other-placeholder-creator")
+                    .as_str()
+            ),
+            "fork issue #766 M3: the disambiguated clone must be owned by the SECOND caller's \
+             own identity, never silently inheriting the legacy marker's creator"
+        );
+
+        // The ORIGINAL legacy-marked clone must remain completely
+        // untouched -- never silently adopted by the second, mismatched
+        // caller.
+        let original_marker_content =
+            std::fs::read_to_string(&marker_path).expect("original provenance marker still exists");
+        assert_eq!(
+            crate::issue_dispatch_run::isolated_clone_provenance_field(
+                &original_marker_content,
+                "creator"
+            )
+            .as_deref(),
+            Some(legacy_creator.as_str()),
+            "fork issue #766 M3: the original legacy-marked clone must remain untouched by the \
+             second, colliding caller's disambiguated provisioning"
         );
     }
 
