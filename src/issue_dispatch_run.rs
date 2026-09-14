@@ -4253,12 +4253,11 @@ impl ResumeRejection {
         match self {
             Self::Stranger => {
                 "a directory already exists there but was not created by this deck (no \
-                 ownership evidence found) — remove it manually, or pick a different Worktree \
-                 slug"
+                 ownership evidence found) — remove it manually, or pick a different Name"
             }
             Self::AncestryMismatch => {
                 "the existing directory's history does not match this project (wrong repo, or \
-                 stale) — remove it manually, or pick a different Worktree slug"
+                 stale) — remove it manually, or pick a different Name"
             }
             Self::AncestryUnverifiable => {
                 "the existing directory's history could not be compared against this project \
@@ -4272,12 +4271,9 @@ impl ResumeRejection {
             Self::Contested => "another request just resumed it first — try again",
             Self::NameCollision => {
                 "a different orchestration already opened the workspace at this location (its \
-                 provenance record names a different creator) — either a different Worktree \
-                 slug that sanitizes to the same directory, or the identical Worktree slug \
-                 picked against a different nested subdirectory of the same project; pick a \
-                 different Worktree slug (or reopen the exact same picked directory) instead of \
-                 retyping the Name, which no longer changes where this resolves. It may still \
-                 be in use by the orchestration that opened it — do not remove it"
+                 provenance record names a different creator) — pick a different Name instead \
+                 of this one. It may still be in use by the orchestration that opened it — do \
+                 not remove it"
             }
         }
     }
@@ -4467,20 +4463,18 @@ fn resume_existing_isolated_clone(
         // not merely namespace-prefixed — round 2's own review/audit fix
         // round (reviewer/auditor B1, BLOCKER): a bare
         // `starts_with("orchestration:")` test does not identify the
-        // legacy format at all, since TODAY's formats carry that same
-        // prefix too (a plain toplevel pick's path-derived creator, and a
-        // nested typed-slug pick's digest-fronted creator —
-        // `spawn_pane_creator_identity_seed`, `src/ui.rs`). Left as a bare
-        // prefix check, a toplevel pick could adopt, then irreversibly
-        // migrate, a CURRENT-format marker written by a nested typed-slug
-        // pick of the same repo typing the same slug — both write the same
-        // `name=` (the bare segment, never folded with the subpath) and can
-        // resolve to the same `clone_dir` (fork issue #763's accepted
-        // residual) — silently merging two live orchestrations into one
-        // physical clone and permanently orphaning the nested pick's own
-        // resume (`Nested` never gets a fallback). See
-        // `workspace_046_toplevel_pick_never_adopts_a_nested_picks_workspace_via_the_legacy_fallback`
-        // (`src/ui.rs`) for the regression this reproduces end to end.
+        // legacy format at all, since TODAY's own path-derived creator
+        // carries that same prefix too. (PRD fork#760 Part A, since
+        // reverted, briefly added a SECOND current-ish format — a
+        // digest-fronted creator for a nested pick with a typed Worktree
+        // slug. No build after the revert can ever produce that format
+        // again, but a workspace provisioned by a fork#760/#763-era build
+        // may still carry one on disk, so the shape test below stays
+        // general enough to keep rejecting it rather than assuming it can
+        // no longer occur.) Left as a bare prefix check, a toplevel pick
+        // could adopt, then irreversibly migrate, a CURRENT-format marker
+        // written under a colliding `name=` — silently merging two live
+        // orchestrations into one physical clone.
         //
         // The shape test below strips the `"orchestration:"` prefix and
         // runs the remaining suffix through
@@ -4489,10 +4483,10 @@ fn resume_existing_isolated_clone(
         // `name=` — and requires the result to equal the marker's own
         // stored `name=` exactly. For a genuine legacy marker the suffix
         // IS a bare segment, so this is a no-op fixed point and the check
-        // passes. For today's path-derived or digest-fronted suffixes, the
-        // extra structure they carry (path separators, a hex digest and a
-        // colon) essentially never sanitizes down to match a bare `name=`
-        // value — belt-and-suspenders alongside
+        // passes. For today's path-derived (or a legacy digest-fronted)
+        // suffix, the extra structure it carries (path separators, or a
+        // hex digest and a colon) essentially never sanitizes down to
+        // match a bare `name=` value — belt-and-suspenders alongside
         // [`LegacyFallbackEligibility::Disabled`]'s structural fix for
         // audit A2 (`src/dispatch.rs`'s own `dispatch:`-namespaced creator
         // can never legitimately match a legacy ORCHESTRATION marker, and
@@ -4501,10 +4495,8 @@ fn resume_existing_isolated_clone(
         //
         // `Nested`/`Disabled` both yield no identity branch at all — a
         // nested pick's legacy format never carried subpath information to
-        // compare against in the first place (fork issue #763's collision
-        // the digest-fronted creator format exists to prevent), and a
-        // caller with no real identity to offer has nothing this check can
-        // validate.
+        // compare against in the first place, and a caller with no real
+        // identity to offer has nothing this check can validate.
         const ORCHESTRATION_CREATOR_NAMESPACE: &str = "orchestration:";
         let stored_name = marker_content
             .as_deref()
