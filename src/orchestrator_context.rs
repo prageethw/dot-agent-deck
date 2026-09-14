@@ -20,8 +20,8 @@ use crate::project_config::OrchestrationConfig;
 // ---------------------------------------------------------------------------
 
 /// Build the orchestrator context file content.
-/// Includes the role's own prompt_template, the available-agents list, and
-/// delegation protocol instructions.
+/// Includes the role's own prompt_template, workspace-sync instructions, the
+/// available-agents list, and delegation protocol instructions.
 pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     let mut content = String::new();
 
@@ -33,7 +33,46 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
         content.push_str("\n\n");
     }
 
-    // 2. Available agents list.
+    // 2. Workspace sync (issue #760 Part B). Comes before everything else,
+    // including "## Important"'s wait-for-the-user guidance, because a stale
+    // or dirty workspace makes every subsequent step (delegation, review,
+    // merge) act on the wrong state.
+    let bin_for_sync = crate::platform::paths::binary_name();
+    content.push_str(&format!(
+        "## Workspace sync\n\n\
+         Before doing anything else — including before \"## Important\"'s instruction to wait \
+         for the user — check that this workspace is safe to touch and caught up with the \
+         repository's default branch:\n\n\
+         1. Inspect the workspace: uncommitted changes, staged changes, untracked files, and \
+         local commits not yet on the remote.\n\n\
+         ```bash\n\
+         git status --porcelain\n\
+         git log @{{u}}.. --oneline\n\
+         ```\n\n\
+         2. Fetch the default branch's latest state:\n\n\
+         ```bash\n\
+         git fetch origin\n\
+         ```\n\n\
+         3. If the workspace is behind, integrate the default branch into your current branch \
+         yourself. `{bin_for_sync} worktree sync` does **not** do this — it only fast-forwards a \
+         workspace onto the default branch once that workspace's own work has already merged, or \
+         does a read-only fetch otherwise; it never merges the default branch into an \
+         in-progress branch. A plain merge is the safe default unless this repository's own \
+         documented workflow calls for a rebase:\n\n\
+         ```bash\n\
+         git merge origin/<default-branch>\n\
+         ```\n\n\
+         4. NEVER force this through with `git reset --hard`, `git clean -f`/`-fd`, or \
+         `git checkout .`/`--` — these discard uncommitted, staged, or untracked work. Never \
+         discard partially-completed work just to make the sync look clean.\n\n\
+         5. If the merge produces conflicts, STOP normal work: report plainly which files \
+         conflict and what is blocking, and do not force a resolution by blindly picking one \
+         side. Wait for direction unless the correct resolution is genuinely unambiguous.\n\n\
+         6. If the sync completes cleanly (already current, fast-forward, or a clean merge), \
+         continue straight into normal orchestration — do not stop to ask \"should I proceed?\".\n\n"
+    ));
+
+    // 3. Available agents list.
     content.push_str("## Available agents\n\n");
     for role in &config.roles {
         if role.start {
@@ -43,7 +82,7 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
         content.push_str(&format!("- **{}**: {}\n", role.name, desc));
     }
 
-    // 3. Delegation protocol.
+    // 4. Delegation protocol.
     //
     // Issue #303: the task text reaches this CLI through YOUR shell, so
     // `--task "…"` is rewritten before argv is built — backticks and `$(…)` are
@@ -144,7 +183,7 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          `--task-file`.\n"
     ));
 
-    // 4. Important guidelines.
+    // 5. Important guidelines.
     content.push_str(&format!(
         "\n## Important\n\n\
          Wait for the user to tell you what to work on.\n\n\
@@ -376,6 +415,87 @@ mod tests {
              of your own, per docs/orchestration.md's documented split between CLAUDE.md rule 28's \
              live-process convention and the wait CLI's cross-turn backstop — an unscoped rewrite \
              (e.g. \"always use `wait start` when waiting\") must fail this test; got: {important}"
+        );
+    }
+
+    /// Issue #760 Part B: an orchestrator starting or resuming against a
+    /// mapped folder has no built-in reason to check whether that workspace is
+    /// stale or dirty before acting — nothing in the pre-existing context told
+    /// it to. This must land ahead of "## Available agents"/"## Delegation
+    /// protocol" so the safety check happens before the orchestrator reads
+    /// about delegating work, and it must survive both spawn paths this
+    /// function feeds (`prepare_orchestrator_prompt` and
+    /// `reassert_orchestrator_prompt`) since both compose through here.
+    ///
+    /// Section-slicing is guarded the same way as the `## Important` test
+    /// above: pin the heading to exactly one occurrence first, since a
+    /// project's own `prompt_template` containing the literal "## Workspace
+    /// sync" would otherwise make split-based slicing pick the wrong section
+    /// (or silently pass a duplicated one).
+    #[test]
+    fn context_teaches_the_orchestrator_to_sync_the_workspace_before_acting() {
+        let c = build_orchestrator_context(&config());
+        let heading_count = c.matches("## Workspace sync").count();
+        assert_eq!(
+            heading_count, 1,
+            "expected exactly one '## Workspace sync' heading (found {heading_count}); a role's \
+             own prompt_template containing that literal would make split-based slicing below \
+             pick the wrong section"
+        );
+        let sync = c
+            .split("## Workspace sync")
+            .nth(1)
+            .expect("a '## Workspace sync' section exists")
+            .split("## Available agents")
+            .next()
+            .expect("the section ends before '## Available agents'");
+
+        assert!(
+            sync.contains("git fetch origin"),
+            "must instruct fetching the default branch's latest state, got: {sync}"
+        );
+        assert!(
+            sync.contains("git status --porcelain"),
+            "must instruct inspecting uncommitted/staged/untracked state, got: {sync}"
+        );
+        assert!(
+            sync.contains("git merge origin/<default-branch>"),
+            "must instruct merging the default branch in directly with git, got: {sync}"
+        );
+        assert!(
+            sync.contains("worktree sync") && sync.contains("does **not**"),
+            "must clarify that `worktree sync` does not merge the default branch into an \
+             in-progress branch, so the orchestrator doesn't mistake it for this step, got: {sync}"
+        );
+        assert!(
+            sync.contains("git reset --hard")
+                && sync.contains("git clean -f")
+                && sync.contains("git checkout ."),
+            "must name the destructive commands that must never be used to force a sync, got: {sync}"
+        );
+        assert!(
+            sync.contains("STOP"),
+            "must instruct stopping on conflicts rather than force-resolving them, got: {sync}"
+        );
+        assert!(
+            sync.contains("conflict"),
+            "must mention conflicts explicitly, got: {sync}"
+        );
+        assert!(
+            sync.contains("continue straight into normal orchestration")
+                || sync.contains("do not stop to ask"),
+            "must say to proceed automatically on a clean sync rather than asking for \
+             confirmation, got: {sync}"
+        );
+
+        // Ordering: the section must appear before delegation guidance, since
+        // the orchestrator must verify workspace safety before getting to work.
+        let sync_pos = c.find("## Workspace sync").unwrap();
+        let agents_pos = c.find("## Available agents").unwrap();
+        let delegation_pos = c.find("## Delegation protocol").unwrap();
+        assert!(
+            sync_pos < agents_pos && agents_pos < delegation_pos,
+            "workspace sync must come before available agents and delegation protocol"
         );
     }
 
