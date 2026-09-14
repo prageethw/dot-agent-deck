@@ -4149,21 +4149,26 @@ impl AgentPtyRegistry {
     /// back on refusal.
     ///
     /// Issue #760 (reviewer R2 / auditor N1): a SECOND, independent
-    /// guard runs alongside the Name-based one above. Since #760 decoupled
-    /// the on-disk workspace path from `name` (a typed Worktree slug can
-    /// now put two *different* Names on the identical resolved `cwd`), the
-    /// Name-based check alone can no longer detect two live orchestrations
-    /// landing in one working tree — concretely, Name `alpha` + slug `fix`
-    /// and Name `beta` + slug `fix` in the same repo resolve to the same
-    /// on-disk directory but never collide on `name`, so the first check
-    /// waves the second one through. The added clause below makes a
-    /// concrete (`Some`) `cwd` an exclusive resource across pane ids
-    /// regardless of `name`: two different `pane_id`s can never
-    /// simultaneously hold a claim scoped to the identical `Some(cwd)`.
-    /// It deliberately mirrors none of the `cwd: None` wildcard semantics
-    /// above — an absent `cwd` on either side means "unknown to this
-    /// caller," never "identical to every other claim," so this clause
-    /// only ever fires when BOTH sides name the same concrete directory.
+    /// guard runs alongside the Name-based one above. The on-disk workspace
+    /// path is `sanitize_workspace_segment(name)`-derived, and that
+    /// sanitizer is not injective — two *different* Names can sanitize to
+    /// the identical segment (e.g. `fix/544` and `fix-544` both collapse to
+    /// `fix-544`), putting two different Names on the identical resolved
+    /// `cwd`. The Name-based check alone can't detect that case — two live
+    /// orchestrations in the same repo whose Names happen to collide this
+    /// way resolve to the same on-disk directory but never collide on
+    /// `name` itself, so the first check waves the second one through. The
+    /// added clause below makes a concrete (`Some`) `cwd` an exclusive
+    /// resource across pane ids regardless of `name`: two different
+    /// `pane_id`s can never simultaneously hold a claim scoped to the
+    /// identical `Some(cwd)`. It deliberately mirrors none of the `cwd:
+    /// None` wildcard semantics above — an absent `cwd` on either side
+    /// means "unknown to this caller," never "identical to every other
+    /// claim," so this clause only ever fires when BOTH sides name the
+    /// same concrete directory. (This was originally motivated by PRD
+    /// fork#760 Part A's separate typed Worktree-slug field, since
+    /// reverted — see that PRD's Decisions table — but the guard itself is
+    /// genuinely independent of what feeds the segment and stays.)
     pub fn claim_orchestration_name(&self, name: &str, cwd: Option<&str>, pane_id: &str) -> bool {
         let mut claims = self.orchestration_name_claims.lock().unwrap();
         let conflict = claims.iter().any(|(k, holder)| {
