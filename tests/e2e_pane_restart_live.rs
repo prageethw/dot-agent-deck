@@ -108,10 +108,13 @@ fn run_delegate_cli(
 /// task's one-line file-pointer (`compose_delegate_prompt`'s "Read
 /// .dot-agent-deck/worker-task-coder..." text, the same substring
 /// `tests/e2e_pi_live.rs` already waits for to prove a delegate landed)
-/// actually renders in `coder`'s pane through the STILL-ATTACHED TUI. A
-/// daemon that only fixes its own bookkeeping but never gets an
-/// already-attached viewer to follow the pane onto its new agent would pass
-/// every handler-level `pane/restart/*` test and still fail this one.
+/// actually renders in `coder`'s pane through the STILL-ATTACHED TUI once
+/// focused there (a `cat` stand-in carries no recognized agent identity, so
+/// the role card's own unfocused `Prmt:` preview field never activates for
+/// it — only the raw, focused PTY echo shows the pointer text). A daemon
+/// that only fixes its own bookkeeping but never gets an already-attached
+/// viewer to follow the pane onto its new agent would pass every
+/// handler-level `pane/restart/*` test and still fail this one.
 #[spec("pane/restart/011")]
 #[test]
 fn restart_011_restarted_pane_stays_reachable_in_an_already_attached_tui() {
@@ -197,12 +200,28 @@ fn restart_011_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         String::from_utf8_lossy(&delegate_output.stderr)
     );
 
+    // Focus coder's own role pane (command mode via Ctrl+d, then `2` jumps to
+    // role card 2 and focuses its pane -- coder is the second role declared
+    // in the fixture, after the start-role orchestrator) so its live,
+    // verbatim-echoed PTY content is what the detail panel actually draws.
+    // `cat` carries no recognized agent identity, so `is_empty_placeholder`
+    // (`src/ui.rs`) never clears for it -- that gate needs a genuine,
+    // non-synthetic status assertion from the agent's own hooks
+    // (`agent_report_activity_seen`, `src/state.rs`), which a bare `cat`
+    // stand-in never produces -- meaning the role card's own `Prmt:` preview
+    // (`tests/e2e_pi_live.rs`'s route for a real, hook-integrated agent) never
+    // activates here. The delegated pointer text is only ever observable
+    // through the raw PTY echo, which requires focus. `2` is an idempotent
+    // jump (repeated presses stay on card 2), so it is safe to retry via
+    // `send_keys_until_grid_string_within` against the async daemon
+    // round-trip a focus keystroke rides.
+    deck.send_bytes(b"\x04"); // PaneInput -> Command Mode
     assert!(
-        deck.wait_for_grid_string_within("worker-task-coder", Duration::from_secs(15)),
+        deck.send_keys_until_grid_string_within(b"2", "worker-task-coder", Duration::from_secs(15)),
         "a role restarted via `pane restart` must stay genuinely reachable in an \
-         ALREADY-ATTACHED TUI -- the delegated task's file-pointer text never \
-         rendered in coder's pane, meaning the attached view never followed the \
-         pane onto its new, restarted agent.\nGrid:\n{}",
+         ALREADY-ATTACHED TUI -- after focusing coder's role card, the delegated \
+         task's file-pointer text never rendered in coder's pane, meaning the \
+         attached view never followed the pane onto its new, restarted agent.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }
