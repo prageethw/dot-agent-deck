@@ -10356,7 +10356,26 @@ impl AppState {
             session.display_name = Some(name);
         }
 
-        if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
+        // Issue #730: the wrapper's fork-time `SessionStart`
+        // (`Emitter::emit_fork_session_start`, `src/wrap.rs`) fires the
+        // instant `cmd.spawn()` returns, purely to surface the dashboard
+        // card early — the wrapped child is typically still a launcher at
+        // that point, seconds from the real agent. `Emitter::build_event`
+        // stamps `agent_type` on every event unconditionally, including
+        // this one, so without this guard the fork-time event alone would
+        // flip `session.agent_type` away from `None` before the wrapped
+        // agent has identified itself — defeating the "Starting…" render
+        // gate (`is_untyped_agent` / `is_pending` in `render_session_card`)
+        // and letting a stale `session.status` (e.g. "Thinking") show
+        // through instead. `is_wrapper_fork_session_start` checks
+        // specifically for this marker (not the interface-ready/settled
+        // ones `is_wrapper_session_start` also covers) — those later
+        // signals genuinely do observe the wrapped child doing something,
+        // so they're left free to resolve `agent_type` as before.
+        if session.agent_type == AgentType::None
+            && event.agent_type != AgentType::None
+            && !event.is_wrapper_fork_session_start()
+        {
             session.agent_type = event.agent_type.clone();
         }
 
