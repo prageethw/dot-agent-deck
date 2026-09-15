@@ -10395,7 +10395,7 @@ pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRe
 
 /// Retry the REAL `dot-agent-deck pane restart <role>` CLI as a subprocess
 /// against `socket`, from `caller_pane`'s identity, until it succeeds or
-/// `timeout` elapses (upstream PR #918 review, `tests/e2e_pane_restart_live.rs`,
+/// `timeout` elapses (issue #782's `tests/e2e_pane_restart_live.rs`,
 /// `pane/restart/009`). A refusal whose stderr contains "has not crashed" —
 /// `handle_restart_role_with_state`'s (`src/state.rs`) exact wording when the
 /// daemon does not yet consider the pane crashed — means keep waiting, since

@@ -463,16 +463,17 @@ async fn pane_spawn_011_refuses_a_crashed_roles_spawn_with_a_pane_restart_pointe
 }
 
 // ---------------------------------------------------------------------------
-// Fix round (upstream PR #918 review): CLI-level RED coverage for `pane
-// spawn`'s own handling of `SocketReply::NoReply` and an unparseable reply
-// line — the identical pattern `tests/pane_restart.rs`'s
-// `pane_restart_007`/`008` pin for `pane restart`. `src/main.rs`'s
-// `PaneCmd::Spawn` arm used to fold BOTH into `return ExitCode::SUCCESS`,
-// which reads to an orchestrating agent as "spawned" when nothing happened.
-// These drive the REAL CLI binary against a stub Unix-socket "daemon" —
-// exactly `src/hook.rs`'s `socket_006_silent_close_returns_no_reply_not_empty_line`
-// stub-listener technique — rather than calling the handler directly like
-// every test above.
+// Fix-round (issue #782 / upstream PR #918 review): CLI-level RED coverage
+// for `pane spawn`'s own handling of `SocketReply::NoReply` and an
+// unparseable reply line — the identical pattern
+// `tests/pane_restart.rs`'s `pane_restart_007`/`008` pin for `pane restart`.
+// `src/main.rs`'s `PaneCmd::Spawn` arm used to fold BOTH into `return
+// ExitCode::SUCCESS`, which reads to an orchestrating agent as "spawned"
+// when nothing happened. These drive the REAL CLI binary against a stub
+// Unix-socket "daemon" — exactly `src/hook.rs`'s
+// `socket_006_silent_close_returns_no_reply_not_empty_line` stub-listener
+// technique — rather than calling the handler directly like every test
+// above.
 // ---------------------------------------------------------------------------
 
 /// Same deliberate, documented stderr-wording contract as

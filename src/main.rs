@@ -1896,7 +1896,7 @@ fn main() -> ExitCode {
                     // message below stays cause-agnostic rather than
                     // asserting "old daemon" and telling the agent to
                     // restart the whole daemon, which would be the worst
-                    // possible advice in that case (PR #918 review).
+                    // possible advice in that case (PR #783 fix round).
                     SocketReply::NoReply => {
                         eprintln!(
                             "Error: the daemon did not answer `pane restart {role}` in time — \
@@ -1957,10 +1957,10 @@ fn main() -> ExitCode {
                     }
                 };
                 use dot_agent_deck::hook::SocketReply;
-                // `pane spawn`'s own, larger reply budget — see
-                // `SPAWN_ROLE_REPLY_TIMEOUT`'s doc for why `delegate`'s 5s is
-                // too small now that a timeout is a hard failure rather than
-                // a silent success (PR #918 review).
+                // PR #783 fix round (auditor L1): `pane spawn`'s own, larger
+                // reply budget — see `SPAWN_ROLE_REPLY_TIMEOUT`'s doc for why
+                // `delegate`'s 5s is too small now that a timeout is a hard
+                // failure rather than a silent success.
                 let line = match dot_agent_deck::hook::send_and_await_spawn_role_reply(&json) {
                     SocketReply::Unreachable => {
                         eprintln!(
@@ -1976,7 +1976,7 @@ fn main() -> ExitCode {
                     // is "old daemon"; a `DeadlineExpired` here means the
                     // spawn may still be in flight, so the message below
                     // stays cause-agnostic rather than asserting "old
-                    // daemon" (PR #918 review).
+                    // daemon" (PR #783 fix round).
                     SocketReply::NoReply => {
                         eprintln!(
                             "Error: the daemon did not answer `pane spawn {role}` in time — \

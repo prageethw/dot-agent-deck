@@ -1,24 +1,25 @@
 #![cfg(feature = "e2e")]
 
-//! Upstream PR #918 review fix round: PTY-attached L2 coverage for `pane
-//! restart <role>` — the coverage gap every existing `pane/restart/*` entry
-//! (`tests/pane_restart.rs`) leaves open. Those tests all call
-//! `handle_restart_role_with_state` directly, bypassing the CLI/socket layer
-//! AND a real attached TUI entirely — they prove the daemon's own
-//! registry/`delegate_targets` bookkeeping survives a restart, never that an
-//! ALREADY-ATTACHED viewer keeps rendering the pane correctly once the
-//! daemon quietly swaps out its agent underneath it. That is fundamentally
-//! an attached-view question no handler-level test can exercise — exactly
-//! why this file is a genuine L2, PTY-attached test (modeled directly on
-//! `tests/e2e_pane_spawn_live.rs`'s `spawn_005`, the established real-TUI-
-//! via-PTY + real daemon + real CLI-subprocess technique for this same
-//! `pane <verb>` family), not another entry in `tests/pane_restart.rs`.
+//! PRD #699 fix-round (issue #782 / upstream PR #918 review): PTY-attached
+//! L2 coverage for `pane restart <role>` — the coverage gap every existing
+//! `pane/restart/*` entry (`tests/pane_restart.rs`) leaves open. Those tests
+//! all call `handle_restart_role_with_state` directly, bypassing the
+//! CLI/socket layer AND a real attached TUI entirely — they prove the
+//! daemon's own registry/`delegate_targets` bookkeeping survives a restart,
+//! never that an ALREADY-ATTACHED viewer keeps rendering the pane correctly
+//! once the daemon quietly swaps out its agent underneath it. That is
+//! fundamentally an attached-view question no handler-level test can
+//! exercise — exactly why this file is a genuine L2, PTY-attached test
+//! (modeled directly on `tests/e2e_pane_spawn_live.rs`'s `spawn_005`, the
+//! established real-TUI-via-PTY + real daemon + real CLI-subprocess
+//! technique for this same `pane <verb>` family), not another entry in
+//! `tests/pane_restart.rs`.
 
 mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, agent_records_on, retry_pane_restart_until_success};
+use common::{TuiDeck, commit_fixture, open_orchestration, retry_pane_restart_until_success};
 use dot_agent_deck::agent_pty::TabMembership;
 use spec::spec;
 
@@ -43,31 +44,28 @@ const LONG_LIVED_CONFIG: &str = "[[orchestrations]]\n\
      command = \"cat\"\n\
      clear = false\n";
 
-/// Drive the new-pane dialog to open the (single) orchestration in the
-/// `pane-restart-live` fixture. With no `[[modes]]` defined the Mode chip
-/// row is `[No mode] [Orch: restart-orch] [schedule]`, so ONE Right selects
-/// the orchestration; selecting an orchestration HIDES the Command field, so
-/// a second Enter submits the form. Mirrors
-/// `tests/e2e_pane_spawn_live.rs`'s own `open_orchestration` helper.
-fn open_orchestration(deck: &TuiDeck) {
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
-    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_keys(b"\x1b[C"); // Right -> [Orch: restart-orch]
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
-}
-
 /// Run the real `dot-agent-deck delegate` CLI as a subprocess from
-/// `caller_pane`'s identity, mirroring `tests/e2e_dispatcher_mode.rs`'s own
-/// `run_delegate_to` — reimplemented locally since integration test binaries
-/// cannot share helpers across files.
+/// `caller_pane`'s identity — the same fork-#358/#567 caller-identity
+/// technique `tests/e2e_work_done_reporting.rs`'s
+/// `run_delegate_cli_with_subject` and `tests/e2e_dispatcher_mode.rs`'s
+/// `run_delegate_to` already use, reimplemented locally since integration
+/// test binaries cannot share helpers across files.
 fn run_delegate_cli(
     deck: &TuiDeck,
     caller_pane: &str,
     to: &str,
     task: &str,
 ) -> std::process::Output {
+    let caller_record = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(caller_pane))
+        .expect("the caller pane must still be present in ListAgents");
+    let caller_generation = caller_record
+        .registration_generation
+        .expect("the caller pane must carry a registration_generation once registered");
+    let caller_boot_id = caller_record
+        .daemon_boot_id
+        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
     std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .arg("delegate")
         .arg("--to")
@@ -76,13 +74,18 @@ fn run_delegate_cli(
         .arg(task)
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", caller_pane)
+        .env(
+            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
+            caller_generation.to_string(),
+        )
+        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", caller_boot_id)
         .output()
         .expect("run the real `dot-agent-deck delegate` CLI")
 }
 
 /// Scenario: Open a real orchestration tab (`pane-restart-live` fixture:
 /// `orchestrator` [start] + `coder`, `coder` running a short-lived command
-/// so it exits on its own shortly after boot). Overwrite the RUNNING
+/// so it exits on its own shortly after boot). Mutate the RUNNING
 /// orchestration's own `.dot-agent-deck.toml` (the same "operator edited the
 /// config mid-session" technique `tests/e2e_pane_spawn_live.rs`'s `spawn_005`
 /// uses) so `coder`'s command becomes the long-lived `cat` — the post-restart
@@ -92,29 +95,36 @@ fn run_delegate_cli(
 /// subprocess (no `--force` needed, since the pane genuinely crashes on its
 /// own) until it succeeds, exactly as a real orchestrator agent would from
 /// inside its own pane: `ListAgents`/`agent_records()` deliberately filters
-/// out exited-but-not-reaped entries, so polling it for coder's `crashed ==
-/// Some(true)` marker can never observe that marker firing — the real CLI
-/// call itself, retried against the "has not crashed; pass --force" refusal
-/// (`src/state.rs`) until coder's boot command has actually exited, is the
-/// reliable signal available from outside the daemon. A successful restart
-/// IS the proof the precondition held; any OTHER failure is a genuine test
-/// failure, not a wait condition. Once restarted, prove the pane is
-/// genuinely reachable — not merely that the daemon's own registry says so —
-/// by running the REAL `dot-agent-deck delegate --to coder` CLI and
-/// confirming the delegated task's one-line file-pointer
-/// (`compose_delegate_prompt`'s "Read .dot-agent-deck/worker-task-coder..."
-/// text, the same substring `tests/e2e_pi_live.rs` already waits for to
-/// prove a delegate landed) actually renders in `coder`'s pane through the
-/// STILL-ATTACHED TUI once focused there. A daemon that only fixes its own
-/// bookkeeping but never gets an already-attached viewer to follow the pane
-/// onto its new agent would pass every handler-level `pane/restart/*` test
-/// and still fail this one.
+/// out exited-but-not-reaped entries (`src/agent_pty.rs:8071-8082`), so
+/// polling it for coder's `crashed == Some(true)` marker can never observe
+/// that marker firing — the real CLI call itself, retried against the "has
+/// not crashed; pass --force" refusal (`src/state.rs:8258-8266`) until
+/// coder's boot command has actually exited, is the reliable signal
+/// available from outside the daemon. A successful restart IS the proof the
+/// precondition held; any OTHER failure is a genuine test failure, not a
+/// wait condition. Once restarted, prove the pane is genuinely reachable —
+/// not merely that the daemon's own registry says so — by running the REAL
+/// `dot-agent-deck delegate --to coder` CLI and confirming the delegated
+/// task's one-line file-pointer (`compose_delegate_prompt`'s "Read
+/// .dot-agent-deck/worker-task-coder..." text, the same substring
+/// `tests/e2e_pi_live.rs` already waits for to prove a delegate landed)
+/// actually renders in `coder`'s pane through the STILL-ATTACHED TUI once
+/// focused there (a `cat` stand-in carries no recognized agent identity, so
+/// the role card's own unfocused `Prmt:` preview field never activates for
+/// it — only the raw, focused PTY echo shows the pointer text). A daemon
+/// that only fixes its own bookkeeping but never gets an already-attached
+/// viewer to follow the pane onto its new agent would pass every
+/// handler-level `pane/restart/*` test and still fail this one.
 #[spec("pane/restart/009")]
 #[test]
 fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("pane-restart-live");
+    let work = deck.workdir().to_path_buf();
+    // Isolated-clone provisioning needs a ref to branch from — an unborn HEAD
+    // (the harness's own bare `git init`) does not provide one.
+    commit_fixture(&work);
     deck.wait_for_string("No active sessions");
 
     open_orchestration(&deck);
@@ -128,10 +138,11 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         deck.snapshot_grid()
     );
 
-    // Read back the orchestrator's real (daemon-minted) pane id and cwd --
-    // both come from the daemon's own registry, never reconstructed by hand,
-    // matching `spawn_005`'s technique exactly.
-    let records = agent_records_on(deck.attach_socket_path());
+    // Read back the orchestrator's real (daemon-minted) pane id and the
+    // isolated-clone cwd its role panes actually run in -- both come from the
+    // daemon's own registry, never reconstructed by hand, matching
+    // `spawn_005`'s technique exactly.
+    let records = common::agent_records_on(deck.attach_socket_path());
     let orchestrator_record = records
         .iter()
         .find(|r| {
@@ -149,7 +160,7 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     let orchestration_cwd = orchestrator_record
         .cwd
         .clone()
-        .expect("the orchestrator role must carry its cwd");
+        .expect("the orchestrator role must carry its (isolated-clone) cwd");
 
     // Swap coder's command to a long-lived one BEFORE the restart retry loop
     // below starts: the respawn re-reads this file fresh
@@ -193,19 +204,23 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     // role card 2 and focuses its pane -- coder is the second role declared
     // in the fixture, after the start-role orchestrator) so its live,
     // verbatim-echoed PTY content is what the detail panel actually draws.
-    // `cat` carries no recognized agent identity, so the role card's own
-    // unfocused preview field never activates for it -- the delegated
-    // pointer text is only ever observable through the raw PTY echo, which
-    // requires focus.
+    // `cat` carries no recognized agent identity, so `is_empty_placeholder`
+    // (`src/ui.rs`) never clears for it -- that gate needs a genuine,
+    // non-synthetic status assertion from the agent's own hooks
+    // (`agent_report_activity_seen`, `src/state.rs`), which a bare `cat`
+    // stand-in never produces -- meaning the role card's own `Prmt:` preview
+    // (`tests/e2e_pi_live.rs`'s route for a real, hook-integrated agent) never
+    // activates here. The delegated pointer text is only ever observable
+    // through the raw PTY echo, which requires focus.
     //
     // A single `2` press, then a pure wait -- not a retry. The digit jump
-    // only resolves in `UiMode::Normal`; a successful `focus_deck` switches
-    // straight to `UiMode::PaneInput`, so only the FIRST `2` after `\x04` is
-    // ever interpreted as a jump -- resending `2` on a retry would land as a
-    // literal keystroke forwarded into whichever pane is already focused,
-    // not a jump, so it could never recover from the race it would be trying
-    // to guard against. Waiting once for the needle after a single press is
-    // both correct and sufficient here.
+    // only resolves in `UiMode::Normal` (`src/ui.rs`); a successful
+    // `focus_deck` switches straight to `UiMode::PaneInput`, so only the
+    // FIRST `2` after `\x04` is ever interpreted as a jump -- resending `2`
+    // on a retry would land as a literal keystroke forwarded into whichever
+    // pane is already focused, not a jump, so it could never recover from
+    // the race it would be trying to guard against. Waiting once for the
+    // needle after a single press is both correct and sufficient here.
     deck.send_bytes(b"\x04"); // PaneInput -> Command Mode
     deck.send_bytes(b"2"); // jump to role card 2 (coder) and focus it
     assert!(

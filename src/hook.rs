@@ -706,8 +706,8 @@ pub fn send_and_await_restart_role_reply(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(RESTART_ROLE_REPLY_TIMEOUT))
 }
 
-/// PR #918 review fix round: `pane spawn`'s own CLI round-trip budget. It
-/// used to share [`DELEGATE_REPLY_TIMEOUT`] (5s), which was fine while a
+/// PR #783 fix round (auditor L1): `pane spawn`'s own CLI round-trip budget.
+/// It used to share [`DELEGATE_REPLY_TIMEOUT`] (5s), which was fine while a
 /// timeout silently mapped to success; now that a `NoReply` timeout is a hard
 /// failure (see [`SocketReply::NoReply`]'s doc), that 5s budget turns a
 /// slow-but-successful spawn under load into a false failure. `pane spawn`
