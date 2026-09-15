@@ -32535,6 +32535,13 @@ mod tests {
             model: None,
         });
 
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "exactly one session must exist before the pane_id `.find()` below \
+             is a safe, order-independent lookup; got {:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
         let session = state
             .sessions
             .values()
@@ -32595,6 +32602,13 @@ mod tests {
             model: None,
         });
 
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "exactly one session must exist before the pane_id `.find()` below \
+             is a safe, order-independent lookup; got {:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
         let session = state
             .sessions
             .values()

@@ -7186,26 +7186,42 @@ impl AppState {
         // The snapshot's event-derived agent_type wins; fall back to the
         // spawn-time value only when the snapshot has none (or is absent).
         //
-        // Issue #730 (round 2, reviewer/auditor finding C): both sides of
-        // this fallback are already guarded AT THEIR SOURCE by this round's
-        // other two fixes, so no additional guard is added here — this
-        // function only consumes two already-clean upstream values:
-        // `snap.agent_type` is read straight off `AppState.sessions` (the
-        // daemon's own `ListAgents` join, `src/daemon_protocol.rs`), which
-        // now goes through the widened `apply_event` guard on BOTH the
-        // creation and update paths, so it can no longer carry a value the
-        // wrapper's own boot-provenance `SessionStart` taught it; `agent_type`
-        // (the spawn-time/registry value threaded in from
-        // `HydratedPane.agent_type` → `AgentRecord.agent_type`) is likewise
-        // now guarded at its own source, the hook-ingest guard added to
-        // `src/daemon.rs`'s `set_agent_type` call. What remains here is the
-        // pre-existing, deliberate PRD #76 M2.13 behaviour of falling back to
-        // a caller-DECLARED identity (the role config's `agent_type`, when a
-        // pane was spawned already knowing what it would run) rather than
-        // resetting to `AgentType::None` — a documented, accepted tradeoff:
-        // reconnect hydration reasonably wants the best-known value even when
-        // it is a declaration rather than an observation, and it is not the
-        // same defect class the two source-side guards close.
+        // Issue #730 (round 2, reviewer finding R2-1): this fallback is left
+        // unguarded deliberately, but NOT because both of its upstream inputs
+        // are clean — that claim was wrong for #730's own pane shape. For a
+        // declared-identity wrapped pane (`resolved_agent_type()` already
+        // `Some(Codex)` before the wrap starts, exactly #730's shape),
+        // `RunningAgent::agent_type` is seeded `Some(Codex)` at SPAWN time
+        // from `SpawnOptions::agent_type` (`src/agent_pty.rs`, around the
+        // `spawn` entry point), not learned later from a hook. The
+        // `set_agent_type` guard added in `src/daemon.rs` this round is
+        // upgrade-only (`if agent.agent_type.is_none()`) and is therefore a
+        // no-op for that pane class — `agent_type` here (threaded in from
+        // `HydratedPane.agent_type` → `AgentRecord.agent_type`) can still
+        // carry the wrapper-taught value on reconnect. `set_agent_type`'s
+        // guard is real only for the narrower population where the spawn-time
+        // identity was genuinely unresolved (`RunningAgent::agent_type`
+        // starts `None`) and a later hook (including a wrapper-origin one)
+        // would otherwise teach it prematurely.
+        //
+        // What actually makes this fallback safe to leave unguarded is a
+        // different, independent reason: `seed_hydrated_session` routes
+        // through `insert_placeholder_session`, which hardcodes
+        // `expects_agent_report = false`. `render_session_card`'s
+        // `is_pending = is_untyped_agent && session.expects_agent_report`
+        // gate (`src/ui.rs`) is therefore always `false` here regardless of
+        // what `effective_agent_type` resolves to — the render gate this PR
+        // is about is neutralized for reconnect hydration by construction,
+        // not because the value feeding it is clean.
+        //
+        // This does NOT neutralize the OTHER consumers of `session.agent_type`
+        // — prompt-delivery `agent_ready` checks and `ConfirmationCapability`
+        // still see a typed pane after reconnect for an agent that has not
+        // genuinely identified itself yet. That is a known, accepted gap for
+        // reconnected panes specifically (PRD #76 M2.13's pre-existing
+        // declared-identity tradeoff), not silently absent — reconnect
+        // hydration reasonably wants the best-known value even when it is a
+        // declaration rather than an observation.
         let effective_agent_type = match live {
             Some(snap) => snap.agent_type.clone().or(agent_type),
             None => agent_type,
