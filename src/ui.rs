@@ -32380,6 +32380,315 @@ mod tests {
         );
     }
 
+    /// Scenario: A placeholder explicitly awaiting an agent report (the
+    /// Codex/orchestration-role shape from `dashboard/placeholder/001`)
+    /// receives ONLY the wrapper's own fork-time `SessionStart` — the same
+    /// event `dashboard/placeholder/009` covers, built the same way. This
+    /// test pins a DIFFERENT field on the same event: `session.agent_type`
+    /// must stay `AgentType::None`, because `Emitter::emit_fork_session_start`
+    /// (`src/wrap.rs`) exists only "to surface the dashboard card early" and
+    /// deliberately stamps `SESSION_START_ORIGIN_METADATA_KEY` /
+    /// `WRAPPER_FORK_SESSION_START_ORIGIN` so readiness gates can tell it
+    /// apart from a genuine "the session is up and accepting input" signal.
+    #[spec("dashboard/placeholder/010")]
+    #[test]
+    fn dashboard_placeholder_010_wrapper_fork_session_start_must_not_set_agent_type() {
+        // Issue #730 (round 2 — reviewer M1 / auditor A widened this from the
+        // fork-only guard round 1 shipped): `AppState::apply_event`'s
+        // agent_type assignment now excludes every wrapper boot-provenance
+        // `SessionStart` — fork-time AND both interface facts, via
+        // `event.is_wrapper_session_start()` paired with
+        // `event.event_type == EventType::SessionStart` — not only the
+        // fork-time marker this test exercises. See
+        // `dashboard_placeholder_011_wrapper_interface_ready_session_start_must_not_set_agent_type`
+        // and `..._012_..._interface_settled_...` for the other two origins,
+        // and `..._013_...fresh_session...` for the session-CREATION path (a
+        // wrapper-origin event landing on no pre-existing placeholder — the
+        // shape the daemon-side `AppState` always sees, since
+        // `insert_placeholder_session*` is a TUI-only concept).
+        //
+        // `Emitter::build_event` (`src/wrap.rs`) stamps `agent_type:
+        // self.agent_type.clone()` unconditionally on every event the
+        // wrapper emits, including this one, so without the guard
+        // `session.agent_type` would flip to `Codex` the instant the
+        // fork-time event arrives — seconds before the wrapped agent has
+        // done any real work.
+        //
+        // That flip would defeat the render-layer "Starting…" gate in
+        // `render_session_card` (`is_untyped_agent = session.agent_type ==
+        // AgentType::None`; `is_pending = is_untyped_agent &&
+        // session.expects_agent_report`): once `agent_type` is non-`None`
+        // the card falls through to raw `session.status` instead of
+        // "Starting…", and Codex's own native hooks do not fire until its
+        // first turn completes — so the raw status can display a
+        // stale/leftover value (e.g. "Thinking") indefinitely, matching
+        // issue #730's reported symptom (Codex reviewer/auditor panes wedged
+        // showing "Thinking" pre-task, 8h+, zero hook events).
+        //
+        // This is a distinct field from `dashboard/placeholder/009`'s
+        // `expects_agent_report`/`agent_report_activity_seen`: that fix
+        // (issue #733) protects those two flags via
+        // `AgentEvent::is_daemon_synthetic()`; this guard protects
+        // `agent_type` itself, in `apply_event`'s separate assignment.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(AgentEvent {
+            session_id: "wrapper-fork-1".to_string(),
+            // The wrapper knows its own agent identity at fork time (it is
+            // handed the agent type on the command line), matching
+            // production and `dashboard/placeholder/009`'s construction.
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("1".to_string()),
+            agent_id: Some("d-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("the fork-time SessionStart must have kept (or created) a session");
+        assert_eq!(
+            session.agent_type,
+            AgentType::None,
+            "a wrapper fork-time SessionStart alone must not set \
+             session.agent_type — it is a card-surfacing signal, not \
+             evidence the wrapped agent has identified itself, and setting \
+             it prematurely defeats the 'Starting…' readiness gate \
+             (is_untyped_agent / is_pending) in render_session_card; got \
+             {session:?}"
+        );
+    }
+
+    /// Scenario: same construction as `dashboard/placeholder/010`, but the
+    /// wrapper's INTERFACE-READY `SessionStart` (`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`,
+    /// `Emitter::emit_interface_ready`, `src/wrap.rs`) arrives instead of the
+    /// fork-time one. `session.agent_type` must stay `AgentType::None` for
+    /// this origin too — round 1's guard covered only the fork-time marker,
+    /// which review round 2 found left this fact (and the settled one below)
+    /// free to re-stamp `agent_type` within a couple of seconds of fork,
+    /// undoing round 1's fix almost as soon as it took effect.
+    #[spec("dashboard/placeholder/011")]
+    #[test]
+    fn dashboard_placeholder_011_wrapper_interface_ready_session_start_must_not_set_agent_type() {
+        // Issue #730 (round 2): `is_wrapper_interface_ready_session_start()`
+        // is the STRONGEST wrapper readiness fact — the wrapper observed the
+        // child clear `ICANON`/`ECHO` on the inner PTY — but "the interface
+        // came up" is still not "the agent identified itself": it is boot
+        // provenance about the wrapper's own child, exactly the question
+        // `AgentEvent::is_wrapper_session_start()`'s doc (`src/event.rs`)
+        // answers, and the same question issue #733 already widened a
+        // sibling guard over (see that test's own reasoning, reused here).
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(AgentEvent {
+            session_id: "wrapper-fork-1".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("1".to_string()),
+            agent_id: Some("d-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "exactly one session must exist before the pane_id `.find()` below \
+             is a safe, order-independent lookup; got {:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("the interface-ready SessionStart must have kept (or created) a session");
+        assert_eq!(
+            session.agent_type,
+            AgentType::None,
+            "a wrapper interface-ready SessionStart alone must not set \
+             session.agent_type — it is boot provenance about the \
+             wrapper's own child, not evidence the wrapped agent has \
+             identified itself; got {session:?}"
+        );
+    }
+
+    /// Scenario: same construction as `dashboard/placeholder/011`, but the
+    /// wrapper's OUTPUT-SETTLED `SessionStart`
+    /// (`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`,
+    /// `Emitter::emit_interface_ready`, `src/wrap.rs`) arrives instead.
+    /// `session.agent_type` must stay `AgentType::None` for this origin too
+    /// — the weakest of the three facts, and per `src/wrap.rs`'s own doc on
+    /// `INTERFACE_SETTLE_WINDOW` explicitly "a GUESS" that can fire while a
+    /// shellenv-heavy launcher (`devbox run codex-big`, issue #730's own
+    /// production shape) is still canonical, not the exec'd agent.
+    #[spec("dashboard/placeholder/012")]
+    #[test]
+    fn dashboard_placeholder_012_wrapper_interface_settled_session_start_must_not_set_agent_type() {
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(AgentEvent {
+            session_id: "wrapper-fork-1".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("1".to_string()),
+            agent_id: Some("d-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "exactly one session must exist before the pane_id `.find()` below \
+             is a safe, order-independent lookup; got {:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("the interface-settled SessionStart must have kept (or created) a session");
+        assert_eq!(
+            session.agent_type,
+            AgentType::None,
+            "a wrapper interface-settled SessionStart alone must not set \
+             session.agent_type — src/wrap.rs's own doc on \
+             INTERFACE_SETTLE_WINDOW calls this fact a GUESS that can fire \
+             while a shellenv-heavy launcher is still canonical, not the \
+             exec'd agent; got {session:?}"
+        );
+    }
+
+    /// Scenario: a wrapper-origin `SessionStart` (fork-time, this test's
+    /// choice — the other two origins share the same `or_insert_with` path)
+    /// is the FIRST event this daemon/TUI ever sees for its session key — no
+    /// placeholder pre-exists. The freshly-CREATED session must also start
+    /// `agent_type: AgentType::None`, not the event's `Codex` — the
+    /// session-creation counterpart to `dashboard/placeholder/010`'s
+    /// session-UPDATE guard.
+    #[spec("dashboard/placeholder/013")]
+    #[test]
+    fn dashboard_placeholder_013_wrapper_session_start_creating_a_fresh_session_must_not_set_agent_type()
+     {
+        // Issue #730 (round 2, auditor finding B): `apply_event`'s
+        // `self.sessions.entry(..).or_insert_with(..)` stamps
+        // `agent_type: event.agent_type.clone()` when this is the FIRST
+        // event on a session key — unconditionally, before round 2. On the
+        // DAEMON side specifically this is the common case for a wrapped
+        // pane: `insert_placeholder_session*` is called only from
+        // `src/ui.rs` (TUI-side), so the daemon's own `AppState` (the exact
+        // side issue #730's original evidence — `daemon status` showing no
+        // live snapshot — was captured against) has no placeholder for the
+        // pane, and the wrapper's fork-time event both CREATES the session
+        // and (pre-fix) stamped its `agent_type` in the same step. This
+        // test reproduces that shape directly: no
+        // `insert_placeholder_session*` call before `apply_event`.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(AgentEvent {
+            session_id: "wrapper-fork-fresh-1".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("1".to_string()),
+            agent_id: Some("d-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let session = state
+            .sessions
+            .get("wrapper-fork-fresh-1")
+            .expect("the wrapper's fork-time SessionStart must have created a session");
+        assert_eq!(
+            session.agent_type,
+            AgentType::None,
+            "a wrapper-origin SessionStart that CREATES a session (no \
+             pre-existing placeholder — the daemon-side shape) must seed \
+             agent_type: AgentType::None, not the event's declared type; \
+             got {session:?}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
