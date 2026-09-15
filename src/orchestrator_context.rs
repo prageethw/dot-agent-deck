@@ -314,7 +314,13 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          anything, so you still need whatever check actually learns the outcome — and it keeps \
          the pane reading `Working` only while the wait is outstanding, not indefinitely; call \
          `wait done ... --outcome cancelled` instead of waiting for the TTL if you stop caring \
-         about the wait before it resolves. (Full detail: `docs/orchestration.md`.)\n"
+         about the wait before it resolves. (Full detail: `docs/orchestration.md`.)\n\n\
+         If a delegated worker's pane crashes, `{bin} pane restart <role>` brings it back \
+         without a human. If a role in the config was never spawned into this orchestration, \
+         `{bin} pane spawn <role>` brings it up. `<role>` comes from `.dot-agent-deck.toml`, \
+         which can itself be a cloned third-party repo, so single-quote it unless it's already \
+         a bare safe token when you compose either command as a shell string. See \
+         `docs/orchestration.md#restarting-and-spawning-worker-panes`.\n"
     ));
 
     content
@@ -537,6 +543,43 @@ mod tests {
              of your own, per docs/orchestration.md's documented split between CLAUDE.md rule 28's \
              live-process convention and the wait CLI's cross-turn backstop — an unscoped rewrite \
              (e.g. \"always use `wait start` when waiting\") must fail this test; got: {important}"
+        );
+    }
+
+    /// Issue #782 (upstream PR #918 review): the orchestrator context never
+    /// mentions `pane restart <role>` / `pane spawn <role>` (PRD #699) at
+    /// all, so an orchestrating agent has no way to discover either command
+    /// exists unless a human tells it out of band. Also pins that fixing
+    /// that omission must not drag `--force` into this composed paragraph —
+    /// forcing a restart on a HEALTHY pane is a people-only escalation per
+    /// the upstream review, so it isn't pre-taught here. That's deliberately
+    /// narrower than total containment, though (PR #783 fix round, auditor
+    /// M2): the daemon's own refusal — `"has not crashed; pass --force to
+    /// restart a healthy pane"` — is still printed verbatim to the agent's
+    /// own stderr the moment a plain restart is genuinely refused, and
+    /// `docs/orchestration.md`'s Troubleshooting entry documents it in full.
+    /// This paragraph only avoids teaching `--force` pre-emptively; it does
+    /// not, and structurally cannot, withhold it after a refusal.
+    #[test]
+    fn context_teaches_the_orchestrator_about_pane_restart_and_pane_spawn() {
+        let c = build_orchestrator_context(&config());
+        let bin = crate::platform::paths::binary_name();
+
+        assert!(
+            c.contains(&format!("{bin} pane restart")),
+            "the context must mention `pane restart <role>` by its real binary name \
+             ({bin:?}), got: {c}"
+        );
+        assert!(
+            c.contains(&format!("{bin} pane spawn")),
+            "the context must mention `pane spawn <role>` by its real binary name \
+             ({bin:?}), got: {c}"
+        );
+        assert!(
+            !c.contains("--force"),
+            "the agent-facing context must not mention `--force` anywhere — restarting a \
+             HEALTHY pane with --force is a people-only escalation, not guidance to hand the \
+             orchestrating agent, per the upstream PR #918 review; got: {c}"
         );
     }
 
