@@ -1,0 +1,430 @@
+name: Tag Release
+
+# Issue #1089: cut a release without a human pushing to the protected `main`.
+#
+# Until this workflow existed, the `/tag-release` skill told a maintainer to bump
+# the `flake.nix` version pin, commit it, and `git push origin HEAD` — straight at
+# a ruleset-protected branch. For an admin that SUCCEEDS, printing
+# `remote: Bypassed rule violations for refs/heads/main`, which CLAUDE.md rule 8
+# names as worse than a rejection: the gate decays into ceremony without anyone
+# deciding that it should. Every pin from v0.39.1 to v0.40.1 landed that way.
+#
+# The commit itself is unavoidable. Nix exposes `rev` but never tag names, so a
+# `nix run github:vfarcic/dot-agent-deck` build has no tag to read and would fall
+# back to Cargo.toml's `0.1.0` placeholder; the version has to be IN the tree the
+# tag points at. What was avoidable is a person pushing it — and that is all this
+# workflow changes. The identity it pushes under, `RELEASE_TOKEN`, is the same
+# admin PAT that `release.yml` and `docs-publish.yml` already use for their own
+# direct pushes to `main`. No new secret, no new bypass actor, no ruleset edit.
+#
+# WHY THE TAG IS CREATED HERE TOO, rather than left to a human `git push --tags`:
+# a workflow triggered BY a tag cannot create the commit that tag points at. The
+# ordering is pin -> commit -> push `main` -> tag -> push tag -> `release.yml`
+# fires on the tag push, so the entry point has to be a dispatch.
+#
+# WHY THE PIN COMMIT CARRIES NO `[skip ci]`: it is the commit that gets tagged,
+# and GitHub skips workflow runs for a push whose HEAD commit message carries a
+# skip marker — a tag push is an `on: push` event like any other, and its head
+# commit is the tagged commit. A `[skip ci]` pin would therefore mean no release
+# at all. The old skill's "create an empty preparation commit" step existed
+# solely to get out from under a `[skip ci]` HEAD before tagging; here the pin
+# commit IS a fresh non-skip commit, so the step is moot on the normal path. It
+# is not moot on the no-op path, which is why "Keep the tagged commit runnable"
+# below still exists. Leaving the marker off is better anyway: `ci.yml` then runs
+# against the exact tree being released, which did not happen for v0.40.1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, with no leading v (e.g. 0.40.2). Must equal what the changelog fragments compute unless allow_mismatch is set.'
+        required: true
+        type: string
+      allow_mismatch:
+        description: 'Tag `version` even though it differs from what the fragments compute. Deliberate override only.'
+        type: boolean
+        default: false
+      expected_head:
+        description: "The full 40-hex SHA of main's tip as you inspected it (git rev-parse origin/main). The workflow refuses if main has moved since. Omitting it releases whatever main's tip is when the job starts."
+        required: false
+        type: string
+        default: ''
+      tag_message:
+        description: 'Annotated tag message. Defaults to "Release v<version>".'
+        required: false
+        type: string
+        default: ''
+
+# The job pushes with RELEASE_TOKEN, never with GITHUB_TOKEN, so the automatic
+# token needs nothing beyond the read `actions/checkout` would use if the PAT
+# were absent. Narrow it rather than inheriting the repository default.
+permissions:
+  contents: read
+
+# Serialise with itself only. `release.yml` has its own `release` group and runs
+# in a separate workflow run triggered by the tag push, so it is not held here.
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      # Fail at step 1, not at the push. Same guard, same reasoning and very
+      # nearly the same words as `release.yml`'s `prepare` and
+      # `docs-publish.yml`'s `publish`: `main` is ruleset-protected and
+      # `github-actions[bot]` is deliberately NOT a bypass actor, because
+      # GITHUB_TOKEN cannot be one on a user-owned repository.
+      #
+      # What it does NOT cover, stated for the same reason those two state it:
+      # this tests emptiness only, so a token that is present but expired,
+      # revoked or under-scoped passes here and fails later at the push. That is
+      # deliberate — probing the token costs an API call and adds a failure mode
+      # of its own on the release path — but do not read a green step 1 as proof
+      # the token works.
+      - name: Verify RELEASE_TOKEN is present
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_TOKEN}" ]; then
+            echo "::error::RELEASE_TOKEN is unset or empty. This job pushes the flake version pin to the protected \`main\` branch and needs the admin PAT to bypass the ruleset; GITHUB_TOKEN cannot. See CLAUDE.md rule 8 and docs/develop/governance.md."
+            exit 1
+          fi
+
+      # `workflow_dispatch` can be fired from any branch that carries this file.
+      # The checkout below pins `main` regardless, so a dispatch from a branch
+      # would run THAT branch's workflow definition against `main`'s scripts and
+      # `main`'s tree — a combination nobody inspected. Refuse instead.
+      - name: Refuse to run off the default branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "${REF}" != "refs/heads/main" ]; then
+            echo "::error::Refusing to release: this workflow must be dispatched from \`main\`, not from '${REF}'. It pins, commits and tags \`main\`; running it from a branch would use that branch's workflow definition against main's tree."
+            exit 1
+          fi
+
+      # `ref: main` (not the dispatch SHA) so the release is cut from main's tip
+      # at the moment the job starts.
+      #
+      # THE TAGS ARE THE POINT of `fetch-depth: 0` here, not the history:
+      # `analyze.sh` derives the current version from `git tag --list 'v*'`, and
+      # the existing-tag guard below reads the same refs. `fetch-tags: true` is
+      # redundant with `fetch-depth: 0` — which the `build` job already relies on
+      # for `git describe` — but it is one line and it removes the need for a
+      # reader to know that. Worth knowing anyway: an empty tag list would make
+      # `analyze.sh` start from `v0.0.0` and propose `v0.0.1`, which cannot match
+      # the version the operator supplied, so the failure mode is a refusal
+      # rather than a wrong tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      # The version check alone does NOT make the human checkpoint binding, and
+      # the gap is narrow enough to be easy to miss: the operator reviews a
+      # fragment list at one moment and this job checks out `main` at another, so
+      # a fragment of the SAME bump class merging in between leaves the computed
+      # version identical, passes the comparison, and ships content nobody
+      # reviewed. The version is what the operator asserts; the SHA is what binds
+      # the assertion to a tree.
+      #
+      # Refusing is the whole design here — it deliberately does not check out
+      # the older SHA instead. The pin commit has to land on `main`, so building
+      # on a superseded tip would either need a non-fast-forward push or would
+      # tag a commit that is not on the branch. Re-deriving against the new tip
+      # is the operator's call, not this workflow's.
+      - name: Bind the release to the tree the operator inspected
+        env:
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "main is at ${HEAD_SHA}"
+          if [ -z "${EXPECTED_HEAD}" ]; then
+            echo "::warning::expected_head was not supplied, so this release is bound to whatever main's tip is right now rather than to the tree whose fragments were reviewed. A fragment of the same bump class landing in between leaves the computed version identical, so the version check below would not notice. The /tag-release skill always passes it."
+            exit 0
+          fi
+          # Enumerated ASCII, anchored: an exact 40-hex object name and nothing
+          # else. A short SHA is refused rather than resolved, because the whole
+          # point is an exact comparison against a value the operator recorded.
+          if [[ ! "${EXPECTED_HEAD}" =~ ^[0123456789abcdefABCDEF]{40}$ ]]; then
+            printf 'Rejected expected_head (escaped): %q\n' "${EXPECTED_HEAD}" >&2
+            echo "::error::Refusing to release: expected_head must be a full 40-character hex SHA (git rev-parse origin/main). The escaped value is in this step's log."
+            exit 1
+          fi
+          # Case-fold before comparing. `git rev-parse` always emits lowercase,
+          # so an uppercase value can only come from a human or a tool that
+          # uppercased it — and comparing those raw fails with an error naming
+          # two SHAs that look identical to the reader, which is a worse outcome
+          # than either accepting or plainly rejecting it. Bash 4 `${,,}` is fine
+          # here (the runner is bash 5); `cleanup.sh` avoids it only because a
+          # maintainer's macOS ships bash 3.2.
+          EXPECTED_HEAD="${EXPECTED_HEAD,,}"
+          if [ "${EXPECTED_HEAD}" != "${HEAD_SHA}" ]; then
+            echo "::error::Refusing to release: main is at ${HEAD_SHA} but you inspected ${EXPECTED_HEAD}. Something merged in between, so this release would carry fragments nobody reviewed. Re-run analyze.sh against the new tip and dispatch again. Nothing has been committed or tagged."
+            exit 1
+          fi
+          echo "main's tip matches the inspected tree."
+
+      - name: Validate the requested version
+        id: input
+        # Every GitHub-context value this workflow's scripts consume is bound
+        # through `env:` and read as a quoted shell variable, exactly as
+        # `release.yml` does and for the same reason: a `${{ }}` expression is
+        # substituted as raw text before bash parses the line, so a crafted
+        # dispatch input would otherwise execute as shell code in a job holding
+        # the admin PAT. Bound through `env:` the value is only ever data.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # A SECOND gate, not the only one: `release.yml`'s `prepare` re-validates
+          # with a fuller transcription of SemVer 2.0.0. This one exists because
+          # `prepare` runs only after the tag has been pushed, and a tag is the
+          # irreversible step this job owns. The classes are spelled out as ASCII
+          # enumerations and `LC_ALL=C` is pinned for the reason `prepare`
+          # documents at length: a bracket RANGE in a bash regex is resolved
+          # through the active locale's collation, so `[0-9]` is not ASCII-only
+          # and values like `1.2.3-é` passed under `en_US.UTF-8`.
+          export LC_ALL=C
+          VERSION="${INPUT_VERSION}"
+          # Trim the `v` people type out of habit rather than rejecting it: the
+          # tag is `vX.Y.Z` and the flake pin is `X.Y.Z`, and confusing the two
+          # is the single most likely operator slip here.
+          VERSION="${VERSION#v}"
+          d='[0123456789]'
+          nz='[123456789]'
+          # `-` last inside a bracket expression is a literal, never a range end.
+          alpha='[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-]'
+          alnum='[0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-]'
+          # `{0,18}` keeps each core field inside the `u64` that
+          # `semver::Version::parse` stores it in, so nothing this accepts can be
+          # rejected by `build.rs` downstream.
+          core="(0|${nz}${d}{0,18})"
+          ident="(0|${nz}${d}*|${d}*${alpha}${alnum}*)"
+          semver_re="^${core}[.]${core}[.]${core}(-${ident}([.]${ident})*)?([+]${alnum}+([.]${alnum}+)*)?"'$'
+          if [[ ! "$VERSION" =~ $semver_re ]]; then
+            # `%q` escapes the rejected value so it cannot start a line with
+            # `::` and forge a workflow command, nor span multiple lines.
+            printf 'Rejected version (escaped): %q\n' "$VERSION" >&2
+            echo "::error::Refusing to release: the requested version is not valid SemVer. Expected X.Y.Z, optionally -prerelease and +build. The escaped value is in this step's log."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::Refusing to release: tag v${VERSION} already exists. Delete it first (\`git push origin :refs/tags/v${VERSION}\`) if you are re-cutting a failed release, or pick the next version."
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive the version from the changelog fragments
+        id: derive
+        env:
+          REQUESTED: ${{ steps.input.outputs.version }}
+          ALLOW_MISMATCH: ${{ inputs.allow_mismatch }}
+        run: |
+          set -euo pipefail
+          # The same script the maintainer runs from the skill, deliberately:
+          # ONE implementation of the 0.x bump policy, which
+          # docs/develop/versioning.md cites as the implementation of its table.
+          # A second copy inlined here is exactly how the two would drift.
+          #
+          # Being the same script also bounds what the comparison below proves.
+          # It is NOT an independent derivation of the version — it is a
+          # RE-derivation at release time against what the operator said they
+          # were cutting. That catches a typo, a stale reading, and a fragment
+          # that landed between the operator's `analyze.sh` run and this
+          # dispatch. It does not catch a bug in `analyze.sh` itself; nothing
+          # here does.
+          #
+          # Note this runs a script out of `.claude/skills/` in a job holding the
+          # admin PAT. So does `release.yml` with `scripts/assemble-changelog.sh`
+          # and the Taskfile; the containment is that every change to it goes
+          # through a reviewed PR like any other code on this path.
+          ANALYSIS="${RUNNER_TEMP}/analysis.txt"
+          # analyze.sh exits 1 on ERROR=true, so run it without `set -e` killing
+          # the step before the branches below can turn its output into an
+          # actionable message.
+          set +e
+          bash .claude/skills/tag-release/analyze.sh > "${ANALYSIS}" 2>&1
+          rc=$?
+          set -e
+          cat "${ANALYSIS}"
+
+          if grep -q '^ERROR=true$' "${ANALYSIS}"; then
+            echo "::error::Refusing to release: analyze.sh reported an error. Its MESSAGE line is in this step's log."
+            exit 1
+          fi
+          if grep -q '^NO_FRAGMENTS=true$' "${ANALYSIS}"; then
+            echo "::error::Refusing to release: there are no changelog fragments in changelog.d/, so there is nothing to release."
+            exit 1
+          fi
+          if [ "${rc}" -ne 0 ]; then
+            echo "::error::Refusing to release: analyze.sh exited ${rc}. Its output is in this step's log."
+            exit 1
+          fi
+
+          COMPUTED=$(sed -n 's/^PROPOSED_VERSION=v\{0,1\}//p' "${ANALYSIS}")
+          if [ -z "${COMPUTED}" ]; then
+            echo "::error::Refusing to release: analyze.sh printed no PROPOSED_VERSION. Its output is in this step's log."
+            exit 1
+          fi
+
+          if [ "${COMPUTED}" != "${REQUESTED}" ]; then
+            if [ "${ALLOW_MISMATCH}" = "true" ]; then
+              echo "::warning::Releasing ${REQUESTED} although the fragments compute ${COMPUTED}. allow_mismatch was set, so this is a deliberate override."
+            else
+              echo "::error::Refusing to release: you asked for ${REQUESTED} but the fragments in changelog.d/ compute ${COMPUTED}. Either dispatch again with ${COMPUTED}, or set allow_mismatch if the difference is deliberate. Nothing has been committed or tagged."
+              exit 1
+            fi
+          fi
+          echo "computed=${COMPUTED}" >> "$GITHUB_OUTPUT"
+          # On the record in the run's own summary: which fragments this release
+          # actually carried, as read from the tree being tagged rather than from
+          # the operator's earlier local run.
+          {
+            echo "### Fragments in this release"
+            echo ""
+            sed -n '/^FRAGMENTS:$/,$p' "${ANALYSIS}" | tail -n +2 | sed 's/^  /- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pin the flake version
+        env:
+          VERSION: ${{ steps.input.outputs.version }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # The same assertions `release.yml`'s "Verify the flake version matches
+          # the release" step makes, but placed around the edit rather than after
+          # the tag. The two structural counts run BEFORE it — exactly one
+          # anchored `version = "...";` line, and exactly one
+          # `DAD_VERSION = version;` wiring it to the build, since a pin that
+          # agrees with the tag but is no longer handed to the build ships a
+          # binary reporting `0.1.0` (issue #250). The value check runs AFTER:
+          # the pin must read back as exactly the version being released, which
+          # is strictly stronger than release.yml's non-empty-extraction guard.
+          matches=$(grep -cE '^[[:space:]]*version = "[^"]+";[[:space:]]*$' flake.nix || true)
+          if [ "${matches:-0}" -ne 1 ]; then
+            echo "::error::Refusing to release: expected exactly one anchored 'version = \"...\";' line in flake.nix, found ${matches:-0}. The pin cannot be bumped safely."
+            exit 1
+          fi
+          wired=$(grep -cE '^[[:space:]]*DAD_VERSION = version;[[:space:]]*$' flake.nix || true)
+          if [ "${wired:-0}" -ne 1 ]; then
+            echo "::error::Refusing to release: expected exactly one anchored 'DAD_VERSION = version;' line in flake.nix, found ${wired:-0}. The pin is no longer wired to the build, so bumping it would change nothing the binary reports."
+            exit 1
+          fi
+
+          # The pin carries NO leading `v`: the tag is v0.40.2, the pin 0.40.2.
+          sed -i -E "s/^([[:space:]]*)version = \"[^\"]+\";\$/\\1version = \"${VERSION}\";/" flake.nix
+
+          FLAKE_VERSION=$(sed -nE 's/^[[:space:]]*version = "([^"]+)";[[:space:]]*$/\1/p' flake.nix)
+          if [ "${FLAKE_VERSION}" != "${VERSION}" ]; then
+            echo "::error::Refusing to release: after the edit flake.nix pins '${FLAKE_VERSION}' rather than '${VERSION}'. The substitution did not do what it was meant to."
+            exit 1
+          fi
+          # At most one line may have changed. Anything else means the pattern
+          # matched somewhere it should not have.
+          CHANGED=$(git diff --numstat -- flake.nix | awk '{print $1"/"$2}')
+          echo "flake.nix insertions/deletions: ${CHANGED:-0/0}"
+          if [ -n "${CHANGED}" ] && [ "${CHANGED}" != "1/1" ]; then
+            echo "::error::Refusing to release: bumping the pin changed more than one line in flake.nix (${CHANGED})."
+            exit 1
+          fi
+          git diff -- flake.nix
+
+      - name: Commit and push the pin
+        env:
+          VERSION: ${{ steps.input.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add flake.nix
+          if git diff --cached --quiet; then
+            echo "flake.nix already pins ${VERSION}; nothing to commit. This is the expected path when a previous run pushed the pin and then failed to tag."
+            exit 0
+          fi
+          # No `[skip ci]`, deliberately — see the header. This is the commit the
+          # tag will point at, and a skip marker on it would stop `release.yml`
+          # from running at all.
+          git commit -m "chore: pin flake version to v${VERSION}"
+          # No rebase-and-retry. If `main` advanced since the checkout, this push
+          # is rejected and the job stops with NOTHING done — no tag, no release.
+          # Rebasing would move the pin onto a tree nobody inspected, whose
+          # fragments may no longer compute the version being cut. Re-dispatch
+          # instead.
+          git push origin HEAD:refs/heads/main
+
+      - name: Keep the tagged commit runnable
+        # The residual half of the old skill's Step 3. On the normal path the pin
+        # commit above is HEAD and carries no skip marker, so this does nothing.
+        # It matters on the no-op path: if the pin was already correct, HEAD is
+        # whatever `main` last received — and `docs-publish.yml` ends every
+        # release by committing `chore: update docs chart to <tag> [skip ci]`, so
+        # main's tip very often DOES carry the marker. Tagging it would skip the
+        # release workflow silently.
+        run: |
+          set -euo pipefail
+          HEAD_MSG=$(git log -1 --format='%B' HEAD)
+          # Matched with bash's own `==` under `nocasematch` rather than through
+          # a `git log | grep -q` pipeline: `grep -q` exits on its first match,
+          # which can SIGPIPE the writer, and under `pipefail` that turns a
+          # successful match into a non-zero pipeline — i.e. "no marker found"
+          # exactly when one was.
+          #
+          # GitHub documents TWO ways to skip a run and both have to be here: the
+          # five bracket markers anywhere in the message, and a `skip-checks:
+          # true` TRAILER. The trailer is matched anywhere rather than only as a
+          # real trailer block, which errs toward inserting a preparation commit
+          # that was not strictly needed — harmless — instead of tagging a commit
+          # that silently never triggers the release. `analyze.sh`'s SKIP_CI is a
+          # narrower, advisory heuristic; this is the binding check.
+          shopt -s nocasematch
+          if [[ "${HEAD_MSG}" == *"[skip ci]"* || "${HEAD_MSG}" == *"[ci skip]"* || "${HEAD_MSG}" == *"[no ci]"* || "${HEAD_MSG}" == *"[skip actions]"* || "${HEAD_MSG}" == *"[actions skip]"* ]] \
+             || [[ "${HEAD_MSG}" =~ skip-checks[[:space:]]*:[[:space:]]*true ]]; then
+            echo "HEAD carries a skip-ci marker, which would stop the tag push from triggering release.yml. Adding an empty preparation commit."
+            git commit --allow-empty -m "chore: prepare release"
+            git push origin HEAD:refs/heads/main
+          else
+            echo "HEAD carries no skip-ci marker; the tag push will trigger release.yml."
+          fi
+
+      - name: Create and push the tag
+        env:
+          VERSION: ${{ steps.input.outputs.version }}
+          TAG_MESSAGE: ${{ inputs.tag_message }}
+        run: |
+          set -euo pipefail
+          MESSAGE="${TAG_MESSAGE}"
+          if [ -z "${MESSAGE}" ]; then
+            MESSAGE="Release v${VERSION}"
+          fi
+          # `-m` takes the message as a single argv element, so it is data even
+          # though the operator typed it.
+          git tag -a "v${VERSION}" -m "${MESSAGE}"
+          # The tag push is what triggers release.yml. It fires because this push
+          # is made under the RELEASE_TOKEN PAT rather than GITHUB_TOKEN: events
+          # raised by GITHUB_TOKEN do not start new workflow runs, PAT-raised
+          # ones do. The in-repo evidence is docs-publish.yml, whose PAT push to
+          # `main` carries `[skip ci]` precisely because it would otherwise
+          # trigger ci.yml.
+          git push origin "refs/tags/v${VERSION}"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.input.outputs.version }}
+          COMPUTED: ${{ steps.derive.outputs.computed }}
+        run: |
+          {
+            echo "## Tagged v${VERSION}"
+            echo ""
+            echo "- **Computed from fragments**: \`${COMPUTED}\`"
+            echo "- **Pin**: \`flake.nix\` now pins \`${VERSION}\` on \`main\`"
+            echo "- **Next**: the tag push triggers [Release](../../actions/workflows/release.yml); \`ci.yml\` also runs against the tagged tree on \`main\`."
+          } >> "$GITHUB_STEP_SUMMARY"
