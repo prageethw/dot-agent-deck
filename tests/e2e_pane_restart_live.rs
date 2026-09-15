@@ -148,7 +148,8 @@ fn restart_011_restarted_pane_stays_reachable_in_an_already_attached_tui() {
             Duration::from_secs(30)
         ),
         "precondition: coder's short-lived boot command must exit on its own and \
-         be marked crashed before this test restarts it.\nGrid:\n{}",
+         be marked crashed before this test restarts it.\nListAgents records:\n{:#?}\nGrid:\n{}",
+        common::agent_records_on(deck.attach_socket_path()),
         deck.snapshot_grid()
     );
 
