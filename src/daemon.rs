@@ -3432,7 +3432,43 @@ async fn run_hook_loop_with_idle_timeout(
                                          register a card with no local pane"
                                     );
                                 }
-                                pty_registry.set_agent_type(pane_id, &event.agent_type);
+                                // Issue #730 (round 2, auditor finding C,
+                                // narrowed per reviewer finding R2-1): the
+                                // registry's display badge must not LEARN its
+                                // identity from `dot-agent-deck wrap`'s own
+                                // boot-provenance `SessionStart` either — the
+                                // wrapped child is typically still a launcher
+                                // at fork and possibly still a shellenv at
+                                // "settled" (see the identical reasoning on
+                                // `AppState::apply_event`'s guard,
+                                // `src/state.rs`). `set_agent_type` itself is
+                                // upgrade-only (`if agent.agent_type.is_none()`,
+                                // `src/agent_pty.rs`), so this guard matters
+                                // only for the pane population where the
+                                // spawn-time identity was genuinely unresolved
+                                // (`RunningAgent::agent_type` starts `None`)
+                                // and a hook is the first thing to teach it —
+                                // it is a no-op for a declared-identity spawn
+                                // (`RunningAgent::agent_type` already
+                                // `Some(...)` from `SpawnOptions::agent_type`
+                                // at spawn time, exactly issue #730's own pane
+                                // shape), since the upgrade-only check already
+                                // refuses to overwrite a `Some`. Genuine
+                                // agent-origin events (native hooks, the
+                                // wrapper's own text/status classifier) carry
+                                // no boot-provenance marker and are
+                                // unaffected. See `src/state.rs`'s
+                                // `seed_hydrated_session` doc for why the
+                                // reconnect fallback that reads this same
+                                // registry value stays safe by a different,
+                                // independent mechanism (the render gate is
+                                // neutralized there, not this value).
+                                let is_wrapper_boot_session_start = event.event_type
+                                    == crate::event::EventType::SessionStart
+                                    && event.is_wrapper_session_start();
+                                if !is_wrapper_boot_session_start {
+                                    pty_registry.set_agent_type(pane_id, &event.agent_type);
+                                }
                             }
                             // Fan out to subscribed attach connections and
                             // apply locally as ONE ordered operation, so a
@@ -4228,6 +4264,138 @@ mod hook_ingestion_tests {
         drop(stalled);
         fixture.handle.abort();
         let _ = fixture.handle.await;
+    }
+
+    /// Scenario: issue #730 (round 2, reviewer finding R2-3) — the
+    /// `set_agent_type` guard added to `run_hook_loop`'s hook-ingest match
+    /// arm (the auditor-finding-C fix, `src/daemon.rs`) had zero coverage:
+    /// posting an UNMARKED `SessionStart` (the sibling
+    /// `run_hook_loop_persists_agent_type_into_registry`'s fixture) would
+    /// pass identically whether the guard exists or not, since it never
+    /// exercises `event.is_wrapper_session_start()`'s `true` branch. Mirror
+    /// that sibling's real-socket fixture but post a wrapper-origin
+    /// `SessionStart` FIRST (carrying `SESSION_START_ORIGIN_METADATA_KEY` /
+    /// `WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN` — the same weakest,
+    /// most-recently-fixed origin `dashboard/placeholder/012` exercises at
+    /// the `AppState` layer), then a genuine unmarked `SessionStart` for a
+    /// DIFFERENT agent type on the same pane. `set_agent_type` is
+    /// upgrade-only (`if agent.agent_type.is_none()`), so the two events'
+    /// relative ORDER makes the guard's effect directly observable without
+    /// racing a negative assertion against async ingestion: if the guard
+    /// suppresses the wrapper-origin event as designed, `agent_type` is
+    /// still `None` when the second event lands and `ClaudeCode` wins; if
+    /// the guard were absent (or scoped wrong), the wrapper-origin event's
+    /// `Codex` would win the race for the registry's `is_none()` check and
+    /// the later unmarked `ClaudeCode` event would be silently dropped as a
+    /// no-op upgrade, leaving `Codex` — this test's regression signal.
+    #[spec("hooks/delivery/009")]
+    #[tokio::test]
+    async fn hooks_delivery_009_wrapper_origin_session_start_must_not_teach_registry_agent_type() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-it-730".to_string(),
+                )],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        // Spawn-time guess is None — same starting state as the sibling
+        // fixture, and the precondition that makes the ordering trick above
+        // meaningful (an already-Some spawn-time type would make
+        // `set_agent_type` a no-op regardless of the guard, per the round-2
+        // fix to `seed_hydrated_session`'s doc comment in `src/state.rs`).
+        assert_eq!(registry.agent_records()[0].agent_type, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        // See the umask comment in `run_hook_loop_persists_agent_type_into_registry`
+        // for why this deliberately binds without `bind_socket`.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let shutdown = Arc::new(Notify::new());
+
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+        });
+
+        // One connection, two lines in order: `run_hook_loop`'s per-connection
+        // read loop (`while let Some(line) = read_bounded_hook_line(...)`)
+        // processes lines from the SAME connection sequentially, so writing
+        // both on one stream (rather than the sibling test's single-line
+        // stream) pins the ordering this test's assertion depends on.
+        let mut stream = UnixStream::connect(&sock)
+            .await
+            .expect("connect hook socket");
+
+        let wrapper_origin_event = serde_json::json!({
+            "session_id": "wrapper-origin-sess",
+            "agent_type": "codex",
+            "event_type": "session_start",
+            "timestamp": "2026-06-20T12:00:00Z",
+            "pane_id": "pane-it-730",
+            "metadata": {
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY:
+                    crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN,
+            },
+        });
+        stream
+            .write_all(format!("{wrapper_origin_event}\n").as_bytes())
+            .await
+            .expect("write wrapper-origin SessionStart hook line");
+        stream.flush().await.unwrap();
+
+        let genuine_event = serde_json::json!({
+            "session_id": "wrapper-origin-sess",
+            "agent_type": "claude_code",
+            "event_type": "session_start",
+            "timestamp": "2026-06-20T12:00:01Z",
+            "pane_id": "pane-it-730",
+        });
+        stream
+            .write_all(format!("{genuine_event}\n").as_bytes())
+            .await
+            .expect("write genuine SessionStart hook line");
+        stream.flush().await.unwrap();
+
+        // Ingestion is async — poll the registry until a type lands, bounded
+        // so a regression (neither event's type ever persisted) fails fast.
+        let mut learned = None;
+        for _ in 0..40 {
+            if let Some(rec) = registry.agent_records().into_iter().next()
+                && rec.agent_type.is_some()
+            {
+                learned = rec.agent_type;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            learned,
+            Some(AgentType::ClaudeCode),
+            "the wrapper-origin SessionStart must not have taught the \
+             registry's display badge its Codex identity — if it had, the \
+             upgrade-only set_agent_type guard (`if agent.agent_type.is_none()`) \
+             would have refused the later genuine SessionStart's ClaudeCode \
+             value and this would read Some(Codex) instead"
+        );
+
+        handle.abort();
+        // Await the aborted task so it drops its `registry` Arc clone before
+        // we tear the registry down — strictly sequences cleanup instead of
+        // racing `shutdown_all` against the still-live loop task.
+        let _ = handle.await;
+        registry.shutdown_all();
     }
 
     /// Scenario: PR #507 fix-round rework (reviewer M2/S1). The original
