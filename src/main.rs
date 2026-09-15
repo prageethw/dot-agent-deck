@@ -199,6 +199,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: OrchestratorCmd,
     },
+    /// Manage the calling pane's own worker panes within its orchestration
+    /// (issue #868).
+    Pane {
+        #[command(subcommand)]
+        cmd: PaneCmd,
+    },
     /// Daemon-side subcommands. Used internally by remote transports — not
     /// part of the everyday user surface.
     Daemon {
@@ -360,6 +366,27 @@ enum OrchestratorCmd {
     /// extension in Pi's global extension dir. Idempotent (re-run to refresh a
     /// stale copy). Exits non-zero with the install hint when `pi` is absent.
     Setup,
+}
+
+#[derive(Subcommand)]
+enum PaneCmd {
+    /// Restart a worker role's pane within the calling orchestrator's own
+    /// orchestration (issue #868). Recovery for a role marked `crashed`;
+    /// refused for a healthy role unless `--force` is given.
+    Restart {
+        /// Worker role name to restart (as declared in .dot-agent-deck.toml).
+        role: String,
+        /// Restart even when the target pane's current agent hasn't
+        /// crashed. Without this, restarting a healthy pane is refused.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Spawn a worker role that is declared in .dot-agent-deck.toml but was
+    /// never spawned into this running orchestration instance (issue #868).
+    Spawn {
+        /// Worker role name to spawn (as declared in .dot-agent-deck.toml).
+        role: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1240,6 +1267,167 @@ fn main() -> ExitCode {
                             }
                         }
                     }
+                }
+            }
+        },
+        Some(Commands::Pane { cmd }) => match cmd {
+            PaneCmd::Restart { role, force } => {
+                let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        eprintln!(
+                            "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let signal = dot_agent_deck::event::RestartRoleSignal {
+                    pane_id,
+                    role: role.clone(),
+                    force,
+                    timestamp: chrono::Utc::now(),
+                };
+                let msg = dot_agent_deck::event::DaemonMessage::RestartRole(signal);
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize restart-role signal: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                use dot_agent_deck::hook::SocketReply;
+                // Issue #868: `pane restart`'s own, larger reply budget —
+                // see `RESTART_ROLE_REPLY_TIMEOUT`'s doc for why `delegate`'s
+                // 5s is too small for a respawn's worst case.
+                let line = match dot_agent_deck::hook::send_and_await_restart_role_reply(&json) {
+                    SocketReply::Unreachable => {
+                        eprintln!(
+                            "Error: could not reach the dot-agent-deck daemon socket, so the \
+                             restart of role {role} was NOT delivered."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
+                    // restart` must not read a silent close as success — but
+                    // `NoReply` folds several distinct `ReplyReadError`
+                    // causes (see its doc comment above), only one of which
+                    // is "old daemon"; a `DeadlineExpired` here means the
+                    // restart may well have already succeeded, so the
+                    // message below stays cause-agnostic rather than
+                    // asserting "old daemon" and telling the agent to
+                    // restart the whole daemon, which would be the worst
+                    // possible advice in that case (PR #918 review).
+                    SocketReply::NoReply => {
+                        eprintln!(
+                            "Error: the daemon did not answer `pane restart {role}` in time — \
+                             either it does not support this command (an older build; restart \
+                             the daemon to pick up the new one) or the restart is still in \
+                             flight and may have already succeeded. Check the pane before \
+                             retrying — retrying a successful restart will kill and respawn it \
+                             again."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    SocketReply::Line(line) => line,
+                };
+                let resp =
+                    serde_json::from_str::<dot_agent_deck::event::RestartRoleResponse>(&line)
+                        .ok()
+                        .filter(|r| r.is_restart_role_reply());
+                let Some(resp) = resp else {
+                    eprintln!(
+                        "Error: the running daemon sent an unexpected reply to \
+                         `pane restart {role}` — it may not support this command; restart \
+                         the daemon to pick up the new build."
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if resp.restarted {
+                    println!("Restarted role {role}");
+                    ExitCode::SUCCESS
+                } else {
+                    eprintln!(
+                        "Error: restart of role {role} failed: {}",
+                        resp.error.as_deref().unwrap_or("unknown error")
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+            PaneCmd::Spawn { role } => {
+                let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        eprintln!(
+                            "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let signal = dot_agent_deck::event::SpawnRoleSignal {
+                    pane_id,
+                    role: role.clone(),
+                    timestamp: chrono::Utc::now(),
+                };
+                let msg = dot_agent_deck::event::DaemonMessage::SpawnRole(signal);
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize spawn-role signal: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                use dot_agent_deck::hook::SocketReply;
+                // `pane spawn`'s own, larger reply budget — see
+                // `SPAWN_ROLE_REPLY_TIMEOUT`'s doc for why `delegate`'s 5s is
+                // too small now that a timeout is a hard failure rather than
+                // a silent success (PR #918 review).
+                let line = match dot_agent_deck::hook::send_and_await_spawn_role_reply(&json) {
+                    SocketReply::Unreachable => {
+                        eprintln!(
+                            "Error: could not reach the dot-agent-deck daemon socket, so the \
+                             spawn of role {role} was NOT delivered."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
+                    // spawn` must not read a silent close as success — but
+                    // `NoReply` folds several distinct `ReplyReadError`
+                    // causes (see its doc comment above), only one of which
+                    // is "old daemon"; a `DeadlineExpired` here means the
+                    // spawn may still be in flight, so the message below
+                    // stays cause-agnostic rather than asserting "old
+                    // daemon" (PR #918 review).
+                    SocketReply::NoReply => {
+                        eprintln!(
+                            "Error: the daemon did not answer `pane spawn {role}` in time — \
+                             either it does not support this command (an older build; restart \
+                             the daemon to pick up the new one) or the spawn is still in \
+                             flight. Check the pane before retrying."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    SocketReply::Line(line) => line,
+                };
+                let resp = serde_json::from_str::<dot_agent_deck::event::SpawnRoleResponse>(&line)
+                    .ok()
+                    .filter(|r| r.is_spawn_role_reply());
+                let Some(resp) = resp else {
+                    eprintln!(
+                        "Error: the running daemon sent an unexpected reply to \
+                         `pane spawn {role}` — it may not support this command; restart \
+                         the daemon to pick up the new build."
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if resp.spawned {
+                    println!("Spawned role {role}");
+                    ExitCode::SUCCESS
+                } else {
+                    eprintln!(
+                        "Error: spawn of role {role} failed: {}",
+                        resp.error.as_deref().unwrap_or("unknown error")
+                    );
+                    ExitCode::FAILURE
                 }
             }
         },

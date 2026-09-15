@@ -439,6 +439,22 @@ If critical context is missing, surface it in your work-done summary.
 """
 ```
 
+## Restarting and spawning worker panes
+
+Two CLI subcommands reach into a **running** orchestration without restarting the whole tab or the deck: `dot-agent-deck pane restart <role>` and `dot-agent-deck pane spawn <role>`. Both are scoped by `DOT_AGENT_DECK_PANE_ID` exactly like [`dot-agent-deck delegate`](#how-delegation-works) — the calling pane must be the orchestration's own orchestrator; both commands refuse a call from a non-orchestrator pane.
+
+`dot-agent-deck pane restart <role>` restarts a worker role's pane within the calling orchestrator's own orchestration — its primary intended use is the orchestrating agent recovering on its own after a worker pane's agent crashes, rather than a human reaching for it from the TUI. `dot-agent-deck pane spawn <role>` spawns a role that is declared in `.dot-agent-deck.toml` but was not yet spawned into the running orchestration — for example, a role you added to the config file after the tab was already open; it is refused if the role is already live in this orchestration instance, or if it is not in the config at all.
+
+A `prompt_template` line can make the self-healing behavior explicit:
+
+```
+If a delegated worker role stops responding or its pane looks dead, run
+`dot-agent-deck pane restart <role>` for that role yourself, then re-delegate
+the task it was working on. Only ask the user if the restart itself fails.
+```
+
+You don't have to add this yourself to get the behavior — the orchestrator's own context teaches it both commands automatically, so a `prompt_template` line like the one above is reinforcement, not the only way the orchestrator learns these commands exist.
+
 ## Validate your config
 
 Run `dot-agent-deck validate` to check your `.dot-agent-deck.toml` for issues before opening an orchestration tab:
@@ -585,6 +601,18 @@ The `dot-agent-deck delegate` and `work-done` commands read `DOT_AGENT_DECK_PANE
 ### "delegate from non-orchestrator pane"
 
 Only the role with `start = true` can call `dot-agent-deck delegate`. If a worker tries to delegate, the daemon rejects it and logs this message. Check that your config has exactly one role with `start = true`.
+
+### `pane restart` says "has not crashed; pass --force to restart a healthy pane"
+
+`dot-agent-deck pane restart <role>` refuses a healthy pane unless you pass `--force` — without the flag, restart only succeeds against a pane the daemon has flagged as having exited on its own (which includes, but is not limited to, a genuine crash: a role whose command simply finished, even with a clean exit, is equally restartable without `--force`). This is deliberate: without it, the command could accidentally force-kill a worker mid-task. `--force` is left out of the orchestrator's own composed context on purpose, so an orchestrating agent isn't pre-taught it (see [Restarting and spawning worker panes](#restarting-and-spawning-worker-panes)) — but that only avoids teaching it pre-emptively. This exact refusal message is still printed verbatim to the agent's own stderr the moment a plain restart is genuinely refused, so an orchestrating agent does learn about `--force`, just one step later than the composed context. Reaching for `--force` yourself from a shell instead of instructing an agent to pass it is a preference for keeping that escalation a guaranteed human-only step, not something the system enforces.
+
+### `pane restart` never detects a wedged-but-alive agent
+
+Restart only acts on a pane the daemon has flagged as having actually exited — a process that is still running but hung (wedged on I/O, stuck in a loop, deadlocked) is not detected as crashed, and `pane restart` on it is refused with "has not crashed" the same as a genuinely healthy pane, with no further explanation beyond pointing at `--force`. If you suspect a worker is wedged rather than merely slow, check its pane's actual output before reaching for `--force`.
+
+### `pane spawn` refuses to create a second pane under an already-running role name
+
+`dot-agent-deck pane spawn <role>` is refused if the role is already live — it starts a NEW pane for a role that has none, not a second instance of one that already has one. To run two instances of the same kind of worker at once, give the second one its own role name in `.dot-agent-deck.toml` (e.g. `reviewer2`) rather than spawning the same name twice.
 
 ### Worker receives no task
 
