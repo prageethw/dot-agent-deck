@@ -8169,6 +8169,30 @@ impl AppState {
     }
 }
 
+/// Shared by [`handle_restart_role_with_state`]'s early (pre-lock) crash
+/// check and its issue #789 post-lock recheck: `pane_id`'s occupant must be
+/// currently crashed, or `force` must be set, or the restart is refused with
+/// the same wording either check produces.
+fn restart_refusal_for_crashed_pane(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    role: &str,
+    force: bool,
+) -> Option<String> {
+    let crashed = registry
+        .authorized_occupant(pane_id)
+        .as_deref()
+        .and_then(|id| registry.agent_record_any(id))
+        .is_some_and(|record| record.crashed == Some(true));
+    if crashed || force {
+        return None;
+    }
+    Some(format!(
+        "pane {pane_id} (role `{role}`) has not crashed; pass --force to restart \
+         a healthy pane"
+    ))
+}
+
 /// PRD #699 M2: handle `dot-agent-deck pane restart <role>` — an
 /// orchestrator asking the daemon to restart one of its own worker roles
 /// on demand. Recovery for a role M1 marked `crashed` (the ordinary case),
@@ -8287,18 +8311,11 @@ pub async fn handle_restart_role_with_state(
         // — set at spawn and overwritten at respawn (`set_authorized_occupant`),
         // never cleared by a crash — so it still names the crashed agent's id
         // until a respawn/recreate replaces it.
-        let target_agent_id = registry.authorized_occupant(&pane_id);
-        let crashed = target_agent_id
-            .as_deref()
-            .and_then(|id| registry.agent_record_any(id))
-            .is_some_and(|record| record.crashed == Some(true));
-        if !crashed && !signal.force {
+        if let Some(error) =
+            restart_refusal_for_crashed_pane(registry, &pane_id, &signal.role, signal.force)
+        {
             return RestartRoleResponse {
-                error: Some(format!(
-                    "pane {pane_id} (role `{}`) has not crashed; pass --force to restart \
-                     a healthy pane",
-                    signal.role
-                )),
+                error: Some(error),
                 ..Default::default()
             };
         }
@@ -8336,6 +8353,24 @@ pub async fn handle_restart_role_with_state(
     // its own respawn — see this function's doc comment.
     let dispatch_mutex = registry.pane_dispatch_lock(&resolved.pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
+
+    // Issue #789 (TOCTOU): the read-guard check above ran BEFORE this lock
+    // was acquired, so a concurrent `clear = true` delegation
+    // (`dispatch_one_owned`, which takes this same dispatch lock) can have
+    // installed a healthy replacement into the pane while this restart was
+    // queued behind the lock. Repeat the identical crash check now that the
+    // lock is actually held, before touching `recreate_identity` or calling
+    // `respawn_or_recreate_agent_for_pane` — otherwise this function would
+    // blindly respawn whatever now occupies the pane. `--force` is
+    // unaffected: it skips this recheck exactly as it skips the early one.
+    if let Some(error) =
+        restart_refusal_for_crashed_pane(registry, &resolved.pane_id, &signal.role, signal.force)
+    {
+        return RestartRoleResponse {
+            error: Some(error),
+            ..Default::default()
+        };
+    }
 
     // Issue #706: reserve the registration generation and read the daemon
     // boot id under one write-guard acquisition BEFORE building
