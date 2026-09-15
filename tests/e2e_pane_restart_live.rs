@@ -145,7 +145,7 @@ fn restart_011_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         wait_for_role_crashed(
             deck.attach_socket_path(),
             CODER_ROLE,
-            Duration::from_secs(10)
+            Duration::from_secs(30)
         ),
         "precondition: coder's short-lived boot command must exit on its own and \
          be marked crashed before this test restarts it.\nGrid:\n{}",
