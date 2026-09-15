@@ -1,4 +1,4 @@
-import { createFixtureSnapshot, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
@@ -13,6 +13,7 @@ import type { HandoffEdge,
   DaemonResolvedProject,
   DeckAction,
   DeckActionResult,
+  DeckFleet,
   DeckSnapshot,
   EvidenceItem,
   RuntimeMode,
@@ -24,7 +25,20 @@ import type { HandoffEdge,
 export interface DesktopSnapshotDto {
   connection: {
     status: "connected" | "disconnected" | "incompatible";
+    /** What the deck is CALLED — `Endpoint::describe()`. A label, never a key. */
     socketPath: string;
+    /**
+     * What the deck IS — `EndpointIdentity::wire_id()`, an opaque
+     * `deck-<16 hex>` token (PRD #742 M5).
+     *
+     * `daemonId` is derived from THIS and never from `socketPath` again.
+     * `socketPath` is `describe()`, which renders neither the remote socket
+     * path, the identity file nor the jump host — so two `[[endpoints.remote]]`
+     * rows naming two daemons on ONE host described identically, folded into one
+     * group, and their agents shared a key. The composite `(daemonId, agentId)`
+     * does not save that, because the key component is the collision.
+     */
+    deckId: string;
     /** `"local"` or `"remote"` — PRD #741 M7. Always present. */
     deckKind: string;
     /** Why Stop and Replace are unavailable; present exactly for a remote deck. */
@@ -81,6 +95,89 @@ export interface DesktopSnapshotDto {
   scheduleRevision?: number;
   protocolVersion: number;
   source: "daemon";
+  /**
+   * Every deck the crate is observing, by `connection.deckId`, in observed
+   * order with the SELECTED deck first (PRD #742 M5).
+   *
+   * # What it replaced, and why it had to
+   *
+   * M4 found there is no event for a deck LEAVING the observed set:
+   * `apply_selection` ends the departed deck's watcher, and under `All` ->
+   * `local` the resolved deck does not move, so nothing is emitted at all. A
+   * bridge that only upserts what arrives would have kept that deck's agents on
+   * screen, frozen and looking live. M4 approximated membership by resetting it
+   * at `connect()`; this is the exact version, so the departed deck goes on the
+   * next arrival from ANY deck rather than on the next handshake.
+   *
+   * It also carries "which deck is selected" as `fleet[0]` — a question nothing
+   * on this stream could answer before, since under `All` every observed deck
+   * emits the same shape.
+   *
+   * Every deck's snapshot carries the same list, so folding one may prune all.
+   *
+   * Optional here only so a single-deck DTO literal in a test need not restate
+   * it — the crate always emits it, and never empty. Read an absent or empty
+   * list as "this payload says nothing about membership", which is how
+   * `pruneFleet` treats it: it prunes NOTHING rather than clearing the screen.
+   */
+  fleet?: string[];
+  /**
+   * The members of {@link fleet} the app cannot connect to (PRD #742 M12) — a
+   * configured deck whose socket path is not filled in yet.
+   *
+   * Such a deck gets no watcher, because there is no address to watch, so it
+   * never emits a snapshot of its own and {@link pruneFleet} would never have
+   * anything to keep. The crate states it here instead: the row exists, it has
+   * no address, and here is what to call it and what to say. That is a fact
+   * from the settings document rather than a connection state nobody measured,
+   * which is the distinction {@link pruneFleet} refuses to cross on its own.
+   *
+   * Carried on every snapshot for the same reason `fleet` is, and optional for
+   * the same reason: a single-deck DTO literal in a test need not restate it.
+   */
+  unconfigured?: UnconfiguredDeckDto[];
+  /**
+   * The members of {@link fleet} the app CONNECTS to, each NAMED (PRD #742
+   * M14) — whether or not it has reported yet.
+   *
+   * A deck joins {@link fleet} when the settings document is applied and emits
+   * its own snapshot only once its watcher has established, which for a remote
+   * deck is a tunnel, a handshake and a `ListAgents` away. This is what lets a
+   * deck in that window be RENDERED rather than merely counted: `fleet` carries
+   * `deck-<16 hex>` hashes, and a stored settings row's id is a different value
+   * entirely, so there is no id-to-name join on this side to reach for.
+   *
+   * Every connectable deck is listed, the ones that have already reported
+   * included — which of them this bridge has heard from is a question only this
+   * bridge can answer, and {@link fleetView} answers it by looking in its own
+   * map.
+   *
+   * Carried on every snapshot and optional for the same reasons {@link fleet}
+   * and {@link unconfigured} are. Read an absent field as "this payload says
+   * nothing about naming", exactly as {@link adoptUnconfigured} reads an absent
+   * `unconfigured`.
+   */
+  observed?: ObservedDeckDto[];
+}
+
+/** One configured-but-unaddressed deck (PRD #742 M12). */
+export interface UnconfiguredDeckDto {
+  /** The crate's `unconfigured_deck_id` — disjoint from every real `deckId`. */
+  deckId: string;
+  /** `user@host[:port]`. */
+  label: string;
+  /** Why there is nothing to show. */
+  reason: string;
+}
+
+/** One deck the app connects to, named before it has reported (PRD #742 M14). */
+export interface ObservedDeckDto {
+  /** The crate's `deck_wire_id` — the key this deck's own snapshot arrives under. */
+  deckId: string;
+  /** A socket path for a local deck, `user@host[:port]` for a remote one. */
+  label: string;
+  /** Whether this deck runs on this machine; what decides how it is named. */
+  deckKind?: "local" | "remote";
 }
 
 export interface DesktopAgentDto {
@@ -279,8 +376,8 @@ export interface RemoteEndpointDto {
 export type AppearanceMode = "system" | "light" | "dark";
 
 /**
- * The `Selection` token that means the local deck, and therefore the one word
- * an endpoint id may not be (`LOCAL_SELECTION_TOKEN` in `settings.rs`).
+ * The `Selection` token that means the local deck, and therefore one of the two
+ * words an endpoint id may not be (`LOCAL_SELECTION_TOKEN` in `settings.rs`).
  *
  * The local deck is deliberately **not** a stored row: `Endpoint::local()`
  * resolves it from the platform paths the way every caller did before endpoints
@@ -288,6 +385,19 @@ export type AppearanceMode = "system" | "light" | "dark";
  * deleting the section gets the local deck back rather than nothing.
  */
 export const LOCAL_ENDPOINT_SELECTION = "local";
+
+/**
+ * The `Selection` token that means every configured deck at once — PRD #742's
+ * fleet — and therefore the other word an endpoint id may not be
+ * (`ALL_SELECTION_TOKEN` in `settings.rs`).
+ *
+ * Reserved on both sides rather than merely recognised here: `all` is a legal
+ * id *shape*, so `EndpointId::parse` refuses it case-insensitively and a
+ * hand-written `id = "all"` row fails to load. Without that the one stored
+ * string would be ambiguous between the fleet and a row somebody named after
+ * it.
+ */
+export const ALL_ENDPOINT_SELECTION = "all";
 
 /** `RemoteEndpoint::DEFAULT_PORT` — what a row with no `port` key means. */
 export const DEFAULT_SSH_PORT = 22;
@@ -317,6 +427,39 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettingsDto = {
  * reload.
  */
 export const FIXTURE_SETTINGS_KEY = "dot-agent-deck.desktop-settings";
+
+/** The fingerprint of a document that declares no `[endpoints]` section. */
+const UNSPECIFIED_ENDPOINTS = "unspecified";
+
+/**
+ * The `[endpoints]` section as one comparable string (PRD #742 M4).
+ *
+ * What it answers is "could this document have changed which decks the app
+ * observes", and the whole section is the honest answer to that: the selection
+ * decides whether the fleet is one deck or all of them, and each row's address
+ * fields decide which deck a row IS — a changed `socket`, `identity` or `jump`
+ * names a different daemon or a different route to it, which is exactly the
+ * distinction `EndpointIdentity` was introduced for on the Rust side.
+ *
+ * It is deliberately coarse in one direction: a row edited from one unreachable
+ * address to another re-establishes the fleet for nothing. That costs one
+ * handshake against a deck the user is actively editing, which is the cheapest
+ * possible moment to spend one.
+ *
+ * `JSON.stringify` over fields this module names in this order, so the answer
+ * does not depend on the key order the crate happened to serialise.
+ */
+function endpointsFingerprint(settings: DesktopSettingsDto): string {
+  const endpoints = settings.endpoints;
+  // `undefined` is UNSPECIFIED and never empty — see `DesktopSettingsDto`. A
+  // document that says nothing about the section left whatever is on disk
+  // exactly where it was, so it cannot have changed which decks are observed.
+  if (!endpoints) return UNSPECIFIED_ENDPOINTS;
+  return JSON.stringify([
+    endpoints.selection,
+    endpoints.remote.map((row) => [row.id, row.host, row.user, row.port, row.socket, row.identity, row.jump]),
+  ]);
+}
 
 /**
  * Coerce anything read back from storage into a valid document. An unknown
@@ -521,7 +664,18 @@ export type DesktopRunActionDto =
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" };
 
-type SnapshotListener = (snapshot: DeckSnapshot) => void;
+/**
+ * PRD #742 M4: the listener takes the WHOLE fleet, never one deck's snapshot.
+ *
+ * It used to take one, and that was the shape the last-wins flicker came out
+ * of: with `Selection::All` the desktop crate runs one watcher per observed
+ * deck, each coalescing on its own 150 ms window, so N snapshots arrive per
+ * window and a single-snapshot listener renders whichever landed last. The
+ * bridge folds them into a fleet keyed by deck instead, and hands the listener
+ * the fold — so an arriving snapshot updates ITS deck and leaves the others
+ * exactly where they were.
+ */
+type FleetListener = (fleet: DeckFleet) => void;
 type TerminalListener = (event: TerminalChunk) => void;
 type Unsubscribe = () => void;
 
@@ -536,8 +690,24 @@ interface PendingTerminalAttachment {
 
 export interface DeckBridge {
   readonly mode: RuntimeMode;
-  connect(): Promise<DeckSnapshot>;
-  subscribe(onSnapshot: SnapshotListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
+  /**
+   * Establish the fleet and answer every deck the app is observing, SELECTED
+   * DECK FIRST (PRD #742 M4).
+   *
+   * It answered one `DeckSnapshot` until M4, which is where "one deck" was
+   * baked into the CONTRACT rather than merely into the data — a bridge whose
+   * only snapshot verb returns one deck cannot express a fleet however
+   * multi-deck the wire underneath it becomes.
+   *
+   * **It also RESETS fleet membership**, and that is the half worth knowing
+   * before calling it. The desktop crate pushes a per-deck snapshot but no
+   * "this deck left the fleet" event, so the set of decks the bridge knows
+   * about is the set seen since the last connect. Everything that can change
+   * which decks are observed therefore goes through here: app start, Reconnect,
+   * and a settings save that touched `[endpoints]` (see `saveSettings`).
+   */
+  connect(): Promise<DeckFleet>;
+  subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
   runAction(action: DeckAction): Promise<DeckActionResult>;
   sendTerminalInput(agentId: string, data: string): Promise<void>;
   resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
@@ -565,7 +735,15 @@ export interface DeckBridge {
   setZoom(level: number): Promise<number>;
   /** The desktop app's own settings document, and where it lives (PRD #803). Never rejects. */
   getSettings(): Promise<DesktopSettingsSnapshotDto>;
-  /** Persist the whole document and resolve with what was written. */
+  /**
+   * Persist the whole document and resolve with what was written.
+   *
+   * PRD #742 M4: a write that changed the `[endpoints]` section also
+   * **re-establishes the fleet**, because that section is the only thing that
+   * decides which decks are observed and the crate emits no membership event a
+   * listener could prune from. A theme save changes no deck and takes no such
+   * path.
+   */
   saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto>;
   /**
    * Test one deck end to end and resolve with a **named state** (PRD #741 M10).
@@ -775,11 +953,136 @@ function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"])
   return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, deck v${connection.serverProtocolVersion ?? "unknown"}`;
 }
 
+/**
+ * The snapshot a configured deck with no address renders as (PRD #742 M12).
+ *
+ * Built as a `DesktopSnapshotDto` and mapped through {@link mapDesktopSnapshot}
+ * rather than hand-assembled, so this group has exactly the shape every other
+ * deck's does and cannot drift from it — the overview's `DeckGroup` then needs
+ * no knowledge of this state at all, because "a deck that is not answering" is
+ * already what it renders as a degraded group.
+ *
+ * `disconnected` is the honest status: nothing answered, and nothing was asked.
+ * It keeps the deck out of `decksUp` — an unconfigured deck must never count as
+ * one that answered — while leaving it in `decks.length`, which is the
+ * denominator the header states.
+ *
+ * Every field here comes from the crate. The rest of the DTO is the minimum
+ * `mapDesktopSnapshot` requires, and each value is a statement about a deck
+ * that was never contacted: no protocol version was exchanged, no build stamp
+ * was reported, and no agent count is known.
+ */
+export function unconfiguredDeckSnapshot(deck: UnconfiguredDeckDto, clientProtocolVersion: number, clientBuildVersion: string): DeckSnapshot {
+  const snapshot = mapDesktopSnapshot({
+    connection: {
+      status: "disconnected",
+      socketPath: deck.label,
+      deckId: deck.deckId,
+      deckKind: "remote",
+      error: deck.reason,
+      clientProtocolVersion,
+      clientBuildVersion,
+    },
+    agents: [],
+    protocolVersion: clientProtocolVersion,
+    source: "daemon",
+  });
+  // Set after the map rather than carried through the DTO: this is what the
+  // BRIDGE knows about an entry it built, not something a deck reported, and
+  // `mapDesktopSnapshot` describes decks that answered.
+  snapshot.connection.unconfigured = true;
+  return snapshot;
+}
+
+/**
+ * What a deck that has not reported yet says instead of a state (PRD #742 M14).
+ *
+ * Written on THIS side rather than carried from the crate, unlike
+ * `UnconfiguredDeckDto.reason`: the crate does not know which decks the webview
+ * has heard from, so "has not reported yet" is a statement only this bridge is
+ * in a position to make. It is deliberately calm — there is nothing for the
+ * reader to do and nothing has gone wrong — and it names the fleet rather than
+ * the connection, because what the reader is being told is why a group is on
+ * screen with nothing in it.
+ */
+export const PENDING_DECK_MESSAGE = "In the fleet, waiting for it to report.";
+
+/**
+ * What a fleet member that has NOT REPORTED YET renders as (PRD #742 M14).
+ *
+ * # The defect it closes is the moving denominator, not the delay
+ *
+ * `desktop_bootstrap` answers the RESOLVED deck alone. Every other observed
+ * deck appears when its own watcher emits, which for a remote deck means
+ * acquiring an ssh tunnel, handshaking and running `ListAgents` — bounded by
+ * the crate's reconcile interval for a quiet deck and by `FORWARD_READY_TIMEOUT`
+ * (30s) for a tunnel that never comes up. So with two decks configured the
+ * header read `DECKS 1/1` and then, seconds later, `2/2`: two statements that
+ * both read as "everything is fine", with a TOTAL that changed under the
+ * reader. A total that moves is worse than one that is merely incomplete, and
+ * this makes it `1/2` then `2/2` — the denominator right from the first frame,
+ * with only the numerator climbing.
+ *
+ * # Why it is a state of its own and not `disconnected`
+ *
+ * `disconnected` asserts a measurement: something was asked and nothing
+ * answered. Nothing has been asked of this deck yet. `loading` is the honest
+ * status and {@link ConnectionView.pending} is what tells it from the runtime's
+ * own pre-connect seed, which is the app having no deck rather than a deck
+ * having no snapshot.
+ *
+ * # Built through the mapper, like its M12 sibling
+ *
+ * Same reason {@link unconfiguredDeckSnapshot} is: the group then has exactly
+ * the shape every other deck's does and cannot drift from it. The two fields
+ * the mapper cannot express are set after it — `loading` is not a status the
+ * crate can send, and `pending` is something this bridge knows about an entry
+ * it built rather than something a deck reported.
+ *
+ * It keeps the deck out of `decksUp`, which counts decks that ANSWERED, while
+ * leaving it in `decks.length`, which is the denominator the header states —
+ * and out of every agent count beside it, for the same reason a disconnected
+ * deck is out of them: what it is running is unknown, and adding zero for it
+ * would be a wrong number that looks exactly like a right one.
+ */
+export function pendingDeckSnapshot(deck: ObservedDeckDto, clientProtocolVersion: number, clientBuildVersion: string): DeckSnapshot {
+  const snapshot = mapDesktopSnapshot({
+    connection: {
+      /*
+        The nearest thing the wire can say — `loading` is this side's and is set
+        below. The mapper does read it on the way through, and what it derives
+        is right anyway: `health: "idle"` for a deck with nothing to report, and
+        `daemonDetected: false`, since no daemon has answered. The one thing it
+        would get wrong is the message, and `error` below supplies that.
+      */
+      status: "disconnected",
+      socketPath: deck.label,
+      deckId: deck.deckId,
+      deckKind: deck.deckKind === "remote" ? "remote" : "local",
+      error: PENDING_DECK_MESSAGE,
+      clientProtocolVersion,
+      clientBuildVersion,
+    },
+    agents: [],
+    protocolVersion: clientProtocolVersion,
+    source: "daemon",
+  });
+  snapshot.connection.status = "loading";
+  snapshot.connection.pending = true;
+  return snapshot;
+}
+
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
-  // The socket path is the only per-daemon identity the handshake gives us, and
-  // it is exactly what distinguishes one local daemon from another (PRD #745,
-  // ahead of #742).
-  const daemonId = dto.connection.socketPath;
+  /*
+    PRD #742 M5. This was `dto.connection.socketPath` — `Endpoint::describe()`,
+    a sentence for a human — and that string is not an identity: it renders
+    neither the remote socket path, the identity file nor the jump host, so two
+    stored rows naming two daemons on ONE host produced one `daemonId` and one
+    group. The crate now carries `EndpointIdentity` itself, and this reads it.
+
+    `socketPath` is still what the UI renders; it just no longer keys anything.
+  */
+  const daemonId = dto.connection.deckId;
   const agents = dto.agents.map((agent, index) => agentFromDto(agent, index, daemonId));
   // Three tiers since PRD #819 M6, not four. The daemon-reported agent cwd
   // leads, as it always did; the removed tier was the desktop's own guess at a
@@ -810,6 +1113,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     scheduleRevision: dto.scheduleRevision,
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
+      deckId: dto.connection.deckId,
       socketPath: dto.connection.socketPath,
       message: dto.connection.error ?? fallbackConnectionMessage(dto.connection),
       daemonDetected: dto.connection.status === "connected" || dto.connection.status === "incompatible",
@@ -846,39 +1150,57 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
-  private snapshot: DeckSnapshot;
-  private snapshotListeners = new Set<SnapshotListener>();
+  /**
+   * The whole fixture fleet, selected deck first (PRD #742 M4). One entry for
+   * every scenario but `fleet`, which is the three-deck one.
+   */
+  private fleet: DeckFleet;
+  private fleetListeners = new Set<FleetListener>();
   private terminalListeners = new Set<TerminalListener>();
   private fixtureStep = 0;
   private settings?: DesktopSettingsDto;
 
+  /**
+   * The selected deck, which is the only one every mutating fixture action
+   * touches — `runAction` is the deck screen's, and the deck screen is
+   * single-deck (PRD #742 DECISION 1). An accessor rather than a second field
+   * so the two can never disagree.
+   */
+  private get snapshot(): DeckSnapshot {
+    return this.fleet[0];
+  }
+
+  private set snapshot(value: DeckSnapshot) {
+    this.fleet[0] = value;
+  }
+
   constructor() {
     const requestedState = new URLSearchParams(window.location.search).get("state");
     const state = FIXTURE_STATES.find((candidate) => candidate === requestedState) ?? "connected";
-    this.snapshot = createFixtureSnapshot(state);
+    this.fleet = createFixtureFleet(state);
   }
 
-  async connect(): Promise<DeckSnapshot> {
+  async connect(): Promise<DeckFleet> {
     await Promise.resolve();
-    return structuredClone(this.snapshot);
+    return structuredClone(this.fleet);
   }
 
-  async subscribe(onSnapshot: SnapshotListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
-    this.snapshotListeners.add(onSnapshot);
+  async subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
+    this.fleetListeners.add(onFleet);
     this.terminalListeners.add(onTerminal);
     return () => {
-      this.snapshotListeners.delete(onSnapshot);
+      this.fleetListeners.delete(onFleet);
       this.terminalListeners.delete(onTerminal);
     };
   }
 
   private emitSnapshot(): void {
-    const value = structuredClone(this.snapshot);
-    this.snapshotListeners.forEach((listener) => listener(value));
+    const value = structuredClone(this.fleet);
+    this.fleetListeners.forEach((listener) => listener(value));
   }
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
@@ -910,7 +1232,9 @@ class FixtureDeckBridge implements DeckBridge {
         this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === "tester" ? { ...agent, status: "passed", transcript: `${agent.transcript}\u001b[32mPASS\u001b[0m browser · a11y · PTY fixture\r\n` } : agent);
         this.snapshot.currentNode = 6;
       } else {
-        this.snapshot = createFixtureSnapshot("connected");
+        // Only the SELECTED deck is reset: `advance_fixture` is the deck
+        // screen's own control, and the deck screen is single-deck.
+        this.snapshot = createFixtureFleet("connected")[0];
       }
     }
     this.emitSnapshot();
@@ -1044,7 +1368,7 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   async dispose(): Promise<void> {
-    this.snapshotListeners.clear();
+    this.fleetListeners.clear();
     this.terminalListeners.clear();
   }
 }
@@ -1109,6 +1433,75 @@ export class TauriDeckBridge implements DeckBridge {
   private attachRequested = new Set<string>();
   private terminalListener?: TerminalListener;
   /**
+   * The fold every `desktop://snapshot` lands in (PRD #742 M4): one entry per
+   * deck, keyed by `connection.deckId`, in insertion order — which is observed
+   * order, because `connect()` seeds the selected deck and every other deck is
+   * inserted by its own watcher's first emit.
+   *
+   * A `Map` rather than an array because the wire is an UPSERT stream: N
+   * watchers each emit their own deck on their own coalescing window, so what
+   * arrives is "here is deck X as of now" and never "here is the fleet". The
+   * array the listeners see is built from this on every emit.
+   *
+   * **PRD #742 M5 changed the key from `connection.socketPath` to
+   * `connection.deckId`**, and that is the whole of this milestone at this
+   * layer: `socketPath` is `Endpoint::describe()`, which two daemons on one host
+   * share, so `fleet.set(socketPath, …)` folded the second deck ON TOP of the
+   * first — one entry, last writer wins, and a screen that looks like one
+   * healthy deck.
+   */
+  private fleet = new Map<string, DeckSnapshot>();
+  /**
+   * Which deck the single-deck surfaces are bound to.
+   *
+   * **Read off `DesktopSnapshotDto.fleet[0]` on every arrival since PRD #742
+   * M5**, and seeded from `connect()`. Before M5 nothing on the snapshot stream
+   * said "this one is selected" and it could not be inferred — under `All`
+   * every observed deck emits the same shape — so it was re-learnt at
+   * `connect()` and nowhere else. The crate now states it on every snapshot,
+   * which is why membership no longer depends on a handshake landing.
+   */
+  private selectedDeckId?: string;
+  /**
+   * The unconfigured decks as the crate last stated them, with the two client
+   * facts the payload that stated them carried (PRD #742 M12).
+   *
+   * Held rather than folded into {@link fleet}, because these are not upserts
+   * competing with a watcher's snapshots — the whole list is restated on every
+   * arrival and replaces what was here, so a row that gains a socket path (and
+   * therefore a watcher) simply stops being listed and the group it had is
+   * rebuilt from the snapshot that deck now emits.
+   *
+   * The protocol version and build stamp travel WITH the list rather than being
+   * defaulted, because they are facts about this app that every snapshot
+   * already carries and that a deck nobody contacted has no way to report. One
+   * field rather than three so they cannot be read from different arrivals, and
+   * `undefined` until the first one, so nothing is rendered before the crate
+   * has said anything.
+   */
+  private unconfigured?: { decks: UnconfiguredDeckDto[]; clientProtocolVersion: number; clientBuildVersion: string };
+  /**
+   * Every connectable deck as the crate last NAMED it, with the same two client
+   * facts (PRD #742 M14) — the source {@link fleetView} builds a pending group
+   * from.
+   *
+   * Held, replaced and read exactly like {@link unconfigured} above, and for
+   * the same reason: the crate restates the whole list on every arrival, so the
+   * newest one is the whole truth about what the applied document observes.
+   *
+   * It is deliberately NOT filtered to the decks that have yet to report — that
+   * is decided per view, by looking in {@link fleet}, so a deck that reports
+   * between two emits stops being pending without anything having to notice.
+   */
+  private observed?: { decks: ObservedDeckDto[]; clientProtocolVersion: number; clientBuildVersion: string };
+  private fleetListener?: FleetListener;
+  /**
+   * The `[endpoints]` section as this bridge last saw it, serialised. Compared
+   * on every `saveSettings` so a theme save does not re-establish a fleet, and
+   * an endpoint edit does. `undefined` until a read or a write has been seen.
+   */
+  private lastEndpoints?: string;
+  /**
    * PRD #882 — the geometry the daemon has applied per agent, and who wants to
    * hear about it changing.
    *
@@ -1121,9 +1514,54 @@ export class TauriDeckBridge implements DeckBridge {
   private geometryListeners = new Set<(agentId: string, rows: number, cols: number) => void>();
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
-  /** Newest-first ring of mapped hook events, capped at MAX_LIVE_EVIDENCE. */
+  /**
+   * Newest-first ring of mapped hook events for the SELECTED deck, capped at
+   * MAX_LIVE_EVIDENCE. {@link handoffs} is the same thing for the handoff rail.
+   *
+   * **A working copy of one deck's history, not a process-global one** (PRD
+   * #742 M8). It was global, `foldSnapshot` handed it to whichever deck was
+   * currently selected, and `connect()` cleared `fleet` but not this — so hook
+   * events recorded while the local deck was selected survived a switch and
+   * `build-box`'s first snapshot arrived carrying them. One machine's hook
+   * history, with its agent ids, roles and pane ids, under another machine's
+   * name.
+   *
+   * That was **pre-existing** rather than introduced by the fleet — `4a7ae532`
+   * passed the same global ring — but the fleet is what makes it easy to meet,
+   * and `isSelectedDeckEvent` stops *live* events crossing while doing nothing
+   * about a ring that survives the switch. A reader who sees that filter will
+   * reasonably conclude the drawer is deck-clean; it was not.
+   *
+   * {@link adoptEvidenceDeck} is the whole of the fix. The per-deck storage
+   * already existed — each `DeckSnapshot` in {@link fleet} carries its own
+   * `evidence`/`handoffs` — so switching decks swaps this working copy for the
+   * arriving deck's own history rather than carrying it across, and no parallel
+   * per-deck map is needed.
+   */
   private evidence: EvidenceItem[] = [];
   private handoffs: HandoffEdge[] = [];
+  /**
+   * Which deck {@link evidence} and {@link handoffs} describe, or `undefined`
+   * before this bridge knows which deck it is on.
+   *
+   * `undefined` is load-bearing rather than an initial value: `subscribe()` runs
+   * BEFORE `connect()` in `useDeckRuntime`, so hook events genuinely arrive
+   * before any snapshot has said which deck is selected. Those belong to the
+   * first deck that becomes selected — which is what `undefined` means here, and
+   * why {@link adoptEvidenceDeck} adopts rather than clears in that one case.
+   */
+  private evidenceDeckId?: string;
+  /**
+   * Mints `hook-<n>` ids, and NEVER reset — not on a deck switch, not on
+   * `connect()`.
+   *
+   * These ids are React keys on the evidence drawer's rows, and a deck switch
+   * puts another deck's rows on screen; a counter that restarted would mint
+   * `hook-0` for the second deck while the first deck's `hook-0` is still held
+   * in its own snapshot, so switching back would collide two distinct items
+   * under one key. Monotonic for the life of the bridge costs a larger integer
+   * and nothing else.
+   */
   private evidenceSequence = 0;
   private agentIndex: AgentSession[] = [];
 
@@ -1136,6 +1574,59 @@ export class TauriDeckBridge implements DeckBridge {
     const match = this.agentIndex.find((agent) => (agentId && agent.id === agentId) || (paneId && agent.paneId === paneId));
     return match ? { id: match.id, role: match.role } : undefined;
   };
+
+  /**
+   * Whether a `desktop://daemon-event` payload belongs to the deck the deck
+   * screen is on (PRD #742 M4).
+   *
+   * `deck` is the flat string PRD #742 M3 stamps beside the event, carrying
+   * exactly what `connection.deckId` does — M5 moved BOTH from the label to the
+   * key in one change, and they have to move together or this compares two
+   * different naming schemes and silently drops every event.
+   *
+   * An absent or non-string `deck` reads as YES, deliberately: the field is
+   * additive, and treating its absence as "some other deck" would silence every
+   * event from a build that predates the stamp and every event a fixture
+   * synthesises.
+   */
+  private isSelectedDeckEvent(payload: unknown): boolean {
+    if (this.selectedDeckId === undefined) return true;
+    if (typeof payload !== "object" || payload === null) return true;
+    const deck = (payload as { deck?: unknown }).deck;
+    return typeof deck !== "string" || deck === this.selectedDeckId;
+  }
+
+  /**
+   * Point the evidence ring and the handoff rail at `deckId` (PRD #742 M8).
+   *
+   * Called wherever {@link selectedDeckId} is learnt or re-learnt — `connect()`
+   * and `foldSnapshot` — and a no-op whenever it has not moved, so it costs
+   * nothing on the ordinary snapshot and does its work on the first arrival and
+   * on the ones that follow a selection change.
+   *
+   * Three cases, and the middle one is the finding:
+   *
+   * - *same deck* — nothing to do.
+   * - *a different deck* — the working copy is replaced by that deck's OWN
+   *   held history, taken from its snapshot in {@link fleet}, or emptied when it
+   *   has none yet. This is what stops one machine's hook history being handed
+   *   to another machine's snapshot, and it also means switching back restores
+   *   what that deck had rather than showing an empty drawer.
+   * - *no deck yet* (`evidenceDeckId === undefined`) — whatever has accumulated
+   *   is ADOPTED, not cleared. `subscribe()` runs before `connect()`, so events
+   *   that land in that window have no deck of their own and belong to the first
+   *   one selected; clearing here would lose the drawer's earliest entries,
+   *   which is the behaviour that was already deliberate before M8.
+   */
+  private adoptEvidenceDeck(deckId: string): void {
+    if (this.evidenceDeckId === deckId) return;
+    if (this.evidenceDeckId !== undefined) {
+      const held = this.fleet.get(deckId);
+      this.evidence = held?.evidence ?? [];
+      this.handoffs = held?.handoffs ?? [];
+    }
+    this.evidenceDeckId = deckId;
+  }
 
   private recordDaemonEvent(payload: unknown): boolean {
     const edges = applyHandoffEvent(this.handoffs, payload);
@@ -1456,7 +1947,163 @@ export class TauriDeckBridge implements DeckBridge {
     });
   }
 
-  async connect(): Promise<DeckSnapshot> {
+  /**
+   * The fleet as the bridge holds it, selected deck first.
+   *
+   * Built on every emit rather than maintained as an array, because the wire is
+   * an upsert stream and the order a listener needs is not the order snapshots
+   * arrive in: the selected deck must lead however late its watcher happened to
+   * fire. Insertion order carries the rest, which is observed order.
+   */
+  private fleetView(): DeckFleet {
+    const entries = Array.from(this.fleet.entries());
+    const selectedAt = entries.findIndex(([deckId]) => deckId === this.selectedDeckId);
+    const decks = entries.map(([, deck]) => deck);
+    /*
+      PRD #742 M12: the configured decks with no address, last and never first.
+      They are built here rather than held in `fleet` because nothing upserts
+      them — the crate restates the whole list on every arrival, so deriving
+      them per view is what keeps a row that has just gained a socket path from
+      lingering as a ghost beside the real group its new watcher emits.
+
+      Never `fleet[0]`: `selectedDeckId` is a real deck's key, so one of these
+      can only lead when the fleet is otherwise empty — which is the loading
+      seed's job and not a state the crate produces (`observed_fleet` always
+      carries the resolved deck).
+    */
+    const stated = this.unconfigured;
+    const unconfigured = stated ? stated.decks.map((deck) => unconfiguredDeckSnapshot(deck, stated.clientProtocolVersion, stated.clientBuildVersion)) : [];
+    const pending = this.pendingDecks();
+    /*
+      PRD #742 M14: after the decks that answered and before the ones with no
+      address, which is the order the three states degrade in — a deck with an
+      agent list, then one whose list is still coming, then one that has nowhere
+      to get a list from. Never first, for the reason the M12 note gives: every
+      single-deck surface binds to `fleet[0]`, and a pending entry has no agents
+      and no terminals to bind them to.
+    */
+    if (selectedAt <= 0) return [...decks, ...pending, ...unconfigured];
+    const [selected] = decks.splice(selectedAt, 1);
+    return [selected, ...decks, ...pending, ...unconfigured];
+  }
+
+  /**
+   * The observed decks this bridge has not heard from yet, as groups (PRD #742
+   * M14).
+   *
+   * # Derived, never stored
+   *
+   * Computed per view rather than held, which is what makes the state
+   * self-clearing: a deck stops being pending the instant its own snapshot
+   * lands in {@link fleet}, with nothing to remember to delete. It is also why
+   * this is not a synthesized entry in that map — {@link pruneFleet}
+   * deliberately refuses to invent one for an id it has heard nothing about,
+   * and a fabricated snapshot in there would be fighting that guard rather than
+   * using it. This reads the crate's own statement of what the applied document
+   * observes, which is a fact about the document and not a connection state.
+   *
+   * # Read off `observed` rather than off `fleet`
+   *
+   * `fleet` is ids, and its unconfigured members are ids too — deriving from it
+   * would mean subtracting one list from another and then having nothing to
+   * name what was left. Every entry here carries its own label, so a pending
+   * group is always nameable, and the unconfigured rows are not in this list at
+   * all.
+   */
+  private pendingDecks(): DeckSnapshot[] {
+    const stated = this.observed;
+    if (!stated) return [];
+    return stated.decks
+      .filter((deck) => !this.fleet.has(deck.deckId))
+      .map((deck) => pendingDeckSnapshot(deck, stated.clientProtocolVersion, stated.clientBuildVersion));
+  }
+
+  /**
+   * Drop every deck the crate no longer observes (PRD #742 M5).
+   *
+   * # Why this is the exact answer M4 could not write
+   *
+   * A deck LEAVING the observed set produces no event. `apply_selection` ends
+   * its watcher and, for `All` -> `local`, does not even take the path that
+   * emits — so the departed deck simply stops arriving, which is
+   * indistinguishable from a quiet deck. Left alone the bridge keeps its last
+   * snapshot and the overview renders its agents, frozen and looking live.
+   *
+   * `DesktopSnapshotDto.fleet` states membership on EVERY snapshot, and every
+   * deck's snapshot carries the same list, so any arrival is enough to prune.
+   *
+   * # It does not seed
+   *
+   * A deck named in `fleet` that has not emitted yet is not invented here: this
+   * bridge has nothing to render for it and a fabricated entry would be a
+   * connection state nobody measured. It appears when its watcher emits, which
+   * for a newly started one is immediate.
+   *
+   * An empty or absent list prunes NOTHING. The crate's invariant is
+   * "never empty" (a deck it cannot reach is still an entry carrying a
+   * `disconnected` connection), so an empty list is a malformed payload rather
+   * than an empty fleet — and acting on it would clear the screen.
+   */
+  /**
+   * Take the crate's statement of which configured decks have no address yet
+   * (PRD #742 M12).
+   *
+   * Replaces rather than merges: the list is a property of the applied
+   * document, restated on every snapshot from every deck, so the newest
+   * arrival is the whole truth. That is what drops a row the moment `Test
+   * connection` fills its socket path in — it leaves this list, and the watcher
+   * the crate now spawns for it emits the real group.
+   *
+   * An ABSENT field changes nothing, and an empty array clears. The two differ
+   * on purpose: absent is a DTO literal in a test that says nothing about this,
+   * while `[]` is the crate saying every configured deck has an address. This
+   * is the opposite reading from {@link pruneFleet}, and for the opposite
+   * reason — an empty membership list would blank the screen, whereas an empty
+   * unconfigured list is the ordinary, healthy case.
+   */
+  private adoptUnconfigured(dto: DesktopSnapshotDto): void {
+    if (!Array.isArray(dto.unconfigured)) return;
+    this.unconfigured = {
+      decks: dto.unconfigured,
+      clientProtocolVersion: dto.connection.clientProtocolVersion,
+      clientBuildVersion: dto.connection.clientBuildVersion,
+    };
+  }
+
+  /**
+   * Take the crate's statement of what the applied document observes, and what
+   * each of those decks is called (PRD #742 M14).
+   *
+   * Replaces rather than merges, and an ABSENT field changes nothing — the same
+   * two readings {@link adoptUnconfigured} makes, for the same two reasons. An
+   * empty array would be the crate saying it observes nothing, which
+   * `connectable_endpoints` cannot answer: it is the one selected endpoint for
+   * every selection but `All`, and for `All` the local deck plus the rows with
+   * an address.
+   *
+   * Note an empty list here CANNOT blank the screen the way an empty `fleet`
+   * would: this list only ever ADDS groups for decks that have not reported,
+   * and every deck that has reported is rendered from {@link fleet} whatever
+   * this says.
+   */
+  private adoptObserved(dto: DesktopSnapshotDto): void {
+    if (!Array.isArray(dto.observed)) return;
+    this.observed = {
+      decks: dto.observed,
+      clientProtocolVersion: dto.connection.clientProtocolVersion,
+      clientBuildVersion: dto.connection.clientBuildVersion,
+    };
+  }
+
+  private pruneFleet(observed: readonly string[] | undefined): void {
+    if (!Array.isArray(observed) || observed.length === 0) return;
+    const keep = new Set(observed);
+    this.fleet.forEach((_, deckId) => {
+      if (!keep.has(deckId)) this.fleet.delete(deckId);
+    });
+  }
+
+  async connect(): Promise<DeckFleet> {
     // Reconnect is the user's remedy for a wedged control room, so it has to be
     // able to remedy this too. `useDeckRuntime` memoizes the bridge on `mode`
     // alone and `reconnect()` calls straight into here, so nothing is disposed
@@ -1468,22 +2115,114 @@ export class TauriDeckBridge implements DeckBridge {
     // the daemon owns, so a nine-agent fleet cost nine sockets and nine
     // scrollback replays before a single terminal was on screen. The UI states
     // what it shows through `setShownTerminals`, and that is the only trigger.
-    const snapshot = mapDesktopSnapshot(dto, undefined, this.evidence, this.handoffs);
+    /*
+      PRD #742 M8: BEFORE the map, and before the `fleet.clear()` below that
+      would take every deck's held history with it. `connect()` used to hand the
+      ring to `dto.connection.deckId` whatever deck it actually described, which
+      is the reconnect-shaped half of the cross-deck attribution — reconnecting
+      while `build-box` is selected handed it the local deck's drawer.
+    */
+    this.selectedDeckId = dto.fleet?.[0] ?? dto.connection.deckId;
+    this.adoptEvidenceDeck(this.selectedDeckId);
+    const selected = dto.connection.deckId === this.selectedDeckId;
+    const snapshot = mapDesktopSnapshot(
+      dto,
+      this.fleet.get(dto.connection.deckId),
+      selected ? this.evidence : undefined,
+      selected ? this.handoffs : undefined,
+    );
     this.agentIndex = snapshot.agents;
-    return snapshot;
+    /*
+      PRD #742 M4 reset membership here because this was the ONLY moment a
+      departed deck could be forgotten — the crate emitted no event that said one
+      had left. M5 put `fleet` on every snapshot, so forgetting is no longer this
+      call's job and `foldSnapshot` does it on every arrival.
+
+      The reset stays anyway, and for a reason that outlives the one it replaced:
+      `desktop_bootstrap` is a fresh statement of the whole world, and a
+      `connect()` that MERGED would carry a stale deck across a reconnect that
+      the user reached for precisely because the app looked wrong. Every
+      still-observed deck reinstates itself on its watcher's next emit —
+      immediate for a newly established one, bounded by the crate's reconcile
+      interval for a quiet one.
+    */
+    this.fleet.clear();
+    this.fleet.set(dto.connection.deckId, snapshot);
+    this.adoptUnconfigured(dto);
+    this.adoptObserved(dto);
+    return this.fleetView();
   }
 
-  async subscribe(onSnapshot: SnapshotListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
+  /**
+   * Fold one deck's snapshot into the fleet and answer the new whole.
+   *
+   * The previous snapshot passed to `mapDesktopSnapshot` is THIS DECK'S, never
+   * the last one to arrive: it carries the per-agent transcripts forward, and
+   * agent ids are per-daemon monotonic integers, so folding deck B's arrival
+   * against deck A's previous state would graft one machine's scrollback onto
+   * another machine's agent of the same id.
+   */
+  private foldSnapshot(dto: DesktopSnapshotDto): DeckFleet {
+    const deckId = dto.connection.deckId;
+    /*
+      PRD #742 M5: the selection comes off the wire now, and it is read BEFORE
+      the fold because `selected` below decides which deck gets the evidence
+      ring and which deck the hook-event resolver indexes.
+
+      `fleet[0]` is the crate's own `resolve()`, restated on every snapshot. M4
+      re-learnt the selection at `connect()` alone, which is why a settings save
+      that moved the selection had to re-handshake to be believed.
+    */
+    if (dto.fleet?.length) this.selectedDeckId = dto.fleet[0];
+    this.adoptUnconfigured(dto);
+    this.adoptObserved(dto);
+    /*
+      PRD #742 M8: and the ring follows the selection, rather than being handed
+      to whoever the selection now names. Before this the ring was global, so a
+      switch to `build-box` mapped its first snapshot carrying every hook event
+      recorded while local was selected.
+    */
+    if (this.selectedDeckId !== undefined) this.adoptEvidenceDeck(this.selectedDeckId);
+    /*
+      The evidence ring and the handoff edges are the SELECTED deck's — the
+      only deck whose events this bridge records at all, since the stamped
+      `desktop://daemon-event` filter drops the rest — so they are handed to
+      that deck's snapshot and to no other. Passing them to every deck would
+      hang one machine's hook history off another machine's snapshot; an
+      omitted argument leaves each other deck with whatever it already had,
+      which on a first arrival is nothing.
+    */
+    const selected = deckId === this.selectedDeckId;
+    const mapped = mapDesktopSnapshot(
+      dto,
+      this.fleet.get(deckId),
+      selected ? this.evidence : undefined,
+      selected ? this.handoffs : undefined,
+    );
+    this.fleet.set(deckId, mapped);
+    /*
+      AFTER the set, deliberately: a watcher that is itself being torn down can
+      land one last snapshot whose `fleet` — read fresh from the crate's applied
+      document — no longer names its own deck. Pruning first would delete the
+      entry and then this line would put it straight back. Pruning last drops
+      that deck on the emit that announced its own departure.
+    */
+    this.pruneFleet(dto.fleet);
+    // The hook-event resolver is the deck screen's, and the deck screen is
+    // single-deck — so it indexes the SELECTED deck alone. Indexing the fleet
+    // would let a colliding agent id resolve an event to the wrong machine's
+    // agent, which is the same mislabel the composite key exists to stop.
+    if (selected) this.agentIndex = mapped.agents;
+    return this.fleetView();
+  }
+
+  async subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
     const { listen } = await import("@tauri-apps/api/event");
     this.terminalListener = onTerminal;
+    this.fleetListener = onFleet;
     this.pendingTerminal.forEach((events) => events.forEach((event) => onTerminal(event)));
     this.pendingTerminal.clear();
-    let latest: DeckSnapshot | undefined;
-    const emit = (dto: DesktopSnapshotDto) => {
-      latest = mapDesktopSnapshot(dto, latest, this.evidence, this.handoffs);
-      this.agentIndex = latest.agents;
-      onSnapshot(latest);
-    };
+    const emit = (dto: DesktopSnapshotDto) => onFleet(this.foldSnapshot(dto));
     const stopSnapshot = await listen<DesktopSnapshotDto>("desktop://snapshot", (event) => {
       // PRD #745 M7: a snapshot reports what the daemon owns, which says nothing
       // about what is on screen — so re-declare the set the UI last declared,
@@ -1505,9 +2244,22 @@ export class TauriDeckBridge implements DeckBridge {
     // event produces one within the coalescing window; republishing the last
     // mapped snapshot keeps the drawer current without waiting for the next.
     const stopDaemonEvent = await listen<unknown>("desktop://daemon-event", (event) => {
-      if (!this.recordDaemonEvent(event.payload) || !latest) return;
-      latest = { ...latest, evidence: this.evidence, handoffs: this.handoffs };
-      onSnapshot(latest);
+      // PRD #742 M3 stamped every payload with the deck it came from, and this
+      // is the reader that stamp was for: the evidence drawer and the handoff
+      // rail are the DECK SCREEN's, which DECISION 1 keeps single-deck, so an
+      // event from a deck the screen is not on is dropped rather than folded
+      // into another machine's drawer. An UNSTAMPED payload is kept — a fixture
+      // sends none, and an older crate sent none either.
+      if (!this.isSelectedDeckEvent(event.payload)) return;
+      // Recorded BEFORE the guards below, exactly as it was when the guard was
+      // `!latest`: an event that lands before the first snapshot still belongs
+      // in the ring, and dropping it would lose the drawer's earliest entries.
+      const changed = this.recordDaemonEvent(event.payload);
+      const selectedDeckId = this.selectedDeckId;
+      const selected = selectedDeckId === undefined ? undefined : this.fleet.get(selectedDeckId);
+      if (!changed || selectedDeckId === undefined || selected === undefined) return;
+      this.fleet.set(selectedDeckId, { ...selected, evidence: this.evidence, handoffs: this.handoffs });
+      onFleet(this.fleetView());
     });
     const stopTerminalState = await listen<DesktopTerminalStateDto>("desktop://terminal-state", (event) => {
       if (event.payload.state === "attached") return;
@@ -1612,12 +2364,54 @@ export class TauriDeckBridge implements DeckBridge {
    */
   async getSettings(): Promise<DesktopSettingsSnapshotDto> {
     const invoke = await this.getInvoke();
-    return normalizeDesktopSettingsSnapshot(await invoke<DesktopSettingsSnapshotDto>("desktop_get_settings"));
+    const snapshot = normalizeDesktopSettingsSnapshot(await invoke<DesktopSettingsSnapshotDto>("desktop_get_settings"));
+    this.lastEndpoints = endpointsFingerprint(snapshot.settings);
+    return snapshot;
   }
 
   async saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto> {
     const invoke = await this.getInvoke();
-    return normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings }));
+    const written = normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings }));
+    const fingerprint = endpointsFingerprint(written);
+    // An unspecified section is not a change and must not become the baseline
+    // either: recording the sentinel would make the NEXT real edit compare
+    // against it and re-establish the fleet for nothing.
+    const known = fingerprint !== UNSPECIFIED_ENDPOINTS;
+    const moved = known && this.lastEndpoints !== undefined && this.lastEndpoints !== fingerprint;
+    if (known) this.lastEndpoints = fingerprint;
+    /*
+      PRD #742 M4 needed this for CORRECTNESS and M5 does not, so the reason is
+      rewritten rather than inherited — and the call stays.
+
+      M4's version: the crate emitted no membership signal at all, so unticking a
+      deck left its last-known agents frozen on the overview looking live, and
+      moving the selection left the app believing the old deck was still the
+      selected one. Re-connecting was the only way to learn either, because
+      `desktop_bootstrap` was the one place the fleet map was reset and the one
+      statement of `resolve()` the frontend ever received.
+
+      M5 put both on the wire: `DesktopSnapshotDto.fleet` names the observed set
+      and leads with the selected deck, so `foldSnapshot` prunes and re-learns on
+      every arrival, from any deck. The screen is now self-correcting whether or
+      not this fires.
+
+      What it still buys is PROMPTNESS, and the number is what makes it worth a
+      handshake. The self-correction is bounded by the crate's `RECONCILE_INTERVAL`
+      — 5 seconds — because a quiet deck's watcher emits on that timer and the
+      `All` -> `local` case takes `apply_selection`'s no-emit path entirely. Five
+      seconds of a deck the user just removed still sitting on their overview
+      reads as the app ignoring them. One handshake against a deck they are
+      actively editing is the cheapest moment this app ever spends one.
+
+      Gated on the section having MOVED, so an appearance save — which sends the
+      whole document too — costs no handshake, and `undefined` (nothing read or
+      written yet on this bridge) never counts as a move.
+    */
+    if (moved) {
+      const fleet = await this.connect().catch(() => undefined);
+      if (fleet) this.fleetListener?.(fleet);
+    }
+    return written;
   }
 
   /**

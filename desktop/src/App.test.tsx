@@ -32,10 +32,11 @@ function settingsStore(initial?: Partial<DesktopSettingsDto>, path?: string) {
 }
 
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
+  const base = createFixtureSnapshot("connected");
   const settings = settingsStore();
   return {
     mode: "fixture",
-    snapshot: createFixtureSnapshot("connected"),
+    snapshot: base,
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult),
@@ -66,6 +67,14 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
     ...overrides,
+    /*
+      PRD #742 M4: the fleet, derived from whatever `snapshot` this test asked
+      for unless the test states one of its own. Derived rather than required
+      so a single-deck case stays one line — and derived from `overrides` so
+      `fleet[0]` and `snapshot` cannot silently describe two different decks,
+      which is the invariant `DeckRuntimeState` documents.
+    */
+    fleet: overrides.fleet ?? [overrides.snapshot ?? base],
   };
 }
 
@@ -1521,7 +1530,7 @@ describe("ControlDeck", () => {
   it("asserts no attempt count and no branch in live mode", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
     const snapshot = mapDesktopSnapshot({
-      connection: { status: "connected", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      connection: { status: "connected", deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
       agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, tab: { kind: "dashboard" } }],
       protocolVersion: 8,
       source: "daemon",
@@ -1572,7 +1581,7 @@ describe("ControlDeck", () => {
     // become one DOM text node, once per agent, on every refreshed snapshot.
     const hostile = `${stripped.join("")}${"p".repeat(64 * 1024)}`;
     const snapshot = mapDesktopSnapshot({
-      connection: { status: "connected", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      connection: { status: "connected", deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
       agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, lastUserPrompt: hostile, tab: { kind: "dashboard" } }],
       protocolVersion: 8,
       source: "daemon",
@@ -1611,6 +1620,7 @@ describe("ControlDeck", () => {
     const snapshot = mapDesktopSnapshot({
       connection: {
         status: "connected",
+        deckId: "deck-000000000000dec1",
         socketPath: "/tmp/deck.sock",
         deckKind: "remote",
         clientProtocolVersion: 8,
@@ -1649,7 +1659,7 @@ describe("ControlDeck", () => {
   it("prints the deck's own stand-in for a working directory the daemon did not report", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
     const agent = { id: "7", displayName: "Coder", rows: 32, cols: 120, agentType: "claude_code" as const, status: "working" as const, toolCount: 3, tab: { kind: "dashboard" as const } };
-    const connection = { status: "connected" as const, socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" };
+    const connection = { status: "connected" as const, deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" };
 
     const absent = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: mapDesktopSnapshot({ connection, agents: [agent], protocolVersion: 8, source: "daemon" }) })} />);
     expect(absent.container.querySelector(".agent-footer span:nth-child(2)")?.textContent).toBe("Unavailable");
@@ -1777,6 +1787,47 @@ describe("ControlDeck", () => {
     await waitFor(() => expect(screen.queryByText(started)).not.toBeInTheDocument());
   });
 
+  /**
+   * **PRD #742 M8's F5, carried across the #1046 merge.** Scenario: a failure is
+   * dismissed, and a SECOND, distinct failure arrives whose sanitised sentence
+   * is identical. It must be shown — the dismissal was aimed at the first one.
+   *
+   * M8 answered this with an id minted per report, which `App` held instead of
+   * the sentence. `clearError` answers it with less: the dismissal empties the
+   * error rather than suppressing it, so identity never has to be decided and a
+   * later report shows whatever it says. The id machinery was dropped in the
+   * merge for exactly that reason; this test is what holds its property.
+   *
+   * The report has to be a real second `setError`, because that is the
+   * distinction under test — a fake holding a constant `error` prop cannot tell
+   * two reports of one sentence apart from one report rendered twice, which is
+   * the confusion F5 is about.
+   */
+  function DeckWithReportableError({ message }: { message: string }) {
+    const base = useMemo(() => runtime({ mode: "live" }), []);
+    const [error, setError] = useState<string | undefined>(message);
+    return (
+      <>
+        <button data-testid="report-again" onClick={() => setError(message)}>report</button>
+        <ControlDeck runtime={{ ...base, error, clearError: () => setError(undefined) }} />
+      </>
+    );
+  }
+
+  it("shows a second failure whose sentence matches a dismissed one", async () => {
+    const same = "The deck stopped answering.";
+    render(<DeckWithReportableError message={same} />);
+    expect(await screen.findByText(same)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+    await waitFor(() => expect(screen.queryByText(same)).not.toBeInTheDocument());
+
+    // A different failure that happens to read identically. Suppressed by a
+    // dismissal keyed on the text; shown once the dismissal CLEARS instead.
+    fireEvent.click(screen.getByTestId("report-again"));
+
+    expect(await screen.findByText(same)).toBeInTheDocument();
+  });
   /**
    * The fixture keeps its own attempt counts: they are legitimate fixture data,
    * and M8's claim is about what LIVE mode presents as fact.

@@ -10,10 +10,13 @@
  * the user can see and change without leaving them.
  *
  * It is also the seam [#742](https://github.com/vfarcic/dot-agent-deck/issues/742)
- * extends rather than replaces. That issue adds **All Decks** to this list; the
- * cost of doing so is one variant of {@link DeckSelection} and one arm in each
- * of `parseSelection`, `selectionToken` and `deckChoices`. Nothing in this file
- * handles a raw endpoint id, so nothing here has to change for it.
+ * extended rather than replaced, and the bill came in at the quoted price: its
+ * M1 added **All Decks** to this list for one variant of {@link DeckSelection}
+ * and one arm in each of `parseSelection`, `selectionToken` and `deckChoices`,
+ * and **not one line of this file**. Nothing here handles a raw endpoint id, so
+ * the new option arrives through `deckChoices` like any other and its testid is
+ * its stored token, `deck-selector-option-all`. What the option DOES is still
+ * #742 M4's: until then it selects a fleet that resolves to the local deck.
  *
  * # One control, both shells
  *
@@ -60,6 +63,7 @@ import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
   type DeckSelection,
   deckChoices,
+  endpointSectionToSave,
   parseSelection,
   sameSelection,
   selectionToken,
@@ -128,17 +132,30 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
 
   const choose = (next: DeckSelection) => {
     setOpen(false);
-    // A no-op guard, and it carries a second job. When the document has NO
-    // `[endpoints]` section the only choice is the local deck and it is already
-    // selected, so every click lands here — which is what stops this component
-    // from writing back the `{ remote: [], selection: "local" }` that
-    // `normalizeEndpointSettings` exists to avoid fabricating. The section below
-    // is therefore only ever built from one that already exists.
-    if (sameSelection(next, selection)) return;
-    settings.save({
-      ...settings.settings,
-      endpoints: { remote: section?.remote ?? [], selection: selectionToken(next) },
+    /*
+      The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6
+      and is a data safety property rather than a tidiness one.
+
+      The claim it used to carry here was that when the document has NO
+      `[endpoints]` section the only choice is the local deck and it is already
+      selected, so every click lands on the guard and the section below is only
+      ever built from one that already exists. **All Decks is a second choice
+      that needs no configuration**, so that stopped being true at M1.
+
+      What an unguarded click costs: the webview's section is ordinarily absent
+      because the DOCUMENT's is, so writing `{ remote: [], selection }` deletes
+      nothing. It is also absent when `desktop.toml` failed to parse and
+      `load_from` fell back to defaults — and there `remote: []` merges over
+      rows that are still on disk. `endpointSectionToSave` is where that is
+      refused for every write site at once, and its doc comment carries the rest
+      of the reasoning, including what it deliberately does not close.
+    */
+    const write = endpointSectionToSave(section, {
+      remote: section?.remote ?? [],
+      selection: selectionToken(next),
     });
+    if (!write) return;
+    settings.save({ ...settings.settings, endpoints: write });
   };
 
   return (

@@ -29,7 +29,61 @@ export type Verdict = "PASS" | "FIX" | "HUMAN" | "ERROR" | "INFO";
 
 export interface ConnectionView {
   status: ConnectionStatus;
+  /**
+   * This deck's KEY — the crate's `EndpointIdentity::wire_id()`, an opaque
+   * `deck-<16 hex>` token (PRD #742 M5). Every per-deck map, React key and
+   * `agentKey` composite is built on it.
+   *
+   * Optional because the loading and error seeds in `useDeckRuntime` have no
+   * deck to name yet — they are placeholders for a fleet that has not arrived.
+   * Every deck that came off the wire or out of the fixture carries one, so a
+   * consumer keying on it should treat `undefined` as "not a deck", never as a
+   * value to fall back to `socketPath` from: falling back is precisely the
+   * collision this field exists to remove.
+   */
+  deckId?: string;
+  /**
+   * What this deck is CALLED — the crate's `Endpoint::describe()`: a socket path
+   * for a local deck, `user@host[:port]` for a remote one.
+   *
+   * **A label.** It is what the overview prints and what a hover discloses, and
+   * it is deliberately NOT unique: two daemons on one host describe identically.
+   * `deckId` above is what anything keying on a deck uses.
+   */
   socketPath?: string;
+  /**
+   * This deck is CONFIGURED but has no address yet (PRD #742 M12) — a stored
+   * row whose socket path `Test connection` has not filled in.
+   *
+   * Set only by `unconfiguredDeckSnapshot`, which builds the entry the crate's
+   * `DesktopSnapshotDto.unconfigured` describes. It is not a connection state:
+   * nothing was contacted and nothing failed, which is exactly why the
+   * `disconnected` note — "no deck is listening", "start one, then reconnect" —
+   * is the wrong sentence for it and the overview renders its own.
+   */
+  unconfigured?: boolean;
+  /**
+   * This deck is in the fleet and HAS NOT REPORTED YET (PRD #742 M14) — a
+   * fourth honest state beside connected, disconnected and unconfigured.
+   *
+   * Set in live mode by `pendingDeckSnapshot` alone, from an entry the crate
+   * states on `DesktopSnapshotDto.observed` that no snapshot has arrived for —
+   * and by the `fleet` fixture, which holds the state still so it can be
+   * looked at. A deck
+   * joins the fleet when the settings document is applied and emits its own
+   * snapshot only once its watcher has a tunnel, a handshake and an agent
+   * list — up to `FORWARD_READY_TIMEOUT` (30s) for a remote deck — so without
+   * this the fleet's own TOTAL climbed while the reader watched: `1/1`, then
+   * `2/2` a few seconds later, both reading as "everything is fine" and only
+   * one of them true.
+   *
+   * `status` is `"loading"` and never `"disconnected"`, which is the whole
+   * distinction: disconnected asserts that something was asked and nothing
+   * answered, and here nothing has been asked yet. The flag is what separates
+   * it from `useDeckRuntime`'s pre-connect loading seed, which is the app
+   * having no deck rather than a deck having no snapshot.
+   */
+  pending?: boolean;
   message?: string;
   /**
    * Which kind of deck this connection is to (PRD #741 M7): `"local"` for a
@@ -500,6 +554,42 @@ export interface DeckSnapshot {
   profiles: AgentProfile[];
 }
 
+/**
+ * Every deck the app is observing right now, one snapshot each (PRD #742 M4).
+ *
+ * # Selected deck first, and never empty
+ *
+ * The desktop crate's observed set is `[resolve().endpoint]` for every
+ * selection except `All`, and for `All` it LEADS with the local deck — which is
+ * what `All` resolves to. So the first entry is always the deck the
+ * single-deck surfaces talk to, and there is always at least one: a deck the
+ * app cannot reach is still an entry, carrying a `disconnected` connection and
+ * no agents. That is the distinction the whole fleet view rests on — "no
+ * agents" and "we cannot see the agents" are different statements, and an
+ * absent entry could not tell them apart.
+ *
+ * # Keyed by `connection.deckId`
+ *
+ * That token is the crate's `EndpointIdentity::wire_id()`, and it is the same
+ * value `daemonId` is derived from — so an entry here and the agents inside it
+ * agree on identity by construction rather than by care.
+ *
+ * **It was `connection.socketPath` until PRD #742 M5**, which is `describe()` —
+ * a label that renders neither the remote socket path, the identity file nor
+ * the jump host. Two decks differing only in one of those folded into ONE entry
+ * here and their agents shared a `daemonId`; the composite `(daemonId,
+ * agentId)` key could not separate them, because the key component was the
+ * collision.
+ *
+ * # Membership is exact, and comes from the wire
+ *
+ * `DesktopSnapshotDto.fleet` lists the observed decks on every snapshot, so a
+ * deck that LEAVES the observed set is dropped on the next arrival from any
+ * deck. M4 could only approximate this by resetting at `connect()`, because
+ * nothing on the stream said a deck had gone.
+ */
+export type DeckFleet = DeckSnapshot[];
+
 /** One delegation's lifecycle, driven by the daemon's handoff events. */
 export interface HandoffEdge {
   /** The daemon's delegation id (`dlg-<millis>-<seq>`). */
@@ -644,7 +734,24 @@ export interface TerminalFeed {
 
 export interface DeckRuntimeState {
   mode: RuntimeMode;
+  /**
+   * The deck every SINGLE-DECK surface is bound to — the deck screen, its
+   * terminals, and every action. Identical to `fleet[0]` (PRD #742 M4), and
+   * kept as its own member because "the selected deck" is what these screens
+   * mean and reading it as an index would put the invariant at each call site.
+   */
   snapshot: DeckSnapshot;
+  /**
+   * Every deck the app is observing, selected first (PRD #742 M4). One entry
+   * under every selection but `All`, where it is the whole configured fleet.
+   *
+   * The agent overview renders one group per entry. Nothing else does: a tile's
+   * terminal is always the selected deck's, because an attach costs one
+   * connection and one daemon-side task PER VISIBLE TILE and attach streams
+   * carry no stream id, so N decks of rows is cheap and N decks of live
+   * terminals is not (PRD #742 DECISION 1).
+   */
+  fleet: DeckFleet;
   terminalData: Record<string, TerminalBuffer>;
   /** Direct PTY-byte path that bypasses React state; absent in tests/fixture. */
   terminalFeed?: TerminalFeed;

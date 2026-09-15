@@ -40,7 +40,11 @@ import { useDeckRuntime } from "./useDeckRuntime";
 describe("useDeckRuntime", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    bridge.connect.mockResolvedValue(createFixtureSnapshot("connected"));
+    // A FLEET, not one snapshot: PRD #742 M4 made `connect()` return every
+    // observed deck, and `useDeckRuntime` ignores an empty one — so a bare
+    // snapshot here leaves the hook on its loading seed and the test reads as
+    // a connection failure rather than as the contract drift it is.
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("connected")]);
     bridge.subscribe.mockResolvedValue(() => {});
     bridge.onTerminalGeometry.mockReturnValue(() => {});
   });

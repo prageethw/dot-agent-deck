@@ -1,6 +1,48 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EndpointsPanel } from "./EndpointsPanel";
+
+/**
+ * The shared write gate, spied but NOT replaced (PRD 742 M8's F3).
+ *
+ * The panel's data-safety property is "every write goes through
+ * `endpointSectionToSave`", and that property is not observable in the panel's
+ * output: the gate returns the section unchanged in every case that reaches it
+ * from here today, so a write that bypasses it and a write that goes through it
+ * produce the same `onSave`. That is precisely why the bypass survived — three
+ * comments asserted the coverage and nothing checked it.
+ *
+ * So the assertion is on the call, and the implementation stays real: the mock
+ * delegates to the original, every other test in this file is unaffected, and
+ * the behavioural tests above and below still do the behavioural work.
+ */
+const writeGate = vi.hoisted(() => vi.fn());
+vi.mock("../lib/endpoints", async () => {
+  const actual = await vi.importActual<typeof import("../lib/endpoints")>("../lib/endpoints");
+  writeGate.mockImplementation(actual.endpointSectionToSave);
+  // Lazy getters rather than a spread. `endpoints.ts` and `bridge.ts` import
+  // each other, so several of this module's exports are re-exports of the
+  // other, and reading them eagerly inside a mock factory takes them before the
+  // cycle has settled — measured: a spread here left
+  // `ALL_ENDPOINT_SELECTION` `undefined` for the panel while the module's own
+  // internal reference to it was fine. A getter defers the read to the moment
+  // the panel actually uses the value, which is after both modules exist.
+  return Object.defineProperties(
+    {},
+    Object.fromEntries(
+      Object.keys(actual).map((name) => [
+        name,
+        {
+          enumerable: true,
+          get: () =>
+            name === "endpointSectionToSave"
+              ? writeGate
+              : (actual as unknown as Record<string, unknown>)[name],
+        },
+      ]),
+    ),
+  );
+});
 import {
   DEFAULT_DESKTOP_SETTINGS,
   type DesktopSettingsDto,
@@ -73,6 +115,13 @@ function renderPanel(
 }
 
 describe("EndpointsPanel", () => {
+  // Braced, not an expression body: `mockClear()` returns the mock for
+  // chaining, and a value returned from `beforeEach` is taken by vitest as a
+  // cleanup function and CALLED after the test — with no arguments.
+  beforeEach(() => {
+    writeGate.mockClear();
+  });
+
   /**
    * Scenario: open the Decks section on a fresh install — a document with no
    * `[endpoints]` section at all. The local deck is listed and chosen, and
@@ -142,6 +191,123 @@ describe("EndpointsPanel", () => {
 
     expect(onSave).not.toHaveBeenCalled();
     expect(screen.queryByTestId("deck-detail")).toBeNull();
+  });
+
+  /*
+    -------------------------------------------------------------------------
+    PRD 742 M6 — the client-side counterpart of Rust's
+    `a_client_that_cannot_render_endpoints_cannot_delete_them`.
+
+    That test pins the protection a client which CANNOT render decks gets from
+    `DesktopSettings::endpoints` being an `Option`. These pin the other half:
+    this panel CAN render decks, it reads an absent section through a
+    `{ remote: [], selection: "local" }` stand-in, and `remote: []` is the
+    assertion "this user has no decks" — which `merged_document` writes over
+    whatever `[[endpoints.remote]]` rows are on disk. The webview is handed an
+    absent-looking section not only when there genuinely is none, but also when
+    `desktop.toml` failed to parse and `load_from` fell back to defaults with
+    every row still in the file. Nobody reproduces that by hand.
+    -------------------------------------------------------------------------
+  */
+
+  /**
+   * Scenario: a document with no `[endpoints]` section. Press "Add a deck",
+   * then abandon the draft by clicking back onto **This machine** — the deck
+   * that was already in force. Nothing about the document changed, so nothing
+   * may be written: the section this panel would write is a stand-in it
+   * invented, and it would delete rows it was never shown.
+   */
+  it("a client that CAN render endpoints does not delete them by re-choosing the deck already in force", () => {
+    const { onSave } = renderPanel();
+    fireEvent.click(screen.getByTestId("add-deck"));
+    expect(screen.getByTestId("deck-detail")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("deck-choice-local").querySelector("input")!);
+
+    // The draft is abandoned, which is what the click was for...
+    expect(screen.queryByTestId("deck-detail")).toBeNull();
+    // ...and the document is untouched, which is the property.
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: the same click against a document that DOES declare a section,
+   * with a deck stored and selected. Re-choosing it is still a no-op, so the
+   * rows are never rewritten — the guard is about the change being empty, not
+   * about the section being absent.
+   */
+  it("does not rewrite a declared section for a selection that has not moved", () => {
+    const row = deck();
+    const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } });
+    fireEvent.click(screen.getByTestId("add-deck"));
+
+    fireEvent.click(screen.getByTestId(`deck-choice-${row.id}`).querySelector("input")!);
+
+    // The draft is gone and the stored deck's own fields are back on screen.
+    expect(screen.getByLabelText("Host")).toHaveValue(row.host);
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /*
+    -------------------------------------------------------------------------
+    PRD 742 M6 — a stored fleet selection.
+
+    M1 added **All Decks** to `deckChoices`, which the top bar's Deck selector
+    is built from. This panel had a chooser of its own, so with `all` stored its
+    `shown` matched no row: no radio checked, no detail form, and a **Test
+    connection** button still enabled for a token no probe can answer.
+    -------------------------------------------------------------------------
+  */
+
+  /**
+   * Scenario: the document stores the fleet selection. The chooser shows **All
+   * Decks** checked and says why there are no fields under it, rather than
+   * rendering a chooser with nothing chosen.
+   */
+  it("shows a stored fleet selection as chosen, with a reason there are no fields", () => {
+    renderPanel({ endpoints: { remote: [deck()], selection: "all" } });
+
+    expect(screen.getByTestId("deck-choice-all").querySelector("input")).toBeChecked();
+    expect(screen.getByTestId("deck-choice-local").querySelector("input")).not.toBeChecked();
+    expect(screen.getByTestId("deck-choice-deck0000000000aa").querySelector("input")).not.toBeChecked();
+    // No fields, and a sentence saying that is correct rather than missing.
+    expect(screen.queryByTestId("deck-detail")).toBeNull();
+    expect(screen.getByTestId("deck-fleet-note")).toHaveTextContent("All Decks is every deck at once");
+    // The fleet is not a row, so there is nothing to remove.
+    expect(screen.queryByTestId("remove-deck-all")).toBeNull();
+  });
+
+  /**
+   * Scenario: press **Test connection** while the fleet is selected. You
+   * cannot: a probe tests one deck, and the fleet token names a set. Before
+   * this the button was live and reached `endpoint_test::unsealed`, which
+   * answered "That deck is no longer in this settings document" — safe, and the
+   * wrong sentence for a selection that is in force.
+   */
+  it("cannot probe under a fleet selection", () => {
+    const testEndpoint = vi.fn(async () => report());
+    renderPanel({ endpoints: { remote: [deck()], selection: "all" } }, { testEndpoint });
+
+    expect(screen.getByTestId("test-connection")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("test-connection"));
+    expect(testEndpoint).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: choose **All Decks** from this panel on a document that already
+   * declares a section. It is a real change, so it is written — and the stored
+   * rows travel with it rather than being replaced by the chooser's own idea of
+   * the list.
+   */
+  it("stores the fleet selection without disturbing the rows", () => {
+    const row = deck();
+    const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } });
+
+    fireEvent.click(screen.getByTestId("deck-choice-all").querySelector("input")!);
+
+    const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
+    expect(saved.endpoints?.selection).toBe("all");
+    expect(saved.endpoints?.remote).toEqual([row]);
   });
 
   /**
@@ -355,6 +521,61 @@ describe("EndpointsPanel", () => {
 
     await waitFor(() => expect(testEndpoint).toHaveBeenCalled());
     expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /**
+   * **PRD 742 M8's F3.** Scenario: a probe discovers a socket and the panel
+   * writes it back. That write must go through the shared gate, like every
+   * other write this panel makes.
+   *
+   * It did not. `runTest`'s write-back called `onSave` directly — because it
+   * writes against `latest.current` (the document as of the newest render)
+   * rather than the one its handler closed over, and `saveSection` closed over
+   * `settings` — while three separate comments said every write in this panel
+   * goes through `endpointSectionToSave`: the doc on `saveSection`, the doc on
+   * the gate itself (which *named* this write-back among the sites it covers),
+   * and the M6 section of `docs/develop/desktop-gui.md`.
+   *
+   * **What this proves:** that the claim is now true, at the one site that
+   * falsified it.
+   *
+   * **What it does NOT prove, and this is why the test is shaped like this:**
+   * that the gate changes the outcome here. It does not, and cannot — the gate
+   * returns the section unchanged in every case that reaches it from this site,
+   * because the `row && !row.socket` find-guard above the write only fires when
+   * the row genuinely gains a socket it did not have. There is therefore **no
+   * input that distinguishes the two implementations**, which is exactly how
+   * three comments came to assert a coverage nothing checked. So the assertion
+   * is on the call rather than on the output, and the implementation stays real
+   * — the tests around this one do the behavioural work and are unaffected.
+   *
+   * What the routing buys is future-tense and structural: on an unreadable
+   * `desktop.toml` the webview is handed a fabricated `{ remote: [] }`, and it
+   * is now the gate rather than this one find-guard that refuses to merge that
+   * over the rows still on disk. A probe write-back that filled in a port, a
+   * user or a jump host — or one that upserted a row instead of patching one —
+   * is covered without anyone having to notice that it needs to be.
+   */
+  it("routes the discovered-socket write-back through the shared write gate", async () => {
+    const testEndpoint = vi.fn(async () =>
+      report({ discoveredSocket: "/run/user/1000/dot-agent-deck-attach.sock" }),
+    );
+    const { onSave } = renderPanel(
+      { endpoints: { remote: [deck()], selection: "deck0000000000aa" } },
+      { testEndpoint },
+    );
+
+    fireEvent.click(screen.getByTestId("test-connection"));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+
+    expect(writeGate).toHaveBeenCalledTimes(1);
+    const [received, next] = writeGate.mock.calls[0];
+    // The document as of the newest render, not the one the click closed over —
+    // both halves of the property in one call.
+    expect(received).toEqual({ remote: [deck()], selection: "deck0000000000aa" });
+    expect(next?.remote[0].socket).toBe("/run/user/1000/dot-agent-deck-attach.sock");
+    // And the gate let it through, because it is a genuine change.
+    expect(writeGate.mock.results[0].value).toBe(next);
   });
 
   /**

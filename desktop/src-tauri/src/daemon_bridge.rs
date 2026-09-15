@@ -17,8 +17,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_view::AgentView;
 use crate::dto::{
-    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
-    map_agent, safe_message, selected_endpoint, selection_fields, socket_path_text,
+    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, deck_path_text,
+    deck_wire_id, disconnected_snapshot, map_agent, observed_fleet, observed_fleet_decks,
+    safe_message, selected_endpoint, selection_fields, unconfigured_fleet,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -187,9 +188,14 @@ pub(crate) const HANDSHAKE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5
 /// long-lived connections plus one short-lived one per refresh. Four things
 /// decided it:
 ///
-/// 1. **The population of one.** There is exactly one `EventSubscription` per
-///    desktop process — `DesktopState::start_watcher_once` guarantees a single
-///    watcher — so half the muxing target is a set with one member in it.
+/// 1. **The population of one, which PRD #742 M3 makes a population of N — per
+///    DECK, not per stream.** There is one `EventSubscription` per *observed
+///    deck* (`DesktopState::start_watcher_once_for` guarantees one watcher per
+///    deck, and `retain_watchers` ends a departed deck's), and each one is a
+///    connection to a **different daemon**. Multiplexing is a thing you do to
+///    several streams sharing one peer, so a set of one-per-peer is exactly as
+///    un-muxable at N decks as it was at one; what grows is the connection count
+///    this doc comment already prices below, not the muxing case.
 ///
 /// 2. **Muxing attach streams is a WIRE change, not a refactor.** The frame
 ///    header is five bytes: one kind byte and a four-byte big-endian length
@@ -220,15 +226,68 @@ pub(crate) const HANDSHAKE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5
 /// what M4 was opened about: the streams are established once and then carry
 /// frames, so nothing about them is paid per refresh.
 ///
-/// # Concurrency
+/// # Concurrency — one gate per deck, and the map lock held across nothing
 ///
-/// One async mutex over the whole map, held across establishment. That
-/// serialises concurrent first-uses into ONE handshake instead of N, which is
-/// the point; the cache-hit path is an uncontended lock acquire. A deck that is
-/// not answering queues the other callers behind one connect timeout rather
-/// than giving each its own, which is also the better of the two.
+/// **This inverted at PRD #742 M3, and the old comment said so in advance.** It
+/// used to be one async mutex over the whole map, *held across establishment*,
+/// and its own justification ended "a deck that is not answering queues the
+/// other callers behind one connect timeout rather than giving each its own,
+/// which is also the better of the two". That is true while the queued callers
+/// are other users of the *same* deck. At N decks the callers queued behind an
+/// unreachable deck's connect are **other decks**, and the desktop's whole fleet
+/// stops updating because one machine is down — PRD #742 success criterion 2,
+/// and the one risk the PRD says can make it fail its own headline.
+///
+/// So establishment is serialised **per deck** instead, by a gate keyed the same
+/// way the map is, and the map's own lock is now held only for the two lookups
+/// around it. Both halves of the original property survive:
+///
+/// - *Concurrent first-uses of ONE deck still collapse into ONE handshake.* The
+///   second caller waits on that deck's gate, and by the time it gets in the
+///   first caller has already published its link, so it takes the cache-hit path
+///   rather than handshaking again.
+/// - *Two callers on DIFFERENT decks never wait for each other*, because they
+///   hold different gates and neither holds the map across a connect.
+///
+/// Pinned by [`tests::an_unresponsive_deck_does_not_queue_another_decks_handshake`]
+/// and [`tests::a_held_link_is_reused_and_costs_one_handshake`] respectively.
+///
+/// The gate map is a **`std::sync::Mutex`** and is never held across an `await`:
+/// it hands out an `Arc` and is released. That is what keeps `clippy::await_holding_lock`
+/// honest here rather than allowed.
+///
+/// # Publishing — the half the split gave up, put back (PRD #742 M8)
+///
+/// The whole-map lock did a second job nobody replaced: it excluded
+/// [`Self::invalidate_all`] *for the duration of an establishment*. The per-deck
+/// gate does not — `invalidate_all` takes the map lock and nothing else — and a
+/// deck being established has no entry to clear, so an invalidation landing
+/// mid-handshake is followed by the establishment publishing the very link it
+/// meant to forget. [`EndpointTunnels::acquire`] has the same shape and the same
+/// remedy; `crate::generation` is the shared mechanism and carries the
+/// reasoning.
+///
+/// **What the compare covers, stated exactly rather than generally.**
+/// [`Self::trusted`] reads the epoch before establishing and compares it under
+/// the same map lock it inserts under — so against `invalidate_all`, which bumps
+/// under that lock, the two are serialised and the result is exact: either the
+/// insert lands first and the `clear()` removes it, or the bump lands first and
+/// the insert is refused. `EndpointTunnels`' own three teardowns bump under the
+/// *tunnel* map's lock instead, so against those this compare is conservative
+/// rather than atomic. It does not need to be: this map's teardown is
+/// `invalidate_all`, and a link that outlives a tunnel `release` was already the
+/// designed behaviour — [`TrustedDaemon`] holds its own lease exactly so a
+/// classified link cannot describe a deck whose transport has gone. The path F1
+/// is about is covered either way, because `retarget_selection` calls
+/// `invalidate_all` and `EndpointTunnels::retain` in consecutive statements.
 pub(crate) struct DaemonLinks {
     links: AsyncMutex<HashMap<EndpointIdentity, Arc<TrustedDaemon>>>,
+    /// One establishment gate per deck — see this type's *Concurrency* section.
+    ///
+    /// Empty of state by design: the gate carries nothing, it only says whose
+    /// turn it is to handshake for that deck. Which is why [`Self::gate`] may
+    /// drop any gate nobody is holding without coordinating with anyone.
+    gates: std::sync::Mutex<HashMap<EndpointIdentity, Arc<AsyncMutex<()>>>>,
     /// The live transports (PRD #741 M7).
     ///
     /// **This is a field of `DesktopState`, shared here by `Arc` — it is not a
@@ -250,6 +309,7 @@ impl Default for DaemonLinks {
     fn default() -> Self {
         Self {
             links: AsyncMutex::new(HashMap::new()),
+            gates: std::sync::Mutex::new(HashMap::new()),
             tunnels: Arc::new(EndpointTunnels::default()),
             handshakes: AtomicUsize::new(0),
         }
@@ -263,17 +323,34 @@ impl DaemonLinks {
     /// A failed establishment removes any held link first, so a stale
     /// classification is never returned after the deck behind it stopped
     /// answering.
+    ///
+    /// PRD #742 M3: serialised **per deck** rather than over the whole map — see
+    /// this type's *Concurrency* section for what that keeps and what it fixes.
     pub(crate) async fn trusted(&self, endpoint: &Endpoint) -> Result<Arc<TrustedDaemon>, String> {
         let key = endpoint.identity();
-        let mut links = self.links.lock().await;
-        if let Some(held) = links.get(&key)
-            && held.is_fresh(Instant::now())
+        // PRD #742 M8: read before the gate and before the lookup, so every
+        // teardown that could make this deck unwanted lands inside the window
+        // the publish below compares across. See this type's *Publishing*
+        // section for which of them that compare is exact against.
+        let wanted_at = self.tunnels.generation().current();
+        // Held across the establishment below, and it is this deck's alone.
+        let gate = self.gate(&key);
+        let _establishing = gate.lock().await;
         {
-            return Ok(Arc::clone(held));
+            let mut links = self.links.lock().await;
+            if let Some(held) = links.get(&key)
+                && held.is_fresh(Instant::now())
+            {
+                return Ok(Arc::clone(held));
+            }
+            // Removed BEFORE the handshake and while nothing else can be
+            // establishing for this deck, so a stale classification is never
+            // readable during the window in which it is being replaced.
+            links.remove(&key);
         }
-        links.remove(&key);
         let established = Arc::new(establish(endpoint, &self.tunnels).await?);
         self.handshakes.fetch_add(1, Ordering::Relaxed);
+        let mut links = self.links.lock().await;
         // **Only a CONNECTED classification is held.** A refusal is the one
         // verdict you want re-checked rather than cached, and there is a
         // user-visible reason as well as a principled one: on the incompatible
@@ -289,10 +366,43 @@ impl DaemonLinks {
         // `WATCH_RETRY_DELAY`, not at the 150 ms coalesce floor, so they were
         // never what this milestone was about; the connected path is the one
         // running 6.667 times a second and it is held in full.
-        if established.connection.status == ConnectionStatus::Connected {
+        //
+        // PRD #742 M8: and only while the deck is still wanted. `invalidate_all`
+        // and `EndpointTunnels`' three teardowns bump the epoch read on the way
+        // in; a link published behind one of those would hold a `DaemonClient`,
+        // its captured capability set and — through `establish` — a lease on an
+        // `ssh` child, for a deck nothing observes. Returning the link without
+        // holding it is the right fallback: the caller gets its answer and
+        // everything it stands on dies with the request.
+        if established.connection.status == ConnectionStatus::Connected
+            && self.tunnels.generation().current() == wanted_at
+        {
             links.insert(key, Arc::clone(&established));
         }
         Ok(established)
+    }
+
+    /// This deck's establishment gate, minting one if it has none.
+    ///
+    /// A `std::sync::Mutex` held for exactly this lookup and released before the
+    /// caller awaits on what it returns — the gate is the thing awaited, never
+    /// the map that stores it.
+    ///
+    /// **It also forgets gates nobody is holding**, which is what keeps this map
+    /// bounded by the decks currently in play rather than by every address a
+    /// user has ever typed into the endpoints panel (each edit mints a new
+    /// [`EndpointIdentity`]). Safe without coordinating with anyone, and for a
+    /// reason that is a property rather than a hope: a gate whose `Arc` strong
+    /// count is 1 is held by this map alone, so no caller is waiting on it or
+    /// inside it — and no caller can be *taking* a clone concurrently, because
+    /// cloning happens here, under this same lock.
+    fn gate(&self, key: &EndpointIdentity) -> Arc<AsyncMutex<()>> {
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates.retain(|held, gate| held == key || Arc::strong_count(gate) > 1);
+        Arc::clone(gates.entry(key.clone()).or_default())
     }
 
     /// The shared transport map, for `DesktopState` and for the commands that
@@ -311,8 +421,26 @@ impl DaemonLinks {
     /// not specific to one deck — the watcher losing its event stream, and the
     /// in-app build-mismatch allowance, whose entire effect is that the
     /// handshake must be classified again.
+    ///
+    /// **It also bumps the live set's epoch** (PRD #742 M8), which is the half a
+    /// `clear()` cannot do: a deck whose establishment is in flight has no entry
+    /// to clear, so without this it would publish its link *after* the
+    /// invalidation that was meant to forget it. The epoch lives on
+    /// [`EndpointTunnels`] and is shared with it — see that type's field comment
+    /// for why one counter serves both maps.
     pub(crate) async fn invalidate_all(&self) {
-        self.links.lock().await.clear();
+        let mut links = self.links.lock().await;
+        self.tunnels.generation().bump();
+        links.clear();
+    }
+
+    /// How many links this map holds. Test-only, like [`Self::handshake_count`]:
+    /// PRD #742 M8 needs to assert that an establishment did NOT publish, and
+    /// "the map is empty" is the direct statement of that, where a second
+    /// `trusted()` re-handshaking is an inference from it.
+    #[cfg(test)]
+    pub(crate) async fn held(&self) -> usize {
+        self.links.lock().await.len()
     }
 
     /// How many handshakes have been performed since this store was created.
@@ -803,11 +931,28 @@ pub(crate) fn classify_handshake_for_test(
     classify_handshake(response, client_build, build_mismatch_allowance(), stamps)
 }
 
-fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
-    let (deck_kind, local_only_reason, selection_fallback) = selection_fields();
+/// The classified handshake as a [`DesktopConnection`], stamped with the deck it
+/// was taken against.
+///
+/// **PRD #742 M3 added the endpoint, and that one parameter is the whole of
+/// test-plan items 8 and 9.** `snapshot_with` has taken the deck as an argument
+/// since #741 M4(a) and this function dropped it at the one place the identity
+/// is written, reading `socket_path_text()` and `selection_fields()` off the
+/// process-global selection instead. So every deck in a fleet was emitted under
+/// the *selected* deck's name — and since the frontend derives `daemonId` from
+/// `connection.socketPath` and keys agents by `(daemonId, agentId)`, two decks
+/// arriving under one identity do not render an error, they render one fleet
+/// where there were two.
+fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> DesktopConnection {
+    let (deck_kind, local_only_reason, selection_fallback) = selection_fields(endpoint);
     DesktopConnection {
         status: handshake.status,
-        socket_path: socket_path_text(),
+        socket_path: deck_path_text(endpoint),
+        // PRD #742 M5: the KEY beside the label, from the same endpoint and in
+        // the same breath — the two disagreeing is the whole defect, and the
+        // only way to make them disagree now is to hand this function the wrong
+        // deck, which is the mistake M3 already closed.
+        deck_id: deck_wire_id(endpoint),
         deck_kind,
         local_only_reason,
         selection_fallback,
@@ -833,6 +978,79 @@ fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
 /// learn it on its own would spend a second `Hello` on a connection whose
 /// handshake reply is already in hand.
 pub(crate) async fn hello(
+    socket_path: &Path,
+    stamps: StampPolicy,
+) -> Result<(HandshakeInfo, AttachResponse), String> {
+    bounded_reply("the handshake", hello_exchange(socket_path, stamps)).await
+}
+
+/// How long the desktop waits for ONE daemon reply before calling the deck not
+/// answering (PRD #742 M14).
+///
+/// # Why a bound exists at all
+///
+/// Every request this crate sends is a `connect`, a write and a `read_response`,
+/// and `read_response` waits for as long as the peer keeps the socket open. A
+/// daemon that ACCEPTS a connection and never answers it is therefore not a
+/// failure any caller can observe — it is a future that never completes. That is
+/// a different thing from a deck being down, which is an immediate `ECONNREFUSED`
+/// and has always worked.
+///
+/// It costs more than a stuck request. A deck's watcher emits its first snapshot
+/// only *after* its first reply — a handshake, a subscription and a `ListAgents`
+/// — so a peer that stalls any of the three leaves the webview with a deck it
+/// has been told exists and has heard nothing about, forever. M14 renders that
+/// as a pending group, which is right for the seconds an ssh tunnel takes and
+/// wrong as a permanent state: a spinner that never resolves is worse than a
+/// late appearance.
+///
+/// # What this bounds, and what it does not
+///
+/// The three replies above are the ones a first snapshot waits on, and each is
+/// bounded here; the `ssh` forward before them already was, at
+/// `FORWARD_READY_TIMEOUT`. What stays outside any clock is the watcher TASK
+/// itself ending — a panic inside its loop — which leaves the deck with nothing
+/// to emit for it at all. That is bounded by a user action rather than by time:
+/// `WatcherClaim::watching` is what makes the webview's Reconnect start a
+/// replacement, where before M14 the dead claim refused one for the life of the
+/// process.
+///
+/// # Why fifteen seconds
+///
+/// A responsive daemon answers any of the three in sub-milliseconds — the reply
+/// is built from an in-memory registry — so this is three to four orders of
+/// magnitude of headroom rather than a tuned value, and nothing legitimate is
+/// near it. It sits deliberately below the 30s
+/// [`dot_agent_deck::remote_tunnel`] forward-ready timeout that precedes it, so
+/// the two bounds add to something a user will wait through rather than
+/// multiply; and above the watcher's 5s reconcile interval, so a deck that is
+/// merely quiet is never mistaken for one that is stalled.
+///
+/// **Not applied to the event stream**, which is long-lived by design: this
+/// bounds the RESP that confirms a subscription, and never the frames after it.
+pub(crate) const DECK_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bound one daemon round trip at [`DECK_REPLY_TIMEOUT`].
+///
+/// The elapsed case is reported as what it is — a deck that took the connection
+/// and did not answer — rather than folded into the transport error beside it,
+/// because the two send a reader to different places: one says the deck is not
+/// there and the other says it is there and wedged.
+pub(crate) async fn bounded_reply<T, E: std::fmt::Display>(
+    what: &str,
+    reply: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(DECK_REPLY_TIMEOUT, reply).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(safe_message(error.to_string())),
+        Err(_) => Err(safe_message(format!(
+            "the deck took the connection but did not answer {what} within {}s",
+            DECK_REPLY_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+async fn hello_exchange(
     socket_path: &Path,
     stamps: StampPolicy,
 ) -> Result<(HandshakeInfo, AttachResponse), String> {
@@ -902,7 +1120,7 @@ async fn establish(
     // through a forwarded Unix socket, so the handshake needs no transport of
     // its own — M5 supplies the address, not a different way of opening it.
     let (info, response) = hello(transport.address(), StampPolicy::for_endpoint(endpoint)).await?;
-    let connection = connection_from_handshake(info);
+    let connection = connection_from_handshake(endpoint, info);
     // Built from the TRANSPORT rather than the address, so the client carries
     // what a `stat` of that address is allowed to mean. `DaemonClient::new`
     // would stamp a tunnel's own socket `LocalInode` and put `exists()`-as-health
@@ -972,7 +1190,7 @@ pub(crate) async fn snapshot_with(
 ) -> DesktopSnapshot {
     let daemon = match links.trusted(endpoint).await {
         Ok(daemon) => daemon,
-        Err(error) => return disconnected_snapshot(error),
+        Err(error) => return disconnected_snapshot(endpoint, error),
     };
     let connection = daemon.connection();
     if connection.status != ConnectionStatus::Connected {
@@ -989,6 +1207,9 @@ pub(crate) async fn snapshot_with(
             schedule_revision: None,
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
+            fleet: observed_fleet(),
+            unconfigured: unconfigured_fleet(),
+            observed: observed_fleet_decks(),
         };
     }
 
@@ -997,7 +1218,7 @@ pub(crate) async fn snapshot_with(
             let records = view.records();
             return connected_snapshot(connection, records, view.schedule_revision());
         }
-        return match daemon.client.list_agents_detailed().await {
+        return match bounded_reply("ListAgents", daemon.client.list_agents_detailed()).await {
             Ok(listing) => {
                 view.install(listing, tokio::time::Instant::now());
                 connected_snapshot(connection, view.records(), view.schedule_revision())
@@ -1007,12 +1228,15 @@ pub(crate) async fn snapshot_with(
                 // cleared, and the next refresh will try again rather than
                 // promoting whatever it was holding into an answer.
                 links.invalidate(endpoint).await;
-                disconnected_snapshot(error.to_string())
+                disconnected_snapshot(endpoint, error)
             }
         };
     }
 
-    match daemon.client.list_agents_detailed().await {
+    // PRD #742 M14: bounded, like the handshake above it. This is the call that
+    // produces a deck's FIRST snapshot, so a peer that stalls here is a deck the
+    // webview never hears from rather than a request that is merely slow.
+    match bounded_reply("ListAgents", daemon.client.list_agents_detailed()).await {
         Ok(listing) => connected_snapshot(connection, listing.records, listing.schedule_revision),
         Err(error) => {
             // The held link just failed to carry a request. Whatever is at the
@@ -1021,7 +1245,7 @@ pub(crate) async fn snapshot_with(
             // handshakes again rather than reporting a verdict it can no longer
             // support.
             links.invalidate(endpoint).await;
-            disconnected_snapshot(error.to_string())
+            disconnected_snapshot(endpoint, error)
         }
     }
 }
@@ -1064,6 +1288,12 @@ fn connected_snapshot(
         schedule_revision,
         protocol_version: PROTOCOL_VERSION,
         source: "daemon",
+        // The applied document's observed set, not this deck's anything — so
+        // every deck in a fleet carries the same list and a webview may prune
+        // its map on whichever snapshot happens to land first (PRD #742 M5).
+        fleet: observed_fleet(),
+        unconfigured: unconfigured_fleet(),
+        observed: observed_fleet_decks(),
     }
 }
 
@@ -1172,7 +1402,7 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
             links.invalidate(&endpoint).await;
             get_snapshot(links).await
         }
-        Err(error) => disconnected_snapshot(error.to_string()),
+        Err(error) => disconnected_snapshot(&endpoint, error.to_string()),
     }
 }
 
@@ -2249,6 +2479,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The property the whole-map lock existed for, kept after PRD #742 M3 split
+    /// it: **two callers racing on the SAME deck still cost one handshake.**
+    ///
+    /// Its sibling above drives the two calls sequentially, so it measures the
+    /// held-link cache and not the collapse — it would pass just as well with no
+    /// serialisation at all. This one is the half M3 could break: the map lock is
+    /// no longer held across establishment, so what stops a concurrent first-use
+    /// from opening a second connection is the per-deck gate and nothing else.
+    /// Without it both callers would miss the empty map and handshake, which is
+    /// N ssh authentications for N tiles arriving at once on a remote deck.
+    ///
+    /// The script offers **two** replies while the assertion demands one
+    /// connection, so a broken collapse fails on the count rather than hanging;
+    /// a working one leaves the daemon waiting for a second client that never
+    /// comes, which is why it is aborted rather than awaited.
+    ///
+    /// The cross-deck half — two callers on DIFFERENT decks never waiting for
+    /// each other — is
+    /// [`tests::an_unresponsive_deck_does_not_queue_another_decks_handshake`].
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_first_uses_of_one_deck_still_collapse_into_one_handshake() {
+        let (dir, socket) = scratch_socket("m3-collapse");
+        let listener = bind_trusted(&socket);
+        let daemon = tokio::spawn(scripted_daemon_sequence(
+            listener,
+            vec![matching_hello(), matching_hello()],
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+
+        let (first, second) = tokio::join!(links.trusted(&endpoint), links.trusted(&endpoint));
+        let first = first.expect("the racing caller that established");
+        let second = second.expect("the racing caller that waited");
+
+        daemon.abort();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both racers must hold the SAME link, not two equal ones"
+        );
+        assert_eq!(
+            links.handshake_count(),
+            1,
+            "concurrent first-uses of one deck must collapse into ONE handshake \
+             — the per-deck gate is all that keeps this true now that the map \
+             lock is not held across establishment"
+        );
+    }
+
     /// Invalidation is the other half: after it the next call handshakes again,
     /// against whatever is at the address now. This is what every replacement
     /// route goes through — the watcher losing its event stream, Stop, Replace,
@@ -2355,16 +2637,19 @@ mod tests {
     fn a_held_handshake_goes_stale_after_the_revalidate_interval() {
         let link = TrustedDaemon {
             client: Arc::new(DaemonClient::new("/tmp/attach.sock".into())),
-            connection: connection_from_handshake(HandshakeInfo {
-                status: ConnectionStatus::Connected,
-                error: None,
-                server_protocol_version: Some(PROTOCOL_VERSION),
-                daemon_build_version: None,
-                daemon_version: None,
-                running_agent_count: Some(0),
-                build_stamp_mismatch_only: false,
-                project_actions_reason: None,
-            }),
+            connection: connection_from_handshake(
+                &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+                HandshakeInfo {
+                    status: ConnectionStatus::Connected,
+                    error: None,
+                    server_protocol_version: Some(PROTOCOL_VERSION),
+                    daemon_build_version: None,
+                    daemon_version: None,
+                    running_agent_count: Some(0),
+                    build_stamp_mismatch_only: false,
+                    project_actions_reason: None,
+                },
+            ),
             _transport: tokio::runtime::Runtime::new()
                 .expect("a runtime for the lease")
                 .block_on(
@@ -2887,5 +3172,1203 @@ mod tests {
         );
         assert_eq!(daemon.await.expect("no panic"), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #742 M3 — the fleet: isolated folds, deck-stamped emits, and the
+    // whole-map mutex.
+    //
+    // Everything above this line drives ONE deck, which is what the desktop has
+    // always had. These drive two at once, which is the milestone: #741's stale
+    // fold was a SEQUENTIAL hazard (the deck the user left), and with N decks
+    // the subscriptions are concurrent, so "which deck is this from" stops
+    // being answerable by "there is exactly one".
+    // -----------------------------------------------------------------------
+
+    /// One `ToolStart` naming a specific deck's agent, so a fold can be traced
+    /// back to the deck that broadcast it.
+    #[cfg(unix)]
+    fn tool_event_for(
+        pane_id: &str,
+        agent_id: &str,
+        tool: &str,
+    ) -> dot_agent_deck::event::BroadcastMsg {
+        use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
+        BroadcastMsg::Event(AgentEvent {
+            session_id: format!("{pane_id}-session"),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some(tool.to_string()),
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(pane_id.into()),
+            agent_id: Some(agent_id.into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        })
+    }
+
+    /// The active tool the snapshot shows for `id`, or `None` if that agent is
+    /// not in it at all.
+    #[cfg(unix)]
+    fn active_tool_of(snapshot: &DesktopSnapshot, id: &str) -> Option<String> {
+        snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .and_then(|agent| agent.active_tool.as_ref())
+            .map(|tool| tool.name.clone())
+    }
+
+    /// **Test-plan item 8, and the headline of the milestone.** Scenario: two
+    /// decks are observed and answered concurrently, each running its own agent,
+    /// and deck A broadcasts a `ToolStart` for A's agent. Deck A's snapshot must
+    /// show that agent working and must be labelled with deck A's own address;
+    /// deck B's snapshot must show only B's agent, untouched by A's broadcast,
+    /// and must be labelled with B's address.
+    ///
+    /// This is the N-deck generalisation of the bug PRD #741 already shipped and
+    /// fixed once: its watcher went on folding the previous deck's broadcasts
+    /// into the view answering the new deck's snapshots and re-emitting them
+    /// under the new deck's name. #741's fix handled a sequential selection
+    /// change; here both subscriptions are live at the same time, which is
+    /// strictly harder because `BroadcastMsg` carries no deck id.
+    ///
+    /// **Asserted on the end state rather than on the routing.** Nothing here
+    /// says how many watcher tasks there are or where a view lives — only that a
+    /// snapshot answered FOR a deck carries that deck's agents and that deck's
+    /// identity. Every emit goes through this function, so a merged watcher that
+    /// mislabelled would fail here whatever its task topology.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fold_for_one_deck_never_reaches_another_decks_snapshot() {
+        let (dir_a, socket_a) = scratch_socket("m3-fold-a");
+        let (dir_b, socket_b) = scratch_socket("m3-fold-b");
+        let listener_a = bind_trusted(&socket_a);
+        let listener_b = bind_trusted(&socket_b);
+        let (stop_a, stop_a_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stop_b, stop_b_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon_a = tokio::spawn(counting_daemon(
+            listener_a,
+            vec![listed_agent("agent-a", "pane-a")],
+            stop_a_rx,
+        ));
+        let daemon_b = tokio::spawn(counting_daemon(
+            listener_b,
+            vec![listed_agent("agent-b", "pane-b")],
+            stop_b_rx,
+        ));
+
+        let links = DaemonLinks::default();
+        let deck_a = Endpoint::Local(LocalEndpoint::at(&socket_a));
+        let deck_b = Endpoint::Local(LocalEndpoint::at(&socket_b));
+        let mut view_a = AgentView::default();
+        let mut view_b = AgentView::default();
+
+        // Both decks answered at once, which is the fleet's shape rather than
+        // the selection change #741 fixed.
+        let (first_a, first_b) = tokio::join!(
+            snapshot_with(&deck_a, &links, Some(&mut view_a)),
+            snapshot_with(&deck_b, &links, Some(&mut view_b)),
+        );
+        assert_eq!(first_a.connection.status, ConnectionStatus::Connected);
+        assert_eq!(first_b.connection.status, ConnectionStatus::Connected);
+
+        // Deck A broadcasts. Nothing about the message says which deck it came
+        // from, which is exactly why the isolation has to be structural.
+        view_a.apply(&tool_event_for("pane-a", "agent-a", "Bash"));
+
+        let (second_a, second_b) = tokio::join!(
+            snapshot_with(&deck_a, &links, Some(&mut view_a)),
+            snapshot_with(&deck_b, &links, Some(&mut view_b)),
+        );
+
+        let _ = stop_a.send(());
+        let _ = stop_b.send(());
+        daemon_a.abort();
+        daemon_b.abort();
+
+        // The fold reached the deck that broadcast it...
+        assert_eq!(
+            active_tool_of(&second_a, "agent-a"),
+            Some("Bash".to_string()),
+            "the broadcasting deck's own snapshot must show its agent working"
+        );
+        // ...and only that deck.
+        assert_eq!(
+            second_b
+                .agents
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-b"],
+            "the other deck's snapshot must carry only its own agents"
+        );
+        assert_eq!(
+            active_tool_of(&second_b, "agent-b"),
+            None,
+            "one deck's broadcast must not move another deck's agent"
+        );
+
+        // And each snapshot is LABELLED with the deck it was answered for. The
+        // frontend derives `daemonId` from `connection.socketPath`
+        // (`desktop/src/lib/bridge.ts`), so this string is the deck identity as
+        // far as every screen is concerned.
+        assert_eq!(
+            second_a.connection.socket_path,
+            deck_a.describe(),
+            "a snapshot answered for deck A must name deck A"
+        );
+        assert_eq!(
+            second_b.connection.socket_path,
+            deck_b.describe(),
+            "a snapshot answered for deck B must name deck B"
+        );
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// **Test-plan item 9.** Scenario: two observed decks are each running an
+    /// agent that reports the SAME registry id, and both are snapshotted. The
+    /// two snapshots must carry different deck identities, so the frontend's
+    /// `(daemonId, agentId)` composite key still tells the two agents apart.
+    ///
+    /// This is the failure that looks right on screen, which is why it needs a
+    /// test rather than review. `AgentOverview.tsx` keys agents by
+    /// `(daemonId, agentId)`; the DTO carries exactly ONE `connection`. So a
+    /// merge that emits N decks' agents under one identity does not render an
+    /// error — it renders one fleet where there were two, and a later action on
+    /// such a row sends one deck's agent id to the other deck.
+    ///
+    /// **PRD #742 M5 moved `daemonId` off `connection.socketPath` and onto
+    /// `connection.deckId`, and the assertions below follow it.** Two LOCAL
+    /// decks differ in their describe string, so this pair was separable either
+    /// way; what was not is two REMOTE rows differing only in socket path,
+    /// identity file or jump host — `dto::tests::the_snapshot_fleet_is_the_observed_set_selected_first`
+    /// is where that pair is pinned, because it needs a settings document
+    /// rather than a listening socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_decks_running_the_same_agent_id_never_share_one_deck_identity() {
+        let (dir_a, socket_a) = scratch_socket("m3-ident-a");
+        let (dir_b, socket_b) = scratch_socket("m3-ident-b");
+        let listener_a = bind_trusted(&socket_a);
+        let listener_b = bind_trusted(&socket_b);
+        // The same id on both decks: a bare-id key collides, and only the deck
+        // half of the composite key can separate them.
+        let daemon_a = tokio::spawn(scripted_daemon_sequence(
+            listener_a,
+            vec![
+                matching_hello(),
+                AttachResponse::agent_records(vec![listed_agent("1", "pane-1")]),
+            ],
+        ));
+        let daemon_b = tokio::spawn(scripted_daemon_sequence(
+            listener_b,
+            vec![
+                matching_hello(),
+                AttachResponse::agent_records(vec![listed_agent("1", "pane-1")]),
+            ],
+        ));
+
+        let links = DaemonLinks::default();
+        let deck_a = Endpoint::Local(LocalEndpoint::at(&socket_a));
+        let deck_b = Endpoint::Local(LocalEndpoint::at(&socket_b));
+
+        let (snapshot_a, snapshot_b) =
+            tokio::join!(snapshot_of(&deck_a, &links), snapshot_of(&deck_b, &links),);
+
+        daemon_a.abort();
+        daemon_b.abort();
+
+        assert_eq!(snapshot_a.connection.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot_b.connection.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot_a.agents.len(), 1);
+        assert_eq!(snapshot_b.agents.len(), 1);
+        assert_eq!(
+            snapshot_a.agents[0].id, snapshot_b.agents[0].id,
+            "the fixture must really put the same agent id on both decks, or \
+             this test proves nothing"
+        );
+
+        assert_ne!(
+            snapshot_a.connection.deck_id, snapshot_b.connection.deck_id,
+            "two decks must never be emitted under one identity — the composite \
+             key collapses and two fleets render as one"
+        );
+        assert_eq!(snapshot_a.connection.deck_id, deck_wire_id(&deck_a));
+        assert_eq!(snapshot_b.connection.deck_id, deck_wire_id(&deck_b));
+        assert_ne!(
+            snapshot_a.connection.socket_path, snapshot_b.connection.socket_path,
+            "and the LABEL beside it still names each deck for a reader"
+        );
+        assert_eq!(snapshot_a.connection.socket_path, deck_a.describe());
+        assert_eq!(snapshot_b.connection.socket_path, deck_b.describe());
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// A deck that accepts a handshake and then never answers it.
+    ///
+    /// A **deterministic** stall the test controls rather than a real connect
+    /// timeout waited out: [`hello`] has no deadline of its own, so a daemon
+    /// that reads the request frame and does not reply parks the caller inside
+    /// `establish()` for exactly as long as the test wants it there. Signals
+    /// `accepted` once it is holding the connection and holds it until `release`
+    /// fires — the write half is kept bound rather than dropped, because
+    /// dropping it shuts the socket down and the client would see EOF instead of
+    /// a stall.
+    #[cfg(unix)]
+    async fn unresponsive_daemon(
+        listener: tokio::net::UnixListener,
+        accepted: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use dot_agent_deck::daemon_protocol::read_frame;
+        let (stream, _peer) = listener.accept().await.expect("accept one client");
+        let (mut reader, _writer) = stream.into_split();
+        let _ = read_frame(&mut reader).await;
+        let _ = accepted.send(());
+        let _ = release.await;
+    }
+
+    /// A deck that accepts a handshake, stalls until `release`, and then answers
+    /// it properly.
+    ///
+    /// [`unresponsive_daemon`]'s sibling, and the difference is the whole of
+    /// what PRD #742 M8's F1 needs: that one parks a caller inside `establish()`
+    /// forever, which proves another deck is not queued behind it; this one
+    /// parks a caller and then lets it **succeed**, so the test can act on the
+    /// map while an establishment is in flight and then watch what that
+    /// establishment does with its result.
+    #[cfg(unix)]
+    async fn stalled_then_answering_daemon(
+        listener: tokio::net::UnixListener,
+        accepted: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use dot_agent_deck::daemon_protocol::{KIND_RESP, read_frame, write_frame};
+        let (stream, _peer) = listener.accept().await.expect("accept one client");
+        let (mut reader, mut writer) = stream.into_split();
+        let _ = read_frame(&mut reader).await;
+        let _ = accepted.send(());
+        let _ = release.await;
+        let encoded = serde_json::to_vec(&matching_hello()).expect("serialize the reply");
+        let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+    }
+
+    /// **PRD #742 M8's F1, reached end to end rather than at a seam.**
+    /// Scenario: a refresh is mid-handshake against deck `D` when the user
+    /// changes the selection. `retarget_selection`'s `invalidate_all()` runs
+    /// while `D`'s establishment is parked inside `hello()`; the deck then
+    /// answers, and the establishment comes back with a perfectly good
+    /// `Connected` link. It must hand that link to its caller and **not** put it
+    /// in the map: `D` is a deck nothing observes any more, and a link held for
+    /// it holds a `DaemonClient`, a captured capability set and a lease on an
+    /// `ssh` child until the next settings save.
+    ///
+    /// Before M8 the map's own lock did this — it was held across establishment,
+    /// so `invalidate_all` could not run in the middle. The per-deck gate M3
+    /// replaced it with does not exclude `invalidate_all` at all, and `D` has no
+    /// entry to clear while it is being established, so the clear was a no-op
+    /// and the insert landed behind it.
+    ///
+    /// **What this proves:** the real `trusted()`, against a real socket, with
+    /// the invalidation genuinely interleaved — the deck has taken the request
+    /// frame (`accepted`) and has not answered it (`release` has not fired) when
+    /// `invalidate_all` runs. No sleeps and no timing assumptions: both edges
+    /// are `oneshot` channels the test fires itself.
+    ///
+    /// **What it does not prove:** the same property for
+    /// `EndpointTunnels::acquire`, whose stall would have to be an `ssh` spawn.
+    /// That one is pinned at its publish seam instead —
+    /// `endpoint_tunnels::tests::a_transport_whose_deck_left_mid_establishment_is_not_published`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_established_across_an_invalidation_is_not_published() {
+        let (dir, socket) = scratch_socket("m8-strand");
+        let listener = bind_trusted(&socket);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(stalled_then_answering_daemon(
+            listener, accepted, release_rx,
+        ));
+
+        let links = Arc::new(DaemonLinks::default());
+        let deck = Endpoint::Local(LocalEndpoint::at(&socket));
+        let establishing = {
+            let links = Arc::clone(&links);
+            let deck = deck.clone();
+            tokio::spawn(async move { links.trusted(&deck).await })
+        };
+
+        accepted_rx
+            .await
+            .expect("the deck must have taken the handshake before the selection moves");
+        // The user picked a different deck. This is the whole of what
+        // `retarget_selection` does to this map, and `D` is not in it yet.
+        links.invalidate_all().await;
+        assert_eq!(links.held().await, 0);
+
+        let _ = release.send(());
+        let established = establishing
+            .await
+            .expect("the establishing task must finish")
+            .expect("the deck answered, so the handshake itself succeeds");
+
+        assert_eq!(
+            established.connection().status,
+            ConnectionStatus::Connected,
+            "the caller still gets its answer — refusing the publish is not \
+             refusing the request"
+        );
+        assert_eq!(
+            links.held().await,
+            0,
+            "a link established for a deck invalidated mid-handshake must not be \
+             held: nothing observes that deck, and the link holds a client, a \
+             capability set and a lease on an ssh child"
+        );
+
+        let _ = daemon.await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The contrast the test above needs to be worth anything. Scenario: the
+    /// same stalled-then-answering deck, with **no** invalidation while the
+    /// handshake is out. The link must be held, so a second caller reuses it.
+    ///
+    /// Without this, a `trusted()` that never published anything would pass the
+    /// test above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_established_with_nothing_moving_under_it_is_published() {
+        let (dir, socket) = scratch_socket("m8-keep");
+        let listener = bind_trusted(&socket);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(stalled_then_answering_daemon(
+            listener, accepted, release_rx,
+        ));
+
+        let links = Arc::new(DaemonLinks::default());
+        let deck = Endpoint::Local(LocalEndpoint::at(&socket));
+        let establishing = {
+            let links = Arc::clone(&links);
+            let deck = deck.clone();
+            tokio::spawn(async move { links.trusted(&deck).await })
+        };
+
+        accepted_rx.await.expect("the deck took the handshake");
+        let _ = release.send(());
+        let established = establishing
+            .await
+            .expect("the establishing task must finish")
+            .expect("the deck answered");
+        assert_eq!(established.connection().status, ConnectionStatus::Connected);
+
+        assert_eq!(
+            links.held().await,
+            1,
+            "nothing moved under this establishment, so its link is held"
+        );
+        assert_eq!(links.handshake_count(), 1);
+
+        let _ = daemon.await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **PRD #742 M14.** Scenario: a deck accepts the handshake connection and
+    /// never answers it. `hello()` must give up and report that rather than
+    /// waiting for a reply that is not coming.
+    ///
+    /// # What was unbounded, and what it cost
+    ///
+    /// `issue_command` is a write followed by a `read_response`, and
+    /// `read_response` waits for as long as the peer keeps the socket open — so
+    /// an accepting-but-silent deck was a future that never completed rather
+    /// than an error any caller could observe. A deck that is simply DOWN was
+    /// always fine: `connect` fails immediately.
+    ///
+    /// It is M14's boundedness question because a watcher emits its first
+    /// snapshot only after its first reply. Until then the webview renders the
+    /// deck as pending — right for the seconds an ssh tunnel takes, wrong
+    /// forever — so without this the fleet view has a spinner with no terminal
+    /// state, which is worse than the late appearance it replaced.
+    ///
+    /// # Paused time, not fifteen real seconds — and paused at a POINT
+    ///
+    /// The clock is stopped only after `accepted_rx` resolves, which is the
+    /// peer confirming it took the connection and read the request. That
+    /// ordering is the test rather than an optimisation: `start_paused` would
+    /// auto-advance from the first moment the runtime had nothing ready to
+    /// poll, so a clock that jumped while the connect was still in flight would
+    /// produce the same error message for a scenario nobody meant to write.
+    /// Pausing here leaves exactly one thing outstanding — a read against a
+    /// peer that is never going to write — and the runtime advances to the
+    /// timeout because that is the only deadline left. Real socket I/O, real
+    /// silence, and none of the fifteen seconds spent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_that_takes_the_connection_and_never_answers_is_reported_rather_than_awaited() {
+        let (dir, socket) = scratch_socket("m14-silent");
+        let listener = bind_trusted(&socket);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let silent = tokio::spawn(unresponsive_daemon(listener, accepted, release_rx));
+
+        let asking = {
+            let socket = socket.clone();
+            tokio::spawn(async move { hello(&socket, StampPolicy::Enforced).await })
+        };
+        accepted_rx
+            .await
+            .expect("the deck must have taken the connection and read the request");
+        // Everything outstanding is now parked: this deck's reply, which is
+        // never coming, and the stall the test releases below.
+        tokio::time::pause();
+        /*
+            The outer bound is what turns a REGRESSION into a failure instead of
+            a hang. Measured: with the timeout taken back out of `hello()` this
+            test does not fail, it never returns — which in CI is a job burning
+            its whole budget with nothing to read. Under a paused clock tokio
+            advances to the NEAREST deadline, so `hello`'s own fifteen seconds
+            fire first while it has one, and this fires only when it does not.
+            Neither costs wall clock.
+        */
+        let outcome = tokio::time::timeout(Duration::from_secs(600), asking)
+            .await
+            .expect("hello() must bound its own wait rather than await a reply that is not coming")
+            .expect("the handshake task must not panic");
+
+        let _ = release.send(());
+        let _ = silent.await;
+        let _ = std::fs::remove_dir_all(dir);
+
+        let error = outcome.expect_err("a deck that never answers must not resolve as connected");
+        assert!(
+            error.contains("did not answer"),
+            "the elapsed case must say the deck took the connection and stalled, \
+             rather than reading as a transport failure: {error}"
+        );
+        assert!(
+            error.contains(&DECK_REPLY_TIMEOUT.as_secs().to_string()),
+            "and name the bound it exceeded: {error}"
+        );
+    }
+
+    /// **Test-plan item 10, and the risk this PRD is most likely to fail on.**
+    /// Scenario: one observed deck accepts a handshake and never answers it,
+    /// while a second, healthy deck is asked for its own. The healthy deck's
+    /// handshake must complete promptly rather than queueing behind the
+    /// unresponsive one.
+    ///
+    /// [`DaemonLinks::trusted`] holds **one async mutex over the whole map,
+    /// across establishment**, and its own doc calls that the better of the two
+    /// — which it is, for one deck: concurrent first-uses of the same deck
+    /// collapse into one handshake. At N decks it inverts, because the callers
+    /// queued behind the timeout are now OTHER decks. That is success criterion
+    /// 2 of PRD #742, stated as a measurement precisely because it fails
+    /// silently.
+    ///
+    /// **The property, not the lock's shape.** Nothing here asserts that a mutex
+    /// was split, or that establishment moved out of it; either fix passes. What
+    /// is asserted is that a healthy deck's handshake completes while another
+    /// deck is mid-connect.
+    ///
+    /// The bound is five seconds against a sub-millisecond local handshake —
+    /// three orders of magnitude of headroom, because `.config/nextest.toml`
+    /// keeps `retries = 0` and a flaky timing test here would be worse than no
+    /// test at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unresponsive_deck_does_not_queue_another_decks_handshake() {
+        let (dir_stalled, socket_stalled) = scratch_socket("m3-stall");
+        let (dir_healthy, socket_healthy) = scratch_socket("m3-healthy");
+        let stalled_listener = bind_trusted(&socket_stalled);
+        let healthy_listener = bind_trusted(&socket_healthy);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let stalled = tokio::spawn(unresponsive_daemon(stalled_listener, accepted, release_rx));
+        let healthy = tokio::spawn(scripted_daemon_sequence(
+            healthy_listener,
+            vec![matching_hello()],
+        ));
+
+        let links = Arc::new(DaemonLinks::default());
+        let unresponsive = Endpoint::Local(LocalEndpoint::at(&socket_stalled));
+        let reachable = Endpoint::Local(LocalEndpoint::at(&socket_healthy));
+
+        let blocked = {
+            let links = Arc::clone(&links);
+            tokio::spawn(async move {
+                let _ = links.trusted(&unresponsive).await;
+            })
+        };
+        accepted_rx
+            .await
+            .expect("the unresponsive deck must have taken the handshake");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), links.trusted(&reachable)).await;
+
+        // Cleanup BEFORE the assertion, so the failing run still lets go of the
+        // stalled connection and the scratch sockets.
+        let _ = release.send(());
+        let _ = stalled.await;
+        blocked.abort();
+        healthy.abort();
+        let _ = std::fs::remove_dir_all(dir_stalled);
+        let _ = std::fs::remove_dir_all(dir_healthy);
+
+        let link = outcome
+            .expect(
+                "a healthy deck's handshake must not be queued behind an \
+                 unreachable deck's connect — PRD #742 success criterion 2",
+            )
+            .expect("the healthy deck answered, so its link must establish");
+        assert_eq!(link.connection().status, ConnectionStatus::Connected);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #742 M9 — the same fleet properties, against two REAL daemons
+    //
+    // Everything above this line answers a `scripted_daemon`: a hand-written
+    // socket responder that replies with whatever the test handed it. Those are
+    // genuine concurrency tests and they stay — they pin edge cases a real
+    // server makes awkward (a daemon that accepts and never answers, a reply
+    // sequence chosen per connection, a listing the test controls byte for
+    // byte). What they cannot show is that the client folds and stamps
+    // correctly against the thing it actually talks to.
+    //
+    // These run the PRODUCTION attach server in-process, twice, on two sockets.
+    // What that adds over the scripted pair, item by item:
+    //
+    //   - `bind_attach_listener` creates the inode with the production
+    //     umask-before-`bind(2)` dance, so `verify_endpoint_trusted`'s uid and
+    //     exactly-`0o600` predicate runs against a socket a real server made
+    //     rather than one `bind_trusted` restated the mode on afterwards;
+    //   - the `Hello` reply, its `running_agents` summary and its capability
+    //     advertisement are the daemon's own, not a fixture's;
+    //   - `ListAgents` is the real handler joining a real `AgentPtyRegistry`
+    //     holding real PTY children, so the records under test are minted by
+    //     the registry rather than written by the test;
+    //   - `SubscribeEvents` is a real push stream, so "a fold never crosses
+    //     decks" can be asserted on the WIRE — deck B's subscription never
+    //     carrying deck A's broadcast — rather than on two `AgentView` objects
+    //     a test hand-fed.
+    //
+    // `examples/perf_baseline_probe.rs` is the worked precedent for binding the
+    // production server over a Unix socket and driving real agents through it.
+    // -----------------------------------------------------------------------
+
+    /// One real daemon: the production attach server, bound by production code,
+    /// serving a real registry over a real Unix socket.
+    ///
+    /// **The bind happens on the calling thread, not inside the spawned task**,
+    /// which is why nothing here polls for the socket to appear:
+    /// [`bind_attach_listener`] creates the inode before `start` returns and
+    /// `serve_attach` is handed the listener it created. The perf probe's
+    /// connect-until-it-works loop exists because it calls
+    /// `run_attach_server_with_counter`, which binds inside the task; splitting
+    /// the bind from the accept loop removes the race rather than waiting it
+    /// out.
+    ///
+    /// [`bind_attach_listener`] flips the **process** umask around its
+    /// `bind(2)`, which `scripted_daemon` above deliberately avoids. That is
+    /// safe here and the difference is the test runner: `cargo test-fast` is
+    /// nextest, which is process-per-test, so the flip is private to this test.
+    /// Under a plain `cargo test` the whole module shares one process and the
+    /// flip is momentary but global — and it is accepted rather than avoided,
+    /// because a socket this test created some other way would not be the thing
+    /// the trust check is supposed to be running against.
+    ///
+    /// "Momentary" is a property of the production helper rather than of this
+    /// call site, and since PRD #742 M11 it holds on the unwind path too:
+    /// `platform::fsperm::with_socket_umask` restores from a `Drop`, so a body
+    /// that panicked could not leave the process at `0o177`. Nothing here needs
+    /// a scope guard of its own — unlike `project/resolve/002`'s cwd, the flip
+    /// is confined to one `bind(2)` inside production code and is already back
+    /// before `start` returns.
+    ///
+    /// [`bind_attach_listener`]: dot_agent_deck::daemon_protocol::bind_attach_listener
+    #[cfg(unix)]
+    struct RealDeck {
+        dir: std::path::PathBuf,
+        endpoint: Endpoint,
+        registry: Arc<dot_agent_deck::agent_pty::AgentPtyRegistry>,
+        /// The daemon-wide broadcast every `SubscribeEvents` stream forwards.
+        /// Holding the `Sender` is how a test makes a REAL daemon push a real
+        /// event frame to its own subscribers and to nobody else's.
+        events: tokio::sync::broadcast::Sender<dot_agent_deck::event::BroadcastMsg>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl RealDeck {
+        fn start(tag: &str) -> Self {
+            use dot_agent_deck::daemon_protocol::{bind_attach_listener, serve_attach};
+            let (dir, socket) = scratch_socket(tag);
+            let registry = Arc::new(dot_agent_deck::agent_pty::AgentPtyRegistry::new());
+            // The initial receiver is dropped immediately: a broadcast channel
+            // stays open with none, and every reader in these tests is a real
+            // `SubscribeEvents` connection the daemon subscribes on its own.
+            let (events, _initial) = tokio::sync::broadcast::channel(64);
+            let listener = bind_attach_listener(&socket).expect("bind the real attach socket");
+            let server = {
+                let registry = Arc::clone(&registry);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let _ = serve_attach(listener, registry, events).await;
+                })
+            };
+            Self {
+                dir,
+                endpoint: Endpoint::Local(LocalEndpoint::at(&socket)),
+                registry,
+                events,
+                server,
+            }
+        }
+
+        /// A real PTY child under this daemon's registry, and the **registry's**
+        /// own id for it.
+        ///
+        /// `cat` for the same reason the perf probe uses it: it reads its PTY
+        /// and blocks, so the record stays live for the test's duration without
+        /// any keep-alive of its own.
+        ///
+        /// Every registry mints ids from its own counter starting at 1, so the
+        /// first agent on each of two decks is id `"1"` — which is the collision
+        /// a bare-id key gets wrong, arrived at by the registry rather than
+        /// staged by the test.
+        fn spawn_agent(&self, pane_id: &str) -> String {
+            use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+            self.registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn a real PTY agent")
+        }
+
+        /// Stop answering, and reap the PTY children — the socket inode is left
+        /// in place, so a client meeting this deck afterwards gets
+        /// `ECONNREFUSED` rather than a missing file. That is what a killed
+        /// daemon looks like to a held link.
+        fn kill_server(&self) {
+            self.server.abort();
+            self.registry.shutdown_all();
+        }
+
+        fn shutdown(self) {
+            self.kill_server();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The real-daemon sibling of
+    /// [`tests::two_decks_running_the_same_agent_id_never_share_one_deck_identity`].
+    /// Scenario: two production attach servers are running on two sockets, each
+    /// with one real PTY agent, and both are snapshotted concurrently. Both
+    /// registries mint `"1"` for their first agent, so the two snapshots carry
+    /// the same agent id and must still carry different deck identities.
+    ///
+    /// **What the real server adds.** The scripted version writes the colliding
+    /// id into its own `ListAgents` reply; here the collision is produced by two
+    /// independent `AgentPtyRegistry` id counters, which is where it comes from
+    /// in production. The `Hello` each deck answers is the daemon's own, so the
+    /// classification, the capability capture and the running-agent summary are
+    /// all on the real path, and `verify_endpoint_trusted` runs against an inode
+    /// `bind_attach_listener` created.
+    ///
+    /// **What it does not prove.** Two LOCAL decks differ in their describe
+    /// string as well as in their identity, so this pair is separable either
+    /// way; the pair that is *not* — two remote rows differing only in socket
+    /// path, identity file or jump host — needs a settings document rather than
+    /// a listening socket and stays at
+    /// `dto::tests::the_snapshot_fleet_is_the_observed_set_selected_first`. It
+    /// also says nothing about what the webview renders: no test in this
+    /// repository can (#953).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_real_daemons_serving_the_same_agent_id_never_share_one_deck_identity() {
+        let deck_a = RealDeck::start("m9-ident-a");
+        let deck_b = RealDeck::start("m9-ident-b");
+        let id_a = deck_a.spawn_agent("pane-a");
+        let id_b = deck_b.spawn_agent("pane-b");
+        assert_eq!(
+            id_a, id_b,
+            "two registries must really mint the same first id, or this test \
+             proves nothing"
+        );
+
+        let links = DaemonLinks::default();
+        let (snapshot_a, snapshot_b) = tokio::join!(
+            snapshot_of(&deck_a.endpoint, &links),
+            snapshot_of(&deck_b.endpoint, &links),
+        );
+
+        let endpoint_a = deck_a.endpoint.clone();
+        let endpoint_b = deck_b.endpoint.clone();
+        deck_a.shutdown();
+        deck_b.shutdown();
+
+        assert_eq!(snapshot_a.connection.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot_b.connection.status, ConnectionStatus::Connected);
+        assert_eq!(
+            snapshot_a
+                .agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![id_a.as_str()],
+        );
+        assert_eq!(
+            snapshot_b
+                .agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![id_b.as_str()],
+        );
+
+        assert_ne!(
+            snapshot_a.connection.deck_id, snapshot_b.connection.deck_id,
+            "two real daemons must never be emitted under one identity — the \
+             frontend's (daemonId, agentId) key collapses and two fleets render \
+             as one"
+        );
+        assert_eq!(snapshot_a.connection.deck_id, deck_wire_id(&endpoint_a));
+        assert_eq!(snapshot_b.connection.deck_id, deck_wire_id(&endpoint_b));
+        assert_ne!(
+            snapshot_a.connection.socket_path, snapshot_b.connection.socket_path,
+            "and the label beside the key still names each deck for a reader"
+        );
+    }
+
+    /// The real-daemon sibling of
+    /// [`tests::a_fold_for_one_deck_never_reaches_another_decks_snapshot`], and
+    /// the one place the isolation is asserted on the **wire** rather than on
+    /// two objects. Scenario: two production attach servers each run one agent
+    /// that reports the same registry id `"1"` on the same pane id, the client
+    /// holds a real `SubscribeEvents` stream to each, and deck A broadcasts a
+    /// `ToolStart`. Deck A's stream must carry it, deck B's stream must not, and
+    /// the two snapshots must show each deck's own tool.
+    ///
+    /// **What the real server adds.** The scripted version hand-applies the
+    /// event to `view_a`, so all it can show is that two `AgentView`s are two
+    /// objects — which M3's Work Log records as a property that "cannot fail".
+    /// Here the event goes into deck A's real daemon-wide broadcast, is
+    /// serialised by the real `handle_subscribe_events`, and is read back off a
+    /// real socket; the assertion that deck B's subscription's **first** frame
+    /// is B's own sentinel is what pins that A's broadcast never reached B's
+    /// stream. A's was sent first, so anything that could cross would already be
+    /// queued ahead of it.
+    ///
+    /// The two agents deliberately share **both** the registry id and the pane
+    /// id, so nothing but per-deck isolation separates the two folds.
+    ///
+    /// **What it does not prove.** That the *watcher* stamps its own endpoint on
+    /// what it emits — that needs an `AppHandle` and is the `R: Runtime` refactor
+    /// deferred to #953, recorded as a residual at M3 and unchanged here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_real_decks_broadcast_never_reaches_another_real_decks_stream_or_fold() {
+        let deck_a = RealDeck::start("m9-fold-a");
+        let deck_b = RealDeck::start("m9-fold-b");
+        let id_a = deck_a.spawn_agent("pane-1");
+        let id_b = deck_b.spawn_agent("pane-1");
+        assert_eq!(id_a, id_b, "both decks must really run the same agent id");
+
+        let links = DaemonLinks::default();
+        let mut view_a = AgentView::default();
+        let mut view_b = AgentView::default();
+        let (first_a, first_b) = tokio::join!(
+            snapshot_with(&deck_a.endpoint, &links, Some(&mut view_a)),
+            snapshot_with(&deck_b.endpoint, &links, Some(&mut view_b)),
+        );
+        assert_eq!(first_a.connection.status, ConnectionStatus::Connected);
+        assert_eq!(first_b.connection.status, ConnectionStatus::Connected);
+
+        // Two real subscriptions, held at once — the fleet's shape, and the
+        // thing #741 never had.
+        let mut stream_a = links
+            .trusted(&deck_a.endpoint)
+            .await
+            .expect("deck A is up")
+            .client
+            .subscribe_events()
+            .await
+            .expect("subscribe to deck A");
+        let mut stream_b = links
+            .trusted(&deck_b.endpoint)
+            .await
+            .expect("deck B is up")
+            .client
+            .subscribe_events()
+            .await
+            .expect("subscribe to deck B");
+
+        // Deck A broadcasts FIRST, so anything able to cross has a head start.
+        deck_a
+            .events
+            .send(tool_event_for("pane-1", &id_a, "Bash"))
+            .expect("deck A's subscriber is registered");
+        let from_a = stream_a
+            .next_event()
+            .await
+            .expect("deck A's stream is healthy")
+            .expect("deck A pushed its own broadcast");
+        view_a.apply(&from_a);
+
+        deck_b
+            .events
+            .send(tool_event_for("pane-1", &id_b, "Grep"))
+            .expect("deck B's subscriber is registered");
+        let from_b = stream_b
+            .next_event()
+            .await
+            .expect("deck B's stream is healthy")
+            .expect("deck B pushed its own broadcast");
+        view_b.apply(&from_b);
+
+        let (second_a, second_b) = tokio::join!(
+            snapshot_with(&deck_a.endpoint, &links, Some(&mut view_a)),
+            snapshot_with(&deck_b.endpoint, &links, Some(&mut view_b)),
+        );
+
+        drop(stream_a);
+        drop(stream_b);
+        deck_a.shutdown();
+        deck_b.shutdown();
+
+        // The wire half: B's first frame was B's own, so A's broadcast was
+        // never on B's stream.
+        assert_eq!(
+            tool_name_of(&from_b),
+            Some("Grep".to_string()),
+            "deck B's subscription must never carry deck A's broadcast"
+        );
+        assert_eq!(tool_name_of(&from_a), Some("Bash".to_string()));
+
+        // The fold half: same agent id, same pane id, different decks.
+        assert_eq!(
+            active_tool_of(&second_a, &id_a),
+            Some("Bash".to_string()),
+            "the broadcasting deck's own snapshot must show its agent working"
+        );
+        assert_eq!(
+            active_tool_of(&second_b, &id_b),
+            Some("Grep".to_string()),
+            "and the other deck's snapshot must show ITS agent's tool, not A's"
+        );
+    }
+
+    /// The tool name a broadcast names, for the wire-level half of the fold
+    /// test — `active_tool_of` reads a rendered snapshot, this reads the frame
+    /// that produced it.
+    #[cfg(unix)]
+    fn tool_name_of(msg: &dot_agent_deck::event::BroadcastMsg) -> Option<String> {
+        match msg {
+            dot_agent_deck::event::BroadcastMsg::Event(event) => event.tool_name.clone(),
+            _ => None,
+        }
+    }
+
+    /// **PRD #742 success criterion 2, half one: a deck that STOPPED answering.**
+    /// Scenario: two production attach servers are up and both have been
+    /// snapshotted, so the client holds a link to each; one server is then
+    /// killed and both decks are refreshed concurrently. The dead deck must
+    /// degrade on its own — a disconnected snapshot carrying its own name — and
+    /// the survivor must answer in full, with its own agent, inside a bound.
+    ///
+    /// **What the real server adds.** The scripted decks cannot be killed in a
+    /// way that resembles a killed daemon: a scripted responder either answers
+    /// or was told in advance not to. Here the accept loop is aborted with the
+    /// socket inode left in place, which is exactly what a `daemon stop` leaves
+    /// behind, so the survivor's refresh races a held link whose client is about
+    /// to meet `ECONNREFUSED` — the path `snapshot_with` invalidates on and the
+    /// one that decides whether a dead deck's failure is per-deck or fleet-wide.
+    ///
+    /// **What it does not prove.** That an unreachable deck does not *queue*
+    /// another deck's handshake: a killed daemon fails fast, so the timeout here
+    /// bounds a degradation rather than a stall. The stall is the sibling test
+    /// below, and the deterministic scripted version is
+    /// [`tests::an_unresponsive_deck_does_not_queue_another_decks_handshake`].
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_killed_real_deck_degrades_alone_and_the_survivor_answers_in_full() {
+        let survivor = RealDeck::start("m9-alive");
+        let doomed = RealDeck::start("m9-doomed");
+        let survivor_agent = survivor.spawn_agent("pane-alive");
+        doomed.spawn_agent("pane-doomed");
+
+        let links = DaemonLinks::default();
+        let (before_survivor, before_doomed) = tokio::join!(
+            snapshot_of(&survivor.endpoint, &links),
+            snapshot_of(&doomed.endpoint, &links),
+        );
+        assert_eq!(
+            before_survivor.connection.status,
+            ConnectionStatus::Connected
+        );
+        assert_eq!(before_doomed.connection.status, ConnectionStatus::Connected);
+        assert_eq!(links.held().await, 2, "both decks are held");
+
+        // The daemon goes away; its socket inode does not, which is what a held
+        // link meets in production.
+        doomed.kill_server();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                snapshot_of(&survivor.endpoint, &links),
+                snapshot_of(&doomed.endpoint, &links),
+            )
+        })
+        .await;
+
+        let survivor_endpoint = survivor.endpoint.clone();
+        let doomed_endpoint = doomed.endpoint.clone();
+        survivor.shutdown();
+        doomed.shutdown();
+
+        let (after_survivor, after_doomed) = outcome.expect(
+            "one dead deck must not stall another deck's refresh — PRD #742 \
+             success criterion 2",
+        );
+        assert_eq!(
+            after_survivor.connection.status,
+            ConnectionStatus::Connected,
+            "the surviving deck must keep answering: {:?}",
+            after_survivor.connection.error
+        );
+        assert_eq!(
+            after_survivor
+                .agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![survivor_agent.as_str()],
+            "and must still carry its own agent"
+        );
+        assert_eq!(
+            after_survivor.connection.deck_id,
+            deck_wire_id(&survivor_endpoint)
+        );
+
+        assert_eq!(
+            after_doomed.connection.status,
+            ConnectionStatus::Disconnected,
+            "the dead deck must report its own failure"
+        );
+        assert!(after_doomed.connection.error.is_some(), "and must say why");
+        assert!(after_doomed.agents.is_empty());
+        assert_eq!(
+            after_doomed.connection.deck_id,
+            deck_wire_id(&doomed_endpoint),
+            "a degraded deck is still named as itself, or the fleet cannot show \
+             which group went down"
+        );
+    }
+
+    /// **PRD #742 success criterion 2, half two: a deck that ACCEPTS and never
+    /// answers.** Scenario: one deck's socket is bound by the production binder
+    /// and a connection on it is accepted and then held without a reply, so a
+    /// `trusted()` against it is parked inside `hello()` for as long as the test
+    /// wants; a second, fully real deck is then asked for a complete snapshot.
+    /// That snapshot must come back inside a bound, with the real deck's own
+    /// agent in it.
+    ///
+    /// **What the real server adds over the scripted sibling.** The scripted
+    /// version's healthy deck answers exactly one canned `Hello` frame, so it
+    /// pins `DaemonLinks::trusted` and stops there. Here the healthy side is a
+    /// production attach server and the assertion is a whole `snapshot_of` —
+    /// handshake, capability capture and a real `ListAgents` join — so a
+    /// regression that unqueued the handshake and requeued the listing would be
+    /// caught. The stalled side's inode is created by `bind_attach_listener`,
+    /// so the trust check it passes on the way in is the production one.
+    ///
+    /// **What is scripted here, stated rather than implied.** Only the
+    /// *withholding of the reply*. A real daemon always answers, so a
+    /// deterministic stall cannot be built out of one — the connection is
+    /// accepted on a production-bound listener and then simply not served, which
+    /// is the condition being modelled (a daemon wedged before its reply) and
+    /// not a fixture standing in for one. The `accepted` oneshot is what makes
+    /// it deterministic: the healthy deck is not asked for anything until the
+    /// stalled deck is provably holding the handshake.
+    ///
+    /// The five-second bound is three orders of magnitude over a sub-millisecond
+    /// local snapshot, for the reason the scripted sibling gives:
+    /// `.config/nextest.toml` keeps `retries = 0`, so a flaky timing test here
+    /// would be worse than no test at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unresponsive_deck_does_not_queue_a_real_decks_whole_snapshot() {
+        use dot_agent_deck::daemon_protocol::{bind_attach_listener, read_frame};
+
+        let (stalled_dir, stalled_socket) = scratch_socket("m9-stall");
+        let stalled_listener =
+            bind_attach_listener(&stalled_socket).expect("bind the stalled deck's socket");
+        let healthy = RealDeck::start("m9-healthy");
+        let healthy_agent = healthy.spawn_agent("pane-healthy");
+
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let stalled_server = tokio::spawn(async move {
+            let stream = stalled_listener.accept().await.expect("accept one client");
+            // The write half is kept bound: dropping it half-closes the socket
+            // and the client would see EOF instead of a stall.
+            let (mut reader, _writer) = stream.into_split();
+            let _ = read_frame(&mut reader).await;
+            let _ = accepted.send(());
+            let _ = release_rx.await;
+        });
+
+        let links = Arc::new(DaemonLinks::default());
+        let stalled_endpoint = Endpoint::Local(LocalEndpoint::at(&stalled_socket));
+        let blocked = {
+            let links = Arc::clone(&links);
+            tokio::spawn(async move {
+                let _ = links.trusted(&stalled_endpoint).await;
+            })
+        };
+        accepted_rx.await.expect(
+            "the stalled deck must be holding the handshake before the \
+                     healthy deck is asked for anything",
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            snapshot_of(&healthy.endpoint, &links),
+        )
+        .await;
+
+        // Cleanup BEFORE the assertions, so a failing run still lets go of the
+        // parked connection, the PTY child and the scratch sockets.
+        let _ = release.send(());
+        let _ = stalled_server.await;
+        blocked.abort();
+        let healthy_endpoint = healthy.endpoint.clone();
+        healthy.shutdown();
+        let _ = std::fs::remove_dir_all(&stalled_dir);
+
+        let snapshot = outcome.expect(
+            "a healthy deck's whole snapshot must not be queued behind an \
+             unresponsive deck's handshake — PRD #742 success criterion 2",
+        );
+        assert_eq!(
+            snapshot.connection.status,
+            ConnectionStatus::Connected,
+            "{:?}",
+            snapshot.connection.error
+        );
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![healthy_agent.as_str()],
+            "the listing has to have completed too, not only the handshake"
+        );
+        assert_eq!(snapshot.connection.deck_id, deck_wire_id(&healthy_endpoint));
+    }
+
+    /// **Fleet membership against real servers.** Scenario: two production
+    /// attach servers are observed and both held; the teardown pair
+    /// `retarget_selection` runs — `DaemonLinks::invalidate_all` followed by
+    /// `EndpointTunnels::retain` over the surviving key — is then applied, and
+    /// the surviving deck is refreshed. The departed deck must stop being held,
+    /// and the survivor's snapshot must be unaffected: connected, its own agent,
+    /// its own identity, with nothing re-established for the deck that left.
+    ///
+    /// **What the real server adds.** That the survivor really answers after the
+    /// teardown rather than returning something cached — its link was cleared by
+    /// `invalidate_all`, so the snapshot below is a fresh handshake and a fresh
+    /// listing against a daemon that has been running the whole time.
+    ///
+    /// **What it does not prove.** The settings-document half. `observed_fleet`
+    /// and `DesktopSnapshot.fleet` are derived from the applied
+    /// `EndpointSettings`, and a stored `[[endpoints.remote]]` row is remote by
+    /// construction (`EndpointSettings::connectable_endpoints` leads with
+    /// `Endpoint::local()` and extends with remote rows only) — so a fleet of
+    /// two *local* real daemons cannot be expressed as a document at all. That
+    /// half stays at `dto::tests::the_snapshot_fleet_is_the_observed_set_selected_first`,
+    /// which needs a document and no listening socket. What is asserted here is
+    /// the map-level half a document cannot reach: the transports and links
+    /// themselves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_deck_that_left_the_fleet_stops_being_held_and_the_survivor_is_unaffected() {
+        use std::collections::HashSet;
+
+        let kept = RealDeck::start("m9-kept");
+        let dropped = RealDeck::start("m9-dropped");
+        let kept_agent = kept.spawn_agent("pane-kept");
+        dropped.spawn_agent("pane-dropped");
+
+        let links = DaemonLinks::default();
+        let tunnels = links.tunnels();
+        let (kept_first, dropped_first) = tokio::join!(
+            snapshot_of(&kept.endpoint, &links),
+            snapshot_of(&dropped.endpoint, &links),
+        );
+        assert_eq!(kept_first.connection.status, ConnectionStatus::Connected);
+        assert_eq!(dropped_first.connection.status, ConnectionStatus::Connected);
+        assert_eq!(links.held().await, 2);
+        assert_eq!(tunnels.held().await, 2);
+
+        // Exactly what `retarget_selection` does to these two maps, in its own
+        // order, with `dropped` no longer in the observed set.
+        let observed: HashSet<_> = std::iter::once(kept.endpoint.identity()).collect();
+        links.invalidate_all().await;
+        tunnels.retain(&observed).await;
+        assert_eq!(links.held().await, 0, "invalidate_all clears both links");
+        assert_eq!(
+            tunnels.held().await,
+            1,
+            "and retain keeps exactly the observed deck's transport"
+        );
+
+        let after = snapshot_of(&kept.endpoint, &links).await;
+
+        let kept_endpoint = kept.endpoint.clone();
+        let held_links = links.held().await;
+        let held_tunnels = tunnels.held().await;
+        kept.shutdown();
+        dropped.shutdown();
+
+        assert_eq!(
+            after.connection.status,
+            ConnectionStatus::Connected,
+            "the surviving deck must re-handshake and answer: {:?}",
+            after.connection.error
+        );
+        assert_eq!(
+            after
+                .agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![kept_agent.as_str()],
+            "with its own agent and nobody else's"
+        );
+        assert_eq!(after.connection.deck_id, deck_wire_id(&kept_endpoint));
+        assert_eq!(
+            held_links, 1,
+            "only the observed deck is held again — a refresh must not \
+             re-establish the deck that left"
+        );
+        assert_eq!(
+            held_tunnels, 1,
+            "and its transport is not re-acquired either"
+        );
     }
 }

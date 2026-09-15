@@ -192,12 +192,111 @@ impl Endpoint {
 /// (there is none today) would have to be argued for explicitly by writing
 /// `Hash`/`PartialEq` by hand.
 ///
-/// It is deliberately opaque — no `Display`, no `as_str`. The only thing a
-/// caller may do with one is compare it, hash it, or put it in a map, which is
-/// the whole point: a key that could be *printed* is a key someone will
-/// eventually build by printing.
+/// It is deliberately opaque — no `Display`, no `as_str`. A caller may compare
+/// it, hash it, put it in a map, or ask it for the opaque token
+/// [`EndpointIdentity::wire_id`] mints, and that list is exhaustive because the
+/// type exposes nothing else. What is missing from it is the point: none of the
+/// four hands back any part of the endpoint's text, and a key that could be
+/// *printed* is a key someone will eventually build by printing. (`wire_id` was
+/// added by PRD #742 M5 and made this list wrong for one milestone; its own doc
+/// argues why a hash preserves the opacity rather than spending it.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EndpointIdentity(Endpoint);
+
+impl EndpointIdentity {
+    /// This identity as a short, opaque, stable token — the deck id the desktop
+    /// puts on its **own** IPC wire (PRD #742 M5).
+    ///
+    /// # Why this exists at all
+    ///
+    /// The type above was introduced **on PR #1035, specifically for the N-deck
+    /// case** — and then stopped at the Rust boundary: the desktop's
+    /// `DesktopConnection` carried
+    /// [`Endpoint::describe`] and the webview derived its per-deck key from that
+    /// string. So the three fields `describe()` does not render collapsed two
+    /// decks into one group — the very collision this type was written to stop,
+    /// reappearing one layer out. This is the identity crossing the boundary.
+    ///
+    /// # Derived through `Hash`, so it tracks the key rather than restating it
+    ///
+    /// The whole point of the newtype's derived `Hash` is that a new field on
+    /// [`RemoteEndpoint`] joins the key the moment it is declared. Hashing
+    /// `self` inherits that: a field added tomorrow changes this token with
+    /// nothing here to update. A hand-picked tuple of fields would have been the
+    /// second copy the newtype's own doc comment argues against.
+    ///
+    /// # Why a hash and not a rendering
+    ///
+    /// It keeps the value **opaque**, which is the property the type is built
+    /// around: a token nobody can read is a token nobody builds by printing, so
+    /// the `deck-…` string cannot become a second, hand-assembled identity the
+    /// way `describe()` did. It is not a disclosure control — the desktop's IPC
+    /// is same-process and `socketPath` already carries the host beside it — it
+    /// is a *misuse* control.
+    ///
+    /// # Stability
+    ///
+    /// `StableHasher` below is FNV-1a with the algorithm written out in this file
+    /// rather than `DefaultHasher`, whose output `std` documents as unspecified
+    /// and free to change between Rust releases. The token therefore names the
+    /// same deck across a restart.
+    ///
+    /// **Nothing depends on that yet, and the version of this paragraph that
+    /// said otherwise was wrong** (PRD #742 M8). It claimed the webview "keys
+    /// `localStorage`-backed UI state on it"; every `localStorage` key the
+    /// webview writes — the overview's column set, the workflow order, the
+    /// prompt library, the agent profiles, the fixture settings — is scoped by
+    /// runtime *mode* and by nothing else, and a reader who went looking for the
+    /// per-deck key would not find one. The forward-looking reason is the real
+    /// one: this is the identity a per-deck preference *would* be keyed on the
+    /// first time somebody stores one, and a token that silently moved under a
+    /// toolchain upgrade would make that store fail in a way nobody would
+    /// connect to the upgrade. Choosing the stable hash costs one small `impl`;
+    /// discovering later that the obvious key is unusable costs a migration.
+    ///
+    /// Two things it does **not** promise, stated rather than glossed, because
+    /// the honest scope is narrower than "stable": identity across a future
+    /// change to `std`'s own `Hash` impl for a component type, and identity
+    /// across architectures, since the default `Hasher::write_*` methods feed
+    /// integers in native-endian order. Either would reset such a preference on
+    /// one machine. Neither can confuse two decks, because both sides of every
+    /// comparison are minted by one process from one build.
+    pub fn wire_id(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = StableHasher(StableHasher::OFFSET_BASIS);
+        self.hash(&mut hasher);
+        format!("deck-{:016x}", hasher.finish())
+    }
+}
+
+/// FNV-1a, 64-bit — a [`std::hash::Hasher`] whose output is a property of this
+/// source file rather than of the toolchain.
+///
+/// The one requirement [`EndpointIdentity::wire_id`] has that
+/// `std::collections::hash_map::DefaultHasher` cannot meet: `DefaultHasher`'s
+/// algorithm is documented as unspecified and free to change between Rust
+/// versions, and a deck id that moves under the app's feet is a deck id nothing
+/// can key stored state on. See that method's *Stability* section for what does
+/// and does not currently rely on it.
+struct StableHasher(u64);
+
+impl StableHasher {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+}
+
+impl std::hash::Hasher for StableHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+}
 
 /// A daemon running on **this machine**, addressed by the OS name a client
 /// connects to: a Unix domain socket path, or a `\\.\pipe\…` name on Windows
@@ -2178,8 +2277,16 @@ mod tests {
     /// decoration: it is what shows the pair really is indistinguishable to the
     /// old key, so a future change that made `describe()` render the socket
     /// path would turn this test vacuous loudly instead of quietly.
-    #[test]
-    fn every_connection_bearing_field_is_part_of_the_identity() {
+    /// The field set both identity tests are written against: a base deck, the
+    /// fields [`Endpoint::describe`] renders, and the three it does not.
+    ///
+    /// **One list, read twice.** PRD #742 M5's defect was an identity that
+    /// existed in Rust and never reached the desktop's wire, so the test below
+    /// it — that the WIRE id separates the same pairs — has to be built from the
+    /// same enumeration or the two can drift apart into agreeing about different
+    /// sets of fields. A field added to [`RemoteEndpoint`] belongs here, and
+    /// then both tests cover it.
+    fn identity_field_cases() -> (RemoteEndpoint, [RemoteEndpoint; 3], [RemoteEndpoint; 3]) {
         use crate::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath, SshUser};
 
         let deck = |host: &str, socket: &str| {
@@ -2206,6 +2313,82 @@ mod tests {
             base.clone()
                 .with_jump(HostAlias::parse("bastion").expect("jump alias")),
         ];
+        (base, visible, invisible)
+    }
+
+    /// Every field that changes the [`EndpointIdentity`] changes the token that
+    /// identity puts on the desktop's wire (PRD #742 M5).
+    ///
+    /// # The defect this is the regression test for
+    ///
+    /// [`EndpointIdentity`] was introduced on PR #1035 *specifically* for the
+    /// N-deck case and then stopped at the Rust boundary: the desktop emitted
+    /// [`Endpoint::describe`] as its per-deck key, so two `[[endpoints.remote]]`
+    /// rows naming **two daemons on one host** — different `socket`, which is
+    /// precisely what that field is for — folded into one group on screen and
+    /// their agents shared a key. The composite `(daemonId, agentId)` did not
+    /// save it, because the key component was the collision. The test above
+    /// would have caught it and did not, for the one reason this test exists:
+    /// the id it guards never left Rust.
+    ///
+    /// The `describe()` equality is the premise here exactly as it is there —
+    /// it is what shows the pair really is indistinguishable to the label, so a
+    /// `describe()` that started rendering the socket path turns this vacuous
+    /// loudly rather than quietly.
+    #[test]
+    fn every_connection_bearing_field_changes_the_wire_id() {
+        let (base, visible, invisible) = identity_field_cases();
+        let id = |deck: &RemoteEndpoint| Endpoint::Remote(deck.clone()).identity().wire_id();
+
+        for other in visible.iter().chain(invisible.iter()) {
+            assert_ne!(
+                id(&base),
+                id(other),
+                "a field that changes the connection must change the wire id: {other:?}"
+            );
+        }
+        for other in &invisible {
+            assert_eq!(
+                base.describe(),
+                other.describe(),
+                "this case only means something while `describe()` cannot tell the two apart"
+            );
+        }
+
+        // The same deck twice is one token, or nothing keyed on it would ever
+        // find its own group again across a restart.
+        assert_eq!(id(&base), id(&base.clone()));
+        // And a local deck is neither a remote one nor another local one.
+        let local = |path: &str| {
+            Endpoint::Local(LocalEndpoint::at(path))
+                .identity()
+                .wire_id()
+        };
+        assert_eq!(local("/run/deck.sock"), local("/run/deck.sock"));
+        assert_ne!(local("/run/deck.sock"), local("/run/other.sock"));
+        assert_ne!(local("/run/deck.sock"), id(&base));
+
+        // Opaque, and shaped so nothing downstream has to quote or escape it.
+        let token = id(&base);
+        assert!(
+            token.starts_with("deck-") && token.len() == "deck-".len() + 16,
+            "the wire id is a fixed-width opaque token: {token}"
+        );
+        assert!(
+            token["deck-".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "the wire id carries no endpoint text: {token}"
+        );
+        assert!(
+            !token.contains("build-box"),
+            "the wire id is a key, not a label: {token}"
+        );
+    }
+
+    #[test]
+    fn every_connection_bearing_field_is_part_of_the_identity() {
+        let (base, visible, invisible) = identity_field_cases();
 
         for other in visible.iter().chain(invisible.iter()) {
             assert_ne!(
@@ -2225,7 +2408,7 @@ mod tests {
         // And the same deck twice is one key, or nothing would ever be cached.
         assert_eq!(
             Endpoint::Remote(base.clone()).identity(),
-            Endpoint::Remote(deck("build-box.example.com", "/run/deck.sock")).identity()
+            Endpoint::Remote(identity_field_cases().0).identity()
         );
         // A local deck is keyed by its address, and never equal to a remote one.
         assert_eq!(

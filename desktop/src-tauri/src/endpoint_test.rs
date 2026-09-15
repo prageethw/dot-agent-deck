@@ -65,7 +65,9 @@ use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use crate::daemon_bridge::{HandshakeInfo, StampPolicy, hello};
 use crate::dto::{ConnectionStatus, safe_display_text};
 use crate::endpoint_tunnels::EndpointTunnels;
-use crate::settings::{DesktopSettings, EndpointId, LOCAL_SELECTION_TOKEN, RemoteEndpointSettings};
+use crate::settings::{
+    ALL_SELECTION_TOKEN, DesktopSettings, EndpointId, LOCAL_SELECTION_TOKEN, RemoteEndpointSettings,
+};
 
 /// What a `Test connection` found, as one named state.
 ///
@@ -417,6 +419,18 @@ fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo, stamps
 /// id. Taking the token rather than an endpoint is what lets the two
 /// `SelectionFallback` states — a row that is gone, a row with no socket — be
 /// reported as themselves.
+///
+/// **`all` is not one of them, and it has a sentence of its own** (PRD #742 M6).
+/// A probe tests one deck and the fleet token names a set, so there is nothing
+/// to probe. `EndpointId::parse` refuses the reserved word, so the malformed-
+/// token arm below already answered it *safely* — but with "that deck is no
+/// longer in this settings document", which is untrue twice over: All Decks is
+/// not a deck and it has not gone anywhere. The state stays `UnknownDeck`,
+/// because no probe was made and the report carries no deck; only the sentence
+/// changes, and a caller reaching here is told what to do instead.
+///
+/// The panel disables **Test connection** under a fleet selection, so this is
+/// the answer for a client that asks anyway rather than the one a user meets.
 pub(crate) async fn test_endpoint(
     settings: &DesktopSettings,
     selection: &str,
@@ -441,6 +455,14 @@ async fn unsealed(
     if selection.eq_ignore_ascii_case(LOCAL_SELECTION_TOKEN) {
         return test_local(tunnels).await;
     }
+    if selection.eq_ignore_ascii_case(ALL_SELECTION_TOKEN) {
+        return EndpointTestReport::new(
+            selection,
+            safe_display_text(selection),
+            EndpointTestState::UnknownDeck,
+            FLEET_IS_NOT_A_DECK.to_string(),
+        );
+    }
     let Ok(id) = EndpointId::parse(selection) else {
         return EndpointTestReport::new(
             selection,
@@ -464,6 +486,17 @@ async fn unsealed(
     };
     test_remote(&id, &row, tunnels).await
 }
+
+/// What a probe says when the selection is the whole fleet.
+///
+/// Not in `message_for`, deliberately: that function answers *per state*, and
+/// this shares [`EndpointTestState::UnknownDeck`] with the row-is-gone case it
+/// is the counterexample to. Giving it a state of its own would be a thirteenth
+/// variant, a thirteenth arm in the TypeScript union and a thirteenth row in
+/// every table that enumerates them, to distinguish two reports that differ
+/// only in one sentence.
+const FLEET_IS_NOT_A_DECK: &str =
+    "All Decks is every deck at once, not a deck to test. Choose one deck, then test it.";
 
 /// The local deck: no ssh, no tunnel, no forwards — just the handshake.
 ///
@@ -507,7 +540,7 @@ async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
             );
         }
     }
-    release_if_not_selected(tunnels, &endpoint).await;
+    release_if_not_observed(tunnels, &endpoint).await;
     report
 }
 
@@ -621,35 +654,56 @@ async fn test_remote(
         }
     }
 
-    release_if_not_selected(tunnels, &endpoint).await;
+    release_if_not_observed(tunnels, &endpoint).await;
     report
 }
 
 /// Give a probe's transport back unless the app is actually using it
 /// (`endpoint_tunnels` rule 3, teardown trigger 3).
 ///
-/// A deck that is **not** the selection is released, because a tunnel per
+/// A deck the fleet does **not** observe is released, because a tunnel per
 /// Test-connection click is exactly the process leak this milestone is about and
 /// nothing would otherwise close it until the app exits.
 ///
-/// A deck that **is** the selection keeps its transport, and that is the more
+/// A deck the fleet **does** observe keeps its transport, and that is the more
 /// interesting half. Releasing it would only drop the *map's* handle — a live
 /// link still holds a lease, so the child would survive — and the next
 /// `establish()` would then open a **second** `ssh` child beside the first for
-/// as long as the old link stayed fresh. Testing the deck you are connected to
+/// as long as the old link stayed fresh. Testing a deck you are connected to
 /// would cost a duplicate authenticated session, which is the same defect this
 /// function exists to avoid, arrived at from the other side.
+///
+/// # The predicate is "observed", not "selected" (PRD #742 M3)
+///
+/// It compared against `selected_endpoint()` until M3, and carried the name
+/// `release_if_not_selected` until M6 — one milestone longer, because the test
+/// below was written by a role whose brief forbade editing it. The two agreed
+/// for every selection but
+/// [`crate::settings::Selection::All`], under which the resolved deck is the
+/// **local** one — so **Test connection** on any remote deck in a fleet read as
+/// "not the selection" and released the transport of a deck the app was actively
+/// watching. Inert while nothing held a lease on a non-selected deck, and a
+/// duplicate `ssh` child the moment M3's per-deck watchers do: the watcher keeps
+/// the child alive through its own lease while the next `establish()` opens a
+/// second one beside it. The converse still has to hold, and the same test pins
+/// it — a fix that simply stopped releasing would trade one leak for another.
+///
+/// Sourced from the **applied** observed set (`crate::dto::deck_is_observed`)
+/// rather than from the settings document this command was handed, which is
+/// optimistic: the panel saves as the user types, so the document can name a
+/// deck no watcher has been started for yet. What must not be released is a deck
+/// something is *currently* holding, and that is what the applied set describes.
 ///
 /// Compared by [`dot_agent_deck::daemon_client::EndpointIdentity`], not by
 /// `describe()`, and this is the sharp direction of PRD #741's Greptile P1: a
 /// display string omits the remote socket path, the identity file and the jump
-/// host, so a probe of a deck differing from the selection only in one of those
-/// read as "this IS the selection" and **kept** its transport. Nothing else
+/// host, so a probe of a deck differing from an observed one only in one of
+/// those read as "this one IS observed" and **kept** its transport. Nothing else
 /// closes one, so every such click leaked an authenticated `ssh` child — the
 /// exact leak this function exists to prevent, reached by mistaking two decks
 /// for one.
-async fn release_if_not_selected(tunnels: &EndpointTunnels, endpoint: &Endpoint) {
-    if endpoint.identity() != crate::dto::selected_endpoint().identity() {
+async fn release_if_not_observed(tunnels: &EndpointTunnels, endpoint: &Endpoint) {
+    if !crate::dto::deck_is_observed(endpoint) {
         tunnels.release(endpoint).await;
     }
 }
@@ -1162,6 +1216,35 @@ mod tests {
         assert_eq!(report.state, EndpointTestState::UnknownDeck);
     }
 
+    /// The fleet token is not a missing row, and PRD #742 M6 stops it being
+    /// reported as one.
+    ///
+    /// `EndpointId::parse` refuses the reserved word `all`, so before M6 this
+    /// landed on the malformed-token arm above and came back "That deck is no
+    /// longer in this settings document" — untrue twice over: All Decks is not
+    /// a deck, and it has not gone anywhere. The state is unchanged, because no
+    /// probe was made and the report carries no deck; the sentence is what had
+    /// to move, and it says what to do instead.
+    #[tokio::test]
+    async fn the_fleet_token_is_told_it_is_not_a_deck_rather_than_a_missing_row() {
+        let settings = DesktopSettings::default();
+        let tunnels = EndpointTunnels::default();
+        let report = test_endpoint(&settings, ALL_SELECTION_TOKEN, &tunnels).await;
+
+        assert_eq!(report.state, EndpointTestState::UnknownDeck);
+        assert!(!report.state.is_ok(StampPolicy::Enforced));
+        assert_eq!(report.message, FLEET_IS_NOT_A_DECK);
+        assert_ne!(
+            report.message,
+            message_for(EndpointTestState::UnknownDeck, "", None),
+            "the fleet must not be told a deck it never named has been removed"
+        );
+
+        // Case-insensitively, the way every other reserved token is read.
+        let upper = test_endpoint(&settings, "ALL", &tunnels).await;
+        assert_eq!(upper.message, FLEET_IS_NOT_A_DECK);
+    }
+
     /// Every text field a remote or a planted ssh config can influence is
     /// stripped of bidi characters, not only of control characters.
     #[test]
@@ -1458,5 +1541,99 @@ mod tests {
             }),
             ..DesktopSettings::default()
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #742 M3 — the regression guard for a defect M3 CREATES
+    //
+    // `release_if_not_observed` compared the probed deck against
+    // `crate::dto::selected_endpoint()` before M3, which is what it was called
+    // `release_if_not_selected` for. Under `Selection::All` the selected deck
+    // resolves to the LOCAL one, so **Test connection** on any remote observed
+    // deck released that deck's transport.
+    //
+    // That is inert today — nothing holds a lease on a non-selected deck, so the
+    // release drops the only handle and the next use re-opens. It becomes a real
+    // defect the moment M3's per-deck watchers hold leases: releasing the map's
+    // handle leaves the child alive under the watcher while the next
+    // `establish()` opens a SECOND `ssh` child beside it. A duplicate
+    // authenticated session is the exact hazard this function's own doc comment
+    // warns about, arrived at from the fleet's side.
+    // -----------------------------------------------------------------------
+
+    /// A one-row fleet document under `Selection::All`, plus the connectable
+    /// endpoint for that row.
+    #[cfg(unix)]
+    fn fleet_with(host: &str) -> (DesktopSettings, Endpoint) {
+        use crate::settings::{EndpointSettings, Selection};
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let mut row = RemoteEndpointSettings::new(
+            EndpointId::parse("deck000000000042").expect("a valid id"),
+            Hostname::parse(host).expect("a valid host"),
+        );
+        row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+        let settings = DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![row],
+                selection: Selection::All,
+            }),
+            ..DesktopSettings::default()
+        };
+        let endpoint = settings
+            .connectable_endpoints()
+            .into_iter()
+            .find(|endpoint| matches!(endpoint, Endpoint::Remote(_)))
+            .expect("the fleet observes its remote row");
+        (settings, endpoint)
+    }
+
+    /// Scenario: the fleet is selected, a remote deck in it holds a transport,
+    /// and **Test connection** is run against that deck. The probe must leave
+    /// that deck's transport in place; a deck the fleet does NOT observe must
+    /// still have its transport given back.
+    ///
+    /// The correct predicate is "is this deck **observed**", sourced from the
+    /// APPLIED observed set rather than from the optimistic document the webview
+    /// passes in — `crate::dto::apply_settings_selection` is the one writer of
+    /// applied selection state, so the set belongs beside the deck it already
+    /// stores. This test does not care where it is stored; it drives the
+    /// behaviour through the applied document.
+    ///
+    /// The second half is not decoration: `release_if_not_observed` exists to
+    /// stop a tunnel leaking per Test-connection click, and a fix that simply
+    /// stopped releasing would trade one leak for another.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn testing_an_observed_deck_keeps_its_transport() {
+        let (fleet, observed) = fleet_with("build-box.example.com");
+        let (_unobserved_doc, stranger) = fleet_with("not-in-the-fleet.example.com");
+        crate::dto::apply_settings_selection(&fleet);
+
+        let tunnels = EndpointTunnels::default();
+        tunnels.insert_stand_in(&observed).await;
+        assert_eq!(tunnels.held().await, 1, "the fixture must seed a transport");
+
+        release_if_not_observed(&tunnels, &observed).await;
+        assert_eq!(
+            tunnels.held().await,
+            1,
+            "probing a deck the fleet OBSERVES must not release its transport — \
+             a watcher is holding a lease on it, so the next establish() would \
+             open a second ssh child beside the live one"
+        );
+
+        // The converse still holds: a deck nothing observes is still released.
+        tunnels.insert_stand_in(&stranger).await;
+        assert_eq!(tunnels.held().await, 2);
+        release_if_not_observed(&tunnels, &stranger).await;
+        assert_eq!(
+            tunnels.held().await,
+            1,
+            "a deck outside the observed set must still give its transport back \
+             — that leak is what this function exists for"
+        );
+
+        crate::dto::apply_settings_selection(&DesktopSettings::default());
     }
 }

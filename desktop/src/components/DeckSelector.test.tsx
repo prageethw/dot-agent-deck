@@ -39,9 +39,10 @@ function settingsWith(endpoints?: EndpointSettingsDto): DesktopSettingsDto {
 }
 
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
+  const base = createFixtureSnapshot("crowded");
   return {
     mode: "live",
-    snapshot: createFixtureSnapshot("crowded"),
+    snapshot: base,
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult),
@@ -67,6 +68,14 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     getSettings: vi.fn(async () => ({ settings: settingsWith() })),
     saveSettings: vi.fn(async (settings: DesktopSettingsDto) => structuredClone(settings)),
     ...overrides,
+    /*
+      PRD #742 M4: the fleet, derived from whatever `snapshot` this test asked
+      for unless the test states one of its own. Derived rather than required
+      so a single-deck case stays one line — and derived from `overrides` so
+      `fleet[0]` and `snapshot` cannot silently describe two different decks,
+      which is the invariant `DeckRuntimeState` documents.
+    */
+    fleet: overrides.fleet ?? [overrides.snapshot ?? base],
   };
 }
 
@@ -94,18 +103,22 @@ describe("DeckSelector", () => {
     await mountShell();
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("This machine");
     const menu = await openMenu();
-    // The one entry, and it needs no configuration to exist — `Endpoint::local()`
-    // resolves it from the platform paths.
-    expect(within(menu).getAllByRole("radio")).toHaveLength(1);
+    // The two entries neither of which needs configuration to exist: All Decks
+    // (PRD #742 M1) and the local deck, which `Endpoint::local()` resolves from
+    // the platform paths.
+    expect(within(menu).getAllByRole("radio")).toHaveLength(2);
     expect(within(menu).getByTestId("deck-selector-option-local")).toHaveAttribute("aria-checked", "true");
+    expect(within(menu).getByTestId("deck-selector-option-all")).toHaveAttribute("aria-checked", "false");
   });
 
-  it("lists every configured deck, local first, named by its address", async () => {
+  it("lists every configured deck, the fleet and local first, named by its address", async () => {
     await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks("local")) })) });
     const menu = await openMenu();
 
     const options = within(menu).getAllByRole("radio").map((option) => option.textContent);
-    expect(options).toEqual(["This machine", "vf@build-box.example.com", "relay.example.com:2222"]);
+    // **All Decks**, not "All Daemons": rendered text says Deck. The testid
+    // keeps the stored token, which is what every other option does too.
+    expect(options).toEqual(["All Decks", "This machine", "vf@build-box.example.com", "relay.example.com:2222"]);
     // No display name is stored, so every label is derived from the address the
     // same way `RemoteEndpoint::describe()` derives it — including the port,
     // which is shown only when it is not 22.
@@ -133,6 +146,36 @@ describe("DeckSelector", () => {
     // The rows travel unchanged: this control chooses, it does not edit.
     expect(written.endpoints?.remote).toHaveLength(2);
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com");
+  });
+
+  it("choosing All Decks stores the reserved fleet token", async () => {
+    const { deck } = await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks("local")) })) });
+    const menu = await openMenu();
+
+    fireEvent.click(within(menu).getByTestId("deck-selector-option-all"));
+
+    // PRD #742 M1 ships the stored VALUE and the option; the merged view is M4.
+    // What has to hold now is that the choice reaches the document as `all` —
+    // the word `EndpointId::parse` reserves — rather than as a deck id, and that
+    // it is the trigger's name afterwards.
+    await waitFor(() => expect(deck.saveSettings).toHaveBeenCalled());
+    const written = vi.mocked(deck.saveSettings).mock.calls[0][0];
+    expect(written.endpoints?.selection).toBe("all");
+    // The rows travel unchanged: this control chooses, it does not edit.
+    expect(written.endpoints?.remote).toHaveLength(2);
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All Decks");
+  });
+
+  it("names a stored fleet selection on the trigger", async () => {
+    await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks("all")) })) });
+
+    // The round trip a user sees: `all` came back out of the document and found
+    // its own choice, rather than falling through to `UNKNOWN_DECK_LABEL` the
+    // way it did in every build before #742.
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All Decks");
+    const menu = await openMenu();
+    expect(within(menu).getByTestId("deck-selector-option-all")).toHaveAttribute("aria-checked", "true");
+    expect(within(menu).getByTestId("deck-selector-option-local")).toHaveAttribute("aria-checked", "false");
   });
 
   it("choosing the deck already selected writes nothing", async () => {
@@ -174,7 +217,7 @@ describe("DeckSelector", () => {
     // selector still works, and the rest of the shell is still on screen.
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com");
     const menu = await openMenu();
-    expect(within(menu).getAllByRole("radio")).toHaveLength(3);
+    expect(within(menu).getAllByRole("radio")).toHaveLength(4);
   });
 
   it("a substitution that leaves the app CONNECTED is still reported", async () => {
@@ -202,7 +245,7 @@ describe("DeckSelector", () => {
     expect(screen.getByTestId("open-deck")).toBeInTheDocument();
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com");
     const menu = await openMenu();
-    expect(within(menu).getAllByRole("radio")).toHaveLength(3);
+    expect(within(menu).getAllByRole("radio")).toHaveLength(4);
   });
 
   it("groups its options with a span, never a legend (issue 1032)", async () => {
