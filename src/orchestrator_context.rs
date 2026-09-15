@@ -314,7 +314,11 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          anything, so you still need whatever check actually learns the outcome — and it keeps \
          the pane reading `Working` only while the wait is outstanding, not indefinitely; call \
          `wait done ... --outcome cancelled` instead of waiting for the TTL if you stop caring \
-         about the wait before it resolves. (Full detail: `docs/orchestration.md`.)\n"
+         about the wait before it resolves. (Full detail: `docs/orchestration.md`.)\n\n\
+         If a delegated worker's pane crashes, `{bin} pane restart <role>` brings it back \
+         without a human. If a role in the config was never spawned into this orchestration, \
+         `{bin} pane spawn <role>` brings it up. See \
+         `docs/orchestration.md#restarting-and-spawning-worker-panes`.\n"
     ));
 
     content

@@ -1838,10 +1838,17 @@ fn main() -> ExitCode {
                         );
                         return ExitCode::FAILURE;
                     }
-                    // Same reasoning as `delegate`'s `NoReply`: a daemon that
-                    // doesn't know this verb yet (older build) must not read
-                    // as a proven failure.
-                    SocketReply::NoReply => return ExitCode::SUCCESS,
+                    // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
+                    // restart` must not read a silent close as success: an
+                    // old/broken daemon cannot possibly have restarted
+                    // anything, so this has to fail loudly instead.
+                    SocketReply::NoReply => {
+                        eprintln!(
+                            "Error: the running daemon does not support `pane restart` — \
+                             restart the daemon to pick up the new build."
+                        );
+                        return ExitCode::FAILURE;
+                    }
                     SocketReply::Line(line) => line,
                 };
                 let resp =
@@ -1849,7 +1856,12 @@ fn main() -> ExitCode {
                         .ok()
                         .filter(|r| r.is_restart_role_reply());
                 let Some(resp) = resp else {
-                    return ExitCode::SUCCESS;
+                    eprintln!(
+                        "Error: the running daemon sent an unexpected reply to \
+                         `pane restart {role}` — it may not support this command; restart \
+                         the daemon to pick up the new build."
+                    );
+                    return ExitCode::FAILURE;
                 };
                 if resp.restarted {
                     println!("Restarted role {role}");
@@ -1894,17 +1906,29 @@ fn main() -> ExitCode {
                         );
                         return ExitCode::FAILURE;
                     }
-                    // Same reasoning as `delegate`'s `NoReply`: a daemon that
-                    // doesn't know this verb yet (older build) must not read
-                    // as a proven failure.
-                    SocketReply::NoReply => return ExitCode::SUCCESS,
+                    // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
+                    // spawn` must not read a silent close as success: an
+                    // old/broken daemon cannot possibly have spawned
+                    // anything, so this has to fail loudly instead.
+                    SocketReply::NoReply => {
+                        eprintln!(
+                            "Error: the running daemon does not support `pane spawn` — \
+                             restart the daemon to pick up the new build."
+                        );
+                        return ExitCode::FAILURE;
+                    }
                     SocketReply::Line(line) => line,
                 };
                 let resp = serde_json::from_str::<dot_agent_deck::event::SpawnRoleResponse>(&line)
                     .ok()
                     .filter(|r| r.is_spawn_role_reply());
                 let Some(resp) = resp else {
-                    return ExitCode::SUCCESS;
+                    eprintln!(
+                        "Error: the running daemon sent an unexpected reply to \
+                         `pane spawn {role}` — it may not support this command; restart \
+                         the daemon to pick up the new build."
+                    );
+                    return ExitCode::FAILURE;
                 };
                 if resp.spawned {
                     println!("Spawned role {role}");

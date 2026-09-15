@@ -19,7 +19,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, commit_fixture, open_orchestration, wait_for_role_crashed};
+use common::{TuiDeck, commit_fixture, open_orchestration, retry_pane_restart_until_success};
 use dot_agent_deck::agent_pty::TabMembership;
 use spec::spec;
 
@@ -43,19 +43,6 @@ const LONG_LIVED_CONFIG: &str = "[[orchestrations]]\n\
      name = \"coder\"\n\
      command = \"cat\"\n\
      clear = false\n";
-
-/// Run the real `dot-agent-deck pane restart <role>` CLI as a subprocess,
-/// exactly as a real orchestrator agent would from inside its own pane
-/// (`src/main.rs`'s `PaneCmd::Restart` arm): only `DOT_AGENT_DECK_PANE_ID`
-/// and the hook socket, never this subprocess's own filesystem cwd.
-fn run_pane_restart_cli(deck: &TuiDeck, caller_pane: &str, role: &str) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["pane", "restart", role])
-        .env("DOT_AGENT_DECK_PANE_ID", caller_pane)
-        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-        .output()
-        .expect("run the real `dot-agent-deck pane restart <role>` CLI")
-}
 
 /// Run the real `dot-agent-deck delegate` CLI as a subprocess from
 /// `caller_pane`'s identity — the same fork-#358/#567 caller-identity
@@ -98,26 +85,33 @@ fn run_delegate_cli(
 
 /// Scenario: Open a real orchestration tab (`pane-restart-live` fixture:
 /// `orchestrator` [start] + `coder`, `coder` running a short-lived command
-/// so it exits on its own shortly after boot). Wait for M1's
-/// `crashed == Some(true)` marker to fire naturally, then mutate the RUNNING
+/// so it exits on its own shortly after boot). Mutate the RUNNING
 /// orchestration's own `.dot-agent-deck.toml` (the same "operator edited the
 /// config mid-session" technique `tests/e2e_pane_spawn_live.rs`'s `spawn_005`
 /// uses) so `coder`'s command becomes the long-lived `cat` — the post-restart
 /// respawn re-reads this file fresh, so without the swap the restarted pane
 /// would just race its own second self-exit before this test could observe
-/// anything. Invoke the REAL `dot-agent-deck pane restart coder` CLI
-/// subprocess (no `--force` needed, since the pane genuinely crashed) exactly
-/// as a real orchestrator agent would from inside its own pane, then prove
-/// the restarted pane is genuinely reachable — not merely that the daemon's
-/// own registry says so — by running the REAL `dot-agent-deck delegate --to
-/// coder` CLI and confirming the delegated task's one-line file-pointer
-/// (`compose_delegate_prompt`'s "Read .dot-agent-deck/worker-task-coder..."
-/// text, the same substring `tests/e2e_pi_live.rs` already waits for to prove
-/// a delegate landed) actually renders in `coder`'s pane through the
-/// STILL-ATTACHED TUI. A daemon that only fixes its own bookkeeping but never
-/// gets an already-attached viewer to follow the pane onto its new agent
-/// would pass every handler-level `pane/restart/*` test and still fail this
-/// one.
+/// anything. Then retry the REAL `dot-agent-deck pane restart coder` CLI
+/// subprocess (no `--force` needed, since the pane genuinely crashes on its
+/// own) until it succeeds, exactly as a real orchestrator agent would from
+/// inside its own pane: `ListAgents`/`agent_records()` deliberately filters
+/// out exited-but-not-reaped entries (`src/agent_pty.rs:8071-8082`), so
+/// polling it for coder's `crashed == Some(true)` marker can never observe
+/// that marker firing — the real CLI call itself, retried against the "has
+/// not crashed; pass --force" refusal (`src/state.rs:8258-8266`) until
+/// coder's boot command has actually exited, is the reliable signal
+/// available from outside the daemon. A successful restart IS the proof the
+/// precondition held; any OTHER failure is a genuine test failure, not a
+/// wait condition. Once restarted, prove the pane is genuinely reachable —
+/// not merely that the daemon's own registry says so — by running the REAL
+/// `dot-agent-deck delegate --to coder` CLI and confirming the delegated
+/// task's one-line file-pointer (`compose_delegate_prompt`'s "Read
+/// .dot-agent-deck/worker-task-coder..." text, the same substring
+/// `tests/e2e_pi_live.rs` already waits for to prove a delegate landed)
+/// actually renders in `coder`'s pane through the STILL-ATTACHED TUI. A
+/// daemon that only fixes its own bookkeeping but never gets an
+/// already-attached viewer to follow the pane onto its new agent would pass
+/// every handler-level `pane/restart/*` test and still fail this one.
 #[spec("pane/restart/011")]
 #[test]
 fn restart_011_restarted_pane_stays_reachable_in_an_already_attached_tui() {
@@ -138,18 +132,6 @@ fn restart_011_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         deck.wait_for_grid_string_within("coder", Duration::from_secs(10)),
         "the coder role card must be visible on the freshly-opened orchestration \
          tab before this test touches anything else.\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    assert!(
-        wait_for_role_crashed(
-            deck.attach_socket_path(),
-            CODER_ROLE,
-            Duration::from_secs(30)
-        ),
-        "precondition: coder's short-lived boot command must exit on its own and \
-         be marked crashed before this test restarts it.\nListAgents records:\n{:#?}\nGrid:\n{}",
-        common::agent_records_on(deck.attach_socket_path()),
         deck.snapshot_grid()
     );
 
@@ -177,21 +159,26 @@ fn restart_011_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         .clone()
         .expect("the orchestrator role must carry its (isolated-clone) cwd");
 
-    // Swap coder's command to a long-lived one BEFORE restarting it: the
-    // respawn re-reads this file fresh (`lookup_orchestration_role_indexed`
-    // -> `load_project_config`), so this is exactly what the restarted pane
-    // runs.
+    // Swap coder's command to a long-lived one BEFORE the restart retry loop
+    // below starts: the respawn re-reads this file fresh
+    // (`lookup_orchestration_role_indexed` -> `load_project_config`), so this
+    // is exactly what the restarted pane runs once a restart finally
+    // succeeds.
     let running_config_path = std::path::Path::new(&orchestration_cwd).join(".dot-agent-deck.toml");
     std::fs::write(&running_config_path, LONG_LIVED_CONFIG)
         .expect("swap coder's command to a long-lived one before restarting it");
 
-    let restart_output = run_pane_restart_cli(&deck, &orchestrator_pane_id, CODER_ROLE);
-    assert!(
-        restart_output.status.success(),
-        "`pane restart coder` must succeed against a genuinely crashed pane -- \
-         stdout={}, stderr={}",
-        String::from_utf8_lossy(&restart_output.stdout),
-        String::from_utf8_lossy(&restart_output.stderr)
+    // Retry the REAL `pane restart coder` CLI call itself until it succeeds,
+    // instead of polling `ListAgents` for a `crashed` marker that
+    // `agent_records()` never surfaces for an exited-but-not-reaped entry —
+    // see `retry_pane_restart_until_success`'s own doc comment for why. A
+    // successful restart IS the proof coder's short-lived boot command had
+    // already exited.
+    retry_pane_restart_until_success(
+        deck.hook_socket_path(),
+        &orchestrator_pane_id,
+        CODER_ROLE,
+        Duration::from_secs(30),
     );
 
     deck.wait_until_quiescent();
