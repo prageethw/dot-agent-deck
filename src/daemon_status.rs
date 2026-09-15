@@ -103,8 +103,8 @@ pub struct StatusAgent {
     /// wait start`/`wait done`) is the reason this pane currently reads
     /// `Working` — either because the wait promoted it from idle, or
     /// because it is holding open a `Working` that an agent's own real
-    /// completion would otherwise have reverted. Drives the `(observing)`
-    /// marker on both the CLI and TUI surfaces.
+    /// completion would otherwise have reverted. Drives the `Observing`
+    /// label on both the CLI and TUI surfaces (issue #784).
     pub wait_observing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<StatusTool>,
@@ -232,6 +232,21 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
             .as_ref()
             .map(|s| format!("{s:?}"))
             .unwrap_or_else(|| DASH.to_string());
+        // Issue #714 / #784: a `Working` currently held up by a monitored
+        // external wait (`worker-agent-deck wait start`) rather than real
+        // agent activity — either because the wait promoted the pane from
+        // idle, or because it is holding open a `Working` an agent's own
+        // completion would otherwise have reverted — renders as the bare
+        // word `"Observing"` (issue #784 dropped the earlier `"Working
+        // (observing)"` suffix composition). See `wait_observing`'s doc
+        // comment above. This replaces the whole status word, so it must run
+        // before the shell-busy marker below, which attaches to whatever
+        // word is current.
+        let status = if a.wait_observing && a.status == Some(SessionStatus::Working) {
+            "Observing".to_string()
+        } else {
+            status
+        };
         // Fork issue #21 provenance marker: flag a `Working` that this
         // mechanism currently holds shell responsible for keeping up.
         // Originally that meant "synthesized from shell activity rather
@@ -239,20 +254,11 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
         // now also be set by a hand-off (`MonitoredWaitDone`'s Direction A)
         // onto a `Working` a real agent event emitted, once a monitored
         // wait's revert becomes shell's obligation to pay. See
-        // `shell_synthetic_working`'s doc comment in `src/state.rs`.
+        // `shell_synthetic_working`'s doc comment in `src/state.rs`. Runs
+        // after the observing check above so the marker attaches directly to
+        // whichever word is current (`"Working*"` or `"Observing*"`).
         let status = if a.shell_synthetic_working {
             format!("{status}*")
-        } else {
-            status
-        };
-        // Issue #714: flag a `Working` currently held up by a monitored
-        // external wait (`worker-agent-deck wait start`) rather than real
-        // agent activity — either because the wait promoted the pane from
-        // idle, or because it is holding open a `Working` an agent's own
-        // completion would otherwise have reverted. See `wait_observing`'s
-        // doc comment above.
-        let status = if a.wait_observing && a.status == Some(SessionStatus::Working) {
-            format!("{status} (observing)")
         } else {
             status
         };
@@ -495,13 +501,14 @@ mod tests {
     /// Scenario: issue #714 — a `Working` row held up purely by a monitored
     /// wait (`wait_synthetic_working`) must render distinctly from both a
     /// plain `Working` row and a shell-synthetic one, and the two markers
-    /// must compose when both apply: shell's `*` first (existing ordering),
-    /// then the wait marker's `" (observing)"` after. Also pins the PRD's
-    /// headline flow — `wait_deferred_revert` alone (the H1 fix's OR-broadening,
-    /// `build_status_agents`'s `wait_synthetic_working || wait_deferred_revert`)
-    /// must trigger the same marker — and the negative case: either flag set
-    /// on a row whose status is NOT `Working` must never show the marker
-    /// (the `status == Working` gate added alongside the fix).
+    /// must compose when both apply: the bare `"Observing"` word replaces
+    /// `"Working"` (issue #784), then shell's `*` marker attaches directly
+    /// to it. Also pins the PRD's headline flow — `wait_deferred_revert`
+    /// alone (the H1 fix's OR-broadening, `build_status_agents`'s
+    /// `wait_synthetic_working || wait_deferred_revert`) must trigger the
+    /// same word — and the negative case: either flag set on a row whose
+    /// status is NOT `Working` must never show it (the `status == Working`
+    /// gate added alongside the fix).
     #[test]
     fn format_human_marks_wait_synthetic_working_as_observing() {
         let mut wait_only = snapshot(SessionStatus::Working);
@@ -514,8 +521,9 @@ mod tests {
             .find(|l| l.contains("wait-pane"))
             .unwrap_or_else(|| panic!("no row for wait-pane in {table:?}"));
         assert!(
-            line.contains("Working (observing)"),
-            "a wait-only synthetic Working row must render \"Working (observing)\"; got {line:?}"
+            line.contains("Observing") && !line.contains("Working (observing)"),
+            "a wait-only synthetic Working row must render the bare \"Observing\" word; \
+             got {line:?}"
         );
 
         let mut shell_only = snapshot(SessionStatus::Working);
@@ -528,7 +536,7 @@ mod tests {
             .find(|l| l.contains("shell-pane"))
             .unwrap_or_else(|| panic!("no row for shell-pane in {table:?}"));
         assert!(
-            line.contains("Working*") && !line.contains("(observing)"),
+            line.contains("Working*") && !line.contains("Observing"),
             "a shell-only synthetic Working row must keep rendering exactly \"Working*\", \
              unchanged (non-regression); got {line:?}"
         );
@@ -543,9 +551,9 @@ mod tests {
             .find(|l| l.contains("both-pane"))
             .unwrap_or_else(|| panic!("no row for both-pane in {table:?}"));
         assert!(
-            line.contains("Working* (observing)"),
-            "when both markers apply they must compose as \"Working* (observing)\" — shell's \
-             `*` immediately after the status word, then the wait marker; got {line:?}"
+            line.contains("Observing*") && !line.contains("Working* (observing)"),
+            "when both markers apply they must compose as \"Observing*\" — the shell-busy \
+             marker attached directly to the new status word; got {line:?}"
         );
 
         // H1 fix: `wait_deferred_revert` alone (no `wait_synthetic_working`)
@@ -565,9 +573,9 @@ mod tests {
             .find(|l| l.contains("deferred-pane"))
             .unwrap_or_else(|| panic!("no row for deferred-pane in {table:?}"));
         assert!(
-            line.contains("Working (observing)"),
+            line.contains("Observing") && !line.contains("Working (observing)"),
             "a `wait_deferred_revert`-only row (no `wait_synthetic_working`) must still render \
-             \"Working (observing)\" — this is the H1 fix's OR-broadening; got {line:?}"
+             the bare \"Observing\" word — this is the H1 fix's OR-broadening; got {line:?}"
         );
 
         // Negative case: the flag set but the status is NOT `Working` must
@@ -584,8 +592,8 @@ mod tests {
             .find(|l| l.contains("waiting-pane"))
             .unwrap_or_else(|| panic!("no row for waiting-pane in {table:?}"));
         assert!(
-            !line.contains("(observing)") && line.contains("WaitingForInput"),
-            "a non-Working row must never show \"(observing)\" even with both wait flags set; \
+            !line.contains("Observing") && line.contains("WaitingForInput"),
+            "a non-Working row must never show \"Observing\" even with both wait flags set; \
              got {line:?}"
         );
         assert!(
@@ -594,13 +602,12 @@ mod tests {
         );
     }
 
-    /// Scenario: issue #784 (RED — pins new behavior, not yet implemented).
-    /// `format_human` must drop the `"Working "` prefix for a wait-observing
-    /// row and render the bare word `"Observing"` instead of today's
-    /// `"Working (observing)"` composition —
-    /// `format_human_marks_wait_synthetic_working_as_observing` above still
-    /// pins the OLD text and is deliberately left untouched (the coder
-    /// updates it alongside the production fix); this is a NEW, separate pin.
+    /// Scenario: issue #784. `format_human` drops the `"Working "` prefix for
+    /// a wait-observing row and renders the bare word `"Observing"` instead
+    /// of the earlier `"Working (observing)"` composition —
+    /// `format_human_marks_wait_synthetic_working_as_observing` above now
+    /// pins the same current text (updated alongside this fix); this is a
+    /// separate, more focused pin sitting next to it.
     ///
     /// Composition question for the shell-busy `"*"` marker when BOTH
     /// `shell_synthetic_working` and the wait-observing gate apply: today's

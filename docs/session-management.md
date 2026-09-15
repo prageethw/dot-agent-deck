@@ -18,7 +18,7 @@ Each session card shows the agent's current state:
 | **Idle** | Agent is between tasks |
 | **Error** | Something went wrong |
 
-A card can also show **Working (observing)**, in a distinct color from ordinary `Working`: the session is `Working` because a monitored external wait (`dot-agent-deck wait start`) is holding it there, not because the agent itself is doing something — the agent may be idle underneath while something else it's waiting on (CI, a delegated worker, an approval) resolves.
+A card can also show **Observing**, in a distinct color from ordinary `Working`: the session is `Working` because a monitored external wait (`dot-agent-deck wait start`) is holding it there, not because the agent itself is doing something — the agent may be idle underneath while something else it's waiting on (CI, a delegated worker, an approval) resolves.
 
 Cards also display:
 

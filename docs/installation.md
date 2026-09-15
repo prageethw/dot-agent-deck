@@ -195,7 +195,7 @@ The columns are tab-separated, so pipe the output through `column -t -s $'\t'` i
 | `PANE` | The pane id, the same value a managed agent sees as `DOT_AGENT_DECK_PANE_ID`. |
 | `AGENT` | The daemon's own id for the agent. |
 | `ROLE` | `mode:<name>` for a pane launched into a [mode](configuration.md), the role name for an [orchestration](orchestration.md) pane (suffixed `(orchestrator)` for the start role), `-` for a plain dashboard pane. |
-| `STATUS` | The live status: one of `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error`. A `Working` currently held up by a monitored external wait (`dot-agent-deck wait start`) rather than real agent activity shows as `Working (observing)`. |
+| `STATUS` | The live status: one of `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error`. A `Working` currently held up by a monitored external wait (`dot-agent-deck wait start`) rather than real agent activity shows as `Observing`. |
 | `TOOL` | The name of the tool the agent is running right now — the name only, never its arguments. |
 | `LABEL` | The pane's display name. |
 | `CWD` | The directory the agent was launched in. |
