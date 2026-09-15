@@ -306,6 +306,26 @@ pub struct OrchestrationSnapshot {
     /// loudly rather than guessing — see `docs/orchestration.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// PRD fork#777 fix round (reviewer M2): the exact `cwd` string
+    /// `Action::SpawnPane`'s own PRE-provisioning `ClaimOrchestrationName`
+    /// request sent when this orchestration was created — the LOGICAL,
+    /// collision-UNAWARE identity (toplevel + segment + relative subpath),
+    /// not wherever this orchestration's clone physically ended up after a
+    /// possible provisioning-time collision retry. Captured here so the
+    /// daemon-empty restore path can reuse it VERBATIM for its own
+    /// `ClaimOrchestrationName` request, instead of recomputing a claim
+    /// `cwd` from the physical `saved_pane.dir` (`src/ui.rs`'s
+    /// `restore_claim_cwd_for`) — see that function's own doc comment for
+    /// why the two can genuinely diverge for a disambiguated workspace, and
+    /// why that divergence reopens fork issue #607's shared-clone hazard
+    /// after a daemon restart if left unfixed. `None` both for a snapshot
+    /// written before this field existed (falls back to the pre-fix,
+    /// physical-dir-based derivation) and for a live claim whose own `cwd`
+    /// was itself degraded to the daemon's wildcard semantics (a cwd
+    /// carrying an ASCII control character — see `Action::SpawnPane`'s own
+    /// `orchestration_claim_cwd_for_request` comment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_cwd: Option<String>,
 }
 
 /// Issue #949 — where the user was looking when the snapshot was taken, so a
@@ -2356,16 +2376,18 @@ active_pane = "12"
     /// Scenario: Build a `SavedSession` whose single pane carries an
     /// `OrchestrationSnapshot` (3 roles in display order, a start-role cursor,
     /// an orchestrator prompt, the resolved config name + project path, a
-    /// started-roles list, and — fork #166 M3.0 — a persisted `owner`
-    /// identity string), serialize it to TOML and deserialize it back —
-    /// asserting every orchestration field round-trips intact, `owner`
+    /// started-roles list, fork #166 M3.0's persisted `owner` identity
+    /// string, and — PRD fork#777 fix round — the persisted `claim_cwd`),
+    /// serialize it to TOML and deserialize it back — asserting every
+    /// orchestration field round-trips intact, `owner`/`claim_cwd`
     /// included. Then deserialize two backward-compat `session.toml`
     /// strings: one with NO `orchestration` key at all, and one WITH an
-    /// `[panes.orchestration]` block but no `owner` key (a snapshot written
-    /// before this field existed) — asserting both still parse, the first
-    /// with `orchestration == None` and the second with `owner == None`,
-    /// proving the `#[serde(default)]` forward-compat guarantee for both the
-    /// whole block and the new field individually.
+    /// `[panes.orchestration]` block but no `owner`/`claim_cwd` key (a
+    /// snapshot written before those fields existed) — asserting both still
+    /// parse, the first with `orchestration == None` and the second with
+    /// `owner == None` and `claim_cwd == None`, proving the
+    /// `#[serde(default)]` forward-compat guarantee for both the whole
+    /// block and each new field individually.
     #[spec("config/saved-session/001")]
     #[test]
     fn saved_session_001_orchestration_serde_round_trip_and_legacy_parse() {
@@ -2390,6 +2412,7 @@ active_pane = "12"
                     started_role_indices: vec![0, 1],
                     display_title: Some("My TDD Run".to_string()),
                     owner: Some("orchestration:tdd-cycle".to_string()),
+                    claim_cwd: Some("/repo/app-tdd-cycle".to_string()),
                 }),
             }],
             last_command: None,
@@ -2419,6 +2442,7 @@ active_pane = "12"
         assert_eq!(orch.started_role_indices, vec![0, 1]);
         assert_eq!(orch.display_title.as_deref(), Some("My TDD Run"));
         assert_eq!(orch.owner.as_deref(), Some("orchestration:tdd-cycle"));
+        assert_eq!(orch.claim_cwd.as_deref(), Some("/repo/app-tdd-cycle"));
 
         // (b) A legacy session.toml predating the orchestration field still
         // parses, with orchestration == None (the #[serde(default)] guarantee).
@@ -2436,11 +2460,12 @@ command = "vim"
             "a legacy snapshot with no orchestration key must parse with orchestration == None"
         );
 
-        // (c) Fork #166 M3.0: an orchestration snapshot written BEFORE the
-        // `owner` field existed (has `[panes.orchestration]` but no `owner`
-        // key) must still parse, with `owner == None` — the honest
-        // "no identity captured" outcome for a pre-upgrade snapshot, not a
-        // parse failure.
+        // (c) Fork #166 M3.0 / PRD fork#777 fix round: an orchestration
+        // snapshot written BEFORE the `owner`/`claim_cwd` fields existed
+        // (has `[panes.orchestration]` but neither key) must still parse,
+        // with both == None — the honest "no identity/no claim-cwd
+        // captured" outcome for a pre-upgrade snapshot, not a parse
+        // failure.
         let pre_owner_field = r#"
 [[panes]]
 dir = "/repo/app"
@@ -2464,6 +2489,11 @@ project_path = "/repo/app"
             pre_owner_orch.owner.is_none(),
             "a pre-M3.0 snapshot with no owner key must restore with owner == None, \
              not a fabricated or defaulted identity"
+        );
+        assert!(
+            pre_owner_orch.claim_cwd.is_none(),
+            "a pre-fork#777 snapshot with no claim_cwd key must restore with claim_cwd == \
+             None, so restore falls back to its pre-fix, physical-dir-based claim derivation"
         );
     }
 
