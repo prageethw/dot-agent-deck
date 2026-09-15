@@ -540,6 +540,37 @@ mod tests {
         );
     }
 
+    /// Issue #782 (upstream PR #918 review): the orchestrator context never
+    /// mentions `pane restart <role>` / `pane spawn <role>` (PRD #699) at
+    /// all, so an orchestrating agent has no way to discover either command
+    /// exists unless a human tells it out of band. Also pins that fixing
+    /// that omission must not drag `--force` into the agent-facing text —
+    /// forcing a restart on a HEALTHY pane is a people-only escalation per
+    /// the upstream review, not guidance this context should hand an
+    /// orchestrating agent.
+    #[test]
+    fn context_teaches_the_orchestrator_about_pane_restart_and_pane_spawn() {
+        let c = build_orchestrator_context(&config());
+        let bin = crate::platform::paths::binary_name();
+
+        assert!(
+            c.contains(&format!("{bin} pane restart")),
+            "the context must mention `pane restart <role>` by its real binary name \
+             ({bin:?}), got: {c}"
+        );
+        assert!(
+            c.contains(&format!("{bin} pane spawn")),
+            "the context must mention `pane spawn <role>` by its real binary name \
+             ({bin:?}), got: {c}"
+        );
+        assert!(
+            !c.contains("--force"),
+            "the agent-facing context must not mention `--force` anywhere — restarting a \
+             HEALTHY pane with --force is a people-only escalation, not guidance to hand the \
+             orchestrating agent, per the upstream PR #918 review; got: {c}"
+        );
+    }
+
     /// Issue #760 Part B: an orchestrator starting or resuming against a
     /// mapped folder has no built-in reason to check whether that workspace is
     /// stale or dirty before acting — nothing in the pre-existing context told

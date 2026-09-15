@@ -9296,6 +9296,36 @@ pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRe
     }
 }
 
+/// Poll `ListAgents` over `socket` until `role`'s registered pane carries
+/// M1's `crashed == Some(true)` marker — the same precondition
+/// `tests/pane_restart.rs`'s `pane/restart/001` waits for at the handler
+/// level, observed here through a real daemon's attach socket instead
+/// (issue #782's `tests/e2e_pane_restart_live.rs`). Lives here rather than in
+/// that e2e file's own body because `cargo xtask linkage-check`'s Decision 21
+/// rule forbids a bare `std::thread::sleep` inside an `e2e_*.rs` test body —
+/// `wait_for_file_substr_count` just above takes the same escape hatch.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_for_role_crashed(socket: &Path, role: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let crashed = agent_records_on(socket).into_iter().any(|record| {
+            matches!(
+                &record.tab_membership,
+                Some(dot_agent_deck::agent_pty::TabMembership::Orchestration { role_name, .. })
+                    if role_name == role
+            ) && record.crashed == Some(true)
+        });
+        if crashed {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// One-shot read of a daemon-side pane's PTY scrollback via
 /// `AttachRequest::Snapshot`, over `socket`. The daemon replies `RESP ok`, then
 /// (when the ring is non-empty) a single `STREAM_OUT` frame carrying the whole
