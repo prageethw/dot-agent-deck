@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
-    DOT_AGENT_DECK_REGISTRATION_GENERATION, SpawnOptions, TabMembership,
+    DOT_AGENT_DECK_REGISTRATION_GENERATION, PaneRecreateIdentity, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::event::{RestartRoleResponse, RestartRoleSignal};
 use dot_agent_deck::state::OrchestrationIdentity;
@@ -920,5 +920,146 @@ fn pane_restart_010_cli_fails_when_the_reply_does_not_parse_as_a_restart_respons
         stderr.contains(MALFORMED_REPLY_STDERR_NEEDLE),
         "stderr must name that the daemon's response was unexpected (needle \
          {MALFORMED_REPLY_STDERR_NEEDLE:?}); got stderr = {stderr:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix-round (issue #789 / upstream PR #918 review "Restart Can Kill
+// Replacement"): `handle_restart_role_with_state` checks crash state ONCE,
+// early, inside its own short-lived read-guard block — that guard drops
+// before the function acquires `pane_dispatch_lock` and respawns. Nothing
+// re-checks crash state (or occupant identity) after the lock is acquired.
+// `dispatch_one_owned` (a concurrent `clear = true` delegate) holds the SAME
+// `pane_dispatch_lock` while it installs a healthy replacement agent into the
+// pane; if that delegate wins the lock race and completes BETWEEN this
+// handler's initial check and its own lock acquisition, the restart proceeds
+// anyway and kills the just-installed healthy replacement without `--force`
+// ever having been given.
+// ---------------------------------------------------------------------------
+
+/// Scenario: the worker crashes and is marked `crashed == Some(true)` (same
+/// precondition as `pane_restart_001`). The test itself then takes
+/// `AgentPtyRegistry::pane_dispatch_lock(WORKER_PANE)` — the exact lock
+/// `handle_restart_role_with_state` and a concurrent `clear = true` delegate
+/// (`dispatch_one_owned`) both acquire before respawning — and starts a
+/// `force: false` restart in the background, which blocks trying to acquire
+/// that same lock. While still holding it, the test calls the same
+/// `respawn_or_recreate_agent_for_pane` a concurrent delegate's
+/// `dispatch_one_owned` would use, installing a healthy `cat` replacement
+/// into the pane. Only after that does the test release the lock. The
+/// interleaving is pinned by the lock itself, not by timing: since the
+/// background restart cannot even attempt its respawn until the lock is
+/// free, the replacement is guaranteed to already be installed by the time
+/// the restart's respawn would run. The restart must refuse — report
+/// `restarted: false` with a "has not crashed" error, the same wording the
+/// early check uses — rather than proceed and kill the replacement.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/012")]
+async fn pane_restart_012_recheck_under_dispatch_lock_prevents_killing_a_concurrent_replacement() {
+    let fx = fixture("sleep 0.2").await;
+
+    let crashed = wait_for_crashed(
+        &fx.daemon.registry,
+        &fx.worker_agent_id,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        crashed,
+        "precondition: the worker stand-in never got marked crashed; record = {:?}",
+        fx.daemon.registry.agent_record_any(&fx.worker_agent_id)
+    );
+
+    // Hold the same dispatch lock the handler and a concurrent delegate both
+    // acquire before respawning, so everything below is ordered by the lock
+    // rather than by timing.
+    let dispatch_mutex = fx.daemon.registry.pane_dispatch_lock(WORKER_PANE);
+    let dispatch_guard = dispatch_mutex.lock().await;
+
+    let state = fx.daemon.state.clone();
+    let registry = fx.daemon.registry.clone();
+    let event_tx = fx.daemon.event_tx.clone();
+    let signal = RestartRoleSignal {
+        pane_id: ORCH_PANE.to_string(),
+        role: WORKER_ROLE.to_string(),
+        force: false,
+        timestamp: chrono::Utc::now(),
+    };
+    let restart_task = tokio::spawn(async move {
+        dot_agent_deck::state::handle_restart_role_with_state(signal, &state, &registry, &event_tx)
+            .await
+    });
+
+    // Still holding the lock: simulate exactly what a concurrent
+    // `clear = true` delegate's `dispatch_one_owned` does on the SAME lock in
+    // production — install a healthy replacement via
+    // `respawn_or_recreate_agent_for_pane`. The crashed worker's registry
+    // record is still present (never closed), so this must resolve as an
+    // ordinary respawn (`recreated == false`), not the recreate leg — the
+    // identity fields below are therefore unused by this call and are filled
+    // only for the type to construct.
+    let recreate_identity = PaneRecreateIdentity {
+        cwd: None,
+        display_name: Some(WORKER_ROLE.to_string()),
+        tab_membership: None,
+        agent_type: None,
+        env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+    };
+    let replacement = fx
+        .daemon
+        .registry
+        .respawn_or_recreate_agent_for_pane(WORKER_PANE, "cat", &recreate_identity)
+        .await
+        .expect(
+            "the simulated concurrent delegate must be able to install a healthy replacement \
+             while the restart is queued behind the same dispatch lock",
+        );
+    assert!(
+        !replacement.recreated,
+        "the crashed worker's registry record was still present, so this must be an ordinary \
+         respawn (recreated == false) — the same leg `dispatch_one_owned`'s common case takes; \
+         replacement = {replacement:?}"
+    );
+    let replacement_agent_id = replacement.agent_id;
+
+    // Release the lock: only now can the background restart's own
+    // `pane_dispatch_lock` acquisition succeed and its respawn attempt run.
+    drop(dispatch_guard);
+
+    let response = restart_task
+        .await
+        .expect("the background restart task must not panic");
+
+    assert!(
+        !response.restarted,
+        "TOCTOU (issue #789): the restart proceeded and reported restarted: true even though a \
+         healthy replacement was installed into the pane while the restart was queued behind \
+         the dispatch lock, without --force ever having been given; response = {response:?}"
+    );
+    assert!(
+        response
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("has not crashed")),
+        "the refusal must re-check crash state under the dispatch lock and give the same \
+         \"has not crashed\" wording the early check uses; response = {response:?}"
+    );
+
+    let occupant = fx.daemon.registry.pane_current_agent_id(WORKER_PANE);
+    assert_eq!(
+        occupant.as_deref(),
+        Some(replacement_agent_id.as_str()),
+        "the healthy replacement installed by the simulated concurrent delegate must still be \
+         the pane's live occupant afterward — proof the restart did not kill it; \
+         occupant = {occupant:?}, replacement = {replacement_agent_id}"
+    );
+    assert!(
+        fx.daemon
+            .registry
+            .agent_record_any(&replacement_agent_id)
+            .is_some_and(|r| r.crashed != Some(true)),
+        "the healthy replacement must still be alive (not marked crashed) after the restart \
+         resolved; record = {:?}",
+        fx.daemon.registry.agent_record_any(&replacement_agent_id)
     );
 }

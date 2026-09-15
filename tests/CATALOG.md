@@ -4444,6 +4444,13 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-level `pane restart` verb's own registry correctness (covered by `pane/restart/001`-`008`); the CLI's exit-code handling of an old/unresponsive daemon (`pane/restart/009`/`010` own that); exact card body/status-badge layout; the unfocused role-card `Prmt:` preview route for a restarted pane — the `cat` stand-in carries no recognized agent identity, so that route never activates here and this test structurally cannot cover it (a real, hook-integrated agent is `tests/e2e_pi_live.rs`'s job, tracked separately as fork issue #786).
 - **Platform coverage:** mac+linux (unix-only, PTY-backed harness).
 
+##### pane/restart/012 — TOCTOU: nothing re-checks crash state after `handle_restart_role_with_state` acquires `pane_dispatch_lock`, so a concurrent `clear = true` delegate's freshly-installed healthy replacement gets killed anyway when a queued restart (no `--force`) finally proceeds (issue #789, upstream PR #918 review "Restart Can Kill Replacement").
+- **Layer:** L1/fast (same in-process technique as `pane/restart/001`, plus the test itself takes `AgentPtyRegistry::pane_dispatch_lock` directly to pin the interleaving deterministically through the lock rather than racing timing).
+- **Agent:** none (a `sleep 0.2` crashed worker stand-in, then a `cat` stand-in installed as the healthy replacement).
+- **Asserts:** with the worker's record marked crashed, the test holds `pane_dispatch_lock(WORKER_PANE)`, starts `handle_restart_role_with_state(force: false)` in the background (which blocks acquiring the same lock), then — still holding the lock — calls the same `AgentPtyRegistry::respawn_or_recreate_agent_for_pane` a concurrent `dispatch_one_owned` would use to install a healthy replacement into the pane. After the lock is released and the background restart resolves, it must report `restarted: false` with an error containing "has not crashed" (the same wording the early refusal uses) rather than proceed and kill the replacement, and the replacement's agent id must still be the pane's live, non-crashed occupant.
+- **Does not assert:** the `--force` path, which is unaffected by this fix by design (the caller has already opted into killing whatever occupies the pane); the CLI/socket layer.
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (PRD #699 M3).
