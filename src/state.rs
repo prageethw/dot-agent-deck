@@ -7185,6 +7185,27 @@ impl AppState {
     ) {
         // The snapshot's event-derived agent_type wins; fall back to the
         // spawn-time value only when the snapshot has none (or is absent).
+        //
+        // Issue #730 (round 2, reviewer/auditor finding C): both sides of
+        // this fallback are already guarded AT THEIR SOURCE by this round's
+        // other two fixes, so no additional guard is added here — this
+        // function only consumes two already-clean upstream values:
+        // `snap.agent_type` is read straight off `AppState.sessions` (the
+        // daemon's own `ListAgents` join, `src/daemon_protocol.rs`), which
+        // now goes through the widened `apply_event` guard on BOTH the
+        // creation and update paths, so it can no longer carry a value the
+        // wrapper's own boot-provenance `SessionStart` taught it; `agent_type`
+        // (the spawn-time/registry value threaded in from
+        // `HydratedPane.agent_type` → `AgentRecord.agent_type`) is likewise
+        // now guarded at its own source, the hook-ingest guard added to
+        // `src/daemon.rs`'s `set_agent_type` call. What remains here is the
+        // pre-existing, deliberate PRD #76 M2.13 behaviour of falling back to
+        // a caller-DECLARED identity (the role config's `agent_type`, when a
+        // pane was spawned already knowing what it would run) rather than
+        // resetting to `AgentType::None` — a documented, accepted tradeoff:
+        // reconnect hydration reasonably wants the best-known value even when
+        // it is a declaration rather than an observation, and it is not the
+        // same defect class the two source-side guards close.
         let effective_agent_type = match live {
             Some(snap) => snap.agent_type.clone().or(agent_type),
             None => agent_type,
@@ -10257,12 +10278,37 @@ impl AppState {
             .and_then(|pid| self.pane_started_at.get(pid))
             .copied();
 
+        // Issue #730 (widened per #733's already-committed reasoning, see
+        // `AgentEvent::is_daemon_synthetic`'s doc on `src/event.rs`): a
+        // `SessionStart` `dot-agent-deck wrap` authored ABOUT ITS OWN CHILD —
+        // any of the three boot-provenance origins, not just the fork-time
+        // one — is boot provenance, never the wrapped agent identifying
+        // itself. Paired with the `event_type` check because the origin
+        // marker alone is metadata-only and every sibling consumer of these
+        // markers (e.g. the generation guard a few dozen lines above) pairs
+        // it with this same check.
+        let is_wrapper_boot_session_start =
+            event.event_type == EventType::SessionStart && event.is_wrapper_session_start();
+
         let session = self
             .sessions
             .entry(event.session_id.clone())
             .or_insert_with(|| SessionState {
                 session_id: event.session_id.clone(),
-                agent_type: event.agent_type.clone(),
+                // Issue #730 finding B (auditor): this closure runs
+                // UNCONDITIONALLY stamping `event.agent_type` the moment this
+                // is the FIRST event on this session key — which, on the
+                // daemon side, is very likely the wrapper's own fork-time
+                // event, since daemon-side `AppState` has no placeholder
+                // concept (`insert_placeholder_session*` is TUI-only). The
+                // guard below only protects a session that already exists;
+                // a session BORN from a wrapper boot-provenance event must
+                // start `AgentType::None` for the same reason.
+                agent_type: if is_wrapper_boot_session_start {
+                    AgentType::None
+                } else {
+                    event.agent_type.clone()
+                },
                 cwd: event.cwd.clone(),
                 status: SessionStatus::Idle,
                 active_tool: None,
@@ -10356,25 +10402,63 @@ impl AppState {
             session.display_name = Some(name);
         }
 
-        // Issue #730: the wrapper's fork-time `SessionStart`
-        // (`Emitter::emit_fork_session_start`, `src/wrap.rs`) fires the
-        // instant `cmd.spawn()` returns, purely to surface the dashboard
-        // card early — the wrapped child is typically still a launcher at
-        // that point, seconds from the real agent. `Emitter::build_event`
-        // stamps `agent_type` on every event unconditionally, including
-        // this one, so without this guard the fork-time event alone would
-        // flip `session.agent_type` away from `None` before the wrapped
-        // agent has identified itself — defeating the "Starting…" render
-        // gate (`is_untyped_agent` / `is_pending` in `render_session_card`)
-        // and letting a stale `session.status` (e.g. "Thinking") show
-        // through instead. `is_wrapper_fork_session_start` checks
-        // specifically for this marker (not the interface-ready/settled
-        // ones `is_wrapper_session_start` also covers) — those later
-        // signals genuinely do observe the wrapped child doing something,
-        // so they're left free to resolve `agent_type` as before.
+        // Issue #730 (widened in review round 2 — reviewer M1 / auditor A):
+        // the wrapper's boot-provenance `SessionStart` events
+        // (`Emitter::emit_fork_session_start` / `emit_interface_ready`,
+        // `src/wrap.rs`) fire while `dot-agent-deck wrap`'s own child is
+        // still typically a launcher, seconds from the real agent —
+        // including the "settled" signal, which `src/wrap.rs`'s own doc on
+        // `INTERFACE_SETTLE_WINDOW` calls out as "a GUESS" that fires while
+        // a shellenv-heavy launcher (e.g. `devbox run codex-big`) is still
+        // canonical, not the exec'd agent. `Emitter::build_event` stamps
+        // `agent_type` on every event unconditionally, including all three
+        // of these, so without this guard they would flip
+        // `session.agent_type` away from `None` before the wrapped agent
+        // has identified itself — defeating the "Starting…" render gate
+        // (`is_untyped_agent` / `is_pending` in `render_session_card`) and
+        // letting a stale `session.status` (e.g. "Thinking") show through
+        // instead.
+        //
+        // The original round only excluded the fork-time origin, reasoning
+        // that the interface-ready/settled facts "genuinely observe the
+        // wrapped child doing something" — but issue #733 had already
+        // reasoned through this EXACT question for a sibling field
+        // (`agent_report_activity_seen`, see `AgentEvent::is_daemon_synthetic`'s
+        // doc on `src/event.rs`) and concluded the opposite: splitting the
+        // three origins to exclude only the fork-time fact "would leave the
+        // interface-ready/settled facts still able to latch [the field] off
+        // nothing but the wrapper watching its own child's terminal settle,
+        // which is exactly the same card-surfacing-not-readiness gap for a
+        // different origin value". That reasoning transfers directly here,
+        // so this guard now asks the same broad question
+        // (`is_wrapper_boot_session_start`, computed above) rather than the
+        // narrow `is_wrapper_fork_session_start()`.
+        //
+        // Blast-radius note (reviewer D / auditor D): `agent_type !=
+        // AgentType::None` is also the `agent_ready` predicate for a few
+        // prompt-delivery/confirmation-capability paths (`src/ui.rs`
+        // `process_pending_dispatches` / `process_pending_seed_prompts` /
+        // the orchestration-prompt gate, `pane_confirmation_capability` in
+        // `src/prompt_delivery.rs`). Widening this guard delays
+        // `agent_type` resolution further — now until a genuine,
+        // non-wrapper-origin event, not just past the fork+settle window.
+        // Read every one of those call sites for this round: the direction
+        // is conservative in each (hold the provisional/`Unknown` state
+        // longer rather than finalize on boot provenance), matching the
+        // documented safe-waiting-state contract those consumers already
+        // have for `AgentType::None`/`Unknown`. The one path that bypasses
+        // the readiness buffer entirely (`timeout_ready`,
+        // `process_pending_seed_prompts`) becomes reachable for a wrapped
+        // pane that used to resolve `agent_type` within ~750ms of fork and
+        // now waits for a genuine agent-origin event instead — that is the
+        // SAME direction the buffer's own timeout already exists to bound
+        // (a documented worst case, not a new one), so no additional change
+        // is made here. `deliver_orchestrator_prompt`'s own readiness check
+        // is unaffected either way, since it reads the event scan
+        // (`session_start_seen`) rather than `agent_type`.
         if session.agent_type == AgentType::None
             && event.agent_type != AgentType::None
-            && !event.is_wrapper_fork_session_start()
+            && !is_wrapper_boot_session_start
         {
             session.agent_type = event.agent_type.clone();
         }

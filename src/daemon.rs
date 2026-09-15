@@ -3085,7 +3085,37 @@ async fn run_hook_loop(
                                          register a card with no local pane"
                                     );
                                 }
-                                pty_registry.set_agent_type(pane_id, &event.agent_type);
+                                // Issue #730 (round 2, auditor finding C): the
+                                // registry's display badge must not learn its
+                                // identity from `dot-agent-deck wrap`'s own
+                                // boot-provenance `SessionStart` either — the
+                                // wrapped child is typically still a launcher
+                                // at fork and possibly still a shellenv at
+                                // "settled" (see the identical reasoning on
+                                // `AppState::apply_event`'s guard,
+                                // `src/state.rs`). Left unguarded, this exact
+                                // premature value fed straight back into the
+                                // SAME `session.agent_type` render gate
+                                // through a different door: `list_agents`
+                                // echoes `AgentRecord.agent_type` as
+                                // `HydratedPane.agent_type`, which
+                                // `seed_hydrated_session`
+                                // (`src/state.rs`) falls back to on every
+                                // `dot-agent-deck connect` reconnect whenever
+                                // the daemon's live snapshot carries no
+                                // event-derived type of its own — reopening
+                                // the guard on reconnect even after this PR's
+                                // widened `apply_event` fix. Genuine
+                                // agent-origin events (native hooks, the
+                                // wrapper's own text/status classifier) carry
+                                // no boot-provenance marker and are
+                                // unaffected.
+                                let is_wrapper_boot_session_start = event.event_type
+                                    == crate::event::EventType::SessionStart
+                                    && event.is_wrapper_session_start();
+                                if !is_wrapper_boot_session_start {
+                                    pty_registry.set_agent_type(pane_id, &event.agent_type);
+                                }
                             }
                             // Fan out to subscribed attach connections and
                             // apply locally as ONE ordered operation, so a
