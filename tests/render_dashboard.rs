@@ -2743,6 +2743,112 @@ fn palette_008_idle_card_with_outstanding_delegation_shows_delegated_badge_and_c
     );
 }
 
+/// Scenario: issue #784 (RED — pins new behavior, not yet implemented). The
+/// dashboard card label for a wait-observing `Working` session must render as
+/// the bare word `"Observing"`, dropping the `"Working "` prefix entirely —
+/// `theme/palette/007` still pins today's `"Working (observing)"` composition
+/// and is deliberately left untouched here (the coder updates it alongside the
+/// production fix); this is a NEW, separate pin sitting next to it. Exercises
+/// both trigger flags (`wait_synthetic_working` and `wait_deferred_revert`,
+/// same union `theme/palette/007` already covers) and re-asserts the `Working`
+/// gate: a non-`Working` status with both wait flags set must show neither
+/// "Observing" nor the old "(observing)" suffix. The border color
+/// (`palette::STATUS_OBSERVING`) is unaffected by this change and is not
+/// re-pinned here beyond a light non-regression check, since issue #784 is a
+/// text-only change.
+#[spec("theme/palette/009")]
+#[test]
+fn palette_009_wait_promoted_working_card_shows_bare_observing_label() {
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+
+    let mut wait_synthetic = palette_session(SessionStatus::Working);
+    wait_synthetic.wait_synthetic_working = true;
+    let buffer = render_card_to_buffer(
+        &wait_synthetic,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        height,
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Observing"),
+        "a wait_synthetic_working-promoted Working card must render the bare \"Observing\" \
+         label; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Working (observing)"),
+        "the old \"Working (observing)\" composition must be gone once issue #784 lands; \
+         got:\n{rendered}"
+    );
+    let (border_fg, _modifier) = border_style_at_mid(&buffer);
+    assert_eq!(
+        border_fg,
+        dot_agent_deck::palette::STATUS_OBSERVING,
+        "the border color is unaffected by this text-only change and must still resolve \
+         through STATUS_OBSERVING; got {border_fg:?}"
+    );
+
+    // Second positive case: `wait_deferred_revert` alone (the PRD #499
+    // headline flow — the wait landed on an already-`Working` card) must
+    // render identically.
+    let mut deferred = palette_session(SessionStatus::Working);
+    deferred.wait_deferred_revert = true;
+    let buffer = render_card_to_buffer(
+        &deferred,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        height,
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Observing"),
+        "a wait_deferred_revert-promoted Working card must render the bare \"Observing\" \
+         label; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Working (observing)"),
+        "the old \"Working (observing)\" composition must be gone once issue #784 lands; \
+         got:\n{rendered}"
+    );
+
+    // Negative case: both wait flags set, but status is NOT Working — neither
+    // the new "Observing" label nor the old "(observing)" suffix must appear,
+    // and the real WaitingForInput label must still render.
+    let mut not_working = palette_session(SessionStatus::WaitingForInput);
+    not_working.wait_synthetic_working = true;
+    not_working.wait_deferred_revert = true;
+    let buffer = render_card_to_buffer(
+        &not_working,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        height,
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        !rendered.contains("Observing") && !rendered.contains("(observing)"),
+        "a non-Working card must never show the \"Observing\" label even with both wait \
+         flags set; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Needs Input"),
+        "the card must still render its real WaitingForInput label unchanged; got:\n{rendered}"
+    );
+}
+
 /// Scenario: Render a FOCUSED, LIVE (`UiMode::PaneInput`) embedded pane and
 /// assert its border is the dedicated `focused` accent role — Color::Cyan — and
 /// that this color is distinct from every status role

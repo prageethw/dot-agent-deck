@@ -6996,6 +6996,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the bell/tab-bar-aggregate-count consequences of the same field (covered by the plain `#[test]`s alongside `compute_bell_needed` in `src/ui.rs` and `aggregate_stats` in `src/state.rs`, neither of which carries a catalog spec id); the reconnect/hydration plumbing that populates the field (covered by `tests/rehydration.rs`); live updates to an already-attached pane with no reconnect (covered by `scheduler/idle-worker/023`, once the `BroadcastMsg::DelegationArmed`/`DelegationRetired` push landed).
 - **Platform coverage:** mac+linux+windows.
 
+##### theme/palette/009 — A wait-observing `Working` card's badge label renders as the bare word `"Observing"`, not `"Working (observing)"` (issue #784, RED — pins new behavior, not yet implemented). `theme/palette/007` still pins today's `"Working (observing)"` composition; this is a NEW, separate pin sitting next to it, not an edit of `007` — the coder updates `007`'s assertions to match once the production fix lands.
+- **Layer:** L1 (ratatui `TestBackend`, plain buffer-text capture — no color assertion beyond a light non-regression check that `STATUS_OBSERVING` still resolves, since this issue is text-only).
+- **Agent:** none (three live session fixtures — two `Working`, one `WaitingForInput`, mirroring `theme/palette/007`'s fixture shape).
+- **Asserts:** rendering an unselected deck card for a `Working` session carrying `wait_synthetic_working: true` shows the bare `"Observing"` label and no longer contains `"Working (observing)"`; the same holds for a `Working` session carrying only `wait_deferred_revert: true`; a session carrying both wait flags but a non-`Working` status (`WaitingForInput`) shows neither `"Observing"` nor the old `"(observing)"` suffix and keeps rendering its real `"Needs Input"` label.
+- **Does not assert:** the border colour transition beyond a light non-regression check (unchanged by this issue, already owned by `theme/palette/007`); the `daemon status` CLI text surface (covered by the new `src/daemon_status.rs` unit test `format_human_marks_wait_observing_as_bare_observing_word`, uncatalogued per this file's convention for that module's plain unit tests — see the existing `daemon/status` section's own scope note); the `(delegated)` badge, unrelated to this issue (`theme/palette/008`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Mode indication (PRD #341)
 
 #### mode/cursor

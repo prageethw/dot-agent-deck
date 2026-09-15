@@ -593,4 +593,113 @@ mod tests {
             "the projected wire value must gate on `status == Working` too, not just the text marker"
         );
     }
+
+    /// Scenario: issue #784 (RED — pins new behavior, not yet implemented).
+    /// `format_human` must drop the `"Working "` prefix for a wait-observing
+    /// row and render the bare word `"Observing"` instead of today's
+    /// `"Working (observing)"` composition —
+    /// `format_human_marks_wait_synthetic_working_as_observing` above still
+    /// pins the OLD text and is deliberately left untouched (the coder
+    /// updates it alongside the production fix); this is a NEW, separate pin.
+    ///
+    /// Composition question for the shell-busy `"*"` marker when BOTH
+    /// `shell_synthetic_working` and the wait-observing gate apply: today's
+    /// code (`format_human`) attaches `*` directly onto the status WORD first
+    /// (`"Working"` -> `"Working*"`), then appends `" (observing)"` as a
+    /// wholly separate suffix — so `*` has never been part of the
+    /// `"(observing)"` composition, it is a distinct concern (shell holding
+    /// responsibility for keeping `Working` alive) that happens to render
+    /// adjacent to it. Since this fix replaces the whole status WORD
+    /// (`"Working"` -> `"Observing"`) rather than appending a suffix to it,
+    /// the marker's existing "attaches directly to the status word" placement
+    /// is preserved by attaching it to the new word the same way: `"Observing*"`,
+    /// not `"Observing (marker dropped)"` or `"Working*Observing"`. This
+    /// keeps the two concerns visually composed exactly as before — a status
+    /// word, optionally starred — with only the word itself changing.
+    #[test]
+    fn format_human_marks_wait_observing_as_bare_observing_word() {
+        let mut wait_only = snapshot(SessionStatus::Working);
+        wait_only.shell_synthetic_working = false;
+        wait_only.wait_synthetic_working = true;
+        let agents = build_status_agents(vec![record("agent-1", "wait-pane", Some(wait_only))]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("wait-pane"))
+            .unwrap_or_else(|| panic!("no row for wait-pane in {table:?}"));
+        assert!(
+            line.contains("Observing"),
+            "a wait-only synthetic Working row must render the bare \"Observing\" word; \
+             got {line:?}"
+        );
+        assert!(
+            !line.contains("Working (observing)"),
+            "the old \"Working (observing)\" composition must be gone once issue #784 lands; \
+             got {line:?}"
+        );
+
+        let mut deferred_only = snapshot(SessionStatus::Working);
+        deferred_only.wait_synthetic_working = false;
+        deferred_only.wait_deferred_revert = true;
+        let agents = build_status_agents(vec![record(
+            "agent-2",
+            "deferred-pane",
+            Some(deferred_only),
+        )]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("deferred-pane"))
+            .unwrap_or_else(|| panic!("no row for deferred-pane in {table:?}"));
+        assert!(
+            line.contains("Observing"),
+            "a `wait_deferred_revert`-only row (no `wait_synthetic_working`) must also render \
+             \"Observing\" — this is the H1 fix's OR-broadening; got {line:?}"
+        );
+
+        // Composition case: both the shell-busy marker and wait-observing
+        // apply. See this test's own doc comment for the reasoning behind
+        // pinning "Observing*" (marker preserved, attached to the new word)
+        // rather than dropping the marker entirely.
+        let mut both = snapshot(SessionStatus::Working);
+        both.shell_synthetic_working = true;
+        both.wait_synthetic_working = true;
+        let agents = build_status_agents(vec![record("agent-3", "both-pane", Some(both))]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("both-pane"))
+            .unwrap_or_else(|| panic!("no row for both-pane in {table:?}"));
+        assert!(
+            line.contains("Observing*"),
+            "when both markers apply they must compose as \"Observing*\" — the shell-busy \
+             marker preserved and attached directly to the new status word; got {line:?}"
+        );
+        assert!(
+            !line.contains("Working* (observing)") && !line.contains("Working (observing)"),
+            "the old composition must be fully gone once issue #784 lands; got {line:?}"
+        );
+
+        // Negative case: the flag set but the status is NOT `Working` must
+        // never show the new "Observing" word (nor the old suffix).
+        let mut not_working = snapshot(SessionStatus::WaitingForInput);
+        not_working.wait_synthetic_working = true;
+        not_working.wait_deferred_revert = true;
+        let agents =
+            build_status_agents(vec![record("agent-4", "waiting-pane", Some(not_working))]);
+        let table = format_human(&agents);
+        let line = table
+            .lines()
+            .find(|l| l.contains("waiting-pane"))
+            .unwrap_or_else(|| panic!("no row for waiting-pane in {table:?}"));
+        assert!(
+            !line.contains("Observing") && !line.contains("(observing)"),
+            "a non-Working row must never show \"Observing\" even with both wait flags set; \
+             got {line:?}"
+        );
+        assert!(
+            line.contains("WaitingForInput"),
+            "a non-Working row must keep rendering its real status; got {line:?}"
+        );
+    }
 }
