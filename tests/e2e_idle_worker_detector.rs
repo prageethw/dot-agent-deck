@@ -269,6 +269,7 @@ fn real_agent_orchestration_session(
                 started_role_indices: vec![0],
                 display_title: None,
                 owner: None,
+                claim_cwd: None,
             }),
         }],
         last_command: None,

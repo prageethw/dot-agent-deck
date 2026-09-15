@@ -1833,11 +1833,31 @@ pub(crate) fn provision_isolated_clone_sync_with_legacy_fallback(
 /// [`resume_existing_isolated_clone`] needs to check it against.
 pub(crate) enum LegacyFallbackEligibility<'a> {
     /// The picked directory is nested under its git toplevel. The fallback
-    /// is never reachable regardless of anything else — the legacy format
-    /// never carried subpath information to compare against, and widening
-    /// it here would silently reopen the exact collision fork issue #763
-    /// closed.
-    Nested,
+    /// (adopting/resuming the legacy marker) is never reachable regardless
+    /// of anything else — the legacy format never carried subpath
+    /// information to compare against, and widening it here would silently
+    /// reopen the exact collision fork issue #763 closed.
+    ///
+    /// `own_segment` (PRD fork#777 fix round, reviewer M1 / auditor's
+    /// `workspace_044` reasoning) is NOT an identity offered to the
+    /// fallback — [`Self::identity_branch`] still returns `None` for this
+    /// variant unconditionally, so a nested pick can never silently ADOPT a
+    /// legacy marker, preserving fork issue #766 M3's safety property
+    /// intact. It exists only so [`resume_existing_isolated_clone`] can
+    /// detect the narrower, genuinely ambiguous sub-case — a legacy-shaped
+    /// marker whose stored `name=` happens to equal THIS caller's own
+    /// segment — and refuse it distinguishably
+    /// ([`ResumeRejection::LegacyNestedIdentityUnverifiable`]) rather than
+    /// silently treating it as an ordinary, unambiguous collision with a
+    /// genuinely different pick (`ResumeRejection::NameCollision`, which
+    /// `provision_isolated_clone_or_status` recovers from by disambiguating
+    /// and creating a separate clone). See that variant's own doc comment
+    /// for why the two cases must not be conflated: the ambiguous case
+    /// might be this exact pick's own workspace from before today's
+    /// subpath-aware marker format, in which case silently forking a new,
+    /// empty clone would abandon the user's existing workspace — possibly
+    /// holding uncommitted work — with nothing surfacing that it happened.
+    Nested { own_segment: &'a str },
     /// The picked directory IS its own git toplevel (or isn't inside a git
     /// repository at all), and the caller supplies its own current
     /// branch/segment value for THIS pick — the exact string that would be
@@ -1860,11 +1880,26 @@ pub(crate) enum LegacyFallbackEligibility<'a> {
 
 impl LegacyFallbackEligibility<'_> {
     /// The caller-supplied identity to check the legacy marker's `name=`
-    /// field against, when this variant offers one at all.
+    /// field against, when this variant offers one at all. `Nested` NEVER
+    /// offers one here — see its own doc comment; that is the structural
+    /// gate that keeps a nested pick from ever silently adopting a legacy
+    /// marker.
     fn identity_branch(&self) -> Option<&str> {
         match self {
             Self::ToplevelWithIdentity(branch) => Some(branch),
-            Self::Nested | Self::Disabled => None,
+            Self::Nested { .. } | Self::Disabled => None,
+        }
+    }
+
+    /// PRD fork#777 fix round (reviewer M1): the segment THIS nested
+    /// caller's own pick would produce, offered ONLY for detecting the
+    /// specific ambiguous case described on [`Self::Nested`]'s own doc
+    /// comment — never for adopting the marker (see [`Self::identity_branch`],
+    /// unaffected by this method and still `None` for `Nested`).
+    fn nested_own_segment(&self) -> Option<&str> {
+        match self {
+            Self::Nested { own_segment } => Some(own_segment),
+            Self::ToplevelWithIdentity(_) | Self::Disabled => None,
         }
     }
 }
@@ -4241,6 +4276,28 @@ pub(crate) enum ResumeRejection {
     /// bare-segment-derived — being reopened by this path's
     /// `orchestration:<clone_dir>` producer.
     NameCollision,
+    /// PRD fork#777 fix round (reviewer M1 / auditor's `workspace_044`
+    /// reasoning). Evidence, ancestry and health all passed, and this call
+    /// won the `Contested` race, but the provenance artifact's stored
+    /// `creator=` is a LEGACY-shaped marker (`"orchestration:" +
+    /// sanitize_workspace_segment(suffix) == name=`) whose `name=` field
+    /// equals THIS caller's own segment — for a NESTED pick, where the
+    /// legacy format never carried subpath information to distinguish "my
+    /// own earlier workspace, written before today's subpath-aware marker
+    /// format" from "a genuinely different nested pick that merely shares
+    /// the same top-level Name/segment". Deliberately distinct from
+    /// [`Self::NameCollision`], which `provision_isolated_clone_or_status`
+    /// recovers from by disambiguating and creating a separate clone: this
+    /// variant is refused OUTRIGHT and never retried, because the
+    /// disambiguation-and-create recovery is only safe when the collision
+    /// is UNAMBIGUOUSLY a different pick — here it might not be, and
+    /// silently forking a brand-new, empty clone in that case would abandon
+    /// the user's own existing workspace (possibly holding uncommitted
+    /// work) with nothing surfacing that it happened. See
+    /// `LegacyFallbackEligibility::Nested`'s own doc comment for the full
+    /// reasoning and `crate::ui::provision_isolated_clone_or_status`'s
+    /// retry guard for where this is kept out of the retry.
+    LegacyNestedIdentityUnverifiable,
 }
 
 impl ResumeRejection {
@@ -4274,6 +4331,14 @@ impl ResumeRejection {
                  provenance record names a different creator) — pick a different Name instead \
                  of this one. It may still be in use by the orchestration that opened it — do \
                  not remove it"
+            }
+            Self::LegacyNestedIdentityUnverifiable => {
+                "the existing directory's ownership record is in an old format this build \
+                 cannot verify for a picked subdirectory — it may be this exact project's own \
+                 earlier workspace (written before today's marker format), or it may be a \
+                 different one that merely shares this Name. Pick a different Name, or inspect \
+                 the directory manually and remove it only once you have confirmed it is stale \
+                 — it may still be in use"
             }
         }
     }
@@ -4512,6 +4577,39 @@ fn resume_existing_isolated_clone(
                     == Some(crate::worktree_reclaim::sanitize_marker_creator(branch).as_str())
             });
         if !legacy_match {
+            // PRD fork#777 fix round (reviewer M1 / auditor's `workspace_044`
+            // reasoning): a NESTED caller whose own segment happens to equal
+            // this legacy-shaped marker's stored `name=` is genuinely
+            // ambiguous — it might be this exact pick's own workspace from
+            // before today's subpath-aware marker format, or it might be an
+            // entirely different nested pick that merely shares the same
+            // top-level Name/segment (the ordinary fork#607 collision this
+            // whole mechanism exists to catch). Nothing on disk can
+            // distinguish the two — the legacy format never carried subpath
+            // information at all (`LegacyFallbackEligibility::Nested`'s own
+            // doc comment) — so treating this as "just an ordinary,
+            // unambiguous different pick" and letting
+            // `provision_isolated_clone_or_status` silently disambiguate
+            // would risk abandoning the user's own existing workspace,
+            // possibly holding uncommitted work, with nothing surfacing that
+            // it happened. Refuse distinguishably instead of falling through
+            // to the ordinary `NameCollision` (which IS safe to
+            // disambiguate, since it never carries this ambiguity).
+            if legacy_shape_ok
+                && legacy_fallback
+                    .nested_own_segment()
+                    .is_some_and(|own_segment| {
+                        stored_name.as_deref()
+                            == Some(
+                                crate::worktree_reclaim::sanitize_marker_creator(own_segment)
+                                    .as_str(),
+                            )
+                    })
+            {
+                return Ok(IsolatedCloneOutcome::Rejected(
+                    ResumeRejection::LegacyNestedIdentityUnverifiable,
+                ));
+            }
             return Ok(IsolatedCloneOutcome::Rejected(
                 ResumeRejection::NameCollision,
             ));
