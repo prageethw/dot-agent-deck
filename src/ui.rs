@@ -32380,6 +32380,106 @@ mod tests {
         );
     }
 
+    /// Scenario: A placeholder explicitly awaiting an agent report (the
+    /// Codex/orchestration-role shape from `dashboard/placeholder/001`)
+    /// receives ONLY the wrapper's own fork-time `SessionStart` — the same
+    /// event `dashboard/placeholder/009` covers, built the same way. This
+    /// test pins a DIFFERENT field on the same event: `session.agent_type`
+    /// must stay `AgentType::None`, because `Emitter::emit_fork_session_start`
+    /// (`src/wrap.rs`) exists only "to surface the dashboard card early" and
+    /// deliberately stamps `SESSION_START_ORIGIN_METADATA_KEY` /
+    /// `WRAPPER_FORK_SESSION_START_ORIGIN` so readiness gates can tell it
+    /// apart from a genuine "the session is up and accepting input" signal.
+    #[spec("dashboard/placeholder/010")]
+    #[test]
+    fn dashboard_placeholder_010_wrapper_fork_session_start_must_not_set_agent_type() {
+        // Issue #730: `AppState::apply_event`'s agent_type assignment,
+        //
+        //   if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
+        //       session.agent_type = event.agent_type.clone();
+        //   }
+        //
+        // (src/state.rs, `apply_event`) does not consult
+        // `SESSION_START_ORIGIN_METADATA_KEY` at all — it sets
+        // `session.agent_type` from ANY event carrying a non-`None`
+        // `agent_type`, including this wrapper fork-time `SessionStart`,
+        // which `Emitter::build_event` stamps with `agent_type:
+        // self.agent_type.clone()` unconditionally on every event the
+        // wrapper emits. So for a Codex-identity wrapped pane,
+        // `session.agent_type` flips to `Codex` the instant the fork-time
+        // event arrives — seconds before the wrapped agent has done any
+        // real work.
+        //
+        // That flip defeats the render-layer "Starting…" gate in
+        // `render_session_card` (`is_untyped_agent = session.agent_type ==
+        // AgentType::None`; `is_pending = is_untyped_agent &&
+        // session.expects_agent_report`): once `agent_type` is non-`None`
+        // the card falls through to raw `session.status` instead of
+        // "Starting…", and Codex's own native hooks do not fire until its
+        // first turn completes — so the raw status can display a
+        // stale/leftover value (e.g. "Thinking") indefinitely, matching
+        // issue #730's exact reported symptom (Codex reviewer/auditor panes
+        // wedged showing "Thinking" pre-task, 8h+, zero hook events).
+        //
+        // This is a distinct field from `dashboard/placeholder/009`'s
+        // `expects_agent_report`/`agent_report_activity_seen`: that fix
+        // (issue #733) protects those two flags via
+        // `AgentEvent::is_daemon_synthetic()`, but does nothing for
+        // `agent_type` itself, which `apply_event` sets in a wholly
+        // separate, unguarded code path.
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session_awaiting_report(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(AgentEvent {
+            session_id: "wrapper-fork-1".to_string(),
+            // The wrapper knows its own agent identity at fork time (it is
+            // handed the agent type on the command line), matching
+            // production and `dashboard/placeholder/009`'s construction.
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("1".to_string()),
+            agent_id: Some("d-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("1"))
+            .expect("the fork-time SessionStart must have kept (or created) a session");
+        assert_eq!(
+            session.agent_type,
+            AgentType::None,
+            "a wrapper fork-time SessionStart alone must not set \
+             session.agent_type — it is a card-surfacing signal, not \
+             evidence the wrapped agent has identified itself, and setting \
+             it prematurely defeats the 'Starting…' readiness gate \
+             (is_untyped_agent / is_pending) in render_session_card; got \
+             {session:?}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
