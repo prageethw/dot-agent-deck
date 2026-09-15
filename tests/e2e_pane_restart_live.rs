@@ -211,17 +211,25 @@ fn restart_011_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     // stand-in never produces -- meaning the role card's own `Prmt:` preview
     // (`tests/e2e_pi_live.rs`'s route for a real, hook-integrated agent) never
     // activates here. The delegated pointer text is only ever observable
-    // through the raw PTY echo, which requires focus. `2` is an idempotent
-    // jump (repeated presses stay on card 2), so it is safe to retry via
-    // `send_keys_until_grid_string_within` against the async daemon
-    // round-trip a focus keystroke rides.
+    // through the raw PTY echo, which requires focus.
+    //
+    // A single `2` press, then a pure wait -- not a retry. The digit jump
+    // only resolves in `UiMode::Normal` (`src/ui.rs`); a successful
+    // `focus_deck` switches straight to `UiMode::PaneInput`, so only the
+    // FIRST `2` after `\x04` is ever interpreted as a jump -- resending `2`
+    // on a retry would land as a literal keystroke forwarded into whichever
+    // pane is already focused, not a jump, so it could never recover from
+    // the race it would be trying to guard against. Waiting once for the
+    // needle after a single press is both correct and sufficient here.
     deck.send_bytes(b"\x04"); // PaneInput -> Command Mode
+    deck.send_bytes(b"2"); // jump to role card 2 (coder) and focus it
     assert!(
-        deck.send_keys_until_grid_string_within(b"2", "worker-task-coder", Duration::from_secs(15)),
+        deck.wait_for_grid_string_within("worker-task-coder", Duration::from_secs(15)),
         "a role restarted via `pane restart` must stay genuinely reachable in an \
          ALREADY-ATTACHED TUI -- after focusing coder's role card, the delegated \
-         task's file-pointer text never rendered in coder's pane, meaning the \
-         attached view never followed the pane onto its new, restarted agent.\nGrid:\n{}",
+         task's file-pointer text never rendered in coder's pane, meaning a \
+         still-attached TUI failed to render the restarted pane's live PTY once \
+         focused after the fact.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }

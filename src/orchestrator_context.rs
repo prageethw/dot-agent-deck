@@ -317,7 +317,9 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          about the wait before it resolves. (Full detail: `docs/orchestration.md`.)\n\n\
          If a delegated worker's pane crashes, `{bin} pane restart <role>` brings it back \
          without a human. If a role in the config was never spawned into this orchestration, \
-         `{bin} pane spawn <role>` brings it up. See \
+         `{bin} pane spawn <role>` brings it up. `<role>` comes from `.dot-agent-deck.toml`, \
+         which can itself be a cloned third-party repo, so single-quote it unless it's already \
+         a bare safe token when you compose either command as a shell string. See \
          `docs/orchestration.md#restarting-and-spawning-worker-panes`.\n"
     ));
 
@@ -548,10 +550,16 @@ mod tests {
     /// mentions `pane restart <role>` / `pane spawn <role>` (PRD #699) at
     /// all, so an orchestrating agent has no way to discover either command
     /// exists unless a human tells it out of band. Also pins that fixing
-    /// that omission must not drag `--force` into the agent-facing text —
+    /// that omission must not drag `--force` into this composed paragraph —
     /// forcing a restart on a HEALTHY pane is a people-only escalation per
-    /// the upstream review, not guidance this context should hand an
-    /// orchestrating agent.
+    /// the upstream review, so it isn't pre-taught here. That's deliberately
+    /// narrower than total containment, though (PR #783 fix round, auditor
+    /// M2): the daemon's own refusal — `"has not crashed; pass --force to
+    /// restart a healthy pane"` — is still printed verbatim to the agent's
+    /// own stderr the moment a plain restart is genuinely refused, and
+    /// `docs/orchestration.md`'s Troubleshooting entry documents it in full.
+    /// This paragraph only avoids teaching `--force` pre-emptively; it does
+    /// not, and structurally cannot, withhold it after a refusal.
     #[test]
     fn context_teaches_the_orchestrator_about_pane_restart_and_pane_spawn() {
         let c = build_orchestrator_context(&config());

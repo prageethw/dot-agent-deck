@@ -493,7 +493,7 @@ If you receive a "delegated worker exited without work-done" notice, run
 the task it was working on. Only ask the user if the restart itself fails.
 ```
 
-You don't have to add this yourself to get the behavior — the orchestrator's own context now teaches it both commands automatically, so a `prompt_template` line like the one above is reinforcement, not the only way the orchestrator learns these commands exist.
+You don't have to add this yourself to get the behavior — the orchestrator's own context teaches it both commands automatically, so a `prompt_template` line like the one above is reinforcement, not the only way the orchestrator learns these commands exist.
 
 ## Validate your config
 
@@ -661,7 +661,15 @@ Only the role with `start = true` can call `dot-agent-deck delegate`. If a worke
 
 ### `pane restart` says "has not crashed; pass --force to restart a healthy pane"
 
-`dot-agent-deck pane restart <role>` refuses a healthy pane unless you pass `--force` — without the flag, restart only succeeds against a pane the daemon has flagged as having exited on its own (which includes, but is not limited to, a genuine crash: a role whose command simply finished, even with a clean exit, is equally restartable without `--force`). This is deliberate: without it, the command could accidentally force-kill a worker mid-task. `--force` is a people-only escalation — it is left out of the orchestrator's own context on purpose (see [Restarting and spawning worker panes](#restarting-and-spawning-worker-panes)), so reach for it yourself from a shell rather than instructing an agent to pass it.
+`dot-agent-deck pane restart <role>` refuses a healthy pane unless you pass `--force` — without the flag, restart only succeeds against a pane the daemon has flagged as having exited on its own (which includes, but is not limited to, a genuine crash: a role whose command simply finished, even with a clean exit, is equally restartable without `--force`). This is deliberate: without it, the command could accidentally force-kill a worker mid-task. `--force` is left out of the orchestrator's own composed context on purpose, so an orchestrating agent isn't pre-taught it (see [Restarting and spawning worker panes](#restarting-and-spawning-worker-panes)) — but that only avoids teaching it pre-emptively. This exact refusal message is still printed verbatim to the agent's own stderr the moment a plain restart is genuinely refused, so an orchestrating agent does learn about `--force`, just one step later than the composed context. Reaching for `--force` yourself from a shell instead of instructing an agent to pass it is a preference for keeping that escalation a guaranteed human-only step, not something the system enforces.
+
+### `pane restart` never detects a wedged-but-alive agent
+
+Restart only acts on a pane the daemon has flagged as having actually exited — a process that is still running but hung (wedged on I/O, stuck in a loop, deadlocked) is not detected as crashed, and `pane restart` on it is refused with "has not crashed" the same as a genuinely healthy pane, with no further explanation beyond pointing at `--force`. If you suspect a worker is wedged rather than merely slow, check its pane's actual output before reaching for `--force`.
+
+### `pane spawn` refuses to create a second pane under an already-running role name
+
+`dot-agent-deck pane spawn <role>` is refused if the role is already live — it starts a NEW pane for a role that has none, not a second instance of one that already has one. To run two instances of the same kind of worker at once, give the second one its own role name in `.dot-agent-deck.toml` (e.g. `reviewer2`) rather than spawning the same name twice.
 
 ### Worker receives no task
 

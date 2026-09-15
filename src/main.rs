@@ -1839,13 +1839,23 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                     // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
-                    // restart` must not read a silent close as success: an
-                    // old/broken daemon cannot possibly have restarted
-                    // anything, so this has to fail loudly instead.
+                    // restart` must not read a silent close as success — but
+                    // `NoReply` folds several distinct `ReplyReadError`
+                    // causes (see its doc comment above), only one of which
+                    // is "old daemon"; a `DeadlineExpired` here means the
+                    // restart may well have already succeeded, so the
+                    // message below stays cause-agnostic rather than
+                    // asserting "old daemon" and telling the agent to
+                    // restart the whole daemon, which would be the worst
+                    // possible advice in that case (PR #783 fix round).
                     SocketReply::NoReply => {
                         eprintln!(
-                            "Error: the running daemon does not support `pane restart` — \
-                             restart the daemon to pick up the new build."
+                            "Error: the daemon did not answer `pane restart {role}` in time — \
+                             either it does not support this command (an older build; restart \
+                             the daemon to pick up the new one) or the restart is still in \
+                             flight and may have already succeeded. Check the pane before \
+                             retrying — retrying a successful restart will kill and respawn it \
+                             again."
                         );
                         return ExitCode::FAILURE;
                     }
@@ -1898,7 +1908,11 @@ fn main() -> ExitCode {
                     }
                 };
                 use dot_agent_deck::hook::SocketReply;
-                let line = match dot_agent_deck::hook::send_and_await_reply(&json) {
+                // PR #783 fix round (auditor L1): `pane spawn`'s own, larger
+                // reply budget — see `SPAWN_ROLE_REPLY_TIMEOUT`'s doc for why
+                // `delegate`'s 5s is too small now that a timeout is a hard
+                // failure rather than a silent success.
+                let line = match dot_agent_deck::hook::send_and_await_spawn_role_reply(&json) {
                     SocketReply::Unreachable => {
                         eprintln!(
                             "Error: could not reach the dot-agent-deck daemon socket, so the \
@@ -1907,13 +1921,19 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                     // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
-                    // spawn` must not read a silent close as success: an
-                    // old/broken daemon cannot possibly have spawned
-                    // anything, so this has to fail loudly instead.
+                    // spawn` must not read a silent close as success — but
+                    // `NoReply` folds several distinct `ReplyReadError`
+                    // causes (see its doc comment above), only one of which
+                    // is "old daemon"; a `DeadlineExpired` here means the
+                    // spawn may still be in flight, so the message below
+                    // stays cause-agnostic rather than asserting "old
+                    // daemon" (PR #783 fix round).
                     SocketReply::NoReply => {
                         eprintln!(
-                            "Error: the running daemon does not support `pane spawn` — \
-                             restart the daemon to pick up the new build."
+                            "Error: the daemon did not answer `pane spawn {role}` in time — \
+                             either it does not support this command (an older build; restart \
+                             the daemon to pick up the new one) or the spawn is still in \
+                             flight. Check the pane before retrying."
                         );
                         return ExitCode::FAILURE;
                     }
