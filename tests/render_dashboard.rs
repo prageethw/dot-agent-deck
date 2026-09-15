@@ -2567,13 +2567,13 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
 /// Scenario: issue #714 — a card whose session is `Working` purely because a
 /// monitored wait is holding it there (`wait_synthetic_working: true`) must
 /// render distinctly from an ordinary Working card: both its badge label
-/// (the `" (observing)"` suffix, matching `daemon status`'s CLI wording) and
-/// its border color (`palette::STATUS_OBSERVING`, not the plain
+/// (the bare `"Observing"` word, issue #784, matching `daemon status`'s CLI
+/// wording) and its border color (`palette::STATUS_OBSERVING`, not the plain
 /// `STATUS_WORKING` green) must reflect the wait promotion. Both assertions
 /// read the observable rendered buffer, per this harness's convention. Also
 /// pins the `status == Working` gate the fix round added: a card that is NOT
 /// `Working` (here `WaitingForInput`) but carries both wait flags must show
-/// neither the badge nor the color, and — the worst-case regression reviewer
+/// neither the label nor the color, and — the worst-case regression reviewer
 /// and auditor called out — must not lose `WaitingForInput`'s own
 /// `Modifier::BOLD` on its status text.
 #[spec("theme/palette/007")]
@@ -2603,8 +2603,8 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
     );
     let rendered = buffer_to_text(&buffer);
     assert!(
-        rendered.contains("observing"),
-        "a wait-promoted Working card's badge must show the \"(observing)\" marker; got:\n{rendered}"
+        rendered.contains("Observing"),
+        "a wait-promoted Working card's label must show the bare \"Observing\" word; got:\n{rendered}"
     );
 
     // Second positive case: the OTHER half of H1's fix — a card that was
@@ -2637,13 +2637,13 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
     );
     let rendered = buffer_to_text(&buffer);
     assert!(
-        rendered.contains("observing"),
-        "a wait-deferred-revert Working card's badge must show the \"(observing)\" marker; \
+        rendered.contains("Observing"),
+        "a wait-deferred-revert Working card's label must show the bare \"Observing\" word; \
          got:\n{rendered}"
     );
 
     // Negative case: both wait flags set, but status is NOT `Working` — the
-    // marker/color must not appear, and `WaitingForInput`'s BOLD must survive.
+    // label/color must not appear, and `WaitingForInput`'s BOLD must survive.
     let mut not_working = palette_session(SessionStatus::WaitingForInput);
     not_working.wait_synthetic_working = true;
     not_working.wait_deferred_revert = true;
@@ -2659,8 +2659,8 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
     );
     let rendered = buffer_to_text(&buffer);
     assert!(
-        !rendered.contains("observing"),
-        "a non-Working card must never show the \"(observing)\" marker even with both wait \
+        !rendered.contains("Observing"),
+        "a non-Working card must never show the \"Observing\" label even with both wait \
          flags set; got:\n{rendered}"
     );
     assert!(
@@ -2686,7 +2686,7 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
 /// `Idle` but whose daemon-side `outstanding_delegation` is armed (a
 /// `delegate` was sent to this pane and no `work-done` has landed yet) must
 /// render distinctly from a genuinely idle card: both its badge label (an
-/// `" (delegated)"` suffix, mirroring the `" (observing)"` convention
+/// `" (delegated)"` suffix, mirroring the observing-marker convention
 /// `theme/palette/007` already pins for a wait-held `Working`) and its border
 /// color (`palette::STATUS_OBSERVING`, reused rather than a new role — see
 /// that constant's doc). A genuinely idle card (no outstanding delegation)
@@ -2751,6 +2751,111 @@ fn palette_008_idle_card_with_outstanding_delegation_shows_delegated_badge_and_c
     assert!(
         !rendered.contains("delegated"),
         "a genuinely idle card must never show the \"(delegated)\" marker; got:\n{rendered}"
+    );
+}
+
+/// Scenario: issue #784. The dashboard card label for a wait-observing
+/// `Working` session renders as the bare word `"Observing"`, dropping the
+/// `"Working "` prefix entirely — `theme/palette/007` now pins the same
+/// current composition (updated alongside this fix); this is a separate,
+/// more focused pin sitting next to it. Exercises both trigger flags
+/// (`wait_synthetic_working` and `wait_deferred_revert`, same union
+/// `theme/palette/007` already covers) and re-asserts the `Working` gate: a
+/// non-`Working` status with both wait flags set must show neither
+/// "Observing" nor the old "(observing)" suffix. The border color
+/// (`palette::STATUS_OBSERVING`) is unaffected by this change and is not
+/// re-pinned here beyond a light non-regression check, since issue #784 is a
+/// text-only change.
+#[spec("theme/palette/009")]
+#[test]
+fn palette_009_wait_promoted_working_card_shows_bare_observing_label() {
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+
+    let mut wait_synthetic = palette_session(SessionStatus::Working);
+    wait_synthetic.wait_synthetic_working = true;
+    let buffer = render_card_to_buffer(
+        &wait_synthetic,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        height,
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Observing"),
+        "a wait_synthetic_working-promoted Working card must render the bare \"Observing\" \
+         label; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Working (observing)"),
+        "the old \"Working (observing)\" composition must be gone once issue #784 lands; \
+         got:\n{rendered}"
+    );
+    let (border_fg, _modifier) = border_style_at_mid(&buffer);
+    assert_eq!(
+        border_fg,
+        dot_agent_deck::palette::STATUS_OBSERVING,
+        "the border color is unaffected by this text-only change and must still resolve \
+         through STATUS_OBSERVING; got {border_fg:?}"
+    );
+
+    // Second positive case: `wait_deferred_revert` alone (the PRD #499
+    // headline flow — the wait landed on an already-`Working` card) must
+    // render identically.
+    let mut deferred = palette_session(SessionStatus::Working);
+    deferred.wait_deferred_revert = true;
+    let buffer = render_card_to_buffer(
+        &deferred,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        height,
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Observing"),
+        "a wait_deferred_revert-promoted Working card must render the bare \"Observing\" \
+         label; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Working (observing)"),
+        "the old \"Working (observing)\" composition must be gone once issue #784 lands; \
+         got:\n{rendered}"
+    );
+
+    // Negative case: both wait flags set, but status is NOT Working — neither
+    // the new "Observing" label nor the old "(observing)" suffix must appear,
+    // and the real WaitingForInput label must still render.
+    let mut not_working = palette_session(SessionStatus::WaitingForInput);
+    not_working.wait_synthetic_working = true;
+    not_working.wait_deferred_revert = true;
+    let buffer = render_card_to_buffer(
+        &not_working,
+        Some("example-agent"),
+        Some(1),
+        density,
+        0,
+        false,
+        width,
+        height,
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        !rendered.contains("Observing") && !rendered.contains("(observing)"),
+        "a non-Working card must never show the \"Observing\" label even with both wait \
+         flags set; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Needs Input"),
+        "the card must still render its real WaitingForInput label unchanged; got:\n{rendered}"
     );
 }
 
