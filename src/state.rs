@@ -8244,6 +8244,22 @@ fn restart_refusal_for_crashed_pane(
 /// `respawn_agent_for_pane`/`respawn_or_recreate_agent_for_pane`
 /// (`dispatch_one_owned`) holds, serializing this restart against a
 /// concurrent `clear = true` delegate on the same pane.
+///
+/// **Locking (issue #789)**: serializing against `dispatch_one_owned` closes
+/// the race on lock ACQUISITION ORDER, but the crash check above still runs
+/// under the short-lived read guard, before this function ever reaches the
+/// dispatch lock — so a `dispatch_one_owned` delegate that wins the dispatch
+/// lock and installs a healthy replacement BETWEEN that read-guard check and
+/// this function's own dispatch-lock acquisition would previously go
+/// unnoticed: this function would still respawn on the strength of the now-
+/// stale early check and kill the just-installed replacement without
+/// `--force`. The crash check is now repeated immediately after
+/// `_dispatch_guard` is acquired, below, before `recreate_identity` is built
+/// or `respawn_or_recreate_agent_for_pane` is called — by the time this
+/// second check runs, no concurrent dispatch on this pane can still be
+/// in-flight (this function now holds the same lock they all serialize on),
+/// so its result is authoritative. `--force` skips both checks identically,
+/// by design: it means "restart regardless of crash state."
 pub async fn handle_restart_role_with_state(
     signal: RestartRoleSignal,
     state: &SharedState,
