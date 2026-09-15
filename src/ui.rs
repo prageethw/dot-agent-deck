@@ -11413,13 +11413,16 @@ fn provision_isolated_clone_or_status(
         branch: &'a str,
     ) -> crate::issue_dispatch_run::LegacyFallbackEligibility<'a> {
         match relative_subpath {
-            Some(_) => crate::issue_dispatch_run::LegacyFallbackEligibility::Nested,
+            Some(_) => crate::issue_dispatch_run::LegacyFallbackEligibility::Nested {
+                own_segment: branch,
+            },
             None => {
                 crate::issue_dispatch_run::LegacyFallbackEligibility::ToplevelWithIdentity(branch)
             }
         }
     }
 
+    let plain_worktree_path = worktree_path;
     let mut effective_worktree_path: std::borrow::Cow<'_, Path> =
         std::borrow::Cow::Borrowed(worktree_path);
     let mut outcome = crate::issue_dispatch_run::provision_isolated_clone_sync_resolved(
@@ -11439,18 +11442,49 @@ fn provision_isolated_clone_or_status(
     // eligibility check) — the exact signal the PRD's Decisions table names
     // as "belongs to a genuinely different pick". Every OTHER rejection
     // (`Stranger`, `AncestryMismatch`, `AncestryUnverifiable`, `Unhealthy`,
-    // `Contested`) is left exactly as before: none of them is proof of a
-    // genuinely different DECK-created pick colliding on the same plain
-    // segment, so retrying under a disambiguated name would risk silently
-    // working around a real problem (an unrelated directory in the way, a
-    // corrupt clone, an in-flight race) rather than resolving an actual
-    // naming collision.
-    if matches!(
-        outcome,
-        Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Rejected(
-            crate::issue_dispatch_run::ResumeRejection::NameCollision
-        ))
-    ) {
+    // `Contested`, and PRD fork#777 fix round's own
+    // `LegacyNestedIdentityUnverifiable` — see that variant's doc comment)
+    // is left exactly as before: none of them is proof of a genuinely
+    // different DECK-created pick colliding on the same plain segment, so
+    // retrying under a disambiguated name would risk silently working
+    // around a real problem (an unrelated directory in the way, a corrupt
+    // clone, an in-flight race, or — the fork#777 fix round's own addition
+    // — an unverifiable identity that might be this very pick's own prior
+    // workspace) rather than resolving an actual naming collision.
+    //
+    // PRD fork#777 fix round (reviewer B2 / auditor A3, BLOCKER):
+    // `disambiguate_workspace_segment(_, None)` is a documented no-op — for
+    // a TOPLEVEL pick (`relative_subpath` is `None`), retrying would
+    // re-attempt the exact same path this call just refused, losing this
+    // call's own registry claim to itself and degrading an accurate
+    // `NameCollision` refusal into a misleading `Contested` one (plus a
+    // narrow same-path TOCTOU window across the released-then-reacquired
+    // attach lock). Guarding on `relative_subpath.is_some()` keeps the
+    // retry meaningful — for a nested pick the disambiguated path is always
+    // genuinely different — and leaves a toplevel collision as the direct,
+    // accurate refusal it already was.
+    if relative_subpath.is_some()
+        && matches!(
+            outcome,
+            Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Rejected(
+                crate::issue_dispatch_run::ResumeRejection::NameCollision
+            ))
+        )
+    {
+        // PRD fork#777 fix round (reviewer B1 / auditor A2, BLOCKER):
+        // `resume_existing_isolated_clone` registers `plain_worktree_path`
+        // in the process-local `resumed_isolated_clones()` registry before
+        // the creator comparison, and deliberately leaves that entry
+        // claimed on `NameCollision` (see that function's own doc comment
+        // for why). This call is about to abandon `plain_worktree_path`
+        // entirely in favor of the disambiguated path below, so release it
+        // NOW rather than leaving it to a caller that only ever released
+        // the PLAIN path — which left the disambiguated path's own
+        // registration (inserted below, if this retry resumes an existing
+        // disambiguated clone) leaked forever, permanently `Contested`-ing
+        // the third and later opens of the same collided workspace within
+        // this process.
+        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(plain_worktree_path);
         let disambiguated_worktree_path = resolve_workspace_path(
             resolved_root_dir,
             &disambiguate_workspace_segment(branch, relative_subpath),
@@ -11465,6 +11499,20 @@ fn provision_isolated_clone_or_status(
         effective_worktree_path = std::borrow::Cow::Owned(disambiguated_worktree_path);
     }
     let worktree_path: &Path = effective_worktree_path.as_ref();
+    // PRD fork#777 fix round (reviewer B1 / auditor A2, BLOCKER): release
+    // the FINAL, effective path's own registry claim too, on every outcome
+    // — this makes the function self-contained with respect to
+    // `resumed_isolated_clones()`: by the time this call returns, no entry
+    // it created (on either the plain or, if the retry fired, the
+    // disambiguated path) still outlives it. A real caller's own
+    // `ClaimOrchestrationName` round trip already durably established this
+    // orchestration as the sole live user of the resolved directory before
+    // provisioning ever ran, so this registry's brief defense-in-depth job
+    // is done the moment provisioning returns — see
+    // `resumed_isolated_clones`'s own doc comment (`src/issue_dispatch_run.rs`).
+    // Callers no longer need — and must not perform — their own release
+    // call.
+    crate::issue_dispatch_run::release_resumed_isolated_clone_registration(worktree_path);
     match outcome {
         Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
             marker_warning,
@@ -12534,13 +12582,33 @@ fn dispatch_action(
                     // reproduces the identical `worktree_path` and
                     // `relative_subpath`, and therefore the identical
                     // `creator`.
-                    let creator = orchestration_creator_string(&{
+                    //
+                    // PRD fork#777 fix round (auditor A1, BLOCKER): the raw
+                    // joined path above is unbounded, and
+                    // `orchestration_creator_string` truncates whatever
+                    // exceeds 200 characters — two different nested picks
+                    // whose joined seeds agree on their first ~186
+                    // characters would otherwise compute byte-identical
+                    // `creator` strings once truncated, defeating the very
+                    // comparison that keeps them from silently sharing one
+                    // physical clone. `spawn_pane_creator_identity_seed`
+                    // front-loads a fixed-length digest of the structured
+                    // inputs so truncation can never drop the bytes that
+                    // keep two colliding picks distinguishable — see its
+                    // own doc comment.
+                    let always_folded_worktree_path = {
                         let mut creator_seed_path = workspace_resolution.worktree_path.clone();
                         if let Some(rel) = &workspace_resolution.relative_subpath {
                             creator_seed_path = creator_seed_path.join(rel);
                         }
-                        creator_seed_path.display().to_string()
-                    });
+                        creator_seed_path
+                    };
+                    let creator = orchestration_creator_string(&spawn_pane_creator_identity_seed(
+                        &workspace_resolution.resolved_root_dir,
+                        workspace_resolution.relative_subpath.as_deref(),
+                        &segment,
+                        &always_folded_worktree_path,
+                    ));
                     let orchestration_claim_token = mint_orchestration_claim_token();
                     // `workspace_resolution.resolved_dir()` doesn't exist on
                     // disk yet (provisioning hasn't run), so canonicalizing
@@ -12597,9 +12665,22 @@ fn dispatch_action(
                     // different directory, never silently corrupt anything,
                     // and it restores the "used to work" behavior for this
                     // directory rather than hard-failing it.
+                    // PRD fork#777 fix round (reviewer M2): `orchestration_claim_cwd`
+                    // itself (not just the `_for_request` copy below) is kept
+                    // alive past this point — the `OrchestrationSnapshot`
+                    // capture further down persists it verbatim as
+                    // `claim_cwd`, so the daemon-empty restore path can
+                    // reuse this EXACT logical (pre-collision-disambiguation)
+                    // value for its own claim, rather than recomputing one
+                    // from the physical `saved_pane.dir` — see
+                    // `restore_claim_cwd_for`'s own doc comment for why that
+                    // recomputation can diverge from this value after a
+                    // collision retry, and why that divergence reopens fork
+                    // issue #607's shared-clone hazard after a daemon
+                    // restart.
                     let orchestration_claim_cwd_for_request =
                         crate::agent_pty::is_valid_orchestration_cwd(&orchestration_claim_cwd)
-                            .then_some(orchestration_claim_cwd);
+                            .then(|| orchestration_claim_cwd.clone());
                     let claim_result = send_daemon_request_blocking_with_timeout(
                         &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
                             name: orchestration_claim_name.clone(),
@@ -12944,6 +13025,26 @@ fn dispatch_action(
                                         // restore can pass it through rather
                                         // than fabricate or drop it.
                                         owner: Some(creator.clone()),
+                                        // PRD fork#777 fix round (reviewer
+                                        // M2): the exact LOGICAL claim `cwd`
+                                        // this launch's own pre-provisioning
+                                        // `ClaimOrchestrationName` request
+                                        // sent (or `None` when that value
+                                        // itself degraded to the daemon's
+                                        // wildcard semantics — see
+                                        // `orchestration_claim_cwd_for_request`'s
+                                        // own comment) — carried forward so
+                                        // a future daemon-empty restore
+                                        // reuses THIS value rather than
+                                        // recomputing one from wherever this
+                                        // orchestration's clone physically
+                                        // ended up (see
+                                        // `restore_claim_cwd_for`'s own doc
+                                        // comment).
+                                        claim_cwd: crate::agent_pty::is_valid_orchestration_cwd(
+                                            &orchestration_claim_cwd,
+                                        )
+                                        .then_some(orchestration_claim_cwd.clone()),
                                     }),
                                 },
                             );
@@ -14058,6 +14159,73 @@ fn orchestration_creator_string(identity_seed: &str) -> String {
     sanitized
 }
 
+/// PRD fork#777 fix round (auditor A1, BLOCKER): the `Action::SpawnPane`
+/// creator seed, front-loaded with a FIXED-LENGTH digest so
+/// [`crate::worktree_reclaim::sanitize_marker_creator`]'s 200-character
+/// truncation can never collapse two genuinely different nested picks onto
+/// the identical `creator` identity.
+///
+/// Naming (`resolve_orchestration_workspace`) is collision-UNAWARE by
+/// design under this PRD — two different nested picks that share a
+/// segment now resolve to the IDENTICAL physical `clone_dir`, and
+/// `resume_existing_isolated_clone`'s `stored_creator !=
+/// sanitize_marker_creator(creator)` byte comparison is the ONLY thing
+/// keeping them from silently sharing that clone once both land on it. A
+/// bare `<plain worktree path>/<relative subpath>` seed is unbounded —
+/// `sanitize_marker_creator` truncates whatever exceeds 200 characters, so
+/// two picks whose seeds agree on their first ~186 characters (easily
+/// reached in an ordinary deep monorepo layout, once the fixed
+/// `"orchestration:"` prefix is accounted for) and differ only afterward
+/// produce byte-identical truncated `creator` strings — the second pick
+/// then silently `Resume`s onto the first pick's live clone instead of
+/// being refused. This is the exact hazard fork issue #763's fix round
+/// closed for the (since-reverted) typed-Worktree-slug shape via a
+/// digest-fronted seed; PR #779 (PRD fork#777) reopened its precondition
+/// (two picks sharing one physical `clone_dir`) without restoring the
+/// mitigation, deleted along with fork#760 Part A by commit `8d1c3332`.
+///
+/// Digests `(resolved_root_dir, relative_subpath, segment)` — the
+/// STRUCTURED inputs that determine physical placement — with `fnv1a64`
+/// (fixed constants, stable across Rust versions/builds/platforms, since
+/// this value is compared against a marker PERSISTED to disk, possibly by
+/// a different process/build) and places the 16 hex digits at the FRONT of
+/// the seed, right after [`orchestration_creator_string`]'s own
+/// `"orchestration:"` prefix once that function adds it, so truncation —
+/// if it ever fires — can only ever drop the (now redundant) folded-path
+/// tail, never the digest bytes that keep two colliding picks
+/// distinguishable.
+///
+/// A no-op (returns `always_folded_worktree_path` unchanged, exactly as
+/// `Action::SpawnPane` computed it before this fix) whenever there is no
+/// relative subpath: a toplevel pick's `worktree_path` already uniquely
+/// determines its own physical clone (naming refuses to retry a toplevel
+/// collision at all — see `provision_isolated_clone_or_status`'s guard on
+/// `relative_subpath.is_some()`), so two DIFFERENT toplevel picks can never
+/// share a `clone_dir` in the first place and the truncation hazard this
+/// function exists to close cannot arise for them.
+fn spawn_pane_creator_identity_seed(
+    resolved_root_dir: &Path,
+    relative_subpath: Option<&Path>,
+    segment: &str,
+    always_folded_worktree_path: &Path,
+) -> String {
+    match relative_subpath.filter(|rel| !rel.as_os_str().is_empty()) {
+        Some(rel) => {
+            let digest = crate::platform::lock::fnv1a64(
+                format!(
+                    "{}\u{0}{}\u{0}{}",
+                    resolved_root_dir.display(),
+                    rel.display(),
+                    segment,
+                )
+                .as_bytes(),
+            );
+            format!("{digest:016x}:{}", always_folded_worktree_path.display())
+        }
+        None => always_folded_worktree_path.display().to_string(),
+    }
+}
+
 /// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
 /// orchestration metadata on the daemon-empty restore path.
 ///
@@ -14173,6 +14341,47 @@ fn resolve_orchestration_for_restore(
     // a saved cursor that differs from the config default is preserved on
     // restore.
     Ok((orch, snap.start_role_index))
+}
+
+/// PRD fork#777 fix round (reviewer M2, BLOCKER) — the daemon-empty restore
+/// path's `ClaimOrchestrationName` claim `cwd`.
+///
+/// Before this fix, restore always recomputed the claim `cwd` from
+/// `saved_pane.dir` — the PHYSICAL directory this orchestration's clone
+/// actually occupies. Live spawn's own pre-provisioning claim, by contrast,
+/// computes its `cwd` from the LOGICAL pick identity (toplevel + segment +
+/// relative subpath) BEFORE provisioning has run, so it cannot know yet
+/// whether this pick will land on the plain path or — after a genuine
+/// collision — a disambiguated sibling. For an orchestration that never
+/// collided the two derivations agree (the physical path IS the plain,
+/// logical one), so this divergence was invisible until a collision
+/// actually happened.
+///
+/// For a DISAMBIGUATED orchestration, though, `saved_pane.dir` names the
+/// disambiguated path while the ORIGINAL live claim named the plain one —
+/// two different strings. `claim_orchestration_name`'s daemon-side conflict
+/// guard (`src/agent_pty.rs`) is a byte-equality comparison on this exact
+/// string, so after a daemon restart, restore re-claiming the physical
+/// (disambiguated) path no longer byte-matches what a FRESH, still-plain,
+/// still-colliding pick would claim for the identical logical identity —
+/// letting the daemon grant both claims and reopening fork issue #607's
+/// shared-clone hazard specifically across a restart.
+///
+/// The fix: reuse [`config::OrchestrationSnapshot::claim_cwd`] — the exact
+/// logical value the ORIGINAL live spawn claimed, persisted verbatim at
+/// creation time (`Action::SpawnPane`'s own snapshot-capture site) —
+/// instead of recomputing one from the physical `saved_dir`. Only a
+/// snapshot written before this field existed (`None`) falls back to the
+/// pre-fix, physical-dir-based derivation; that cannot regress past what
+/// restore already did before this fix, and a re-saved snapshot picks up
+/// `claim_cwd` on its very next write regardless.
+fn restore_claim_cwd_for(orch_snap: &config::OrchestrationSnapshot, saved_dir: &str) -> String {
+    orch_snap.claim_cwd.clone().unwrap_or_else(|| {
+        std::path::Path::new(saved_dir)
+            .canonicalize()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| saved_dir.to_string())
+    })
 }
 
 /// PRD #227 M2: whether this process pushed `KeyboardEnhancementFlags`.
@@ -15497,13 +15706,14 @@ pub fn run_tui(
                                         )
                                     });
                                 let restore_claim_token = mint_orchestration_claim_token();
-                                // PRD fork#603: same canonicalize-then-fallback
-                                // treatment as the live spawn path, adapted for
-                                // `saved_pane.dir`'s `String` type.
-                                let restore_claim_cwd = std::path::Path::new(&saved_pane.dir)
-                                    .canonicalize()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|_| saved_pane.dir.clone());
+                                // PRD fork#777 fix round (reviewer M2): reuse
+                                // the LOGICAL claim `cwd` this orchestration
+                                // was created with, when it was persisted —
+                                // see `restore_claim_cwd_for`'s own doc
+                                // comment for why that is no longer always
+                                // the same as `saved_pane.dir`.
+                                let restore_claim_cwd =
+                                    restore_claim_cwd_for(orch_snap, &saved_pane.dir);
                                 let restore_claim_result = send_daemon_request_blocking_with_timeout(
                                     &crate::daemon_protocol::AttachRequest::ClaimOrchestrationName {
                                         name: restore_claim_name.clone(),
@@ -44040,36 +44250,38 @@ mod tests {
         );
     }
 
-    /// Scenario: fork issue #766 fix round 2 (reviewer M3), updated for PRD
-    /// fork#777. A nested pick (a picked directory under, not equal to, its
-    /// git toplevel) must never SILENTLY ADOPT an existing marker via the
-    /// legacy-creator-format fallback, even in the adversarial case where an
-    /// existing marker's stored `name=`/`creator=` would satisfy the
-    /// fallback's caller-identity check exactly, were it ever reachable —
-    /// proving `provision_isolated_clone_or_status`'s own
+    /// Scenario: fork issue #766 fix round 2 (reviewer M3), then PRD
+    /// fork#777's own fix round (reviewer M1 / auditor's own reasoning
+    /// about this test). A nested pick (a picked directory under, not equal
+    /// to, its git toplevel) must never SILENTLY ADOPT an existing marker
+    /// via the legacy-creator-format fallback, even in the adversarial case
+    /// where an existing marker's stored `name=`/`creator=` would satisfy
+    /// the fallback's caller-identity check exactly, were it ever reachable
+    /// — proving `provision_isolated_clone_or_status`'s own
     /// `Some(relative_subpath) => LegacyFallbackEligibility::Nested` wiring
-    /// (not just the enum's internal logic) genuinely gates it: deleting
-    /// that gate, or wiring `Some` to `ToplevelWithIdentity` by mistake,
-    /// would turn this red (the second call would then wrongly `Resume`
-    /// the FIRST clone instead of disambiguating).
+    /// (not just the enum's internal logic) genuinely gates it.
     ///
-    /// Before PRD fork#777, this refusal (`NameCollision`) was the call's
-    /// FINAL outcome — provisioning simply failed. Under fork#777, a
-    /// `NameCollision` refusal at the plain path is no longer final: per
-    /// the PRD's own Design §2 ("Different identity → ... retry ... under
-    /// the disambiguated name"), which draws no nested/legacy carve-out,
-    /// `provision_isolated_clone_or_status` now recovers by disambiguating
-    /// and provisioning a SEPARATE clone for the second, mismatched caller
-    /// — exactly as it would for any other genuine collision (see
-    /// `workspace_048`). This test now pins that the underlying #766 M3
-    /// safety property survives that change intact: the second caller's
-    /// disambiguated clone is owned by ITS OWN identity, never silently
-    /// inheriting the legacy marker, and the original legacy-marked clone
-    /// is left completely untouched.
+    /// PRD fork#777's FIRST pass at this contract (since corrected) let
+    /// provisioning recover from this refusal exactly like an ordinary
+    /// `NameCollision` — disambiguating and silently creating a brand-new,
+    /// EMPTY clone for the second, mismatched caller. That is unsound for
+    /// this specific case: the legacy marker's `name=` equals this second
+    /// caller's own segment too, so the two are genuinely ambiguous — this
+    /// might be the SAME pick's own earlier workspace (written before
+    /// today's subpath-aware marker format), which the silent fork would
+    /// then abandon, possibly with uncommitted work, with nothing
+    /// surfacing that it happened. `resume_existing_isolated_clone` now
+    /// refuses this specific, ambiguous sub-case as its own distinguishable
+    /// `ResumeRejection::LegacyNestedIdentityUnverifiable` rather than the
+    /// ordinary `NameCollision` — `provision_isolated_clone_or_status`'s
+    /// retry only ever fires for `NameCollision`, so this refusal is final,
+    /// matching the spirit of the original pre-fork#777 loud refusal (the
+    /// exact wording differs — it now names the specific ambiguity rather
+    /// than reusing `NameCollision`'s generic "different creator" text).
+    /// The original legacy-marked clone is left completely untouched.
     #[spec("orchestration/workspace/044")]
     #[test]
-    fn workspace_044_legacy_creator_marker_mismatch_disambiguates_a_nested_pick_instead_of_resuming()
-     {
+    fn workspace_044_legacy_nested_identity_unverifiable_refuses_rather_than_silently_forking() {
         let tmp = tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         init_git_repo(&repo);
@@ -44142,17 +44354,16 @@ mod tests {
         std::fs::write(&marker_path, &rewritten)
             .expect("overwrite provenance marker with legacy creator");
 
-        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(&worktree_path);
-
         // Reopen the IDENTICAL nested pick -- ancestry matches (same repo),
         // the stored creator is legacy-shaped AND matches this caller's own
-        // identity exactly, so the ONLY thing standing between this and an
-        // incorrect resume is `relative_subpath.is_some()` structurally
-        // mapping to `LegacyFallbackEligibility::Nested`. Fork#777: that
-        // gate still fires internally -- the plain path is still refused as
-        // `NameCollision` -- but the caller no longer surfaces that as a
-        // final error; it disambiguates and provisions a SEPARATE clone for
-        // this second, mismatched identity instead.
+        // segment exactly, so this is precisely the ambiguous case
+        // `ResumeRejection::LegacyNestedIdentityUnverifiable` exists to
+        // catch: the ONLY thing standing between this and an incorrect
+        // resume is `relative_subpath.is_some()` structurally mapping to
+        // `LegacyFallbackEligibility::Nested`, and the marker's own `name=`
+        // matches this caller's own segment, so it is genuinely ambiguous
+        // whether this is the same pick from an older build or a
+        // coincidentally-same-segment different one.
         let result = provision_isolated_clone_or_status(
             &toplevel,
             Some(prefix.as_path()),
@@ -44160,53 +44371,38 @@ mod tests {
             &segment,
             "some-other-placeholder-creator",
         );
-        let (resumed_dir, ..) = result.expect(
-            "fork#777: a nested pick refused via the legacy-fallback gate is an ordinary \
-             NameCollision like any other -- provisioning must recover by disambiguating and \
-             creating a SEPARATE clone for the second identity, not refuse the whole launch",
+        let error = match result {
+            Err(e) => e,
+            Ok(ok) => panic!(
+                "fork#777 fix round (reviewer M1): a nested pick whose own segment matches a \
+                 legacy-shaped marker's stored name= is genuinely ambiguous (it might be this \
+                 exact pick's own earlier workspace) and must be refused OUTRIGHT, not \
+                 silently disambiguated into a brand-new, empty clone that abandons the \
+                 existing workspace -- got Ok({ok:?})"
+            ),
+        };
+        assert!(
+            error.contains("ownership record is in an old format"),
+            "the refusal must specifically be `LegacyNestedIdentityUnverifiable` (proving the \
+             ambiguous-identity gate is what refused it, not some other failure) -- got \
+             {error:?}"
         );
 
-        let expected_disambiguated_path = resolve_workspace_path(
+        // Nothing may be created at the disambiguated path either -- this
+        // is a final refusal, not a disambiguate-and-retry outcome.
+        let disambiguated_path = resolve_workspace_path(
             &toplevel,
             &disambiguate_workspace_segment(&segment, Some(prefix.as_path())),
         );
         assert!(
-            PathBuf::from(&resumed_dir).starts_with(&expected_disambiguated_path),
-            "fork#777: the second, mismatched-identity pick must land on the disambiguated \
-             form {expected_disambiguated_path:?}, not the original legacy-marked clone -- got \
-             {resumed_dir:?}"
-        );
-        assert!(
-            !PathBuf::from(&resumed_dir).starts_with(&worktree_path),
-            "fork#777: the second pick must NOT reuse/overwrite the original legacy-marked \
-             clone at {worktree_path:?} -- got {resumed_dir:?}"
-        );
-
-        // fork issue #766 M3's underlying safety property survives intact:
-        // the disambiguated clone is owned by the SECOND caller's own
-        // identity, never silently inheriting the legacy marker's
-        // `creator=`.
-        let disambiguated_marker_content = std::fs::read_to_string(
-            crate::issue_dispatch_run::isolated_clone_provenance_path(&expected_disambiguated_path),
-        )
-        .expect("the disambiguated clone's own provenance marker must exist");
-        assert_eq!(
-            crate::issue_dispatch_run::isolated_clone_provenance_field(
-                &disambiguated_marker_content,
-                "creator"
-            )
-            .as_deref(),
-            Some(
-                crate::worktree_reclaim::sanitize_marker_creator("some-other-placeholder-creator")
-                    .as_str()
-            ),
-            "fork issue #766 M3: the disambiguated clone must be owned by the SECOND caller's \
-             own identity, never silently inheriting the legacy marker's creator"
+            !disambiguated_path.exists(),
+            "fork#777 fix round: a final refusal must not create the disambiguated sibling \
+             directory at all -- found one at {disambiguated_path:?}"
         );
 
         // The ORIGINAL legacy-marked clone must remain completely
-        // untouched -- never silently adopted by the second, mismatched
-        // caller.
+        // untouched -- never silently adopted, and never abandoned for a
+        // fresh clone either.
         let original_marker_content =
             std::fs::read_to_string(&marker_path).expect("original provenance marker still exists");
         assert_eq!(
@@ -44217,7 +44413,7 @@ mod tests {
             .as_deref(),
             Some(legacy_creator.as_str()),
             "fork issue #766 M3: the original legacy-marked clone must remain untouched by the \
-             second, colliding caller's disambiguated provisioning"
+             second, colliding caller's refused provisioning attempt"
         );
     }
 
@@ -45052,14 +45248,23 @@ mod tests {
         );
     }
 
-    /// Scenario: PRD fork#777 M1(d). Repeating the SECOND (genuinely
-    /// colliding, now disambiguated) pick from `workspace_048` again --
-    /// same colliding Name, same subdirectory -- must resume the
-    /// disambiguated folder it already provisioned, not disambiguate a
-    /// second time (e.g. double-prefixing) nor error. Shares
-    /// `workspace_048`'s setup shape; currently fails at the same
-    /// naming-layer assertion since `resolve_orchestration_workspace`
-    /// already disambiguates every nested pick unconditionally today.
+    /// Scenario: PRD fork#777 M1(d), extended by the fix round (reviewer B1
+    /// / auditor A2, BLOCKER). Repeating the SECOND (genuinely colliding,
+    /// now disambiguated) pick from `workspace_048` again -- same colliding
+    /// Name, same subdirectory -- must resume the disambiguated folder it
+    /// already provisioned, not disambiguate a second time (e.g.
+    /// double-prefixing) nor error, and this must keep working for a THIRD
+    /// (and later) repeat too. `provision_isolated_clone_or_status` now
+    /// releases every `resumed_isolated_clones()` registry claim it creates
+    /// itself, on every outcome -- for both the plain attempt (abandoned as
+    /// soon as a retry fires) and the final, effective path (released
+    /// unconditionally before returning) -- so this test calls it directly
+    /// with NO manual release call of its own, exactly as the one
+    /// production caller (`Action::SpawnPane`) now does. Before this fix
+    /// round, only the plain path was ever released by anyone; the
+    /// disambiguated path's registration leaked after the SECOND resume,
+    /// permanently `Contested`-ing the third and any later open within the
+    /// same process.
     #[spec("orchestration/workspace/049")]
     #[test]
     fn workspace_049_repeat_of_a_disambiguated_pick_resumes_the_disambiguated_folder() {
@@ -45114,18 +45319,6 @@ mod tests {
             "creator-a",
         )
         .expect("the first pick must provision cleanly");
-        // fork#777 fix round: a real caller (`Action::SpawnPane`, `src/ui.rs`
-        // around line 12704) releases this process-local resume-registry
-        // claim on `workspace_resolution.worktree_path` immediately after
-        // EVERY `provision_isolated_clone_or_status` call, on every outcome
-        // -- this test calls that function directly, bypassing the real
-        // caller, so it must replicate the same release or a later call
-        // targeting the identical plain path incorrectly finds it still
-        // claimed (see `resumed_isolated_clones`'s doc comment,
-        // `src/issue_dispatch_run.rs`).
-        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
-            &resolution_a.worktree_path,
-        );
 
         let resolution_b = resolve_orchestration_workspace(&team_b, &segment_b);
         let (resolved_dir_b_first, ..) = provision_isolated_clone_or_status(
@@ -45138,19 +45331,6 @@ mod tests {
         .expect(
             "fork#777: setup -- the second, colliding pick must disambiguate (see \
              workspace_048)",
-        );
-        // This first colliding attempt initially targets the SAME plain
-        // path as `resolution_a` (naming stays collision-unaware), loses
-        // the plain path's resume-registry claim to a creator mismatch
-        // (`ResumeRejection::NameCollision`, deliberately left claimed --
-        // see `resume_existing_isolated_clone`'s doc comment), THEN
-        // disambiguates and succeeds at a different path. Release the
-        // plain path's leaked claim exactly as the real caller would, or
-        // the repeat pick below (which also starts at the plain path)
-        // incorrectly finds it Contested rather than reaching the
-        // creator-mismatch check that triggers disambiguation again.
-        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
-            &resolution_b.worktree_path,
         );
 
         // Repeat the SAME second pick: identical colliding Name, identical
@@ -45173,9 +45353,6 @@ mod tests {
             "fork#777: repeating the identical, already-disambiguated pick must resume \
              cleanly, not error nor disambiguate a second time",
         );
-        crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
-            &resolution_b_repeat.worktree_path,
-        );
 
         assert_eq!(
             PathBuf::from(&resolved_dir_b_repeat),
@@ -45185,13 +45362,46 @@ mod tests {
              {resolved_dir_b_repeat:?} vs {resolved_dir_b_first:?}"
         );
 
+        // PRD fork#777 fix round (reviewer B1 / auditor A2, BLOCKER): a
+        // THIRD open of the same collided workspace, within the same
+        // process. Before this fix round, only the PLAIN path's registry
+        // claim was ever released by anyone (by the real caller,
+        // `Action::SpawnPane`) -- the disambiguated path's own claim,
+        // inserted by the SECOND open's `Resumed` outcome above, leaked
+        // forever, so this third open would lose the registry race to its
+        // own leaked entry and be refused as `Contested` ("another request
+        // just resumed it first -- try again", advice that could never
+        // succeed since nothing else was ever racing it). Now that
+        // `provision_isolated_clone_or_status` releases every claim it
+        // creates itself before returning, this must keep succeeding
+        // indefinitely.
+        let resolution_b_repeat2 = resolve_orchestration_workspace(&team_b, &segment_b);
+        let (resolved_dir_b_repeat2, ..) = provision_isolated_clone_or_status(
+            &resolution_b_repeat2.resolved_root_dir,
+            resolution_b_repeat2.relative_subpath.as_deref(),
+            &resolution_b_repeat2.worktree_path,
+            &segment_b,
+            "creator-b",
+        )
+        .expect(
+            "fork#777 fix round (reviewer B1 / auditor A2, BLOCKER): a THIRD open of the same \
+             collided, disambiguated workspace must keep resuming cleanly -- a leaked registry \
+             claim from the second open would incorrectly refuse this as Contested",
+        );
+        assert_eq!(
+            PathBuf::from(&resolved_dir_b_repeat2),
+            PathBuf::from(&resolved_dir_b_first),
+            "fork#777: the third open must resume the exact same disambiguated folder as the \
+             first and second -- got {resolved_dir_b_repeat2:?} vs {resolved_dir_b_first:?}"
+        );
+
         let siblings = sibling_workspace_dir_names(&repo);
         assert_eq!(
             siblings.len(),
             2,
             "fork#777: exactly two sibling workspace directories must exist -- the \
              plain-named first pick and the ONE disambiguated second pick, not a third one \
-             from re-disambiguating the repeat -- found {siblings:?}"
+             from re-disambiguating any of the repeats -- found {siblings:?}"
         );
     }
 
@@ -45309,6 +45519,73 @@ mod tests {
             "fork#777: exactly two independent sibling workspace directories must exist -- \
              the legacy-shaped one (unmigrated) and the fresh plain-named one -- found \
              {siblings:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#777 fix round (reviewer B2 / auditor A3,
+    /// BLOCKER). For a TOPLEVEL pick (`relative_subpath == None`),
+    /// `disambiguate_workspace_segment(_, None)` is a documented no-op, so
+    /// retrying a `NameCollision` at the plain path would re-attempt the
+    /// EXACT SAME path this call just refused -- losing this call's own
+    /// registry claim to itself and degrading the accurate, actionable
+    /// `NameCollision` refusal into a misleading `Contested` one ("try
+    /// again", advice that can never succeed). Two DIFFERENT typed Names
+    /// that sanitize to the identical segment (`workspace_026`'s own
+    /// colliding-Name shape), both picked directly at the SAME git
+    /// toplevel, must refuse the second open OUTRIGHT with the accurate
+    /// `NameCollision` wording -- never `Contested`'s, and never create a
+    /// disambiguated sibling directory (there is nothing to disambiguate
+    /// to, per `disambiguate_workspace_segment`'s own no-op doc comment).
+    #[spec("orchestration/workspace/051")]
+    #[test]
+    fn workspace_051_toplevel_collision_is_not_retried_and_surfaces_the_accurate_refusal() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+
+        let segment_a = sanitize_workspace_segment("fix/544");
+        let segment_b = sanitize_workspace_segment("fix-544");
+        assert_eq!(
+            segment_a, segment_b,
+            "setup: sanity -- see workspace_026 for the same colliding-segment shape"
+        );
+
+        let worktree_path = resolve_workspace_path(&repo, &segment_a);
+        provision_isolated_clone_or_status(&repo, None, &worktree_path, &segment_a, "creator-a")
+            .expect("the first toplevel pick must provision cleanly");
+
+        let result = provision_isolated_clone_or_status(
+            &repo,
+            None,
+            &worktree_path,
+            &segment_b,
+            "creator-b",
+        );
+        let error = match result {
+            Err(e) => e,
+            Ok(ok) => panic!(
+                "fork#777 fix round (reviewer B2 / auditor A3, BLOCKER): a TOPLEVEL collision \
+                 must be refused outright, never silently retried at the identical path -- got \
+                 Ok({ok:?})"
+            ),
+        };
+        assert!(
+            error.contains("a different orchestration already opened"),
+            "the refusal must be the accurate `NameCollision` wording, not `Contested`'s \
+             misleading \"try again\" (which can never succeed for a same-path retry) -- got \
+             {error:?}"
+        );
+        assert!(
+            !error.contains("try again"),
+            "the refusal must not be `Contested`'s wording -- got {error:?}"
+        );
+
+        let siblings = sibling_workspace_dir_names(&repo);
+        assert_eq!(
+            siblings.len(),
+            1,
+            "a final refusal for a toplevel collision must not create any disambiguated \
+             sibling directory -- found {siblings:?}"
         );
     }
 
@@ -45448,6 +45725,310 @@ mod tests {
         );
     }
 
+    /// Scenario: PRD fork#777 fix round (auditor A1, BLOCKER) — pure unit
+    /// test of the identity-computation property this fix relies on,
+    /// WITHOUT constructing any real filesystem path longer than 200
+    /// characters. Two earlier attempts at this test (fork issue #763's own
+    /// fix round) tried to force the adversarial length through a real
+    /// on-disk directory tree and both failed `build-windows` in CI:
+    /// Windows' own historical `MAX_PATH` (~260 characters, no long-path
+    /// opt-in assumed) makes a genuinely long real filesystem path a losing
+    /// fight regardless of how the padding is spread across components.
+    /// Redirect (this attempt, adapted for PRD fork#777's naming change):
+    /// the property that actually matters —
+    /// [`spawn_pane_creator_identity_seed`] producing genuinely distinct
+    /// outputs for two different `(resolved_root_dir, relative_subpath)`
+    /// inputs even when the combined pre-truncation string would exceed 200
+    /// characters — is a pure string/hash computation with no filesystem
+    /// access of its own, so it needs no real directory, no real git
+    /// repository, and no real file I/O to test at all.
+    ///
+    /// Asserts two things: first, that the adversarial precondition
+    /// genuinely holds for the OLD (pre-fix) derivation — the two synthetic
+    /// picks' `orchestration:` + always-folded-path seeds agree on their
+    /// first 200 characters, i.e. would have collided after
+    /// `sanitize_marker_creator`'s truncation; second, that
+    /// [`spawn_pane_creator_identity_seed`]'s digest-fronted seed, run
+    /// through the same [`orchestration_creator_string`] sanitization,
+    /// produces two DISTINCT `creator` identities for those same two
+    /// inputs.
+    #[spec("orchestration/worktree/031")]
+    #[test]
+    fn worktree_031_creator_identity_seed_survives_the_200_char_truncation_cap_for_two_synthetic_long_picks()
+     {
+        const SEGMENT: &str = "features";
+        // A long but entirely SYNTHETIC path -- no real directory needs to
+        // exist on disk for this test, since both
+        // `spawn_pane_creator_identity_seed` and
+        // `orchestration_creator_string` are pure string/hash computations.
+        let long_root = PathBuf::from(format!("/{}/monorepo", "d".repeat(200)));
+        let subpath_a = Path::new("team-a/proj");
+        let subpath_b = Path::new("team-b/proj");
+
+        // PRD fork#777: naming stays collision-UNAWARE, so both picks'
+        // PLAIN worktree path is identical -- the join only happens in the
+        // creator seed, per `Action::SpawnPane`'s own construction (see its
+        // `always_folded_worktree_path` local).
+        let plain_worktree_path = resolve_workspace_path(&long_root, SEGMENT);
+        let always_folded_a = plain_worktree_path.join(subpath_a);
+        let always_folded_b = plain_worktree_path.join(subpath_b);
+
+        // The OLD (pre-fix) derivation: `orchestration:` + the
+        // always-folded path, with no digest -- built with the exact same
+        // shared primitives production uses, not a hand-typed
+        // reconstruction, so this genuinely proves the adversarial
+        // precondition rather than assuming it.
+        let old_seed_a = format!("orchestration:{}", always_folded_a.display());
+        let old_seed_b = format!("orchestration:{}", always_folded_b.display());
+        const MARKER_CREATOR_MAX_CHARS: usize = 200;
+        assert!(
+            old_seed_a.chars().count() > MARKER_CREATOR_MAX_CHARS,
+            "fixture setup failed to reach the adversarial precondition -- the OLD (pre-fix) \
+             creator seed for team-a/proj is only {} characters, need more than \
+             {MARKER_CREATOR_MAX_CHARS} for `sanitize_marker_creator` to even truncate it: \
+             {old_seed_a:?}",
+            old_seed_a.chars().count()
+        );
+        let old_truncated_a: String = old_seed_a.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
+        let old_truncated_b: String = old_seed_b.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
+        assert_eq!(
+            old_truncated_a, old_truncated_b,
+            "fixture setup failed to reach the adversarial precondition -- the two picks' OLD \
+             (pre-fix) creator seeds must agree on their first {MARKER_CREATOR_MAX_CHARS} \
+             characters (that is the whole point of this fixture) but disagree already"
+        );
+
+        // The NEW, digest-fronted derivation this fix introduces, called
+        // directly rather than through the whole `Action::SpawnPane`
+        // dispatch arm.
+        let seed_a = spawn_pane_creator_identity_seed(
+            &long_root,
+            Some(subpath_a),
+            SEGMENT,
+            &always_folded_a,
+        );
+        let seed_b = spawn_pane_creator_identity_seed(
+            &long_root,
+            Some(subpath_b),
+            SEGMENT,
+            &always_folded_b,
+        );
+        let creator_a = orchestration_creator_string(&seed_a);
+        let creator_b = orchestration_creator_string(&seed_b);
+        assert_ne!(
+            creator_a, creator_b,
+            "two different nested picks sharing an identical segment, whose OLD (pre-fix) \
+             creator seeds agree on their first {MARKER_CREATOR_MAX_CHARS} characters, must \
+             still compute DISTINCT `creator` identities under the fix -- got the identical \
+             creator {creator_a:?} for both, meaning the second pick would silently resume into \
+             the first's live clone instead of being refused (the exact fork#74 condition this \
+             whole mechanism exists to prevent)"
+        );
+        // Prove truncation was actually EXERCISED on both sides, not merely
+        // that the two outcomes differ -- a future change that stopped
+        // truncating entirely would still trivially pass the `assert_ne!`
+        // above. `sanitize_marker_creator` appends a trailing `…` on the
+        // truncation branch, so a genuinely truncated result is
+        // `MARKER_CREATOR_MAX_CHARS + 1` characters long, not exactly the
+        // cap.
+        assert_eq!(
+            creator_a.chars().count(),
+            MARKER_CREATOR_MAX_CHARS + 1,
+            "creator_a must have actually been truncated by `sanitize_marker_creator` (cap plus \
+             trailing ellipsis) -- got {} characters: {creator_a:?}",
+            creator_a.chars().count()
+        );
+        assert!(
+            creator_a.ends_with('…'),
+            "creator_a must end with `sanitize_marker_creator`'s truncation ellipsis: \
+             {creator_a:?}"
+        );
+        assert_eq!(
+            creator_b.chars().count(),
+            MARKER_CREATOR_MAX_CHARS + 1,
+            "creator_b must have actually been truncated by `sanitize_marker_creator` (cap plus \
+             trailing ellipsis) -- got {} characters: {creator_b:?}",
+            creator_b.chars().count()
+        );
+        assert!(
+            creator_b.ends_with('…'),
+            "creator_b must end with `sanitize_marker_creator`'s truncation ellipsis: \
+             {creator_b:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#777 fix round (reviewer M2, BLOCKER). A nested
+    /// pick that GENUINELY collides at provisioning time and lands on a
+    /// disambiguated physical directory must still persist its own
+    /// `ClaimOrchestrationName` request's LOGICAL (plain,
+    /// pre-disambiguation) `cwd` into the captured
+    /// `OrchestrationSnapshot.claim_cwd` — never the physical directory it
+    /// actually landed on. This is the property `restore_claim_cwd_for`
+    /// relies on: the daemon-empty restore path reuses this persisted value
+    /// verbatim rather than recomputing a claim `cwd` from `saved_pane.dir`
+    /// (the physical, disambiguated path) — which is what reopens fork
+    /// issue #607's shared-clone hazard across a daemon restart if left to
+    /// diverge (see that function's own doc comment for the full chain).
+    #[spec("orchestration/identity/041")]
+    #[test]
+    fn identity_041_a_collided_pick_persists_its_plain_logical_claim_cwd_not_the_disambiguated_physical_dir()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_committed_git_repo(&repo);
+        let team_a = repo.join("team-a").join("proj");
+        let team_b = repo.join("team-b").join("proj");
+        std::fs::create_dir_all(&team_a).expect("create team-a/proj");
+        std::fs::create_dir_all(&team_b).expect("create team-b/proj");
+        std::fs::write(team_a.join("marker.txt"), "hi\n").expect("write marker a");
+        std::fs::write(team_b.join("marker.txt"), "hi\n").expect("write marker b");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "seed nested projects",
+        ]);
+
+        const NAME_A: &str = "fix/544";
+        const NAME_B: &str = "fix-544";
+        let segment_a = sanitize_workspace_segment(NAME_A);
+        let segment_b = sanitize_workspace_segment(NAME_B);
+        assert_eq!(
+            segment_a, segment_b,
+            "setup: sanity -- see workspace_048 for the same colliding-segment shape"
+        );
+
+        // First pick: occupies the plain path, nothing to collide with yet.
+        {
+            let config = make_orchestration("review");
+            let pc = Arc::new(CapturingPaneController::new());
+            let req = NewPaneRequest {
+                dir: team_a.clone(),
+                name: NAME_A.to_string(),
+                command: String::new(),
+                mode_config: None,
+                orchestration_config: Some(config),
+                seed_prompt: None,
+                form_agent_type: None,
+            };
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+            let daemon_dir = tempdir().expect("tempdir for first daemon-stub");
+            let _daemon = with_empty_agents_daemon(daemon_dir.path());
+            let _ = dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                &mut ui,
+                pc.as_ref(),
+                &state,
+                &mut tm,
+                &snapshot,
+                &[],
+                None,
+                Rect::new(0, 0, 200, 50),
+            );
+            assert_eq!(
+                tm.tab_count(),
+                2,
+                "setup: the first pick must succeed -- got {} tab(s), status: {:?}",
+                tm.tab_count(),
+                ui.status_message.as_ref().map(|(m, _)| m.clone())
+            );
+        }
+
+        // Second pick: a DIFFERENT typed Name sanitizing to the identical
+        // segment, a DIFFERENT nested subdirectory -- a genuine collision
+        // that must disambiguate (see `workspace_048`).
+        let config_b = make_orchestration("review");
+        let pc_b = Arc::new(CapturingPaneController::new());
+        let req_b = NewPaneRequest {
+            dir: team_b.clone(),
+            name: NAME_B.to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config_b),
+            seed_prompt: None,
+            form_agent_type: None,
+        };
+        let mut tm_b = TabManager::new(pc_b.clone());
+        let mut ui_b = default_ui();
+        let state_b: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot_b = AppState::default();
+        let daemon_dir_b = tempdir().expect("tempdir for second daemon-stub");
+        let _daemon_b = with_empty_agents_daemon(daemon_dir_b.path());
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req_b)),
+            &mut ui_b,
+            pc_b.as_ref(),
+            &state_b,
+            &mut tm_b,
+            &snapshot_b,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+        assert_eq!(
+            tm_b.tab_count(),
+            2,
+            "setup: the second, colliding pick must also succeed (disambiguated) -- got {} \
+             tab(s), status: {:?}",
+            tm_b.tab_count(),
+            ui_b.status_message.as_ref().map(|(m, _)| m.clone())
+        );
+
+        // Read back what the real call site's own shared primitives compute
+        // for the PLAIN, pre-disambiguation claim cwd -- NOT a hand-typed
+        // reconstruction.
+        let resolution = resolve_orchestration_workspace(&team_b, &segment_b);
+        let canonical_root = resolution
+            .resolved_root_dir
+            .canonicalize()
+            .expect("resolved_root_dir already exists on disk (it's the git toplevel)");
+        let mut expected_plain_claim_cwd = resolve_workspace_path(&canonical_root, &segment_b);
+        if let Some(rel) = &resolution.relative_subpath {
+            expected_plain_claim_cwd = expected_plain_claim_cwd.join(rel);
+        }
+        let expected_plain_claim_cwd = expected_plain_claim_cwd.display().to_string();
+
+        let orch_snapshot = ui_b
+            .pane_metadata
+            .values()
+            .find_map(|saved| saved.orchestration.as_ref())
+            .expect("the start-role pane's SavedPane must carry an OrchestrationSnapshot");
+
+        assert_eq!(
+            orch_snapshot.claim_cwd.as_deref(),
+            Some(expected_plain_claim_cwd.as_str()),
+            "the persisted claim_cwd must be the PLAIN, pre-disambiguation logical claim cwd \
+             this launch's own ClaimOrchestrationName request actually sent -- got {:?}",
+            orch_snapshot.claim_cwd
+        );
+        assert_ne!(
+            orch_snapshot.claim_cwd.as_deref(),
+            Some(orch_snapshot.project_path.as_str()),
+            "for a genuinely collided pick, the persisted claim_cwd must differ from \
+             project_path (the physical, disambiguated directory this orchestration actually \
+             occupies) -- proving claim identity is decoupled from physical placement, not \
+             merely equal to it by coincidence"
+        );
+    }
+
     /// Fork #122: a real `.dot-agent-deck.toml` at `dir` defining one
     /// orchestration with the same `coder`/`reviewer` role shape
     /// `make_orchestration` builds in memory — used by both
@@ -45496,6 +46077,7 @@ mod tests {
             started_role_indices: Vec::new(),
             display_title: None,
             owner: None,
+            claim_cwd: None,
         };
 
         let (orch_config, start_idx) = resolve_orchestration_for_restore(&snap, &worktree_str)
@@ -45552,6 +46134,7 @@ mod tests {
             started_role_indices: Vec::new(),
             display_title: None,
             owner: None,
+            claim_cwd: None,
         };
 
         let result = resolve_orchestration_for_restore(&snap, &worktree_str);
@@ -45565,6 +46148,91 @@ mod tests {
             err.contains(&snap.config_name),
             "the resolve error must name the orchestration so session_warnings \
              surfaces something the user can act on: {err:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#777 fix round (reviewer M2, BLOCKER). When the
+    /// snapshot carries a persisted `claim_cwd`, `restore_claim_cwd_for`
+    /// must return it VERBATIM — no canonicalization, no recomputation from
+    /// `saved_dir` — even when `saved_dir` names a genuinely different
+    /// (disambiguated) physical directory, which is exactly the case this
+    /// fix exists for.
+    #[test]
+    fn restore_claim_cwd_for_prefers_the_persisted_logical_value_over_the_physical_saved_dir() {
+        let snap = config::OrchestrationSnapshot {
+            version: 1,
+            roles: vec!["coder".to_string()],
+            start_role_index: 0,
+            orchestrator_prompt: String::new(),
+            config_name: "demo".to_string(),
+            project_path: "/work/repo-8-features-team-b-proj".to_string(),
+            started_role_indices: Vec::new(),
+            display_title: None,
+            owner: None,
+            claim_cwd: Some("/work/repo-features/team-b/proj".to_string()),
+        };
+        assert_eq!(
+            restore_claim_cwd_for(&snap, "/work/repo-8-features-team-b-proj"),
+            "/work/repo-features/team-b/proj",
+            "a persisted claim_cwd must be reused verbatim, not recomputed from the physical \
+             saved dir (which names a DIFFERENT, disambiguated path here)"
+        );
+    }
+
+    /// Scenario: PRD fork#777 fix round (reviewer M2). A snapshot written
+    /// before `claim_cwd` existed (`None`) must fall back to the pre-fix
+    /// behavior exactly — canonicalize `saved_dir` when it exists on disk.
+    #[test]
+    fn restore_claim_cwd_for_falls_back_to_canonicalized_saved_dir_when_claim_cwd_is_absent() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("legacy-workspace");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let snap = config::OrchestrationSnapshot {
+            version: 1,
+            roles: vec!["coder".to_string()],
+            start_role_index: 0,
+            orchestrator_prompt: String::new(),
+            config_name: "demo".to_string(),
+            project_path: dir.display().to_string(),
+            started_role_indices: Vec::new(),
+            display_title: None,
+            owner: None,
+            claim_cwd: None,
+        };
+        let expected = dir
+            .canonicalize()
+            .expect("dir exists")
+            .display()
+            .to_string();
+        assert_eq!(
+            restore_claim_cwd_for(&snap, &dir.display().to_string()),
+            expected,
+            "a legacy snapshot with no claim_cwd must fall back to canonicalizing saved_dir, \
+             exactly as restore did before this fix"
+        );
+    }
+
+    /// Scenario: PRD fork#777 fix round (reviewer M2). When `claim_cwd` is
+    /// absent AND `saved_dir` cannot be canonicalized (removed from disk),
+    /// the fallback must degrade to the raw string rather than panicking or
+    /// erroring — matching the pre-fix behavior's own `unwrap_or_else`.
+    #[test]
+    fn restore_claim_cwd_for_falls_back_to_the_raw_saved_dir_when_it_no_longer_exists() {
+        let snap = config::OrchestrationSnapshot {
+            version: 1,
+            roles: vec!["coder".to_string()],
+            start_role_index: 0,
+            orchestrator_prompt: String::new(),
+            config_name: "demo".to_string(),
+            project_path: "/nonexistent/removed-workspace".to_string(),
+            started_role_indices: Vec::new(),
+            display_title: None,
+            owner: None,
+            claim_cwd: None,
+        };
+        assert_eq!(
+            restore_claim_cwd_for(&snap, "/nonexistent/removed-workspace"),
+            "/nonexistent/removed-workspace",
         );
     }
 
@@ -45607,6 +46275,7 @@ mod tests {
                     started_role_indices: Vec::new(),
                     display_title: None,
                     owner: Some(owner.clone()),
+                    claim_cwd: None,
                 }),
             }],
             last_command: None,
