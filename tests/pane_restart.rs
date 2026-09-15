@@ -941,21 +941,34 @@ fn pane_restart_010_cli_fails_when_the_reply_does_not_parse_as_a_restart_respons
 /// precondition as `pane_restart_001`). The test itself then takes
 /// `AgentPtyRegistry::pane_dispatch_lock(WORKER_PANE)` — the exact lock
 /// `handle_restart_role_with_state` and a concurrent `clear = true` delegate
-/// (`dispatch_one_owned`) both acquire before respawning — and starts a
-/// `force: false` restart in the background, which blocks trying to acquire
-/// that same lock. While still holding it, the test calls the same
-/// `respawn_or_recreate_agent_for_pane` a concurrent delegate's
-/// `dispatch_one_owned` would use, installing a healthy `cat` replacement
-/// into the pane. Only after that does the test release the lock. The
-/// interleaving is pinned by the lock itself, not by timing: since the
-/// background restart cannot even attempt its respawn until the lock is
-/// free, the replacement is guaranteed to already be installed by the time
-/// the restart's respawn would run. The restart must refuse — report
-/// `restarted: false` with a "has not crashed" error, the same wording the
-/// early check uses — rather than proceed and kill the replacement.
+/// (`dispatch_one_owned`) both acquire before respawning — and builds the
+/// restart call as a plain (unspawned) future it drives BY HAND, the same
+/// deterministic technique `daemon.rs`'s `shell_activity_008` uses: a manual
+/// `poll` with a no-op waker, no `tokio::spawn`, so nothing here rests on the
+/// OS scheduler happening to run a background task before or after this
+/// test's own next line (a real, observed failure mode of an earlier version
+/// of this test — spawning the restart and racing it against a real OS
+/// thread let the restart's own early check sometimes run AFTER the
+/// replacement was already installed, silently testing nothing). The first
+/// poll must already return `Pending`: the handler's read-guard phase
+/// (caller check, target resolution, the crash check itself, the role config
+/// lookup) contains no other `.await` that can suspend on an uncontended
+/// lock, so reaching `Pending` here is only possible via the SAME
+/// `pane_dispatch_lock` this test holds — proof the crash check already ran
+/// and captured `crashed == true` before anything else happens. Only then
+/// does the test call the same `respawn_or_recreate_agent_for_pane` a
+/// concurrent delegate's `dispatch_one_owned` would use, installing a
+/// healthy `cat` replacement into the pane while still holding the lock, and
+/// only after that does it release the lock and drive the restart future to
+/// completion. The restart must refuse — report `restarted: false` with a
+/// "has not crashed" error, the same wording the early check uses — rather
+/// than proceed and kill the replacement.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/restart/012")]
 async fn pane_restart_012_recheck_under_dispatch_lock_prevents_killing_a_concurrent_replacement() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
     let fx = fixture("sleep 0.2").await;
 
     let crashed = wait_for_crashed(
@@ -976,19 +989,26 @@ async fn pane_restart_012_recheck_under_dispatch_lock_prevents_killing_a_concurr
     let dispatch_mutex = fx.daemon.registry.pane_dispatch_lock(WORKER_PANE);
     let dispatch_guard = dispatch_mutex.lock().await;
 
-    let state = fx.daemon.state.clone();
-    let registry = fx.daemon.registry.clone();
-    let event_tx = fx.daemon.event_tx.clone();
     let signal = RestartRoleSignal {
         pane_id: ORCH_PANE.to_string(),
         role: WORKER_ROLE.to_string(),
         force: false,
         timestamp: chrono::Utc::now(),
     };
-    let restart_task = tokio::spawn(async move {
-        dot_agent_deck::state::handle_restart_role_with_state(signal, &state, &registry, &event_tx)
-            .await
-    });
+    let mut restart_future = Box::pin(dot_agent_deck::state::handle_restart_role_with_state(
+        signal,
+        &fx.daemon.state,
+        &fx.daemon.registry,
+        &fx.daemon.event_tx,
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        restart_future.as_mut().poll(&mut cx).is_pending(),
+        "the restart's first poll must already be blocked acquiring the dispatch lock this test \
+         holds — if it completed (or needed a second poll) here, its early check never ran \
+         against the crashed state this test is trying to pin, and the rest of this test would \
+         be racing nothing"
+    );
 
     // Still holding the lock: simulate exactly what a concurrent
     // `clear = true` delegate's `dispatch_one_owned` does on the SAME lock in
@@ -1022,13 +1042,11 @@ async fn pane_restart_012_recheck_under_dispatch_lock_prevents_killing_a_concurr
     );
     let replacement_agent_id = replacement.agent_id;
 
-    // Release the lock: only now can the background restart's own
+    // Release the lock: only now can the restart future's own
     // `pane_dispatch_lock` acquisition succeed and its respawn attempt run.
     drop(dispatch_guard);
 
-    let response = restart_task
-        .await
-        .expect("the background restart task must not panic");
+    let response = restart_future.await;
 
     assert!(
         !response.restarted,
