@@ -12772,19 +12772,6 @@ fn dispatch_action(
                         &segment,
                         &creator,
                     );
-                    // PRD fork#544 M3 fix round: release this process-local
-                    // resume registration the moment provisioning returns,
-                    // on every outcome — the `ClaimOrchestrationName` call
-                    // above already durably established liveness for this
-                    // Name before provisioning even ran, so the registry's
-                    // brief defense-in-depth job is done here regardless of
-                    // whether provisioning resumed, created, or refused.
-                    // See `resumed_isolated_clones`'s doc comment
-                    // (`src/issue_dispatch_run.rs`) for why this is correct
-                    // rather than a weakening of the race protection.
-                    crate::issue_dispatch_run::release_resumed_isolated_clone_registration(
-                        &workspace_resolution.worktree_path,
-                    );
                     let (
                         dir_str,
                         worktree_marker_warning,
