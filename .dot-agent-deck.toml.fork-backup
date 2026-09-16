@@ -34,15 +34,15 @@
 #      (the snapshot was written on the state change, not only at clean quit).
 #
 # 4) ORCHESTRATION-TAB RESTORE
-#    - dot-agent-deck ; open the `dot-agent-deck` orchestration via the new-pane
-#      form (Ctrl+N -> cycle Mode to "Orch: dot-agent-deck" -> submit); give it a
-#      prompt
+#    - dot-agent-deck ; open the `mixed` orchestration via the new-pane form
+#      (Ctrl+N -> cycle Mode to "Orch: mixed" -> submit); give it a prompt
 #    - WARM: detach + relaunch          -> tab rebuilt via daemon hydration
 #    - COLD: stop the daemon + relaunch -> tab rebuilt from the snapshot:
 #      orchestrator + role panes in order, the prompt replayed, start-role cursor
-#    - DRIFT: rename the `dot-agent-deck` orchestration in THIS file, stop the
-#      daemon, relaunch -> a clear warning shows and the tab falls back to a
-#      PLAIN dashboard pane (never a half-broken tab).
+#    - DRIFT: rename the `mixed` orchestration in THIS file, stop the daemon,
+#      relaunch -> a clear warning shows and the tab falls back to a PLAIN
+#      dashboard pane (never a half-broken tab). Renaming one that is LIVE also
+#      severs its role lookup (see the note above `[[orchestrations]]` below).
 #
 # 5) FRESH-START ESCAPE HATCH
 #    - dot-agent-deck snapshot clear        -> deletes the local snapshot; the
@@ -86,13 +86,40 @@ watch = false
 pattern = "git (log|status|show|diff)"
 watch = false
 
-# Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), and three GPT harnesses all on the same gpt-5.6-sol model: reviewer=pi, auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative under it.
+# THREE orchestrations, one workflow (issue #705). They exist so a contributor
+# who has credentials for only one provider can still run the team, and so work
+# survives one provider's credits drying up mid-PRD:
+#
+#   mixed      the dogfooding default — four harnesses across two providers
+#   anthropic  Claude everywhere
+#   GPT        OpenCode on GPT models everywhere
+#
+# `anthropic` and `GPT` are DELIBERATELY not copies. Each `extends = "mixed"` and
+# restates only its six `command` lines; every role's prompt_template, workflow,
+# description, start flag and clear flag comes from `mixed`. So a change to how
+# this team works is made once, here, and all three get it. Three hand-maintained
+# copies of a 142-line block is the shape issue #304 was closed over, after two
+# such lists drifted until one was missing a mode the other had.
+#
+# `mixed` carries `default = true` (issue #704): that is what a bare
+# `dispatch --orchestration=` and a scheduled task rooted here open. It is a
+# DECLARATION, not the fact that it comes first — reordering this file no longer
+# changes which provider a default run uses.
+#
+# ONE HAZARD when editing the `name` of any of these: `lookup_orchestration_role_indexed`
+# re-reads this file on every delegate and matches by name against the name the
+# daemon captured at spawn. Rename an orchestration that is CURRENTLY OPEN and
+# every later worker is delegated to without its prompt_template and without its
+# clear flag — the daemon logs a warning saying so. Close the tab first.
+
+# Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), reviewer=pi (Opus, high thinking), and two GPT harnesses on gpt-5.6-sol: auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative under it, or switch the whole team with `--orchestration 'anthropic'` / `--orchestration 'GPT'`.
 [[orchestrations]]
-name = "dot-agent-deck"
+name = "mixed"
+default = true
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "devbox run claude-sonnet-devbox --permission-mode plan"
+command = "devbox run claude-sonnet-devbox-plan"
 # command = "devbox run pi-big"   # pi (Opus, high thinking)
 start = true
 prompt_template = """
@@ -147,7 +174,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
 
 5. **Pre-release phase.** After review is resolved and step 4's e2e check (CI-covered by default, or a local run under its narrow exceptions) is satisfied, delegate `/prd-done` to **release**, giving it the context it needs (branch, files to commit, PRD path, issue number, **the draft PR's number**, gate results) and these instructions: **the PR already exists as a draft from step 4**, so `/prd-done` marks it ready for review (`gh pr ready <n>`) rather than creating one — it only opens a PR if the branch genuinely has none. Then wait for all PR processes to finish (CI / GitHub Actions, anything else), report the results back, and STOP before merging. The report-back happens *after* those processes settle — never instruct release to stop at PR creation. This is NOT a user gate; do not pause for approval before delegating. **Do not build or post the demo reel here** — the reel is produced *after* this gate is green, in the pre-merge window (step 6).
 
-6. **Demo reel (pre-merge window).** Once the PR is open and its CI has settled **green** (step 5), and **before** merge, delegate the reel build to **coder** (PRD #180) — but **only if step 4's e2e gate actually ran on this machine under exception (b)**, with `DOT_AGENT_DECK_RECORD=1`, which is what leaves the passing tests' casts on disk under `.dot-agent-deck/recordings/`. That is no longer the default path: when step 4 was answered by CI instead, the casts were written to the CI runner and not to this machine, so there are no local casts and the reel cannot proceed on them — record that and skip this step. (The most common case is already handled by the clean-skip rule below: a branch that changed no e2e tests never fires exception (b) and skips the reel entirely.) Tell coder NOT to re-run e2e (the casts already exist from step 4) and to run the adapter from the worktree root: `.claude/skills/demo-reel-adapter/build.sh --out reel.mp4 --publish`. The adapter composes a descriptive video title (`<repo> · PRD #<prd> · PR #<pr> — <short desc>`, e.g. `dot-agent-deck · PRD #180 · PR #182 — PRD demo reel`), selects the e2e `#[spec]` tests this branch added/changed (diff vs `main`), lifts each test's title (`test.md` H1) and `## Scenario` description, builds the manifest, and invokes the engine (`.claude/skills/demo-reel/reel.sh`) to stitch one narrated MP4 (title/description card, then that test's recording, repeated in catalog order) and upload it **unlisted to YouTube**, returning the watch URL. Have coder report back the URL (or the clean-skip / publish-skip message). Then — in the same delegation — have coder post the URL in **THREE** places so it rides along with the PR *and* the release notes:
+6. **Demo reel (pre-merge window).** Once the PR is open and its CI has settled **green** (step 5), and **before** merge, delegate the reel build to **coder** (PRD #180) — but **only if step 4's e2e gate actually ran on this machine under exception (b)**, with `DOT_AGENT_DECK_RECORD=1`, which is what leaves the passing tests' casts on disk under `.dot-agent-deck/recordings/`. That is no longer the default path: when step 4 was answered by CI instead, the casts were written to the CI runner and not to this machine, so there are no local casts and the reel cannot proceed on them — record that and skip this step. (The most common case is already handled by the clean-skip rule below: a branch that changed no e2e tests never fires exception (b) and skips the reel entirely.) Tell coder NOT to re-run e2e (the casts already exist from step 4) and to run the adapter from the worktree root: `.claude/skills/demo-reel-adapter/build.sh --out reel.mp4 --publish`. The adapter composes a descriptive video title (`<repo> · PRD #<prd> · PR #<pr> — <short desc>`, e.g. `dot-agent-deck · PRD #180 · PR #182 — PRD demo reel`), selects the e2e `#[spec]` tests this branch added/changed (diff vs `main`), lifts each test's title (`test.md` H1) and `## Scenario` description, builds the manifest, and invokes the engine (`.claude/skills/demo-reel/reel.sh`) to stitch one narrated MP4 (title/description card, then that test's recording, repeated in catalog order) and upload it **PRIVATE to YouTube**, returning the watch URL. Private is not a knob on this path: the adapter forwards no privacy option and the engine passes none, so the prescribed command can only produce a private video — one **only the channel owner can open**. That is deliberate and is the security boundary (every reel-eligible cast was recorded by a process holding live credentials, and the link goes into public release notes), so a private result is the SUCCESS case, not a failed attempt at an unlisted one — do not work around it, do not reach for `upload.sh --privacy`, and do not treat it as a defect to report. Have coder report back the URL (or the clean-skip / publish-skip message). Then — in the same delegation — have coder post the URL in **THREE** places so it rides along with the PR *and* the release notes:
    - **(a) a PR comment** — `gh pr comment <n> --body "Demo reel for PRD #NNN: <link>. Watch before merging."`.
    - **(b) the PR description/body** — append the same line to the PR body (`gh pr edit <n> --body …`, preserving the existing body).
    - **(c) the changelog fragment** — append the link to `changelog.d/<prd>.feature.md` so it flows into the release notes; commit and push that change. Committing the changelog/PR-body update triggers **one final quick CI pass** before merge — wait for it to settle green.
@@ -155,9 +182,9 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
    - **Clean skip (no e2e changes):** if the branch changed no e2e tests, the adapter writes no manifest, builds no reel, uploads nothing, and prints `skipped: no e2e tests changed on this branch`. Record that there is no reel and *why*; do **not** post a comment, touch the PR body, or add a changelog link. Skip the rest of this step.
    - **Publish failure:** if `--publish` cannot upload (missing YouTube OAuth credentials, or a runtime upload error), the engine still keeps the local `reel.mp4` and reports why — relay that note instead of a URL, and treat missing credentials as a one-time human-provisioning gap (see `docs/develop/demo-reel.md` for the manifest contract and OAuth setup).
 
-   This step touches **no source code** — only the changelog fragment and PR metadata. Note that the unlisted YouTube link, once it is in the public release notes, is reachable by anyone who reads those notes (intended).
+   This step touches **no source code** — only the changelog fragment and PR metadata. The link still goes in the PR body and the changelog, and it works for the channel owner immediately, so the pre-merge review is unaffected — but while the video is private nobody else can open it, including a reader of the published release notes. **Publication is a separate, explicit HUMAN decision**: somebody watches the reel and flips it private → unlisted before a release ships. The video id survives the flip, so the link already in the PR and the changelog starts working with no re-upload and no link edit. Never make that flip on an agent's own initiative, and never ask for it as part of this step — see [`docs/develop/demo-reel.md`](docs/develop/demo-reel.md).
 
-7. **Merge phase.** When the final CI pass from the changelog/PR-body commit (step 6) settles **green**, run `cargo xtask list-tests` and check the merge conditions in CLAUDE.md rule 25 — every condition established against the PR's final head SHA, which reaches downward too: the closing-keyword audit is where staleness bites hardest, since a fix round's own commits are exactly what it has to catch (every expected PR check present and passing — read the e2e result from the job log, never the run conclusion, and quote the literal `Summary [...] N tests run:` line; `reviewer` and `auditor` both returned; every finding resolved or its disposition recorded, and every *behavioural* fix pinned by a test; no blocker-severity finding accepted; `mergeable=MERGEABLE` and `mergeStateStatus=CLEAN`; closing-keyword audit clean on body/commits/title). If every condition holds and the change is ordinary work — not a rule-12 protocol change, a `.breaking.md`, a release/tag, or an edit to the machinery by which everything else is judged (`CLAUDE.md`'s rules, this workflow text, `.github/workflows/**`, or the release flow — rule 25's always-ask list) — post the merge report as a PR comment (`gh pr comment`, naming the checked head SHA, the quoted CI summary line, both findings-file paths, every finding's disposition, and the closing-keyword audit result) and re-delegate to **release** to merge with `gh pr merge <n> --squash --match-head-commit <sha>` and finish `/prd-done` without waiting on the user. Otherwise pause: present the full picture — the synthetic-test inventory (every #[spec] test created/modified, every catalog prose change, every linkage-allowlist delta), the reported CI status, any review findings, and — if one was produced — the demo-reel link as `Demo reel for PRD #NNN: <link>. Watch before merging.` — and wait for the user's explicit go-ahead before re-delegating to **release**. Say plainly, in the reply you pause on, that you are waiting, so the user can tell the pause apart from work still in flight. If there are CI failures or findings to address first, re-delegate fixes to coder/tester and then re-delegate to release to re-check.
+7. **Merge phase.** When the final CI pass from the changelog/PR-body commit (step 6) settles **green**, run `cargo xtask list-tests` and check the merge conditions in CLAUDE.md rule 25 — every condition established against the PR's final head SHA, which reaches downward too: the closing-keyword audit is where staleness bites hardest, since a fix round's own commits are exactly what it has to catch (every expected PR check present and passing — read the e2e result from the job log, never the run conclusion, and quote the literal `Summary [...] N tests run:` line; `reviewer` and `auditor` both returned; every finding resolved or its disposition recorded, and every *behavioural* fix pinned by a test; no blocker-severity finding accepted; `mergeable=MERGEABLE` and `mergeStateStatus=CLEAN`; closing-keyword audit clean on body/commits/title). If every condition holds and the change is ordinary work — not a rule-12 protocol change, a `.breaking.md`, a release/tag, or an edit to the machinery by which everything else is judged (`CLAUDE.md`'s rules, this workflow text, `.github/workflows/**`, or the release flow — rule 25's always-ask list) — post the merge report as a PR comment (`gh pr comment`, naming the checked head SHA, the quoted CI summary line, both findings-file paths, every finding's disposition, and the closing-keyword audit result) and re-delegate to **release** to merge with `gh pr merge <n> --squash --match-head-commit <sha>`, run `worker-agent-deck worktree sync` right after the merge succeeds (fork issue #744 — catches up any other live isolated-clone workspace: the one whose own branch just merged auto-switches to the updated default branch, everything else gets a read-only fetch), and finish `/prd-done` without waiting on the user. Otherwise pause: present the full picture — the synthetic-test inventory (every #[spec] test created/modified, every catalog prose change, every linkage-allowlist delta), the reported CI status, any review findings, and — if one was produced — the demo-reel link as `Demo reel for PRD #NNN: <link>. Watch before merging.` — and wait for the user's explicit go-ahead before re-delegating to **release**. Say plainly, in the reply you pause on, that you are waiting, so the user can tell the pause apart from work still in flight. If there are CI failures or findings to address first, re-delegate fixes to coder/tester and then re-delegate to release to re-check.
 
 The test-plan approval (step 1) is the workflow's standing user gate. Step 7's merge is conditional per CLAUDE.md rule 25 — it is a user gate only when the checklist fails or the always-ask list applies, not unconditionally. The test inventory and the demo-reel link are informational context either way, not a gate of their own.
 
@@ -178,6 +205,7 @@ Context handoff (CRITICAL): every worker cold-starts with NO memory of prior con
 - When chaining workers (coder → reviewer/auditor), summarize the prior worker's relevant findings or list the files they changed.
 - When retrying after a failure, paste the exact error message into --task.
 - If context is long, write it to .dot-agent-deck/<task-slug>.md and reference that path in --task instead of pasting inline.
+- **Before ending your turn, confirm every task file you authored this turn for `--task-file` has a matching `delegate` call already issued in this same turn** — a staged file with no `delegate` call behind it is a stalled task, not a finished one, and nothing on the deck notices the gap. If one is missing, issue the `delegate` call now, before you stop.
 - When the deliverable is **accumulated observations rather than a code change** — a long-running investigation, a hands-on verification pass — instruct the worker to write its findings **incrementally** to a file under `.dot-agent-deck/` as it goes, and to reference that path in its `work-done` rather than holding them only in context. A worker that is stood down, re-delegated, interrupted, or that simply runs out of context loses everything it never wrote down, and its replacement cold-starts with no transcript — so evidence that exists only in a worker's context is one interruption away from being gone.
 """
 
@@ -191,6 +219,7 @@ prompt_template = "Implement the requested change. If the task references a PRD 
 [[orchestrations.roles]]
 name = "reviewer"
 command = "devbox run claude-opus-devbox"
+# command = "devbox run pi-big"   # pi (Opus, high thinking)
 # command = "devbox run agent-reviewer"   # all-claude default
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. Write your findings under the ROOT CHECKOUT's `.dot-agent-deck/` directory — not your worktree's, because a worktree is reclaimed once its branch merges and the evidence has to outlive it. If the task names an exact absolute path, use it verbatim. If it does not, DERIVE the root checkout rather than guessing or refusing: `dirname \"$(git rev-parse --path-format=absolute --git-common-dir)\"` returns it exactly from inside any linked worktree, and you write to `<that>/.dot-agent-deck/<descriptive-name>.md`. Never resolve a relative findings path against your worktree. Keep the `work-done` signal to a short verdict plus a pointer to that path. If that path turns out to be unwritable, say so as the first line of `work-done` and inline the findings there instead, kept short, rather than losing them. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you. Begin every `work-done` report with a short **Summary** section — two or three sentences naming the PRD number and/or issue number the work belongs to, what changed, and the outcome (done / blocked / needs a decision); the detail follows underneath. Someone reading only the summary should be able to tell which PRD it is and whether it needs their attention."
@@ -205,6 +234,7 @@ prompt_template = "Audit the change for security vulnerabilities, unsafe pattern
 [[orchestrations.roles]]
 name = "tester"
 command = "devbox run claude-sonnet-devbox"
+# command = "devbox run codex-big"   # GPT credits exhausted 2026-08-26
 # command = "devbox run agent-tester"   # all-claude default
 description = "Writes failing synthetic L2 tests under the TUI test harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
 prompt_template = """
@@ -244,8 +274,83 @@ No bot posts an automated code review on this fork's own PRs (fork issue #226; C
 
 Once the PR is open and CI is green, STOP — do NOT merge. Report back via work-done with the PR URL and the one-line settle result so the orchestrator can check the merge conditions (CLAUDE.md rule 25) and decide whether to pause for the user or proceed unattended. Do not notify the user yourself and do not wait on the user — the orchestrator is the only agent that does either. Only merge when the orchestrator re-delegates with explicit instruction to continue, and merge with `gh pr merge <n> --squash --match-head-commit <sha>` (the SHA the orchestrator's merge report checked), never a bare `gh pr merge`.
 
+Right after the merge succeeds, run `worker-agent-deck worktree sync` (fork issue #744) — no path argument, it discovers every sibling isolated clone on its own, same as `worktree reclaim`. This catches up any other live isolated-clone workspace: the one whose own branch was just merged auto-switches to the updated default branch (only when safe — an uncommitted change or an extra local commit leaves it untouched instead); every other one gets a read-only fetch that keeps its `origin/<default branch>` current. Report the command's own summary output alongside the merge result — do not treat a `LeftUntouched`/fetch-failed row as a merge failure, it is informational only.
+
 Begin every `work-done` report with a short **Summary** section — two or three sentences naming the PRD number and/or issue number the work belongs to, what changed, and the outcome (done / blocked / needs a decision); the detail follows underneath. Someone reading only the summary should be able to tell which PRD it is and whether it needs their attention.
 
 After a successful merge and issue closure, signal completion by running:
   dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> closed. <one-line summary of what shipped.>" --subject "#<n>"
 """
+
+# ---------------------------------------------------------------------------
+# Claude everywhere. Same six roles, same prompts, same workflow as `mixed` —
+# only the launchers differ. For a contributor with Anthropic credentials and
+# nothing else, and for the days GPT credits are out.
+# ---------------------------------------------------------------------------
+[[orchestrations]]
+name = "anthropic"
+extends = "mixed"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator"
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder"
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer"
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor"
+
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester"
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-release"
+
+# ---------------------------------------------------------------------------
+# OpenCode on GPT models everywhere. The mirror image of `anthropic`.
+#
+# Launchers: `agent-orchestrator-oc`, `agent-coder-oc` and `agent-tester-oc` are
+# NEW devbox scripts rather than three more references to the existing `oc-big`,
+# because `oc-big` is already `mixed`'s auditor command — pointing GPT's roles at
+# it would mean a GPT-only model bump silently re-models `mixed` too. Where reuse
+# carries no such coupling it is reused: `agent-reviewer-oc` / `agent-auditor-oc`
+# (gpt-5.5, deliberately a different model from the implementers, mirroring how
+# `mixed` runs its review roles on a different harness) and `oc-release`
+# (gpt-5.4-mini, mirroring `mixed`'s cheaper Sonnet release role).
+# ---------------------------------------------------------------------------
+[[orchestrations]]
+name = "GPT"
+extends = "mixed"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator-oc"
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder-oc"
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer-oc"
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor-oc"
+
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester-oc"
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run oc-release"
