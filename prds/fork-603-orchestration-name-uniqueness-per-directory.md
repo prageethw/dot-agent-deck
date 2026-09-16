@@ -112,7 +112,7 @@ That concern was about a **per-directory *suggestion counter*** operating undern
 - [ ] M4 — Existing tests updated (builder/signature shape only, same intent): `orchestration/identity/003`, `/004`, `orchestration/guard/002`, `/003` (`src/ui.rs`, ~34528+/35044+/35159+) move from `.with_live_orchestration_names(vec![...])` to `.with_live_orchestration_identities(vec![(dir, name), ...])`; the `identity/02x` daemon claim-race tests (`src/agent_pty.rs`) move to the 3-arg `claim_orchestration_name` signature.
 - [ ] M5 — New tests (previously-impossible surface, not modifications): client-side proof that two different directories both suggesting/holding `<basename>-orchestrator-1` do not collide; daemon-side proof that `claim("x", Some("/a"), p1)` and `claim("x", Some("/b"), p2)` both succeed while `claim("x", Some("/a"), p3)` is refused; daemon-side backward-compat proof that a `None`-cwd claim conflicts with any `Some(cwd)` claim of the same name in both directions; an e2e test opening two different fixture directories that resolve to the same suggested name and confirming both land un-blocked. `tests/CATALOG.md` gets entries for every new `#[spec(...)]` id.
 - [ ] M6 — Rule 12 cross-version manual test run and recorded (see above), `PROTOCOL_VERSION`/`.breaking.md` decision confirmed or corrected based on its result.
-- [ ] M7 — Offer upstream per rule 19 once merged here, alongside/against the still-open fork#192 upstream PR (#539), since both touch the same new-pane-form surface.
+- [ ] M7 — Offer upstream per rule 19 once merged here, building on fork#192's own upstream PR (#539, merged 2026-08-17) rather than racing it, since both touch the same new-pane-form surface.
 
 ## Test plan
 
