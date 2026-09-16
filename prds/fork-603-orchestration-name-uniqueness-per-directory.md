@@ -4,7 +4,7 @@
 **Priority:** High
 **Status:** Planning
 **Related:** `prds/done/fork-192-orchestration-name-as-identity.md` (built the name-only system this extends), fork issue #201 (the daemon claim registry this touches was built to close its TOCTOU race), `prds/done/fork-544-*` shared-clone/workspace-path architecture (confirmed orthogonal — see Problem Statement), PRD #140 (the same-cwd warning this reuses a comparison helper from)
-**Fork-only?** No — the new-pane form and the daemon claim registry are upstream-shared code (fork#192's own M2.0 already offered the name-only system's form-level commit upstream as [vfarcic/dot-agent-deck#539](https://github.com/vfarcic/dot-agent-deck/pull/539), still open). Fix here first per CLAUDE.md rule 19; offer upstream once shipped.
+**Fork-only?** No — the new-pane form and the daemon claim registry are upstream-shared code (fork#192's own M2.0 already offered the name-only system's form-level commit upstream as [vfarcic/dot-agent-deck#539](https://github.com/vfarcic/dot-agent-deck/pull/539), merged 2026-08-17). Fix here first per CLAUDE.md rule 19; offer upstream once shipped.
 
 ## Problem Statement
 
@@ -112,7 +112,7 @@ That concern was about a **per-directory *suggestion counter*** operating undern
 - [ ] M4 — Existing tests updated (builder/signature shape only, same intent): `orchestration/identity/003`, `/004`, `orchestration/guard/002`, `/003` (`src/ui.rs`, ~34528+/35044+/35159+) move from `.with_live_orchestration_names(vec![...])` to `.with_live_orchestration_identities(vec![(dir, name), ...])`; the `identity/02x` daemon claim-race tests (`src/agent_pty.rs`) move to the 3-arg `claim_orchestration_name` signature.
 - [ ] M5 — New tests (previously-impossible surface, not modifications): client-side proof that two different directories both suggesting/holding `<basename>-orchestrator-1` do not collide; daemon-side proof that `claim("x", Some("/a"), p1)` and `claim("x", Some("/b"), p2)` both succeed while `claim("x", Some("/a"), p3)` is refused; daemon-side backward-compat proof that a `None`-cwd claim conflicts with any `Some(cwd)` claim of the same name in both directions; an e2e test opening two different fixture directories that resolve to the same suggested name and confirming both land un-blocked. `tests/CATALOG.md` gets entries for every new `#[spec(...)]` id.
 - [ ] M6 — Rule 12 cross-version manual test run and recorded (see above), `PROTOCOL_VERSION`/`.breaking.md` decision confirmed or corrected based on its result.
-- [ ] M7 — Offer upstream per rule 19 once merged here, alongside/against the still-open fork#192 upstream PR (#539), since both touch the same new-pane-form surface.
+- [ ] M7 — Offer upstream per rule 19 once merged here, building on fork#192's own upstream PR (#539, merged 2026-08-17) rather than racing it, since both touch the same new-pane-form surface.
 
 ## Test plan
 
