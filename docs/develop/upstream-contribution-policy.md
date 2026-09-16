@@ -133,17 +133,13 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 
 **These are not backlog and must not be re-offered.** They are open PRs on `vfarcic/dot-agent-deck`, green and mergeable, waiting on the maintainer's approving review — the fork's maintainer is the author and cannot self-approve, and the `main-protected` ruleset has no bypass actors. Nothing here needs work; it needs someone else's click.
 
-*(Table re-verified against GitHub 2026-08-14. #390, #419 and #427 had all **merged** and were still listed here as awaiting review — the exact drift the "Keep it current" note below warns about, in the direction that makes the queue look more stalled than it is. Four genuinely-open PRs were missing. Re-verify with `gh pr list --repo vfarcic/dot-agent-deck --state open --author prageethw` rather than trusting this table.)*
+*(Table re-verified against GitHub 2026-09-16. The entire 2026-08-14 table had gone stale: #506, #520, #539 and #556 had all **merged**, and #471 was **closed without merging** on 2026-08-19 — moved to the "closed without merging" table below rather than silently dropped, since that table's own rule requires an explicit re-offer/abandon decision rather than deletion. The queue is currently empty. Re-verify with `gh pr list --repo vfarcic/dot-agent-deck --state open --author prageethw` rather than trusting this table.)*
 
 | Upstream PR | Opened | Review state | What |
 |---|---|---|---|
-| [#471](https://github.com/vfarcic/dot-agent-deck/pull/471) | 2026-08-09 | `CHANGES_REQUESTED` | Claim dispatched issues and triage them on dispatch (upstream #421) |
-| [#506](https://github.com/vfarcic/dot-agent-deck/pull/506) | 2026-08-11 | `CHANGES_REQUESTED` | Identify Claude Code hook rules by command, not by the binary's name (upstream #516, #517). **All three requested items were addressed and pushed 2026-08-13; all 10 checks green.** The fork's own fix merged here as PR #240 on 2026-08-11. |
-| [#520](https://github.com/vfarcic/dot-agent-deck/pull/520) | 2026-08-12 | `REVIEW_REQUIRED` | Resolve the deck's command name from `current_exe()` rather than the crate literal (fork #253) |
-| [#539](https://github.com/vfarcic/dot-agent-deck/pull/539) | 2026-08-13 | `REVIEW_REQUIRED` | Suggest and enforce unique orchestration names on the new-orchestration form (fork #192) |
-| [#556](https://github.com/vfarcic/dot-agent-deck/pull/556) | 2026-08-14 | `REVIEW_REQUIRED` | De-duplicate two PRD files and repoint their references |
+| *(none currently open)* | | | |
 
-A `CHANGES_REQUESTED` row is **not** automatically outstanding work — check whether the requested items have already been pushed, as on #506, where the standing review is the only thing left and the author has already responded. Re-review happens on the maintainer's clock.
+A `CHANGES_REQUESTED` row is **not** automatically outstanding work — check whether the requested items have already been pushed (the now-merged #506 was a worked example of exactly this: the standing review was the only thing left after the author had already responded). Re-review happens on the maintainer's clock.
 
 **Why this table exists.** On 2026-08-10 an orchestration asked to offer PRD #421 upstream searched both trackers' *issues*, correctly found upstream #421 open and unimplemented on `upstream/main`, and planned the entire port — which #471 had already delivered the day before. Nothing in this repository recorded that the offer had been made, so the only way to discover it was to query GitHub for PRs. That absence is what made the near-duplicate possible; this table is the fix, and CLAUDE.md rule 20 now requires a `gh pr list --state all` search over both trackers as well as the issue search.
 
@@ -157,6 +153,7 @@ These are **not** in the backlog above — they were offered and did not land. E
 
 | Upstream PR | Commit | What |
 |---|---|---|
+| #471 | `0b44349` | claim dispatched issues and triage them on dispatch (upstream #421, fork PRD #421) — open ~10 days under `CHANGES_REQUESTED`, then closed without merging 2026-08-19. Needs an explicit re-offer or abandon decision; not yet made. |
 | #411 | `205272c` | codex-hooks `write_atomic` preserves destination mode |
 | #409 | `9e0c79d` | work-done output-path collisions — this is fork **#76**, whose symptom (one worker's report archiving another's) recurs in practice |
 | #408 | `10039b9` | make daemon rejections and confirmations visible to the `delegate` caller |
