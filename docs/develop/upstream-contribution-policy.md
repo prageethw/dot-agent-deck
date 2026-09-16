@@ -153,7 +153,7 @@ These are **not** in the backlog above — they were offered and did not land. E
 
 | Upstream PR | Commit | What |
 |---|---|---|
-| #471 | `0b44349` | claim dispatched issues and triage them on dispatch (upstream #421, fork PRD #421) — open ~10 days under `CHANGES_REQUESTED`, then closed without merging 2026-08-19. Needs an explicit re-offer or abandon decision; not yet made. |
+| #471 | `0b44349` | claim dispatched issues and triage them on dispatch (upstream #421, fork PRD #421) — open ~10 days under `CHANGES_REQUESTED`, then closed without merging 2026-08-19. **The re-offer/abandon decision was already made** — `prds/421-issue-triage-labels-and-dispatch-claims.md:3` (jointly decided by @vfarcic and @prageethw, 2026-08-17): #471 implemented Phases 1–2 against a superseded shape and does not merge; the rework lands as a fresh PR citing that document's milestone numbering. |
 | #411 | `205272c` | codex-hooks `write_atomic` preserves destination mode |
 | #409 | `9e0c79d` | work-done output-path collisions — this is fork **#76**, whose symptom (one worker's report archiving another's) recurs in practice |
 | #408 | `10039b9` | make daemon rejections and confirmations visible to the `delegate` caller |
