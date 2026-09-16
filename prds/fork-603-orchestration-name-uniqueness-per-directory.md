@@ -4,7 +4,7 @@
 **Priority:** High
 **Status:** Planning
 **Related:** `prds/done/fork-192-orchestration-name-as-identity.md` (built the name-only system this extends), fork issue #201 (the daemon claim registry this touches was built to close its TOCTOU race), `prds/done/fork-544-*` shared-clone/workspace-path architecture (confirmed orthogonal — see Problem Statement), PRD #140 (the same-cwd warning this reuses a comparison helper from)
-**Fork-only?** No — the new-pane form and the daemon claim registry are upstream-shared code (fork#192's own M2.0 already offered the name-only system's form-level commit upstream as [vfarcic/dot-agent-deck#539](https://github.com/vfarcic/dot-agent-deck/pull/539), still open). Fix here first per CLAUDE.md rule 19; offer upstream once shipped.
+**Fork-only?** No — the new-pane form and the daemon claim registry are upstream-shared code (fork#192's own M2.0 already offered the name-only system's form-level commit upstream as [vfarcic/dot-agent-deck#539](https://github.com/vfarcic/dot-agent-deck/pull/539), merged 2026-08-17). Fix here first per CLAUDE.md rule 19; offer upstream once shipped.
 
 ## Problem Statement
 
