@@ -423,7 +423,7 @@ first — it governs the gates below and overrides anything that conflicts with 
 YOU ARE ALREADY ISOLATED. dot-agent-deck cut this worktree for you and you are
 already on branch agent/dispatch-prd-<n>. So mode is `branch`, and you SKIP every
 branch-or-worktree creation step in the lifecycle: /prd-full step 1, /prd-start's
-branch creation, and /pr-create's "Create feature branch". Stay on
+branch creation, and /prd-done's "Create feature branch". Stay on
 agent/dispatch-prd-<n> and open the PR from it. Do NOT run /worktree-prd — it
 would cut a second worktree off local `main`, outside this pane's cwd.
 
@@ -562,7 +562,7 @@ lifecycle, and it covers what /prd-full does not.
 
 - You are already isolated. dot-agent-deck cut this worktree and you are on
   branch agent/dispatch-prd-<n>. Neither you nor any worker creates a branch or
-  a worktree: skip /pr-create's "Create feature branch" step and open the PR from
+  a worktree: skip /prd-done's "Create feature branch" step and open the PR from
   agent/dispatch-prd-<n>. Do not delegate /worktree-prd to anyone.
 - Nobody is watching this pane. `dispatch` is fire-and-forget with no return
   edge, so your notifications are the only channel out of this unit — treat the

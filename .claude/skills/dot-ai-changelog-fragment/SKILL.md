@@ -1,6 +1,6 @@
 ---
 name: dot-ai-changelog-fragment
-description: Create changelog fragment for release notes. Invoke during /pr-create workflow during the first push to the PR.
+description: Create changelog fragment for release notes. Invoke during implementation, at the first push to the PR — before `/prd-done` marks the PR ready and merges it.
 user-invocable: true
 ---
 
