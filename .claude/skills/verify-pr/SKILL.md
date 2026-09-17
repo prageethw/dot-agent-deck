@@ -13,7 +13,7 @@ Someone else's PR is open and a decision is needed on it. "Someone else" include
 Not this skill:
 
 - **Several PRs, or no PR named** → `/pr-review-queue`, which builds the queue of open PRs where the ball is in your court and dispatches one isolated unit per PR. *"Review the open PRs on this repo"* or *"what is waiting on me"* is that skill, not this one — it matches this description on every content word, so check for a number before assuming.
-- **Your own in-flight work** → `/pr-create` owns that path.
+- **Your own in-flight work** → `/prd-done` owns that path.
 - **A quick static read with no build** → the built-in `/review`.
 - **Your uncommitted working diff** → `/code-review`.
 
@@ -286,7 +286,7 @@ git worktree prune
 
 Remove `../dot-agent-deck-pr-<n>-base` the same way if a baseline worktree was created.
 
-`-D`, and the reason is worth knowing: `git branch -d` **always refuses** a review branch, because it holds the contributor's commits and those are by definition not on `main` — squash-merging the PR does not change that, since the commits never land verbatim. This paragraph used to say the same refusal was "real signal (work that should have been merged and wasn't)" over in `/tag-release`, which its own preceding sentence contradicted: ancestry says nothing about a squash merge anywhere, not just here. Measured 2026-09-14, `-d` would have refused all 13 correctly-merged dispatch branches; issue #1089 moved `/tag-release` to `-D` gated on the merged-PR head SHA that its `cleanup.sh` vets, which is a check that actually distinguishes the two cases. The branch is a disposable local copy of `refs/pull/<n>/head`, which lives on GitHub and `setup.sh` re-fetches on demand, so deleting it destroys nothing. That is exactly why the `git log` line comes first: it is the one thing `-D` skips, so check that no commit in there is *yours* before dropping it.
+`-D` rather than `/tag-release`'s `-d` here, and the reason is worth knowing: `git branch -d` **always refuses** a review branch, because it holds the contributor's commits and those are by definition not on `main` — squash-merging the PR does not change that, since the commits never land verbatim. In `/tag-release` that refusal is real signal (work that should have been merged and wasn't); here it is guaranteed noise. The branch is a disposable local copy of `refs/pull/<n>/head`, which lives on GitHub and `setup.sh` re-fetches on demand, so deleting it destroys nothing. That is exactly why the `git log` line comes first: it is the one thing `-D` skips, so check that no commit in there is *yours* before dropping it.
 
 `git worktree remove` refuses when the worktree has local changes. `checks.sh` keeps its logs under `target/`, which is gitignored, so a clean review never trips this — if it does trip, something was edited in there. Report it and let the user decide rather than reaching for `--force`.
 

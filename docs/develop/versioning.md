@@ -32,7 +32,7 @@ While the major version is `0`, the bump rules are deliberately shifted down one
 | feature (new user-facing functionality) | **patch** (`0.31.1 → 0.31.2`) | minor |
 | bugfix | **patch** | patch |
 
-The consequence worth internalizing: while in `0.x`, a feature-only release is a *patch* release, and **only a protocol-breaking change bumps the minor**. So the minor digit stops meaning "has new features" and starts meaning "compatibility broke" — if `0.31.x` becomes `0.32.0`, an older peer can no longer safely talk to a `0.32.x` one. This is already implemented on the release side in [`.claude/skills/tag-release/analyze.sh`](../../.claude/skills/tag-release/analyze.sh) (the `breaking → minor`, `feature/bugfix → patch` recalibration); the table above is the policy that script encodes. That script has two callers and they run the same code: a maintainer, from `/tag-release` Step 1, to see the proposed version; and `.github/workflows/tag-release.yml`, to re-derive it at release time and refuse when it disagrees with the version the maintainer supplied.
+The consequence worth internalizing: while in `0.x`, a feature-only release is a *patch* release, and **only a protocol-breaking change bumps the minor**. So the minor digit stops meaning "has new features" and starts meaning "compatibility broke" — if `0.31.x` becomes `0.32.0`, an older peer can no longer safely talk to a `0.32.x` one. This is already implemented on the release side in the vendored `.claude/skills/dot-ai-tag-release/analyze.sh` (the `breaking → minor`, `feature/bugfix → patch` recalibration); the table above is the policy that script encodes.
 
 ## Cross-version manual-test discipline
 
@@ -48,7 +48,7 @@ The consequence worth internalizing: while in `0.x`, a feature-only release is a
 - **Decline the mismatch prompt.** With agents present the handshake asks instead of restarting; press any key other than `S`. Declining returns `HandshakeOutcome::ProceedOnExisting`, which attaches to the older daemon unchanged (PRD #161 D4, the never-strand rule). Accepting restarts the daemon on the new binary and lands you in the same false pass, with the agents stopped as well.
 - **Confirm before trusting the result:** the daemon serving the new TUI should still have the previous release's binary as its `exe`.
 
-If delegate or hooks silently stop flowing, the change broke the contract behind a stable wire — bump `PROTOCOL_VERSION` (if the wire shape moved) and/or add a `.breaking.md` fragment so the release is versioned as a compatibility break. This step is enforced in-repo by **CLAUDE.md permanent instruction 12**, which every agent in this project loads and follows, and by the project-local [`pr-create`](../../.claude/skills/pr-create/SKILL.md) skill, which asks the question as part of opening a PR.
+If delegate or hooks silently stop flowing, the change broke the contract behind a stable wire — bump `PROTOCOL_VERSION` (if the wire shape moved) and/or add a `.breaking.md` fragment so the release is versioned as a compatibility break. This step is enforced in-repo by **CLAUDE.md permanent instruction 12**, which every agent in this project loads and follows; the canonical `dot-ai-prd-done` skill in the `dot-ai` repo carries the same check, and syncing the vendored copy under `.claude/skills/dot-ai-prd-done/` is a separate follow-up.
 
 ## Where the reported version comes from, and how to inject it
 
@@ -110,6 +110,6 @@ The orphaning recurs on **every** sync by construction, so a freshly-cut fork ta
 
 ## Where this lives across repos
 
-- The **0.x recalibration** in `analyze.sh` is generically correct and was contributed to the shared skill **source** (the `prompts` repo), but the copy here is no longer vendored: issue #1089 forked `dot-ai-tag-release` to the project-local `tag-release` for the same reason #1052 forked `pr-create`, so it is now ours to edit and no sync will revert or update it. The generic changelog-fragment guidance stays in the `dot-ai-changelog-fragment` mirror, which is *not* forked.
+- The **0.x recalibration** in `analyze.sh` and the generic changelog-fragment guidance are generically correct and belong in the shared skill **source** (the `prompts` repo); the vendored copy here is kept in sync.
 - The **dot-agent-deck-specific** parts — this breaking definition and the protocol-surface specifics — stay local (this doc + the `pyproject.toml` comment).
-- The **cross-version manual-test step** and the "did this change the TUI↔daemon contract?" prompt are enforced in-repo by **CLAUDE.md permanent instruction 12** (loaded by every agent, including the `release` role that runs `/pr-create`) and by the `pr-create` skill itself. That skill is project-local and owned here — it was forked out of the `dot-ai` mirror under issue #1052 precisely so this check cannot be reverted by a sync.
+- The **cross-version manual-test step** and the "did this change the TUI↔daemon contract?" prompt are enforced in-repo by **CLAUDE.md permanent instruction 12** (loaded by every agent, including the `release` role that runs `/prd-done`). The same check lives canonically in the `dot-ai` repo's `dot-ai-prd-done` skill; the copy under `.claude/skills/dot-ai-prd-done/` here is vendored, and folding the check into that vendored copy + its upstream source is a separate follow-up.
