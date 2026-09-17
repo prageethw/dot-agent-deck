@@ -228,13 +228,6 @@ mod paths;
 /// `scripts/check-pin-lockstep.sh`, which CI's `devbox` job also runs directly.
 #[cfg(all(test, unix))]
 mod pin_lockstep;
-/// PR #966: the authorization boundary the PR-review agent's verdict crosses to
-/// reach the job that casts an approving review with an App credential. Which
-/// comments count as a verdict is a runtime property — the first version
-/// accepted a forged one from any GitHub account. Tests only; the rule lives in
-/// `.github/scripts/pr_review_common.py`, driven here under `python3`.
-#[cfg(test)]
-mod pr_review_verdict;
 /// Issue #1019 review: `scripts/reap-orphans.sh` SIGKILLs processes selected by
 /// parsing `/proc`, and every property that makes that safe — the never-kill
 /// list, the two-part MCP identification, the stat-field arithmetic past a comm
@@ -790,8 +783,8 @@ fn main() -> ExitCode {
     // single `cargo xtask` alias can drive both linkage-check and
     // docs. `cargo xtask docs --tests` → docs generator;
     // anything else (including no first arg or `linkage-check`) →
-    // the fifteen Decision-7 / Decision-30 / issue #322 / fork #148 / issue
-    // #259 / fork #281 checks below (CHECK_COUNT).
+    // the sixteen Decision-7 / Decision-30 / issue #322 / fork #148 / issue
+    // #259 / fork #281 / 14th fork/upstream sync checks below (CHECK_COUNT).
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("docs")) {
         return run_docs(&args[1..]);

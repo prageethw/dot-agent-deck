@@ -852,7 +852,7 @@ jobs:
             printf "  \`\`\`sh\n  xattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n  \`\`\`\n\n"
             printf "**Linux** (\`.deb\`) -- nothing blocks this install and nothing warns you: \`dpkg -i\` does not verify package signatures, so the checks below are the only ones anybody makes.\n\n"
             printf "**Verifying what you downloaded.** Every asset on this release carries [build provenance](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), which is a stronger claim than a checksum: it says this exact file was produced by this repository's release workflow, from a named commit, rather than merely that it matches a number printed on the same page that served it.\n\n"
-            printf "\`\`\`sh\ngh attestation verify <the-file-you-downloaded> --repo vfarcic/dot-agent-deck\n\`\`\`\n\n"
+            printf "\`\`\`sh\ngh attestation verify <the-file-you-downloaded> --repo %s\n\`\`\`\n\n" "$REPO"
             printf "Signing and notarization -- which is what would stop macOS warning you in the first place -- are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757.\n"
           } | gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file -
 

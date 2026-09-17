@@ -7,8 +7,12 @@
 //! before touching anything this check names. In short: (1) upstream's
 //! automated PR-review bot
 //! (`.github/workflows/pr-review-batch.yml`/`pr-review.lock.yml`/
-//! `pr-review.md`, `.github/pr-review-rubric.md`) contradicts CLAUDE.md rule
-//! 8's fork policy that no bot reviews this fork's PRs; (2) the
+//! `pr-review.md`, `.github/pr-review-rubric.md`, plus its implementation —
+//! `.github/scripts/pr_review_common.py`, `pr_review_select.py`,
+//! `pr_review_vote.py`, and the `xtask/linkage-check` test module gating
+//! them, `pr_review_verdict.rs`, all missed by the original strip and
+//! removed only in a fix-round commit after the 14th sync) contradicts
+//! CLAUDE.md rule 8's fork policy that no bot reviews this fork's PRs; (2) the
 //! orchestrator's step-1 human plan-approval gate — the literal sentence this
 //! check pins in `.dot-agent-deck.toml` — is the standing gate CLAUDE.md rule
 //! 27 relies on, and upstream's rebase carries a hunk that removes it in
@@ -43,6 +47,10 @@ const FORBIDDEN_FILES: &[&str] = &[
     ".github/workflows/pr-review.md",
     ".github/pr-review-rubric.md",
     ".github/workflows/tag-release.yml",
+    ".github/scripts/pr_review_common.py",
+    ".github/scripts/pr_review_select.py",
+    ".github/scripts/pr_review_vote.py",
+    "xtask/linkage-check/src/pr_review_verdict.rs",
 ];
 
 /// Directories whose mere existence — of any file under them, not just the
