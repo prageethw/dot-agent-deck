@@ -9914,16 +9914,32 @@ impl AppState {
         // Dropping it costs a lost report in a case that is already a mis-route;
         // delivering it costs a forged solicitation.
         //
-        // The fallback — the pane's CURRENT live agent, resolved immediately
-        // before the call — is therefore reserved for the genuinely UNSOLICITED
-        // arm, where there is no commissioning delegation to name an identity at
-        // all. It is deliberately weaker: it does not prove the recipient is the
-        // conversation that asked for anything (nothing asked), but it does bind
-        // the write to a concrete agent, so the primitive's post-lock
-        // re-validation still refuses a pane that changes hands between here and
-        // the write. An orchestrator pane with no live agent yields no identity at
-        // all and the feedback is dropped into this log, which is the same outcome
-        // the unguarded write reached by failing.
+        // The fallback is therefore reserved for the genuinely UNSOLICITED arm,
+        // where there is no commissioning delegation to name an identity at all
+        // (either truly unsolicited, or a real delegation whose idle-worker
+        // detector was disabled, so no `arm_outstanding_delegation` watch was
+        // ever armed for it — `WorkDoneProvenance`'s doc names this as the one
+        // shape `retire_delegation_commission` alone cannot tell apart from
+        // "never delegated").
+        //
+        // Fix-round note (14th upstream sync, `handle_work_done_refuses_feedback_into_a_pane_reused_since_the_delegation`):
+        // this used to read `registry.pane_current_agent_id(&orch_pane_id)` —
+        // the pane's CURRENT live agent, resolved immediately before the call —
+        // which does not prove the recipient is any conversation that asked for
+        // anything, NOR that it is even the SAME conversation the delegation was
+        // commissioned under: a bare `spawn_agent` reusing `orch_pane_id` after
+        // its original occupant closed (never a `respawn_agent_for_pane`, the
+        // only legitimate handover) produces a fresh, unrelated live agent that
+        // this fallback would happily authorize. `authorized_occupant` is the
+        // fix — the SAME per-pane, self-clearing-only-on-legitimate-respawn
+        // ledger `agent_pty.rs`'s own doc already lists `handle_work_done`
+        // feedback as one of the four writers it is meant to guard (a claim this
+        // fallback did not actually honour until now). For the ordinary,
+        // never-reused case the two calls return the same value, so this closes
+        // the pane-reuse gap without narrowing the legitimate unsolicited path
+        // at all. An orchestrator pane with no live agent yields no identity at
+        // all and the feedback is dropped into this log, which is the same
+        // outcome the unguarded write reached by failing.
         let expected_orchestrator_agent_id = match commissioning_orchestrator {
             Some((commissioned_pane, commissioned_agent)) if commissioned_pane == orch_pane_id => {
                 Some(commissioned_agent)
@@ -9939,7 +9955,7 @@ impl AppState {
                 );
                 return;
             }
-            None => registry.pane_current_agent_id(&orch_pane_id),
+            None => registry.authorized_occupant(&orch_pane_id),
         };
         let Some(expected_orchestrator_agent_id) = expected_orchestrator_agent_id else {
             warn!(

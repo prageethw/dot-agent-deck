@@ -19,10 +19,19 @@
 //! favour of "keep the plan internal, do not wait for sign-off, go straight
 //! to execution", bundled with a `release`-role hunk pointing at a new
 //! `/pr-create` skill this fork declined in place of `/prd-done`; (3)
-//! upstream's tag-release ruleset-bypass-avoidance automation
-//! (`.github/workflows/tag-release.yml`, `.claude/skills/tag-release/`)
-//! solves a problem this fork's own `main` does not have, since it carries no
-//! branch-protection ruleset at all.
+//! upstream's tag-release **workflow-dispatch automation specifically**
+//! (`.github/workflows/tag-release.yml`) solves a problem this fork's own
+//! `main` does not have, since it carries no branch-protection ruleset at
+//! all. Note item (3) is narrower than the sync originally declined: the same
+//! upstream commit also carried a genuine bug fix to `cleanup.sh`'s merge
+//! detection (SHA-vetted PR state instead of `git branch -d` ancestry, which
+//! measurably false-positives on squash merges) bundled with the workflow
+//! automation — that fix was restored at
+//! `.claude/skills/tag-release/{cleanup.sh,analyze.sh,SKILL.md}` in a
+//! fix-round commit after the 14th sync (rule 24 case 1: a genuine bug fix,
+//! separable from the ruleset-bypass-avoidance automation, which remains
+//! declined). Only `.github/workflows/tag-release.yml` itself stays forbidden
+//! below; the `.claude/skills/tag-release/` directory no longer is.
 //!
 //! The forcing reason this is a `linkage-check` rule and not only a doc note:
 //! all three items came in on the sync's own rebase as clean, non-conflicting
@@ -54,8 +63,13 @@ const FORBIDDEN_FILES: &[&str] = &[
 ];
 
 /// Directories whose mere existence — of any file under them, not just the
-/// bare directory — means one of the three declined items resurfaced.
-const FORBIDDEN_DIRS: &[&str] = &[".claude/skills/tag-release", ".claude/skills/pr-create"];
+/// bare directory — means one of the declined items resurfaced.
+///
+/// `.claude/skills/tag-release` is deliberately NOT here — see the module
+/// doc's item (3) note: that directory now holds a fork-owned, genuine bug
+/// fix, not the declined item. `.github/workflows/tag-release.yml` (the
+/// actual declined automation) is still forbidden via `FORBIDDEN_FILES`.
+const FORBIDDEN_DIRS: &[&str] = &[".claude/skills/pr-create"];
 
 /// The step-1 human plan-approval gate sentence (CLAUDE.md rule 27's standing
 /// gate). Upstream's declined rebase hunk replaces this instruction with "keep
@@ -100,6 +114,22 @@ pub fn run(root: &Path) -> Vec<String> {
                      step-1 human plan-approval gate looks altered or removed — {POINTER}"
                 ));
             }
+        }
+        // Matches checks 14/15's own skip pattern (`main.rs`'s
+        // `resolve_base`/origin-main-not-resolvable handling): a synthetic
+        // fixture repo (this rule's own self-tests, `duplicate_catalog_id.rs`
+        // and `resurrected_changelog_fragment.rs`) has no `.dot-agent-deck.toml`
+        // at all, because it is not this project's checkout — that is a
+        // precondition that does not apply here, not evidence the gate
+        // sentence was altered. A file that DOES exist but fails to read for
+        // any other reason (permissions, an `Err` kind other than
+        // `NotFound`) still fails loudly, since that is not the "wrong
+        // context" case this skip exists for.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "linkage-check: [16] skipped ({CONFIG_PATH} not present — not this project's \
+                 checkout, e.g. a synthetic fixture repo)"
+            );
         }
         Err(e) => failures.push(format!(
             "failed to read {CONFIG_PATH}: {e} — cannot verify the step-1 plan-approval gate \
@@ -239,11 +269,18 @@ mod tests {
         assert!(failures[0].contains("plan-approval gate"));
     }
 
+    /// A completely missing config file means "not this project's checkout"
+    /// (a synthetic fixture repo, e.g. `duplicate_catalog_id.rs`'s and
+    /// `resurrected_changelog_fragment.rs`'s own self-tests, which run the
+    /// real `xtask-linkage-check` binary against a tempdir with no
+    /// `.dot-agent-deck.toml` at all) — matching checks 14/15's own
+    /// precondition-not-applicable skip, not a failure. A config file that
+    /// DOES exist but is missing the gate sentence is still a failure —
+    /// see `a_removed_gate_sentence_fails` above.
     #[test]
-    fn a_missing_config_file_fails_rather_than_silently_passing() {
+    fn a_missing_config_file_is_skipped_not_failed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let failures = run(tmp.path());
-        assert_eq!(failures.len(), 1, "got {failures:?}");
-        assert!(failures[0].contains("failed to read"));
+        assert_eq!(failures, Vec::<String>::new(), "got {failures:?}");
     }
 }

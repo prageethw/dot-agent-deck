@@ -2868,14 +2868,22 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                         Some(SendResult::Applied),
                         true,
                     )
-                // PRD #20 R20-003 finding #4 (see `compute_write_and_submit_outcome`'s
-                // doc comment in `src/daemon_protocol.rs`): the strict "reject a
-                // None-named session" rule is scoped to a LIVE INTERACTIVE
-                // (attached) pane, deliberately — an unattached/headless delivery
-                // whose agent identity is confirmed proceeds regardless of whether
-                // a current session is recorded, since finding #4's threat is a
-                // stale prompt surfacing in a conversation someone is watching.
-                && unattached_session_guard_observation == (Some(SendResult::Applied), true)
+                // Fix-round note (14th upstream sync): this sub-scenario omits
+                // `expected_session_id` entirely, so it exercises issue #608's
+                // UNNAMED-session arm, not PRD #20 R20-003 finding #4's NAMED-session
+                // one — the comment that used to sit here invoked finding #4's
+                // original attached-only carve-out, but that carve-out was never
+                // finding #4's to begin with for this arm. `compute_write_and_submit_outcome`'s
+                // own doc (`src/daemon_protocol.rs`) states plainly, and unchanged since
+                // issue #608 predates this sync (commit `83893cc4`), that the unnamed
+                // arm "deliberately does not read" attachment: a pane that HAS a
+                // current hook session is a conversation the daemon knows about that
+                // the caller did not name, so the write is refused (`Stale`)
+                // regardless of whether anything is attached to watch it. This
+                // sub-scenario's fixture applies a genuine `SessionStart`
+                // establishing exactly such a current session, so `Stale`/no-leak is
+                // the correct, already-documented outcome — not `Applied`.
+                && unattached_session_guard_observation == (Some(SendResult::Stale), false)
                 && sessionless_observation == (Some(SendResult::Applied), true),
             "guarded paned delivery must fail closed on absent identity without weakening valid sends; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target}), missing_agent={missing_agent_observation:?}, session_guard={session_guard_observation:?}, unattached_session_guard={unattached_session_guard_observation:?}, sessionless={sessionless_observation:?}",
             same_agent_result,

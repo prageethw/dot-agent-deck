@@ -1206,12 +1206,27 @@ impl CleanupOutput {
             .collect()
     }
 
+    /// Branch names offered in `LOCAL_BRANCHES:`/`REMOTE_BRANCHES:` — the
+    /// `<branch> <sha>` shape the SHA-vetted `cleanup.sh` (restored from the
+    /// 14th upstream sync's declined-then-un-declined tag-release skill,
+    /// `.claude/skills/tag-release/cleanup.sh`) prints so the skill's delete
+    /// step can gate `-D` on the vetted tip. A branch name can never contain
+    /// a space (git disallows it), so splitting once on the first space and
+    /// keeping only the name is unambiguous — this file's callers care about
+    /// which branches were OFFERED, never the SHA itself.
+    fn branch_names(lines: Vec<String>) -> Vec<String> {
+        lines
+            .into_iter()
+            .filter_map(|line| line.split(' ').next().map(str::to_string))
+            .collect()
+    }
+
     fn local_branches(&self) -> Vec<String> {
-        self.section("LOCAL_BRANCHES:")
+        Self::branch_names(self.section("LOCAL_BRANCHES:"))
     }
 
     fn remote_branches(&self) -> Vec<String> {
-        self.section("REMOTE_BRANCHES:")
+        Self::branch_names(self.section("REMOTE_BRANCHES:"))
     }
 
     fn degraded(&self) -> bool {

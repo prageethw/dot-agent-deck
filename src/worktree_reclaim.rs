@@ -351,6 +351,19 @@ const GIT_DIR_UNRESOLVED_UNKNOWN_REASON: &str = "this worktree's own git metadat
 const GH_LOGIN_UNRESOLVED_UNKNOWN_REASON: &str = "no ownership marker is present and `gh api user` could not resolve a login (gh absent, \
      unauthenticated, or failing) -- worktree list keeps working rather than guessing an identity";
 
+/// Fix-round note (14th upstream sync, `worktree_reclaim_027`): the marker
+/// FILE exists at this path, but it is zero bytes — the residue of
+/// `std::fs::write`'s `File::create`-then-`write_all` torn mid-write
+/// (issue #946). Distinct from [`LEGACY_MARKER_UNKNOWN_REASON`] (a marker
+/// that has real, if identity-less, content) and from the "no marker at
+/// all" branch (which resolves a human owner) — an empty marker is neither:
+/// it is evidence SOMETHING tried to write a deck-ownership claim here and
+/// failed partway, which is the opposite of a human hand-made worktree, so
+/// reporting it as `Human` would be actively wrong, not merely uninformative.
+const TORN_MARKER_UNKNOWN_REASON: &str = "ownership marker exists but is zero bytes -- the residue of a write that was truncated \
+     before any content landed (issue #946); it proves nothing, not even deck-creation, and is \
+     never read as a human worktree either";
+
 /// Resolve a worktree's reporting owner (PRD fork#298 M1.0). `human_cache`
 /// is shared across one [`examine_worktrees`] call so that, in a repo with
 /// several unmarked (hand-made) worktrees, the `gh api user` round trip
@@ -365,7 +378,21 @@ fn resolve_worktree_owner(
     match owned_git_dir(repo_dir, worktree_path) {
         Some(git_dir) => {
             let marker_path = git_dir.join(OWNER_MARKER_FILENAME);
-            if marker_path.is_file() {
+            // Fix-round note (14th upstream sync, `worktree_reclaim_027`):
+            // matches `ownership_of`'s own non-empty check just above in this
+            // file, for the same reason (issue #946) — a zero-byte marker is
+            // torn-write residue, not a claim, and reporting it as
+            // `owner_kind: "unknown"` with the LEGACY reason ("it proves
+            // deck-creation") would misdescribe a worktree `ownership_of`
+            // has already, correctly, reported as `Foreign`. A three-way
+            // read (rather than `is_file()` alone) is what lets the zero-byte
+            // case be told apart from BOTH "no marker at all" (human) and "a
+            // marker with real, if identity-less, content" (legacy) below.
+            let marker_metadata = std::fs::metadata(&marker_path);
+            if marker_metadata
+                .as_ref()
+                .is_ok_and(|m| m.is_file() && m.len() > 0)
+            {
                 // Reads the marker directly via `read_marker_owner` rather
                 // than going through `owner_of` (review F2 / audit F3):
                 // `owner_of` would re-resolve `owned_git_dir` a THIRD
@@ -381,6 +408,10 @@ fn resolve_worktree_owner(
                     None => WorktreeOwner::Unknown {
                         reason: LEGACY_MARKER_UNKNOWN_REASON,
                     },
+                }
+            } else if marker_metadata.is_ok_and(|m| m.is_file()) {
+                WorktreeOwner::Unknown {
+                    reason: TORN_MARKER_UNKNOWN_REASON,
                 }
             } else {
                 human_cache.get_or_insert_with(resolve_human_owner).clone()
@@ -1120,13 +1151,34 @@ pub(crate) fn owned_git_dir(repo_dir: &Path, worktree_path: &Path) -> Option<Pat
 /// Whether the deck can prove it created `worktree_path`, examined as part
 /// of enumerating `repo_dir`: [`owned_git_dir`] resolves and
 /// containment-checks the worktree's own git metadata dir, and the marker
-/// file must exist there. Any resolution failure or containment miss
-/// already returns `None` from [`owned_git_dir`], which this maps to
-/// `Foreign` — unknown must never resolve to `Ours`.
+/// file must exist there AND be non-empty. Any resolution failure or
+/// containment miss already returns `None` from [`owned_git_dir`], which
+/// this maps to `Foreign` — unknown must never resolve to `Ours`.
+///
+/// Fix-round note (14th upstream sync, `worktree_reclaim_027`): this used to
+/// check only `.is_file()`. Issue #946 (`worktree_owner::reads_as_claim`)
+/// already established that a zero-byte marker — the residue of
+/// `std::fs::write`'s `File::create`-then-`write_all` torn mid-write
+/// (ENOSPC, EIO, a killed process) — proves nothing, and a merged, clean
+/// worktree reading it as a claim is the one verdict
+/// (`Verdict::Remove`) that deletes a directory with no confirmation. That
+/// fix landed in `worktree_owner.rs`'s own gate, but this function is a
+/// SEPARATE, independent implementation of the same question (see its own
+/// module docs on why splitting the writer and reader is how they drift) —
+/// #946 never touched it, so the reclaim/verdict report path this function
+/// feeds kept reading a torn write as ownership. `metadata().len() > 0`
+/// mirrors `reads_as_claim` exactly, so the two gates can no longer answer
+/// this question differently.
 fn ownership_of(repo_dir: &Path, worktree_path: &Path) -> Ownership {
     match owned_git_dir(repo_dir, worktree_path) {
-        Some(git_dir) if git_dir.join(OWNER_MARKER_FILENAME).is_file() => Ownership::Ours,
-        _ => Ownership::Foreign,
+        Some(git_dir) => {
+            let marker = git_dir.join(OWNER_MARKER_FILENAME);
+            match std::fs::metadata(&marker) {
+                Ok(m) if m.is_file() && m.len() > 0 => Ownership::Ours,
+                _ => Ownership::Foreign,
+            }
+        }
+        None => Ownership::Foreign,
     }
 }
 

@@ -1,6 +1,6 @@
 ---
 name: close-not-must-fix
-description: Review every open bug and PRD on prageethw/dot-agent-deck and close the ones that are clearly not required — optional, cosmetic, superseded, out of supported scope, or not worth carrying as active work. Read-only against code (verification only, never implementation). Uses a conservative standard: leaves anything genuinely uncertain open. Use when the user asks to prune the must-fix queue, close non-essential bugs/PRDs, or trim the backlog down to what actually needs doing.
+description: 'Review every open bug and PRD on prageethw/dot-agent-deck and close the ones that are clearly not required — optional, cosmetic, superseded, out of supported scope, or not worth carrying as active work. Read-only against code (verification only, never implementation). Uses a conservative standard: leaves anything genuinely uncertain open. Use when the user asks to prune the must-fix queue, close non-essential bugs/PRDs, or trim the backlog down to what actually needs doing.'
 user-invocable: true
 ---
 

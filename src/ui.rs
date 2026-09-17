@@ -5492,9 +5492,25 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
 /// and is refreshed on EVERY frame — that half is what lets a late-identifying
 /// producer still arm its retries.
 fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
+    // Fix-round note (14th upstream sync, `prompt/pane-input/034`): this used
+    // to read `snapshot.pane_hook_session_id(pane_id)` directly, which is
+    // `Some` too early — `AppState`'s hook-session map establishes on the
+    // FIRST event a pane ever sees, announced or not (state.rs's
+    // `None => !provisional_start` branch), so a producer's own unattributed
+    // noise (`src/wrap.rs`'s generic stdout classifier, exactly the shape
+    // issue #422 already refuses to trust as CONFIRMATION evidence in
+    // [`prompt_submission_evidence`]) could get bound here as "the
+    // conversation we are about to write into." When the real producer then
+    // genuinely announced itself moments later, [`delivery_target_changed`]
+    // read that as the pane rolling over and abandoned a delivery nothing
+    // endangered — clearing the prompt without ever finalizing the role.
+    // [`pane_announced_generation`] is the ANNOUNCED-only discriminator the
+    // block below already uses for the identical reason (#684); using it here
+    // too makes both blocks agree, which is what "one pinned policy across all
+    // three paths" (this function's own doc) actually requires.
     if delivery.expected_session_id.is_none()
         && delivery.attempts == 0
-        && let Some(current) = snapshot.pane_hook_session_id(pane_id)
+        && let Some(current) = pane_announced_generation(snapshot, pane_id)
     {
         adopt_generation(delivery, current);
     }
@@ -49093,11 +49109,16 @@ mod tests {
         let now = std::time::Instant::now();
         let tab_id: TabId = 35;
         let mut ui = default_ui();
-        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
-        ui.orchestration_ready_since.insert(
+        // Issue #1005/#1014: `ready_prompt_snapshot` never announces a
+        // conversation, so `spawn_time_agent_ready`'s fast path never opens —
+        // the only door in is the 10-second `timeout_ready` fallback, same as
+        // the already-passing sibling `prompt/pane-input/030`. The anchor is
+        // aged past that threshold up front so every call below is gated only
+        // by backoff/confirmation, never by spawn-time readiness.
+        ui.orchestration_prompt_anchor_at.insert(
             tab_id,
-            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
-                .expect("ready timestamp"),
+            now.checked_sub(std::time::Duration::from_secs(11))
+                .expect("aged anchor timestamp"),
         );
         let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
         let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
@@ -49212,11 +49233,11 @@ mod tests {
         let now2 = std::time::Instant::now();
         let tab_id2: TabId = 35;
         let mut ui2 = default_ui();
-        ui2.orchestration_prompt_anchor_at.insert(tab_id2, now2);
-        ui2.orchestration_ready_since.insert(
+        // Same #1005/#1014 fallback reasoning as the first scenario above.
+        ui2.orchestration_prompt_anchor_at.insert(
             tab_id2,
-            now2.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
-                .expect("ready timestamp"),
+            now2.checked_sub(std::time::Duration::from_secs(11))
+                .expect("aged anchor timestamp"),
         );
         let mut snapshot2 = ready_prompt_snapshot(PANE_ID_2, AGENT_ID_2);
         let mut role_statuses2 = vec![OrchestrationRoleStatus::Waiting];
@@ -49885,14 +49906,20 @@ mod tests {
         let mut ui = default_ui();
         let tab_id: TabId = 30040;
         let mut now = std::time::Instant::now();
-        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
-        // Readiness already satisfied before the first call, so every
-        // attempt below is gated only by backoff, never by the spawn-time
-        // buffer.
-        ui.orchestration_ready_since.insert(
+        // Issue #1005/#1014: `ready_prompt_snapshot` never announces a
+        // conversation (no `SessionStart` at all — this pane, per the test's
+        // own scenario, never reports the prompt submitted), so
+        // `spawn_time_agent_ready`'s fast path can never open here — the only
+        // door in is the 10-second `timeout_ready` fallback, same as the
+        // already-passing sibling `prompt/pane-input/030`. The anchor is aged
+        // past that 10s threshold up front (rather than stamped at `now`,
+        // which `now` — advanced by 1ms per iteration below, never by 10s —
+        // would never catch up to) so every attempt below is gated only by
+        // backoff, never by spawn-time readiness.
+        ui.orchestration_prompt_anchor_at.insert(
             tab_id,
-            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
-                .expect("ready timestamp"),
+            now.checked_sub(std::time::Duration::from_secs(11))
+                .expect("aged anchor timestamp"),
         );
         let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
         let role_panes = [PANE_ID.to_string()];

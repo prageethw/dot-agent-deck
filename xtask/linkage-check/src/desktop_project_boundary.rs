@@ -279,6 +279,26 @@ const PENDING_M6: &[(&str, &str, &str)] = &[];
 /// Run the rule over the checkout at `root`. Returns rendered failures, already
 /// carrying the rule sentence; an empty vector is a pass.
 pub fn run(root: &Path) -> Vec<String> {
+    // No top-level `desktop/` at all means `root` is not this project's
+    // checkout — a synthetic fixture repo (e.g. `duplicate_catalog_id.rs`'s
+    // and `resurrected_changelog_fragment.rs`'s own self-tests, which drive
+    // the real `xtask-linkage-check` binary against a throwaway tempdir with
+    // only a `[workspace]` `Cargo.toml` and a `tests/` directory), not a
+    // dot-agent-deck checkout whose desktop crate moved. That is check 16's
+    // and checks 14/15's own "precondition does not apply here" skip, not a
+    // failure — matches `fork_declined_items::run`'s `.dot-agent-deck.toml`
+    // handling. `desktop/src-tauri/src` specifically going missing while
+    // `desktop/` itself is present IS the real regression this rule exists to
+    // catch (the desktop crate moved or was restructured under a real
+    // dot-agent-deck checkout) and still fails loudly below.
+    if !root.join("desktop").is_dir() {
+        eprintln!(
+            "linkage-check: [12] skipped (no top-level desktop/ directory — not this project's \
+             checkout, e.g. a synthetic fixture repo)"
+        );
+        return Vec::new();
+    }
+
     let dir = root.join(DESKTOP_SRC);
     if !dir.is_dir() {
         return vec![format!(

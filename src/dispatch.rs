@@ -2348,6 +2348,20 @@ mod tests {
             ],
         );
 
+        // Fix-round note (14th upstream sync): issue #490's clone gate now runs
+        // unconditionally near the top of `handle_dispatch`, before any worktree
+        // provisioning — without a reachable daemon it fails closed with its OWN
+        // message ("could not confirm no other live orchestration...") and this
+        // test's actual subject (the coordinator-context-publish refusal) is
+        // never reached. Stub a daemon reporting no live sibling so the gate
+        // takes its `Ok(false)` branch and falls through, mirroring the sibling
+        // happy-path test `an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task`
+        // above, which already does this for the identical reason.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let state: crate::state::SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
