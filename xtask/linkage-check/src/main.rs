@@ -96,6 +96,20 @@
 //!      remote, a shallow/PR clone) — see
 //!      [`check_cross_branch_catalog_collisions`] for the full
 //!      design.
+//!  16. None of three upstream governance/infra changes the maintainer
+//!      reviewed and explicitly declined during the 14th fork/upstream
+//!      sync has resurfaced — no forbidden file/directory (the
+//!      automated PR-review bot workflow files, `.claude/skills/
+//!      tag-release/`, `.claude/skills/pr-create/`) exists in the
+//!      working tree, and `.dot-agent-deck.toml` still carries the
+//!      step-1 human plan-approval gate sentence verbatim. See
+//!      [`fork_declined_items`] and
+//!      `docs/develop/fork-sync-workflow.md`'s "Re-curation and rebase
+//!      history" section (14th-sync declined-items entry) for why this
+//!      exists: all three landed as clean, non-conflicting adds with no
+//!      rebase conflict to force a human check, so nothing but a
+//!      mechanical gate stops a future sync's rebase from quietly
+//!      re-adding them.
 //!
 //!   The numbers are stable identifiers in the failure output, so a
 //!   new rule takes the next one rather than renumbering the others.
@@ -176,6 +190,11 @@ mod desktop_settings_secrets;
 /// through `scripts/devbox-smoke.sh`.
 #[cfg(all(test, target_os = "linux"))]
 mod devbox_gtk_origin;
+/// The 14th fork/upstream sync's declined-items tripwire (issue: fork-only,
+/// see `docs/develop/fork-sync-workflow.md`'s "Re-curation and rebase
+/// history" section). Unlike the `#[cfg(test)]` modules around it this one
+/// carries a live rule — check 16 below — as well as its own tests.
+mod fork_declined_items;
 /// PR #966 / Renovate #989: the gh-aw `*.lock.yml` files are GENERATED, and
 /// Renovate bumps the action pins inside them without regenerating the body.
 /// That broke every PR-review agent job with a gateway config error. Tests
@@ -279,10 +298,11 @@ const TESTS_DIR: &str = "tests";
 /// one fact, rather than the three that used to drift independently: the
 /// module doc's prose said "nine" and "ten" while the success line below
 /// printed "9 rules", issue #259 added a fourteenth check without
-/// touching any of them, and fork #281 added a fifteenth. The same shape
-/// as `work_type`'s own (private, unrelated, five-rule) `RULE_COUNT`,
-/// which exists for the identical reason one module over.
-const CHECK_COUNT: usize = 15;
+/// touching any of them, fork #281 added a fifteenth, and the 14th
+/// fork/upstream sync's declined-items tripwire added a sixteenth. The
+/// same shape as `work_type`'s own (private, unrelated, five-rule)
+/// `RULE_COUNT`, which exists for the identical reason one module over.
+const CHECK_COUNT: usize = 16;
 
 /// Check 8 (issue #322): why a bare `tempfile` constructor is forbidden under
 /// `tests/`, spelled out here because the violation is invisible at the call
@@ -1133,6 +1153,20 @@ fn main() -> ExitCode {
         desktop_project_boundary::run(&root)
             .into_iter()
             .map(|v| format!("[12] {v}")),
+    );
+
+    // Check 16 (14th fork/upstream sync): none of the three upstream
+    // governance/infra changes the maintainer reviewed and explicitly
+    // declined has resurfaced. Read straight off the working tree rather than
+    // folded into the `tests/` + `src/` scan above, because it covers a
+    // fixed, unrelated set of paths plus one config file, not test sources.
+    // See `fork_declined_items`'s module doc and
+    // `docs/develop/fork-sync-workflow.md`'s "Re-curation and rebase history"
+    // section for the full reasoning.
+    failures.extend(
+        fork_declined_items::run(&root)
+            .into_iter()
+            .map(|v| format!("[16] {v}")),
     );
 
     // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
