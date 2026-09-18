@@ -70,6 +70,20 @@ output is substantive activity") before this script had read anything. With
 `suppress_text_status` now `true` for this scenario, stdout is never
 classified into anything at all, so that stray event can no longer happen;
 `READY_MARKER` stays purely a grid-visible marker of reaching this point.
+
+Fix-round note (orchestration/seed/019, /020 CI regression): the hook-socket
+move above had a side effect nobody priced -- the retired stdout path's
+classified `Thinking` event, an accident though it was, used to satisfy
+`spawn_time_agent_ready`'s (`src/ui.rs`) requirement for a GENUINE announced
+generation the instant this script printed `READY_MARKER`. With that gone,
+this stand-in's only hook-socket events (`thinking`/`idle`) fire AFTER a
+completed `readline()`, which itself needs the deck to have already written
+the seed prompt -- a dependency loop that silently forced every delivery in
+this scenario onto the 10s `timeout_ready` fallback, eating most of the 15s
+delivery budget `orchestration/seed/019`/`/020` never anticipated giving up.
+`main()` now emits a genuine `session_start` at the ready point (see its own
+comment) to restore the fast path -- the same thing a real Codex session's
+native hooks would do on their own, independent of stdin.
 """
 import json
 import os
@@ -139,6 +153,37 @@ def main() -> None:
         termios.tcflush(fd, termios.TCIFLUSH)
     except Exception:
         pass
+
+    # Fix-round note (orchestration/seed/019, /020 CI regression): a real
+    # Codex session announces itself over its OWN native hooks the moment its
+    # session initializes -- independent of whether anything has been typed
+    # into it yet. Before the 15th sync's hook-socket rewrite, this stand-in's
+    # `READY_MARKER` line (printed at this exact point) was picked up by
+    # `dot-agent-deck wrap`'s stdout/JSON classifier and turned into a
+    # `Thinking`-shaped event carrying THE WRAPPER'S OWN session id -- which,
+    # despite being an accident of the old (now-retired) stdout-scraping path,
+    # was enough to satisfy `AppState::pane_hook_session_id(pane_id).is_some()`
+    # (`spawn_time_agent_ready`, `src/ui.rs`) right at this same instant.
+    # Moving turn-lifecycle reporting to the hook socket (this file's own
+    # module doc) removed that side effect and nothing replaced it: this
+    # stand-in's hook-socket events are `thinking`/`idle` ONLY, both of which
+    # require a completed `readline()` -- which requires the deck to have
+    # ALREADY written the seed prompt. `spawn_time_agent_ready` requires a
+    # GENUINE (non-provisional) announcement before the deck will write at
+    # all, so every delivery in this scenario was silently downgraded onto
+    # the 10s `timeout_ready` fallback, leaving orchestration/seed/019's and
+    # /020's already-tight 15s delivery budget with only a few seconds of
+    # real margin -- comfortable on a quiet machine, unreliable on a
+    # contended CI runner. Emitting a genuine `session_start` here, at the
+    # stand-in's own ready point (post-delay, post-flush, same session id the
+    # thinking/idle events below use so the `announced` bit persists across
+    # the same-id refresh instead of rolling over to an unannounced one --
+    # `AppState::pane_hook_session`'s own fix-round note, `src/state.rs`),
+    # restores the fast path this test was written to exercise: the deck's
+    # write lands once THIS producer's own readiness is genuinely announced,
+    # not once a producer-agnostic accident of a retired stdout-scraping path
+    # happened to look like one.
+    _send_event("session_start")
 
     sys.stdout.write(f"{READY_MARKER}\n")
     sys.stdout.flush()
