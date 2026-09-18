@@ -24,6 +24,24 @@ const RETURN_WAIT: Duration = Duration::from_secs(20);
 struct PaneRef {
     pane_id: String,
     agent_id: String,
+    // Fix-round note (15th upstream sync, `dispatch/return/001`/`/002`): the
+    // real spawn path (`crate::spawn::pane_env`, fork #358 M2/M4) injects
+    // `DOT_AGENT_DECK_REGISTRATION_GENERATION`/`DOT_AGENT_DECK_DAEMON_BOOT_ID`
+    // into an orchestration role's OWN process environment at spawn time —
+    // never queried back later, since the real agent already has them. A
+    // `--done`/`work-done` invocation this harness runs as a SEPARATE
+    // process (rather than as a subprocess of the role's own PTY, which
+    // would inherit them) has no way to see those values unless it is told
+    // them directly, so carry them here — read off the SAME `AgentRecord`
+    // (`ListAgents`) `pane_id`/`agent_id` already come from — and have
+    // `run_work_done` forward them as env, mirroring what the real pane's
+    // environment actually holds. `None` for a pane the daemon never
+    // registered as an orchestration role (the interactive `caller`, a
+    // `dispatch --single` unit) — `run_work_done` omits the env vars
+    // entirely in that case, which is what such a pane's real environment
+    // looks like too.
+    registration_generation: Option<u64>,
+    daemon_boot_id: Option<String>,
 }
 
 /// Removes a dispatch worktree on drop, including while a RED assertion is
@@ -134,6 +152,8 @@ fn open_probe_caller(deck: &TuiDeck) -> PaneRef {
                 Some(PaneRef {
                     pane_id: record.pane_id_env?,
                     agent_id: record.id,
+                    registration_generation: record.registration_generation,
+                    daemon_boot_id: record.daemon_boot_id,
                 })
             })
     };
@@ -178,15 +198,34 @@ fn run_dispatch(deck: &TuiDeck, caller: &PaneRef, unit: &str, shape: &str) -> Ou
         .expect("run the real dispatch CLI")
 }
 
-fn run_work_done(deck: &TuiDeck, pane_id: &str, cwd: &Path, report: &str) -> Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["work-done", "--done", "--task", report])
+// Fix-round note (15th upstream sync, `dispatch/return/001`/`/002`): forwards
+// `pane.registration_generation`/`pane.daemon_boot_id` as env, when present,
+// so this externally-run CLI presents the SAME compound identity
+// (`AppState::handle_work_done`, fork #358 M2/M4) the real role process's own
+// environment would carry — see [`PaneRef`]'s doc for why those two fields
+// exist at all. Neither var is set when `pane` carries `None` for it (the
+// interactive `caller`, or a `dispatch --single` unit), matching such a
+// pane's real environment, which never has them either.
+fn run_work_done(deck: &TuiDeck, pane: &PaneRef, cwd: &Path, report: &str) -> Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    cmd.args(["work-done", "--done", "--task", report])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-        .env("DOT_AGENT_DECK_PANE_ID", pane_id)
+        .env("DOT_AGENT_DECK_PANE_ID", &pane.pane_id)
         .env("HOME", deck.home_dir())
-        .current_dir(cwd)
-        .output()
-        .expect("run the real work-done CLI")
+        .current_dir(cwd);
+    if let Some(generation) = pane.registration_generation {
+        cmd.env(
+            dot_agent_deck::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION,
+            generation.to_string(),
+        );
+    }
+    if let Some(boot_id) = pane.daemon_boot_id.as_deref() {
+        cmd.env(
+            dot_agent_deck::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID,
+            boot_id,
+        );
+    }
+    cmd.output().expect("run the real work-done CLI")
 }
 
 fn assert_cli_succeeded(label: &str, output: &Output) {
@@ -326,6 +365,8 @@ fn wait_for_orchestrator(deck: &TuiDeck, worktree: &Path) -> PaneRef {
                 Some(PaneRef {
                     pane_id: record.pane_id_env?,
                     agent_id: record.id,
+                    registration_generation: record.registration_generation,
+                    daemon_boot_id: record.daemon_boot_id,
                 })
             })
     };
@@ -370,6 +411,8 @@ fn wait_for_single_unit(deck: &TuiDeck, worktree: &Path, unit: &str) -> PaneRef 
                 Some(PaneRef {
                     pane_id: record.pane_id_env?,
                     agent_id: record.id,
+                    registration_generation: record.registration_generation,
+                    daemon_boot_id: record.daemon_boot_id,
                 })
             })
     };
@@ -449,7 +492,7 @@ fn dispatch_return_001_orchestration_completion_reaches_the_caller() {
     wait_for_submitted_ack(&deck, UNIT, &caller, &log);
 
     let orchestrator = wait_for_orchestrator(&deck, &worktree);
-    let completed = run_work_done(&deck, &orchestrator.pane_id, &worktree, REPORT);
+    let completed = run_work_done(&deck, &orchestrator, &worktree, REPORT);
     assert_cli_succeeded("dispatched orchestrator work-done --done", &completed);
 
     assert_return_reached_caller(
@@ -458,9 +501,13 @@ fn dispatch_return_001_orchestration_completion_reaches_the_caller() {
         UNIT,
         REPORT,
         &log,
-        "Today's handler recognizes the role, logs `orchestration complete \
-         (orchestrator --done)`, and returns after discarding the caller identity; \
-         this is RED until the dispatch callback survives to that branch.",
+        "The handler recognizes the role, logs `orchestration complete \
+         (orchestrator --done)`, and calls `return_dispatch_completion` before \
+         returning. If this fires, check `AppState::handle_work_done`'s \
+         generation/boot-id compound check (fork #358 M4) first — a registered \
+         pane whose signal doesn't carry the SAME `DOT_AGENT_DECK_REGISTRATION_GENERATION`/\
+         `DOT_AGENT_DECK_DAEMON_BOOT_ID` this test's `run_work_done` read off the \
+         orchestrator's own `AgentRecord` is refused before that branch ever runs.",
     );
 }
 
@@ -523,7 +570,7 @@ fn dispatch_return_002_callback_survives_caller_detach_and_reattach() {
         deck.snapshot_grid()
     );
 
-    let completed = run_work_done(&deck, &orchestrator.pane_id, &worktree, REPORT);
+    let completed = run_work_done(&deck, &orchestrator, &worktree, REPORT);
     assert_cli_succeeded("reattached orchestration work-done --done", &completed);
     assert_return_reached_caller(
         &deck,
@@ -570,7 +617,7 @@ fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert()
     // role nor a dispatched unit. Its report must take the existing warning path
     // and reach no pane. The later positive return is the drain barrier for the
     // absence check, so this cannot pass merely because the daemon was slow.
-    let unknown = run_work_done(&deck, &caller.pane_id, deck.workdir(), UNKNOWN_REPORT);
+    let unknown = run_work_done(&deck, &caller, deck.workdir(), UNKNOWN_REPORT);
     assert_cli_succeeded("unknown-pane work-done --done control", &unknown);
     assert!(
         common::wait_until(Duration::from_secs(10), || {
@@ -582,7 +629,7 @@ fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert()
         log_tail(&log)
     );
 
-    let completed = run_work_done(&deck, &single.pane_id, &worktree, REPORT);
+    let completed = run_work_done(&deck, &single, &worktree, REPORT);
     assert_cli_succeeded("dispatched single work-done --done", &completed);
     assert_return_reached_caller(
         &deck,
@@ -590,9 +637,11 @@ fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert()
         UNIT,
         REPORT,
         &log,
-        "Today's single pane has no `pane_role_map` identity, so the daemon logs \
-         `work-done from unknown pane` for it too and returns before any completion \
-         routing can run.",
+        "A `dispatch --single` unit's pane has no `pane_role_map` identity, so the \
+         `handle_work_done` compound generation/boot-id check (fork #358 M4) must \
+         fall through its `None` case for an unregistered pane rather than refusing \
+         outright, letting `return_dispatch_completion`'s own dedicated \
+         dispatch-return registry decide instead.",
     );
 
     let leaked_to: Vec<String> = common::agent_records_on(deck.attach_socket_path())

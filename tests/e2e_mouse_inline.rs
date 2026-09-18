@@ -146,13 +146,28 @@ fn inline_001_rename_save_commits() {
 
     click_button(&deck, "[Save]");
 
-    // Committed like Enter: the new name reaches the CARD. Asserted as the
-    // title's `<type> · <name>` shape, which the rename input cannot produce —
-    // a bare `renamed7` would also match the `Rename: renamed7` row this click
-    // is dismissing, which is exactly how this test passed without the rename
-    // ever having happened.
-    deck.wait_for_string("· renamed7");
+    // Committed like Enter: the new name reaches the CARD.
+    //
+    // Fix-round note (15th upstream sync): PRD fork#405 M1 moved a card's
+    // identity off the title (which used to read `<type> · <name>`) onto its
+    // own bare body row with no distinguishing prefix — see
+    // `render_session_card`, `src/ui.rs`. A bare `renamed7` would therefore
+    // also match the still-visible `Rename: renamed7` row this click is
+    // dismissing, which is exactly the false-positive this test's ORIGINAL
+    // `· renamed7` check existed to rule out (see the comment this replaced,
+    // preserved in git history). Waiting for Normal mode FIRST closes the
+    // same gap the old title-shape check did: `[Save]`'s handler commits the
+    // rename and leaves rename mode in the same synchronous step, so once
+    // the Normal-mode bar is back the `Rename:` row is provably gone, and a
+    // bare `renamed7` from here on can only be the persisted identity row.
     deck.wait_for_string("[New Pane Ctrl+N]"); // back to Normal
+    assert!(
+        !deck.snapshot_grid().contains("Rename:"),
+        "still in rename mode after [Save] — the identity check below would be \
+         meaningless.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.wait_for_string("renamed7");
 }
 
 /// Scenario: With a selected card backed by a real pane, press `r` to enter
@@ -179,7 +194,10 @@ fn inline_001_rename_cancel_abandons() {
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04");
     deck.wait_for_string("[New Pane Ctrl+N]");
-    deck.wait_for_string("· realpane");
+    // Fix-round note (15th upstream sync): PRD fork#405 M1 dropped the old
+    // `<type> · <name>` title shape — see `inline_001_rename_save_commits`'s
+    // matching note. The identity row is now a bare name with no prefix.
+    deck.wait_for_string("realpane");
 
     deck.send_bytes(b"r");
     deck.wait_for_string("Rename:");
@@ -190,10 +208,12 @@ fn inline_001_rename_cancel_abandons() {
 
     // Abandoned like Esc: the rename input is discarded and the card keeps the
     // title it had. Both halves are asserted — the typed name gone proves the
-    // row was dismissed, and `· realpane` still present proves the click did
-    // not commit, which is what tells Cancel apart from Save.
+    // row was dismissed, and `realpane` still present proves the click did
+    // not commit, which is what tells Cancel apart from Save. No ambiguity
+    // with the dismissed input row here (unlike the Save sibling): the typed
+    // text was `discarded9`, never `realpane`.
     deck.wait_for_absence("discarded9");
-    deck.wait_for_string("· realpane");
+    deck.wait_for_string("realpane");
 }
 
 /// Scenario: A real `--continue`-spawned pane (`realpane`, running a long-

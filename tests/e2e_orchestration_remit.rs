@@ -687,6 +687,40 @@ fn inject_clear_session_start(
         CLEAR_SESSION_START_METADATA_KEY.to_string(),
         CLEAR_SESSION_START_METADATA_VALUE.to_string(),
     );
+
+    // See [`prime_active_tool`]. The barrier below cannot be a wait for
+    // `SessionStatus::Idle`: that is a VALUE this event produces, not a
+    // footprint of this event, and it is also where a quiet pane already sits.
+    let tool_marker = format!("remit-clear-primer-{session_id}");
+    prime_active_tool(
+        deck,
+        socket,
+        pane_id,
+        agent_id,
+        session_id,
+        &agent_type,
+        &tool_marker,
+    );
+
+    // Fix-round note (15th upstream sync, `orchestration/remit/004`/`/005`):
+    // the `SessionStart` event's `timestamp` is captured HERE, AFTER the
+    // primer above, not before it. `AppState::apply_event`'s per-pane
+    // generation tracking (`pane_hook_session`) only advances a SAME-id
+    // entry when the incoming event's timestamp is STRICTLY newer than what
+    // is already recorded (`src/state.rs`), and the primer's own `ToolStart`
+    // — sent and durably APPLIED (via its own `wait_for_applied` barrier)
+    // before this point — already established this pane's generation under
+    // `session_id` with ITS timestamp. Building this event's `timestamp`
+    // before that call (the previous shape) baked in an earlier instant than
+    // the primer's, so once actually sent this `SessionStart` lost the
+    // out-of-order race by design and never refreshed the generation's
+    // recorded timestamp — which defeated
+    // `crate::ui::pane_announced_generation`'s "was the current generation
+    // actually ANNOUNCED" check downstream (it compares the newest genuine
+    // `SessionStart` timestamp against that recorded one) even though this
+    // IS a genuine announcement. A real hook binary has no such gap — it
+    // stamps `timestamp` immediately before the write, i.e. right where this
+    // now sits.
     let event = AgentEvent {
         session_id: session_id.to_string(),
         agent_type: agent_type.clone(),
@@ -706,20 +740,6 @@ fn inject_clear_session_start(
     };
     let line = serde_json::to_string(&event)
         .expect("serialize synthetic clear-originated SessionStart AgentEvent");
-
-    // See [`prime_active_tool`]. The barrier below cannot be a wait for
-    // `SessionStatus::Idle`: that is a VALUE this event produces, not a
-    // footprint of this event, and it is also where a quiet pane already sits.
-    let tool_marker = format!("remit-clear-primer-{session_id}");
-    prime_active_tool(
-        deck,
-        socket,
-        pane_id,
-        agent_id,
-        session_id,
-        &agent_type,
-        &tool_marker,
-    );
 
     common::write_hook_line(deck.hook_socket_path(), &line)
         .expect("inject synthetic clear-originated SessionStart AgentEvent over hook socket");
@@ -900,12 +920,20 @@ fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
     let (socket, pane_id, agent_id, log, baseline, _role_cwd) =
         open_and_confirm_initial_delivery(&deck);
 
+    // Fix-round note (15th upstream sync): the fixture's own boot session id
+    // (`remit-reassert-boot-session`, per `ORCHESTRATOR_REMIT_SCRIPT`), not a
+    // synthetic per-call id — see `orchestration_remit_003`'s own comment on
+    // why a differing id models an event shape a real `PreCompact` hook never
+    // produces (it always carries the agent's OWN, already-announced session
+    // id). `crate::ui::pane_announced_generation` only adopts a generation it
+    // has seen a genuine `SessionStart` announce; the boot id was announced
+    // at spawn, a brand-new synthetic one never is.
     inject_compacting(
         &deck,
         &socket,
         &pane_id,
         &agent_id,
-        &format!("{agent_id}-remit001-session"),
+        "remit-reassert-boot-session",
     );
 
     let reasserted = common::wait_for_file_substr_count(
@@ -970,12 +998,16 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
         deck.snapshot_grid()
     );
 
+    // Fix-round note (15th upstream sync): the fixture's own boot session id,
+    // not a synthetic per-call one — see `orchestration_remit_001`'s matching
+    // comment. This is the positive control, so it needs the SAME realistic
+    // shape `orchestration_remit_003` already establishes.
     inject_compacting(
         &deck,
         &socket,
         &orch_pane_id,
         &orch_agent_id,
-        &format!("{orch_agent_id}-remit002-orch-session"),
+        "remit-reassert-boot-session",
     );
     let reasserted_on_start_role = common::wait_for_file_substr_count(
         &log,
@@ -1119,7 +1151,7 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
 #[cfg(unix)]
 fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
-    let (socket, pane_id, agent_id, log, baseline, _role_cwd) =
+    let (socket, pane_id, agent_id, log, baseline, role_cwd) =
         open_and_confirm_initial_delivery(&deck);
 
     // Arm the exactly-once detector BEFORE the trigger (see
@@ -1128,8 +1160,16 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     // payload write, so any detector that only starts looking once the test
     // has OBSERVED that write is racing something it loses more often than it
     // wins.
-    let context_path = deck
-        .workdir()
+    //
+    // Fix-round note (15th upstream sync): PRD fork#544 M2b made
+    // orchestrator-role isolation unconditional, so `reassert_orchestrator_prompt`
+    // writes the context file under the role's OWN isolated-clone `cwd`
+    // (`role_cwd`), never under `deck.workdir()` (the fixture source dir) —
+    // `orchestration_remit_003`/`_007` already read/write their own trigger
+    // files and context sentinel via `role_cwd` for the same reason. Watching
+    // `deck.workdir()`'s copy here always read 0 rewrites: it is a file
+    // nothing in this test's flow ever touches.
+    let context_path = role_cwd
         .join(".dot-agent-deck")
         .join("orchestrator-context.md");
     let rewrites = ContextRewriteWatcher::start(&context_path);
@@ -1401,12 +1441,15 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
     seeded.push('\n');
     std::fs::write(&context_path, &seeded).expect("seed a dispatched task onto the context file");
 
+    // Fix-round note (15th upstream sync): the fixture's own boot session id,
+    // not a synthetic per-call one — see `orchestration_remit_001`'s matching
+    // comment.
     inject_compacting(
         &deck,
         &socket,
         &pane_id,
         &agent_id,
-        &format!("{agent_id}-remit007-session"),
+        "remit-reassert-boot-session",
     );
 
     let reasserted_with_task = common::wait_for_file_substr_count(

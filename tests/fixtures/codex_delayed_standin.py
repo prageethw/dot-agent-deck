@@ -36,38 +36,92 @@ it), it behaves like an agent that received a prompt: it logs the raw line to
 isolated-clone-provisioned worktrees, not the test harness's own workdir, so
 a cwd-relative log file would land somewhere the test can't find it; falls
 back to a relative `standin-input.log` if the caller doesn't set it), then
-emits the same turn-lifecycle JSONL `codex-standin.sh` does, so the wrapper's
-ordinary JSONL classification (`classify_and_emit`) still drives the
-dashboard through Thinking -> Idle for the case where delivery genuinely
-lands. A bare confirmation-retry probe (an empty submitted line) does NOT
-satisfy this and starts no turn.
+reports a genuine turn over the hook socket directly (`Thinking` then
+`Idle`), so the dashboard still moves through the same transition a real
+delivery would drive. A bare confirmation-retry probe (an empty submitted
+line) does NOT satisfy this and starts no turn.
 
-NOTE (issue #737 harness investigation): the `READY_MARKER` line below is
-printed BEFORE the genuine stdin read, deliberately -- the test needs a
-grid-visible way to confirm this script reached that point without touching
-stdin. But `dot-agent-deck wrap`'s `classify_and_emit` (`src/wrap.rs`) tees
-every stdout line of a Codex-identity child through a text classifier, and
-for this stand-in `suppress_text_status` is `false` (this is a plain Python
-script, not real `codex-cli`, so it never fires the native
-`UserPromptSubmit`/`Stop` hooks that would otherwise make the wrapper stand
-the text classifier down) -- so this marker line itself gets classified by
-the generic non-JSON fallback ("any other non-blank output is substantive
-activity") and reaches the daemon as a real `Thinking` AgentEvent, despite
-predating any genuine input. This is expected, independent, already-accepted
-behavior of the wrapper's fallback classifier (see the `CODEX` ruleset's own
-"Accepted risk" doc comment in `src/wrap.rs`) -- not a bug in this script,
-and not something this script can avoid while still proving its own
-readiness on the grid. `tests/e2e_orchestration_seed_synthetic.rs`'s
-`orchestration_seed_019` test tolerates that stray `Thinking` and instead
-asserts on `Idle`, which can only follow this script's own `turn.completed`
-JSONL below -- printed only once a real, non-empty stdin line was read.
+Fix-round note (15th upstream sync): this used to print the turn-lifecycle
+as bare JSONL on stdout for `dot-agent-deck wrap`'s OWN text/JSON classifier
+(`classify_and_emit`, `src/wrap.rs`) to pick up. That relied on
+`suppress_text_status` being `false` for this invocation -- true when this
+script was written, but `codex_spawn_prep` installs and trusts the deck's
+OWN Codex hooks (`crate::codex_hooks_manage`) for ANY pane declaring
+`--agent codex`, REGARDLESS of what program actually runs (by design: a
+declared-Codex LAUNCHER wraps a shell that only execs the real `codex`
+later, so hook install can't wait to see it) -- and this e2e harness's own
+`seed_durable_binary` (PRD #381, `tests/common/mod.rs`) makes that
+install+trust succeed even in a fresh sandboxed `$HOME`, which is
+correct and intentional on its own. Once hook trust is confirmed,
+`suppress_text_status` is unconditionally `true` for a Codex-identity pane
+(issue #638): a plain Python stand-in can never fire Codex's real
+`UserPromptSubmit`/`Stop` hooks the way genuine `codex-cli` does, so its
+stdout JSONL now reaches nobody -- the wrapper is (correctly) trusting a
+native-hook channel this stand-in never uses. A stand-in in this position
+has to speak that channel directly, which is what emitting straight to the
+hook socket below does; it is not a workaround for a defect, it is what a
+producer with confirmed native-hook trust is expected to do instead of
+relying on stdout scraping.
+
+NOTE (issue #737 harness investigation, now moot): the `READY_MARKER` line
+below used to also earn a spurious fallback-classified `Thinking` event
+(`dot-agent-deck wrap`'s generic non-JSON fallback, "any other non-blank
+output is substantive activity") before this script had read anything. With
+`suppress_text_status` now `true` for this scenario, stdout is never
+classified into anything at all, so that stray event can no longer happen;
+`READY_MARKER` stays purely a grid-visible marker of reaching this point.
 """
+import json
 import os
+import socket
 import sys
 import time
+from datetime import datetime, timezone
 
 READY_MARKER = "STANDIN-READY"
 DEFAULT_LOG_NAME = "standin-input.log"
+
+
+def _send_event(event_type, user_prompt=None):
+    """Emit a minimal, genuine `AgentEvent` straight to the hook socket —
+    the channel a REAL, hook-trusted Codex session reports over, and the
+    only one `classify_and_emit` (`src/wrap.rs`) still honours once
+    `suppress_text_status` is `true` for this pane (see the module doc
+    above). `pane_id`/`agent_id` are inherited from `dot-agent-deck wrap`'s
+    own environment (the daemon sets them on the wrapper, and a child
+    process inherits its parent's env by default), so the reuse guard in
+    `AppState::apply_event` (`src/state.rs`) remaps this onto wrap's own
+    fork-time session for the SAME pane/agent rather than minting a second,
+    uncorrelated card.
+
+    `user_prompt`, when given, is the same recipe
+    `orchestration_remit`'s fixture uses (`confirm_submission`,
+    `tests/e2e_orchestration_remit.rs`): a genuine confirmation that this
+    producer submitted the delivered seed pointer, which is what lets
+    `deliver_orchestrator_prompt` (`src/ui.rs`) finalize the delivery and
+    the orchestration role settle into a real `Working`/`Idle` sequence
+    rather than staying provisional indefinitely.
+    """
+    socket_path = os.environ.get("DOT_AGENT_DECK_SOCKET")
+    pane_id = os.environ.get("DOT_AGENT_DECK_PANE_ID")
+    if not socket_path or not pane_id:
+        return
+    payload = {
+        "session_id": f"{pane_id}-standin-session",
+        "agent_type": "codex",
+        "event_type": event_type,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pane_id": pane_id,
+        "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
+    }
+    if user_prompt is not None:
+        payload["user_prompt"] = user_prompt
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(socket_path)
+            s.sendall((json.dumps(payload) + "\n").encode())
+    except OSError:
+        pass
 
 
 def main() -> None:
@@ -95,14 +149,9 @@ def main() -> None:
         handle.write(line)
 
     if line.strip():
-        for payload in (
-            '{"type":"turn.started"}',
-            '{"type":"item.started","item":{"type":"command_execution","command":"ls"}}',
-            '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}',
-        ):
-            sys.stdout.write(payload + "\n")
-            sys.stdout.flush()
-            time.sleep(0.3)
+        _send_event("thinking", user_prompt=line.rstrip("\r\n"))
+        time.sleep(0.3)
+        _send_event("idle")
 
     # Stay alive so the pane's process (and the wrap around it) does not
     # exit and confuse the harness with an unexpected SessionEnd while the

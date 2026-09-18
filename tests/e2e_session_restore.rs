@@ -1108,13 +1108,20 @@ fn focused_role_pane(grid: &str) -> Option<&'static str> {
         .find(|role| common::role_pane_left_edge(grid, role).is_some())
 }
 
-/// Whether the tab strip is highlighting the `Dashboard` tab. `render_tab_strip`
-/// marks the ACTIVE tab by inverting the terminal's own fg/bg in place
-/// (`Modifier::REVERSED`) and adds no text marker, so the styled cells under the
-/// label are the only thing that says which tab the user is looking at.
+/// Whether the tab strip is highlighting the `Dashboard` tab.
+///
+/// Fix-round note (15th upstream sync): `render_tab_strip` used to mark
+/// every active tab by inverting the terminal's own fg/bg in place
+/// (`Modifier::REVERSED`). Issue #306 replaced that with `Modifier::BOLD`
+/// for the general case — `REVERSED` would invert a stacked status `fg`
+/// tint into the label's background — and PRD fork#405 M2 later reinstated
+/// `REVERSED` for exactly ONE case: the active ORCHESTRATION tab
+/// specifically (`src/ui.rs`, scoped on `is_orchestration`), not Dashboard.
+/// Both predate this test file, so the fixed cue for Dashboard has always
+/// been BOLD, never inverse — checked here instead.
 fn dashboard_tab_is_active(deck: &TuiDeck) -> bool {
     deck.visible_text_cell_styles("Dashboard")
-        .is_some_and(|cells| cells.iter().all(|c| c.inverse))
+        .is_some_and(|cells| cells.iter().all(|c| c.bold))
 }
 
 /// Scenario: Start one external daemon and open the `orch-reattach-focus`

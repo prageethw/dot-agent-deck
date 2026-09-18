@@ -53,15 +53,26 @@ const ALPHA_AGENT: &str = "zulu-alpha-41";
 const BRAVO_AGENT: &str = "quebec-bravo-58";
 
 /// Start one long-lived stand-in agent on `daemon` and block until its registry
-/// reports it.
-fn start_stand_in(daemon: &DaemonProc, display_name: &str, pane_id: &str) {
+/// reports it. Returns the daemon-MINTED `pane_id` (see the doc below).
+///
+/// Fix-round note (15th upstream sync): this used to hand the daemon a
+/// caller-chosen `DOT_AGENT_DECK_PANE_ID` via `env` and assert the listing
+/// echoed it back verbatim. PRD #365 M2 (already merged, unrelated to this
+/// sync's own regressions) made the daemon authoritative for `StartAgent`'s
+/// pane id instead: `env`'s `DOT_AGENT_DECK_PANE_ID` entry is now stripped
+/// and replaced with a daemon-minted one before the child ever sees it
+/// (`src/daemon_protocol.rs`), and the response's own `pane_id` field is the
+/// one place a caller can learn what was actually minted. This test predates
+/// that PRD, so read it back from the response rather than asserting a
+/// literal.
+fn start_stand_in(daemon: &DaemonProc, display_name: &str) -> String {
     let response = daemon
         .send_attach_request(&AttachRequest::StartAgent {
             command: Some("sh -c 'sleep 600'".into()),
             cwd: None,
             rows: 24,
             cols: 80,
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane_id.into())],
+            env: Vec::new(),
             display_name: Some(display_name.into()),
             tab_membership: None,
             agent_type: None,
@@ -75,12 +86,17 @@ fn start_stand_in(daemon: &DaemonProc, display_name: &str, pane_id: &str) {
         "StartAgent should succeed, got error: {:?}",
         response.error
     );
+    let pane_id = response
+        .pane_id
+        .clone()
+        .expect("StartAgent's response must carry the daemon-minted pane_id (PRD #365 M2)");
     let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
     assert_eq!(
         records.len(),
         1,
         "the stand-in agent must be registered before the fleet is observed"
     );
+    pane_id
 }
 
 /// Scenario: start two real `dot-agent-deck daemon serve` processes on two
@@ -125,8 +141,8 @@ fn observe_001_two_real_daemon_processes_are_observed_as_two_decks() {
         );
     }
 
-    start_stand_in(&alpha, ALPHA_AGENT, "pane-alpha");
-    start_stand_in(&bravo, BRAVO_AGENT, "pane-bravo");
+    let pane_id_alpha = start_stand_in(&alpha, ALPHA_AGENT);
+    let pane_id_bravo = start_stand_in(&bravo, BRAVO_AGENT);
 
     // The client side. Two endpoints the client did not create and does not own
     // — the inodes belong to two other processes.
@@ -188,8 +204,14 @@ fn observe_001_two_real_daemon_processes_are_observed_as_two_decks() {
     );
     assert_eq!(listed_alpha[0].display_name.as_deref(), Some(ALPHA_AGENT));
     assert_eq!(listed_bravo[0].display_name.as_deref(), Some(BRAVO_AGENT));
-    assert_eq!(listed_alpha[0].pane_id_env.as_deref(), Some("pane-alpha"));
-    assert_eq!(listed_bravo[0].pane_id_env.as_deref(), Some("pane-bravo"));
+    assert_eq!(
+        listed_alpha[0].pane_id_env.as_deref(),
+        Some(pane_id_alpha.as_str())
+    );
+    assert_eq!(
+        listed_bravo[0].pane_id_env.as_deref(),
+        Some(pane_id_bravo.as_str())
+    );
 
     // The case a bare-id key gets wrong: two independent registries mint the
     // same first id, so only the deck half of `(deckId, agentId)` separates

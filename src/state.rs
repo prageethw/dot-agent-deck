@@ -1731,7 +1731,25 @@ pub struct AppState {
     /// so "this pane has an entry" is not merely "something happened on this
     /// pane". Consumers that bind this value as a delivery target depend on that:
     /// see `provisional_start` in [`Self::apply_event`].
-    pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
+    ///
+    /// Fix-round note (15th upstream sync, `orchestration/remit/001`/`/002`/
+    /// `/007`): the third element records whether the CURRENTLY BOUND id was
+    /// ever established by a genuine (non-provisional) `SessionStart`, as
+    /// opposed to only ever having been touched by an ordinary later frame
+    /// (`crate::ui::pane_announced_generation` reads it). It is set once, when
+    /// the id is first established or rolls over, and PRESERVED across every
+    /// same-id refresh that follows — unlike the timestamp beside it, which
+    /// intentionally advances on every such frame (see that field's own
+    /// history). Trying to derive "was this id ever announced" from the
+    /// timestamp alone, by comparing it against the newest genuine
+    /// `SessionStart`'s own timestamp, was tried first and does not work: the
+    /// very first ordinary event after a real `SessionStart` (an agent's
+    /// routine `Thinking`/`ToolStart` traffic, or even just the delivery
+    /// confirmation the spawn-time seed itself provokes) bumps the timestamp
+    /// past the announcement it is supposed to be evidence of, which is
+    /// guaranteed to have happened by the time a long-running orchestration
+    /// actually reaches a compaction. A dedicated, sticky bit is the fix.
+    pane_hook_session: HashMap<String, (String, DateTime<Utc>, bool)>,
     /// Issue #424 F2 / H4 (auditor HIGH): how many times each pane's established
     /// hook generation has been CLOSED — ended, or superseded by a different one.
     ///
@@ -7260,21 +7278,22 @@ impl AppState {
     pub fn pane_hook_session_id(&self, pane_id: &str) -> Option<String> {
         self.pane_hook_session
             .get(pane_id)
-            .map(|(id, _)| id.clone())
+            .map(|(id, _, _)| id.clone())
     }
 
-    /// Issue #424 F2: the pane's current hook generation together with the
-    /// timestamp of the event that ESTABLISHED it.
+    /// Issue #424 F2: the pane's current hook generation, the timestamp of the
+    /// event that most recently touched it, and whether it was ever genuinely
+    /// ANNOUNCED by a `SessionStart` (see [`Self::pane_hook_session`]'s own
+    /// doc for why the timestamp alone cannot answer that).
     ///
-    /// The timestamp is what tells a generation apart from generation-shaped
-    /// drift. This map advances on any frame carrying a pane id — deliberately,
-    /// because the send guard wants the freshest value — so the id alone cannot
-    /// say whether a conversation announced itself or an ordinary event from a
-    /// second producer moved the pointer. `crate::ui`'s unbound-delivery witness
-    /// compares this instant against the pane's newest genuine `SessionStart`
-    /// to answer exactly that, which is the same "only a start announces" rule
+    /// This map advances on any frame carrying a pane id — deliberately,
+    /// because the send guard wants the freshest value — so the id and
+    /// timestamp alone cannot say whether a conversation announced itself or
+    /// an ordinary event from a second producer moved the pointer.
+    /// `crate::ui::pane_announced_generation` reads the third element directly
+    /// for that, which is the same "only a start announces" rule
     /// [`latch_generation`] applies daemon-side.
-    pub fn pane_hook_session_entry(&self, pane_id: &str) -> Option<(String, DateTime<Utc>)> {
+    pub fn pane_hook_session_entry(&self, pane_id: &str) -> Option<(String, DateTime<Utc>, bool)> {
         self.pane_hook_session.get(pane_id).cloned()
     }
 
@@ -9578,29 +9597,49 @@ impl AppState {
         // still reaches the retire calls below and then hits the
         // `pane_role_map` miss, matching PRD #126's original reasoning (a
         // pending teardown racing a late, still-valid report should still
-        // have its bookkeeping cleaned up). It is NOT true for a pane that
-        // was NEVER registered at all — no `pane_registration_generation`
-        // entry was ever written for it — which now ALSO returns here,
-        // before the retire calls, a genuine behavioural change from
-        // before M4. Auditor's review found no production path this loses
-        // anything on: `handle_delegate` only arms a watch/delegation
-        // through `confirm_orchestration_role`, which always writes the
-        // generation entry first, so any pane with an armed watch already
-        // has one. #444 stays open for its own narrower, still-accurate
-        // slice: a pane already unregistered but whose generation is
-        // unchanged.
+        // have its bookkeeping cleaned up).
+        //
+        // Fix-round note (15th upstream sync, `dispatch/return/001`-`/003`):
+        // a pane that was NEVER registered at all — no
+        // `pane_registration_generation` entry was ever written for it — no
+        // longer refuses HERE. It used to (`current_generation != Some(_)` is
+        // true for every `None`, unconditionally, regardless of what the
+        // signal names), on the reasoning that "no production path loses
+        // anything on it": true when M4 landed, because at the time the only
+        // thing gated behind an admitted signal for an unregistered pane was
+        // `handle_delegate`'s watch-arming, which always registers first. PRD
+        // #220 Phase 2 (`#1081`, `return_dispatch_completion`) then added a
+        // SECOND one this refusal never anticipated: a `dispatch --single`
+        // unit's completion is, BY DESIGN (PRD #220 M2.3's own comment two
+        // screens down), "in NO role map... which is what lets this route
+        // WITHOUT widening the admission gate below" — its authorization is
+        // the dedicated dispatch-return registry, not
+        // `pane_registration_generation`. Refusing every unregistered pane
+        // here made that route categorically unreachable: no caller can ever
+        // supply a generation for a pane class the daemon never assigns one
+        // to. A pane that DOES carry a registration and disagrees with the
+        // signal (`Some(x)` not matching, or a live one whose boot id moved)
+        // is UNCHANGED — still refused, below — this only restores the
+        // pre-M4 fall-through for the "never had one" case, letting the
+        // `pane_role_map` lookup right after this block make the call: a
+        // dispatched unit's `None` still routes through
+        // `return_dispatch_completion`, and anything else genuinely unknown
+        // still hits the `work-done from unknown pane` warning. #444 stays
+        // open for its own narrower, still-accurate slice: a pane already
+        // unregistered but whose generation is unchanged.
         let current_generation = self
             .pane_registration_generation
             .get(&signal.pane_id)
             .copied();
         let current_boot_id = self.daemon_boot_id();
-        if current_generation != Some(signal.generation) || current_boot_id != signal.daemon_boot_id
+        if let Some(current_generation) = current_generation
+            && (current_generation != signal.generation || current_boot_id != signal.daemon_boot_id)
         {
             warn!(
                 pane_id = %signal.pane_id,
                 role = ?self.pane_role_map.get(&signal.pane_id),
                 signal_generation = signal.generation,
-                current_generation = ?current_generation,
+                current_generation = current_generation,
                 signal_boot_id = %signal.daemon_boot_id,
                 current_boot_id = %current_boot_id,
                 "work-done: refusing stale signal — pane was re-registered or the \
@@ -11064,7 +11103,7 @@ impl AppState {
                 && self
                     .pane_hook_session
                     .get(pane_id)
-                    .is_some_and(|(current, current_ts)| {
+                    .is_some_and(|(current, current_ts, _)| {
                         *current == incoming_session_id && event.timestamp >= *current_ts
                     })
             {
@@ -11275,7 +11314,15 @@ impl AppState {
                 && (event.is_wrapper_session_start() || event.is_daemon_synthetic());
             let announces_generation =
                 event.event_type == EventType::SessionStart && !provisional_start;
-            let advance = match self.pane_hook_session.get(pane_id) {
+            // Cloned once, up front, rather than re-queried below: the `if
+            // advance` block needs to know both "was there an existing entry"
+            // and "did it already carry the SAME id" to decide the new
+            // `announced` bit (see [`Self::pane_hook_session`]'s doc), and a
+            // second `.get()` after a potential `note_generation_closed` call
+            // would be answering a question about state this same block is
+            // about to overwrite anyway.
+            let existing = self.pane_hook_session.get(pane_id).cloned();
+            let advance = match &existing {
                 // Issue #684: a provisional start may not ESTABLISH a generation
                 // either, which is the half that was missing. Letting it do so
                 // was not merely cosmetic: a TUI-owned delivery binds
@@ -11297,7 +11344,7 @@ impl AppState {
                 // establish on any pane id, so a producer whose native hooks emit
                 // no `SessionStart` at all is unaffected.
                 None => !provisional_start,
-                Some((current_id, current_ts)) => {
+                Some((current_id, current_ts, _)) => {
                     if *current_id == incoming_session_id {
                         // Same generation: keep the id, bump the established
                         // timestamp so subsequent older events stay rejected.
@@ -11313,6 +11360,9 @@ impl AppState {
                 }
             };
             if advance {
+                let same_id = existing
+                    .as_ref()
+                    .is_some_and(|(current, _, _)| *current == incoming_session_id);
                 // Issue #424 H4: a DIFFERENT conversation ANNOUNCING itself over
                 // this pane closes the one it replaces, exactly as a `SessionEnd`
                 // would — the rollover may simply have skipped the end, or its
@@ -11342,16 +11392,28 @@ impl AppState {
                 // first check (`pane_hook_session_id(...).is_some()`) without
                 // ever consulting the witness. Recording one here would change
                 // no decision.
-                if announces_generation
-                    && self
-                        .pane_hook_session
-                        .get(pane_id)
-                        .is_some_and(|(current, _)| *current != incoming_session_id)
-                {
+                if announces_generation && !same_id && existing.is_some() {
                     self.note_generation_closed(pane_id);
                 }
-                self.pane_hook_session
-                    .insert(pane_id.clone(), (incoming_session_id.clone(), incoming_ts));
+                // Fix-round note (15th upstream sync): the `announced` bit
+                // PERSISTS across a same-id refresh (so ordinary traffic after
+                // a real `SessionStart` cannot un-announce the generation it
+                // already established), upgrading to `true` if THIS frame is
+                // itself a genuine announcement even when one was somehow
+                // missing before. A rollover to a DIFFERENT id starts fresh,
+                // carrying forward nothing from the generation it replaces —
+                // `announced` is true only when THIS frame is what announced
+                // the new id, exactly mirroring `latch_generation`'s refusal
+                // to bind either wrapper origin.
+                let announced = if same_id {
+                    existing.as_ref().is_some_and(|(_, _, a)| *a) || announces_generation
+                } else {
+                    announces_generation
+                };
+                self.pane_hook_session.insert(
+                    pane_id.clone(),
+                    (incoming_session_id.clone(), incoming_ts, announced),
+                );
             }
         }
 

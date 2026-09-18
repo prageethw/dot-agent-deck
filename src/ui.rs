@@ -5807,30 +5807,27 @@ fn evidence_channel_is_unidentified(
 /// conversations. That pane is `prompt/pane-input/026`, and it is also the #532
 /// wrapped-agent alternation.
 ///
-/// Matched by TIMESTAMP rather than by session id, because the two are not the
-/// same string by the time they reach here: `AppState::apply_event`'s reuse
-/// guard remaps a same-agent `SessionStart` onto the existing card's id for UI
-/// continuity, while the generation map deliberately records the ORIGINAL,
-/// pre-remap id. Asking whether the pane's newest genuine `SessionStart` is what
-/// ESTABLISHED the current generation compares the two facts that survive that
-/// remap.
+/// Fix-round note (15th upstream sync, `orchestration/remit/001`/`/002`/
+/// `/007`): this used to derive the answer by comparing the pane's newest
+/// genuine `SessionStart` TIMESTAMP against [`AppState::pane_hook_session_entry`]'s
+/// (then two-element) established-at timestamp, on the theory that "the
+/// announcement is what most recently touched this generation" is the same
+/// fact as "this generation was ever announced". It is not: that established-at
+/// timestamp advances on every SAME-id frame too (deliberately, for the send
+/// guard's out-of-order protection), so the very first ordinary event after a
+/// real `SessionStart` — routine `Thinking`/`ToolStart` traffic, or even the
+/// delivery confirmation the spawn-time seed itself provokes — moved it past
+/// the announcement it was supposed to be evidence of. A long-running
+/// orchestration is guaranteed to have accumulated such traffic by the time it
+/// actually reaches a compaction, which made this answer `None` for exactly
+/// the case the orchestrator-remit re-assertion feature exists to serve.
+/// `AppState::pane_hook_session_entry` now carries a dedicated, sticky
+/// `announced` bit instead — set once when the current id is established or
+/// rolls over, and preserved across every same-id refresh — which this reads
+/// directly.
 fn pane_announced_generation(snapshot: &AppState, pane_id: &str) -> Option<String> {
-    let (current, established_at) = snapshot.pane_hook_session_entry(pane_id)?;
-    let announced_at = snapshot
-        .sessions
-        .values()
-        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
-        .flat_map(|session| session.recent_events.iter())
-        // Issue #243: EITHER wrapper origin is excluded. Both carry the wrapper's
-        // own session id rather than the agent's, so neither is a conversation
-        // announcing itself over this pane.
-        //
-        .filter(|event| {
-            event.event_type == EventType::SessionStart && !event.is_wrapper_session_start()
-        })
-        .map(|event| event.timestamp)
-        .max()?;
-    (announced_at >= established_at).then_some(current)
+    let (current, _established_at, announced) = snapshot.pane_hook_session_entry(pane_id)?;
+    announced.then_some(current)
 }
 
 /// Issue #424 (reviewer finding B2/#3): the ordering watermark for `pane_id` —

@@ -268,53 +268,35 @@ fn orchestration_seed_019_wrap_interface_readiness_delivers_a_slow_codex_seed_pr
         deck.snapshot_grid()
     );
 
-    // INVESTIGATION NOTE (issue #737 harness false-positive, found when this
-    // test first went to CI): `codex_delayed_standin.py` must write its own
-    // `STANDIN-READY` marker to stdout (see above) so this test can observe,
-    // from outside the process, that the stand-in genuinely reached its
-    // ready point — there is no other way to confirm that. But
-    // `dot-agent-deck wrap`'s `classify_and_emit` (`src/wrap.rs`) tees EVERY
-    // line of a Codex-identity child's stdout through a text classifier, and
-    // for this synthetic setup `suppress_text_status` is `false`:
-    // `codex_spawn_prep` installs and trusts the deck's native Codex hooks
-    // (it fires for any Codex-identity pane, `program_is_codex(program) ||
-    // pane_id.is_some()`), but this stand-in is a plain Python script that
-    // never actually invokes those hooks the way real `codex-cli` would, so
-    // no native `UserPromptSubmit`/`Stop` event ever arrives to make the
-    // classifier stand down. With suppression off, `classify_line_with`'s
-    // generic non-JSON fallback ("any other non-blank output is substantive
-    // activity") fires on the READY_MARKER line itself and reaches the
-    // daemon as an EARLY `Thinking` AgentEvent — despite that line, by
-    // construction, predating the stand-in's own stdin read. This is real,
-    // independent, and already documented as an accepted tradeoff (the
-    // `CODEX` ruleset's own "Accepted risk" doc comment, `src/wrap.rs`). It
-    // does not undermine the assertions below, which only require `Thinking`
-    // and `Idle` to appear at SOME point — whether the early stray one or
-    // the genuine one that follows the stand-in's own `turn.started` JSONL —
-    // not that either appears exactly once or in a particular order relative
-    // to the ready marker.
-    // TEST-BUG NOTE (found in CI after this test first shipped, distinct from
-    // the harness false-positive documented above): `codex_delayed_standin.py`
-    // prints its three turn-lifecycle JSONL lines only 0.3s apart once it
-    // genuinely reads a non-empty line, so the WHOLE scripted turn
-    // (Thinking -> Idle) can complete in well under a second — fast enough
-    // that a live grid poll starting only after the stdin-log assertion
-    // above already returned can miss the transient "Thinking" frame
-    // entirely and observe only "Idle" by the time it starts polling. That
-    // is a race between this assertion's own polling start and how fast a
-    // SCRIPTED (not real) turn completes, not a delivery regression — CI run
-    // 34541021768 showed the pane already `Idle` with the full
-    // `turn.started`/`item.started`/`turn.completed` JSONL already on
-    // screen. Accept either "Thinking" or "Idle" here instead of only
-    // "Thinking": in this stand-in's lifecycle "Idle" is only reachable via
-    // a completed turn that started in "Thinking" (`SessionStatus::Idle` at
-    // `src/ui.rs`), and the stdin-log assertion just above already rules out
-    // the one false-positive this would otherwise risk — a pane that never
-    // received anything renders `SessionStatus::Unknown` as "Idle" too
-    // (`src/ui.rs:23415`), which is exactly why that assertion has to come
-    // first and stays the primary ground truth. This still fails
-    // meaningfully if the wrap's classification pipeline stops turning
-    // received stdin into any visible status change at all.
+    // Fix-round note (15th upstream sync): this file used to rely on
+    // `codex_delayed_standin.py` printing turn-lifecycle JSONL to stdout for
+    // `dot-agent-deck wrap`'s text/JSON classifier to pick up, on the
+    // (once-true, no longer true — see the fixture's own doc comment)
+    // assumption that `suppress_text_status` was `false` for this synthetic
+    // setup. It is unconditionally `true` once Codex hook trust is confirmed
+    // (issue #638), which `seed_durable_binary` (PRD #381,
+    // `tests/common/mod.rs`) makes happen for every `--agent codex` pane
+    // under this harness — so the stand-in now reports its turn straight
+    // over the hook socket instead, the channel a hook-trusted producer is
+    // actually expected to use. That also retires the old "stray early
+    // Thinking from the READY_MARKER line" concern this comment used to
+    // document at length: with stdout no longer classified into anything,
+    // READY_MARKER can no longer manufacture one.
+    //
+    // The race this comment DOES still need to name: the stand-in's own
+    // `Thinking` -> (0.3s) -> `Idle` pair can land, and the daemon apply
+    // both, before a live grid poll starting only after the stdin-log
+    // assertion above first samples — fast enough to observe only `Idle` and
+    // never catch the transient `Thinking` frame. Accept either "Thinking"
+    // or "Idle" here rather than only "Thinking": in this stand-in's
+    // lifecycle "Idle" is only reachable via a completed turn that started
+    // in "Thinking" (`SessionStatus::Idle`, `src/ui.rs`), and the stdin-log
+    // assertion just above already rules out the one false-positive this
+    // would otherwise risk — a pane that never received anything renders
+    // `SessionStatus::Unknown` as "Idle" too (`src/ui.rs:23415`), which is
+    // exactly why that assertion has to come first and stays the primary
+    // ground truth. This still fails meaningfully if the hook-socket report
+    // stops turning into any visible status change at all.
     assert!(
         deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
             grid.contains("Thinking") || grid.contains("Idle")
