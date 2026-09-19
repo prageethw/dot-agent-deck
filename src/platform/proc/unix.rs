@@ -1106,8 +1106,8 @@ fn command_lines_from_ps_output(stdout: &[u8]) -> std::collections::HashMap<i32,
 /// `roots` are the pids the sample is being taken on behalf of — each pane's PTY
 /// child. They select **whose command line gets read** (issue #862): the bulk
 /// `ps -A` asks for no argv column at all, and a second `ps` then reads the
-/// command line of exactly the detached descendants of these roots, which is
-/// what [`super::command_line_targets`] computes. Pass an empty slice to skip
+/// command line of the session-boundary descendants of these roots plus their
+/// `wrap` parents, which is what [`super::command_line_targets`] computes. Pass an empty slice to skip
 /// the argv phase entirely and get a table whose every row is
 /// [`super::CommandLine::NotSampled`] — useful when the caller only wants the
 /// structural test, which reads no command line.

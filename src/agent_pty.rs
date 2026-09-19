@@ -8889,9 +8889,9 @@ impl AgentPtyRegistry {
     /// candidate pane (issue #862).
     ///
     /// The sampler needs these to decide whose command line to read: its second
-    /// phase reads the argv of exactly the detached descendants of these roots
-    /// (`crate::platform::proc::command_line_targets`) and of nothing else, which
-    /// is what keeps a tick from touching an unrelated process's `mmap_lock`.
+    /// phase reads the argv of the session-boundary descendants of these roots and
+    /// of each one's `wrap` parent (`crate::platform::proc::command_line_targets`),
+    /// never the subtree below the boundary, which is what keeps a tick from touching an unrelated process's `mmap_lock`.
     /// Order does not matter — the sampler sorts and dedupes.
     pub fn shell_activity_roots(candidates: &[ShellActivityCandidate]) -> Vec<i32> {
         candidates.iter().map(|c| c.shell_pid).collect()

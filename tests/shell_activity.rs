@@ -333,12 +333,13 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
 /// pipes, off any terminal — the shape a Claude Bash-tool child has), then
 /// samples the process table twice: once naming the test's own pid as a root and
 /// once naming no root at all. With the root, the detached grandchild's command
-/// line must be `Read` and carry the marker; the test's own non-detached child
-/// (`mid`, in the test's own session) and every unrelated process on the machine
-/// must be `NotSampled`. With no root, even the grandchild must be `NotSampled`.
-/// That is the whole of issue #862's fix expressed as a property: a poll reads
-/// the command line of the processes at its own panes' session boundaries and of
-/// nothing else on the machine.
+/// line must be `Read` and carry the marker; the test's own child `mid` (the parent of
+/// that boundary descendant, and a direct child of the root, so read for the
+/// `wrap` exemption of issue #797) must be `Read` too, and every other
+/// unrelated process on the machine must be `NotSampled`. With no root, even the grandchild must be `NotSampled`.
+/// That is issue #862's fix expressed as a property: a poll reads the command
+/// line of the processes at its own panes' session boundaries, their `wrap`
+/// parents, and nothing else on the machine.
 #[cfg(unix)]
 #[spec("status/shell-activity/008")]
 #[test]
@@ -1135,8 +1136,8 @@ fn shell_activity_014_idle_codex_pane_is_not_busy_under_the_production_sampler()
 /// Scenario: issue #797 shape B — a Codex worker with a delegation outstanding
 /// finishes its turn (Stop hook maps to Idle). One shell-activity monitor tick
 /// over the production-sampled process table must not push the card back to
-/// Working; the tick is replayed exactly as the daemon does it (a busy scan
-/// over a card that has regressed to Idle emits ShellBusy).
+/// Working; the tick is a conservative replay of the daemon's ShellBusy path (a
+/// busy scan over a card that has regressed to Idle emits ShellBusy).
 #[spec("status/shell-activity/015")]
 #[test]
 fn shell_activity_015_codex_stop_with_outstanding_delegation_stays_idle_after_a_monitor_tick() {
