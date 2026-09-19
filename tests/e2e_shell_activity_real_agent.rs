@@ -53,7 +53,8 @@ use spec::spec;
 /// [`process_table`] (issue #862).
 ///
 /// The production sampler reads the argv only of a root's **session-boundary**
-/// descendants, because a Bash-tool call's whole subtree inherits that call's
+/// candidates plus each candidate's parent when that is the root or a direct
+/// child of it (issue #797), because a Bash-tool call's whole subtree inherits that call's
 /// session and re-reading all of it every 500 ms is what made the poll stall
 /// under load. The processes these tests need to *identify* — the `ping` running
 /// under the tool shell, the agent's own MCP servers — sit below that boundary,

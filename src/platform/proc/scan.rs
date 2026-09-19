@@ -508,7 +508,7 @@ pub fn descendant_shell_activity(
             // "not a match" is the right reading.
             CommandLine::Unavailable => continue,
             // Should be unreachable, and it is the one case worth a log line.
-            // The sampler fills the command line for exactly the pids
+            // The sampler fills the command line for a superset of the pids
             // `shell_tool_candidates` reports (see `super::process_table`), and
             // that is the very function this loop iterates, so reaching here
             // means the table was sampled for different roots than it is being

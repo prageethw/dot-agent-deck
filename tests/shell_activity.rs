@@ -1024,8 +1024,9 @@ fn shell_activity_001_process_table_is_none_on_windows() {
 
 /// Build a process table the way production's two-phase sampler does (issue
 /// #862): every row starts `NotSampled`, and only the pids
-/// `command_line_targets` names for `root_pid` (the session-boundary
-/// descendants) get their argv filled in. `rows` are `(pid, ppid, sid, argv)`.
+/// `command_line_targets` names for `root_pid` (the boundary candidates
+/// plus each one's parent when that is the root or its direct child) get
+/// their argv filled in. `rows` are `(pid, ppid, sid, argv)`.
 fn production_sampled_table(rows: &[(i32, i32, i32, &str)], root_pid: i32) -> Vec<ProcessInfo> {
     let mut table: Vec<ProcessInfo> = rows
         .iter()
@@ -1114,11 +1115,11 @@ fn healthy_codex_pane_trees() -> Vec<(&'static str, i32, Vec<PaneRow>)> {
 
 /// Scenario: issue #797 shape A — an idle Codex worker pane with no background
 /// command running must classify as not busy when the process table is sampled
-/// the way production samples it (argv read only for session-boundary
-/// descendants, so the `wrap` root's own argv is never read). Today the wrap
-/// exemption from issue #644 cannot fire because it needs `wrap`'s argv, so
-/// `wrap`'s own primary child reads as a detached command and the pane is
-/// pinned at Working.
+/// the way production samples it (argv read for the session-boundary
+/// candidates plus each candidate's parent when that parent is the pane root
+/// or a direct child of it). Regression guard: the `wrap` root's argv is
+/// sampled, so the issue #644 wrap exemption fires and `wrap`'s own primary
+/// child is not mistaken for a detached command; the pane reads idle.
 #[spec("status/shell-activity/014")]
 #[test]
 fn shell_activity_014_idle_codex_pane_is_not_busy_under_the_production_sampler() {
@@ -1127,8 +1128,9 @@ fn shell_activity_014_idle_codex_pane_is_not_busy_under_the_production_sampler()
         assert_eq!(
             descendant_shell_activity(&table, root, &[]),
             Some(false),
-            "{name}: a healthy idle Codex pane (no detached command) must read idle even when \
-             only session-boundary argv is sampled (issue #797)"
+            "{name}: a healthy idle Codex pane (no detached command) must read idle when the \
+             sampler reads boundary candidates plus their root/direct-child parents \
+             (so `wrap`'s argv is present for the #644 exemption; issue #797)"
         );
     }
 }

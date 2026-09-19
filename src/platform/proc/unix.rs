@@ -581,8 +581,8 @@ const PS_TABLE_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty="];
 /// descendant** of one of the sample's roots
 /// (`super::shell_tool_candidates` — read its doc comment, the narrowing there is
 /// what keeps this phase from re-reading a whole build tree). So it costs nothing
-/// on an idle deck, and on a busy one it reads one command line per `setsid`-ed
-/// shell-tool call — always a process the deck itself spawned, never an unrelated
+/// on an idle deck, and on a busy one it reads up to two command lines per `setsid`-ed
+/// shell-tool call (the candidate plus its `wrap` parent, issue #797) — always a process the deck itself spawned, never an unrelated
 /// one, and never the `cargo`/`rustc`/`ld` subtree below that call.
 ///
 /// Kept as one portable `ps` call rather than split into a Linux
