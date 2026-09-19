@@ -380,13 +380,14 @@ fn shell_activity_008_the_sample_reads_command_lines_only_at_session_boundaries(
     );
 
     // 2. `mid`, a real child of this test in this test's OWN session, is not a
-    //    detached descendant, so nothing reads its command line — the scoping is
-    //    by session, not merely by descendancy.
-    assert_eq!(
-        row(&table, mid_pid).command_line,
-        CommandLine::NotSampled,
-        "a descendant that shares the root's POSIX session can never be a cross-check \
-         candidate, so its command line must not be read"
+    //    detached descendant. Since issue #797 it IS read, but only because it is
+    //    the direct parent of a session-boundary candidate (the shape `wrap` has
+    //    relative to `node codex`, whose argv the #644 exemption needs). The
+    //    scoping stays tight: parents only, and only the root or its direct
+    //    children — asserted by check 3 below.
+    assert!(
+        matches!(row(&table, mid_pid).command_line, CommandLine::Read(_)),
+        "the parent of a session-boundary candidate must be read (issue #797)"
     );
 
     // 2b. And the scoping stops AT the session boundary rather than descending
@@ -411,12 +412,12 @@ fn shell_activity_008_the_sample_reads_command_lines_only_at_session_boundaries(
         .iter()
         .filter(|p| p.command_line != CommandLine::NotSampled)
         .map(|p| p.pid)
-        .filter(|pid| *pid != spawned.target_pid)
+        .filter(|pid| *pid != spawned.target_pid && *pid != mid_pid)
         .collect();
     assert!(
         unrelated.is_empty(),
-        "only the detached descendants of the sample's roots may have a command line \
-         read; these other pids did too: {unrelated:?}"
+        "only the detached descendants of the sample's roots (and, issue #797, their \
+         parents) may have a command line read; these other pids did too: {unrelated:?}"
     );
 
     // 4. With no roots, the argv phase does not run at all — so even the

@@ -637,20 +637,26 @@ pub fn command_line_targets(table: &[ProcessInfo], roots: &[i32]) -> Vec<i32> {
         .flatten()
         .collect();
     // Issue #797: the #644 `wrap` exemption in `descendant_shell_activity`
-    // needs the argv of the pane root and of the root's direct children (the
-    // only rows it ever asks `argv_is_wrap_invocation` about — a `wrap` is
-    // the root itself, or its direct child behind a surviving `sh -c`). None
-    // of those is a session-boundary candidate, so without this the exemption
-    // never fires and a healthy idle Codex pane reads busy forever. A small
-    // fixed set per root — never the subtree — so the #862 cost bound holds.
-    // Gated on the root having a detached descendant at all, so a pane with
-    // nothing detached still costs no second-phase `ps`.
+    // needs `wrap`'s own argv, and `wrap` is never a session-boundary
+    // candidate: it is the pane root itself, or the root's direct child behind
+    // a surviving `sh -c`, and the `node codex` it launches is the boundary.
+    // So also read the argv of each candidate's PARENT when that parent is the
+    // root or one of its direct children — at most one extra pid per boundary,
+    // never the subtree, so the #862 cost bound holds and an idle pane (no
+    // candidates) still costs no second-phase `ps`.
+    let parent_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.ppid)).collect();
+    let mut wrap_parents: Vec<i32> = Vec::new();
     for root in roots {
-        if detached_descendants(table, *root).is_some_and(|d| !d.is_empty()) {
-            wanted.push(*root);
-            wanted.extend(table.iter().filter(|r| r.ppid == *root).map(|r| r.pid));
+        for candidate in shell_tool_candidates(table, *root).unwrap_or_default() {
+            let Some(parent) = parent_of.get(&candidate).copied() else {
+                continue;
+            };
+            if parent == *root || parent_of.get(&parent) == Some(root) {
+                wrap_parents.push(parent);
+            }
         }
     }
+    wanted.extend(wrap_parents);
     wanted.sort_unstable();
     wanted.dedup();
     wanted
@@ -1292,8 +1298,8 @@ mod tests {
 
     /// Issue #862 — the invariant the two-phase sample rests on: the set of pids
     /// whose command line the sampler reads is the set the classifier consults
-    /// (`shell_tool_candidates`), plus (issue #797) the root and its direct
-    /// children for the `wrap` exemption. Asserted directly, so
+    /// (`shell_tool_candidates`), plus (issue #797) each candidate's
+    /// parent when that is the root or a direct child, for the `wrap` exemption. Asserted directly, so
     /// a future change that widens one without the other fails here rather than
     /// silently suppressing a pane's signal.
     #[test]
@@ -1314,11 +1320,11 @@ mod tests {
         ];
         assert_eq!(shell_tool_candidates(&table, 100).unwrap(), vec![102]);
         assert_eq!(shell_tool_candidates(&table, 200).unwrap(), vec![202]);
-        // Issue #797: each root with a detached descendant also has its own
-        // argv and its direct children's read, for the `wrap` exemption.
+        // Issue #797: a candidate's parent (here the root) is read too, for the
+        // `wrap` exemption.
         assert_eq!(
             command_line_targets(&table, &[100, 200]),
-            vec![100, 101, 102, 200, 201, 202]
+            vec![100, 102, 200, 202]
         );
         assert_eq!(
             command_line_targets(&table, &[]),
@@ -1326,10 +1332,7 @@ mod tests {
             "no roots means no argv read at all"
         );
         // A root the table cannot answer for costs the others nothing.
-        assert_eq!(
-            command_line_targets(&table, &[100, 4242]),
-            vec![100, 101, 102]
-        );
+        assert_eq!(command_line_targets(&table, &[100, 4242]), vec![100, 102]);
     }
 
     /// Issue #862 — the narrowing that makes the two-phase sample worth having.
@@ -1379,9 +1382,9 @@ mod tests {
         );
         assert_eq!(
             command_line_targets(&table, &[AGENT]),
-            vec![100, 101, 200],
-            "and the sampler asks for that one plus the root and its direct children \
-             (issue #797), never the build tree"
+            vec![100, 200],
+            "and the sampler asks for that one plus its parent, the root (issue #797), \
+             never the build tree"
         );
         // The outcome is unchanged by the narrowing: the shape is on the
         // boundary process, so the cross-check still finds it.
