@@ -81,10 +81,11 @@ pub struct ProcessInfo {
 /// The argv is still needed, for the [`ShellToolShape`] cross-check — but only
 /// for a descendant of one of the sample's roots that sits at a **session
 /// boundary**: zero of those on an idle deck, and one per `setsid`-ed shell-tool
-/// call on a busy one. So it is read in a second phase, for exactly the pids
-/// [`shell_tool_candidates`] reports — a set that deliberately excludes the
-/// *subtree below* that boundary, which is where a build's `rustc` and `ld`
-/// processes live. This enum exists so the difference between "nothing needed
+/// call on a busy one. So it is read in a second phase, for the pids
+/// [`shell_tool_candidates`] reports plus each candidate's parent when that
+/// parent is the pane root or a direct child of it (issue #797, needed by the
+/// `wrap` exemption) — a set that deliberately excludes the *subtree below*
+/// that boundary, which is where a build's `rustc` and `ld` processes live. This enum exists so the difference between "nothing needed
 /// it" and "we wanted it and could not get it" survives into the classifier
 /// instead of collapsing into an empty string that silently matches no shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,6 +485,9 @@ pub fn descendant_shell_activity(
             return Some(true);
         }
     }
+    // Argv can now also suppress a busy reading (the `wrap` exemption, issue
+    // #797), but the fail-safe direction holds: `Unavailable` or `NotSampled`
+    // reads as "" and so is neither a `wrap` invocation nor exempt.
     // The cross-check consults the SESSION-BOUNDARY subset, not every detached
     // descendant — see [`shell_tool_candidates`] for why that is both correct
     // for the measured shape and the difference between reading one command
@@ -504,7 +508,7 @@ pub fn descendant_shell_activity(
             // "not a match" is the right reading.
             CommandLine::Unavailable => continue,
             // Should be unreachable, and it is the one case worth a log line.
-            // The sampler fills the command line for exactly the pids
+            // The sampler fills the command line for a superset of the pids
             // `shell_tool_candidates` reports (see `super::process_table`), and
             // that is the very function this loop iterates, so reaching here
             // means the table was sampled for different roots than it is being
@@ -541,9 +545,9 @@ pub fn descendant_shell_activity(
 ///
 /// This is the **structural test** and nothing else. Which processes a
 /// cross-check could ever need the command line of is the narrower
-/// [`shell_tool_candidates`] (issue #862), which both the two-phase sampler and
-/// [`descendant_shell_activity`]'s cross-check call — sharing that function is
-/// what keeps those two sets identical rather than merely intended to be.
+/// [`shell_tool_candidates`] (issue #862), the base of the set the two-phase
+/// sampler reads argv for; [`command_line_targets`] widens it with the `wrap`
+/// parents (issue #797), so the two sets are deliberately not identical.
 pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
     let root = table.iter().find(|row| row.pid == root_pid)?;
     if root.session_id <= 0 {
@@ -623,7 +627,9 @@ pub fn shell_tool_candidates(table: &[ProcessInfo], root_pid: i32) -> Option<Vec
 
 /// Every pid whose command line the second sampling phase must read, for a
 /// sample taken on behalf of `roots` (issue #862) — the union of
-/// [`shell_tool_candidates`] over every root, deduplicated and sorted.
+/// [`shell_tool_candidates`] over every root plus each candidate's parent when
+/// that parent is the root or a direct child of the root (issue #797, for the
+/// `wrap` exemption), deduplicated and sorted.
 ///
 /// Sorted so the `ps -p <list>` invocation built from it is deterministic, which
 /// is what makes the argv phase testable against a fixed expected command line.
@@ -636,6 +642,27 @@ pub fn command_line_targets(table: &[ProcessInfo], roots: &[i32]) -> Vec<i32> {
         .filter_map(|root| shell_tool_candidates(table, *root))
         .flatten()
         .collect();
+    // Issue #797: the #644 `wrap` exemption in `descendant_shell_activity`
+    // needs `wrap`'s own argv, and `wrap` is never a session-boundary
+    // candidate: it is the pane root itself, or the root's direct child behind
+    // a surviving `sh -c`, and the `node codex` it launches is the boundary.
+    // So also read the argv of each candidate's PARENT when that parent is the
+    // root or one of its direct children — at most one extra pid per boundary,
+    // never the subtree, so the #862 cost bound holds and an idle pane (no
+    // candidates) still costs no second-phase `ps`.
+    let parent_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.ppid)).collect();
+    let mut wrap_parents: Vec<i32> = Vec::new();
+    for root in roots {
+        for candidate in shell_tool_candidates(table, *root).unwrap_or_default() {
+            let Some(parent) = parent_of.get(&candidate).copied() else {
+                continue;
+            };
+            if parent == *root || parent_of.get(&parent) == Some(root) {
+                wrap_parents.push(parent);
+            }
+        }
+    }
+    wanted.extend(wrap_parents);
     wanted.sort_unstable();
     wanted.dedup();
     wanted
@@ -1276,12 +1303,13 @@ mod tests {
     }
 
     /// Issue #862 — the invariant the two-phase sample rests on: the set of pids
-    /// whose command line the sampler reads is EXACTLY the set the classifier
-    /// consults, because both are `shell_tool_candidates`. Asserted directly, so
-    /// a future change that widens one without the other fails here rather than
-    /// silently suppressing a pane's signal.
+    /// whose command line the sampler reads is the set the classifier consults
+    /// (`shell_tool_candidates`), plus (issue #797) each candidate's parent when
+    /// that is the root or a direct child, for the `wrap` exemption. Asserted
+    /// directly, so a future change that widens one without the other fails here
+    /// rather than silently suppressing a pane's signal.
     #[test]
-    fn command_line_targets_are_exactly_the_shell_tool_candidates() {
+    fn command_line_targets_are_the_shell_tool_candidates_plus_their_wrap_parents() {
         let table = vec![
             // Two panes' shells, each with an in-session child (an MCP server
             // shape) and a detached one (a Bash-tool shape).
@@ -1298,14 +1326,26 @@ mod tests {
         ];
         assert_eq!(shell_tool_candidates(&table, 100).unwrap(), vec![102]);
         assert_eq!(shell_tool_candidates(&table, 200).unwrap(), vec![202]);
-        assert_eq!(command_line_targets(&table, &[100, 200]), vec![102, 202]);
+        // Issue #797: a candidate's parent (here the root) is read too, for the
+        // `wrap` exemption.
+        assert_eq!(
+            command_line_targets(&table, &[100, 200]),
+            vec![100, 102, 200, 202]
+        );
         assert_eq!(
             command_line_targets(&table, &[]),
             Vec::<i32>::new(),
             "no roots means no argv read at all"
         );
         // A root the table cannot answer for costs the others nothing.
-        assert_eq!(command_line_targets(&table, &[100, 4242]), vec![102]);
+        assert_eq!(command_line_targets(&table, &[100, 4242]), vec![100, 102]);
+        // Idle fast path: a root whose descendants are all in-session has no
+        // candidates, so no argv (and no second-phase `ps`) is wanted.
+        let idle = vec![
+            row(300, 1, 300, "claude --model opus"),
+            row(301, 300, 300, "npm exec @upstash/context7-mcp"),
+        ];
+        assert_eq!(command_line_targets(&idle, &[300]), Vec::<i32>::new());
     }
 
     /// Issue #862 — the narrowing that makes the two-phase sample worth having.
@@ -1355,8 +1395,9 @@ mod tests {
         );
         assert_eq!(
             command_line_targets(&table, &[AGENT]),
-            vec![200],
-            "and the sampler asks for exactly that one"
+            vec![100, 200],
+            "and the sampler asks for that one plus its parent, the root (issue #797), \
+             never the build tree"
         );
         // The outcome is unchanged by the narrowing: the shape is on the
         // boundary process, so the cross-check still finds it.

@@ -581,8 +581,8 @@ const PS_TABLE_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty="];
 /// descendant** of one of the sample's roots
 /// (`super::shell_tool_candidates` — read its doc comment, the narrowing there is
 /// what keeps this phase from re-reading a whole build tree). So it costs nothing
-/// on an idle deck, and on a busy one it reads one command line per `setsid`-ed
-/// shell-tool call — always a process the deck itself spawned, never an unrelated
+/// on an idle deck, and on a busy one it reads up to two command lines per `setsid`-ed
+/// shell-tool call (the candidate plus its `wrap` parent, issue #797) — always a process the deck itself spawned, never an unrelated
 /// one, and never the `cargo`/`rustc`/`ld` subtree below that call.
 ///
 /// Kept as one portable `ps` call rather than split into a Linux
@@ -1106,8 +1106,8 @@ fn command_lines_from_ps_output(stdout: &[u8]) -> std::collections::HashMap<i32,
 /// `roots` are the pids the sample is being taken on behalf of — each pane's PTY
 /// child. They select **whose command line gets read** (issue #862): the bulk
 /// `ps -A` asks for no argv column at all, and a second `ps` then reads the
-/// command line of exactly the detached descendants of these roots, which is
-/// what [`super::command_line_targets`] computes. Pass an empty slice to skip
+/// command line of the session-boundary descendants of these roots plus their
+/// `wrap` parents, which is what [`super::command_line_targets`] computes. Pass an empty slice to skip
 /// the argv phase entirely and get a table whose every row is
 /// [`super::CommandLine::NotSampled`] — useful when the caller only wants the
 /// structural test, which reads no command line.
