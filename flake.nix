@@ -49,14 +49,17 @@
       # the misreport `VersionSource::Placeholder` was added to name.
       #
       # So this flake uses the injection seam that issue #250 built for packagers
-      # (the same one release.yml uses) and pins the version here. Since issue
-      # #1089 this line is bumped by .github/workflows/tag-release.yml, which
-      # commits it and then creates the tag from that same commit; before that it
-      # was a hand-edit in the /tag-release skill, pushed to main by a person. Do
-      # not bump it by hand — the workflow derives the pin and the tag from one
-      # input, so an out-of-band edit can only disagree with one of them.
+      # (the same one release.yml uses) and pins the version here. Upstream's
+      # issue #1089 automated this bump via .github/workflows/tag-release.yml,
+      # deriving the pin and tag from one input to avoid a human bypassing a
+      # branch-protection ruleset when pushing them — a problem this fork's own
+      # `main` doesn't have (no ruleset, CLAUDE.md rule 8), so that automation was
+      # deliberately declined during the 14th upstream sync
+      # (docs/develop/fork-sync-workflow.md). This line is a hand-edit via the
+      # `/tag-release` skill's Step 4, pushed to main by the maintainer/orchestrator,
+      # done immediately before creating the matching tag so the two never disagree.
       # release.yml still refuses to release when the pin disagrees with the tag.
-      version = "0.49.1";
+      version = "0.50.0";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git
       # metadata (build_version_resolve.rs:180-196).
