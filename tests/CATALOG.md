@@ -997,6 +997,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the runtime half of the fix — that a remediation arm actually returns promptly against a real wedged (`D`-state) child. `SIGKILL` cannot be blocked or ignored by an ordinary process, so no portable, CI-safe test child can be made to reap slowly under `kill()`, and `capture_bounded_async` is hard-wired to the concrete `tokio::process::Child` rather than a swappable trait object (unlike the `SlowReapChild` doubles in `platform/proc/mod.rs`). This test pins the structural shape only — a fix that wraps the exact unbounded pair unchanged inside an outer `timeout(async { .. })` would still read as unbounded to this scan even though it would behave correctly; that gap is accepted deliberately for a test that runs in microseconds and cannot flake.
 - **Platform coverage:** mac+linux (`unix.rs` is `#[cfg(unix)]` throughout; the scan itself is pure string matching with no OS process calls).
 
+##### status/shell-activity/014 — A healthy idle Codex pane reads not-busy when the process table is sampled the way production samples it (issue #797, shape A).
+- **Layer:** L1 (pure function over synthetic `ProcessInfo` tables built through `command_line_targets` + `fill_command_lines`; no PTY, no processes).
+- **Agent:** none (process trees mirroring a `wrap`-hosted Codex pane, both wrap-as-root and surviving-`sh -c`-in-front shapes).
+- **Asserts:** with argv filled only for session-boundary descendants (issue #862's two-phase sampler), `descendant_shell_activity(.., &[])` returns `Some(false)` for a Codex pane with no detached command, so the #644 wrap-primary-child exemption still applies in production.
+- **Does not assert:** a real `ps` sample, or the daemon poll loop.
+- **Platform coverage:** mac+linux+windows (pure data).
+
+##### status/shell-activity/015 — A Codex worker whose turn ended (Stop -> Idle) with a delegation outstanding stays Idle after a shell-activity monitor tick (issue #797, shape B).
+- **Layer:** L1 (`AppState` plus a replayed monitor tick over a production-sampled synthetic process table).
+- **Agent:** none (synthetic Codex hook events).
+- **Asserts:** after SessionStart, Thinking, Idle and an outstanding delegation, a busy-scan-driven `ShellBusy` must not move the card off Idle.
+- **Does not assert:** the delegated badge rendering (`theme/palette/008`).
+- **Platform coverage:** mac+linux+windows (pure data).
+
 #### status/message
 
 ##### status/message/001 — `ui.status_message` renders sanitized: control characters and bidi overrides interpolated into the transient status-bar message do not reach the terminal (issue #497).

@@ -51,7 +51,8 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnO
 #[cfg(unix)]
 use dot_agent_deck::platform::proc::{CLAUDE_BASH_TOOL_SHAPE, PS_SAMPLE_BUDGET};
 use dot_agent_deck::platform::proc::{
-    CommandLine, ProcessInfo, descendant_shell_activity, descendants, process_table,
+    CommandLine, ProcessInfo, command_line_targets, descendant_shell_activity, descendants,
+    fill_command_lines, process_table,
 };
 #[cfg(windows)]
 use dot_agent_deck::platform::proc::{ProcessTableOutcome, process_table_async};
@@ -1017,4 +1018,184 @@ fn shell_activity_001_process_table_is_none_on_windows() {
         "process_table_async() must report Unsupported on Windows — permanent for the \
          process's life, distinct from a transient Failed sample"
     );
+}
+
+/// Build a process table the way production's two-phase sampler does (issue
+/// #862): every row starts `NotSampled`, and only the pids
+/// `command_line_targets` names for `root_pid` (the session-boundary
+/// descendants) get their argv filled in. `rows` are `(pid, ppid, sid, argv)`.
+fn production_sampled_table(rows: &[(i32, i32, i32, &str)], root_pid: i32) -> Vec<ProcessInfo> {
+    let mut table: Vec<ProcessInfo> = rows
+        .iter()
+        .map(|(pid, ppid, sid, _)| ProcessInfo {
+            pid: *pid,
+            ppid: *ppid,
+            session_id: *sid,
+            has_controlling_tty: true,
+            session_leader: sid == pid,
+            command_line: CommandLine::NotSampled,
+        })
+        .collect();
+    let wanted = command_line_targets(&table, &[root_pid]);
+    let argv: std::collections::HashMap<i32, String> = rows
+        .iter()
+        .map(|(pid, _, _, a)| (*pid, a.to_string()))
+        .collect();
+    fill_command_lines(&mut table, &wanted, &argv);
+    table
+}
+
+/// The two healthy-Codex-pane process trees from issue #644, with no detached
+/// background command anywhere: `wrap` (or a surviving `sh -c` in front of it)
+/// as the pane root, `node codex` leading the fresh PTY session `wrap`
+/// allocated, and the native codex binary inside that session.
+type PaneRow = (i32, i32, i32, &'static str);
+
+fn healthy_codex_pane_trees() -> Vec<(&'static str, i32, Vec<PaneRow>)> {
+    vec![
+        (
+            "wrap is the pane root",
+            707387,
+            vec![
+                (
+                    707387,
+                    1,
+                    707387,
+                    "dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+                ),
+                (
+                    707563,
+                    707387,
+                    707563,
+                    "node /usr/bin/codex --model gpt-5.6-terra",
+                ),
+                (
+                    707572,
+                    707563,
+                    707563,
+                    "codex-linux-x64/vendor/bin/codex --model gpt-5.6-terra",
+                ),
+            ],
+        ),
+        (
+            "a surviving sh -c sits in front of wrap",
+            800100,
+            vec![
+                (
+                    800100,
+                    1,
+                    800100,
+                    "/bin/sh -c dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+                ),
+                (
+                    800101,
+                    800100,
+                    800100,
+                    "dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+                ),
+                (
+                    800163,
+                    800101,
+                    800163,
+                    "node /usr/bin/codex --model gpt-5.6-terra",
+                ),
+                (
+                    800172,
+                    800163,
+                    800163,
+                    "codex-linux-x64/vendor/bin/codex --model gpt-5.6-terra",
+                ),
+            ],
+        ),
+    ]
+}
+
+/// Scenario: issue #797 shape A — an idle Codex worker pane with no background
+/// command running must classify as not busy when the process table is sampled
+/// the way production samples it (argv read only for session-boundary
+/// descendants, so the `wrap` root's own argv is never read). Today the wrap
+/// exemption from issue #644 cannot fire because it needs `wrap`'s argv, so
+/// `wrap`'s own primary child reads as a detached command and the pane is
+/// pinned at Working.
+#[spec("status/shell-activity/014")]
+#[test]
+fn shell_activity_014_idle_codex_pane_is_not_busy_under_the_production_sampler() {
+    for (name, root, rows) in healthy_codex_pane_trees() {
+        let table = production_sampled_table(&rows, root);
+        assert_eq!(
+            descendant_shell_activity(&table, root, &[]),
+            Some(false),
+            "{name}: a healthy idle Codex pane (no detached command) must read idle even when \
+             only session-boundary argv is sampled (issue #797)"
+        );
+    }
+}
+
+/// Scenario: issue #797 shape B — a Codex worker with a delegation outstanding
+/// finishes its turn (Stop hook maps to Idle). One shell-activity monitor tick
+/// over the production-sampled process table must not push the card back to
+/// Working; the tick is replayed exactly as the daemon does it (a busy scan
+/// over a card that has regressed to Idle emits ShellBusy).
+#[spec("status/shell-activity/015")]
+#[test]
+fn shell_activity_015_codex_stop_with_outstanding_delegation_stays_idle_after_a_monitor_tick() {
+    use chrono::Utc;
+    use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+    use dot_agent_deck::state::{AppState, SessionStatus};
+
+    let event = |event_type: EventType| AgentEvent {
+        session_id: "codex-session".to_string(),
+        agent_type: AgentType::Codex,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some("worker".to_string()),
+        agent_id: Some("agent-1".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    };
+
+    for (name, root, rows) in healthy_codex_pane_trees() {
+        let mut state = AppState::default();
+        state.register_pane("worker".to_string());
+        for et in [
+            EventType::SessionStart,
+            EventType::Thinking,
+            EventType::Idle, // Codex Stop: turn finished
+        ] {
+            state.apply_event(event(et));
+        }
+        let card_id = state
+            .pane_session_id("worker")
+            .expect("the worker pane must have a card");
+        state
+            .sessions
+            .get_mut(&card_id)
+            .unwrap()
+            .outstanding_delegation = Some(dot_agent_deck::agent_pty::WatchSnapshot {
+            armed_secs_ago: 5,
+            orchestrator_pane_id: "orch".to_string(),
+        });
+        assert_eq!(state.sessions[&card_id].status, SessionStatus::Idle);
+
+        // One monitor tick: `run_shell_activity_monitor` emits ShellBusy when
+        // the scan reads busy and the card has regressed to Idle/Unknown.
+        let table = production_sampled_table(&rows, root);
+        if descendant_shell_activity(&table, root, &[]) == Some(true) {
+            state.apply_event(event(EventType::ShellBusy));
+        }
+
+        assert_eq!(
+            state.sessions[&card_id].status,
+            SessionStatus::Idle,
+            "{name}: a finished Codex turn with a delegation outstanding must stay Idle \
+             (rendered as delegated), not flip back to Working (issue #797)"
+        );
+    }
 }
