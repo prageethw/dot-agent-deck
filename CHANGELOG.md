@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.50.1] - 2026-09-19
+
+### Fixed
+
+  Codex worker panes no longer read `Working` constantly (regression since v0.50.0). The process sampler now also reads the command line of the parent of each session-boundary candidate when that parent is the pane root or one of its direct children, so `worker-agent-deck wrap` is recognised again and the idle `node codex` child is no longer treated as a detached background command.
+
+
+
 ## [0.50.0] - 2026-09-19
 
 ### Added
