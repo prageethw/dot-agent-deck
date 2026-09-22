@@ -4143,36 +4143,59 @@ fn layout_001_seven_decks_fit_single_column() {
     }
 }
 
-/// Scenario: Render a single dashboard card at position 23 — well past the
-/// `1`-`9` Normal-mode digit-jump shortcut's range (`Action::FocusCard`,
-/// unchanged by this fix) — and confirm the title row still carries a
-/// visible `23` number badge rather than going blank the way `card_number:
-/// None` silently did for every card past position 9 (issue #801). The
-/// shortcut itself stays scoped to cards 1-9; only the badge's own display
-/// cap is removed.
+/// Scenario: Render ten cards through both production seams whose
+/// `card_number` computation the issue #801 fix changed — the live-deck
+/// single-column grid (`render_card_grid_to_buffer` drives the real
+/// `render_card_grid`, src/ui.rs ~19415) and the flat dashboard-cards seam
+/// (`render_dashboard_cards_to_buffer`, which computes `card_number`
+/// internally too, src/ui.rs ~24950) — and confirm the tenth card in each
+/// still shows its `10` number badge. Before the fix both call sites capped
+/// the value at `if n <= 9 { Some(n) } else { None }`, so `num_prefix`
+/// rendered empty for the tenth card onward with no fallback; this assertion
+/// fails against the pre-fix code and passes against the fix. The `1`-`9`
+/// Normal-mode digit-jump shortcut (`Action::FocusCard`) is untouched by
+/// this fix and stays out of scope here — no card past position 9 gains a
+/// single-keypress shortcut.
 #[spec("dashboard/pane/017")]
 #[test]
 fn pane_017_card_number_badge_past_nine() {
-    let session = filled_session();
-    let width: u16 = 80;
-    let density = CardDensityKind::Normal;
-    let height = density.rendered_height();
-    let buffer = render_card_to_buffer(
-        &session,
-        Some("card-23"),
-        Some(23),
-        density,
-        0,     // animation tick
-        false, // not selected
-        width,
-        height,
-    );
-    let text = buffer_to_text(&buffer);
+    // Ten unique, digit-free display names so a `" 10 "` match in the
+    // rendered text can only be the number badge, never part of a name.
+    const NAMES: [&str; 10] = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
+    ];
+    let sessions: Vec<SessionState> = NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| role_session(i, name))
+        .collect();
+    let cards = as_cards(&sessions);
+
+    // (1) `render_card_grid_to_buffer`: a narrow width (<100) keeps
+    // `grid_columns` at a single column, and a height roomy enough for ten
+    // Compact-density rows (`10 * 6 = 60`) avoids both scrolling and a widened
+    // column count, so `flat_index` lines up 1:1 with session order and the
+    // tenth session lands at `card_number = Some(10)`.
+    let (grid_buffer, _) = render_card_grid_to_buffer(&cards, None, 0, 90, 70);
+    let grid_text = buffer_to_text(&grid_buffer);
     assert!(
-        text.contains(" 23 "),
-        "a card at position 23 must still show its two-digit number badge \
-         on the title row (issue #801) — expected \" 23 \" somewhere in the \
-         rendered card:\n{text}"
+        grid_text.contains(" 10 "),
+        "the tenth card in the live single-column deck grid must still show \
+         its number badge (issue #801) — expected \" 10 \" in the rendered \
+         grid:\n{grid_text}"
+    );
+
+    // (2) `render_dashboard_cards_to_buffer`: one card per row, with the
+    // buffer height derived to fit every card exactly — no scrolling is
+    // possible, so the tenth card is always on screen.
+    let dashboard_buffer =
+        render_dashboard_cards_to_buffer(&cards, None, CardDensityKind::Compact, 0, 64);
+    let dashboard_text = buffer_to_text(&dashboard_buffer);
+    assert!(
+        dashboard_text.contains(" 10 "),
+        "the tenth card in `render_dashboard_cards_to_buffer` must still \
+         show its number badge (issue #801) — expected \" 10 \" in the \
+         rendered cards:\n{dashboard_text}"
     );
 }
 
