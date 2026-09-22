@@ -4117,7 +4117,10 @@ fn layout_001_seven_decks_fit_single_column() {
     let names: Vec<String> = (1..=MANY).map(|i| format!("deck-{i}")).collect();
     let mut rendered_all = String::new();
     for (i, height) in heights.iter().enumerate() {
-        let card_number = if i < 9 { Some((i + 1) as u8) } else { None };
+        // Issue #801: the number badge is shown for every card position, not
+        // just the first nine — mirrors the production fix in `src/ui.rs`
+        // (both `card_number` call sites there dropped the same `<= 9` cap).
+        let card_number = Some((i + 1) as u8);
         let buffer = render_card_to_buffer(
             &session,
             Some(names[i].as_str()),
@@ -4138,6 +4141,39 @@ fn layout_001_seven_decks_fit_single_column() {
              once the column divides evenly (heights={heights:?}):\n{rendered_all}"
         );
     }
+}
+
+/// Scenario: Render a single dashboard card at position 23 — well past the
+/// `1`-`9` Normal-mode digit-jump shortcut's range (`Action::FocusCard`,
+/// unchanged by this fix) — and confirm the title row still carries a
+/// visible `23` number badge rather than going blank the way `card_number:
+/// None` silently did for every card past position 9 (issue #801). The
+/// shortcut itself stays scoped to cards 1-9; only the badge's own display
+/// cap is removed.
+#[spec("dashboard/pane/017")]
+#[test]
+fn pane_017_card_number_badge_past_nine() {
+    let session = filled_session();
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("card-23"),
+        Some(23),
+        density,
+        0,     // animation tick
+        false, // not selected
+        width,
+        height,
+    );
+    let text = buffer_to_text(&buffer);
+    assert!(
+        text.contains(" 23 "),
+        "a card at position 23 must still show its two-digit number badge \
+         on the title row (issue #801) — expected \" 23 \" somewhere in the \
+         rendered card:\n{text}"
+    );
 }
 
 /// The longest prefix of `s` that fits in `max` bytes without splitting a

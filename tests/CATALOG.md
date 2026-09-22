@@ -134,6 +134,12 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** how a live `session.status` (e.g. `Thinking`) actually reaches a session with no real applied event upstream in the field — the daemon-side/wrapper mechanism, split out of the original issue #730 report and tracked separately as issue #732 (the `suppress_text_status`/Codex-version-drift thread reviewer and auditor both identified as the likely live mechanism); the declared-badge-vs-observed-agent precedence, covered by `dashboard/pane/013`.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/017 — A card's number badge renders for every position, not only the first nine (issue #801).
+- **Layer:** L1 (ratatui `TestBackend` buffer-text assertion via `render_card_to_buffer`).
+- **Asserts:** a card rendered with `card_number: Some(23)` — a position well past the `1`-`9` Normal-mode digit-jump shortcut's range (`Action::FocusCard`, unchanged by this fix) — still shows the literal two-digit `23` badge on its title row. Before the fix, both `card_number` computation call sites in `src/ui.rs` capped the value at `if n <= 9 { Some(n) } else { None }`, so `num_prefix` rendered as an empty string for every card past position 9 with no fallback — the badge simply stopped, rather than degrading to some other visual index. The fix decouples the always-shown display value from the digit-key shortcut, which intentionally keeps its `1`-`9` scope.
+- **Does not assert:** that pressing a digit key 10+ jumps to that card — no such shortcut exists, before or after this fix, and none is added by it; badge color or styling; layout/alignment at card widths narrow enough to truncate a two-digit prefix (`truncate_styled_segments` already handles arbitrary-width truncation and is exercised elsewhere).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.

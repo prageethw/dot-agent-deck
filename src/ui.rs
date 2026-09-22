@@ -19406,10 +19406,13 @@ fn render_card_grid(
                 .get(col_idx)
                 .and_then(|id| ui.display_names.get(*id))
                 .or(session.display_name.as_ref());
-            let card_number = {
-                let n = flat_index + 1;
-                if n <= 9 { Some(n as u8) } else { None }
-            };
+            // Issue #801: every card gets a number badge, not only the first
+            // nine — the `1`-`9` Normal-mode digit jump shortcut
+            // (`Action::FocusCard`) still only reaches cards 1-9, but the
+            // badge itself must not silently stop past position 9. `u8`
+            // covers any realistic pane count (255); this is a display value,
+            // not a shortcut, so no cap is applied to it.
+            let card_number = Some((flat_index + 1) as u8);
             let card_area = col_chunks[col_idx];
             // Issue #308: what this pane's config said it runs, for a launcher
             // command that says nothing itself. Consulted only while the pane's
@@ -24942,10 +24945,9 @@ pub fn render_dashboard_cards_to_buffer(
                 height,
             });
             for (flat_index, (session, display_name)) in owned.iter().enumerate() {
-                let card_number = {
-                    let n = flat_index + 1;
-                    if n <= 9 { Some(n as u8) } else { None }
-                };
+                // Issue #801: mirrors the live-deck seam above — every card
+                // gets a number badge, uncapped at 9.
+                let card_number = Some((flat_index + 1) as u8);
                 render_session_card(
                     frame,
                     chunks[flat_index],
