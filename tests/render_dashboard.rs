@@ -4151,11 +4151,15 @@ fn layout_001_seven_decks_fit_single_column() {
 /// internally too, src/ui.rs ~24950) — and confirm the tenth card in each
 /// still shows its `10` number badge. Before the fix both call sites capped
 /// the value at `if n <= 9 { Some(n) } else { None }`, so `num_prefix`
-/// rendered empty for the tenth card onward with no fallback; this assertion
-/// fails against the pre-fix code and passes against the fix. The `1`-`9`
-/// Normal-mode digit-jump shortcut (`Action::FocusCard`) is untouched by
-/// this fix and stays out of scope here — no card past position 9 gains a
-/// single-keypress shortcut.
+/// rendered empty for the tenth card onward with no fallback; both
+/// assertions fail against the pre-fix code and pass against the fix. The
+/// grid assertion strips the deck's title row before checking, since that
+/// row's own `"— 10 session(s)"` count coincidentally contains the literal
+/// `" 10 "` substring regardless of `card_number` — asserting against the
+/// whole buffer would pass on that alone and never actually exercise the
+/// fix. The `1`-`9` Normal-mode digit-jump shortcut (`Action::FocusCard`) is
+/// untouched by this fix and stays out of scope here — no card past
+/// position 9 gains a single-keypress shortcut.
 #[spec("dashboard/pane/017")]
 #[test]
 fn pane_017_card_number_badge_past_nine() {
@@ -4178,11 +4182,27 @@ fn pane_017_card_number_badge_past_nine() {
     // tenth session lands at `card_number = Some(10)`.
     let (grid_buffer, _) = render_card_grid_to_buffer(&cards, None, 0, 90, 70);
     let grid_text = buffer_to_text(&grid_buffer);
+    // `render_card_grid` draws row 0 as the deck title (`deck_title_line`,
+    // src/ui.rs ~19190) BEFORE any card. With 10 sessions and none hidden,
+    // that title reads `" worker-deck — 10 session(s)"` — which itself
+    // contains the literal substring `" 10 "`, independent of card_number
+    // entirely. Asserting against the whole buffer text (including that row)
+    // would pass on that coincidental title match alone, whether or not the
+    // fix ever ran — reverting the production fix would leave this green
+    // (found in review). Strip row 0 first so only the card body — where the
+    // badge itself lives — can satisfy the assertion. The remaining card
+    // body has no other source of a `" 10 "` match for this fixture:
+    // `role_session`'s names are digit-free (alpha..juliet), `tool_count` is
+    // always 0 ("Tools: 0"), and `last_activity` is 30s in the future so
+    // `format_elapsed` always clamps to "Last: 0s" — never "10s" or
+    // "Tools: 10".
+    let grid_body: String = grid_text.lines().skip(1).collect::<Vec<_>>().join("\n");
     assert!(
-        grid_text.contains(" 10 "),
+        grid_body.contains(" 10 "),
         "the tenth card in the live single-column deck grid must still show \
-         its number badge (issue #801) — expected \" 10 \" in the rendered \
-         grid:\n{grid_text}"
+         its number badge (issue #801), OUTSIDE the deck title row (which is \
+         stripped here because it coincidentally also contains \" 10 \" via \
+         the session count) — expected \" 10 \" in the card body:\n{grid_body}"
     );
 
     // (2) `render_dashboard_cards_to_buffer`: one card per row, with the
