@@ -59,7 +59,7 @@
       # `/tag-release` skill's Step 4, pushed to main by the maintainer/orchestrator,
       # done immediately before creating the matching tag so the two never disagree.
       # release.yml still refuses to release when the pin disagrees with the tag.
-      version = "0.50.1";
+      version = "0.50.2";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git
       # metadata (build_version_resolve.rs:180-196).
