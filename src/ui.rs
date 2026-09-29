@@ -40,7 +40,10 @@ use crate::prompt_delivery::{
     unconfirmed_retry_delay,
 };
 use crate::repo_identity;
-use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
+use crate::state::{
+    AppState, DashboardStats, SessionState, SessionStatus, SharedState, observes_own_delegations,
+    observing_orchestrator_panes,
+};
 use crate::tab::{
     OrchestrationRoleStatus, OrchestrationStatus, SplitStage, Tab, TabId, TabManager,
     next_split_stage,
@@ -19240,6 +19243,7 @@ fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> 
 ///   there was the bug: an unpainted role is indistinguishable from a role that
 ///   failed to start, which sent two separate investigations after a hydration
 ///   defect that was not there.
+#[allow(clippy::too_many_arguments)]
 fn render_card_grid(
     frame: &mut Frame,
     area: Rect,
@@ -19248,6 +19252,11 @@ fn render_card_grid(
     session_ids: &[&String],
     total_sessions: usize,
     tick: u64,
+    // Issue #803: the panes that may present as `Observing`
+    // (`AppState::observing_panes`). A whole-deck fact, so it is passed in
+    // rather than derived from `sessions`, which is only the filtered slice
+    // being drawn.
+    observing_panes: &HashSet<String>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -19442,6 +19451,11 @@ fn render_card_grid(
                 // Fork #339: one deck-global toggle read by every card, on
                 // every tab, including one opened after the toggle fired.
                 ui.show_agent_type_badge,
+                observes_own_delegations(
+                    &session.status,
+                    session.pane_id.as_deref(),
+                    observing_panes,
+                ),
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -19801,6 +19815,8 @@ fn render_frame(
     }
 
     if draw_sidebar {
+        // Issue #803: recomputed on every frame, never cached.
+        let observing_panes = state.observing_panes();
         let stats_area = render_card_grid(
             frame,
             dashboard_area,
@@ -19809,6 +19825,7 @@ fn render_frame(
             &session_ids,
             total_sessions,
             tick,
+            &observing_panes,
         );
         render_stats_bar(
             frame,
@@ -23931,6 +23948,11 @@ fn render_session_card(
     declared_agent_type: Option<&AgentType>,
     // Fork #339: deck-global toggle for the agent-type badge (`ui.show_agent_type_badge`).
     show_agent_type_badge: bool,
+    // Issue #803: this pane is idle while a delegation IT ISSUED is still
+    // outstanding on another pane (`observes_own_delegations`). Passed in
+    // because the answer depends on the other sessions on the deck, which a
+    // single card cannot see.
+    observing_own_delegations: bool,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -24014,6 +24036,15 @@ fn render_session_card(
             format!("{label} (delegated)"),
             style.fg(palette::STATUS_OBSERVING),
         )
+    } else if observing_own_delegations {
+        // Issue #803: the mirror image of the branch above, for the
+        // orchestrator that issued the delegation. It is idle only because
+        // it is waiting on a worker, so plain "Idle" misreads it as having
+        // nothing in flight. Display-only — `session.status` stays `Idle` —
+        // and it reads the same bare word, in the same colour, as a
+        // `Working` held by a monitored wait below.
+        let (_label, style) = status_style(&session.status);
+        ("Observing".to_string(), style.fg(palette::STATUS_OBSERVING))
     } else if session.status == SessionStatus::Working
         && (session.wait_synthetic_working || session.wait_deferred_revert)
     {
@@ -24896,6 +24927,9 @@ pub fn render_card_with_declared_agent_to_buffer(
                 mode,
                 declared_agent_type,
                 show_agent_type_badge,
+                // Issue #803: one card has no other session to have
+                // delegated to.
+                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -24938,6 +24972,7 @@ pub fn render_dashboard_cards_to_buffer(
         .iter()
         .map(|(s, name)| (*s, name.map(str::to_string)))
         .collect();
+    let observing_panes = observing_panes_of_cards(cards);
     terminal
         .draw(|frame| {
             let constraints: Vec<Constraint> = (0..owned.len())
@@ -24971,6 +25006,11 @@ pub fn render_dashboard_cards_to_buffer(
                     // doc) — hidden-by-default IS that baseline, so this
                     // stays hardcoded rather than gaining a parameter.
                     false,
+                    observes_own_delegations(
+                        &session.status,
+                        session.pane_id.as_deref(),
+                        &observing_panes,
+                    ),
                 );
             }
         })
@@ -25015,6 +25055,66 @@ pub fn render_card_grid_to_buffer(
     width: u16,
     height: u16,
 ) -> (ratatui::buffer::Buffer, CardGridProbe) {
+    render_card_grid_seam(
+        cards,
+        selected,
+        scroll_offset,
+        width,
+        height,
+        &observing_panes_of_cards(cards),
+    )
+}
+
+/// Issue #803: [`observing_orchestrator_panes`] for an L1 seam that is handed
+/// cards and no [`AppState`]. The cards are that seam's whole deck, so the
+/// delegations their panes owe are all the delegations there are.
+fn observing_panes_of_cards(cards: &[(&SessionState, Option<&str>)]) -> HashSet<String> {
+    observing_orchestrator_panes(cards.iter().filter_map(|(session, _)| {
+        Some((
+            session.pane_id.as_deref()?,
+            session.outstanding_delegation.as_ref()?,
+        ))
+    }))
+}
+
+/// L1 seam for the deck card grid as the LIVE deck draws it from an
+/// [`AppState`]: the same [`render_card_grid`] as
+/// [`render_card_grid_to_buffer`], but every whole-deck fact a card depends on
+/// (issue #803: which panes present as `Observing`) is derived from `state`,
+/// exactly as `render_frame` derives it, rather than from the cards handed in.
+///
+/// `cards` is `(session, display_name)` in deck order and must borrow from
+/// `state.sessions`; `width` × `height` is the deck area.
+#[doc(hidden)]
+pub fn render_state_card_grid_to_buffer(
+    state: &AppState,
+    cards: &[(&SessionState, Option<&str>)],
+    selected: Option<usize>,
+    scroll_offset: usize,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, CardGridProbe) {
+    render_card_grid_seam(
+        cards,
+        selected,
+        scroll_offset,
+        width,
+        height,
+        &state.observing_panes(),
+    )
+}
+
+/// Shared body of [`render_card_grid_to_buffer`] and
+/// [`render_state_card_grid_to_buffer`], which differ only in where
+/// `observing_panes` comes from.
+fn render_card_grid_seam(
+    cards: &[(&SessionState, Option<&str>)],
+    selected: Option<usize>,
+    scroll_offset: usize,
+    width: u16,
+    height: u16,
+    observing_panes: &HashSet<String>,
+) -> (ratatui::buffer::Buffer, CardGridProbe) {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -25056,6 +25156,7 @@ pub fn render_card_grid_to_buffer(
                 &id_refs,
                 sessions.len(),
                 0,
+                observing_panes,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -37415,6 +37516,142 @@ mod tests {
         assert!(
             !need_bell,
             "an Idle transition must not ring bell.on_idle while a delegation is outstanding"
+        );
+    }
+
+    /// Scenario: issue #803. The idle bell is KEPT for an orchestrator that
+    /// goes `Idle` while a delegation it issued is still outstanding on a
+    /// worker pane: its card reads `Observing`, but the transition to idle
+    /// is still the moment the user may want to look, so `bell.on_idle` must
+    /// ring. Only the delegated WORKER's own idle bell stays suppressed
+    /// (issue #755).
+    #[test]
+    fn bell_still_rings_for_idle_orchestrator_with_delegation_it_issued() {
+        let mut orchestrator = make_session(SessionStatus::Idle);
+        orchestrator.pane_id = Some("orch-pane".to_string());
+        let mut worker = make_session(SessionStatus::Idle);
+        worker.pane_id = Some("worker-pane".to_string());
+        worker.outstanding_delegation = Some(crate::agent_pty::WatchSnapshot {
+            armed_secs_ago: 5,
+            orchestrator_pane_id: "orch-pane".to_string(),
+        });
+        let mut sessions = HashMap::new();
+        sessions.insert("orch".into(), orchestrator);
+        sessions.insert("worker".into(), worker);
+
+        // The worker was already idle; only the orchestrator transitions.
+        let mut last = HashMap::new();
+        last.insert("orch".into(), SessionStatus::Working);
+        last.insert("worker".into(), SessionStatus::Idle);
+
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(
+            need_bell,
+            "an orchestrator going Idle must still ring bell.on_idle even though a delegation \
+             it issued is outstanding (its card reads Observing, the bell is kept)"
+        );
+    }
+
+    /// A deck state for the two pane-change bell tests below: `worker-pane-a`
+    /// holds the one session `sess-moving`, run by `agent-moving`, and
+    /// `worker-pane-b` is registered with no session.
+    fn bell_state_with_session_on_pane_a() -> AppState {
+        let mut state = AppState::default();
+        state.register_pane("worker-pane-a".to_string());
+        state.register_pane("worker-pane-b".to_string());
+        state.apply_event(bell_moving_session_start("worker-pane-a"));
+        state
+    }
+
+    /// `sess-moving` announcing itself from `pane_id`.
+    fn bell_moving_session_start(pane_id: &str) -> AgentEvent {
+        AgentEvent {
+            session_id: "sess-moving".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some("agent-moving".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        }
+    }
+
+    fn bell_arm_delegation(state: &mut AppState, worker_pane: &str) {
+        state.apply_delegation_armed(crate::event::DelegationArmedNotice {
+            pane_id: worker_pane.to_string(),
+            snapshot: crate::agent_pty::WatchSnapshot {
+                armed_secs_ago: 5,
+                orchestrator_pane_id: "orch-pane".to_string(),
+            },
+        });
+    }
+
+    /// Whether `bell.on_idle` rings for `sess-moving` having just gone from
+    /// `Working` to the `Idle` it holds in `state`.
+    fn bell_rings_for_moving_session_going_idle(state: &AppState) -> bool {
+        assert_eq!(
+            state
+                .sessions
+                .get("sess-moving")
+                .map(|session| (session.pane_id.as_deref(), session.status.clone())),
+            Some((Some("worker-pane-b"), SessionStatus::Idle)),
+            "fixture precondition: sess-moving is Idle on worker-pane-b"
+        );
+        let mut last = HashMap::new();
+        last.insert("sess-moving".to_string(), SessionStatus::Working);
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&state.sessions, &last, &config);
+        need_bell
+    }
+
+    /// Scenario: issue #803. A session on a worker pane that owes a
+    /// `work-done` carries on in another pane under the same session id, and
+    /// the first pane's delegation is then retired. The session goes `Idle`
+    /// on a pane that owes nothing, so `bell.on_idle` must ring.
+    #[test]
+    fn bell_rings_for_idle_session_that_left_a_pane_whose_delegation_was_retired() {
+        let mut state = bell_state_with_session_on_pane_a();
+        bell_arm_delegation(&mut state, "worker-pane-a");
+        state.apply_event(bell_moving_session_start("worker-pane-b"));
+        state.apply_delegation_retired(crate::event::DelegationRetiredNotice {
+            pane_id: "worker-pane-a".to_string(),
+        });
+
+        assert!(
+            bell_rings_for_moving_session_going_idle(&state),
+            "a session that moved to a pane with no outstanding delegation must ring \
+             bell.on_idle when it goes Idle; the delegation on the pane it left was retired"
+        );
+    }
+
+    /// Scenario: issue #803. A session moves onto a worker pane that already
+    /// owes a `work-done`. Its `Idle` is a delegated worker's, so
+    /// `bell.on_idle` must stay silent (issue #755).
+    #[test]
+    fn bell_suppressed_for_idle_session_that_moved_onto_a_delegated_pane() {
+        let mut state = bell_state_with_session_on_pane_a();
+        bell_arm_delegation(&mut state, "worker-pane-b");
+        state.apply_event(bell_moving_session_start("worker-pane-b"));
+
+        assert!(
+            !bell_rings_for_moving_session_going_idle(&state),
+            "a session that moved onto a pane with an outstanding delegation must not ring \
+             bell.on_idle when it goes Idle"
         );
     }
 

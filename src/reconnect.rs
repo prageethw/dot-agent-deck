@@ -418,10 +418,17 @@ async fn resync_after_reconnect(client: &DaemonClient, state: &SharedState, gate
     if !gate.is_seeded() {
         return;
     }
-    // Nothing on screen to correct. Skipping the round-trip entirely keeps a
-    // flapping daemon from being probed by a TUI with no cards at all.
-    if state.read().await.sessions.is_empty() {
-        return;
+    // Nothing to reconcile: no card on screen to correct and no outstanding
+    // delegation to confirm. Skipping the round-trip entirely keeps a flapping
+    // daemon from being probed by a TUI that holds nothing. The delegations
+    // count on their own because they are kept per pane, not per card: one
+    // whose retirement was lost in the outage would otherwise be inherited by
+    // the next session to appear on its pane.
+    {
+        let state = state.read().await;
+        if state.sessions.is_empty() && !state.has_outstanding_delegations() {
+            return;
+        }
     }
 
     let records = match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents()).await {
@@ -473,13 +480,11 @@ async fn apply_broadcast(state: &SharedState, msg: BroadcastMsg) {
         // either, that's render-loop-local state.
         BroadcastMsg::WorktreeKept(notice) => state.write().await.queue_kept_worktree(notice),
         // Issue #755: applied directly, unlike the two queued variants above
-        // — `outstanding_delegation` lives on `SessionState`, which this
+        // — the outstanding delegations live on `AppState`, which this
         // subscriber can already write through `state`, exactly like the
         // `Event` arm at the top of this match. This is the live-push path
         // that lets an already-attached, healthily-subscribed TUI see a
-        // delegation arm/retire with no reconnect — see
-        // `SessionState::outstanding_delegation`'s doc for why the
-        // hydration/resync paths alone were not enough.
+        // delegation arm/retire with no reconnect.
         BroadcastMsg::DelegationArmed(notice) => state.write().await.apply_delegation_armed(notice),
         BroadcastMsg::DelegationRetired(notice) => {
             state.write().await.apply_delegation_retired(notice)

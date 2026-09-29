@@ -1033,6 +1033,157 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `PaneInput` arm's button-elision width measurement (issue #497 audit F1 / reviewer R3, already fixed in production: `msg_width` is measured against the sanitized string); anything about `strip_control_and_bidi`'s own correctness beyond the one literal codepoint check (that is `untrusted_text`'s own unit tests' job, including `strip_control_and_bidi_covers_every_bidi_codepoint`, which this fix extended with `U+0600`/`U+110BD`).
 - **Platform coverage:** mac+linux+windows.
 
+#### status/observing
+
+Issue #803: an orchestrator whose real status is `Idle` and which has at least one outstanding delegation that IT ISSUED presents as `Observing`. An `Unknown` status is never relabelled (`status/observing/016`), and a pane that itself owes a `work-done` is presented as a delegated worker, never as `Observing` (`status/observing/017`). An outstanding delegation is a fact about the worker's PANE: it survives the worker's session being replaced or restored (`status/observing/011`, `012`, `018`), is kept when it is announced before the pane has a session (`status/observing/015`), stays with the pane when a session changes pane (`status/observing/019`), and after a reconnect resync equals exactly what the daemon reported (`status/observing/013`, `014`, and `020` for a deck with no sessions, where `021` pins that a deck with nothing to reconcile asks the daemon nothing). Display-only: the orchestrator's real `SessionStatus` is never changed, and delegations are not fed into the monitored-wait state machine. The L1 tests draw the deck from the whole `AppState` through `render_state_card_grid_to_buffer` and look cards up by pane, so none of them depends on where the client stores the delegation. The `daemon status` table/`--json` surface, the idle bell (kept) and the tab bar's idle tally (excluded) are pinned by plain `#[test]`s alongside `build_status_agents`/`format_human` in `src/daemon_status.rs`, `compute_bell_needed` in `src/ui.rs` and `aggregate_stats` in `src/state.rs`, none of which carries a catalog spec id.
+
+##### status/observing/001 — An `Idle` orchestrator with a delegation it issued still outstanding reads `Observing` on its own card, while its real status stays `Idle`.
+- **Layer:** L1 (a real `AppState` driven through `apply_event`/`apply_delegation_armed`, drawn through the real card grid via `render_state_card_grid_to_buffer`).
+- **Agent:** none (four `SessionStart`-announced ClaudeCode session fixtures: two orchestrators, two workers).
+- **Asserts:** before any delegation the lead orchestrator's card reads plain `Idle`; after a `DelegationArmed` notice naming it as the issuer its card's status row reads `Observing` with no `Idle` beside it, and its `SessionStatus` is still `Idle`; the delegated worker's card keeps its `Idle (delegated)` badge; a second orchestrator that issued nothing, and an undelegated worker, both keep reading plain `Idle`.
+- **Does not assert:** the colour of the badge or border (`status/observing/008`); retirement (`status/observing/002`); the live daemon push or hydration that populates the field on a real deck (`status/observing/009`, `010`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/002 — Retiring the delegation returns the orchestrator's card to plain `Idle`.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** with one delegation outstanding the lead orchestrator reads `Observing`; after the `DelegationRetired` notice a `work-done` produces, its card reads plain `Idle` and so does the worker's.
+- **Does not assert:** retirement paths other than the notice itself (`status/observing/005`); more than one outstanding delegation (`status/observing/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/003 — An orchestrator with two outstanding delegations keeps reading `Observing` until the last one retires, and another orchestrator is never affected.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** with delegations outstanding on both workers the lead orchestrator reads `Observing`; after the first is retired it still reads `Observing`; after the second is retired it reads plain `Idle`; the second orchestrator, which issued neither delegation, reads plain `Idle` at every step.
+- **Does not assert:** two delegations stacked on the SAME worker pane (the daemon's supersession bookkeeping, covered by the plain `#[test]`s alongside `retire_outstanding_delegation` in `src/agent_pty.rs`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/004 — An orchestrator's real non-idle status always wins over an outstanding delegation.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** with a delegation outstanding, an orchestrator whose real status is `WaitingForInput`, `Error`, `Thinking`, `Working` or `Compacting` shows `Needs Input`, `Error`, `Thinking`, `Working` or `Compacting` respectively, and never `Observing`.
+- **Does not assert:** a `Working` that is itself held by a monitored wait, which already reads `Observing` for that reason (`theme/palette/007`, `status/observing/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/005 — A delegation that ends without a `work-done` does not leave the orchestrator stuck `Observing`.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** an orchestrator reading `Observing` returns to plain `Idle` when the daemon retires the delegation itself (the `DelegationRetired` notice an idle-watch expiry, a pane close and a worker exit all produce), and ALSO when the worker's session is removed from the deck outright (`remove_sessions_for_pane` + `unregister_pane`) with no retirement notice ever applied.
+- **Does not assert:** that the daemon actually emits `DelegationRetired` on each of those paths (covered by the plain `#[test]`s alongside `begin_pane_close`/`sweep_delegations_on_exit` in `src/agent_pty.rs`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/006 — An outstanding delegation keeps the orchestrator `Observing` past the monitored-wait TTL.
+- **Layer:** L1 (same seam as `status/observing/001`, plus `start_monitored_wait`/`sweep_expired_monitored_waits`).
+- **Agent:** none.
+- **Asserts:** with a delegation armed seven hours ago (older than the six-hour cap on a monitored wait's TTL) and a monitored wait on the orchestrator that the TTL sweep expires, the orchestrator's real status reverts to `Idle` and its card still reads `Observing`.
+- **Does not assert:** the monitored-wait state machine itself, which this issue leaves untouched (`wait/monitored/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/007 — Clearing an explicit monitored wait leaves the orchestrator `Observing` while a delegation is still outstanding.
+- **Layer:** L1 (same seam as `status/observing/001`, plus `start_monitored_wait`/`clear_monitored_wait`).
+- **Agent:** none.
+- **Asserts:** an orchestrator with both a delegation outstanding and an active monitored wait reads `Observing`; after the wait is cleared its real status is `Idle` and its card still reads `Observing`; only after the delegation is retired too does it read plain `Idle`.
+- **Does not assert:** the monitored-wait composition rules (`wait/monitored/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/008 — The observing orchestrator's card draws the bare word `Observing` and its border in `STATUS_OBSERVING`.
+- **Layer:** L1 (ratatui `TestBackend`, color-aware capture of the real card grid).
+- **Agent:** none.
+- **Asserts:** the observing orchestrator's status row carries the bare word `Observing` with no `(delegated)`/`(observing)` suffix; the badge text's foreground and the card's left border are both `palette::STATUS_OBSERVING`; a second orchestrator that issued no delegation keeps the plain `STATUS_IDLE` border.
+- **Does not assert:** the selected-card variant, whose border is `palette::SELECTED` regardless of status (`theme/palette/003`, `006`); the status dot's flash cadence.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/009 — An already-attached deck flips the orchestrator's card to `Observing` on `delegate` and back to `Idle` on `work-done`, with no reconnect.
+- **Layer:** L2 lane 1 (PTY-attached real TUI + its lazy daemon; the REAL `delegate` and `work-done` CLIs run as subprocesses against the deck's hook socket).
+- **Agent:** none (`cat` role stand-ins from the `orch-deck` fixture; the orchestrator is announced as an idle agent by a synthetic `SessionStart`, carrying a `cwd`, written to the hook socket once the deck has drawn the orchestrator's `No agent` placeholder card).
+- **Asserts:** after the delegate, once the daemon's own `ListAgents` reports the outstanding delegation on the worker pane issued by the orchestrator pane, the orchestrator's sidebar card status row reads `Observing` and not `Idle`; after the worker's `work-done`, once the daemon reports the delegation gone, the same row reads `Idle` and not `Observing`.
+- **Does not assert:** the worker card's own badge; the work-done feedback text written into the orchestrator's pane (`orchestration/work-done/*`); a real agent.
+- **Platform coverage:** mac+linux.
+
+##### status/observing/010 — A deck attaching while a delegation is outstanding hydrates the orchestrator's card as `Observing`.
+- **Layer:** L2 lane 1 (two PTY-attached real TUIs against one daemon; the REAL `delegate` CLI run as a subprocess).
+- **Agent:** none (`cat` role stand-ins; synthetic `SessionStart` for the orchestrator).
+- **Asserts:** with the delegation outstanding on the daemon and never answered, a second, fresh TUI attached to the same daemon draws the orchestrator's card with a live status and that status row reads `Observing`, not `Idle`.
+- **Does not assert:** the live push to the first deck (`status/observing/009`); which tab the reattached deck lands on (`session/restore/016`).
+- **Platform coverage:** mac+linux.
+
+##### status/observing/011 — An outstanding delegation survives the worker's session being replaced by a respawned agent.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** with the lead's delegation to the coder outstanding, a `SessionStart` on the coder's pane carrying a new agent id and a new session id replaces the coder's session; afterwards the lead's card still reads `Observing` with its real status `Idle`, the coder's new card reads `Idle (delegated)`, and the tab bar tallies 4 active / 2 idle; after the `DelegationRetired` notice both cards read plain `Idle` and the tally is 4 idle.
+- **Does not assert:** the same through a real daemon and deck (`status/observing/018`); a `SessionEnd` in between (`status/observing/012`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/012 — An outstanding delegation survives the worker's session ending and its pane being restored as a placeholder.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** with the lead's delegation to the coder outstanding, a `SessionEnd` on the coder's session leaves the pane one restored placeholder; the lead's card still reads `Observing` and the tally is 3 active / 2 idle; a fresh agent's `SessionStart` on the pane then yields a card reading `Idle (delegated)` with the lead still `Observing` and the tally 4 active / 2 idle; the `DelegationRetired` notice returns both to plain `Idle`.
+- **Does not assert:** what the restored placeholder's own card reads while no agent is on the pane (it keeps its `No agent` label, owned by `dashboard/pane/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/013 — A reconnect resync drops every delegation the daemon no longer reports.
+- **Layer:** L1 (same seam as `status/observing/001`, plus `resync_hydrated_sessions`).
+- **Agent:** none.
+- **Asserts:** a resync whose records still carry the coder's delegation keeps the lead `Observing`; a resync whose records carry no delegation, with the coder's pane run by an agent id the deck has never seen, returns the lead and the coder to plain `Idle` and the tally to 4 idle; so does a resync whose records have no entry for the coder's pane at all.
+- **Does not assert:** the reconnect loop that captures the records (`session/live/*`); the status/tool fields the resync also recovers (`tests/rehydration.rs`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/014 — A resync drops a delegation held for a pane that has no card yet.
+- **Layer:** L1 (same seam as `status/observing/013`).
+- **Agent:** none.
+- **Asserts:** with a delegation announced for the coder's pane while it has no session, a resync whose records carry no delegation, followed by the coder's agent announcing itself, leaves the lead and the coder's new card reading plain `Idle` and the tally at 4 idle.
+- **Does not assert:** that the delegation is kept when no resync intervenes (`status/observing/015`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/015 — A delegation announced before the worker's pane has a session is kept.
+- **Layer:** L1 (same seam as `status/observing/001`, plus `insert_placeholder_session`).
+- **Agent:** none.
+- **Asserts:** with the `DelegationArmed` notice applied while the coder's pane has no session, the lead reads `Observing`, the coder's card reads `Idle (delegated)` and the tally is 4 active / 2 idle once the coder's session appears, both when it is created by the agent's first `SessionStart` and when it is created as a typed placeholder card; retiring the delegation returns the lead to plain `Idle`.
+- **Does not assert:** what the lead's card reads in the interval before the worker's pane has any session.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/016 — An orchestrator whose status is `Unknown` is never relabelled `Observing`.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** an `Unknown` orchestrator with a delegation it issued outstanding draws the neutral `Idle` label `Unknown` always draws, never `Observing`; the tab bar tallies it as idle exactly as it does an `Unknown` agent that delegated nothing (4 active / 3 idle, only the delegated coder left out); the delegated coder keeps `Idle (delegated)`.
+- **Does not assert:** the `daemon status` row for the same pane (plain `#[test]` `unknown_orchestrator_with_outstanding_delegation_keeps_its_own_status` in `src/daemon_status.rs`); a delegated WORKER whose own status is `Unknown` (issue #755, unchanged).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/017 — A pane that owes a `work-done` is drawn as a delegated worker even when it issued a delegation itself.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** with the coder delegated by the lead and the tester delegated by the coder, the coder's card reads `Idle (delegated)` and never `Observing`, the lead reads `Observing`, the tester reads `Idle (delegated)`, and the tally is 4 active / 1 idle; once the coder's own delegation is retired the coder reads `Observing`, the lead plain `Idle`, and the tally is 4 active / 2 idle.
+- **Does not assert:** the `daemon status` row for the same pane (plain `#[test]` `pane_that_owes_a_work_done_is_never_reported_as_observing` in `src/daemon_status.rs`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/018 — The orchestrator's card keeps reading `Observing` after the respawned worker announces itself.
+- **Layer:** L2 lane 1 (PTY-attached real TUI + its lazy daemon; the REAL `delegate` and `work-done` CLIs run as subprocesses against the deck's hook socket).
+- **Agent:** none (`cat` role stand-ins; synthetic `SessionStart` hook lines for the orchestrator and, after the delegate's `clear = true` respawn, for the worker under the respawned agent's real registry id).
+- **Asserts:** after the delegate the orchestrator's card reads `Observing`; once the daemon reports a new agent id on the worker pane, that agent's `SessionStart` is written to the hook socket and the worker's card shows a live agent instead of `No agent`; with the daemon still reporting the delegation outstanding, the orchestrator's card reads `Observing` and not `Idle`, and the worker's card reads `Idle (delegated)`; after the worker's `work-done` the orchestrator's card reads `Idle` and not `Observing`, and the worker's card reads `Idle` with no `(delegated)` suffix.
+- **Does not assert:** the colour of either badge (`status/observing/008`); a real agent.
+- **Platform coverage:** mac+linux.
+
+##### status/observing/019 — An outstanding delegation stays with the pane when a session changes pane.
+- **Layer:** L1 (same seam as `status/observing/001`).
+- **Agent:** none.
+- **Asserts:** (a) with the coder's pane delegated by the lead, a `SessionStart` for the coder's session id and agent id arrives from the tester's pane (registered, no session of its own), then the coder pane's delegation is retired: the moved session's card reads plain `Idle`, the lead reads plain `Idle`, and the tally is 3 active / 3 idle. (b) with the tester's pane delegated by the bystander before it has a session, the coder's session moves onto it: its card reads `Idle (delegated)`, the bystander reads `Observing`, the tally is 3 active / 1 idle, and retiring the tester pane's delegation returns all of it to plain `Idle` and 3 / 3.
+- **Does not assert:** the idle bell for the same two sequences (plain `#[test]`s `bell_rings_for_idle_session_that_left_a_pane_whose_delegation_was_retired` and `bell_suppressed_for_idle_session_that_moved_onto_a_delegated_pane` in `src/ui.rs`); a move onto a pane that already holds another agent's session; what the moved session shows between the move and the retirement.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/observing/020 — A reconnect with no sessions on the deck still drops a delegation the daemon no longer reports.
+- **Layer:** L1 client/wire integration (the production `reconnect::run_event_subscriber` against a mock daemon over a real Unix socket, in `tests/rehydration.rs`; cards drawn through `render_state_card_grid_to_buffer`).
+- **Agent:** none (a mock daemon serving two `AgentRecord`s with nothing outstanding; synthetic `SessionStart` broadcasts).
+- **Asserts:** a deck with two registered panes, no sessions, and one stored delegation on the worker pane issued by the issuer pane loses its subscription (`KIND_STREAM_END "lagged"`) and re-subscribes; the worker and the issuer then announce themselves over the new subscription. The worker's card reads `Idle` with no `(delegated)` suffix, the issuer's card reads `Idle` and not `Observing`, and the tally is 2 active / 2 idle. The announcements are broadcast only after the second subscription is registered, so they are applied after the reconnect resync by construction, not by timing.
+- **Does not assert:** how many `ListAgents` requests the resync makes (reported in the failure message only); the same with sessions on the deck (`status/observing/013`, `014`); the no-reason transport-drop tear-down (`session/live/019`).
+- **Platform coverage:** mac+linux.
+
+##### status/observing/021 — A reconnect with no sessions and no outstanding delegation makes no `ListAgents` call.
+- **Layer:** L1 client/wire integration (same harness as `status/observing/020`).
+- **Agent:** none.
+- **Asserts:** with no sessions and nothing stored, the same tear-down, re-subscribe and announcements leave the mock daemon's `ListAgents` count at zero, both cards read plain `Idle`, and the tally is 2 active / 2 idle.
+- **Does not assert:** the bootstrap `ListAgents` that hydration makes (none runs here: the gate is open); the reconnect backoff.
+- **Platform coverage:** mac+linux.
+
 ### Agent protocol
 
 #### agent/readiness
@@ -1111,7 +1262,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### daemon/status/002 — `dot-agent-deck daemon status --json` pins its schema-versioned public document shape and every supported live-status string.
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status --json` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
 - **Agent:** none (synthetic — a labeled `cat`-stub mode pane spawned through the TUI's real `StartAgent` attach path, driven first by the REAL `dot-agent-deck agent-event --type running` CLI with the daemon-injected pane and agent ids, then by a raw `ToolStart` on the same production hook wire so the representative row has an active tool, then by arming all three delegation-watch detectors — idle, silence, commission — directly on the registry for that same pane).
-- **Asserts:** the subprocess exits successfully; stdout parses as a JSON object; `schema_version` equals the exact current public version; that schema has exactly the top-level fields `schema_version` and `agents`; the fully populated managed-agent row has exactly `agent_id`, `pane_id`, `label`, `cwd`, `role`, `status`, `active_tool`, `outstanding_delegation`, `silence_watch`, and `delegation_commission`, with the expected values and nested tool/watch shapes — proving the `ListAgents` handler's join actually wires the three delegation-watch fields onto a live record (issue #586 M1), not merely that `delegation_watch_snapshot` computes correctly in isolation; and all six supported statuses serialize with the exact public strings `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, and `Error`.
+- **Asserts:** the subprocess exits successfully; stdout parses as a JSON object; `schema_version` equals the exact current public version; that schema has exactly the top-level fields `schema_version` and `agents`; the fully populated managed-agent row has exactly `agent_id`, `pane_id`, `label`, `cwd`, `role`, `status`, `shell_synthetic_working`, `wait_observing`, `observing_delegations` (issue #803: always serialized, `false` on this `Working` row), `active_tool`, `outstanding_delegation`, `silence_watch`, and `delegation_commission`, with the expected values and nested tool/watch shapes — proving the `ListAgents` handler's join actually wires the three delegation-watch fields onto a live record (issue #586 M1), not merely that `delegation_watch_snapshot` computes correctly in isolation; and all six supported statuses serialize with the exact public strings `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, and `Error`.
 - **Does not assert:** the human-readable table (`daemon/status/001`); omission behavior when optional fields are absent (i.e. no watch armed — that shape is exercised by every OTHER `daemon/status` test, none of which arms a watch); tool-detail privacy (`daemon/status/004`).
 - **Platform coverage:** mac+linux.
 

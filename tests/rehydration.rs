@@ -55,7 +55,7 @@ use tokio::task::JoinHandle;
 use chrono::Utc;
 use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, AgentRecord, DISPLAY_NAME_MAX_LEN, DOT_AGENT_DECK_AGENT_ID,
-    DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+    DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership, WatchSnapshot,
 };
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
@@ -64,7 +64,9 @@ use dot_agent_deck::daemon_protocol::{
     bind_attach_listener, read_frame, serve_attach, serve_attach_with_counter, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType, Writable};
+use dot_agent_deck::event::{
+    AgentEvent, AgentType, BroadcastMsg, DelegationArmedNotice, EventType, Writable,
+};
 use dot_agent_deck::reconnect::{HydrationGate, run_event_subscriber};
 use dot_agent_deck::state::{
     ActiveTool, AppState, OrchestrationIdentity, SessionSnapshot, SessionState, SessionStatus,
@@ -72,7 +74,8 @@ use dot_agent_deck::state::{
 };
 use dot_agent_deck::ui::{
     dead_slot_pane_id, fill_dead_slots_with_placeholders, is_dead_slot_pane_id,
-    partition_hydrated_panes, render_card_grid_to_buffer, resolve_orch_config_for_hydration,
+    partition_hydrated_panes, render_card_grid_to_buffer, render_state_card_grid_to_buffer,
+    resolve_orch_config_for_hydration,
 };
 use dot_agent_deck::untrusted_text::is_bidi_format_char;
 use spec::spec;
@@ -4621,6 +4624,388 @@ fn live_019_transport_drop_mid_session_is_also_recovered_by_reconnect_rehydratio
     rt.block_on(assert_reconnect_recovers_the_missed_status(
         ReconnectTeardown::Dropped,
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #803 — the reconnect resync also reconciles outstanding delegations,
+// and the deck may be holding one for a pane that has no session yet.
+// ---------------------------------------------------------------------------
+
+const RECONCILE_WORKER_PANE: &str = "pane-reconcile-worker";
+const RECONCILE_ISSUER_PANE: &str = "pane-reconcile-issuer";
+
+/// What the mock daemon below lets a test observe and drive.
+struct ReconcileDaemon {
+    /// How many `ListAgents` requests the daemon has answered.
+    list_agents_calls: Arc<AtomicUsize>,
+    /// How many `SubscribeEvents` connections the daemon has registered a
+    /// receiver for AND acknowledged.
+    subscriptions: Arc<AtomicUsize>,
+    /// Ends the first subscription.
+    teardown: Arc<tokio::sync::Notify>,
+    event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
+}
+
+/// Mock daemon for issue #803, the same shape as
+/// [`run_reconnect_teardown_server`]: the first `SubscribeEvents` connection
+/// forwards nothing and ends with `KIND_STREAM_END "lagged"` when told to,
+/// every later one forwards broadcasts. `ListAgents` always answers `records`
+/// and is counted, and a subscription is counted only once its receiver is
+/// registered, so anything broadcast after the count moves reaches it.
+async fn run_reconcile_server(
+    listener: UnixListener,
+    records: Vec<AgentRecord>,
+    daemon: Arc<ReconcileDaemon>,
+) {
+    use std::sync::atomic::Ordering;
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let records = records.clone();
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            let req = match read_frame(&mut stream).await {
+                Ok(Some((KIND_REQ, payload))) => {
+                    match serde_json::from_slice::<AttachRequest>(&payload) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    }
+                }
+                _ => return,
+            };
+            match req {
+                AttachRequest::ListAgents => {
+                    daemon.list_agents_calls.fetch_add(1, Ordering::SeqCst);
+                    let resp = AttachResponse {
+                        ok: true,
+                        agent_records: Some(records),
+                        ..Default::default()
+                    };
+                    let _ = write_resp(&mut stream, &resp).await;
+                }
+                AttachRequest::SubscribeEvents => {
+                    let mut rx = daemon.event_tx.subscribe();
+                    if write_resp(&mut stream, &AttachResponse::ok())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let is_first = daemon.subscriptions.fetch_add(1, Ordering::SeqCst) == 0;
+                    if is_first {
+                        drop(rx);
+                        daemon.teardown.notified().await;
+                        let _ = write_frame(&mut stream, KIND_STREAM_END, b"lagged").await;
+                    } else {
+                        while let Ok(msg) = rx.recv().await {
+                            let payload =
+                                serde_json::to_vec(&msg).expect("BroadcastMsg serializes");
+                            if write_frame(&mut stream, KIND_EVENT, &payload)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                }
+            }
+        });
+    }
+}
+
+/// The daemon's record for a live agent on `pane_id` that owes no `work-done`.
+fn reconcile_agent_record(pane_id: &str) -> AgentRecord {
+    AgentRecord {
+        id: format!("agent-{pane_id}"),
+        pane_id_env: Some(pane_id.to_string()),
+        display_name: None,
+        cwd: None,
+        tab_membership: None,
+        agent_type: Some(AgentType::ClaudeCode),
+        rows: 24,
+        cols: 80,
+        live: None,
+        spawned_at_ms: None,
+        daemon_boot_id: None,
+        registration_generation: None,
+        cli_name: None,
+        crashed: None,
+        outstanding_delegation: None,
+        silence_watch: None,
+        delegation_commission: None,
+    }
+}
+
+/// The `SessionStart` the agent on `pane_id` announces itself with.
+fn reconcile_session_start(pane_id: &str) -> AgentEvent {
+    AgentEvent {
+        session_id: format!("sess-{pane_id}"),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(format!("agent-{pane_id}")),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    }
+}
+
+/// What the deck shows once the worker and the issuer have announced
+/// themselves after the reconnect.
+struct ReconciledDeck {
+    /// Every row of the worker's card, drawn alone from the whole state.
+    worker_card: String,
+    /// Every row of the issuer's card, drawn alone from the whole state.
+    issuer_card: String,
+    /// The tab bar's `(active, idle)` tally.
+    tally: (usize, usize),
+    /// `ListAgents` requests the daemon answered up to that point.
+    list_agents_calls: usize,
+}
+
+/// Draw the one card of the session on `pane_id` from the whole `state`, the
+/// way the live deck derives it, and return the drawn rows as text.
+fn reconcile_card_text(state: &AppState, pane_id: &str, name: &str) -> String {
+    let session = state
+        .sessions
+        .values()
+        .find(|session| session.pane_id.as_deref() == Some(pane_id))
+        .unwrap_or_else(|| panic!("no session on {pane_id}"));
+    let (buffer, _) =
+        render_state_card_grid_to_buffer(state, &[(session, Some(name))], None, 0, 80, 20);
+    let area = *buffer.area();
+    let mut out = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            out.push_str(buffer[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Run the production event subscriber against [`run_reconcile_server`] from
+/// a deck that has NO sessions, holding a delegation for the worker pane
+/// issued by the issuer pane when `stored_delegation` is set. The daemon
+/// reports both agents alive and nothing outstanding. The subscription is
+/// torn down, the subscriber reconnects, and only then do the worker and the
+/// issuer announce themselves, over the new subscription.
+///
+/// The announcements are broadcast after the second subscription is
+/// registered, and the subscriber reads events off a subscription only after
+/// its reconnect resync, so once both sessions exist the resync (or the
+/// decision to skip it) is behind us. No sleep decides the order.
+async fn reconnect_with_no_sessions(stored_delegation: bool) -> ReconciledDeck {
+    use std::sync::atomic::Ordering;
+
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = test_temp::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path, listener)
+    };
+    let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastMsg>(16);
+    let daemon = Arc::new(ReconcileDaemon {
+        list_agents_calls: Arc::new(AtomicUsize::new(0)),
+        subscriptions: Arc::new(AtomicUsize::new(0)),
+        teardown: Arc::new(tokio::sync::Notify::new()),
+        event_tx,
+    });
+    let server = tokio::spawn(run_reconcile_server(
+        listener,
+        vec![
+            reconcile_agent_record(RECONCILE_WORKER_PANE),
+            reconcile_agent_record(RECONCILE_ISSUER_PANE),
+        ],
+        daemon.clone(),
+    ));
+
+    let mut initial = AppState::default();
+    initial.register_pane(RECONCILE_WORKER_PANE.to_string());
+    initial.register_pane(RECONCILE_ISSUER_PANE.to_string());
+    if stored_delegation {
+        initial.apply_delegation_armed(DelegationArmedNotice {
+            pane_id: RECONCILE_WORKER_PANE.to_string(),
+            snapshot: WatchSnapshot {
+                armed_secs_ago: 30,
+                orchestrator_pane_id: RECONCILE_ISSUER_PANE.to_string(),
+            },
+        });
+    }
+    assert!(
+        initial.sessions.is_empty(),
+        "precondition: the deck has no sessions when the subscription is lost"
+    );
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(initial));
+
+    // No hydration pass follows, so the gate is open: seeded from the start.
+    let subscriber = tokio::spawn(run_event_subscriber(
+        path.clone(),
+        state.clone(),
+        HydrationGate::open(),
+    ));
+
+    let first_up = {
+        let daemon = daemon.clone();
+        wait_for(Duration::from_secs(10), Duration::from_millis(25), || {
+            daemon.subscriptions.load(Ordering::SeqCst) >= 1
+        })
+        .await
+    };
+    assert!(first_up, "setup: the subscriber never subscribed");
+
+    // The outage. The retire broadcast during it is lost by construction: the
+    // first subscription forwards nothing.
+    daemon.teardown.notify_one();
+    let reconnected = {
+        let daemon = daemon.clone();
+        wait_for(Duration::from_secs(10), Duration::from_millis(25), || {
+            daemon.subscriptions.load(Ordering::SeqCst) >= 2
+        })
+        .await
+    };
+    assert!(
+        reconnected,
+        "setup: the subscriber never re-subscribed after the tear-down"
+    );
+
+    for pane_id in [RECONCILE_WORKER_PANE, RECONCILE_ISSUER_PANE] {
+        daemon
+            .event_tx
+            .send(BroadcastMsg::Event(reconcile_session_start(pane_id)))
+            .expect("the second subscription holds a receiver");
+    }
+    let announced = {
+        let state = state.clone();
+        wait_for(
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || match state.try_read() {
+                Ok(st) => [RECONCILE_WORKER_PANE, RECONCILE_ISSUER_PANE]
+                    .iter()
+                    .all(|pane_id| {
+                        st.sessions
+                            .values()
+                            .any(|session| session.pane_id.as_deref() == Some(*pane_id))
+                    }),
+                Err(_) => false,
+            },
+        )
+        .await
+    };
+
+    let deck = {
+        let st = state.read().await;
+        assert!(
+            announced,
+            "setup: the worker's and the issuer's SessionStart never reached the deck over \
+             the new subscription; sessions = {:?}",
+            st.sessions.keys().collect::<Vec<_>>()
+        );
+        let stats = st.aggregate_stats();
+        ReconciledDeck {
+            worker_card: reconcile_card_text(&st, RECONCILE_WORKER_PANE, "whiskey-worker"),
+            issuer_card: reconcile_card_text(&st, RECONCILE_ISSUER_PANE, "india-issuer"),
+            tally: (stats.active, stats.idle),
+            list_agents_calls: daemon.list_agents_calls.load(Ordering::SeqCst),
+        }
+    };
+
+    subscriber.abort();
+    server.abort();
+    drop(dir);
+    deck
+}
+
+/// Scenario: A deck with no sessions holds an outstanding delegation for a
+/// worker pane whose retirement it missed during an outage, and the daemon
+/// reports nothing outstanding. After the production subscriber reconnects,
+/// the worker and the issuer announce themselves: the worker's card must read
+/// plain `Idle`, the issuer's card must not read `Observing`, and both count
+/// as idle.
+#[spec("status/observing/020")]
+#[test]
+fn observing_020_reconnect_with_no_sessions_drops_a_delegation_the_daemon_no_longer_reports() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("multi-thread runtime");
+    let deck = rt.block_on(reconnect_with_no_sessions(true));
+
+    assert!(
+        deck.worker_card.contains("Idle") && !deck.worker_card.contains("delegated"),
+        "the daemon reported no outstanding delegation when the deck reconnected, so the \
+         worker's card must read plain \"Idle\", not a delegated worker's badge (the daemon \
+         answered {} ListAgents request(s) during the reconnect):\n{}",
+        deck.list_agents_calls,
+        deck.worker_card
+    );
+    assert!(
+        deck.issuer_card.contains("Idle") && !deck.issuer_card.contains("Observing"),
+        "the daemon reported no outstanding delegation when the deck reconnected, so the \
+         issuer's card must read plain \"Idle\", not \"Observing\" (the daemon answered {} \
+         ListAgents request(s) during the reconnect):\n{}",
+        deck.list_agents_calls,
+        deck.issuer_card
+    );
+    assert_eq!(
+        deck.tally,
+        (2, 2),
+        "the tab bar must tally (active, idle) = (2, 2): nothing is outstanding, so the \
+         worker and the issuer are both idle"
+    );
+}
+
+/// Scenario: A deck with no sessions and no outstanding delegation loses its
+/// subscription and the production subscriber reconnects. There is nothing to
+/// reconcile, so the daemon must not be asked for `ListAgents` at all, and the
+/// agents that announce themselves afterwards read plain `Idle`.
+#[spec("status/observing/021")]
+#[test]
+fn observing_021_reconnect_with_nothing_to_reconcile_makes_no_list_agents_call() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("multi-thread runtime");
+    let deck = rt.block_on(reconnect_with_no_sessions(false));
+
+    assert_eq!(
+        deck.list_agents_calls, 0,
+        "a deck with no sessions and no outstanding delegation has nothing to reconcile, so \
+         a reconnect must not probe the daemon with ListAgents"
+    );
+    assert!(
+        deck.worker_card.contains("Idle") && !deck.worker_card.contains("delegated"),
+        "nothing was ever delegated, so the worker's card must read plain \"Idle\":\n{}",
+        deck.worker_card
+    );
+    assert!(
+        deck.issuer_card.contains("Idle") && !deck.issuer_card.contains("Observing"),
+        "nothing was ever delegated, so the issuer's card must read plain \"Idle\":\n{}",
+        deck.issuer_card
+    );
+    assert_eq!(
+        deck.tally,
+        (2, 2),
+        "the tab bar must tally (active, idle) = (2, 2): nothing was ever delegated"
+    );
 }
 
 /// Scenario: PRD fork#378 reviewer/auditor round 2 (HIGH 1 / F8): a session
