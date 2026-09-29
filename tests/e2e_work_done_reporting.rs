@@ -727,6 +727,10 @@ fn work_done_008_matching_subjects_produce_no_mismatch_warning() {
 /// this file's convention, so a silent rewording fails the test.
 const OBSERVING_LABEL: &str = "Observing";
 
+/// The label an idle worker's card must carry while its pane still owes a
+/// `work-done` (issue #755).
+const DELEGATED_IDLE_LABEL: &str = "Idle (delegated)";
+
 /// Leading fragment of the start role's name as the sidebar card draws it on
 /// its first body row. A fragment, not the whole name, so a narrow sidebar
 /// that ellipsizes the name (`orchestrat…`) is still matched.
@@ -1057,7 +1061,7 @@ fn observing_010_reattached_deck_hydrates_orchestrator_card_as_observing() {
     );
 }
 
-/// Scenario: Launch the real TUI and its daemon, open the two-role `orch-deck` orchestration, announce the `cat` orchestrator as an idle agent, and run the REAL `delegate` CLI from the orchestrator to the worker, which respawns the worker under a new agent id. Write the `SessionStart` the respawned worker's hook would send, so the deck replaces the worker's session: the orchestrator's card must STILL read `Observing` once the worker's card shows a live agent. Then run the REAL `work-done` CLI from the worker: the orchestrator's card must go back to `Idle`.
+/// Scenario: Launch the real TUI and its daemon, open the two-role `orch-deck` orchestration, announce the `cat` orchestrator as an idle agent, and run the REAL `delegate` CLI from the orchestrator to the worker, which respawns the worker under a new agent id. Write the `SessionStart` the respawned worker's hook would send, so the deck replaces the worker's session: the orchestrator's card must STILL read `Observing` and the worker's card must read `Idle (delegated)`. Then run the REAL `work-done` CLI from the worker: both cards must go back to plain `Idle`.
 #[spec("status/observing/018")]
 #[test]
 fn observing_018_orchestrator_keeps_observing_after_the_respawned_worker_announces_itself() {
@@ -1141,6 +1145,14 @@ fn observing_018_orchestrator_keeps_observing_after_the_respawned_worker_announc
          outstanding, but the orchestrator's card stopped reading {OBSERVING_LABEL:?}\n{}",
         describe_orchestrator_card(&deck)
     );
+    assert!(
+        wait_for_role_card(&deck, WORKER_ROLE, visible_timeout, |row| {
+            row.contains(DELEGATED_IDLE_LABEL) && !row.contains(OBSERVING_LABEL)
+        }),
+        "the respawned worker announced itself and the daemon still holds the delegation as \
+         outstanding, but the worker's card does not read {DELEGATED_IDLE_LABEL:?}\n{}",
+        describe_orchestrator_card(&deck)
+    );
 
     let (worker_generation, worker_boot_id, _worker_cwd) =
         worker_fail_closed_identity(&deck, &worker_pane);
@@ -1172,6 +1184,14 @@ fn observing_018_orchestrator_keeps_observing_after_the_respawned_worker_announc
         }),
         "the worker reported work-done and the daemon retired the delegation, but the \
          orchestrator's card did not go back to `Idle`\n{}",
+        describe_orchestrator_card(&deck)
+    );
+    assert!(
+        wait_for_role_card(&deck, WORKER_ROLE, visible_timeout, |row| {
+            row.contains("Idle") && !row.contains("delegated") && !row.contains(OBSERVING_LABEL)
+        }),
+        "the worker reported work-done and the daemon retired the delegation, but the \
+         worker's card did not go back to plain `Idle`\n{}",
         describe_orchestrator_card(&deck)
     );
 }

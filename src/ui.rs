@@ -37556,6 +37556,105 @@ mod tests {
         );
     }
 
+    /// A deck state for the two pane-change bell tests below: `worker-pane-a`
+    /// holds the one session `sess-moving`, run by `agent-moving`, and
+    /// `worker-pane-b` is registered with no session.
+    fn bell_state_with_session_on_pane_a() -> AppState {
+        let mut state = AppState::default();
+        state.register_pane("worker-pane-a".to_string());
+        state.register_pane("worker-pane-b".to_string());
+        state.apply_event(bell_moving_session_start("worker-pane-a"));
+        state
+    }
+
+    /// `sess-moving` announcing itself from `pane_id`.
+    fn bell_moving_session_start(pane_id: &str) -> AgentEvent {
+        AgentEvent {
+            session_id: "sess-moving".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some("agent-moving".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        }
+    }
+
+    fn bell_arm_delegation(state: &mut AppState, worker_pane: &str) {
+        state.apply_delegation_armed(crate::event::DelegationArmedNotice {
+            pane_id: worker_pane.to_string(),
+            snapshot: crate::agent_pty::WatchSnapshot {
+                armed_secs_ago: 5,
+                orchestrator_pane_id: "orch-pane".to_string(),
+            },
+        });
+    }
+
+    /// Whether `bell.on_idle` rings for `sess-moving` having just gone from
+    /// `Working` to the `Idle` it holds in `state`.
+    fn bell_rings_for_moving_session_going_idle(state: &AppState) -> bool {
+        assert_eq!(
+            state
+                .sessions
+                .get("sess-moving")
+                .map(|session| (session.pane_id.as_deref(), session.status.clone())),
+            Some((Some("worker-pane-b"), SessionStatus::Idle)),
+            "fixture precondition: sess-moving is Idle on worker-pane-b"
+        );
+        let mut last = HashMap::new();
+        last.insert("sess-moving".to_string(), SessionStatus::Working);
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&state.sessions, &last, &config);
+        need_bell
+    }
+
+    /// Scenario: issue #803. A session on a worker pane that owes a
+    /// `work-done` carries on in another pane under the same session id, and
+    /// the first pane's delegation is then retired. The session goes `Idle`
+    /// on a pane that owes nothing, so `bell.on_idle` must ring.
+    #[test]
+    fn bell_rings_for_idle_session_that_left_a_pane_whose_delegation_was_retired() {
+        let mut state = bell_state_with_session_on_pane_a();
+        bell_arm_delegation(&mut state, "worker-pane-a");
+        state.apply_event(bell_moving_session_start("worker-pane-b"));
+        state.apply_delegation_retired(crate::event::DelegationRetiredNotice {
+            pane_id: "worker-pane-a".to_string(),
+        });
+
+        assert!(
+            bell_rings_for_moving_session_going_idle(&state),
+            "a session that moved to a pane with no outstanding delegation must ring \
+             bell.on_idle when it goes Idle; the delegation on the pane it left was retired"
+        );
+    }
+
+    /// Scenario: issue #803. A session moves onto a worker pane that already
+    /// owes a `work-done`. Its `Idle` is a delegated worker's, so
+    /// `bell.on_idle` must stay silent (issue #755).
+    #[test]
+    fn bell_suppressed_for_idle_session_that_moved_onto_a_delegated_pane() {
+        let mut state = bell_state_with_session_on_pane_a();
+        bell_arm_delegation(&mut state, "worker-pane-b");
+        state.apply_event(bell_moving_session_start("worker-pane-b"));
+
+        assert!(
+            !bell_rings_for_moving_session_going_idle(&state),
+            "a session that moved onto a pane with an outstanding delegation must not ring \
+             bell.on_idle when it goes Idle"
+        );
+    }
+
     #[test]
     fn bell_disabled_globally() {
         let mut sessions = HashMap::new();

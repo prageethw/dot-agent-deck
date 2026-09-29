@@ -6398,3 +6398,109 @@ fn observing_017_pane_that_owes_a_work_done_is_drawn_as_a_delegated_worker() {
          are idle",
     );
 }
+
+/// The conversation that has been running on `from_pane` carries on in
+/// `to_pane`: the same agent, under the same session id, reports from the
+/// other pane, as a session resumed in another pane does. `to_pane` must be
+/// registered and hold no session of its own.
+fn move_observing_session(state: &mut AppState, from_pane: &str, to_pane: &str) {
+    state.apply_event(observing_hook_event(
+        EventType::SessionStart,
+        to_pane,
+        &observing_session_id(from_pane),
+        &observing_agent_id(from_pane),
+    ));
+    assert!(
+        observing_sessions_on(state, from_pane).is_empty(),
+        "fixture precondition: no session is left on {from_pane} once its conversation moved"
+    );
+    let moved: Vec<(&str, SessionStatus)> = observing_sessions_on(state, to_pane)
+        .into_iter()
+        .map(|session| (session.session_id.as_str(), session.status.clone()))
+        .collect();
+    assert_eq!(
+        moved,
+        vec![(
+            observing_session_id(from_pane).as_str(),
+            SessionStatus::Idle
+        )],
+        "fixture precondition: {from_pane}'s conversation is the one Idle session on {to_pane}"
+    );
+}
+
+/// Scenario: The coder owes the lead a `work-done` when its conversation
+/// carries on in the tester's pane under the same session id, and the coder
+/// pane's delegation is then retired. The moved session's card must read plain
+/// `Idle` and count as idle, because the pane it now sits on owes nothing.
+/// Conversely, a session that moves onto a pane which already owes the
+/// bystander a `work-done` must read `Idle (delegated)` and stay out of the
+/// idle tally.
+#[spec("status/observing/019")]
+#[test]
+fn observing_019_delegation_stays_with_the_pane_when_a_session_changes_pane() {
+    // (a) The session leaves the pane that owes the work-done.
+    let mut state = observing_deck_state_without(&[TESTER_PANE]);
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    assert_card_delegated(
+        &render_observing_deck(&state),
+        "bravo-coder",
+        "precondition: the coder's pane owes the lead a work-done",
+    );
+
+    move_observing_session(&mut state, CODER_PANE, TESTER_PANE);
+    retire_delegation(&mut state, CODER_PANE);
+
+    let buffer = render_observing_deck(&state);
+    assert_card_plain_idle(
+        &buffer,
+        "charlie-tester",
+        "the session moved off the coder's pane, the coder pane's delegation has been \
+         retired, and the tester's pane never owed a work-done",
+    );
+    assert_card_plain_idle(&buffer, "alpha-lead", "its only delegation was retired");
+    assert_observing_tally(
+        &state,
+        3,
+        3,
+        "nothing is outstanding, so the lead, the moved session and the bystander are all \
+         idle",
+    );
+
+    // (b) The session arrives on a pane that owes a work-done of its own.
+    let mut state = observing_deck_state_without(&[TESTER_PANE]);
+    arm_delegation(&mut state, TESTER_PANE, BYSTANDER_PANE);
+    move_observing_session(&mut state, CODER_PANE, TESTER_PANE);
+
+    let buffer = render_observing_deck(&state);
+    assert_card_delegated(
+        &buffer,
+        "charlie-tester",
+        "the session now sits on the tester's pane, which owes the bystander a work-done",
+    );
+    assert_card_observing(
+        &buffer,
+        "delta-bystander",
+        "its delegation to the tester's pane is outstanding",
+    );
+    assert_observing_tally(
+        &state,
+        3,
+        1,
+        "the moved session is a delegated worker and the bystander is observing, so only \
+         the lead is idle",
+    );
+
+    retire_delegation(&mut state, TESTER_PANE);
+    let buffer = render_observing_deck(&state);
+    assert_card_plain_idle(
+        &buffer,
+        "charlie-tester",
+        "the delegation on the pane it sits on was retired",
+    );
+    assert_card_plain_idle(
+        &buffer,
+        "delta-bystander",
+        "its only delegation was retired",
+    );
+    assert_observing_tally(&state, 3, 3, "nothing is outstanding any more");
+}
