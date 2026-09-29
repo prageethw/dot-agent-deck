@@ -19177,4 +19177,64 @@ clear = false
              delegated-but-idle pane must not inflate it"
         );
     }
+
+    /// Scenario: issue #803. `aggregate_stats`'s "N idle" tally must not count
+    /// an `Idle` orchestrator while a delegation IT ISSUED is still
+    /// outstanding on a worker pane, so the tab bar agrees with that
+    /// orchestrator's own card (which reads `Observing`). It still counts as
+    /// active, an orchestrator that issued nothing still counts as idle, and
+    /// once the delegation is retired the orchestrator counts as idle again.
+    #[test]
+    fn aggregate_stats_excludes_idle_orchestrator_with_delegation_it_issued() {
+        let mut state = AppState::default();
+        for pane in ["orch-pane", "worker-pane", "bystander-pane"] {
+            state.register_pane(pane.to_string());
+            state.insert_placeholder_session(
+                pane.to_string(),
+                None,
+                Some(AgentType::ClaudeCode),
+                None,
+            );
+        }
+        state.apply_delegation_armed(crate::event::DelegationArmedNotice {
+            pane_id: "worker-pane".to_string(),
+            snapshot: crate::agent_pty::WatchSnapshot {
+                armed_secs_ago: 0,
+                orchestrator_pane_id: "orch-pane".to_string(),
+            },
+        });
+        assert!(
+            state.sessions[&session_id_for_pane("worker-pane")]
+                .outstanding_delegation
+                .is_some(),
+            "precondition: the worker's delegation is armed"
+        );
+        assert_eq!(
+            state.sessions[&session_id_for_pane("orch-pane")].status,
+            SessionStatus::Idle,
+            "precondition: the orchestrator's real status is (and stays) Idle"
+        );
+
+        let stats = state.aggregate_stats();
+        assert_eq!(
+            stats.active, 3,
+            "all three panes count toward active regardless of delegations"
+        );
+        assert_eq!(
+            stats.idle, 1,
+            "only the bystander may count toward the idle bucket: the worker is delegated \
+             (issue #755) and the orchestrator is observing the delegation it issued \
+             (issue #803)"
+        );
+
+        state.apply_delegation_retired(crate::event::DelegationRetiredNotice {
+            pane_id: "worker-pane".to_string(),
+        });
+        let stats = state.aggregate_stats();
+        assert_eq!(
+            stats.idle, 3,
+            "once the delegation is retired the orchestrator (and the worker) are genuinely \
+             idle again and must be counted"
+        );
+    }
 }

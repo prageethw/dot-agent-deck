@@ -37418,6 +37418,43 @@ mod tests {
         );
     }
 
+    /// Scenario: issue #803. The idle bell is KEPT for an orchestrator that
+    /// goes `Idle` while a delegation it issued is still outstanding on a
+    /// worker pane: its card reads `Observing`, but the transition to idle
+    /// is still the moment the user may want to look, so `bell.on_idle` must
+    /// ring. Only the delegated WORKER's own idle bell stays suppressed
+    /// (issue #755).
+    #[test]
+    fn bell_still_rings_for_idle_orchestrator_with_delegation_it_issued() {
+        let mut orchestrator = make_session(SessionStatus::Idle);
+        orchestrator.pane_id = Some("orch-pane".to_string());
+        let mut worker = make_session(SessionStatus::Idle);
+        worker.pane_id = Some("worker-pane".to_string());
+        worker.outstanding_delegation = Some(crate::agent_pty::WatchSnapshot {
+            armed_secs_ago: 5,
+            orchestrator_pane_id: "orch-pane".to_string(),
+        });
+        let mut sessions = HashMap::new();
+        sessions.insert("orch".into(), orchestrator);
+        sessions.insert("worker".into(), worker);
+
+        // The worker was already idle; only the orchestrator transitions.
+        let mut last = HashMap::new();
+        last.insert("orch".into(), SessionStatus::Working);
+        last.insert("worker".into(), SessionStatus::Idle);
+
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(
+            need_bell,
+            "an orchestrator going Idle must still ring bell.on_idle even though a delegation \
+             it issued is outstanding (its card reads Observing, the bell is kept)"
+        );
+    }
+
     #[test]
     fn bell_disabled_globally() {
         let mut sessions = HashMap::new();

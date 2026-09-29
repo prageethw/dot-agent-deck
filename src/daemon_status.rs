@@ -710,4 +710,176 @@ mod tests {
             "a non-Working row must keep rendering its real status; got {line:?}"
         );
     }
+
+    /// Issue #803 fixture: a worker row whose `delegate` was issued by
+    /// `orchestrator_pane` and has not been answered by a `work-done` yet.
+    fn worker_delegated_by(id: &str, pane: &str, orchestrator_pane: &str) -> AgentRecord {
+        AgentRecord {
+            outstanding_delegation: Some(crate::agent_pty::WatchSnapshot {
+                armed_secs_ago: 90,
+                orchestrator_pane_id: orchestrator_pane.to_string(),
+            }),
+            ..record(id, pane, Some(snapshot(SessionStatus::Idle)))
+        }
+    }
+
+    /// The STATUS column of `pane`'s row in the human table (columns are
+    /// tab-separated: `PANE AGENT ROLE STATUS TOOL LABEL CWD`).
+    fn status_cell(table: &str, pane: &str) -> String {
+        table
+            .lines()
+            .find(|l| l.split('\t').next() == Some(pane))
+            .and_then(|l| l.split('\t').nth(3))
+            .unwrap_or_else(|| panic!("no row for {pane} in {table:?}"))
+            .to_string()
+    }
+
+    /// Scenario: issue #803. An orchestrator whose real status is `Idle` and
+    /// which ISSUED a delegation that is still outstanding on a worker pane
+    /// must read `Observing` in the human table, exactly the word a
+    /// wait-held `Working` already uses (issue #784). A second orchestrator
+    /// that issued nothing, and the delegated worker itself, keep their own
+    /// status words.
+    #[test]
+    fn format_human_shows_observing_for_idle_orchestrator_with_outstanding_delegation() {
+        let agents = build_status_agents(vec![
+            record("agent-1", "orch-pane", Some(snapshot(SessionStatus::Idle))),
+            worker_delegated_by("agent-2", "worker-pane", "orch-pane"),
+            record(
+                "agent-3",
+                "bystander-pane",
+                Some(snapshot(SessionStatus::Idle)),
+            ),
+        ]);
+        let table = format_human(&agents);
+
+        assert_eq!(
+            status_cell(&table, "orch-pane"),
+            "Observing",
+            "an Idle orchestrator with a delegation it issued still outstanding must read \
+             \"Observing\" in the `daemon status` table; table:\n{table}"
+        );
+        assert_eq!(
+            status_cell(&table, "bystander-pane"),
+            "Idle",
+            "an orchestrator that issued no outstanding delegation must keep reading \"Idle\" — \
+             another pane's delegations must never leak onto it; table:\n{table}"
+        );
+        assert_eq!(
+            status_cell(&table, "worker-pane"),
+            "Idle",
+            "the delegated WORKER's own row is out of scope for issue #803 and must be \
+             unchanged; table:\n{table}"
+        );
+    }
+
+    /// Scenario: issue #803. The `--json` document for the same Idle
+    /// orchestrator keeps reporting its REAL status (`Idle`) and flags the
+    /// presentation override through `wait_observing: true`; a pane that
+    /// issued no outstanding delegation reports `wait_observing: false`.
+    #[test]
+    fn json_keeps_idle_status_and_flags_wait_observing_for_delegating_orchestrator() {
+        let agents = build_status_agents(vec![
+            record("agent-1", "orch-pane", Some(snapshot(SessionStatus::Idle))),
+            worker_delegated_by("agent-2", "worker-pane", "orch-pane"),
+            record(
+                "agent-3",
+                "bystander-pane",
+                Some(snapshot(SessionStatus::Idle)),
+            ),
+        ]);
+        let json = serde_json::to_string(&StatusDocument::new(agents)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let row = |pane: &str| -> serde_json::Value {
+            v["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["pane_id"] == pane)
+                .unwrap_or_else(|| panic!("no json row for {pane} in {json}"))
+                .clone()
+        };
+        let idle = serde_json::to_value(SessionStatus::Idle).unwrap();
+
+        let orchestrator = row("orch-pane");
+        assert_eq!(
+            orchestrator["status"], idle,
+            "the orchestrator's real status must stay Idle in the json document — issue #803 \
+             is display-only; got {orchestrator}"
+        );
+        assert_eq!(
+            orchestrator["wait_observing"],
+            serde_json::Value::Bool(true),
+            "an Idle orchestrator with a delegation it issued still outstanding must report \
+             `wait_observing: true`; got {orchestrator}"
+        );
+
+        let bystander = row("bystander-pane");
+        assert_eq!(bystander["status"], idle);
+        assert_eq!(
+            bystander["wait_observing"],
+            serde_json::Value::Bool(false),
+            "a pane that issued no outstanding delegation must not report `wait_observing`; \
+             got {bystander}"
+        );
+        let worker = row("worker-pane");
+        assert_eq!(
+            worker["wait_observing"],
+            serde_json::Value::Bool(false),
+            "the delegated worker did not issue the delegation and must not report \
+             `wait_observing`; got {worker}"
+        );
+    }
+
+    /// Scenario: issue #803. The override applies to `Idle`/`Unknown` only:
+    /// an orchestrator with a delegation outstanding whose real status is
+    /// `WaitingForInput`, `Error`, `Thinking` or a genuine `Working` keeps
+    /// its real status word and reports `wait_observing: false`. Once the
+    /// worker's delegation is gone from the records the Idle orchestrator
+    /// reads `Idle` again.
+    #[test]
+    fn delegating_orchestrator_keeps_real_status_when_not_idle() {
+        for status in [
+            SessionStatus::WaitingForInput,
+            SessionStatus::Error,
+            SessionStatus::Thinking,
+            SessionStatus::Working,
+        ] {
+            let agents = build_status_agents(vec![
+                record("agent-1", "orch-pane", Some(snapshot(status.clone()))),
+                worker_delegated_by("agent-2", "worker-pane", "orch-pane"),
+            ]);
+            let table = format_human(&agents);
+            assert_eq!(
+                status_cell(&table, "orch-pane"),
+                format!("{status:?}"),
+                "a {status:?} orchestrator must show its real status even with a delegation \
+                 outstanding; table:\n{table}"
+            );
+            let orchestrator = agents
+                .iter()
+                .find(|a| a.pane_id.as_deref() == Some("orch-pane"))
+                .unwrap();
+            assert!(
+                !orchestrator.wait_observing,
+                "a {status:?} orchestrator must not report `wait_observing` for a delegation"
+            );
+        }
+
+        let agents = build_status_agents(vec![
+            record("agent-1", "orch-pane", Some(snapshot(SessionStatus::Idle))),
+            record(
+                "agent-2",
+                "worker-pane",
+                Some(snapshot(SessionStatus::Idle)),
+            ),
+        ]);
+        let table = format_human(&agents);
+        assert_eq!(
+            status_cell(&table, "orch-pane"),
+            "Idle",
+            "with no delegation outstanding the orchestrator reads plain Idle; table:\n{table}"
+        );
+        assert!(!agents[0].wait_observing);
+    }
 }
