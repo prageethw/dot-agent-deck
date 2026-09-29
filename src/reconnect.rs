@@ -418,10 +418,17 @@ async fn resync_after_reconnect(client: &DaemonClient, state: &SharedState, gate
     if !gate.is_seeded() {
         return;
     }
-    // Nothing on screen to correct. Skipping the round-trip entirely keeps a
-    // flapping daemon from being probed by a TUI with no cards at all.
-    if state.read().await.sessions.is_empty() {
-        return;
+    // Nothing to reconcile: no card on screen to correct and no outstanding
+    // delegation to confirm. Skipping the round-trip entirely keeps a flapping
+    // daemon from being probed by a TUI that holds nothing. The delegations
+    // count on their own because they are kept per pane, not per card: one
+    // whose retirement was lost in the outage would otherwise be inherited by
+    // the next session to appear on its pane.
+    {
+        let state = state.read().await;
+        if state.sessions.is_empty() && !state.has_outstanding_delegations() {
+            return;
+        }
     }
 
     let records = match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents()).await {

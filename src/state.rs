@@ -1116,10 +1116,11 @@ pub struct SessionState {
     /// never a second source of truth: the fact belongs to the pane, so it
     /// outlives any one session on it (a `clear = true` delegate respawns the
     /// worker, whose first hook event replaces the session). `AppState` stamps
-    /// it on every session it creates and restamps it on every write to the
-    /// pane's entry; nothing else writes it. It exists so a consumer that is
-    /// handed sessions without an `AppState` (a single card, the bell) can
-    /// still read it.
+    /// it on every session it creates, restamps it on every write to the
+    /// pane's entry, and restamps it from the new pane's entry when
+    /// [`AppState::apply_event`] moves the session to another pane; nothing
+    /// else writes it. It exists so a consumer that is handed sessions
+    /// without an `AppState` (a single card, the bell) can still read it.
     pub outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
 }
 
@@ -1597,8 +1598,13 @@ pub struct AppState {
     /// ([`Self::unregister_pane`], [`Self::remove_sessions_for_pane`]).
     ///
     /// Private so every write goes through
-    /// [`Self::set_outstanding_delegation`], which keeps
-    /// [`SessionState::outstanding_delegation`] equal to it.
+    /// [`Self::set_outstanding_delegation`] or
+    /// [`Self::replace_outstanding_delegations`], which restamp
+    /// [`SessionState::outstanding_delegation`] on the sessions of each pane
+    /// they touch. The other half of keeping the two equal is on the session
+    /// side: every path that gives a session a pane (creation, and
+    /// [`Self::apply_event`] changing an existing session's pane) stamps the
+    /// copy from that pane's entry here.
     outstanding_delegations: HashMap<String, crate::agent_pty::WatchSnapshot>,
     /// PRD #499 (reopened) M3/M5: active monitored waits, keyed by pane_id.
     ///
@@ -7652,6 +7658,12 @@ impl AppState {
         self.outstanding_delegations.get(pane_id)
     }
 
+    /// Issue #803: whether this client holds any outstanding delegation at
+    /// all, with or without a session on the pane that owes it.
+    pub fn has_outstanding_delegations(&self) -> bool {
+        !self.outstanding_delegations.is_empty()
+    }
+
     /// Issue #803: [`observing_orchestrator_panes`] over every delegation
     /// this client knows to be outstanding.
     pub fn observing_panes(&self) -> HashSet<String> {
@@ -11538,7 +11550,8 @@ impl AppState {
 
         // Issue #803: a delegation is owed by the pane, so a session born on
         // a pane that already owes one (a respawned worker's first hook
-        // event) carries it from its first frame.
+        // event) carries it from its first frame, and a session that moves
+        // to another pane takes on that pane's.
         let pane_delegation = event
             .pane_id
             .as_ref()
@@ -11593,7 +11606,7 @@ impl AppState {
                 model: event.model.clone(),
                 expects_agent_report: false,
                 agent_report_activity_seen: false,
-                outstanding_delegation: pane_delegation,
+                outstanding_delegation: pane_delegation.clone(),
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -11738,6 +11751,9 @@ impl AppState {
         }
 
         if event.pane_id.is_some() {
+            if session.pane_id != event.pane_id {
+                session.outstanding_delegation = pane_delegation;
+            }
             session.pane_id.clone_from(&event.pane_id);
         }
 
