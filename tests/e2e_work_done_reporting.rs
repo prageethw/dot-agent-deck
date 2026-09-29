@@ -733,10 +733,14 @@ const ORCHESTRATOR_CARD_NEEDLE: &str = "orchestrat";
 /// The top-border row of the ORCHESTRATOR's sidebar card — the row that
 /// carries its status badge — or `None` while no such card is drawn.
 ///
-/// A card is a box whose first body row names the role (PRD fork#405 moved the
-/// name off the title). The focused role's embedded PANE is also a box, and
-/// its title is the role name, so a box whose top border names the role is
-/// the pane and is skipped: only the card's status row is ever returned.
+/// A card is a box whose first body row OPENS with the role name, directly
+/// after the box's own left border (PRD fork#405 moved the name off the title
+/// onto that row, unpadded). The focused role's embedded PANE is also a box on
+/// the same grid rows, and its content can mention the role anywhere (a
+/// worker's task pointer carries the `…-orchestrator-1` clone path), so
+/// "contains" is not enough: the name must be the first thing on the row. A
+/// box whose top border names the role is that role's pane and is skipped
+/// too. Only a card's status row is ever returned.
 fn orchestrator_card_status_row(grid: &str) -> Option<String> {
     let lines: Vec<Vec<char>> = grid.lines().map(|line| line.chars().collect()).collect();
     lines.iter().enumerate().find_map(|(row, chars)| {
@@ -756,9 +760,10 @@ fn orchestrator_card_status_row(grid: &str) -> Option<String> {
                     if title.contains(ORCHESTRATOR_CARD_NEEDLE) {
                         return None;
                     }
-                    let body_span: String = body.get(start..=end)?.iter().collect();
-                    body_span
-                        .contains(ORCHESTRATOR_CARD_NEEDLE)
+                    let body_span = body.get(start..=end)?;
+                    let (left_border, inner) = body_span.split_first()?;
+                    let inner: String = inner.iter().collect();
+                    (*left_border == weight.vertical && inner.starts_with(ORCHESTRATOR_CARD_NEEDLE))
                         .then_some(title)
                 })
         })
@@ -947,7 +952,7 @@ fn observing_010_reattached_deck_hydrates_orchestrator_card_as_observing() {
         .without_success_recording()
         .launch_with_fixture("minimal");
 
-    let visible_timeout = common::load_scaled(Duration::from_secs(30));
+    let visible_timeout = common::load_scaled(Duration::from_secs(20));
     assert!(
         wait_for_orchestrator_card(&reattached, visible_timeout, |row| {
             row.contains("Idle") || row.contains(OBSERVING_LABEL)
