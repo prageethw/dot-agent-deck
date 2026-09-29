@@ -31,7 +31,7 @@ use serde::Serialize;
 
 use crate::agent_pty::{AgentRecord, TabMembership};
 use crate::state::{
-    ActiveTool, SessionStatus, delegating_orchestrator_panes, observes_own_delegations,
+    ActiveTool, SessionStatus, observes_own_delegations, observing_orchestrator_panes,
 };
 
 /// Version of the `--json` document shape. Bump on a field removal or a
@@ -106,13 +106,16 @@ pub struct StatusAgent {
     /// `Working` — either because the wait promoted it from idle, or
     /// because it is holding open a `Working` that an agent's own real
     /// completion would otherwise have reverted. Drives the `Observing`
-    /// label on both the CLI and TUI surfaces (issue #784).
-    ///
-    /// Issue #803: also `true` for a pane whose real status is
-    /// `Idle`/`Unknown` while a delegation IT ISSUED is still outstanding
-    /// on a worker pane. `status` keeps reporting the real status in that
-    /// case; this flag is what says the pane presents as `Observing`.
+    /// label on both the CLI and TUI surfaces (issue #784). Only ever `true`
+    /// alongside `status: Working`.
     pub wait_observing: bool,
+    /// Issue #803: whether this pane presents as `Observing` because it is
+    /// `Idle` while a delegation IT ISSUED is still outstanding on a worker
+    /// pane. `status` keeps reporting the real `Idle`. Never `true` for a
+    /// pane that itself owes a `work-done` (that pane is a delegated
+    /// worker), nor alongside any status but `Idle`. Always serialized;
+    /// additive — see [`SCHEMA_VERSION`]'s doc.
+    pub observing_delegations: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<StatusTool>,
     /// Issue #586 M1/M2: PRD #126's idle-worker watch, if currently armed for
@@ -181,26 +184,20 @@ fn role_of(tab_membership: &Option<TabMembership>) -> Option<String> {
 /// Reduce the daemon's `ListAgents` reply to the CLI's own status shape.
 /// Pure — no I/O — so it's unit-testable independent of a live daemon.
 pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
-    // Issue #803: which panes issued a delegation some worker still carries.
-    // Derived from this one reply, so it can never outlive the records it
-    // was read from.
-    let delegating_panes = delegating_orchestrator_panes(
-        records
-            .iter()
-            .filter_map(|record| record.outstanding_delegation.as_ref()),
-    );
+    // Issue #803: derived from this one reply, so it can never outlive the
+    // records it was read from.
+    let observing_panes = observing_orchestrator_panes(records.iter().filter_map(|record| {
+        Some((
+            record.pane_id_env.as_deref()?,
+            record.outstanding_delegation.as_ref()?,
+        ))
+    }));
     records
         .into_iter()
         .map(|record| {
             let live = record.live;
-            // Issue #803: an `Idle`/`Unknown` pane with a delegation IT
-            // ISSUED still outstanding. `status` itself stays the real one.
-            let observes_delegations = live.as_ref().is_some_and(|s| {
-                observes_own_delegations(
-                    &s.status,
-                    record.pane_id_env.as_deref(),
-                    &delegating_panes,
-                )
+            let observing_delegations = live.as_ref().is_some_and(|s| {
+                observes_own_delegations(&s.status, record.pane_id_env.as_deref(), &observing_panes)
             });
             StatusAgent {
                 agent_id: record.id,
@@ -213,14 +210,14 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                     .as_ref()
                     .map(|s| s.shell_synthetic_working)
                     .unwrap_or(false),
-                wait_observing: observes_delegations
-                    || live
-                        .as_ref()
-                        .map(|s| {
-                            s.status == SessionStatus::Working
-                                && (s.wait_synthetic_working || s.wait_deferred_revert)
-                        })
-                        .unwrap_or(false),
+                wait_observing: live
+                    .as_ref()
+                    .map(|s| {
+                        s.status == SessionStatus::Working
+                            && (s.wait_synthetic_working || s.wait_deferred_revert)
+                    })
+                    .unwrap_or(false),
+                observing_delegations,
                 // Issue #455: project down to the NAME here, at the one place
                 // that crosses from internal state into the CLI's document —
                 // `detail` never leaves this function.
@@ -268,15 +265,14 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
         // before the shell-busy marker below, which attaches to whatever
         // word is current.
         //
-        // Issue #803: `wait_observing` is also set for an `Idle`/`Unknown`
-        // orchestrator with a delegation it issued still outstanding, which
-        // reads the same bare word. Every other status keeps its own word
-        // whatever the flag says.
-        let status = if a.wait_observing
-            && matches!(
-                a.status,
-                Some(SessionStatus::Working | SessionStatus::Idle | SessionStatus::Unknown)
-            ) {
+        // Issue #803: an `Idle` orchestrator with a delegation it issued
+        // still outstanding (`observing_delegations`) reads the same bare
+        // word. Each flag is gated on the one status it qualifies, so every
+        // other status keeps its own word whatever the flags say.
+        let wait_observing = a.wait_observing && a.status == Some(SessionStatus::Working);
+        let observing_delegations =
+            a.observing_delegations && a.status == Some(SessionStatus::Idle);
+        let status = if wait_observing || observing_delegations {
             "Observing".to_string()
         } else {
             status

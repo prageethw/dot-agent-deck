@@ -1107,59 +1107,25 @@ pub struct SessionState {
     /// reset to `false`, which is correct — the pane really has no agent
     /// again.
     pub agent_report_activity_seen: bool,
-    /// Issue #755: a mirror of this pane's [`AgentRecord::outstanding_delegation`]
-    /// (`crate::agent_pty::AgentPtyRegistry::delegation_watch_snapshot`'s
-    /// `outstanding_delegation` half), so the dashboard's status badge, the
-    /// idle bell, and the tab bar's aggregate idle count can all tell "genuinely
-    /// idle" apart from "has a `delegate` outstanding with no `work-done` yet" —
-    /// today they read only the raw, hook-event-derived `status`, which stays
-    /// whatever it last was (often `Idle`) for the entire lifetime of a
-    /// delegation, since `handle_delegate`/`handle_delegate_with_state` write
-    /// straight into the target's PTY and never assert a status themselves.
+    /// Issue #755: the delegation this session's PANE still owes a
+    /// `work-done` for, if any — what lets the status badge, the idle bell and
+    /// the tab bar's idle count tell "genuinely idle" apart from "has a
+    /// `delegate` outstanding", which the raw hook-derived `status` cannot.
     ///
-    /// Deliberately NOT threaded onto [`SessionSnapshot`]: this is registry/watch
-    /// state (`AgentPtyRegistry::delegation_watch_snapshot`), not event-derived
-    /// session state, so it rides on `AgentRecord` directly (sibling to `live`)
-    /// and is joined in at [`AppState::seed_hydrated_session`] (bootstrap
-    /// hydration) and [`AppState::resync_hydrated_sessions`] (reconnect resync)
-    /// the same way `daemon_boot_id`/`registration_generation` are joined onto
-    /// `AgentRecord` itself — see those fields' docs. `None` for every session
-    /// that has never gone through either join (freshly created from a live
-    /// hook event, an older daemon, or no delegation ever armed for the pane).
-    ///
-    /// Issue #755 fix round 2: a THIRD path keeps this fresh for a pane that
-    /// stays attached with a healthy subscription for its entire lifetime,
-    /// closing the gap round 1 left open — hydration and reconnect resync
-    /// alone never fire for that case, which is exactly issue #755's own
-    /// reported scenario (a delegation watched live for ~27 minutes with no
-    /// disconnect). [`crate::event::BroadcastMsg::DelegationArmed`] /
-    /// [`crate::event::BroadcastMsg::DelegationRetired`] are pushed the
-    /// instant `AppState::handle_delegate_with_state`/`AppState::handle_work_done`
-    /// arm/retire the daemon-side record, and `crate::reconnect::apply_broadcast`
-    /// applies them directly via [`AppState::apply_delegation_armed`] /
-    /// [`AppState::apply_delegation_retired`] — no reconnect, no re-hydration,
-    /// no poll. All three paths are last-writer-wins over this one field,
-    /// which is safe because they all mirror the identical daemon-side fact
-    /// at different times rather than three different sources of truth.
+    /// A per-session copy of [`AppState::outstanding_delegation_for_pane`],
+    /// never a second source of truth: the fact belongs to the pane, so it
+    /// outlives any one session on it (a `clear = true` delegate respawns the
+    /// worker, whose first hook event replaces the session). `AppState` stamps
+    /// it on every session it creates and restamps it on every write to the
+    /// pane's entry; nothing else writes it. It exists so a consumer that is
+    /// handed sessions without an `AppState` (a single card, the bell) can
+    /// still read it.
     pub outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
 }
 
 /// Issue #803: the pane ids of every orchestrator that ISSUED a delegation
 /// still outstanding in `delegations` — the `orchestrator_pane_id` of each
-/// [`crate::agent_pty::WatchSnapshot`] a worker currently carries.
-///
-/// Takes the snapshots rather than sessions so the three surfaces that
-/// present an idle delegating orchestrator as `Observing` share one
-/// derivation over their own source: the card grid and
-/// [`AppState::aggregate_stats`] feed it
-/// [`SessionState::outstanding_delegation`], `daemon status` feeds it
-/// [`AgentRecord::outstanding_delegation`].
-///
-/// Display-only and deliberately never stored: callers recompute it from
-/// current state on every use, so a worker session that disappears with no
-/// `DelegationRetired` notice (a pane closed on this client) takes its
-/// delegation out of the set with it, rather than leaving the orchestrator
-/// stuck `Observing` on a cached answer.
+/// [`crate::agent_pty::WatchSnapshot`].
 pub fn delegating_orchestrator_panes<'a>(
     delegations: impl IntoIterator<Item = &'a crate::agent_pty::WatchSnapshot>,
 ) -> HashSet<String> {
@@ -1169,22 +1135,47 @@ pub fn delegating_orchestrator_panes<'a>(
         .collect()
 }
 
-/// Issue #803: whether a pane presents as `Observing` because it is idle
-/// while a delegation it issued is still outstanding. `delegating_panes` is
-/// [`delegating_orchestrator_panes`]'s result for the current state.
+/// Issue #803: the panes that may present as `Observing` — every pane that
+/// issued a delegation still outstanding and does not itself owe a
+/// `work-done`. `delegations` is `(worker pane id, its outstanding
+/// delegation)`.
 ///
-/// Only `Idle`/`Unknown` qualify — a real `Working`, `Thinking`,
-/// `WaitingForInput`, `Error` or `Compacting` always shows as itself. The
-/// pane's real [`SessionStatus`] is never changed by this, and it is
-/// independent of the monitored-wait state machine (`wait start`/`wait done`),
-/// which promotes the real status instead.
+/// A pane that owes a `work-done` is a delegated worker on every surface,
+/// whatever it issued itself, so it is left out here rather than by each
+/// caller.
+///
+/// This is the one derivation behind the card grid, the tab bar's idle tally
+/// ([`AppState::observing_panes`]) and `daemon status`. Display-only and
+/// never stored: callers recompute it from current state on every use.
+pub fn observing_orchestrator_panes<'a>(
+    delegations: impl IntoIterator<Item = (&'a str, &'a crate::agent_pty::WatchSnapshot)>,
+) -> HashSet<String> {
+    let delegations: Vec<_> = delegations.into_iter().collect();
+    let mut panes =
+        delegating_orchestrator_panes(delegations.iter().map(|(_, delegation)| *delegation));
+    for (worker_pane_id, _) in delegations {
+        panes.remove(worker_pane_id);
+    }
+    panes
+}
+
+/// Issue #803: whether a pane presents as `Observing` because it is idle
+/// while a delegation it issued is still outstanding. `observing_panes` is
+/// [`observing_orchestrator_panes`]'s result for the current state.
+///
+/// Only `Idle` qualifies. A real `Working`, `Thinking`, `WaitingForInput`,
+/// `Error` or `Compacting` always shows as itself, and so does `Unknown`,
+/// which can be a newer status this build could not decode. The pane's real
+/// [`SessionStatus`] is never changed by this, and it is independent of the
+/// monitored-wait state machine (`wait start`/`wait done`), which promotes
+/// the real status instead.
 pub fn observes_own_delegations(
     status: &SessionStatus,
     pane_id: Option<&str>,
-    delegating_panes: &HashSet<String>,
+    observing_panes: &HashSet<String>,
 ) -> bool {
-    matches!(status, SessionStatus::Idle | SessionStatus::Unknown)
-        && pane_id.is_some_and(|pane_id| delegating_panes.contains(pane_id))
+    *status == SessionStatus::Idle
+        && pane_id.is_some_and(|pane_id| observing_panes.contains(pane_id))
 }
 
 impl SessionState {
@@ -1593,6 +1584,22 @@ pub struct MonitoredWait {
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
+    /// Issue #755 / #803: the delegations this client knows to be
+    /// outstanding, keyed by the WORKER pane that owes the `work-done`.
+    ///
+    /// Keyed by pane, not held on a session, because the daemon records a
+    /// delegation against the pane: it survives the worker's session being
+    /// replaced or ended, and it can be armed before the pane has a session
+    /// at all. Written by [`Self::apply_delegation_armed`] /
+    /// [`Self::apply_delegation_retired`] (live push), per pane by
+    /// [`Self::seed_hydrated_session`], and replaced wholesale by
+    /// [`Self::resync_hydrated_sessions`]; an entry goes when its pane does
+    /// ([`Self::unregister_pane`], [`Self::remove_sessions_for_pane`]).
+    ///
+    /// Private so every write goes through
+    /// [`Self::set_outstanding_delegation`], which keeps
+    /// [`SessionState::outstanding_delegation`] equal to it.
+    outstanding_delegations: HashMap<String, crate::agent_pty::WatchSnapshot>,
     /// PRD #499 (reopened) M3/M5: active monitored waits, keyed by pane_id.
     ///
     /// Round 2 review (reviewer BLOCKER A / auditor B1): this map is
@@ -7118,13 +7125,7 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
         let mut stats = DashboardStats::default();
-        // Issue #803: recomputed from the sessions on every call, never
-        // cached — see `delegating_orchestrator_panes`.
-        let delegating_panes = delegating_orchestrator_panes(
-            self.sessions
-                .values()
-                .filter_map(|session| session.outstanding_delegation.as_ref()),
-        );
+        let observing_panes = self.observing_panes();
         for session in self.sessions.values() {
             if session.agent_type == AgentType::None {
                 continue;
@@ -7143,11 +7144,12 @@ impl AppState {
             // Issue #803: the same for the orchestrator on the other end of
             // that delegation — idle while a delegation IT ISSUED is still
             // outstanding, its card reads `Observing`, so counting it as
-            // idle here would contradict its own card the same way.
+            // idle here would contradict its own card the same way. `Idle`
+            // only: an `Unknown` orchestrator is tallied as any `Unknown`.
             let idle_but_observing = observes_own_delegations(
                 &session.status,
                 session.pane_id.as_deref(),
-                &delegating_panes,
+                &observing_panes,
             );
             let counts_as_idle = !idle_but_delegated && !idle_but_observing;
             match session.status {
@@ -7641,50 +7643,66 @@ impl AppState {
         self.pending_kept_worktrees.push(notice);
     }
 
-    /// Issue #755: apply a live [`BroadcastMsg::DelegationArmed`] push —
-    /// unlike [`Self::queue_orchestration_surface`]/[`Self::queue_kept_worktree`]
-    /// above, this needs no render-loop queue: `outstanding_delegation` lives
-    /// directly on [`SessionState`], which the event subscriber can already
-    /// write through its `AppState` handle, the same way
-    /// [`Self::apply_event`] applies an ordinary hook event. Called from
-    /// [`crate::reconnect::apply_broadcast`].
-    ///
-    /// Sets `outstanding_delegation` on every session whose `pane_id`
-    /// matches the notice (not just one) — a pane can legitimately carry a
-    /// co-resident placeholder alongside its real session (see
-    /// `AppState::apply_event`'s own doc on that), and there is exactly one
-    /// daemon-side truth per worker pane (arming REPLACES any previous
-    /// record for the same pane), so applying it to every co-resident
-    /// session is safe and needs no tie-break.
-    pub fn apply_delegation_armed(&mut self, notice: DelegationArmedNotice) {
-        let mut matched = false;
+    /// Issue #755: the delegation `pane_id` still owes a `work-done` for, as
+    /// last reported by the daemon.
+    pub fn outstanding_delegation_for_pane(
+        &self,
+        pane_id: &str,
+    ) -> Option<&crate::agent_pty::WatchSnapshot> {
+        self.outstanding_delegations.get(pane_id)
+    }
+
+    /// Issue #803: [`observing_orchestrator_panes`] over every delegation
+    /// this client knows to be outstanding.
+    pub fn observing_panes(&self) -> HashSet<String> {
+        observing_orchestrator_panes(
+            self.outstanding_delegations
+                .iter()
+                .map(|(pane_id, delegation)| (pane_id.as_str(), delegation)),
+        )
+    }
+
+    /// The single writer of one pane's entry in `outstanding_delegations`:
+    /// sets or clears it and restamps every session on the pane (a pane can
+    /// carry a co-resident placeholder alongside its real session) to match.
+    fn set_outstanding_delegation(
+        &mut self,
+        pane_id: &str,
+        delegation: Option<crate::agent_pty::WatchSnapshot>,
+    ) {
         for session in self.sessions.values_mut() {
-            if session.pane_id.as_deref() == Some(notice.pane_id.as_str()) {
-                session.outstanding_delegation = Some(notice.snapshot.clone());
-                matched = true;
+            if session.pane_id.as_deref() == Some(pane_id) {
+                session.outstanding_delegation.clone_from(&delegation);
             }
         }
-        if !matched {
-            tracing::debug!(
-                pane_id = %notice.pane_id,
-                "apply_delegation_armed: no session on this pane yet (not hydrated/spawned \
-                 locally) — the next hydration/reconnect will pick it up instead"
-            );
+        match delegation {
+            Some(delegation) => {
+                self.outstanding_delegations
+                    .insert(pane_id.to_string(), delegation);
+            }
+            None => {
+                self.outstanding_delegations.remove(pane_id);
+            }
         }
     }
 
-    /// Issue #755: symmetric with [`Self::apply_delegation_armed`] above —
-    /// clears `outstanding_delegation` on every session whose `pane_id`
-    /// matches, in response to a live [`BroadcastMsg::DelegationRetired`]
-    /// push. This is what prevents a stale `Some(..)` from suppressing a
-    /// real idle-completion bell for the rest of an attached TUI's session
-    /// once the delegation it described has genuinely been answered.
+    /// Issue #755: apply a live [`BroadcastMsg::DelegationArmed`] push.
+    /// Applied directly by the event subscriber
+    /// ([`crate::reconnect::apply_broadcast`]), with no render-loop queue.
+    ///
+    /// Recorded against the worker PANE, so it holds whether or not that
+    /// pane has a session yet. Arming replaces any previous record for the
+    /// same pane, as it does on the daemon.
+    pub fn apply_delegation_armed(&mut self, notice: DelegationArmedNotice) {
+        self.set_outstanding_delegation(&notice.pane_id, Some(notice.snapshot));
+    }
+
+    /// Issue #755: symmetric with [`Self::apply_delegation_armed`] above, in
+    /// response to a live [`BroadcastMsg::DelegationRetired`] push. This is
+    /// what prevents a stale record from suppressing a real idle-completion
+    /// bell once the delegation it described has been answered.
     pub fn apply_delegation_retired(&mut self, notice: DelegationRetiredNotice) {
-        for session in self.sessions.values_mut() {
-            if session.pane_id.as_deref() == Some(notice.pane_id.as_str()) {
-                session.outstanding_delegation = None;
-            }
-        }
+        self.set_outstanding_delegation(&notice.pane_id, None);
     }
 
     /// Create a placeholder session for a newly created pane so it always
@@ -7778,6 +7796,7 @@ impl AppState {
             return session_id;
         }
 
+        let outstanding_delegation = self.outstanding_delegations.get(&pane_id).cloned();
         self.sessions.insert(
             session_id.clone(),
             SessionState {
@@ -7805,7 +7824,7 @@ impl AppState {
                 model: None,
                 expects_agent_report,
                 agent_report_activity_seen: false,
-                outstanding_delegation: None,
+                outstanding_delegation,
             },
         );
         session_id
@@ -7848,11 +7867,10 @@ impl AppState {
         live: Option<&SessionSnapshot>,
         // Issue #755: the daemon's `AgentRecord.outstanding_delegation` for
         // this pane, sibling to `live` rather than part of it (it is
-        // registry/watch state, not event-derived session state — see
-        // `SessionState::outstanding_delegation`'s doc). Seeded
-        // unconditionally, independent of whether `live` is `Some`/`None`,
-        // since a delegation can be outstanding for a pane that has never
-        // emitted a hook event at all.
+        // registry/watch state, not event-derived session state). Replaces
+        // the pane's entry unconditionally, independent of whether `live` is
+        // `Some`/`None`, since a delegation can be outstanding for a pane
+        // that has never emitted a hook event at all.
         outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
     ) {
         // The snapshot's event-derived agent_type wins; fall back to the
@@ -7902,10 +7920,7 @@ impl AppState {
         // started_at reuse, session_id), then overlay the live snapshot
         // fields when one is present.
         self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
-        let session_id_for_delegation = session_id_for_pane(&pane_id);
-        if let Some(session) = self.sessions.get_mut(&session_id_for_delegation) {
-            session.outstanding_delegation = outstanding_delegation;
-        }
+        self.set_outstanding_delegation(&pane_id, outstanding_delegation);
         if let Some(snap) = live {
             let session_id = session_id_for_pane(&pane_id);
             if let Some(session) = self.sessions.get_mut(&session_id) {
@@ -8300,23 +8315,12 @@ impl AppState {
     /// Returns the number of sessions whose `status` the snapshot actually
     /// moved — the recovered-state count issues #49/#28 are about.
     pub fn resync_hydrated_sessions(&mut self, records: &[AgentRecord]) -> usize {
+        self.replace_outstanding_delegations(records);
         let mut recovered = 0;
         for record in records {
             let Some(session_id) = self.resync_target_session_id(record) else {
                 continue;
             };
-            // Issue #755: sync `outstanding_delegation` unconditionally,
-            // independent of whether this record carries a `live` snapshot —
-            // it is registry/watch state (`AgentPtyRegistry::
-            // delegation_watch_snapshot`), not event-derived, so a pane that
-            // has never emitted a hook event can still owe a `work-done`.
-            // Deliberately overwrites rather than OR-ing in the incoming
-            // value (unlike `agent_report_activity_seen`): this is a live,
-            // point-in-time fact the daemon just reported, not a latch, so a
-            // retired delegation must be able to clear the local copy too.
-            if let Some(session) = self.sessions.get_mut(&session_id) {
-                session.outstanding_delegation = record.outstanding_delegation.clone();
-            }
             let Some(snap) = record.live.as_ref() else {
                 continue;
             };
@@ -8398,6 +8402,34 @@ impl AppState {
         recovered
     }
 
+    /// Issue #755 / #803: make `outstanding_delegations` equal exactly what
+    /// the daemon just reported, and restamp every session to match.
+    ///
+    /// Wholesale rather than per matched card, unlike the rest of
+    /// [`Self::resync_hydrated_sessions`]: a `DelegationRetired` broadcast
+    /// sent during the outage is lost, so an entry the snapshot no longer
+    /// carries has to go even when its pane's card is one the resync skips
+    /// (or the pane has no record, or no card, at all). This is registry
+    /// state, independent of whether a record carries a `live` snapshot.
+    fn replace_outstanding_delegations(&mut self, records: &[AgentRecord]) {
+        self.outstanding_delegations = records
+            .iter()
+            .filter_map(|record| {
+                Some((
+                    record.pane_id_env.clone()?,
+                    record.outstanding_delegation.clone()?,
+                ))
+            })
+            .collect();
+        for session in self.sessions.values_mut() {
+            session.outstanding_delegation = session
+                .pane_id
+                .as_ref()
+                .and_then(|pane_id| self.outstanding_delegations.get(pane_id))
+                .cloned();
+        }
+    }
+
     /// Which existing session (if any) [`Self::resync_hydrated_sessions`]
     /// should apply `record`'s snapshot to.
     ///
@@ -8467,6 +8499,9 @@ impl AppState {
         self.orchestrator_pane_ids.remove(pane_id);
         self.pane_orchestration_map.remove(pane_id);
         self.codex_hook_trust_failed.remove(pane_id);
+        // Issue #803: a pane that is gone owes nothing, so the orchestrator
+        // that delegated to it has nothing left to observe.
+        self.set_outstanding_delegation(pane_id, None);
         // PRD #499 (reopened) round 3 (reviewer B3 / auditor B3): round 2
         // added an eager `self.monitored_waits.remove(pane_id)` here (see the
         // superseded comment this replaces), reasoning that a torn-down
@@ -8525,6 +8560,7 @@ impl AppState {
         // an already-absent key (e.g. `src/ui.rs`'s real close, which calls
         // this alongside `unregister_pane`) is a no-op.
         self.monitored_waits.remove(pane_id);
+        self.set_outstanding_delegation(pane_id, None);
         n
     }
 
@@ -11500,6 +11536,15 @@ impl AppState {
         let is_wrapper_boot_session_start =
             event.event_type == EventType::SessionStart && event.is_wrapper_session_start();
 
+        // Issue #803: a delegation is owed by the pane, so a session born on
+        // a pane that already owes one (a respawned worker's first hook
+        // event) carries it from its first frame.
+        let pane_delegation = event
+            .pane_id
+            .as_ref()
+            .and_then(|pane_id| self.outstanding_delegations.get(pane_id))
+            .cloned();
+
         let session = self
             .sessions
             .entry(event.session_id.clone())
@@ -11548,7 +11593,7 @@ impl AppState {
                 model: event.model.clone(),
                 expects_agent_report: false,
                 agent_report_activity_seen: false,
-                outstanding_delegation: None,
+                outstanding_delegation: pane_delegation,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the

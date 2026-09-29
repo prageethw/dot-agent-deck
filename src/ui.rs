@@ -41,8 +41,8 @@ use crate::prompt_delivery::{
 };
 use crate::repo_identity;
 use crate::state::{
-    AppState, DashboardStats, SessionState, SessionStatus, SharedState,
-    delegating_orchestrator_panes, observes_own_delegations,
+    AppState, DashboardStats, SessionState, SessionStatus, SharedState, observes_own_delegations,
+    observing_orchestrator_panes,
 };
 use crate::tab::{
     OrchestrationRoleStatus, OrchestrationStatus, SplitStage, Tab, TabId, TabManager,
@@ -19252,12 +19252,11 @@ fn render_card_grid(
     session_ids: &[&String],
     total_sessions: usize,
     tick: u64,
-    // Issue #803: the panes that issued a delegation still outstanding
-    // somewhere on the deck (`delegating_orchestrator_panes`). Derived by the
-    // caller from EVERY session rather than from `sessions`, which is only
-    // the filtered slice being drawn — a filter that hides the worker must
-    // not change what its orchestrator's card reads.
-    delegating_panes: &HashSet<String>,
+    // Issue #803: the panes that may present as `Observing`
+    // (`AppState::observing_panes`). A whole-deck fact, so it is passed in
+    // rather than derived from `sessions`, which is only the filtered slice
+    // being drawn.
+    observing_panes: &HashSet<String>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -19455,7 +19454,7 @@ fn render_card_grid(
                 observes_own_delegations(
                     &session.status,
                     session.pane_id.as_deref(),
-                    delegating_panes,
+                    observing_panes,
                 ),
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
@@ -19816,14 +19815,8 @@ fn render_frame(
     }
 
     if draw_sidebar {
-        // Issue #803: recomputed from the live sessions on every frame, never
-        // cached — see `delegating_orchestrator_panes`.
-        let delegating_panes = delegating_orchestrator_panes(
-            state
-                .sessions
-                .values()
-                .filter_map(|session| session.outstanding_delegation.as_ref()),
-        );
+        // Issue #803: recomputed on every frame, never cached.
+        let observing_panes = state.observing_panes();
         let stats_area = render_card_grid(
             frame,
             dashboard_area,
@@ -19832,7 +19825,7 @@ fn render_frame(
             &session_ids,
             total_sessions,
             tick,
-            &delegating_panes,
+            &observing_panes,
         );
         render_stats_bar(
             frame,
@@ -24047,9 +24040,9 @@ fn render_session_card(
         // Issue #803: the mirror image of the branch above, for the
         // orchestrator that issued the delegation. It is idle only because
         // it is waiting on a worker, so plain "Idle" misreads it as having
-        // nothing in flight. Display-only — `session.status` stays
-        // `Idle`/`Unknown` — and it reads the same bare word, in the same
-        // colour, as a `Working` held by a monitored wait below.
+        // nothing in flight. Display-only — `session.status` stays `Idle` —
+        // and it reads the same bare word, in the same colour, as a
+        // `Working` held by a monitored wait below.
         let (_label, style) = status_style(&session.status);
         ("Observing".to_string(), style.fg(palette::STATUS_OBSERVING))
     } else if session.status == SessionStatus::Working
@@ -24979,12 +24972,7 @@ pub fn render_dashboard_cards_to_buffer(
         .iter()
         .map(|(s, name)| (*s, name.map(str::to_string)))
         .collect();
-    // Issue #803: the cards handed in are this seam's whole deck.
-    let delegating_panes = delegating_orchestrator_panes(
-        cards
-            .iter()
-            .filter_map(|(session, _)| session.outstanding_delegation.as_ref()),
-    );
+    let observing_panes = observing_panes_of_cards(cards);
     terminal
         .draw(|frame| {
             let constraints: Vec<Constraint> = (0..owned.len())
@@ -25021,7 +25009,7 @@ pub fn render_dashboard_cards_to_buffer(
                     observes_own_delegations(
                         &session.status,
                         session.pane_id.as_deref(),
-                        &delegating_panes,
+                        &observing_panes,
                     ),
                 );
             }
@@ -25067,30 +25055,33 @@ pub fn render_card_grid_to_buffer(
     width: u16,
     height: u16,
 ) -> (ratatui::buffer::Buffer, CardGridProbe) {
-    // Issue #803: the cards handed in are this seam's whole deck, so the
-    // delegations they carry are what the live deck would derive from
-    // `state.sessions`.
-    let delegating_panes = delegating_orchestrator_panes(
-        cards
-            .iter()
-            .filter_map(|(session, _)| session.outstanding_delegation.as_ref()),
-    );
     render_card_grid_seam(
         cards,
         selected,
         scroll_offset,
         width,
         height,
-        &delegating_panes,
+        &observing_panes_of_cards(cards),
     )
+}
+
+/// Issue #803: [`observing_orchestrator_panes`] for an L1 seam that is handed
+/// cards and no [`AppState`]. The cards are that seam's whole deck, so the
+/// delegations their panes owe are all the delegations there are.
+fn observing_panes_of_cards(cards: &[(&SessionState, Option<&str>)]) -> HashSet<String> {
+    observing_orchestrator_panes(cards.iter().filter_map(|(session, _)| {
+        Some((
+            session.pane_id.as_deref()?,
+            session.outstanding_delegation.as_ref()?,
+        ))
+    }))
 }
 
 /// L1 seam for the deck card grid as the LIVE deck draws it from an
 /// [`AppState`]: the same [`render_card_grid`] as
 /// [`render_card_grid_to_buffer`], but every whole-deck fact a card depends on
-/// (issue #803: which panes issued a delegation that is still outstanding) is
-/// derived from `state`, exactly as `render_frame` derives it, rather than
-/// from the cards handed in.
+/// (issue #803: which panes present as `Observing`) is derived from `state`,
+/// exactly as `render_frame` derives it, rather than from the cards handed in.
 ///
 /// `cards` is `(session, display_name)` in deck order and must borrow from
 /// `state.sessions`; `width` × `height` is the deck area.
@@ -25103,32 +25094,26 @@ pub fn render_state_card_grid_to_buffer(
     width: u16,
     height: u16,
 ) -> (ratatui::buffer::Buffer, CardGridProbe) {
-    let delegating_panes = delegating_orchestrator_panes(
-        state
-            .sessions
-            .values()
-            .filter_map(|session| session.outstanding_delegation.as_ref()),
-    );
     render_card_grid_seam(
         cards,
         selected,
         scroll_offset,
         width,
         height,
-        &delegating_panes,
+        &state.observing_panes(),
     )
 }
 
 /// Shared body of [`render_card_grid_to_buffer`] and
 /// [`render_state_card_grid_to_buffer`], which differ only in where
-/// `delegating_panes` comes from.
+/// `observing_panes` comes from.
 fn render_card_grid_seam(
     cards: &[(&SessionState, Option<&str>)],
     selected: Option<usize>,
     scroll_offset: usize,
     width: u16,
     height: u16,
-    delegating_panes: &HashSet<String>,
+    observing_panes: &HashSet<String>,
 ) -> (ratatui::buffer::Buffer, CardGridProbe) {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -25171,7 +25156,7 @@ fn render_card_grid_seam(
                 &id_refs,
                 sessions.len(),
                 0,
-                delegating_panes,
+                observing_panes,
             );
         })
         .expect("TestBackend draw should succeed");
