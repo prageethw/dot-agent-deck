@@ -41,7 +41,8 @@ use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
 };
 use dot_agent_deck::event::{
-    AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
+    AgentEvent, AgentType, BroadcastMsg, DelegateSignal, DelegationRetiredNotice, EventType,
+    WorkDoneSignal,
 };
 use dot_agent_deck::state::{
     AppState, OrchestrationIdentity, SharedState, worker_response_timeout,
@@ -2057,5 +2058,282 @@ fn idle_worker_019_respawn_carries_forward_armed_delegation_and_silence_watch() 
             "the silence watch armed before the respawn did not survive it — \
              respawn_agent_for_pane's no-sweep contract (issue #465 F3) is unpinned"
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Issue #805: a delegation that never reached its worker must not stay armed.
+//
+// The record these tests watch is armed by `handle_delegate` before the
+// dispatch task has run, so a dispatch that ends without handing the worker a
+// task pointer has to retire it. Left armed it costs the user a worker card
+// reading `Idle (delegated)`, an orchestrator card reading `Observing`, and —
+// once the idle-worker timeout runs out — a report about a worker that was
+// never given anything to be silent about.
+// ---------------------------------------------------------------------------
+
+/// A second tab of the same orchestration: same name, different instance token.
+const OTHER_ORCHESTRATION_INSTANCE: &str = "idle-test-orchestration-instance-2";
+
+/// A role command that cannot be exec'd. One word with no shell
+/// metacharacters is exec'd directly rather than through `$SHELL -c`, so this
+/// is a spawn ERROR and not a shell that starts and then exits 127.
+const MISSING_WORKER_BINARY: &str = "/nonexistent-worker-agent-deck-respawn-target";
+
+/// Forward the registry's own retirement announcements onto the harness's
+/// broadcast channel, exactly as the daemon does at startup. The harness builds
+/// a bare registry, which otherwise drops them.
+fn forward_delegation_retirements(harness: &IdleHarness) {
+    let event_tx = harness.event_tx.clone();
+    harness
+        .registry
+        .set_delegation_retired_sink(Arc::new(move |pane_id| {
+            let _ = event_tx.send(BroadcastMsg::DelegationRetired(DelegationRetiredNotice {
+                pane_id,
+            }));
+        }));
+}
+
+/// A project config whose only role is `role`, set to `clear = true` and
+/// pointed at a binary that does not exist, so a delegate to it disposes of the
+/// live worker and then fails to replace it.
+fn config_with_unspawnable_role(role: &str) -> String {
+    format!(
+        "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
+         [[orchestrations.roles]]\nname = \"{role}\"\n\
+         command = \"{MISSING_WORKER_BINARY}\"\nclear = true\n"
+    )
+}
+
+/// Scenario: Close the worker's agent so its pane has no live agent, then delegate to that role. The dispatch has nobody to bind the task pointer to and writes nothing, so the delegation it armed must be retired and that retirement broadcast.
+#[spec("scheduler/idle-worker/025")]
+#[test]
+fn idle_worker_025_delegate_to_a_pane_with_no_live_agent_retires_the_delegation() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("60000"));
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&["absent-worker"], None).await;
+        forward_delegation_retirements(&harness);
+        let worker_pane_id = worker_pane("absent-worker");
+        harness
+            .registry
+            .close_agent(&harness.worker_agent_ids["absent-worker"])
+            .expect("close the worker's agent");
+        assert_eq!(
+            harness.registry.pane_current_agent_id(&worker_pane_id),
+            None,
+            "precondition: the worker pane must have no live agent for the delegate to find"
+        );
+        let mut broadcasts = harness.event_tx.subscribe();
+
+        harness.delegate(&["absent-worker"]).await;
+
+        common::assert_undelivered_delegation_is_retired(
+            &harness.registry,
+            &mut broadcasts,
+            &worker_pane_id,
+            "its worker pane had no live agent (NoLiveTarget)",
+        )
+        .await;
+    });
+}
+
+/// Scenario: Replace the worker with an agent that carries a DIFFERENT orchestration instance on the same pane id, as a pane re-homed into another tab would, then delegate to that role. The task pointer is refused as stale and nothing is written into the pane, so the delegation must be retired and that retirement broadcast.
+#[spec("scheduler/idle-worker/026")]
+#[test]
+fn idle_worker_026_pointer_refused_as_stale_retires_the_delegation() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("60000"));
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&["rehomed-worker"], None).await;
+        forward_delegation_retirements(&harness);
+        let worker_pane_id = worker_pane("rehomed-worker");
+        harness
+            .registry
+            .close_agent(&harness.worker_agent_ids["rehomed-worker"])
+            .expect("close the original worker");
+        let rehomed = spawn_raw_cat_observer_with_membership(
+            &harness.registry,
+            &worker_pane_id,
+            "REHOMED-READY",
+            &harness.cwd_str(),
+            Some(TabMembership::Orchestration {
+                name: ORCHESTRATION.to_string(),
+                role_index: 1,
+                role_name: "rehomed-worker".to_string(),
+                is_start_role: false,
+                orchestration_cwd: Some(harness.cwd_str()),
+                display_title: None,
+                orchestration_id: Some(OTHER_ORCHESTRATION_INSTANCE.to_string()),
+            }),
+        );
+        let ready = String::from_utf8_lossy(
+            &common::wait_for_child_first_output(&harness.registry, &rehomed, b"REHOMED-READY")
+                .await,
+        )
+        .into_owned();
+        assert!(
+            ready.contains("REHOMED-READY"),
+            "precondition: the re-homed worker stub never became ready; snapshot = {ready:?}"
+        );
+        let mut broadcasts = harness.event_tx.subscribe();
+
+        harness.delegate(&["rehomed-worker"]).await;
+
+        assert!(
+            common::wait_for_commission_release(&harness.registry, &worker_pane_id).await,
+            "precondition: the dispatch never reached a no-delivery exit; watches = {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+        let pointer_bytes = common::expected_delegate_pointer(
+            harness.cwd.path(),
+            "rehomed-worker",
+            &worker_pane_id,
+        );
+        let pointer = String::from_utf8_lossy(&pointer_bytes).into_owned();
+        let pane = harness.snapshot_of(&rehomed);
+        assert!(
+            !pane.contains(&pointer),
+            "precondition: a pane that belongs to another orchestration instance must not \
+             receive this orchestration's task pointer; snapshot = {pane:?}"
+        );
+
+        common::assert_undelivered_delegation_is_retired(
+            &harness.registry,
+            &mut broadcasts,
+            &worker_pane_id,
+            "its task pointer was refused as Stale",
+        )
+        .await;
+    });
+}
+
+/// Scenario: Delegate to a live worker and wait for the task pointer to land in its pane. The delegation must stay armed, with no retirement broadcast, for as long as the worker has not reported; the worker's `work-done` is what retires it.
+#[spec("scheduler/idle-worker/027")]
+#[test]
+fn idle_worker_027_delivered_delegation_stays_armed_until_work_done() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("60000"));
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&["delivered-worker"], None).await;
+        forward_delegation_retirements(&harness);
+        let worker_pane_id = worker_pane("delivered-worker");
+        let worker_agent_id = harness.worker_agent_ids["delivered-worker"].clone();
+        let mut broadcasts = harness.event_tx.subscribe();
+
+        harness.delegate(&["delivered-worker"]).await;
+
+        let pointer_bytes = common::expected_delegate_pointer(
+            harness.cwd.path(),
+            "delivered-worker",
+            &worker_pane_id,
+        );
+        let pointer = String::from_utf8_lossy(&pointer_bytes).into_owned();
+        let delivered = harness
+            .wait_for_snapshot_of(
+                &worker_agent_id,
+                |snapshot| snapshot.contains(&pointer),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            delivered.contains(&pointer),
+            "precondition: the task pointer never landed in the worker's pane; snapshot = \
+             {delivered:?}"
+        );
+
+        // A negative window, spent in full: the dispatch task finishes within
+        // a few statements of the write just observed.
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            Duration::from_millis(750),
+            false,
+        )
+        .await;
+        assert!(
+            seen.armed > 0,
+            "precondition: the delegation must have been announced as armed; broadcasts = {seen:?}"
+        );
+        assert_eq!(
+            seen.retired, 0,
+            "a delegation whose task pointer reached the worker was announced as retired before \
+             the worker reported; broadcasts = {seen:?}"
+        );
+        assert_eq!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&worker_pane_id)
+                .outstanding_delegation
+                .map(|armed| armed.orchestrator_pane_id),
+            Some(ORCH_PANE.to_string()),
+            "a delegation whose task pointer reached the worker must stay armed until the worker \
+             reports work-done"
+        );
+
+        harness.work_done("delivered-worker").await;
+
+        assert!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&worker_pane_id)
+                .outstanding_delegation
+                .is_none(),
+            "the worker's work-done must retire the delegation"
+        );
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            common::load_scaled(Duration::from_secs(3)),
+            true,
+        )
+        .await;
+        assert!(
+            seen.retired > 0,
+            "the worker's work-done must be announced as a retirement; broadcasts = {seen:?}"
+        );
+    });
+}
+
+/// Scenario: With a tiny timeout, delegate in one call to a silent control worker and to a role whose `clear = true` respawn fails, so that second delegation never reaches a worker. After the timeout the orchestrator pane must hold the control's idle prompt, proving the detector fired, and no idle prompt about the worker that was never given a task.
+#[spec("scheduler/idle-worker/028")]
+#[test]
+fn idle_worker_028_undelivered_delegation_produces_no_idle_prompt() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("1500"));
+    runtime().block_on(async {
+        let harness = IdleHarness::new(
+            &["silent-control", "undelivered-worker"],
+            Some(&config_with_unspawnable_role("undelivered-worker")),
+        )
+        .await;
+
+        harness
+            .delegate(&["silent-control", "undelivered-worker"])
+            .await;
+
+        let respawn_failed = "respawn failed for role 'undelivered-worker'";
+        let notified = harness
+            .wait_for_snapshot(
+                |snapshot| snapshot.contains(respawn_failed),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            notified.contains(respawn_failed),
+            "precondition: the delegate to `undelivered-worker` must reach the respawn-error \
+             exit for this test to be testing anything; snapshot = {notified:?}"
+        );
+
+        assert_idle_fired_then_role_absent(
+            &harness,
+            "silent-control",
+            Duration::from_secs(6),
+            "silent control worker did not prove the detector fired",
+            "undelivered-worker",
+            "a delegation that never reached its worker still produced an idle-worker prompt \
+             about that worker",
+        )
+        .await;
     });
 }

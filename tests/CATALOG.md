@@ -1184,6 +1184,20 @@ Issue #803: an orchestrator whose real status is `Idle` and which has at least o
 - **Does not assert:** the bootstrap `ListAgents` that hydration makes (none runs here: the gate is open); the reconnect backoff.
 - **Platform coverage:** mac+linux.
 
+##### status/observing/022 — A delegate whose `clear = true` respawn fails leaves neither the orchestrator's card reading `Observing` nor the worker's reading `Idle (delegated)` (issue #805).
+- **Layer:** L2 lane 1 (PTY-attached real TUI + its lazy daemon; the REAL `delegate` CLI runs as a subprocess against the deck's hook socket).
+- **Agent:** none (`cat` role stand-ins; synthetic `SessionStart` hook lines announce both roles as idle agents; the worker role is re-pointed at a binary that does not exist by rewriting `.dot-agent-deck.toml` in the orchestration's own working directory, which the dispatch re-reads on every delegate).
+- **Asserts:** after the delegate exits zero and the daemon has written its respawn-failure notice into the orchestrator's pane, within the deck's redraw window the orchestrator's card reads `Idle` and not `Observing`, the worker's card (if one is still drawn) does not read `delegated`, and the daemon's `ListAgents` reports no outstanding delegation on the worker pane issued by the orchestrator pane — all three at once, continuously for two seconds, so a card that has merely not drawn the delegation yet does not pass.
+- **Does not assert:** what the worker's card reads instead once its agent is gone; a replacement that starts and then dies (`status/observing/023`); the idle-worker prompt that an unretired delegation would eventually send (`scheduler/idle-worker/028`); a real agent.
+- **Platform coverage:** mac+linux.
+
+##### status/observing/023 — A delegate whose replacement worker never becomes live leaves neither the orchestrator's card reading `Observing` nor the worker's reading `Idle (delegated)` (issue #805).
+- **Layer:** L2 lane 1 (same seam as `status/observing/022`).
+- **Agent:** none (`cat` role stand-ins; the worker role is re-pointed at a shell script that exits at once, so the respawn succeeds and the replacement dies before it can receive anything).
+- **Asserts:** after the delegate exits zero and the daemon has written its worker-never-came-up notice into the orchestrator's pane, within the deck's redraw window the orchestrator's card reads `Idle` and not `Observing`, the worker's card (if one is still drawn) does not read `delegated`, and the daemon's `ListAgents` reports no outstanding delegation on the worker pane issued by the orchestrator pane — all three at once, continuously for two seconds, so a card that has merely not drawn the delegation yet does not pass.
+- **Does not assert:** a respawn that fails outright (`status/observing/022`); what the worker's card reads instead once its agent is gone; a real agent.
+- **Platform coverage:** mac+linux.
+
 ### Agent protocol
 
 #### agent/readiness
@@ -4710,6 +4724,34 @@ without depending on the config struct API.
 - **Agent:** none (synthetic — the same env-dumping shell stand-in `orchestration/delegate/046` uses).
 - **Asserts:** with the worker's registry record left intact (never closed — the opposite of `orchestration/delegate/046`) and its initial env already carrying a registration generation/boot id genuinely in sync with `AppState::pane_registration_generation` (mirroring a real production spawn, which this in-process fixture otherwise bypasses), delegating to the role produces an ordinary respawn whose actual env still carries that SAME generation, and `pane_registration_generation` must still equal it — not a bumped value. `dispatch_one_owned` reserves a fresh generation unconditionally before every `clear = true` respawn attempt and writes it into the map immediately; on this leg (`recreated == false`) it restores the map to the pre-reservation value under the same `pane_dispatch_lock` guard rather than confirming, and the respawned child's env is the PREVIOUS child's `spawn_env` replayed verbatim — so the map and the child's env stay in sync.
 - **Does not assert:** the recreate leg (`orchestration/delegate/046` owns that); `handle_restart_role_with_state`'s identical ordinary leg (`pane/restart/013`).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### orchestration/delegate/048 — A `clear = true` delegate whose respawn FAILS retires the outstanding delegation it armed and broadcasts that retirement (issue #805).
+- **Layer:** L1/fast (in-process daemon via `spawn_inprocess_daemon`, so the daemon's own `DelegationRetired` sink is installed; the real `handle_delegate_with_state` and `dispatch_one_owned`; no LLM).
+- **Agent:** none (`cat` stand-ins; the worker role is re-pointed at a binary that does not exist after the first worker is up).
+- **Asserts:** preconditions — the orchestrator's pane shows the respawn-failure notice, the delegate's commission has been released, and a `DelegationArmed` naming the worker pane was broadcast; then `delegation_watch_snapshot(worker).outstanding_delegation` is `None`, and a `BroadcastMsg::DelegationRetired` naming the worker pane was broadcast.
+- **Does not assert:** the commission release itself (`orchestration/work-done/005`); that no idle-worker prompt follows (`scheduler/idle-worker/028`); what the attached deck draws (`status/observing/022`).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### orchestration/delegate/049 — A `clear = true` delegate whose replacement worker never becomes live retires the outstanding delegation it armed and broadcasts that retirement (issue #805).
+- **Layer:** L1/fast (same seam as `orchestration/delegate/048`).
+- **Agent:** none (the one-shot shell stand-in `orchestration/delegate/023` uses: it starts normally until a marker file sits beside it, then exits before doing anything).
+- **Asserts:** preconditions — the orchestrator's pane shows the worker-never-came-up notice, the delegate's commission has been released, and a `DelegationArmed` naming the worker pane was broadcast; then `delegation_watch_snapshot(worker).outstanding_delegation` is `None`, and a `BroadcastMsg::DelegationRetired` naming the worker pane was broadcast.
+- **Does not assert:** how promptly the notice arrives (`orchestration/delegate/023`); what the attached deck draws (`status/observing/023`).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### orchestration/delegate/050 — A task pointer refused because the worker pane changed hands during the readiness buffer retires the outstanding delegation and broadcasts that retirement (issue #805).
+- **Layer:** L1/fast (same seam as `orchestration/delegate/048`; `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` is pinned to 4000 ms so the hand-over lands inside the buffer).
+- **Agent:** none (`cat` stand-ins; a synthetic `SessionStart` for the replacement releases the readiness gate; one second later the replacement is closed and a different `cat` is spawned onto the same pane id).
+- **Asserts:** preconditions — the delegate's commission has been released, the orchestrator's pane does NOT show the worker-never-came-up notice (so the dispatch left through the identity gate, not the dead-replacement exit), the successor's scrollback does not hold the task pointer, and a `DelegationArmed` naming the worker pane was broadcast; then `delegation_watch_snapshot(worker).outstanding_delegation` is `None`, and a `BroadcastMsg::DelegationRetired` naming the worker pane was broadcast.
+- **Does not assert:** which refusal the guarded send returned (the outcome is logged, not observable from a test); the `NoLiveTarget` and `Stale` refusals (`scheduler/idle-worker/025`, `/026`); a refusal caused by the user typing into the worker pane, a write error, or an ambiguous partial write, none of which a `cat` PTY can be driven into.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### orchestration/delegate/051 — An undelivered delegate retires only its OWN delegation: a newer delegation armed on the same worker pane stays armed (issue #805).
+- **Layer:** L1/fast (same seam as `orchestration/delegate/048`; the test holds `AgentPtyRegistry::pane_dispatch_lock` for the worker pane so the older delegate's dispatch is parked while the newer delegation is armed through `arm_outstanding_delegation`, the call `handle_delegate`'s fan-out makes).
+- **Agent:** none (`cat` stand-ins; the worker role is re-pointed at a binary that does not exist).
+- **Asserts:** preconditions — the older delegate armed its delegation, the orchestrator's pane shows the respawn-failure notice, and the older delegate's commission has been released; then, over a 750 ms window spent in full, no `BroadcastMsg::DelegationRetired` naming the worker pane is broadcast, and `take_outstanding_delegation_if(worker, newer.seq)` still finds the newer delegation.
+- **Does not assert:** the superseded count the newer record carries; two real delegates racing each other (the second would also fail its respawn here, so the newer delegation is armed directly).
 - **Platform coverage:** mac+linux (unix-only).
 
 #### orchestration/work-done
@@ -8437,6 +8479,34 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none.
 - **Asserts:** after the production `compose_idle_worker_prompt` text is submitted into an orchestrator pane and the settle decision is run with `Ambiguous`, the payload record survives, so once the user types a byte-identical second prompt is refused (`Stale`) instead of appending the leftover prompt bytes to the user's unsent draft and submitting both as one turn. A second pane runs the identical sequence with `Applied` as a control and IS admitted, which is what makes the refusal a property of the outcome rather than of the harness. Separately asserts the precondition the whole hazard rests on: the coarse elapsed bucket (`format_idle_elapsed`) makes two prompts about one role byte-identical, so the repeat is ordinary rather than exotic. `arm_idle_worker_watch`'s half of issue #715; the direct sibling of `scheduler/idle-worker/018`.
 - **Does not assert:** that a real `Ambiguous` arises from this seam — a `/bin/cat` PTY writer cannot be faulted into a partial write, and the classification itself is unit-tested against a fault-injecting writer in `agent_pty` (`deliver_payload_classifies_partial_write_as_ambiguous`); the registry state is identical either way, since both classification arms call `note_automatic_write` with the same payload, so only the outcome the daemon acts on varies here. Also not asserted: that `arm_idle_worker_watch` reaches the decision at all (the timer, the one-shot take and the identity/liveness gates are `scheduler/idle-worker/004`, `/008` and `/014`); and that an `Ambiguous` submit stops STRANDING those bytes in the input box — it does not, and nothing anywhere removes them. What this pins is only that they are no longer merged into a later turn.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/025 — A delegate to a worker pane with no live agent retires the delegation it armed and broadcasts that retirement (issue #805).
+- **Layer:** fast integration; the real `AppState::handle_delegate` against daemon-owned PTYs, with the registry's `DelegationRetired` sink forwarded onto the harness's broadcast channel the way the daemon installs it at startup.
+- **Agent:** none (`cat` worker stand-in, closed through `AgentPtyRegistry::close_agent` before the delegate).
+- **Asserts:** preconditions — the worker pane has no live agent, the delegate's commission has been released, and a `DelegationArmed` naming the worker pane was broadcast; then `delegation_watch_snapshot(worker).outstanding_delegation` is `None`, and a `BroadcastMsg::DelegationRetired` naming the worker pane was broadcast.
+- **Does not assert:** which refusal the dispatch recorded (logged only); a `clear = true` role, whose respawn would re-create the worker instead (`orchestration/delegate/022`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/026 — A task pointer refused as stale, because the worker pane belongs to a different orchestration instance, retires the delegation and broadcasts that retirement (issue #805).
+- **Layer:** fast integration (same seam as `scheduler/idle-worker/025`).
+- **Agent:** none (the original `cat` worker is closed and a raw/no-echo `cat` carrying another instance token in its `TabMembership` takes the same pane id, so any byte written into the pane is directly observable).
+- **Asserts:** preconditions — the re-homed stub is up, the delegate's commission has been released, the pane's scrollback does not hold the task pointer, and a `DelegationArmed` naming the worker pane was broadcast; then `delegation_watch_snapshot(worker).outstanding_delegation` is `None`, and a `BroadcastMsg::DelegationRetired` naming the worker pane was broadcast.
+- **Does not assert:** the mid-close half of the same revalidation (a closing pane refuses to arm at all, `scheduler/idle-worker/010`); a refusal caused by the user typing into the worker pane.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/027 — A delegation whose task pointer reached the worker stays armed, with no retirement broadcast, until the worker reports `work-done` (issue #805's pin against over-retiring).
+- **Layer:** fast integration (same seam as `scheduler/idle-worker/025`).
+- **Agent:** none (`cat` worker stand-in).
+- **Asserts:** after the task pointer is visible in the worker's pane and a 750 ms window has been spent in full, a `DelegationArmed` naming the worker pane was broadcast, no `DelegationRetired` was, and the outstanding delegation is still armed against the orchestrator pane; after `work-done` the record is gone and a `DelegationRetired` naming the worker pane is broadcast.
+- **Does not assert:** the attached client applying those broadcasts (`scheduler/idle-worker/024`); the pi-native seed delivery or an ambiguous partial write, the other two exits that count as delivered.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/028 — A delegation that never reached its worker produces no idle-worker prompt when the timeout runs out (issue #805).
+- **Layer:** fast integration; one `handle_delegate` call fans out to a silent control worker and to a role whose `clear = true` command does not exist, under a 1500 ms `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS`.
+- **Agent:** none (`cat` worker stand-ins; raw/no-echo `cat` orchestrator).
+- **Asserts:** a precondition that the orchestrator's pane shows the respawn-failure notice for the undelivered role; then, once the control's idle prompt has appeared and a further 500 ms has passed, the orchestrator's pane holds the control's idle prompt and none naming the undelivered role.
+- **Does not assert:** the silent-worker (no-event) notice, which a failed respawn never arms; the registry record itself (`orchestration/delegate/048`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

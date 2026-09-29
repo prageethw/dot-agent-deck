@@ -1195,3 +1195,241 @@ fn observing_018_orchestrator_keeps_observing_after_the_respawned_worker_announc
         describe_orchestrator_card(&deck)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #805: a delegate that never reaches its worker, as the attached deck
+// shows it. The daemon arms the delegation before the dispatch has run, so a
+// dispatch that ends without handing the worker a task pointer has to retire
+// it again, or the two cards below keep advertising work nobody received until
+// the idle-worker timeout.
+// ---------------------------------------------------------------------------
+
+/// A role command that cannot be exec'd. One word with no shell
+/// metacharacters is exec'd directly rather than through `$SHELL -c`, so this
+/// is a spawn ERROR and not a shell that starts and then exits 127.
+const MISSING_WORKER_BINARY: &str = "/nonexistent-worker-agent-deck-respawn-target";
+
+/// The daemon's respawn-failure notice, written into the orchestrator's pane
+/// immediately before the dispatch gives up. Spelled out here rather than
+/// imported, matching this file's convention.
+const RESPAWN_FAILED_NEEDLE: &str = "respawn failed for role 'worker'";
+
+/// The daemon's notice for a replacement worker that died before it was ready.
+const DEAD_REPLACEMENT_NEEDLE: &str = "delegated worker never came up";
+
+/// How long both cards and the daemon must keep agreeing that nothing is
+/// outstanding before an undelivered delegate counts as settled.
+const CARDS_SETTLED_FOR: Duration = Duration::from_secs(2);
+
+/// The `orch-deck` orchestration with its worker role re-pointed at
+/// `worker_command`. The role sets no `clear`, so it keeps the default and a
+/// delegate respawns the worker with this command.
+fn orchestration_config_with_worker_command(worker_command: &str) -> String {
+    format!(
+        "[[orchestrations]]\nname = \"demo-orch\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+         [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = \"{worker_command}\"\n"
+    )
+}
+
+/// Every directory a role pane of the open orchestration runs in. The
+/// dispatch re-reads `.dot-agent-deck.toml` from the worker's own directory on
+/// each delegate, and that directory is the orchestration's isolated clone
+/// rather than `deck.workdir()`.
+fn orchestration_role_dirs(deck: &TuiDeck) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record.tab_membership,
+                Some(TabMembership::Orchestration { .. })
+            )
+        })
+        .filter_map(|record| record.cwd.map(PathBuf::from))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Open the orchestration with both roles announced as idle agents, re-point
+/// the worker role at the command `worker_command` builds, run the REAL
+/// `delegate` CLI, and wait until the daemon has told the orchestrator that the
+/// delegate did not reach a worker (`exit_needle` in the orchestrator's pane).
+/// Then require both cards and the daemon to settle on a non-delegated state
+/// within the deck's normal redraw window.
+fn assert_undelivered_delegate_leaves_no_delegated_cards(
+    worker_command: impl FnOnce(&std::path::Path) -> String,
+    exit_needle: &str,
+    exit: &str,
+) {
+    let deck = launch_deck_with_orchestration();
+    let (worker_pane, orchestrator_agent, orchestrator_pane) = orchestration_ids(&deck);
+    announce_idle_orchestrator(&deck, &orchestrator_pane, &orchestrator_agent);
+    assert!(
+        wait_for_role_card(
+            &deck,
+            WORKER_ROLE,
+            common::load_scaled(CARD_APPEARS_BASE),
+            |row| row.contains(NO_AGENT_LABEL)
+        ),
+        "setup: the deck never drew the worker's placeholder card reading {NO_AGENT_LABEL:?}\n{}",
+        describe_orchestrator_card(&deck)
+    );
+    let worker_agent = agent_id_on_pane(&deck, &worker_pane)
+        .expect("setup: the daemon runs an agent on the worker pane before the delegate");
+    common::write_hook_line(
+        deck.hook_socket_path(),
+        &session_start_hook_line(
+            &deck,
+            "undelivered-worker-session",
+            &worker_pane,
+            &worker_agent,
+        ),
+    )
+    .expect("write the worker's SessionStart hook");
+    assert!(
+        wait_for_role_card(
+            &deck,
+            WORKER_ROLE,
+            common::load_scaled(CARD_UPDATES_BASE),
+            |row| row.contains("Idle")
+        ),
+        "setup: the worker's card never read `Idle` after its SessionStart hook\n{}",
+        describe_orchestrator_card(&deck)
+    );
+
+    let role_dirs = orchestration_role_dirs(&deck);
+    assert!(
+        !role_dirs.is_empty(),
+        "setup: no role pane of the orchestration reports a working directory; records = {:?}",
+        common::agent_records_on(deck.attach_socket_path())
+    );
+    let command = worker_command(&role_dirs[0]);
+    for dir in &role_dirs {
+        std::fs::write(
+            dir.join(".dot-agent-deck.toml"),
+            orchestration_config_with_worker_command(&command),
+        )
+        .expect("re-point the worker role");
+    }
+
+    let output = run_delegate_cli_with_subject(
+        &deck,
+        &orchestrator_pane,
+        WORKER_ROLE,
+        "Do the thing under test for an undelivered delegate.",
+        "#805",
+    );
+    assert!(
+        output.status.success(),
+        "setup: `delegate` exited {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(30)), || {
+            orchestrator_pty(&deck, &orchestrator_agent).contains(exit_needle)
+        }),
+        "setup: the daemon never told the orchestrator that the delegate did not reach a worker \
+         ({exit}), so the dispatch did not take the exit under test; orchestrator pane = {:?}",
+        orchestrator_pty(&deck, &orchestrator_agent)
+    );
+
+    // The delegation was announced to the deck before the dispatch ran, so a
+    // card that merely PASSES THROUGH a non-delegated state proves nothing:
+    // the deck may not have drawn the announcement yet. What is required is
+    // that both cards and the daemon agree on "nothing outstanding" and keep
+    // agreeing for `CARDS_SETTLED_FOR`, within the deck's normal redraw window.
+    let orchestrator_settled = |row: &str| row.contains("Idle") && !row.contains(OBSERVING_LABEL);
+    let worker_settled = |row: &str| !row.contains("delegated");
+    let settled_since = std::cell::Cell::new(None::<std::time::Instant>);
+    let settled = common::wait_until(
+        common::load_scaled(CARD_UPDATES_BASE) + CARDS_SETTLED_FOR,
+        || {
+            let grid = deck.snapshot_grid();
+            let nothing_outstanding = orchestrator_card_status_row(&grid)
+                .as_deref()
+                .is_some_and(orchestrator_settled)
+                && role_card_status_row(&grid, WORKER_ROLE)
+                    .as_deref()
+                    .is_none_or(worker_settled)
+                && !daemon_has_delegation(&deck, &worker_pane, &orchestrator_pane);
+            if !nothing_outstanding {
+                settled_since.set(None);
+                return false;
+            }
+            let since = settled_since.get().unwrap_or_else(|| {
+                let now = std::time::Instant::now();
+                settled_since.set(Some(now));
+                now
+            });
+            since.elapsed() >= CARDS_SETTLED_FOR
+        },
+    );
+
+    // Named one by one, so a failure says WHICH surface still shows the
+    // delegation rather than only that something does.
+    let grid = deck.snapshot_grid();
+    let orchestrator_row = orchestrator_card_status_row(&grid);
+    assert!(
+        orchestrator_row
+            .as_deref()
+            .is_some_and(orchestrator_settled),
+        "the delegate never reached a worker ({exit}), but the orchestrator's card still reads \
+         as if it were waiting on one: {orchestrator_row:?}; daemon records = {:?}\n{}",
+        common::agent_records_on(deck.attach_socket_path()),
+        describe_orchestrator_card(&deck)
+    );
+    let worker_row = role_card_status_row(&grid, WORKER_ROLE);
+    assert!(
+        worker_row.as_deref().is_none_or(worker_settled),
+        "the delegate never reached a worker ({exit}), but the worker's card still reads as if \
+         it owed a work-done: {worker_row:?}\n{}",
+        describe_orchestrator_card(&deck)
+    );
+    assert!(
+        !daemon_has_delegation(&deck, &worker_pane, &orchestrator_pane),
+        "the delegate never reached a worker ({exit}), but the daemon still holds its \
+         delegation as outstanding; records = {:?}",
+        common::agent_records_on(deck.attach_socket_path())
+    );
+    assert!(
+        settled,
+        "the delegate never reached a worker ({exit}); the cards and the daemon each read as \
+         settled just now, but never all at once for {CARDS_SETTLED_FOR:?} within the redraw \
+         window\n{}",
+        describe_orchestrator_card(&deck)
+    );
+}
+
+/// Scenario: Launch the real TUI and its daemon, open the two-role `orch-deck` orchestration with both roles announced as idle agents, re-point the worker role at a binary that does not exist, and run the REAL `delegate` CLI so the worker's respawn fails. Once the orchestrator's pane shows the respawn-failure notice, the orchestrator's card must read `Idle` rather than `Observing` and the worker's card must not read `Idle (delegated)`.
+#[spec("status/observing/022")]
+#[test]
+fn observing_022_a_failed_respawn_leaves_neither_card_reading_delegated() {
+    assert_undelivered_delegate_leaves_no_delegated_cards(
+        |_dir| MISSING_WORKER_BINARY.to_string(),
+        RESPAWN_FAILED_NEEDLE,
+        "its respawn failed",
+    );
+}
+
+/// Scenario: Launch the real TUI and its daemon, open the two-role `orch-deck` orchestration with both roles announced as idle agents, re-point the worker role at a script that exits at once, and run the REAL `delegate` CLI so the replacement worker dies before it can receive anything. Once the orchestrator's pane shows the worker-never-came-up notice, the orchestrator's card must read `Idle` rather than `Observing` and the worker's card must not read `Idle (delegated)`.
+#[spec("status/observing/023")]
+#[test]
+fn observing_023_a_replacement_that_never_becomes_live_leaves_neither_card_reading_delegated() {
+    assert_undelivered_delegate_leaves_no_delegated_cards(
+        |dir| {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script = dir.join("dies-on-arrival.sh");
+            std::fs::write(&script, "#!/bin/sh\nexit 3\n").expect("write the dying stand-in");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod the dying stand-in");
+            script.to_string_lossy().into_owned()
+        },
+        DEAD_REPLACEMENT_NEEDLE,
+        "its replacement worker never became live",
+    );
+}

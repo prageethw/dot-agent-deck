@@ -297,6 +297,160 @@ pub async fn wait_for_child_first_output(
     }
 }
 
+/// Issue #805: ceiling on a delegate's dispatch task reaching one of its
+/// no-delivery exits, before [`load_scaled`] widens it. The exit is observed
+/// through the commission ledger, which every such exit already releases.
+const UNDELIVERED_EXIT_BASE: Duration = Duration::from_secs(10);
+
+/// Issue #805: how long after a no-delivery exit has demonstrably run the
+/// outstanding-delegation record is given to leave the registry, before
+/// [`load_scaled`] widens it. The exit's own commission release is the
+/// synchronization edge, so this bounds a few statements of the same task, not
+/// a timer.
+const UNDELIVERED_RETIREMENT_BASE: Duration = Duration::from_secs(3);
+
+/// Issue #805: what the daemon broadcast about one worker pane's outstanding
+/// delegation while a test was listening.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DelegationBroadcasts {
+    /// `BroadcastMsg::DelegationArmed` messages naming the pane.
+    pub armed: usize,
+    /// `BroadcastMsg::DelegationRetired` messages naming the pane.
+    pub retired: usize,
+}
+
+/// Issue #805: wait until the commission ledger holds nothing for
+/// `worker_pane_id`, returning whether that happened within the budget.
+///
+/// `handle_delegate` arms the commission synchronously, before it returns, and
+/// every no-delivery exit of the dispatch task releases it. So polled AFTER a
+/// delegate call has returned, "no commission" means the dispatch task has run
+/// to a no-delivery exit — the edge the issue #805 tests synchronize on.
+pub async fn wait_for_commission_release(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    worker_pane_id: &str,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + load_scaled(UNDELIVERED_EXIT_BASE);
+    loop {
+        if registry
+            .delegation_watch_snapshot(worker_pane_id)
+            .delegation_commission
+            .is_none()
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Issue #805: wait for `worker_pane_id`'s outstanding-delegation record to
+/// leave the registry. Returns `None` once it is gone, or the record still
+/// armed when the budget ran out.
+pub async fn wait_for_outstanding_delegation_to_retire(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    worker_pane_id: &str,
+) -> Option<dot_agent_deck::agent_pty::WatchSnapshot> {
+    let deadline = tokio::time::Instant::now() + load_scaled(UNDELIVERED_RETIREMENT_BASE);
+    loop {
+        let armed = registry
+            .delegation_watch_snapshot(worker_pane_id)
+            .outstanding_delegation;
+        if armed.is_none() || tokio::time::Instant::now() >= deadline {
+            return armed;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Issue #805: count the delegation broadcasts naming `worker_pane_id` that
+/// arrive on `broadcasts` within `window`, including any already queued.
+///
+/// With `until_retired` the wait ends as soon as one `DelegationRetired` for
+/// the pane has been seen; without it the whole window is spent, which is what
+/// a test asserting that NONE is sent needs.
+pub async fn delegation_broadcasts_for(
+    broadcasts: &mut tokio::sync::broadcast::Receiver<dot_agent_deck::event::BroadcastMsg>,
+    worker_pane_id: &str,
+    window: Duration,
+    until_retired: bool,
+) -> DelegationBroadcasts {
+    use dot_agent_deck::event::BroadcastMsg;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let deadline = tokio::time::Instant::now() + window;
+    let mut seen = DelegationBroadcasts::default();
+    loop {
+        if until_retired && seen.retired > 0 {
+            return seen;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, broadcasts.recv()).await {
+            Ok(Ok(BroadcastMsg::DelegationArmed(notice))) if notice.pane_id == worker_pane_id => {
+                seen.armed += 1;
+            }
+            Ok(Ok(BroadcastMsg::DelegationRetired(notice))) if notice.pane_id == worker_pane_id => {
+                seen.retired += 1;
+            }
+            Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) | Err(_) => return seen,
+        }
+    }
+}
+
+/// Issue #805: the shared tail of every "this delegate never reached its
+/// worker" test. `broadcasts` must have been subscribed BEFORE the delegate
+/// call, and the delegate call must already have returned.
+///
+/// Asserts, in order: the dispatch task reached a no-delivery exit (its
+/// commission was released) and the delegation had been announced as armed —
+/// both preconditions, so a pass cannot come from a delegation that was never
+/// armed — then that the outstanding-delegation record is gone, then that a
+/// `DelegationRetired` naming the worker pane was broadcast. `exit` names the
+/// no-delivery exit under test, for the failure messages.
+pub async fn assert_undelivered_delegation_is_retired(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    broadcasts: &mut tokio::sync::broadcast::Receiver<dot_agent_deck::event::BroadcastMsg>,
+    worker_pane_id: &str,
+    exit: &str,
+) {
+    assert!(
+        wait_for_commission_release(registry, worker_pane_id).await,
+        "precondition: the delegate's commission was never released, so the dispatch task has \
+         not reached the no-delivery exit under test ({exit}); watches = {:?}",
+        registry.delegation_watch_snapshot(worker_pane_id)
+    );
+    let still_armed = wait_for_outstanding_delegation_to_retire(registry, worker_pane_id).await;
+    let seen = delegation_broadcasts_for(
+        broadcasts,
+        worker_pane_id,
+        load_scaled(UNDELIVERED_RETIREMENT_BASE),
+        true,
+    )
+    .await;
+    assert!(
+        seen.armed > 0,
+        "precondition: no DelegationArmed was broadcast for pane {worker_pane_id}, so no \
+         outstanding delegation was ever armed and its absence below would prove nothing; \
+         broadcasts = {seen:?}"
+    );
+    assert!(
+        still_armed.is_none(),
+        "the delegation to pane {worker_pane_id} never reached the worker ({exit}), but its \
+         outstanding-delegation record is still armed, so the worker's card keeps reading \
+         `Idle (delegated)` and the orchestrator's `Observing` until the idle-worker timeout; \
+         still armed = {still_armed:?}, broadcasts = {seen:?}"
+    );
+    assert!(
+        seen.retired > 0,
+        "the delegation to pane {worker_pane_id} never reached the worker ({exit}) and its \
+         record is gone, but no DelegationRetired was broadcast for that pane, so an \
+         already-attached deck keeps showing the delegation as outstanding; broadcasts = {seen:?}"
+    );
+}
+
 /// Decision 20: pinned PTY dimensions for the deck. Resize tests
 /// override via `TuiDeck::resize`.
 const DEFAULT_COLS: u16 = 120;
