@@ -715,10 +715,12 @@ fn work_done_008_matching_subjects_produce_no_mismatch_warning() {
 // --- Issue #803: an orchestrator with a delegation outstanding reads ---------
 // --- `Observing` on its own card ---------------------------------------------
 //
-// The two tests below drive the whole live path with stand-in `cat` roles and
-// the REAL `delegate` / `work-done` CLIs: daemon arms the delegation, pushes it
-// to the attached deck (or serves it to a reattaching one), and the deck draws
-// the ORCHESTRATOR's card. No LLM is involved.
+// The tests below drive the whole live path with stand-in `cat` roles and the
+// REAL `delegate` / `work-done` CLIs: daemon arms the delegation, pushes it to
+// the attached deck (or serves it to a reattaching one), and the deck draws the
+// ORCHESTRATOR's card. No LLM is involved. A `cat` stand-in never emits a hook
+// event, so where a test needs one (an agent announcing itself) it writes the
+// line a real agent's hook would send to the daemon's hook socket.
 
 /// The label an orchestrator's card must carry while a delegation it issued is
 /// outstanding. Spelled out here rather than imported from `src/`, matching
@@ -730,8 +732,27 @@ const OBSERVING_LABEL: &str = "Observing";
 /// that ellipsizes the name (`orchestrat…`) is still matched.
 const ORCHESTRATOR_CARD_NEEDLE: &str = "orchestrat";
 
-/// The top-border row of the ORCHESTRATOR's sidebar card — the row that
-/// carries its status badge — or `None` while no such card is drawn.
+/// What a role's card reads before any agent has announced itself on its pane.
+const NO_AGENT_LABEL: &str = "No agent";
+
+/// Ceiling on a role's placeholder card appearing on the deck, before
+/// [`common::load_scaled`] widens it. The orchestration is already open and
+/// its panes are already spawned when this is waited on, so it bounds a few
+/// frames of rendering, and a deck that never draws the card fails the test
+/// in well under a minute even at the largest load factor.
+const CARD_APPEARS_BASE: Duration = Duration::from_secs(8);
+
+/// Ceiling on a second deck booting, attaching to the running daemon and
+/// drawing its first hydrated card, before [`common::load_scaled`] widens it.
+const REATTACH_BASE: Duration = Duration::from_secs(15);
+
+/// Ceiling on the deck redrawing a card after a hook event or a daemon push
+/// it is already subscribed to, before [`common::load_scaled`] widens it.
+const CARD_UPDATES_BASE: Duration = Duration::from_secs(5);
+
+/// The top-border row of the sidebar card whose name starts with `needle` —
+/// the row that carries its status badge — or `None` while no such card is
+/// drawn.
 ///
 /// A card is a box whose first body row OPENS with the role name, directly
 /// after the box's own left border (PRD fork#405 moved the name off the title
@@ -741,7 +762,7 @@ const ORCHESTRATOR_CARD_NEEDLE: &str = "orchestrat";
 /// "contains" is not enough: the name must be the first thing on the row. A
 /// box whose top border names the role is that role's pane and is skipped
 /// too. Only a card's status row is ever returned.
-fn orchestrator_card_status_row(grid: &str) -> Option<String> {
+fn role_card_status_row(grid: &str, needle: &str) -> Option<String> {
     let lines: Vec<Vec<char>> = grid.lines().map(|line| line.chars().collect()).collect();
     lines.iter().enumerate().find_map(|(row, chars)| {
         let body = lines.get(row + 1)?;
@@ -757,17 +778,20 @@ fn orchestrator_card_status_row(grid: &str) -> Option<String> {
                         .skip(start + 1)
                         .find_map(|(index, ch)| (*ch == weight.top_right).then_some(index))?;
                     let title: String = chars[start..=end].iter().collect();
-                    if title.contains(ORCHESTRATOR_CARD_NEEDLE) {
+                    if title.contains(needle) {
                         return None;
                     }
                     let body_span = body.get(start..=end)?;
                     let (left_border, inner) = body_span.split_first()?;
                     let inner: String = inner.iter().collect();
-                    (*left_border == weight.vertical && inner.starts_with(ORCHESTRATOR_CARD_NEEDLE))
-                        .then_some(title)
+                    (*left_border == weight.vertical && inner.starts_with(needle)).then_some(title)
                 })
         })
     })
+}
+
+fn orchestrator_card_status_row(grid: &str) -> Option<String> {
+    role_card_status_row(grid, ORCHESTRATOR_CARD_NEEDLE)
 }
 
 /// Wait until the orchestrator's card is drawn and its status row satisfies
@@ -782,11 +806,26 @@ fn wait_for_orchestrator_card(
     })
 }
 
+/// Wait until the card of the role whose name starts with `needle` is drawn
+/// and its status row satisfies `pred`. Returns whether that happened within
+/// `timeout`.
+fn wait_for_role_card(
+    deck: &TuiDeck,
+    needle: &str,
+    timeout: Duration,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
+    deck.wait_for_grid_predicate_within(timeout, |grid| {
+        role_card_status_row(grid, needle).is_some_and(|row| pred(&row))
+    })
+}
+
 fn describe_orchestrator_card(deck: &TuiDeck) -> String {
     let grid = deck.snapshot_grid();
     format!(
-        "orchestrator card status row: {:?}\nGrid:\n{grid}",
-        orchestrator_card_status_row(&grid)
+        "orchestrator card status row: {:?}\nworker card status row: {:?}\nGrid:\n{grid}",
+        orchestrator_card_status_row(&grid),
+        role_card_status_row(&grid, WORKER_ROLE)
     )
 }
 
@@ -819,31 +858,75 @@ fn launch_deck_with_orchestration() -> TuiDeck {
     deck
 }
 
+/// The `SessionStart` line a real agent's hook sends when the agent
+/// `agent_id` starts conversation `session_id` on `pane_id`, with the working
+/// directory a real hook always reports.
+fn session_start_hook_line(
+    deck: &TuiDeck,
+    session_id: &str,
+    pane_id: &str,
+    agent_id: &str,
+) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "agent_type": "claude_code",
+        "event_type": "session_start",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "cwd": deck.workdir().to_string_lossy(),
+        "pane_id": pane_id,
+        "agent_id": agent_id,
+    })
+    .to_string()
+}
+
 /// Make the `cat` orchestrator a live, idle agent as far as the deck is
 /// concerned, by writing the `SessionStart` a real agent's hook would send for
 /// that pane, then wait for its card to read `Idle`.
 ///
 /// Without this the stand-in's card reads `No agent`, which is not a status
 /// the `Observing` presentation applies to.
+///
+/// The hook is written only once the deck has DRAWN the orchestrator's
+/// placeholder card. The daemon registers the role panes before the deck
+/// creates their cards, so a hook sent as soon as the daemon knows the pane
+/// can reach the deck first and leave the pane with two cards, the
+/// placeholder among them; every wait here is short, so a setup that goes
+/// wrong fails quickly and names the step.
 fn announce_idle_orchestrator(deck: &TuiDeck, orchestrator_pane: &str, orchestrator_agent: &str) {
-    let session_start = serde_json::json!({
-        "session_id": "observing-orchestrator-session",
-        "agent_type": "claude_code",
-        "event_type": "session_start",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "pane_id": orchestrator_pane,
-        "agent_id": orchestrator_agent,
-    });
-    common::write_hook_line(deck.hook_socket_path(), &session_start.to_string())
-        .expect("write the orchestrator's SessionStart hook");
     assert!(
-        wait_for_orchestrator_card(deck, common::load_scaled(Duration::from_secs(20)), |row| {
+        wait_for_orchestrator_card(deck, common::load_scaled(CARD_APPEARS_BASE), |row| {
+            row.contains(NO_AGENT_LABEL)
+        }),
+        "setup: the deck never drew the orchestrator's placeholder card reading \
+         {NO_AGENT_LABEL:?}, so its SessionStart hook was not sent\n{}",
+        describe_orchestrator_card(deck)
+    );
+    common::write_hook_line(
+        deck.hook_socket_path(),
+        &session_start_hook_line(
+            deck,
+            "observing-orchestrator-session",
+            orchestrator_pane,
+            orchestrator_agent,
+        ),
+    )
+    .expect("write the orchestrator's SessionStart hook");
+    assert!(
+        wait_for_orchestrator_card(deck, common::load_scaled(CARD_UPDATES_BASE), |row| {
             row.contains("Idle")
         }),
         "setup: the orchestrator's card never read `Idle` after its SessionStart hook, so \
          nothing below can be attributed to delegation\n{}",
         describe_orchestrator_card(deck)
     );
+}
+
+/// The registry id of the agent the daemon currently runs on `pane`, if any.
+fn agent_id_on_pane(deck: &TuiDeck, pane: &str) -> Option<String> {
+    common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.pane_id_env.as_deref() == Some(pane))
+        .map(|record| record.id)
 }
 
 /// Run the real `delegate` CLI from the orchestrator to the worker and wait
@@ -883,7 +966,7 @@ fn observing_009_attached_deck_flips_orchestrator_card_on_delegate_and_work_done
 
     delegate_and_wait_until_armed(&deck, &orchestrator_pane, &worker_pane);
 
-    let visible_timeout = common::load_scaled(Duration::from_secs(20));
+    let visible_timeout = common::load_scaled(CARD_UPDATES_BASE);
     assert!(
         wait_for_orchestrator_card(&deck, visible_timeout, |row| {
             row.contains(OBSERVING_LABEL) && !row.contains("Idle")
@@ -952,9 +1035,8 @@ fn observing_010_reattached_deck_hydrates_orchestrator_card_as_observing() {
         .without_success_recording()
         .launch_with_fixture("minimal");
 
-    let visible_timeout = common::load_scaled(Duration::from_secs(20));
     assert!(
-        wait_for_orchestrator_card(&reattached, visible_timeout, |row| {
+        wait_for_orchestrator_card(&reattached, common::load_scaled(REATTACH_BASE), |row| {
             row.contains("Idle") || row.contains(OBSERVING_LABEL)
         }),
         "setup: the reattached deck never drew the orchestrator's card with a live status, so \
@@ -966,11 +1048,130 @@ fn observing_010_reattached_deck_hydrates_orchestrator_card_as_observing() {
         "setup: the delegation must still be outstanding when the second deck hydrates"
     );
     assert!(
-        wait_for_orchestrator_card(&reattached, visible_timeout, |row| {
+        wait_for_orchestrator_card(&reattached, common::load_scaled(CARD_UPDATES_BASE), |row| {
             row.contains(OBSERVING_LABEL) && !row.contains("Idle")
         }),
         "a deck attaching while the orchestrator's delegation is outstanding must hydrate the \
          orchestrator's card as {OBSERVING_LABEL:?}\n{}",
         describe_orchestrator_card(&reattached)
+    );
+}
+
+/// Scenario: Launch the real TUI and its daemon, open the two-role `orch-deck` orchestration, announce the `cat` orchestrator as an idle agent, and run the REAL `delegate` CLI from the orchestrator to the worker, which respawns the worker under a new agent id. Write the `SessionStart` the respawned worker's hook would send, so the deck replaces the worker's session: the orchestrator's card must STILL read `Observing` once the worker's card shows a live agent. Then run the REAL `work-done` CLI from the worker: the orchestrator's card must go back to `Idle`.
+#[spec("status/observing/018")]
+#[test]
+fn observing_018_orchestrator_keeps_observing_after_the_respawned_worker_announces_itself() {
+    let deck = launch_deck_with_orchestration();
+    let (worker_pane, orchestrator_agent, orchestrator_pane) = orchestration_ids(&deck);
+    announce_idle_orchestrator(&deck, &orchestrator_pane, &orchestrator_agent);
+    assert!(
+        wait_for_role_card(
+            &deck,
+            WORKER_ROLE,
+            common::load_scaled(CARD_APPEARS_BASE),
+            |row| row.contains(NO_AGENT_LABEL)
+        ),
+        "setup: the deck never drew the worker's placeholder card reading {NO_AGENT_LABEL:?}\n{}",
+        describe_orchestrator_card(&deck)
+    );
+    let first_worker_agent = agent_id_on_pane(&deck, &worker_pane)
+        .expect("setup: the daemon runs an agent on the worker pane before the delegate");
+
+    delegate_and_wait_until_armed(&deck, &orchestrator_pane, &worker_pane);
+    let visible_timeout = common::load_scaled(CARD_UPDATES_BASE);
+    assert!(
+        wait_for_orchestrator_card(&deck, visible_timeout, |row| {
+            row.contains(OBSERVING_LABEL) && !row.contains("Idle")
+        }),
+        "setup: the orchestrator's card never read {OBSERVING_LABEL:?} after the delegate, so \
+         nothing can be said about whether it KEEPS reading it\n{}",
+        describe_orchestrator_card(&deck)
+    );
+
+    // The delegate's `clear = true` respawn puts a NEW agent on the worker
+    // pane. Its id is what the respawned agent's own hook would report.
+    let respawned_worker_agent = RefCell::new(None);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(30)), || {
+            match agent_id_on_pane(&deck, &worker_pane) {
+                Some(id) if id != first_worker_agent => {
+                    *respawned_worker_agent.borrow_mut() = Some(id);
+                    true
+                }
+                _ => false,
+            }
+        }),
+        "setup: the delegate never respawned the worker under a new agent id (it was \
+         {first_worker_agent:?}); records = {:?}",
+        common::agent_records_on(deck.attach_socket_path())
+    );
+    let respawned_worker_agent = respawned_worker_agent
+        .into_inner()
+        .expect("the wait stores the respawned worker's agent id");
+
+    common::write_hook_line(
+        deck.hook_socket_path(),
+        &session_start_hook_line(
+            &deck,
+            "observing-respawned-worker-session",
+            &worker_pane,
+            &respawned_worker_agent,
+        ),
+    )
+    .expect("write the respawned worker's SessionStart hook");
+    assert!(
+        wait_for_role_card(&deck, WORKER_ROLE, visible_timeout, |row| {
+            row.contains("Idle") && !row.contains(NO_AGENT_LABEL)
+        }),
+        "setup: the worker's card never showed a live agent after the respawned worker's \
+         SessionStart hook, so the deck has not replaced the worker's session yet\n{}",
+        describe_orchestrator_card(&deck)
+    );
+    assert!(
+        daemon_has_delegation(&deck, &worker_pane, &orchestrator_pane),
+        "setup: the delegation must still be outstanding on the daemon after the respawned \
+         worker announced itself"
+    );
+
+    assert!(
+        wait_for_orchestrator_card(&deck, visible_timeout, |row| {
+            row.contains(OBSERVING_LABEL) && !row.contains("Idle")
+        }),
+        "the respawned worker announced itself and the daemon still holds the delegation as \
+         outstanding, but the orchestrator's card stopped reading {OBSERVING_LABEL:?}\n{}",
+        describe_orchestrator_card(&deck)
+    );
+
+    let (worker_generation, worker_boot_id, _worker_cwd) =
+        worker_fail_closed_identity(&deck, &worker_pane);
+    let work_done_output = run_work_done_cli_with_subject(
+        &deck,
+        &worker_pane,
+        worker_generation,
+        &worker_boot_id,
+        "Finished the delegated task. e2e-observing-report-9c41",
+        "#803",
+    );
+    assert!(
+        work_done_output.status.success(),
+        "`work-done` exited {:?}\nstdout: {}\nstderr: {}",
+        work_done_output.status.code(),
+        String::from_utf8_lossy(&work_done_output.stdout),
+        String::from_utf8_lossy(&work_done_output.stderr)
+    );
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(30)), || {
+            !daemon_has_delegation(&deck, &worker_pane, &orchestrator_pane)
+        }),
+        "the daemon never retired the delegation after the worker's work-done; records = {:?}",
+        common::agent_records_on(deck.attach_socket_path())
+    );
+    assert!(
+        wait_for_orchestrator_card(&deck, visible_timeout, |row| {
+            row.contains("Idle") && !row.contains(OBSERVING_LABEL)
+        }),
+        "the worker reported work-done and the daemon retired the delegation, but the \
+         orchestrator's card did not go back to `Idle`\n{}",
+        describe_orchestrator_card(&deck)
     );
 }

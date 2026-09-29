@@ -19299,10 +19299,11 @@ clear = false
     }
 
     /// Scenario: issue #803. `observes_own_delegations` holds only for an
-    /// `Idle`/`Unknown` pane named as the issuer of an outstanding
-    /// delegation: every other status, a pane that issued nothing, and a
-    /// session with no pane id are all refused, and an empty set of
-    /// delegations names no pane at all.
+    /// `Idle` pane named as the issuer of an outstanding delegation: every
+    /// other status (including `Unknown`, which may be a newer status this
+    /// build could not decode), a pane that issued nothing, and a session
+    /// with no pane id are all refused, and an empty set of delegations names
+    /// no pane at all.
     #[test]
     fn observes_own_delegations_needs_idle_status_and_an_issued_delegation() {
         let delegation = crate::agent_pty::WatchSnapshot {
@@ -19311,19 +19312,26 @@ clear = false
         };
         let delegating = delegating_orchestrator_panes([&delegation]);
 
-        for status in [SessionStatus::Idle, SessionStatus::Unknown] {
-            assert!(observes_own_delegations(
-                &status,
-                Some("orch-pane"),
-                &delegating
-            ));
-            assert!(!observes_own_delegations(
-                &status,
-                Some("other-orch-pane"),
-                &delegating
-            ));
-            assert!(!observes_own_delegations(&status, None, &delegating));
-        }
+        assert!(observes_own_delegations(
+            &SessionStatus::Idle,
+            Some("orch-pane"),
+            &delegating
+        ));
+        assert!(!observes_own_delegations(
+            &SessionStatus::Idle,
+            Some("other-orch-pane"),
+            &delegating
+        ));
+        assert!(!observes_own_delegations(
+            &SessionStatus::Idle,
+            None,
+            &delegating
+        ));
+        assert!(
+            !observes_own_delegations(&SessionStatus::Unknown, Some("orch-pane"), &delegating),
+            "an Unknown pane must never be relabelled Observing: Unknown can be a newer \
+             status an older build could not decode"
+        );
         for status in [
             SessionStatus::Working,
             SessionStatus::Thinking,

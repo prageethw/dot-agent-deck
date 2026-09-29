@@ -25067,6 +25067,69 @@ pub fn render_card_grid_to_buffer(
     width: u16,
     height: u16,
 ) -> (ratatui::buffer::Buffer, CardGridProbe) {
+    // Issue #803: the cards handed in are this seam's whole deck, so the
+    // delegations they carry are what the live deck would derive from
+    // `state.sessions`.
+    let delegating_panes = delegating_orchestrator_panes(
+        cards
+            .iter()
+            .filter_map(|(session, _)| session.outstanding_delegation.as_ref()),
+    );
+    render_card_grid_seam(
+        cards,
+        selected,
+        scroll_offset,
+        width,
+        height,
+        &delegating_panes,
+    )
+}
+
+/// L1 seam for the deck card grid as the LIVE deck draws it from an
+/// [`AppState`]: the same [`render_card_grid`] as
+/// [`render_card_grid_to_buffer`], but every whole-deck fact a card depends on
+/// (issue #803: which panes issued a delegation that is still outstanding) is
+/// derived from `state`, exactly as `render_frame` derives it, rather than
+/// from the cards handed in.
+///
+/// `cards` is `(session, display_name)` in deck order and must borrow from
+/// `state.sessions`; `width` × `height` is the deck area.
+#[doc(hidden)]
+pub fn render_state_card_grid_to_buffer(
+    state: &AppState,
+    cards: &[(&SessionState, Option<&str>)],
+    selected: Option<usize>,
+    scroll_offset: usize,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, CardGridProbe) {
+    let delegating_panes = delegating_orchestrator_panes(
+        state
+            .sessions
+            .values()
+            .filter_map(|session| session.outstanding_delegation.as_ref()),
+    );
+    render_card_grid_seam(
+        cards,
+        selected,
+        scroll_offset,
+        width,
+        height,
+        &delegating_panes,
+    )
+}
+
+/// Shared body of [`render_card_grid_to_buffer`] and
+/// [`render_state_card_grid_to_buffer`], which differ only in where
+/// `delegating_panes` comes from.
+fn render_card_grid_seam(
+    cards: &[(&SessionState, Option<&str>)],
+    selected: Option<usize>,
+    scroll_offset: usize,
+    width: u16,
+    height: u16,
+    delegating_panes: &HashSet<String>,
+) -> (ratatui::buffer::Buffer, CardGridProbe) {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -25090,14 +25153,6 @@ pub fn render_card_grid_to_buffer(
     }
     let sessions: Vec<&SessionState> = cards.iter().map(|(session, _)| *session).collect();
     let id_refs: Vec<&String> = ids.iter().collect();
-    // Issue #803: the cards handed in are this seam's whole deck, so the
-    // delegations they carry are what the live deck would derive from
-    // `state.sessions`.
-    let delegating_panes = delegating_orchestrator_panes(
-        sessions
-            .iter()
-            .filter_map(|session| session.outstanding_delegation.as_ref()),
-    );
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
@@ -25116,7 +25171,7 @@ pub fn render_card_grid_to_buffer(
                 &id_refs,
                 sessions.len(),
                 0,
-                &delegating_panes,
+                delegating_panes,
             );
         })
         .expect("TestBackend draw should succeed");

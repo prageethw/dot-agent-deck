@@ -20,7 +20,8 @@ use dot_agent_deck::ui::{
     render_card_for_mode_to_buffer, render_card_grid_to_buffer, render_card_to_buffer,
     render_card_with_declared_agent_to_buffer, render_config_gen_prompt_to_buffer,
     render_dashboard_cards_to_buffer, render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
-    render_stats_bar_to_buffer, render_stop_confirm_to_buffer, sync_and_derive_selection,
+    render_state_card_grid_to_buffer, render_stats_bar_to_buffer, render_stop_confirm_to_buffer,
+    sync_and_derive_selection,
 };
 use dot_agent_deck::untrusted_text::MAX_TOOL_TEXT_BYTES;
 use ratatui::layout::Rect;
@@ -5328,8 +5329,14 @@ fn grid_003_unavoidable_overflow_is_signalled() {
 // Display-only: every test below leaves the orchestrator's real
 // `SessionStatus` alone and asserts on what the deck DRAWS for it. The fixture
 // is a real `AppState` driven through the same entry points the live deck uses
-// (`apply_event`, `apply_delegation_armed` / `apply_delegation_retired`, the
-// monitored-wait verbs), rendered through the real card grid.
+// (`apply_event`, `apply_delegation_armed` / `apply_delegation_retired`,
+// `resync_hydrated_sessions`, the monitored-wait verbs), rendered through the
+// real card grid.
+//
+// Nothing here reads WHERE the client keeps an outstanding delegation: cards
+// are looked up by pane, and the deck is drawn from the whole `AppState`
+// (`render_state_card_grid_to_buffer`), so the tests hold whether that fact
+// lives on a session or on the pane.
 // ---------------------------------------------------------------------------
 
 /// The orchestrator whose delegations these tests arm and retire.
@@ -5353,36 +5360,82 @@ fn observing_session_id(pane_id: &str) -> String {
     format!("sess-{pane_id}")
 }
 
+fn observing_agent_id(pane_id: &str) -> String {
+    format!("agent-{pane_id}")
+}
+
+/// A hook event of `event_type` from the agent `agent_id`, speaking as
+/// conversation `session_id` on `pane_id`.
+fn observing_hook_event(
+    event_type: EventType,
+    pane_id: &str,
+    session_id: &str,
+    agent_id: &str,
+) -> AgentEvent {
+    AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: Some("/home/dev/example-project".to_string()),
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    }
+}
+
+/// The agent on `pane_id` announces itself with a real `SessionStart`.
+fn announce_observing_agent(state: &mut AppState, pane_id: &str) {
+    state.apply_event(observing_hook_event(
+        EventType::SessionStart,
+        pane_id,
+        &observing_session_id(pane_id),
+        &observing_agent_id(pane_id),
+    ));
+    assert_eq!(
+        state.sessions[&observing_session_id(pane_id)].status,
+        SessionStatus::Idle,
+        "fixture precondition: {pane_id} starts Idle"
+    );
+}
+
 /// A deck of four live ClaudeCode agents, every one of them `Idle`: each pane
 /// is registered and announces itself with a real `SessionStart`.
 fn observing_deck_state() -> AppState {
+    observing_deck_state_without(&[])
+}
+
+/// The same deck, except the panes in `silent` are registered but their agent
+/// has not announced itself yet, so they have no session and no card.
+fn observing_deck_state_without(silent: &[&str]) -> AppState {
     let mut state = AppState::default();
     for (pane_id, _) in OBSERVING_DECK {
         state.register_pane(pane_id.to_string());
-        state.apply_event(AgentEvent {
-            session_id: observing_session_id(pane_id),
-            agent_type: AgentType::ClaudeCode,
-            event_type: EventType::SessionStart,
-            tool_name: None,
-            tool_detail: None,
-            cwd: Some("/home/dev/example-project".to_string()),
-            timestamp: chrono::Utc::now(),
-            user_prompt: None,
-            metadata: HashMap::new(),
-            pane_id: Some(pane_id.to_string()),
-            agent_id: Some(format!("agent-{pane_id}")),
-            agent_version: None,
-            schema_version: None,
-            live_target: None,
-            model: None,
-        });
-        assert_eq!(
-            state.sessions[&observing_session_id(pane_id)].status,
-            SessionStatus::Idle,
-            "fixture precondition: {pane_id} starts Idle"
-        );
+        if !silent.contains(&pane_id) {
+            announce_observing_agent(&mut state, pane_id);
+        }
     }
     state
+}
+
+/// Every session currently on `pane_id`, in a stable order. Looked up by pane
+/// rather than by session id, because a respawned agent brings a new session
+/// id to the same pane.
+fn observing_sessions_on<'a>(state: &'a AppState, pane_id: &str) -> Vec<&'a SessionState> {
+    let mut sessions: Vec<&SessionState> = state
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+        .collect();
+    sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    sessions
 }
 
 /// The daemon announces that `orchestrator_pane` delegated to `worker_pane`.
@@ -5403,12 +5456,6 @@ fn arm_delegation_aged(
             orchestrator_pane_id: orchestrator_pane.to_string(),
         },
     });
-    assert!(
-        state.sessions[&observing_session_id(worker_pane)]
-            .outstanding_delegation
-            .is_some(),
-        "fixture precondition: the delegation to {worker_pane} is armed on the client"
-    );
 }
 
 /// The daemon announces that `worker_pane`'s delegation is over — what a
@@ -5421,22 +5468,33 @@ fn retire_delegation(state: &mut AppState, worker_pane: &str) {
 }
 
 /// Draw every card of `OBSERVING_DECK` that still has a session, through the
-/// real card grid. 80 columns keeps the grid at ONE column; the height leaves
-/// room for exactly Normal-density cards, so each card is a full box with its
+/// real card grid, deriving whole-deck facts from `state` the way the live
+/// deck does. 80 columns keeps the grid at ONE column; the height leaves room
+/// for exactly Normal-density cards, so each card is a full box with its
 /// status on the top border and its name on the first body row.
 fn render_observing_deck(state: &AppState) -> ratatui::buffer::Buffer {
     let cards: Vec<(&SessionState, Option<&str>)> = OBSERVING_DECK
         .iter()
-        .filter_map(|(pane_id, name)| {
-            state
-                .sessions
-                .get(&observing_session_id(pane_id))
+        .flat_map(|(pane_id, name)| {
+            observing_sessions_on(state, pane_id)
+                .into_iter()
                 .map(|session| (session, Some(*name)))
         })
         .collect();
     let height = 2 + CardDensityKind::Normal.rendered_height() * cards.len() as u16;
-    let (buffer, _) = render_card_grid_to_buffer(&cards, None, 0, 80, height);
+    let (buffer, _) = render_state_card_grid_to_buffer(state, &cards, None, 0, 80, height);
     buffer
+}
+
+/// The tab bar's tally for the deck: `active` agents, and how many of them
+/// count as `idle`.
+fn assert_observing_tally(state: &AppState, active: usize, idle: usize, why: &str) {
+    let stats = state.aggregate_stats();
+    assert_eq!(
+        (stats.active, stats.idle),
+        (active, idle),
+        "the tab bar must tally (active, idle) = ({active}, {idle}) — {why}"
+    );
 }
 
 /// Where one card sits in a single-column grid buffer.
@@ -5853,5 +5911,490 @@ fn observing_008_observing_orchestrator_card_uses_the_observing_colour() {
         row_needle_fg(&buffer, mid, "│"),
         dot_agent_deck::palette::STATUS_IDLE,
         "an orchestrator that issued no delegation keeps the plain idle border"
+    );
+}
+
+/// The card named `name` must carry the delegated worker's badge: its status
+/// followed by `(delegated)`, and never `Observing`.
+fn assert_card_delegated(buffer: &ratatui::buffer::Buffer, name: &str, why: &str) {
+    let card = drawn_card(buffer, name);
+    assert!(
+        card.title.contains("Idle (delegated)") && !card.title.contains("Observing"),
+        "{name}'s card must read \"Idle (delegated)\" — {why}; its status row was {:?}\n{}",
+        card.title.trim(),
+        buffer_to_text(buffer)
+    );
+}
+
+/// What the daemon's `ListAgents` reply says about one pane of the deck: the
+/// agent `agent_id` runs there, and `delegated_by` names the orchestrator pane
+/// whose delegation it still owes a `work-done` for, if any.
+fn observing_agent_record(
+    pane_id: &str,
+    agent_id: &str,
+    delegated_by: Option<&str>,
+) -> dot_agent_deck::agent_pty::AgentRecord {
+    dot_agent_deck::agent_pty::AgentRecord {
+        id: agent_id.to_string(),
+        pane_id_env: Some(pane_id.to_string()),
+        display_name: None,
+        cwd: Some("/home/dev/example-project".to_string()),
+        tab_membership: None,
+        agent_type: Some(AgentType::ClaudeCode),
+        rows: 24,
+        cols: 80,
+        live: None,
+        spawned_at_ms: None,
+        daemon_boot_id: None,
+        registration_generation: None,
+        cli_name: None,
+        crashed: None,
+        outstanding_delegation: delegated_by.map(|orchestrator_pane| {
+            dot_agent_deck::agent_pty::WatchSnapshot {
+                armed_secs_ago: 30,
+                orchestrator_pane_id: orchestrator_pane.to_string(),
+            }
+        }),
+        silence_watch: None,
+        delegation_commission: None,
+    }
+}
+
+/// The daemon's records for the three panes other than the coder, each run by
+/// the agent the deck already knows and none of them owing a `work-done`.
+fn observing_records_besides_coder() -> Vec<dot_agent_deck::agent_pty::AgentRecord> {
+    [LEAD_PANE, TESTER_PANE, BYSTANDER_PANE]
+        .into_iter()
+        .map(|pane_id| observing_agent_record(pane_id, &observing_agent_id(pane_id), None))
+        .collect()
+}
+
+/// Scenario: The lead orchestrator delegates to the coder, then the coder's
+/// agent is respawned (the default `clear = true` delegate): a `SessionStart`
+/// with a new agent id and a new session id arrives on the coder's pane and
+/// replaces its session. The lead must still read `Observing` and stay out of
+/// the idle tally, the coder's new card must still read `Idle (delegated)`,
+/// and only the delegation-retired notice returns both to plain `Idle`.
+#[spec("status/observing/011")]
+#[test]
+fn observing_011_delegation_survives_the_workers_session_being_replaced() {
+    let mut state = observing_deck_state();
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    assert_card_observing(
+        &render_observing_deck(&state),
+        "alpha-lead",
+        "precondition: its delegation to the coder is outstanding",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        2,
+        "precondition: the delegated coder and the observing lead are not idle",
+    );
+
+    state.apply_event(observing_hook_event(
+        EventType::SessionStart,
+        CODER_PANE,
+        "sess-respawned-coder",
+        "agent-respawned-coder",
+    ));
+    let coder_sessions = observing_sessions_on(&state, CODER_PANE);
+    assert_eq!(
+        coder_sessions
+            .iter()
+            .map(|session| session.agent_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("agent-respawned-coder")],
+        "precondition: the respawned agent's session replaced the coder's old one"
+    );
+
+    let buffer = render_observing_deck(&state);
+    assert_card_observing(
+        &buffer,
+        "alpha-lead",
+        "the coder's agent was respawned, but the delegation the lead issued to the coder's \
+         pane has not been answered",
+    );
+    assert_card_delegated(
+        &buffer,
+        "bravo-coder",
+        "the respawned agent on this pane still owes the lead a work-done",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        2,
+        "replacing the coder's session must not put the coder or the lead back in the idle \
+         tally while the delegation is outstanding",
+    );
+    assert_eq!(
+        state.sessions[&observing_session_id(LEAD_PANE)].status,
+        SessionStatus::Idle,
+        "issue #803 is display-only: the orchestrator's real status must stay Idle"
+    );
+
+    retire_delegation(&mut state, CODER_PANE);
+    let buffer = render_observing_deck(&state);
+    assert_card_plain_idle(&buffer, "alpha-lead", "its only delegation was retired");
+    assert_card_plain_idle(&buffer, "bravo-coder", "its delegation was retired");
+    assert_observing_tally(&state, 4, 4, "nothing is outstanding any more");
+}
+
+/// Scenario: The lead orchestrator delegates to the coder, then the coder's
+/// conversation ends (`SessionEnd`), leaving the pane a restored placeholder,
+/// and a fresh agent then announces itself on that pane. The lead must read
+/// `Observing` and stay out of the idle tally through both steps, the fresh
+/// agent's card must read `Idle (delegated)`, and the delegation-retired
+/// notice returns both to plain `Idle`.
+#[spec("status/observing/012")]
+#[test]
+fn observing_012_delegation_survives_the_workers_session_ending_and_being_restored() {
+    let mut state = observing_deck_state();
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    assert_card_observing(
+        &render_observing_deck(&state),
+        "alpha-lead",
+        "precondition: its delegation to the coder is outstanding",
+    );
+
+    state.apply_event(observing_hook_event(
+        EventType::SessionEnd,
+        CODER_PANE,
+        &observing_session_id(CODER_PANE),
+        &observing_agent_id(CODER_PANE),
+    ));
+    let restored = observing_sessions_on(&state, CODER_PANE);
+    assert_eq!(
+        restored
+            .iter()
+            .map(|session| session.agent_type.clone())
+            .collect::<Vec<_>>(),
+        vec![AgentType::None],
+        "precondition: the coder's session ended and its pane holds one restored placeholder"
+    );
+
+    assert_card_observing(
+        &render_observing_deck(&state),
+        "alpha-lead",
+        "the coder's conversation ended, but the delegation the lead issued to the coder's \
+         pane has not been answered",
+    );
+    assert_observing_tally(
+        &state,
+        3,
+        2,
+        "the placeholder is not an active agent, and the lead is observing, so only the \
+         tester and the bystander are idle",
+    );
+
+    state.apply_event(observing_hook_event(
+        EventType::SessionStart,
+        CODER_PANE,
+        "sess-restarted-coder",
+        "agent-restarted-coder",
+    ));
+    let buffer = render_observing_deck(&state);
+    assert_card_observing(
+        &buffer,
+        "alpha-lead",
+        "a fresh agent started on the coder's pane, and the delegation is still unanswered",
+    );
+    assert_card_delegated(
+        &buffer,
+        "bravo-coder",
+        "the fresh agent on this pane owes the lead a work-done",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        2,
+        "the coder is delegated and the lead is observing",
+    );
+
+    retire_delegation(&mut state, CODER_PANE);
+    let buffer = render_observing_deck(&state);
+    assert_card_plain_idle(&buffer, "alpha-lead", "its only delegation was retired");
+    assert_card_plain_idle(&buffer, "bravo-coder", "its delegation was retired");
+    assert_observing_tally(&state, 4, 4, "nothing is outstanding any more");
+}
+
+/// Scenario: The lead orchestrator reads `Observing` for a delegation to the
+/// coder whose retirement the deck missed during an outage. The reconnect
+/// resync then delivers the daemon's records, in which no pane owes a
+/// `work-done`: once with the coder's pane now run by an agent the deck has
+/// never seen, and once with no record for the coder's pane at all. Either
+/// way the lead must read plain `Idle` afterwards and count as idle again.
+#[spec("status/observing/013")]
+#[test]
+fn observing_013_resync_drops_delegations_the_daemon_no_longer_reports() {
+    // The daemon still reports the delegation: the resync must keep it.
+    let mut state = observing_deck_state();
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    let mut still_outstanding = observing_records_besides_coder();
+    still_outstanding.push(observing_agent_record(
+        CODER_PANE,
+        &observing_agent_id(CODER_PANE),
+        Some(LEAD_PANE),
+    ));
+    state.resync_hydrated_sessions(&still_outstanding);
+    assert_card_observing(
+        &render_observing_deck(&state),
+        "alpha-lead",
+        "precondition: the daemon's records still carry its delegation to the coder",
+    );
+
+    // (a) The coder's pane is now run by an agent this deck never saw start,
+    // and it owes nothing.
+    let mut respawned = observing_records_besides_coder();
+    respawned.push(observing_agent_record(
+        CODER_PANE,
+        "agent-respawned-during-outage",
+        None,
+    ));
+    state.resync_hydrated_sessions(&respawned);
+    let buffer = render_observing_deck(&state);
+    assert_card_plain_idle(
+        &buffer,
+        "alpha-lead",
+        "the daemon's records carry no outstanding delegation at all (the coder's pane is \
+         run by a respawned agent that owes nothing)",
+    );
+    assert_card_plain_idle(
+        &buffer,
+        "bravo-coder",
+        "the daemon reports no outstanding delegation on its pane",
+    );
+    assert_observing_tally(&state, 4, 4, "the daemon reports nothing outstanding");
+
+    // (b) The daemon has no record for the coder's pane at all.
+    let mut state = observing_deck_state();
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    assert_card_observing(
+        &render_observing_deck(&state),
+        "alpha-lead",
+        "precondition: its delegation to the coder is outstanding",
+    );
+    state.resync_hydrated_sessions(&observing_records_besides_coder());
+    assert_card_plain_idle(
+        &render_observing_deck(&state),
+        "alpha-lead",
+        "the daemon's records carry no outstanding delegation at all (and no record for the \
+         coder's pane)",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        4,
+        "the daemon reports nothing outstanding, so every agent is plain idle",
+    );
+}
+
+/// Scenario: The daemon announces the lead's delegation to the coder while the
+/// coder's pane has no session on the deck, then the reconnect resync delivers
+/// records in which the coder owes nothing, and only then does the coder's
+/// agent announce itself. The lead must read plain `Idle` and the coder's new
+/// card must read plain `Idle`: a delegation the daemon no longer reports must
+/// not resurface when the pane gets its card.
+#[spec("status/observing/014")]
+#[test]
+fn observing_014_resync_drops_a_delegation_on_a_pane_that_has_no_card() {
+    let mut state = observing_deck_state_without(&[CODER_PANE]);
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    assert!(
+        observing_sessions_on(&state, CODER_PANE).is_empty(),
+        "precondition: the coder's pane has no session when the resync runs"
+    );
+
+    let mut records = observing_records_besides_coder();
+    records.push(observing_agent_record(
+        CODER_PANE,
+        &observing_agent_id(CODER_PANE),
+        None,
+    ));
+    state.resync_hydrated_sessions(&records);
+    announce_observing_agent(&mut state, CODER_PANE);
+
+    let buffer = render_observing_deck(&state);
+    assert_card_plain_idle(
+        &buffer,
+        "alpha-lead",
+        "the daemon's records carried no outstanding delegation when the deck resynced",
+    );
+    assert_card_plain_idle(
+        &buffer,
+        "bravo-coder",
+        "the daemon reported no outstanding delegation on its pane",
+    );
+    assert_observing_tally(&state, 4, 4, "the daemon reports nothing outstanding");
+}
+
+/// Scenario: The daemon announces the lead's delegation to the coder before
+/// the coder's pane has any session on the deck, and the session appears
+/// afterwards: once as the agent's first hook event and once as a placeholder
+/// card. Either way the lead must read `Observing` and stay out of the idle
+/// tally, and the coder's card must read `Idle (delegated)`.
+#[spec("status/observing/015")]
+#[test]
+fn observing_015_delegation_armed_before_the_worker_has_a_session_is_kept() {
+    // (a) The coder's session is created by its agent's first hook event.
+    let mut state = observing_deck_state_without(&[CODER_PANE]);
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    announce_observing_agent(&mut state, CODER_PANE);
+
+    let buffer = render_observing_deck(&state);
+    assert_card_observing(
+        &buffer,
+        "alpha-lead",
+        "it delegated to the coder before the coder's agent had announced itself",
+    );
+    assert_card_delegated(
+        &buffer,
+        "bravo-coder",
+        "the delegation was armed on its pane before its first hook event",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        2,
+        "the coder is delegated and the lead is observing",
+    );
+
+    // (b) The coder's session is created as a placeholder card.
+    let mut state = observing_deck_state_without(&[CODER_PANE]);
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    state.insert_placeholder_session(
+        CODER_PANE.to_string(),
+        Some("/home/dev/example-project".to_string()),
+        Some(AgentType::ClaudeCode),
+        Some(observing_agent_id(CODER_PANE)),
+    );
+
+    let buffer = render_observing_deck(&state);
+    assert_card_observing(
+        &buffer,
+        "alpha-lead",
+        "it delegated to the coder before the coder's pane had a card",
+    );
+    assert_card_delegated(
+        &buffer,
+        "bravo-coder",
+        "the delegation was armed on its pane before its placeholder card was created",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        2,
+        "the coder is delegated and the lead is observing",
+    );
+
+    retire_delegation(&mut state, CODER_PANE);
+    assert_card_plain_idle(
+        &render_observing_deck(&state),
+        "alpha-lead",
+        "its only delegation was retired",
+    );
+}
+
+/// Scenario: The lead orchestrator has a delegation outstanding while its real
+/// status is `Unknown`, the value an older build decodes a status it does not
+/// recognise into. Its card must show what `Unknown` always shows (the neutral
+/// `Idle` label), never `Observing`, and the tab bar must keep tallying it the
+/// way it tallies any `Unknown` agent, as idle.
+#[spec("status/observing/016")]
+#[test]
+fn observing_016_unknown_status_is_never_relabelled_observing() {
+    let mut state = observing_deck_state();
+    state
+        .sessions
+        .get_mut(&observing_session_id(LEAD_PANE))
+        .expect("the lead orchestrator's session exists")
+        .status = SessionStatus::Unknown;
+    assert_card_plain_idle(
+        &render_observing_deck(&state),
+        "alpha-lead",
+        "precondition: with nothing delegated, Unknown draws the neutral idle label",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        4,
+        "precondition: with nothing delegated, an Unknown agent is tallied as idle",
+    );
+
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    let buffer = render_observing_deck(&state);
+
+    assert_card_plain_idle(
+        &buffer,
+        "alpha-lead",
+        "its real status is Unknown, which may be a newer status this build cannot decode, \
+         so an outstanding delegation must not relabel it",
+    );
+    assert_card_delegated(
+        &buffer,
+        "bravo-coder",
+        "the delegated worker's own badge does not depend on the orchestrator's status",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        3,
+        "an Unknown orchestrator is tallied exactly as any Unknown agent is (idle), whatever \
+         it delegated; only the delegated coder is left out",
+    );
+}
+
+/// Scenario: The coder owes the lead a `work-done` and has itself issued a
+/// delegation to the tester, so its pane is both a delegated worker and an
+/// issuer. Its card must read `Idle (delegated)`, never `Observing`, and the
+/// tab bar leaves it out of the idle tally as it does any delegated worker.
+/// Once the coder's own delegation is retired it is an issuer only and reads
+/// `Observing`.
+#[spec("status/observing/017")]
+#[test]
+fn observing_017_pane_that_owes_a_work_done_is_drawn_as_a_delegated_worker() {
+    let mut state = observing_deck_state();
+    arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
+    arm_delegation(&mut state, TESTER_PANE, CODER_PANE);
+
+    let buffer = render_observing_deck(&state);
+    assert_card_delegated(
+        &buffer,
+        "bravo-coder",
+        "it owes the lead a work-done, which outranks the delegation it issued to the tester",
+    );
+    assert_card_observing(
+        &buffer,
+        "alpha-lead",
+        "it issued a delegation and owes nothing itself",
+    );
+    assert_card_delegated(&buffer, "charlie-tester", "it owes the coder a work-done");
+    assert_card_plain_idle(
+        &buffer,
+        "delta-bystander",
+        "it neither issued nor received a delegation",
+    );
+    assert_observing_tally(
+        &state,
+        4,
+        1,
+        "the lead is observing and the coder and tester are delegated workers, so only the \
+         bystander is idle",
+    );
+
+    retire_delegation(&mut state, CODER_PANE);
+    let buffer = render_observing_deck(&state);
+    assert_card_observing(
+        &buffer,
+        "bravo-coder",
+        "it no longer owes a work-done and its delegation to the tester is outstanding",
+    );
+    assert_card_plain_idle(&buffer, "alpha-lead", "its only delegation was retired");
+    assert_observing_tally(
+        &state,
+        4,
+        2,
+        "the coder is observing and the tester is delegated, so the lead and the bystander \
+         are idle",
     );
 }
