@@ -1144,6 +1144,49 @@ pub struct SessionState {
     pub outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
 }
 
+/// Issue #803: the pane ids of every orchestrator that ISSUED a delegation
+/// still outstanding in `delegations` — the `orchestrator_pane_id` of each
+/// [`crate::agent_pty::WatchSnapshot`] a worker currently carries.
+///
+/// Takes the snapshots rather than sessions so the three surfaces that
+/// present an idle delegating orchestrator as `Observing` share one
+/// derivation over their own source: the card grid and
+/// [`AppState::aggregate_stats`] feed it
+/// [`SessionState::outstanding_delegation`], `daemon status` feeds it
+/// [`AgentRecord::outstanding_delegation`].
+///
+/// Display-only and deliberately never stored: callers recompute it from
+/// current state on every use, so a worker session that disappears with no
+/// `DelegationRetired` notice (a pane closed on this client) takes its
+/// delegation out of the set with it, rather than leaving the orchestrator
+/// stuck `Observing` on a cached answer.
+pub fn delegating_orchestrator_panes<'a>(
+    delegations: impl IntoIterator<Item = &'a crate::agent_pty::WatchSnapshot>,
+) -> HashSet<String> {
+    delegations
+        .into_iter()
+        .map(|delegation| delegation.orchestrator_pane_id.clone())
+        .collect()
+}
+
+/// Issue #803: whether a pane presents as `Observing` because it is idle
+/// while a delegation it issued is still outstanding. `delegating_panes` is
+/// [`delegating_orchestrator_panes`]'s result for the current state.
+///
+/// Only `Idle`/`Unknown` qualify — a real `Working`, `Thinking`,
+/// `WaitingForInput`, `Error` or `Compacting` always shows as itself. The
+/// pane's real [`SessionStatus`] is never changed by this, and it is
+/// independent of the monitored-wait state machine (`wait start`/`wait done`),
+/// which promotes the real status instead.
+pub fn observes_own_delegations(
+    status: &SessionStatus,
+    pane_id: Option<&str>,
+    delegating_panes: &HashSet<String>,
+) -> bool {
+    matches!(status, SessionStatus::Idle | SessionStatus::Unknown)
+        && pane_id.is_some_and(|pane_id| delegating_panes.contains(pane_id))
+}
+
 impl SessionState {
     /// PRD #162: build the wire [`SessionSnapshot`] from this live session.
     /// The snapshot's `agent_type` is the EVENT-DERIVED value, so a
@@ -7075,6 +7118,13 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
         let mut stats = DashboardStats::default();
+        // Issue #803: recomputed from the sessions on every call, never
+        // cached — see `delegating_orchestrator_panes`.
+        let delegating_panes = delegating_orchestrator_panes(
+            self.sessions
+                .values()
+                .filter_map(|session| session.outstanding_delegation.as_ref()),
+        );
         for session in self.sessions.values() {
             if session.agent_type == AgentType::None {
                 continue;
@@ -7090,17 +7140,27 @@ impl AppState {
             let idle_but_delegated =
                 matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown)
                     && session.outstanding_delegation.is_some();
+            // Issue #803: the same for the orchestrator on the other end of
+            // that delegation — idle while a delegation IT ISSUED is still
+            // outstanding, its card reads `Observing`, so counting it as
+            // idle here would contradict its own card the same way.
+            let idle_but_observing = observes_own_delegations(
+                &session.status,
+                session.pane_id.as_deref(),
+                &delegating_panes,
+            );
+            let counts_as_idle = !idle_but_delegated && !idle_but_observing;
             match session.status {
                 SessionStatus::Working => stats.working += 1,
                 SessionStatus::Thinking => stats.thinking += 1,
                 SessionStatus::WaitingForInput => stats.waiting += 1,
                 SessionStatus::Error => stats.errors += 1,
-                SessionStatus::Idle if !idle_but_delegated => stats.idle += 1,
+                SessionStatus::Idle if counts_as_idle => stats.idle += 1,
                 SessionStatus::Idle => {}
                 SessionStatus::Compacting => stats.compacting += 1,
                 // PRD #162 forward-compat: an unknown wire status is bucketed
                 // as idle so it never inflates an active-work tally.
-                SessionStatus::Unknown if !idle_but_delegated => stats.idle += 1,
+                SessionStatus::Unknown if counts_as_idle => stats.idle += 1,
                 SessionStatus::Unknown => {}
             }
             stats.total_tools += session.tool_count as u64;
@@ -19236,5 +19296,52 @@ clear = false
             "once the delegation is retired the orchestrator (and the worker) are genuinely \
              idle again and must be counted"
         );
+    }
+
+    /// Scenario: issue #803. `observes_own_delegations` holds only for an
+    /// `Idle`/`Unknown` pane named as the issuer of an outstanding
+    /// delegation: every other status, a pane that issued nothing, and a
+    /// session with no pane id are all refused, and an empty set of
+    /// delegations names no pane at all.
+    #[test]
+    fn observes_own_delegations_needs_idle_status_and_an_issued_delegation() {
+        let delegation = crate::agent_pty::WatchSnapshot {
+            armed_secs_ago: 3,
+            orchestrator_pane_id: "orch-pane".to_string(),
+        };
+        let delegating = delegating_orchestrator_panes([&delegation]);
+
+        for status in [SessionStatus::Idle, SessionStatus::Unknown] {
+            assert!(observes_own_delegations(
+                &status,
+                Some("orch-pane"),
+                &delegating
+            ));
+            assert!(!observes_own_delegations(
+                &status,
+                Some("other-orch-pane"),
+                &delegating
+            ));
+            assert!(!observes_own_delegations(&status, None, &delegating));
+        }
+        for status in [
+            SessionStatus::Working,
+            SessionStatus::Thinking,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Error,
+            SessionStatus::Compacting,
+        ] {
+            assert!(
+                !observes_own_delegations(&status, Some("orch-pane"), &delegating),
+                "a {status:?} pane must show its real status"
+            );
+        }
+
+        let none = delegating_orchestrator_panes(std::iter::empty());
+        assert!(!observes_own_delegations(
+            &SessionStatus::Idle,
+            Some("orch-pane"),
+            &none
+        ));
     }
 }

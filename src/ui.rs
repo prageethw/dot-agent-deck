@@ -40,7 +40,10 @@ use crate::prompt_delivery::{
     unconfirmed_retry_delay,
 };
 use crate::repo_identity;
-use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
+use crate::state::{
+    AppState, DashboardStats, SessionState, SessionStatus, SharedState,
+    delegating_orchestrator_panes, observes_own_delegations,
+};
 use crate::tab::{
     OrchestrationRoleStatus, OrchestrationStatus, SplitStage, Tab, TabId, TabManager,
     next_split_stage,
@@ -19240,6 +19243,7 @@ fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> 
 ///   there was the bug: an unpainted role is indistinguishable from a role that
 ///   failed to start, which sent two separate investigations after a hydration
 ///   defect that was not there.
+#[allow(clippy::too_many_arguments)]
 fn render_card_grid(
     frame: &mut Frame,
     area: Rect,
@@ -19248,6 +19252,12 @@ fn render_card_grid(
     session_ids: &[&String],
     total_sessions: usize,
     tick: u64,
+    // Issue #803: the panes that issued a delegation still outstanding
+    // somewhere on the deck (`delegating_orchestrator_panes`). Derived by the
+    // caller from EVERY session rather than from `sessions`, which is only
+    // the filtered slice being drawn — a filter that hides the worker must
+    // not change what its orchestrator's card reads.
+    delegating_panes: &HashSet<String>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -19442,6 +19452,11 @@ fn render_card_grid(
                 // Fork #339: one deck-global toggle read by every card, on
                 // every tab, including one opened after the toggle fired.
                 ui.show_agent_type_badge,
+                observes_own_delegations(
+                    &session.status,
+                    session.pane_id.as_deref(),
+                    delegating_panes,
+                ),
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -19801,6 +19816,14 @@ fn render_frame(
     }
 
     if draw_sidebar {
+        // Issue #803: recomputed from the live sessions on every frame, never
+        // cached — see `delegating_orchestrator_panes`.
+        let delegating_panes = delegating_orchestrator_panes(
+            state
+                .sessions
+                .values()
+                .filter_map(|session| session.outstanding_delegation.as_ref()),
+        );
         let stats_area = render_card_grid(
             frame,
             dashboard_area,
@@ -19809,6 +19832,7 @@ fn render_frame(
             &session_ids,
             total_sessions,
             tick,
+            &delegating_panes,
         );
         render_stats_bar(
             frame,
@@ -23931,6 +23955,11 @@ fn render_session_card(
     declared_agent_type: Option<&AgentType>,
     // Fork #339: deck-global toggle for the agent-type badge (`ui.show_agent_type_badge`).
     show_agent_type_badge: bool,
+    // Issue #803: this pane is idle while a delegation IT ISSUED is still
+    // outstanding on another pane (`observes_own_delegations`). Passed in
+    // because the answer depends on the other sessions on the deck, which a
+    // single card cannot see.
+    observing_own_delegations: bool,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -24014,6 +24043,15 @@ fn render_session_card(
             format!("{label} (delegated)"),
             style.fg(palette::STATUS_OBSERVING),
         )
+    } else if observing_own_delegations {
+        // Issue #803: the mirror image of the branch above, for the
+        // orchestrator that issued the delegation. It is idle only because
+        // it is waiting on a worker, so plain "Idle" misreads it as having
+        // nothing in flight. Display-only — `session.status` stays
+        // `Idle`/`Unknown` — and it reads the same bare word, in the same
+        // colour, as a `Working` held by a monitored wait below.
+        let (_label, style) = status_style(&session.status);
+        ("Observing".to_string(), style.fg(palette::STATUS_OBSERVING))
     } else if session.status == SessionStatus::Working
         && (session.wait_synthetic_working || session.wait_deferred_revert)
     {
@@ -24896,6 +24934,9 @@ pub fn render_card_with_declared_agent_to_buffer(
                 mode,
                 declared_agent_type,
                 show_agent_type_badge,
+                // Issue #803: one card has no other session to have
+                // delegated to.
+                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -24938,6 +24979,12 @@ pub fn render_dashboard_cards_to_buffer(
         .iter()
         .map(|(s, name)| (*s, name.map(str::to_string)))
         .collect();
+    // Issue #803: the cards handed in are this seam's whole deck.
+    let delegating_panes = delegating_orchestrator_panes(
+        cards
+            .iter()
+            .filter_map(|(session, _)| session.outstanding_delegation.as_ref()),
+    );
     terminal
         .draw(|frame| {
             let constraints: Vec<Constraint> = (0..owned.len())
@@ -24971,6 +25018,11 @@ pub fn render_dashboard_cards_to_buffer(
                     // doc) — hidden-by-default IS that baseline, so this
                     // stays hardcoded rather than gaining a parameter.
                     false,
+                    observes_own_delegations(
+                        &session.status,
+                        session.pane_id.as_deref(),
+                        &delegating_panes,
+                    ),
                 );
             }
         })
@@ -25038,6 +25090,14 @@ pub fn render_card_grid_to_buffer(
     }
     let sessions: Vec<&SessionState> = cards.iter().map(|(session, _)| *session).collect();
     let id_refs: Vec<&String> = ids.iter().collect();
+    // Issue #803: the cards handed in are this seam's whole deck, so the
+    // delegations they carry are what the live deck would derive from
+    // `state.sessions`.
+    let delegating_panes = delegating_orchestrator_panes(
+        sessions
+            .iter()
+            .filter_map(|session| session.outstanding_delegation.as_ref()),
+    );
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
@@ -25056,6 +25116,7 @@ pub fn render_card_grid_to_buffer(
                 &id_refs,
                 sessions.len(),
                 0,
+                &delegating_panes,
             );
         })
         .expect("TestBackend draw should succeed");
