@@ -34,8 +34,8 @@ use tempfile::TempDir;
 use tokio::sync::{RwLock, broadcast};
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DelegationRetirement, SilenceWatchRetirement,
-    SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DelegationRetirement, GuardedSend,
+    SilenceWatchRetirement, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
@@ -2335,5 +2335,493 @@ fn idle_worker_028_undelivered_delegation_produces_no_idle_prompt() {
              about that worker",
         )
         .await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Issue #805, fix round: a no-delivery exit removes exactly ONE delegation from
+// the worker pane's outstanding set — its own — and never more.
+//
+// The registry keeps one record per worker pane. A newer delegation REPLACES
+// the record and carries the older ones forward only as a count, so the newest
+// record and its one watch are all that stands for an earlier delegation the
+// worker is still busy with. Retiring that record whole because the NEWER task
+// pointer was refused silently drops the earlier, delivered delegation too.
+// ---------------------------------------------------------------------------
+
+/// The daemon-authored opening of the feedback a solicited, filed `work-done`
+/// writes into the orchestrator's pane. Spelled out here rather than imported
+/// so a silent rewording fails the test instead of following it.
+const WORK_DONE_FILED_NEEDLE: &str = "has completed their task";
+
+/// The task pointer a delegate to `role` writes into its worker's pane.
+fn delegate_pointer(harness: &IdleHarness, role: &str) -> String {
+    String::from_utf8(common::expected_delegate_pointer(
+        harness.cwd.path(),
+        role,
+        &worker_pane(role),
+    ))
+    .expect("delegate pointer is valid UTF-8")
+}
+
+/// Wait for a delegate's task pointer to be visible in `role`'s worker pane,
+/// and fail the calling test's precondition when it never lands.
+async fn assert_pointer_landed(harness: &IdleHarness, role: &str) {
+    let pointer = delegate_pointer(harness, role);
+    let worker_agent_id = harness.worker_agent_ids[role].clone();
+    let delivered = harness
+        .wait_for_snapshot_of(
+            &worker_agent_id,
+            |snapshot| snapshot.contains(&pointer),
+            common::load_scaled(Duration::from_secs(5)),
+        )
+        .await;
+    assert!(
+        delivered.contains(&pointer),
+        "precondition: the task pointer never landed in the worker's pane; snapshot = \
+         {delivered:?}"
+    );
+}
+
+/// Put `role`'s worker pane into the state in which the NEXT delegate's task
+/// pointer is refused with nothing written, while the worker itself stays
+/// alive and on its pane: the input box holds pointer bytes an unfinished
+/// delivery left there, and the user has typed since.
+///
+/// That is what an `Ambiguous` (partial) delivery followed by a keystroke
+/// leaves behind. A real PTY writer cannot be made to fail half-way, so the
+/// leftover bytes are written here through the same guarded send the delegate
+/// uses, and never settled; the keystroke is the registry's own user-input
+/// stamp. Every other refusal needs the worker's agent to be gone or replaced.
+async fn leave_unsent_pointer_and_a_user_draft(harness: &IdleHarness, role: &str) {
+    let pane_id = worker_pane(role);
+    let pointer = delegate_pointer(harness, role);
+    let worker_agent_id = harness.worker_agent_ids[role].clone();
+    let outcome = harness
+        .registry
+        .write_and_submit_guarded(&pane_id, &pointer, &worker_agent_id, || async { true })
+        .await;
+    assert!(
+        matches!(outcome, Ok(GuardedSend::Applied)),
+        "precondition: the leftover pointer bytes never reached the worker's pane; outcome = \
+         {outcome:?}"
+    );
+    // The refusal compares two instants and needs the keystroke to be the
+    // later one.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    harness.registry.note_user_input(&pane_id);
+    assert!(
+        harness
+            .registry
+            .user_typed_since_writing_payload(&pane_id, &pointer),
+        "precondition: the worker pane is not in the state that refuses a repeated task \
+         pointer, so the next delegate would be delivered rather than refused"
+    );
+}
+
+/// Wait until the commission ledger holds exactly `expected` entries for
+/// `worker_pane_id`, returning whether that happened within the budget.
+///
+/// `handle_delegate` arms a delegate's commission before it returns and every
+/// no-delivery exit releases exactly one. So polled after a delegate call has
+/// returned, a count back at what it was before that call means the dispatch
+/// has run to a no-delivery exit; a delivered delegate leaves the count up.
+async fn wait_for_outstanding_commissions(
+    harness: &IdleHarness,
+    worker_pane_id: &str,
+    expected: u32,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + common::load_scaled(Duration::from_secs(10));
+    loop {
+        let outstanding = harness
+            .registry
+            .delegation_watch_snapshot(worker_pane_id)
+            .delegation_commission
+            .map_or(0, |commission| commission.outstanding);
+        if outstanding == expected {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A project config whose only role is `role`, declared as a Pi agent behind a
+/// `cat` command and set to `clear = true`: the shape that takes the native
+/// seed delivery. A declared Pi launches its command bare (no wrapper, nothing
+/// materialized at spawn), so the replacement is an ordinary `cat`.
+fn config_with_pi_native_role(role: &str) -> String {
+    format!(
+        "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
+         [[orchestrations.roles]]\nname = \"{role}\"\n\
+         command = \"cat\"\nagent = \"pi\"\nclear = true\n"
+    )
+}
+
+/// Scenario: Delegate to a live worker and wait for the task pointer to land, then delegate to the same worker again while its input box holds unsent pointer bytes the user has typed after, so the second pointer is refused and nothing is written. The first delegation is still owed: the record must stay armed with no retirement broadcast, and the worker's later `work-done` must retire it, broadcast that, and reach the orchestrator.
+#[spec("scheduler/idle-worker/029")]
+#[test]
+fn idle_worker_029_refused_redelegation_leaves_the_delivered_delegation_armed() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("60000"));
+    const WORKER_ROLE: &str = "busy-worker";
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&[WORKER_ROLE], None).await;
+        forward_delegation_retirements(&harness);
+        let worker_pane_id = worker_pane(WORKER_ROLE);
+
+        // The earlier delegation: delivered, and never answered.
+        harness.delegate(&[WORKER_ROLE]).await;
+        assert_pointer_landed(&harness, WORKER_ROLE).await;
+        assert!(
+            wait_for_outstanding_commissions(&harness, &worker_pane_id, 1).await,
+            "precondition: the delivered delegation must leave exactly one commission owed; \
+             watches = {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+
+        leave_unsent_pointer_and_a_user_draft(&harness, WORKER_ROLE).await;
+        let mut broadcasts = harness.event_tx.subscribe();
+
+        // The newer delegation: armed, then refused with nothing written.
+        harness.delegate(&[WORKER_ROLE]).await;
+        assert!(
+            wait_for_outstanding_commissions(&harness, &worker_pane_id, 1).await,
+            "precondition: the second delegate never reached a no-delivery exit (its commission \
+             was not released), so its task pointer was delivered rather than refused; watches = \
+             {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+
+        // A negative window, spent in full: whatever the exit does to the
+        // record it does in the same task as the commission release just seen.
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            Duration::from_millis(750),
+            false,
+        )
+        .await;
+        assert!(
+            seen.armed > 0,
+            "precondition: the second delegation must have been announced as armed; broadcasts = \
+             {seen:?}"
+        );
+        assert_eq!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&worker_pane_id)
+                .outstanding_delegation
+                .map(|armed| armed.orchestrator_pane_id),
+            Some(ORCH_PANE.to_string()),
+            "a refused re-delegation retired the worker pane's whole outstanding-delegation \
+             record, and with it the earlier delegation that WAS delivered and is still \
+             unanswered; a no-delivery exit may remove only its own delegation. broadcasts = \
+             {seen:?}"
+        );
+        assert_eq!(
+            seen.retired, 0,
+            "a refused re-delegation was announced as a retirement while the worker still owes \
+             the earlier, delivered delegation, so an attached deck stops showing the worker as \
+             delegated and the orchestrator as Observing; broadcasts = {seen:?}"
+        );
+
+        harness.work_done(WORKER_ROLE).await;
+
+        assert!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&worker_pane_id)
+                .outstanding_delegation
+                .is_none(),
+            "the refused delegation no longer counts, so the worker's one work-done answers the \
+             only delegation left and must retire the record; watches = {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            common::load_scaled(Duration::from_secs(3)),
+            true,
+        )
+        .await;
+        assert!(
+            seen.retired > 0,
+            "the work-done that answers the earlier delegation must be announced as a \
+             retirement; broadcasts = {seen:?}"
+        );
+        let orchestrator = harness
+            .wait_for_snapshot(
+                |snapshot| snapshot.contains(WORK_DONE_FILED_NEEDLE),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            orchestrator.contains(WORK_DONE_FILED_NEEDLE),
+            "the earlier delegation's work-done never reached the orchestrator as a \
+             commissioned completion; snapshot = {orchestrator:?}"
+        );
+    });
+}
+
+/// Scenario: With a short timeout, delegate to a live worker and wait for the task pointer to land, then delegate to the same worker again in a state that refuses the second pointer with nothing written. The worker then stays silent, and the orchestrator must still receive the idle prompt about it, because the first delegation was delivered and never answered.
+#[spec("scheduler/idle-worker/030")]
+#[test]
+fn idle_worker_030_refused_redelegation_keeps_the_idle_watch_on_the_delivered_delegation() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("3000"));
+    let timeout = Duration::from_millis(3000);
+    const WORKER_ROLE: &str = "silent-busy-worker";
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&[WORKER_ROLE], None).await;
+        let worker_pane_id = worker_pane(WORKER_ROLE);
+
+        harness.delegate(&[WORKER_ROLE]).await;
+        assert_pointer_landed(&harness, WORKER_ROLE).await;
+        leave_unsent_pointer_and_a_user_draft(&harness, WORKER_ROLE).await;
+
+        let before = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+        assert!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&worker_pane_id)
+                .outstanding_delegation
+                .is_some()
+                && !idle_mentions_role(&before, WORKER_ROLE),
+            "precondition: the first delegation's own timeout ran out before the second \
+             delegate could be issued, so there is no earlier delegation left to protect; \
+             snapshot = {before:?}"
+        );
+        harness.delegate(&[WORKER_ROLE]).await;
+        assert!(
+            wait_for_outstanding_commissions(&harness, &worker_pane_id, 1).await,
+            "precondition: the second delegate never reached a no-delivery exit (its commission \
+             was not released), so its task pointer was delivered rather than refused; watches = \
+             {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+        let after_refusal = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+        assert!(
+            !idle_mentions_role(&after_refusal, WORKER_ROLE),
+            "precondition: an idle prompt was already in the orchestrator's pane when the second \
+             delegate was refused, so it came from the first delegation's watch running out \
+             early and proves nothing about what the refusal left armed; snapshot = \
+             {after_refusal:?}"
+        );
+
+        let observed = harness
+            .wait_for_idle_role(
+                WORKER_ROLE,
+                timeout + common::load_scaled(Duration::from_secs(4)),
+            )
+            .await;
+        assert!(
+            idle_mentions_role(&observed, WORKER_ROLE),
+            "a refused re-delegation took the worker pane's only idle watch with it, so a worker \
+             that received the earlier delegation and then went silent was never reported to \
+             the orchestrator; snapshot = {observed:?}"
+        );
+        assert_eq!(
+            idle_count(&observed),
+            1,
+            "one silent worker is reported once; snapshot = {observed:?}"
+        );
+    });
+}
+
+/// Scenario: Hold the worker pane's dispatch lock so a delegate that is going to be refused is armed but cannot run, arm a NEWER delegation and its commission on the same worker pane, then release the lock and let the older delegate be refused with nothing written. The older delegation no longer counts, so the worker's first `work-done` answers the newer one: the record must be retired and that retirement broadcast.
+#[spec("scheduler/idle-worker/031")]
+#[test]
+fn idle_worker_031_work_done_after_an_overtaken_refused_delegate_retires_the_newer_delegation() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("60000"));
+    const WORKER_ROLE: &str = "overtaken-worker";
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&[WORKER_ROLE], None).await;
+        forward_delegation_retirements(&harness);
+        let worker_pane_id = worker_pane(WORKER_ROLE);
+        leave_unsent_pointer_and_a_user_draft(&harness, WORKER_ROLE).await;
+        let mut broadcasts = harness.event_tx.subscribe();
+
+        // Every dispatch on a pane serializes on this lock, so holding it
+        // keeps the older delegate parked at its first statement while the
+        // newer delegation is armed: the ordering is fixed by construction.
+        let dispatch_lock = harness.registry.pane_dispatch_lock(&worker_pane_id);
+        let parked = dispatch_lock.lock().await;
+        harness.delegate(&[WORKER_ROLE]).await;
+        assert!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&worker_pane_id)
+                .outstanding_delegation
+                .is_some(),
+            "precondition: the older delegate must have armed its delegation"
+        );
+        // What `handle_delegate`'s fan-out does for the next delegate to this
+        // pane. Held so the newer delegation's cancellation channel stays open.
+        let _newer = harness
+            .registry
+            .arm_outstanding_delegation(
+                &worker_pane_id,
+                WORKER_ROLE,
+                ORCH_PANE,
+                &harness.orchestrator_agent_id,
+                Some(&OrchestrationIdentity::Instance {
+                    id: ORCHESTRATION_INSTANCE.to_string(),
+                    name: ORCHESTRATION.to_string(),
+                }),
+            )
+            .expect("precondition: neither pane is closing, so the newer delegation must arm");
+        assert!(
+            harness
+                .registry
+                .arm_delegation_commission(&worker_pane_id, ORCH_PANE, None),
+            "precondition: neither pane is closing, so the newer commission must arm"
+        );
+        drop(parked);
+
+        assert!(
+            wait_for_outstanding_commissions(&harness, &worker_pane_id, 1).await,
+            "precondition: the older delegate never reached a no-delivery exit (its commission \
+             was not released); watches = {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            Duration::from_millis(750),
+            false,
+        )
+        .await;
+        assert!(
+            seen.retired == 0
+                && harness
+                    .registry
+                    .delegation_watch_snapshot(&worker_pane_id)
+                    .outstanding_delegation
+                    .is_some(),
+            "precondition: the older delegate's exit must leave the newer delegation armed and \
+             unannounced (`orchestration/delegate/051`); broadcasts = {seen:?}, watches = {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+
+        harness.work_done(WORKER_ROLE).await;
+
+        assert!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&worker_pane_id)
+                .outstanding_delegation
+                .is_none(),
+            "the older delegate never reached the worker, but the newer delegation still counts \
+             it as owed: the worker's first work-done was credited to the delegation that was \
+             never delivered, and the one it answers stays armed until the idle-worker timeout; \
+             watches = {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            common::load_scaled(Duration::from_secs(3)),
+            true,
+        )
+        .await;
+        assert!(
+            seen.retired > 0,
+            "the work-done that answers the newer delegation must be announced as a retirement; \
+             broadcasts = {seen:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to a `clear = true` role declared as a Pi agent, so the dispatch respawns the worker, stashes the task pointer as the replacement's seed and returns without writing into the pane. Once the replacement has pulled that seed the task counts as delivered: the delegation must stay armed, its commission owed, and no retirement broadcast.
+#[spec("scheduler/idle-worker/032")]
+#[test]
+fn idle_worker_032_native_seed_delivery_keeps_the_delegation_armed() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("60000"));
+    const WORKER_ROLE: &str = "pi-worker";
+    runtime().block_on(async {
+        let harness = IdleHarness::new(
+            &[WORKER_ROLE],
+            Some(&config_with_pi_native_role(WORKER_ROLE)),
+        )
+        .await;
+        forward_delegation_retirements(&harness);
+        let worker_pane_id = worker_pane(WORKER_ROLE);
+        let original_agent_id = harness.worker_agent_ids[WORKER_ROLE].clone();
+        let pointer = delegate_pointer(&harness, WORKER_ROLE);
+        let mut broadcasts = harness.event_tx.subscribe();
+
+        harness.delegate(&[WORKER_ROLE]).await;
+
+        // The native pull, as the Pi extension makes it on `session_start`. A
+        // seed to pull is what tells this exit apart from every other one: no
+        // other path through the dispatch stashes the pointer instead of
+        // writing it.
+        let deadline = tokio::time::Instant::now() + common::load_scaled(Duration::from_secs(10));
+        let pulled = loop {
+            let replacement = harness
+                .registry
+                .pane_current_agent_id(&worker_pane_id)
+                .filter(|agent_id| *agent_id != original_agent_id);
+            if let Some(replacement) = replacement
+                && let Some(seed) = harness
+                    .registry
+                    .take_pending_seed_native_for(&worker_pane_id, Some(&replacement))
+            {
+                break Some(seed);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            pulled.as_deref(),
+            Some(pointer.as_str()),
+            "precondition: the delegate must respawn the worker and stash the task pointer as \
+             the replacement's seed, or this test is not on the native seed delivery exit"
+        );
+
+        // A negative window, spent in full: the dispatch returns within a few
+        // statements of the stash just observed.
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            Duration::from_millis(750),
+            false,
+        )
+        .await;
+        assert!(
+            seen.armed > 0,
+            "precondition: the delegation must have been announced as armed; broadcasts = {seen:?}"
+        );
+        assert_eq!(
+            seen.retired, 0,
+            "a delegation delivered as a native seed was announced as retired before the worker \
+             reported; broadcasts = {seen:?}"
+        );
+        let watches = harness.registry.delegation_watch_snapshot(&worker_pane_id);
+        assert_eq!(
+            watches
+                .outstanding_delegation
+                .as_ref()
+                .map(|armed| armed.orchestrator_pane_id.as_str()),
+            Some(ORCH_PANE),
+            "a delegation delivered as a native seed must stay armed until the worker reports \
+             work-done; watches = {watches:?}"
+        );
+        assert_eq!(
+            watches
+                .delegation_commission
+                .as_ref()
+                .map(|commission| commission.outstanding),
+            Some(1),
+            "a delegation delivered as a native seed is still owed a completion; watches = \
+             {watches:?}"
+        );
     });
 }
