@@ -20,7 +20,7 @@ Each session card shows the agent's current state:
 
 A card can also show **Observing**, in a distinct color from ordinary `Working`: the session is `Working` because a monitored external wait (`dot-agent-deck wait start`) is holding it there, not because the agent itself is doing something — the agent may be idle underneath while something else it's waiting on (CI, a delegated worker, an approval) resolves.
 
-An orchestrator's card shows **Observing** automatically, with nothing for the agent to run, while it is `Idle` and at least one delegation it issued has not yet been answered with `work-done`. It returns to `Idle` when the last of those delegations is retired. This is a label only: the session's underlying status is still `Idle`, so any other status (a pending prompt, an error, real activity) shows as itself.
+An orchestrator's card shows **Observing** automatically, with nothing for the agent to run, while it is `Idle` and at least one delegation it issued has not yet been answered with `work-done`. It returns to `Idle` when the last of those delegations is retired. This is a label only: the session's underlying status is still `Idle`, so any other status (a pending prompt, an error, real activity) shows as itself. It also means an orchestrator that has delegated work and then stopped to ask you something in plain text reads **Observing**, not **Idle**, until its workers report back — `bell.on_idle` still rings for it.
 
 Cards also display:
 

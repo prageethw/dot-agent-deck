@@ -195,7 +195,7 @@ The columns are tab-separated, so pipe the output through `column -t -s $'\t'` i
 | `PANE` | The pane id, the same value a managed agent sees as `DOT_AGENT_DECK_PANE_ID`. |
 | `AGENT` | The daemon's own id for the agent. |
 | `ROLE` | `mode:<name>` for a pane launched into a [mode](configuration.md), the role name for an [orchestration](orchestration.md) pane (suffixed `(orchestrator)` for the start role), `-` for a plain dashboard pane. |
-| `STATUS` | The live status: one of `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error`. A `Working` currently held up by a monitored external wait (`dot-agent-deck wait start`) rather than real agent activity shows as `Observing`. So does an `Idle` orchestrator with at least one delegation it issued still outstanding; in `--json` that row keeps `"status": "Idle"` and reports `"wait_observing": true`. |
+| `STATUS` | The live status: one of `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error`. A `Working` currently held up by a monitored external wait (`dot-agent-deck wait start`) rather than real agent activity shows as `Observing`. So does an `Idle` orchestrator with at least one delegation it issued still outstanding; in `--json` that row keeps `"status": "Idle"`, leaves `wait_observing` as `false`, and reports `"observing_delegations": true`. |
 | `TOOL` | The name of the tool the agent is running right now — the name only, never its arguments. |
 | `LABEL` | The pane's display name. |
 | `CWD` | The directory the agent was launched in. |
@@ -222,7 +222,8 @@ dot-agent-deck daemon status --json
       "role": "mode:review",
       "status": "Thinking",
       "shell_synthetic_working": false,
-      "wait_observing": false
+      "wait_observing": false,
+      "observing_delegations": false
     },
     {
       "agent_id": "2",
@@ -232,6 +233,7 @@ dot-agent-deck daemon status --json
       "status": "Working",
       "shell_synthetic_working": false,
       "wait_observing": false,
+      "observing_delegations": false,
       "active_tool": { "name": "Bash" }
     },
     {
@@ -243,6 +245,7 @@ dot-agent-deck daemon status --json
       "status": "Idle",
       "shell_synthetic_working": false,
       "wait_observing": false,
+      "observing_delegations": false,
       "outstanding_delegation": { "armed_secs_ago": 42, "orchestrator_pane_id": "1" },
       "silence_watch": { "armed_secs_ago": 42, "orchestrator_pane_id": "1" },
       "delegation_commission": {
