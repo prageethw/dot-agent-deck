@@ -3505,7 +3505,10 @@ pub struct AgentPtyRegistry {
     /// broadcast through directly — the idle-watch timeout take, a deliberate
     /// pane close (`begin_pane_close`/`finish_pane_close`), and the
     /// agent-exit sweep (`sweep_delegations_on_exit`, driven from
-    /// `pump_reader`, a raw OS thread with no async context at all). Mirrors
+    /// `pump_reader`, a raw OS thread with no async context at all). Issue
+    /// #805 added a fourth user, the delegate dispatch path's no-delivery
+    /// exits, which reach it through the same seq-conditional take as the
+    /// idle-watch timeout. Mirrors
     /// [`DeliveryNoticeSink`] for the identical reason: publishing needs the
     /// daemon's broadcast channel, which the registry does not own. `None`
     /// for a registry with no owning daemon (every in-process unit test),
@@ -5071,9 +5074,15 @@ impl AgentPtyRegistry {
     /// paths with no `event_tx` in scope — a genuine removal fires
     /// [`Self::fire_delegation_retired`] so an already-attached client's
     /// stale `Some(..)` is cleared instead of suppressing that pane's idle
-    /// bell for the rest of the session. Every OTHER caller of this method is
-    /// a test asserting on registry state directly, where firing is a silent
-    /// no-op (no sink installed).
+    /// bell for the rest of the session.
+    ///
+    /// Issue #805: the delegate dispatch path is the second production caller
+    /// (`retire_undelivered_delegation` in `src/state.rs`), retiring a
+    /// delegation whose task pointer never reached the worker. It announces
+    /// through the same sink rather than its own `event_tx`, so the take and
+    /// its announcement stay one operation. Every OTHER caller of this method
+    /// is a test asserting on registry state directly, where firing is a
+    /// silent no-op unless the test installed a sink.
     pub fn take_outstanding_delegation_if(
         &self,
         worker_pane_id: &str,
