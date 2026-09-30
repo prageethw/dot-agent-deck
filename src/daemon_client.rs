@@ -26,6 +26,7 @@ use crate::platform::ipc::{
 use crate::platform::transport::{AttachTransport, TransportReadHalf, TransportWriteHalf};
 use crate::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath, SshUser};
 
+use crate::agent_pty::OutstandingDelegationEntry;
 pub use crate::agent_pty::{
     AgentRecord, TabMembership, validate_orchestration_surface, validate_tab_membership,
 };
@@ -1276,25 +1277,21 @@ impl DaemonClient {
     /// property of any record and so has nowhere to go in a `Vec<AgentRecord>`.
     /// Split rather than widened because `list_agents` has twenty-odd callers
     /// that want exactly the list, and only the desktop's snapshot path wants
-    /// the rest. Both go down one code path, so the sanitisation and the
-    /// older-daemon fallback below cannot differ between them.
+    /// the rest. Both go down one code path ([`Self::list_agents_full`]), so
+    /// the sanitisation and the older-daemon fallback there cannot differ
+    /// between them.
     pub async fn list_agents_detailed(&self) -> Result<AgentListing, ClientError> {
         Ok(self.list_agents_full().await?.0)
     }
 
     /// [`Self::list_agents_detailed`] plus issue #817's daemon-wide outstanding
-    /// delegations (empty from a daemon that predates the field). Kept off
+    /// delegations (empty from a daemon that predates the field, one that holds
+    /// none, or one whose list this build could not parse). Kept off
     /// [`AgentListing`] so its other constructors are untouched; only
     /// `daemon status` wants the list.
     pub async fn list_agents_full(
         &self,
-    ) -> Result<
-        (
-            AgentListing,
-            Vec<crate::agent_pty::OutstandingDelegationEntry>,
-        ),
-        ClientError,
-    > {
+    ) -> Result<(AgentListing, Vec<OutstandingDelegationEntry>), ClientError> {
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents).await?;
         if !resp.ok {

@@ -2782,7 +2782,7 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
     };
 
     let client = DaemonClient::new(attach_socket_path());
-    let records =
+    let (records, delegations) =
         match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents_full()).await {
             Ok(Ok((listing, delegations))) => (listing.records, delegations),
             Ok(Err(e)) => {
@@ -2798,7 +2798,6 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
             }
         };
 
-    let (records, delegations) = records;
     let agents = build_status_agents_with_delegations(records, &delegations);
     if json {
         match serde_json::to_string(&StatusDocument::new(agents)) {

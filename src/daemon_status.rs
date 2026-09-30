@@ -183,6 +183,7 @@ fn role_of(tab_membership: &Option<TabMembership>) -> Option<String> {
 
 /// Reduce the daemon's `ListAgents` reply to the CLI's own status shape.
 /// Pure — no I/O — so it's unit-testable independent of a live daemon.
+#[cfg(test)]
 pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
     build_status_agents_with_delegations(records, &[])
 }

@@ -3626,6 +3626,10 @@ pub struct WatchSnapshot {
 /// worker pane it was issued to. Rides the `ListAgents` reply
 /// ([`crate::daemon_protocol::AttachResponse::outstanding_delegations`]) so a
 /// client can see a delegation whose worker pane has no live agent record.
+///
+/// `watch` is flattened onto the entry, so [`WatchSnapshot`] must never gain a
+/// field named `worker_pane_id` (it would collide on the wire). The flat shape
+/// is pinned by a literal-JSON test in `daemon_protocol`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutstandingDelegationEntry {
     pub worker_pane_id: String,

@@ -1509,6 +1509,25 @@ impl RunningAgentsSummary {
     }
 }
 
+/// Issue #817: decode [`AttachResponse::outstanding_delegations`] without
+/// letting a malformed value fail the enclosing reply. Anything that does not
+/// parse as the expected list is logged at `warn` and read as `None`.
+fn lenient_outstanding_delegations<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<crate::agent_pty::OutstandingDelegationEntry>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match serde_json::from_value(v) {
+        Ok(list) => Some(list),
+        Err(e) => {
+            warn!("list-agents: ignoring malformed outstanding_delegations from daemon: {e}");
+            None
+        }
+    }))
+}
+
 /// Discriminated by the populated optional fields rather than a tag, since
 /// each request type has a fixed shape and clients can decide what to read
 /// based on which request they sent.
@@ -1717,7 +1736,18 @@ pub struct AttachResponse {
     /// the key and the client falls back to the per-record join alone; an older
     /// client ignores the extra key. So no [`PROTOCOL_VERSION`] bump. Absent
     /// when the daemon holds none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// **Decoded leniently** ([`lenient_outstanding_delegations`]): every
+    /// `ListAgents` consumer decodes this reply, so a malformed list must not
+    /// make the whole reply unparseable for all of them. A list this build
+    /// cannot parse becomes `None` (with a `warn!`), i.e. today's per-record
+    /// behaviour, at the cost of `daemon status` possibly reading `Idle` for an
+    /// orchestrator whose delegation sits in the dropped list.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_outstanding_delegations"
+    )]
     pub outstanding_delegations: Option<Vec<crate::agent_pty::OutstandingDelegationEntry>>,
     /// PRD #365 M2: the daemon-minted `pane_id` for a `StartAgent` spawn.
     /// The daemon, not the client, is now authoritative for this value —
@@ -6849,6 +6879,44 @@ mod tests {
 
     /// Issue #817: `AttachResponse.outstanding_delegations` is additive and
     /// optional in both directions, so it costs no `PROTOCOL_VERSION` bump.
+    #[test]
+    fn outstanding_delegations_wire_shape_is_flat_and_tolerant() {
+        // Unknown key inside an entry is ignored (forward compatibility).
+        let resp: AttachResponse = serde_json::from_str(
+            r#"{"ok":true,"outstanding_delegations":[{"worker_pane_id":"w","orchestrator_pane_id":"o","armed_secs_ago":3,"future_key":1}]}"#,
+        )
+        .unwrap();
+        let entry = &resp.outstanding_delegations.unwrap()[0];
+        assert_eq!(entry.worker_pane_id, "w");
+        assert_eq!(entry.watch.orchestrator_pane_id, "o");
+        assert_eq!(entry.watch.armed_secs_ago, 3);
+
+        // Serialised entry is flat: no nested `watch` object.
+        let v = serde_json::to_value(entry).unwrap();
+        assert_eq!(v["worker_pane_id"], "w");
+        assert_eq!(v["orchestrator_pane_id"], "o");
+        assert_eq!(v["armed_secs_ago"], 3);
+        assert!(v.get("watch").is_none());
+    }
+
+    /// Issue #817: a malformed `outstanding_delegations` must not fail the
+    /// whole reply; it decodes to `None` with the rest intact.
+    #[test]
+    fn malformed_outstanding_delegations_decodes_to_none_with_reply_intact() {
+        for bad in [
+            r#""nope""#,
+            r#"{"a":1}"#,
+            r#"[{"orchestrator_pane_id":"o","armed_secs_ago":1}]"#,
+            r#"null"#,
+        ] {
+            let json = format!(r#"{{"ok":true,"agents":["1"],"outstanding_delegations":{bad}}}"#);
+            let resp: AttachResponse = serde_json::from_str(&json).unwrap();
+            assert!(resp.ok, "{bad}");
+            assert_eq!(resp.agents, Some(vec!["1".to_string()]), "{bad}");
+            assert!(resp.outstanding_delegations.is_none(), "{bad}");
+        }
+    }
+
     #[test]
     fn outstanding_delegations_is_additive_and_optional_in_both_directions() {
         use crate::agent_pty::{OutstandingDelegationEntry, WatchSnapshot};
