@@ -6411,18 +6411,25 @@ without depending on the config struct API.
 - **Does not assert:** the separate literal-token-vs-basename gap in `AgentType::from_command_including_devbox` (unit-pinned in `src/event.rs`'s `from_command_including_devbox_recognizes_devbox_run`) — this test deliberately stages the bare `devbox` token so PATH resolution finds the fake script while the parsed command text is unaffected by that gap; a devbox-wrapped MODE-tab or role-wiring restore path (separate call sites in `run_tui`); real devbox behaviour.
 - **Platform coverage:** mac+linux.
 
-##### session/restore/025 — A daemon-empty orchestration restore leaves keyboard focus on the START role's pane when the start role is the first-created role (issue #824).
+##### session/restore/025 — A daemon-empty orchestration restore focuses the START role's pane, and typed input reaches only it, when the start role is declared first (issue #824).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (six role panes each run a stdin-recording shell script that self-posts `SessionStart`; no LLM tokens).
-- **Asserts:** with a six-role orchestration snapshot whose `start_role_index` is 0, after the saved prompt has been replayed to the start role (proving the tab is rebuilt), the focused embedded terminal pane (its header `┌<role>─`, distinct from the numbered deck cards) is the START role's, not whichever pane the pane map yields first.
-- **Does not assert:** that typed keystrokes reach the pane (the deck reads "Pane locked" after this restore, which is a separate behaviour); the focus border styling; the case where the start role is created last (`session/restore/026`); warm-daemon hydration focus; the issue #949 remembered-pane path (`session/restore/016`/`019`).
+- **Asserts:** with a six-role orchestration snapshot whose `start_role_index` is 0 (config `start` flag also on role 0), after the saved prompt has been replayed to the start role (proving the tab is rebuilt), the focused embedded terminal pane (its header `┌<role>─`, distinct from the numbered deck cards) is the START role's, and a unique line typed afterwards is recorded by the start role's recorder and by no other role's.
+- **Does not assert:** the focus border styling; the last-declared and middle/disagreeing cases (`session/restore/026`/`027`); warm-daemon hydration focus; the issue #949 remembered-pane path (`session/restore/016`/`019`). Note the start role is always SPAWNED last (`open_orchestration_tab`), so "declared" position, not creation order, is what these cases vary.
 - **Platform coverage:** mac+linux.
 
-##### session/restore/026 — A daemon-empty orchestration restore leaves keyboard focus on the START role's pane when the start role is the last-created role (issue #824).
+##### session/restore/026 — A daemon-empty orchestration restore focuses the START role's pane, and typed input reaches only it, when the start role is declared last (issue #824).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (six role panes each run a stdin-recording shell script that self-posts `SessionStart`; no LLM tokens).
-- **Asserts:** same as `session/restore/025` but with `start_role_index` 5 (the last of six roles): the focused terminal pane after the restore is the start role's, so focus follows the start role and is not simply the first-created pane.
-- **Does not assert:** the focus border styling; the start-first case (`session/restore/025`); warm-daemon hydration focus.
+- **Asserts:** same as `session/restore/025` but with the config flag and `start_role_index` both 5 (the last of six roles): focused pane and typed-line recipient are both the start role.
+- **Does not assert:** the focus border styling; the first-declared and middle/disagreeing cases (`session/restore/025`/`027`); warm-daemon hydration focus.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/027 — A daemon-empty orchestration restore focuses the role at the SAVED `start_role_index` even when it is a middle role and the config's `start` flag names a different role (issue #824).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (six role panes each run a stdin-recording shell script that self-posts `SessionStart`; no LLM tokens).
+- **Asserts:** with the config `start = true` on role 0 but a saved `start_role_index` of 3 (`tester`), the focused terminal pane and the recipient of a typed line are both `tester`, so only "focus the pane at the saved start index" passes; focusing the first pane, the last pane, or the config-flag role fails.
+- **Does not assert:** the focus border styling; warm-daemon hydration focus.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)

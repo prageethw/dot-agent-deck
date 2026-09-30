@@ -4961,6 +4961,17 @@ mod tests {
              daemon-minted id parses to 0 in the sort key, so the order is the pane \
              HashMap's arbitrary iteration order, different run to run (issue #824)"
         );
+
+        let listed: Vec<String> = controller
+            .list_panes()
+            .expect("list_panes")
+            .into_iter()
+            .map(|p| p.pane_id)
+            .collect();
+        assert_eq!(
+            listed, created,
+            "list_panes() must also be in creation order"
+        );
     }
 
     /// The shared constructor is the whole point of the fix: one definition of

@@ -16439,8 +16439,9 @@ pub fn run_tui(
         let landing_tab = first_restored_orch_tab.unwrap_or(preferred_start_tab);
         tab_manager.switch_to(landing_tab);
 
-        // Focus the first restored pane and enter PaneInput mode so the user
-        // can type immediately. PRD #84 M4: PTY sizing is handled by the
+        // Focus the start role's pane on the daemon-empty orchestration
+        // rebuild path (the first pane otherwise) and enter PaneInput mode so
+        // the user can type immediately. PRD #84 M4: PTY sizing is handled by the
         // per-frame `resize_panes_to_layout` on the first loop iteration — no
         // startup resize sweep here.
         if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
