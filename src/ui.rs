@@ -18959,7 +18959,11 @@ fn stacked_expanded_index(pane_ids: &[String], focused_id: Option<&str>) -> Opti
 /// exactly how `render_terminal_panes` lays panes out for the given
 /// `PaneLayout` and resolved focus. Single source of truth so the layout pass
 /// (which drives PTY resize) and the renderer can't disagree on a pane's rect.
-/// `Tiled`: equal vertical division. `Stacked` (PRD #311): the expanded slot
+/// `Tiled`: integer division of the column height `H` across `n` panes —
+/// heights sum to `H`, differ by at most one row, and the leftover `H % n` rows
+/// go to the FIRST panes (`h[i] = H / n + (i < H % n)`); the cassowary `Ratio`
+/// solver instead rounded cumulative boundaries, scattering the extra rows into
+/// the middle (issue #829). `Stacked` (PRD #311): the expanded slot
 /// fills the whole area and every other pane reserves zero rows (`Length(0)`) —
 /// it is not drawn at all, rather than collapsing to a 1-row title bar.
 fn pane_stack_rects(
@@ -18972,10 +18976,20 @@ fn pane_stack_rects(
         return Vec::new();
     }
     let constraints: Vec<Constraint> = match layout {
-        PaneLayout::Tiled => pane_ids
-            .iter()
-            .map(|_| Constraint::Ratio(1, pane_ids.len() as u32))
-            .collect(),
+        PaneLayout::Tiled => {
+            let n = pane_ids.len() as u16;
+            let base = area.height / n;
+            let extra = area.height % n;
+            let mut y = area.y;
+            return (0..n)
+                .map(|i| {
+                    let h = base + u16::from(i < extra);
+                    let r = Rect::new(area.x, y, area.width, h);
+                    y += h;
+                    r
+                })
+                .collect();
+        }
         PaneLayout::Stacked => {
             // PRD #311: the focused pane gets the ENTIRE area; non-focused
             // panes are not drawn at all, so they reserve zero rows rather
