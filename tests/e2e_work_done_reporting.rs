@@ -766,6 +766,9 @@ const CARD_UPDATES_BASE: Duration = Duration::from_secs(5);
 /// "contains" is not enough: the name must be the first thing on the row. A
 /// box whose top border names the role is that role's pane and is skipped
 /// too. Only a card's status row is ever returned.
+///
+/// `common::card_identity_row` is a second card locator with different matching
+/// rules (whole role name, number-badge title, returns a row) — keep the two in step.
 fn role_card_status_row(grid: &str, needle: &str) -> Option<String> {
     let lines: Vec<Vec<char>> = grid.lines().map(|line| line.chars().collect()).collect();
     lines.iter().enumerate().find_map(|(row, chars)| {

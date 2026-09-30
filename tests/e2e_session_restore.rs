@@ -337,9 +337,9 @@ fn restore_006_empty_daemon_and_no_snapshot_lands_on_clean_dashboard() {
 /// `reviewer` role panes appear as deck cards in their saved order, and — unlike
 /// warm hydration — the saved `orchestrator_prompt` is replayed to the start
 /// (orchestrator) role, which the recorder captures (echo-immune). Each role's
-/// position is read off its own CARD — the box whose first body row opens with
-/// the role name — never off the focused embedded pane's header, which names
-/// whichever role the rebuild happened to focus and sits above every card.
+/// position is read off its own CARD — the numbered box whose first body row
+/// opens with the role name — never off the focused embedded pane, whose header
+/// names whichever role the rebuild happened to focus and sits above every card.
 #[spec("session/restore/008")]
 #[test]
 fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
@@ -403,6 +403,10 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
     // Both rows also come out of ONE grid read — the read that first showed
     // both cards — rather than out of a wait followed by two fresh snapshots,
     // so they describe a single frame.
+    //
+    // Comparing ROWS is enough because an orchestration tab stacks its role
+    // cards in one sidebar column. `card_identity_row` reports no column, so
+    // this would not order cards drawn side by side — see its doc comment.
     let located = std::cell::RefCell::new(None);
     let rebuilt = deck.wait_for_grid_predicate_within(Duration::from_secs(15), |g| {
         match (
@@ -416,13 +420,32 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
             _ => false,
         }
     });
-    assert!(
-        rebuilt,
-        "PRD #89 M2b.3: a daemon-empty launch with an orchestration snapshot on disk must \
-         REBUILD the orchestration tab — the `coder` and `reviewer` role panes must appear as \
-         deck cards — but they never did.\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
+    if !rebuilt {
+        // Say which of the two things went wrong. A role whose text IS on the
+        // grid while its card row is `None` was drawn and not RECOGNISED — the
+        // locator and the card's styling have drifted apart, which is a harness
+        // question. A role whose text is nowhere on the grid was never rebuilt,
+        // which is the product regression this test exists to catch. Both are
+        // read off one final grid, the same one that is printed.
+        let grid = deck.snapshot_grid();
+        let per_role = ["coder", "reviewer"]
+            .map(|role| {
+                format!(
+                    "  `{role}`: card_identity_row = {:?}, role text anywhere on the grid = {}",
+                    common::card_identity_row(&grid, role),
+                    grid.contains(role)
+                )
+            })
+            .join("\n");
+        panic!(
+            "PRD #89 M2b.3: a daemon-empty launch with an orchestration snapshot on disk must \
+             REBUILD the orchestration tab — the `coder` and `reviewer` role panes must appear as \
+             deck cards — but both cards were never located in one frame.\n{per_role}\n\
+             (text present with no card row means the card LOCATOR missed a card that is drawn, \
+             not that the tab was not rebuilt; text absent means it was not rebuilt.)\n\
+             Final grid:\n{grid}"
+        );
+    }
     let (coder_row, reviewer_row, grid) = located
         .into_inner()
         .expect("the wait above returns true only after recording the card rows it located");
