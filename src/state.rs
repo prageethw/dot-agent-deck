@@ -7287,6 +7287,18 @@ async fn dispatch_one_owned(
     );
 }
 
+/// Issue #806: what [`AppState::insert_placeholder_session_awaiting_report`]
+/// makes of the lone session an early hook event left on a pane. Each variant
+/// carries that session's key. See [`AppState::early_pane_session`].
+enum EarlyPaneSession {
+    /// The placeholder-first order would have landed the event ON the
+    /// placeholder: the two are one card.
+    Merges(String),
+    /// The placeholder-first order would have had the event RETIRE the
+    /// placeholder: the session stands alone.
+    Supersedes(String),
+}
+
 /// PRD #20 blocker-4: build an inert [`AgentEvent`] that carries only a
 /// `live_target`, used to re-seed a reconnected session's durable write-
 /// semantics into `recent_events`. Its `Idle` type and empty tool/prompt fields
@@ -7945,6 +7957,57 @@ impl AppState {
     /// CLI and therefore know, at mint time, that the placeholder is awaiting
     /// that agent's first report. Every other caller keeps using the plain
     /// constructor above, which seeds `expects_agent_report = false`.
+    ///
+    /// Issue #806: this is the SPAWN-TIME constructor, so it is also the one
+    /// that can lose a race. The daemon has already started the pane's process
+    /// by the time the deck gets here, and a hook from it (a real agent's boot
+    /// `SessionStart`, or `wrap`'s immediate fork-time one) can be applied
+    /// first. That event creates a session under ITS OWN id, which the
+    /// pane-derived key this constructor computes never collides with — so the
+    /// pane is looked up BY PANE first, and a lone session already on it is
+    /// reconciled with the placeholder instead of being joined by a second
+    /// card. The rule is order-independence: the pane ends up holding what the
+    /// OPPOSITE arrival order (placeholder first, then the event) leaves on it.
+    /// See [`Self::early_pane_session`] for which of the two outcomes applies.
+    /// The plain constructor deliberately does none of this: the `SessionEnd`
+    /// restore and the hydration seed depend on its always-overwrite behaviour.
+    ///
+    /// **Precondition: `pane_id` is FRESHLY MINTED by the spawn this call
+    /// belongs to.** Every production caller passes the id `create_pane*` just
+    /// returned, and [`crate::agent_pty::mint_pane_id`] never repeats one, so a
+    /// session found on the pane can only have been produced since the spawn —
+    /// which is the whole ground for treating it as this spawn's early report
+    /// (or, under another agent id, as a generation newer than the
+    /// placeholder). A caller that reused a pane id would break that: a session
+    /// left behind by a previous occupant ([`Self::unregister_pane`] does not
+    /// remove sessions) would be read the same way — an untagged one would have
+    /// its history and prompts stamped with the NEW agent's id and shown as the
+    /// new agent's, and one naming another agent would stand as the pane's only
+    /// card until the new agent reported. Nothing here can tell the two apart,
+    /// so a future caller that respawns onto an existing pane id must clear the
+    /// pane first ([`Self::remove_sessions_for_pane`]) or use the plain
+    /// constructor.
+    ///
+    /// **Second precondition: the pane is REGISTERED in the same critical
+    /// section as this call, not earlier.** Every production caller does
+    /// `register_pane` and then this insert under one write lock, so any event
+    /// applied before the insert found the pane unregistered — and
+    /// [`Self::apply_event`] admits an event for an unregistered pane only if
+    /// it is a `SessionStart`. That is what the different-agent outcome rests
+    /// on: leaving the pane to the early session is the placeholder-first end
+    /// state BECAUSE the frame that created that session was a `SessionStart`,
+    /// which retires a placeholder unconditionally. A caller that registered
+    /// the pane earlier would let an ordinary frame (`Thinking`, `Idle`, tool
+    /// traffic) create the early session instead, and such a frame retires a
+    /// placeholder only when its producer timestamp is not older than the
+    /// placeholder's `last_activity` — so the placeholder-first order could
+    /// keep BOTH cards where this constructor would still insert none, and the
+    /// two orders would no longer converge. Register and insert together, or do
+    /// not rely on the convergence.
+    ///
+    /// Returns the id of the session that now stands for the pane: the
+    /// pane-derived key in every case but one — when the pane is left to an
+    /// early session naming a different agent, it is that session's own id.
     pub fn insert_placeholder_session_awaiting_report(
         &mut self,
         pane_id: String,
@@ -7953,13 +8016,217 @@ impl AppState {
         agent_id: Option<String>,
         expects_agent_report: bool,
     ) -> String {
-        self.insert_placeholder_session_inner(
-            pane_id,
-            cwd,
-            agent_type,
-            agent_id,
-            expects_agent_report,
-        )
+        match self.early_pane_session(&pane_id, agent_id.as_deref()) {
+            Some(EarlyPaneSession::Merges(early_id)) => self.adopt_early_pane_session(
+                early_id,
+                pane_id,
+                cwd,
+                agent_type,
+                agent_id,
+                expects_agent_report,
+            ),
+            Some(EarlyPaneSession::Supersedes(early_id)) => {
+                self.yield_to_early_pane_session(early_id, &pane_id)
+            }
+            None => self.insert_placeholder_session_inner(
+                pane_id,
+                cwd,
+                agent_type,
+                agent_id,
+                expects_agent_report,
+            ),
+        }
+    }
+
+    /// Issue #806: the session a hook event created on `pane_id` BEFORE the
+    /// pane's spawn-time placeholder was inserted, if there is exactly one, and
+    /// what the placeholder-first order would have made of the pair.
+    ///
+    /// The lookup is by PANE, because the two never share a key: the event's
+    /// session lives under the producer's own `session_id`, the placeholder
+    /// under [`session_id_for_pane`].
+    ///
+    /// A lone early session is always one of two things, and each is decided by
+    /// asking what [`Self::apply_event`] does when the placeholder is already
+    /// there and the early session's `SessionStart` arrives second (an event for
+    /// a pane nobody has registered yet is admitted only if it is a
+    /// `SessionStart`, so that is the frame that put the first session there):
+    ///
+    /// * [`EarlyPaneSession::Merges`] — the session names the same `agent_id`
+    ///   the placeholder is being minted for (the strict-equality half of the
+    ///   reuse guard), or names none at all (that guard's issue #398 fallback,
+    ///   under which an untagged event adopts the pane's lone session). The
+    ///   event would have landed ON the placeholder, so the two become one card
+    ///   under the placeholder's key: [`Self::adopt_early_pane_session`].
+    /// * [`EarlyPaneSession::Supersedes`] — the session names a DIFFERENT agent,
+    ///   which includes naming one where the placeholder names none. The reuse
+    ///   guard matches neither way, and the generation-retire block then RETIRES
+    ///   the placeholder: a `SessionStart` is a generation announcing itself and
+    ///   supersedes unconditionally ([`Self::supersedes_generation`]). The pane
+    ///   is left with the event's session alone, so no placeholder is inserted:
+    ///   [`Self::yield_to_early_pane_session`]. Inserting one beside it — what
+    ///   this did before — left two cards that nothing was guaranteed to
+    ///   reconcile: a later non-`SessionStart` frame retires the placeholder
+    ///   only if its producer timestamp is not older than the placeholder's
+    ///   insert time, and an agent that boots and then waits sends no such
+    ///   frame at all.
+    ///
+    /// Two shapes answer `None` and keep the historical insert. Neither is
+    /// made order-independent here: in both, what the pane ends up holding can
+    /// still depend on which input arrived first.
+    ///
+    /// * the pane-derived key is already occupied. That is the same-key
+    ///   ordering, which [`Self::insert_placeholder_session_inner`] owns — a
+    ///   resolved entry is left alone (issue #724) and an unresolved one is
+    ///   still armed (`dashboard/placeholder/007`/`008`). Those rules predate
+    ///   this lookup and are unchanged by it, the order-dependence included: a
+    ///   resolved entry that is left alone keeps whatever `agent_id` its own
+    ///   event carried (none, for an untagged one), where the placeholder-first
+    ///   order would have kept the placeholder's;
+    /// * more than one session sits on the pane. There is no defensible winner,
+    ///   so nothing is guessed, exactly as the #398 fallback declines to.
+    fn early_pane_session(
+        &self,
+        pane_id: &str,
+        agent_id: Option<&str>,
+    ) -> Option<EarlyPaneSession> {
+        if self.sessions.contains_key(&session_id_for_pane(pane_id)) {
+            return None;
+        }
+        let mut on_pane = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.pane_id.as_deref() == Some(pane_id));
+        match (on_pane.next(), on_pane.next()) {
+            (Some((id, session)), None) => {
+                if session.agent_id.is_none() || session.agent_id.as_deref() == agent_id {
+                    Some(EarlyPaneSession::Merges(id.clone()))
+                } else {
+                    Some(EarlyPaneSession::Supersedes(id.clone()))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Issue #806: turn the session an early hook event created on a pane into
+    /// that pane's placeholder, instead of inserting a placeholder beside it.
+    ///
+    /// The session MOVES to the pane-derived key rather than staying where the
+    /// event put it. That is the key it would be living under had the
+    /// placeholder been inserted first (the reuse guard in
+    /// [`Self::apply_event`] remaps a same-agent event onto the placeholder's
+    /// id), and it is the key that guard will look for on every later event
+    /// from the same agent — so from here on the pane is indistinguishable from
+    /// one whose placeholder won the race.
+    ///
+    /// What the placeholder would have contributed is carried over, and only
+    /// that:
+    ///
+    /// * `expects_agent_report`, unless a real report has already resolved the
+    ///   session (`agent_report_activity_seen`). Arming a resolved session would
+    ///   wedge it at "Starting…" for good — the one `SessionStart` that clears
+    ///   the flag has already been consumed (the issue #724 rule). An
+    ///   unresolved session — all `wrap`'s boot-provenance `SessionStart`
+    ///   leaves behind — IS armed, which is what the placeholder-first order
+    ///   produces for that same event (`dashboard/placeholder/009`);
+    /// * the spawn-time `agent_type` when the caller knows one, which the
+    ///   placeholder-first order never lets an event overwrite. A spawn-time
+    ///   `Some(AgentType::None)` is NOT knowing one — the restore fallback
+    ///   passes it for a declaration it could not resolve — and a placeholder
+    ///   born `AgentType::None` is exactly what an event's type fills in, so
+    ///   that value must not erase a type the event already reported;
+    /// * the daemon's `agent_id` and the spawn `cwd`, each only where the event
+    ///   supplied none;
+    /// * the two timestamps, which the placeholder mints from the DECK's clock
+    ///   and the event's session took from the PRODUCER's. `started_at` is the
+    ///   pane's remembered start or the insert time, exactly as
+    ///   [`Self::insert_placeholder_session_inner`] derives it, and no event
+    ///   ever moves it. `last_activity` is the later of the insert time and the
+    ///   newest event, which is what the high-water assignment in `apply_event`
+    ///   makes of a placeholder born "now". Keeping the event's own values
+    ///   instead would let a skewed or forged early frame backdate the card,
+    ///   and a backdated `last_activity` weakens the ordering evidence
+    ///   [`Self::supersedes_generation`] weighs against a delayed frame.
+    ///
+    /// Everything else the event recorded — status, journal, prompts, model,
+    /// friendly name — is the agent's and is kept as it is.
+    fn adopt_early_pane_session(
+        &mut self,
+        early_id: String,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        expects_agent_report: bool,
+    ) -> String {
+        let session_id = session_id_for_pane(&pane_id);
+        let Some(mut session) = self.sessions.remove(&early_id) else {
+            return self.insert_placeholder_session_inner(
+                pane_id,
+                cwd,
+                agent_type,
+                agent_id,
+                expects_agent_report,
+            );
+        };
+        let now = Utc::now();
+        session.session_id.clone_from(&session_id);
+        // The journal names the card it belongs to, as it does when the reuse
+        // guard remaps an event onto an existing placeholder before journalling.
+        for event in &mut session.recent_events {
+            event.session_id.clone_from(&session_id);
+        }
+        if let Some(agent_type) = agent_type.filter(|known| *known != AgentType::None) {
+            session.agent_type = agent_type;
+        }
+        if session.agent_id.is_none() {
+            session.agent_id = agent_id;
+        }
+        if session.cwd.is_none() {
+            session.cwd = cwd;
+        }
+        if !session.agent_report_activity_seen {
+            session.expects_agent_report = expects_agent_report;
+        }
+        session.started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
+        session.last_activity = session.last_activity.max(now);
+        // A monitored wait is recorded against the CARD it was declared on and
+        // dies with it (see [`MonitoredWait::session_id`]). The card has not
+        // gone anywhere here, it has only been re-keyed, so the wait follows.
+        if let Some(wait) = self.monitored_waits.get_mut(&pane_id)
+            && wait.session_id == early_id
+        {
+            wait.session_id.clone_from(&session_id);
+        }
+        self.sessions.insert(session_id.clone(), session);
+        session_id
+    }
+
+    /// Issue #806: leave the pane to the early session that names a different
+    /// agent, inserting no placeholder — the state the placeholder-first order
+    /// reaches by retiring the placeholder it had inserted (see
+    /// [`EarlyPaneSession::Supersedes`]).
+    ///
+    /// The session stays under its own key and keeps everything its events
+    /// recorded, `last_activity` included: in the placeholder-first order it is
+    /// a session the event CREATES after the retire, so none of the
+    /// placeholder's fields reach it. The one thing that does survive a retired
+    /// placeholder is when the pane started — the retire loop hands its
+    /// `started_at` to [`Self::remember_pane_start`], and the session created
+    /// next reads it back — so that is reproduced here, from the same source the
+    /// placeholder would have used.
+    fn yield_to_early_pane_session(&mut self, early_id: String, pane_id: &str) -> String {
+        let started_at = self
+            .pane_started_at
+            .get(pane_id)
+            .copied()
+            .unwrap_or_else(Utc::now);
+        self.remember_pane_start(pane_id, started_at);
+        if let Some(session) = self.sessions.get_mut(&early_id) {
+            session.started_at = started_at;
+        }
+        early_id
     }
 
     fn insert_placeholder_session_inner(
@@ -19337,6 +19604,720 @@ clear = false
             "a legacy bare pane_id must still produce 'pane-<id>' for \
              backward compatibility; sessions keys were: {:?}",
             state.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ---- Issue #806: the spawn-time placeholder and an early hook event. ----
+    //
+    // `insert_placeholder_session_awaiting_report` runs after the daemon has
+    // already started the pane's process, so a hook from that process can be
+    // applied first. The rule the constructor follows is order-independence:
+    // the pane holds what the placeholder-first order leaves on it. The tests
+    // below therefore do not assert an expected state from first principles —
+    // they build the placeholder-first state from the same inputs and compare.
+
+    /// Where a timestamp on a card came from. The instants themselves differ
+    /// between two runs of the same inputs, so the SOURCE is what is compared.
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum Stamp {
+        /// The pane's remembered start (`pane_started_at`), seeded by the test.
+        PaneStart,
+        /// The producer-supplied timestamp on the early event.
+        Event,
+        /// The deck's own clock, read while the test ran.
+        Deck,
+        /// None of the above — never expected.
+        Other,
+    }
+
+    /// One session on the pane, reduced to what can be compared across two
+    /// separately-built states.
+    #[derive(Debug, PartialEq)]
+    struct EarlyCard {
+        key: String,
+        session_id: String,
+        agent_type: AgentType,
+        agent_id: Option<String>,
+        cwd: Option<String>,
+        status: SessionStatus,
+        expects_agent_report: bool,
+        agent_report_activity_seen: bool,
+        display_name: Option<String>,
+        model: Option<String>,
+        tool_count: u32,
+        first_prompts: Vec<String>,
+        last_user_prompt: Option<String>,
+        active_tool: String,
+        outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
+        /// `(session_id, event type)` of every journalled event, in order.
+        journal: Vec<(String, EventType)>,
+        started_at: Stamp,
+        last_activity: Stamp,
+    }
+
+    /// Everything about one pane that the two arrival orders must agree on.
+    #[derive(Debug, PartialEq)]
+    struct EarlyPane {
+        cards: Vec<EarlyCard>,
+        remembered_start: Option<Stamp>,
+        hook_session: Option<String>,
+        untagged_status: bool,
+        registered: bool,
+    }
+
+    const EARLY_PANE: &str = "7";
+    const EARLY_PANE_KEY: &str = "pane-7";
+    const EARLY_SESSION: &str = "agent-own-conversation";
+
+    /// The inputs of one placeholder-vs-early-event pair.
+    #[derive(Clone)]
+    struct EarlyInputs {
+        event_agent_id: Option<&'static str>,
+        event_agent_type: AgentType,
+        event_cwd: Option<&'static str>,
+        /// `wrap`'s fork-time boot provenance rather than the agent's own start.
+        event_is_wrapper_boot: bool,
+        /// Stamp the event an hour AHEAD of the deck's clock instead of an hour
+        /// behind it.
+        event_in_future: bool,
+        spawn_agent_id: Option<&'static str>,
+        spawn_agent_type: Option<AgentType>,
+        spawn_expects_agent_report: bool,
+        /// Whether the pane already has a remembered start time.
+        pane_start_known: bool,
+    }
+
+    impl EarlyInputs {
+        /// The agent's own boot `SessionStart`, tagged with the same agent id
+        /// the placeholder is minted for — the shape issue #806 reports.
+        fn base() -> Self {
+            Self {
+                event_agent_id: Some("d-1"),
+                event_agent_type: AgentType::ClaudeCode,
+                event_cwd: Some("/event"),
+                event_is_wrapper_boot: false,
+                event_in_future: false,
+                spawn_agent_id: Some("d-1"),
+                spawn_agent_type: None,
+                spawn_expects_agent_report: true,
+                pane_start_known: false,
+            }
+        }
+    }
+
+    /// The fixed instants one pair is built around.
+    struct EarlyClock {
+        test_start: DateTime<Utc>,
+        event_at: DateTime<Utc>,
+        pane_start: DateTime<Utc>,
+    }
+
+    impl EarlyClock {
+        fn new(inputs: &EarlyInputs) -> Self {
+            let test_start = Utc::now();
+            let hour = chrono::TimeDelta::hours(1);
+            Self {
+                test_start,
+                event_at: if inputs.event_in_future {
+                    test_start + hour
+                } else {
+                    test_start - hour
+                },
+                pane_start: test_start - chrono::TimeDelta::hours(5),
+            }
+        }
+
+        fn classify(&self, inputs: &EarlyInputs, at: DateTime<Utc>) -> Stamp {
+            if inputs.pane_start_known && at == self.pane_start {
+                Stamp::PaneStart
+            } else if at == self.event_at {
+                Stamp::Event
+            } else if at >= self.test_start && at <= Utc::now() {
+                Stamp::Deck
+            } else {
+                Stamp::Other
+            }
+        }
+    }
+
+    fn early_event(inputs: &EarlyInputs, clock: &EarlyClock) -> AgentEvent {
+        let mut metadata = std::collections::HashMap::new();
+        if inputs.event_is_wrapper_boot {
+            metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+        }
+        AgentEvent {
+            session_id: EARLY_SESSION.to_string(),
+            agent_type: inputs.event_agent_type.clone(),
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: inputs.event_cwd.map(str::to_string),
+            timestamp: clock.event_at,
+            user_prompt: None,
+            metadata,
+            pane_id: Some(EARLY_PANE.to_string()),
+            agent_id: inputs.event_agent_id.map(str::to_string),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: Some("model-the-event-reported".to_string()),
+        }
+    }
+
+    /// What every production caller does: register the pane, then mint its
+    /// spawn-time placeholder, under one write lock.
+    fn spawn_placeholder(state: &mut AppState, inputs: &EarlyInputs) -> String {
+        state.register_pane(EARLY_PANE.to_string());
+        state.insert_placeholder_session_awaiting_report(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            inputs.spawn_agent_type.clone(),
+            inputs.spawn_agent_id.map(str::to_string),
+            inputs.spawn_expects_agent_report,
+        )
+    }
+
+    fn early_state(inputs: &EarlyInputs, clock: &EarlyClock) -> AppState {
+        let mut state = AppState::default();
+        if inputs.pane_start_known {
+            state
+                .pane_started_at
+                .insert(EARLY_PANE.to_string(), clock.pane_start);
+        }
+        state
+    }
+
+    fn early_pane(state: &AppState, inputs: &EarlyInputs, clock: &EarlyClock) -> EarlyPane {
+        let mut cards: Vec<EarlyCard> = state
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.pane_id.as_deref() == Some(EARLY_PANE))
+            .map(|(key, session)| EarlyCard {
+                key: key.clone(),
+                session_id: session.session_id.clone(),
+                agent_type: session.agent_type.clone(),
+                agent_id: session.agent_id.clone(),
+                cwd: session.cwd.clone(),
+                status: session.status.clone(),
+                expects_agent_report: session.expects_agent_report,
+                agent_report_activity_seen: session.agent_report_activity_seen,
+                display_name: session.display_name.clone(),
+                model: session.model.clone(),
+                tool_count: session.tool_count,
+                first_prompts: session.first_prompts.clone(),
+                last_user_prompt: session.last_user_prompt.clone(),
+                active_tool: format!("{:?}", session.active_tool),
+                outstanding_delegation: session.outstanding_delegation.clone(),
+                journal: session
+                    .recent_events
+                    .iter()
+                    .map(|event| (event.session_id.clone(), event.event_type.clone()))
+                    .collect(),
+                started_at: clock.classify(inputs, session.started_at),
+                last_activity: clock.classify(inputs, session.last_activity),
+            })
+            .collect();
+        cards.sort_by(|a, b| a.key.cmp(&b.key));
+        EarlyPane {
+            cards,
+            remembered_start: state
+                .pane_started_at
+                .get(EARLY_PANE)
+                .map(|at| clock.classify(inputs, *at)),
+            hook_session: state.pane_hook_session_id(EARLY_PANE),
+            untagged_status: state.untagged_status_panes.contains(EARLY_PANE),
+            registered: state.managed_pane_ids.contains(EARLY_PANE),
+        }
+    }
+
+    /// Build the pane in both arrival orders from the same inputs and return
+    /// `(hook_first, placeholder_first)`.
+    fn both_orders(inputs: &EarlyInputs) -> (EarlyPane, EarlyPane) {
+        let clock = EarlyClock::new(inputs);
+
+        let mut hook_first = early_state(inputs, &clock);
+        hook_first.apply_event(early_event(inputs, &clock));
+        assert_eq!(
+            hook_first.sessions.keys().collect::<Vec<_>>(),
+            vec![EARLY_SESSION],
+            "setup: the early event must have created exactly one session, \
+             under the producer's own id"
+        );
+        let returned = spawn_placeholder(&mut hook_first, inputs);
+        assert!(
+            hook_first
+                .sessions
+                .get(&returned)
+                .is_some_and(|session| session.pane_id.as_deref() == Some(EARLY_PANE)),
+            "the constructor must return the id of a session that exists and \
+             sits on the pane; returned {returned:?}, sessions {:?}",
+            hook_first.sessions.keys().collect::<Vec<_>>()
+        );
+
+        let mut placeholder_first = early_state(inputs, &clock);
+        spawn_placeholder(&mut placeholder_first, inputs);
+        placeholder_first.apply_event(early_event(inputs, &clock));
+
+        (
+            early_pane(&hook_first, inputs, &clock),
+            early_pane(&placeholder_first, inputs, &clock),
+        )
+    }
+
+    /// Issue #806: for one spawn-time placeholder and one early hook event, the
+    /// pane must end up in the same state whichever of the two is applied
+    /// first — and that state must have exactly one card. Each row varies one
+    /// thing the adoption has to get right and pins the fields it decides.
+    #[test]
+    fn spawn_placeholder_and_early_event_reach_the_same_state_in_either_order() {
+        struct Expected {
+            key: &'static str,
+            agent_id: Option<&'static str>,
+            agent_type: AgentType,
+            cwd: Option<&'static str>,
+            expects_agent_report: bool,
+            agent_report_activity_seen: bool,
+            started_at: Stamp,
+            last_activity: Stamp,
+            remembered_start: Option<Stamp>,
+        }
+
+        /// The agent's own tagged start merged onto the placeholder's key.
+        fn merged() -> Expected {
+            Expected {
+                key: EARLY_PANE_KEY,
+                agent_id: Some("d-1"),
+                agent_type: AgentType::ClaudeCode,
+                cwd: Some("/event"),
+                expects_agent_report: false,
+                agent_report_activity_seen: true,
+                started_at: Stamp::Deck,
+                last_activity: Stamp::Deck,
+                remembered_start: None,
+            }
+        }
+
+        /// The placeholder yields to an early session naming another agent.
+        fn yielded(agent_id: &'static str) -> Expected {
+            Expected {
+                key: EARLY_SESSION,
+                agent_id: Some(agent_id),
+                // The event's session stands alone, so its producer stamp is
+                // its `last_activity` in both orders; only the pane's start is
+                // the deck's.
+                last_activity: Stamp::Event,
+                remembered_start: Some(Stamp::Deck),
+                ..merged()
+            }
+        }
+
+        let cases: Vec<(&str, EarlyInputs, Expected)> = vec![
+            (
+                "the agent's own tagged start (issue #806's shape): adopted, \
+                 resolved, and timestamped from the deck's clock rather than \
+                 the producer's hour-old stamp",
+                EarlyInputs::base(),
+                merged(),
+            ),
+            (
+                "an event stamped AHEAD of the deck's clock: `last_activity` is \
+                 a high-water mark, so the event's stamp stands",
+                EarlyInputs {
+                    event_in_future: true,
+                    ..EarlyInputs::base()
+                },
+                Expected {
+                    last_activity: Stamp::Event,
+                    ..merged()
+                },
+            ),
+            (
+                "a pane with a remembered start: `started_at` is that, not the \
+                 insert time and not the event's stamp",
+                EarlyInputs {
+                    pane_start_known: true,
+                    ..EarlyInputs::base()
+                },
+                Expected {
+                    started_at: Stamp::PaneStart,
+                    remembered_start: Some(Stamp::PaneStart),
+                    ..merged()
+                },
+            ),
+            (
+                "an UNTAGGED early start carrying no cwd: taken over, stamped \
+                 with the daemon's agent id, and given the spawn cwd",
+                EarlyInputs {
+                    event_agent_id: None,
+                    event_cwd: None,
+                    ..EarlyInputs::base()
+                },
+                Expected {
+                    cwd: Some("/spawn"),
+                    ..merged()
+                },
+            ),
+            (
+                "a spawn-time agent type: it wins over the type the event \
+                 reported, as a typed placeholder is never re-typed by an event",
+                EarlyInputs {
+                    spawn_agent_type: Some(AgentType::Codex),
+                    ..EarlyInputs::base()
+                },
+                Expected {
+                    agent_type: AgentType::Codex,
+                    ..merged()
+                },
+            ),
+            (
+                "a spawn-time `Some(AgentType::None)` (an unresolved \
+                 declaration): it is not a known type and must not erase the \
+                 one the event reported",
+                EarlyInputs {
+                    spawn_agent_type: Some(AgentType::None),
+                    ..EarlyInputs::base()
+                },
+                merged(),
+            ),
+            (
+                "`wrap`'s boot-provenance start: untyped and unresolved, so the \
+                 placeholder's awaiting-report flag is armed",
+                EarlyInputs {
+                    event_agent_type: AgentType::Codex,
+                    event_is_wrapper_boot: true,
+                    ..EarlyInputs::base()
+                },
+                Expected {
+                    agent_type: AgentType::None,
+                    expects_agent_report: true,
+                    agent_report_activity_seen: false,
+                    ..merged()
+                },
+            ),
+            (
+                "a placeholder that expects no report (a non-agent command): \
+                 nothing is armed",
+                EarlyInputs {
+                    event_agent_type: AgentType::Codex,
+                    event_is_wrapper_boot: true,
+                    spawn_expects_agent_report: false,
+                    ..EarlyInputs::base()
+                },
+                Expected {
+                    agent_type: AgentType::None,
+                    expects_agent_report: false,
+                    agent_report_activity_seen: false,
+                    ..merged()
+                },
+            ),
+            (
+                "an early start naming a DIFFERENT agent: the placeholder \
+                 yields, as the placeholder-first order retires it",
+                EarlyInputs {
+                    event_agent_id: Some("d-other"),
+                    ..EarlyInputs::base()
+                },
+                yielded("d-other"),
+            ),
+            (
+                "an early tagged start where the placeholder names NO agent: \
+                 the placeholder yields here too",
+                EarlyInputs {
+                    spawn_agent_id: None,
+                    ..EarlyInputs::base()
+                },
+                yielded("d-1"),
+            ),
+            (
+                "a different agent on a pane with a remembered start: the \
+                 surviving session takes the pane's start",
+                EarlyInputs {
+                    event_agent_id: Some("d-other"),
+                    spawn_agent_type: Some(AgentType::Codex),
+                    pane_start_known: true,
+                    ..EarlyInputs::base()
+                },
+                Expected {
+                    started_at: Stamp::PaneStart,
+                    remembered_start: Some(Stamp::PaneStart),
+                    ..yielded("d-other")
+                },
+            ),
+        ];
+
+        for (name, inputs, expected) in cases {
+            let (hook_first, placeholder_first) = both_orders(&inputs);
+
+            assert_eq!(
+                hook_first, placeholder_first,
+                "[{name}] issue #806: the pane must hold the same state \
+                 whether the early event or the placeholder insert was applied \
+                 first. hook-first (left) vs placeholder-first (right)"
+            );
+
+            assert_eq!(
+                hook_first.cards.len(),
+                1,
+                "[{name}] the pane must hold exactly ONE session; got \
+                 {hook_first:#?}"
+            );
+            let card = &hook_first.cards[0];
+            assert_eq!(card.key, expected.key, "[{name}] map key; got {card:#?}");
+            assert_eq!(
+                card.session_id, expected.key,
+                "[{name}] the session must name the key it lives under; got \
+                 {card:#?}"
+            );
+            assert_eq!(
+                card.agent_id.as_deref(),
+                expected.agent_id,
+                "[{name}] agent_id; got {card:#?}"
+            );
+            assert_eq!(
+                card.agent_type, expected.agent_type,
+                "[{name}] agent_type; got {card:#?}"
+            );
+            assert_eq!(
+                card.cwd.as_deref(),
+                expected.cwd,
+                "[{name}] cwd; got {card:#?}"
+            );
+            assert_eq!(
+                card.expects_agent_report, expected.expects_agent_report,
+                "[{name}] expects_agent_report; got {card:#?}"
+            );
+            assert_eq!(
+                card.agent_report_activity_seen, expected.agent_report_activity_seen,
+                "[{name}] agent_report_activity_seen; got {card:#?}"
+            );
+            assert_eq!(
+                card.started_at, expected.started_at,
+                "[{name}] where `started_at` came from; got {card:#?}"
+            );
+            assert_eq!(
+                card.last_activity, expected.last_activity,
+                "[{name}] where `last_activity` came from; got {card:#?}"
+            );
+            assert_eq!(
+                hook_first.remembered_start, expected.remembered_start,
+                "[{name}] the pane's remembered start; got {hook_first:#?}"
+            );
+            assert_eq!(
+                card.journal,
+                vec![(expected.key.to_string(), EventType::SessionStart)],
+                "[{name}] the journal must hold the one early event, naming the \
+                 card it now belongs to; got {card:#?}"
+            );
+            assert_eq!(
+                card.model.as_deref(),
+                Some("model-the-event-reported"),
+                "[{name}] what the event recorded must survive; got {card:#?}"
+            );
+            assert!(
+                hook_first.registered,
+                "[{name}] the pane must be registered; got {hook_first:#?}"
+            );
+        }
+    }
+
+    /// Issue #806: the two shapes the spawn-time constructor does NOT
+    /// reconcile keep the historical insert — it writes the pane-derived key
+    /// and leaves every other session on the pane exactly where it was.
+    #[test]
+    fn spawn_placeholder_keeps_the_historical_insert_on_an_ambiguous_pane() {
+        fn frame(
+            session: &str,
+            event_type: EventType,
+            agent_id: &str,
+            at: DateTime<Utc>,
+        ) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: at,
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(EARLY_PANE.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        /// `(key, agent_id, expects_agent_report, journal length)`, by key.
+        fn cards(state: &AppState) -> Vec<(String, Option<String>, bool, usize)> {
+            let mut found: Vec<_> = state
+                .sessions
+                .iter()
+                .map(|(key, session)| {
+                    (
+                        key.clone(),
+                        session.agent_id.clone(),
+                        session.expects_agent_report,
+                        session.recent_events.len(),
+                    )
+                })
+                .collect();
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            found
+        }
+
+        let now = Utc::now();
+        let stale = now - chrono::TimeDelta::hours(1);
+
+        // (a) MORE THAN ONE session on the pane, none under the pane key. A
+        // start from one agent, then a frame from another that is too old to
+        // supersede it, leaves two — and no defensible winner.
+        let mut two_sessions = AppState::default();
+        two_sessions.apply_event(frame("first", EventType::SessionStart, "d-a", now));
+        two_sessions.apply_event(frame("second", EventType::Thinking, "d-b", stale));
+        assert_eq!(
+            cards(&two_sessions),
+            vec![
+                ("first".to_string(), Some("d-a".to_string()), false, 1),
+                ("second".to_string(), Some("d-b".to_string()), false, 1),
+            ],
+            "setup: the pane must carry two sessions under their own ids"
+        );
+        two_sessions.register_pane(EARLY_PANE.to_string());
+        let returned = two_sessions.insert_placeholder_session_awaiting_report(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-a".to_string()),
+            true,
+        );
+        assert_eq!(returned, EARLY_PANE_KEY);
+        assert_eq!(
+            cards(&two_sessions),
+            vec![
+                ("first".to_string(), Some("d-a".to_string()), false, 1),
+                (EARLY_PANE_KEY.to_string(), Some("d-a".to_string()), true, 0),
+                ("second".to_string(), Some("d-b".to_string()), false, 1),
+            ],
+            "with two sessions already on the pane the constructor must not \
+             guess: a fresh placeholder goes under the pane key and both \
+             sessions stay untouched — even the one naming the placeholder's \
+             own agent"
+        );
+
+        // (b) The PANE KEY IS ALREADY OCCUPIED, with a sibling beside it. The
+        // same-key rules own this pane (`dashboard/placeholder/007`/`008`): an
+        // unresolved entry is overwritten and armed, and the sibling is not
+        // adopted, moved or removed.
+        let mut occupied = AppState::default();
+        occupied.register_pane(EARLY_PANE.to_string());
+        occupied.insert_placeholder_session(
+            EARLY_PANE.to_string(),
+            None,
+            None,
+            Some("d-old".to_string()),
+        );
+        occupied.apply_event(frame("sibling", EventType::Thinking, "d-new", stale));
+        assert_eq!(
+            cards(&occupied),
+            vec![
+                (
+                    EARLY_PANE_KEY.to_string(),
+                    Some("d-old".to_string()),
+                    false,
+                    0
+                ),
+                ("sibling".to_string(), Some("d-new".to_string()), false, 1),
+            ],
+            "setup: the pane key must be occupied by an unresolved entry, with \
+             a sibling session beside it"
+        );
+        let returned = occupied.insert_placeholder_session_awaiting_report(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-new".to_string()),
+            true,
+        );
+        assert_eq!(returned, EARLY_PANE_KEY);
+        assert_eq!(
+            cards(&occupied),
+            vec![
+                (
+                    EARLY_PANE_KEY.to_string(),
+                    Some("d-new".to_string()),
+                    true,
+                    0
+                ),
+                ("sibling".to_string(), Some("d-new".to_string()), false, 1),
+            ],
+            "an occupied pane key keeps the same-key behaviour: the unresolved \
+             entry is replaced by an armed placeholder, and the sibling stays \
+             under its own id even though it names the placeholder's agent"
+        );
+    }
+
+    /// Issue #806: a monitored wait is recorded against the CARD it was
+    /// declared on. Adoption re-keys that card rather than replacing it, so a
+    /// wait recorded against the early session's id must follow it to the
+    /// pane-derived key — and a wait recorded against some other id must not be
+    /// repointed.
+    #[test]
+    fn a_monitored_wait_follows_the_card_an_adoption_re_keys() {
+        fn wait_on(session_id: &str) -> MonitoredWait {
+            MonitoredWait {
+                label: "ci".to_string(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+                session_id: session_id.to_string(),
+            }
+        }
+
+        let inputs = EarlyInputs::base();
+        let clock = EarlyClock::new(&inputs);
+
+        let mut state = AppState::default();
+        state.apply_event(early_event(&inputs, &clock));
+        state
+            .monitored_waits
+            .insert(EARLY_PANE.to_string(), wait_on(EARLY_SESSION));
+        spawn_placeholder(&mut state, &inputs);
+        assert!(
+            state.sessions.contains_key(EARLY_PANE_KEY)
+                && !state.sessions.contains_key(EARLY_SESSION),
+            "setup: the early session must have been adopted onto the pane \
+             key; sessions {:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state
+                .monitored_waits
+                .get(EARLY_PANE)
+                .map(|wait| wait.session_id.as_str()),
+            Some(EARLY_PANE_KEY),
+            "the wait recorded against the early session's id must follow the \
+             card to its new key, or clearing it would find no card and leave \
+             the pane wedged"
+        );
+
+        let mut unrelated = AppState::default();
+        unrelated.apply_event(early_event(&inputs, &clock));
+        unrelated
+            .monitored_waits
+            .insert(EARLY_PANE.to_string(), wait_on("some-other-card"));
+        spawn_placeholder(&mut unrelated, &inputs);
+        assert_eq!(
+            unrelated
+                .monitored_waits
+                .get(EARLY_PANE)
+                .map(|wait| wait.session_id.as_str()),
+            Some("some-other-card"),
+            "a wait recorded against a different card was not declared on the \
+             adopted one and must not be repointed at it"
         );
     }
 

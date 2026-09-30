@@ -33459,6 +33459,726 @@ mod tests {
         );
     }
 
+    /// Scenario: An agent's real `SessionStart` hook for an orchestration role
+    /// pane reaches the deck BEFORE the deck has inserted that pane's
+    /// placeholder card, and only then does the production
+    /// `insert_role_placeholder_sessions` run for the two-role orchestration.
+    /// Each role pane must end up with exactly one card, and the early pane's
+    /// one card must show the role's name with the `Idle` the hook reported,
+    /// not placeholder copy.
+    #[spec("dashboard/placeholder/014")]
+    #[test]
+    fn dashboard_placeholder_014_hook_before_role_placeholder_leaves_one_card_per_pane() {
+        // Issue #806. The daemon registers an orchestration's role panes before
+        // the deck creates their cards, so a hook can reach the deck inside
+        // that window — a real agent's boot `SessionStart` is enough. The
+        // event's `session_id` is the AGENT'S OWN conversation id, not the
+        // pane-derived `pane-<id>` key the placeholder insert computes, so the
+        // two land on different map keys and nothing reconciles them:
+        //
+        //   * `AppState::apply_event` admits the event through its startup-race
+        //     auto-registration (an unregistered pane + `SessionStart`) and
+        //     creates a session under the hook's own id;
+        //   * `insert_role_placeholder_sessions` then inserts the placeholder
+        //     under `pane-<id>`, looking only at THAT key for an existing
+        //     entry.
+        //
+        // Deliberately unlike `dashboard/placeholder/007`, whose event already
+        // carries the pane-keyed id and so collides with the placeholder on one
+        // entry: this is the shape where the keys differ, which is the one CI
+        // actually hit (`status/observing/010`, three cards for two panes).
+        //
+        // Every assertion below is on what a user sees — how many cards a pane
+        // has and what the surviving one reads — and none of them names which
+        // key survives, so skipping the placeholder and adopting the existing
+        // session are both acceptable ways to satisfy it.
+        const EARLY_PANE: &str = "1";
+        const QUIET_PANE: &str = "2";
+        // Not `orchestrator` / `worker`: the deck's own title row reads
+        // `worker-deck`, which would be counted as a card below.
+        const EARLY_ROLE: &str = "role-alpha";
+        const QUIET_ROLE: &str = "role-beta";
+
+        /// One line per session on `pane`, for the failure messages.
+        fn sessions_on(state: &AppState, pane: &str) -> Vec<String> {
+            let mut found: Vec<String> = state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.pane_id.as_deref() == Some(pane))
+                .map(|(id, session)| {
+                    format!(
+                        "key {id:?}: status {:?}, agent_type {:?}, agent_id {:?}, \
+                         expects_agent_report {}",
+                        session.status,
+                        session.agent_type,
+                        session.agent_id,
+                        session.expects_agent_report
+                    )
+                })
+                .collect();
+            found.sort();
+            found
+        }
+
+        /// Draw the dashboard, optionally scoped to the cards of one pane, the
+        /// way every other render test in this module does.
+        fn render_deck(state: &AppState, ui: &mut UiState, only_pane: Option<&str>) -> String {
+            let backend = TestBackend::new(120, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut filtered = filter_sessions(state, ui);
+            if let Some(pane) = only_pane {
+                filtered.retain(|(_, session)| session.pane_id.as_deref() == Some(pane));
+            }
+            terminal
+                .draw(|frame| {
+                    let noop =
+                        crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                    let tab_view = ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                        zoomed: false,
+                    };
+                    let tab_bar =
+                        TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                    let layout = compute_frame_layout(
+                        frame.area(),
+                        &tab_view,
+                        &tab_bar,
+                        &[],
+                        PaneLayout::Stacked,
+                        None,
+                        1,
+                    );
+                    render_frame(
+                        frame, state, ui, &filtered, 0, false, &noop, &tab_view, &tab_bar, &layout,
+                    )
+                })
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+        }
+
+        let mut state = AppState::default();
+
+        // (1) The hook arrives first. No `register_pane` and no placeholder
+        // yet — `insert_role_placeholder_sessions` is what does both, and it
+        // has not run. Tagged with the pane and the daemon's agent id, exactly
+        // as a daemon-spawned agent's hook is.
+        state.apply_event(AgentEvent {
+            session_id: "claude-conversation-early".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/tmp".to_string()),
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(EARLY_PANE.to_string()),
+            agent_id: Some("d-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let before_insert = sessions_on(&state, EARLY_PANE);
+        assert_eq!(
+            before_insert.len(),
+            1,
+            "setup: the early SessionStart must have created exactly one \
+             session on the role pane before any placeholder exists, or this \
+             test is not exercising the hook-before-placeholder ordering; \
+             got {before_insert:#?}"
+        );
+
+        // (2) The deck now inserts the orchestration's placeholders, through
+        // the production helper both `open_orchestration_tab` call sites use.
+        let role_pane_ids = vec![EARLY_PANE.to_string(), QUIET_PANE.to_string()];
+        let role_agent_ids = vec![Some("d-1".to_string()), Some("d-2".to_string())];
+        let roles: Vec<OrchestrationRoleConfig> = [(EARLY_ROLE, true), (QUIET_ROLE, false)]
+            .into_iter()
+            .map(|(name, start)| OrchestrationRoleConfig {
+                name: name.to_string(),
+                command: "claude".to_string(),
+                agent: None,
+                start,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            })
+            .collect();
+        insert_role_placeholder_sessions(
+            &mut state,
+            &role_pane_ids,
+            &role_agent_ids,
+            &roles,
+            "/tmp",
+        );
+
+        // Name the cards the way the deck does. Both call sites register each
+        // role's name by PANE right after the insert, and the render loop then
+        // copies it onto every session on that pane — so a duplicate session
+        // is a second card under the same role name, which is what CI showed.
+        let mut ui = default_ui();
+        for (pane_id, role) in role_pane_ids.iter().zip(roles.iter()) {
+            ui.pane_display_names
+                .insert(pane_id.clone(), role.name.clone());
+        }
+        for (session_id, session) in &state.sessions {
+            if let Some(pane_id) = session.pane_id.as_ref()
+                && let Some(name) = ui.pane_display_names.get(pane_id).cloned()
+            {
+                ui.display_names.insert(session_id.clone(), name);
+            }
+        }
+
+        let whole_deck = render_deck(&state, &mut ui, None);
+        let early_sessions = sessions_on(&state, EARLY_PANE);
+        let quiet_sessions = sessions_on(&state, QUIET_PANE);
+
+        // (3) One card per pane.
+        assert_eq!(
+            early_sessions.len(),
+            1,
+            "issue #806: a hook event that reached the deck before the role \
+             pane's placeholder was inserted must leave that pane with \
+             exactly ONE session (one card) once \
+             `insert_role_placeholder_sessions` has run — the insert must \
+             skip or adopt the session already on the pane, not add a \
+             placeholder beside it. Found {} on pane {EARLY_PANE}: \
+             {early_sessions:#?}\nrendered deck:\n{whole_deck}",
+            early_sessions.len()
+        );
+        assert_eq!(
+            quiet_sessions.len(),
+            1,
+            "the role pane that had NO early hook must still get its one \
+             placeholder card — handling an occupied pane must not stop the \
+             insert loop from reaching the panes after it. Found {} on pane \
+             {QUIET_PANE}: {quiet_sessions:#?}\nrendered deck:\n{whole_deck}",
+            quiet_sessions.len()
+        );
+        assert_eq!(
+            whole_deck.matches(EARLY_ROLE).count(),
+            1,
+            "issue #806: the deck must draw exactly one {EARLY_ROLE:?} card; \
+             got:\n{whole_deck}"
+        );
+        assert_eq!(
+            whole_deck.matches(QUIET_ROLE).count(),
+            1,
+            "the deck must draw exactly one {QUIET_ROLE:?} card; \
+             got:\n{whole_deck}"
+        );
+
+        // (4) The surviving card is the agent's, not an empty slot: the role's
+        // name together with the status its hook reported.
+        let early_card = render_deck(&state, &mut ui, Some(EARLY_PANE));
+        assert!(
+            early_card.contains(EARLY_ROLE),
+            "the early pane's one card must carry its role name \
+             {EARLY_ROLE:?}; got:\n{early_card}"
+        );
+        assert!(
+            early_card.contains("Idle"),
+            "the early pane's one card must show the `Idle` its agent's \
+             SessionStart reported; got:\n{early_card}"
+        );
+        assert!(
+            !early_card.contains("No agent"),
+            "the early pane's agent HAS reported, so its one card must not \
+             read the genuinely-empty 'No agent' placeholder copy; \
+             got:\n{early_card}"
+        );
+        assert!(
+            !early_card.contains("Starting…"),
+            "the early pane's agent HAS reported, so its one card must not \
+             read the awaiting-report 'Starting…' placeholder copy — the \
+             SessionStart it would be waiting for was already consumed and \
+             will not be sent again; got:\n{early_card}"
+        );
+    }
+
+    /// Scenario: `dot-agent-deck wrap`'s fork-time `SessionStart` for an
+    /// orchestration role pane reaches the deck BEFORE the deck has inserted
+    /// that pane's placeholder card, and only then does the production
+    /// `insert_role_placeholder_sessions` run. The pane must end up with one
+    /// card reading its role name and `Starting…`, in exactly the state the
+    /// same two inputs produce when the placeholder is inserted first.
+    #[spec("dashboard/placeholder/015")]
+    #[test]
+    fn dashboard_placeholder_015_wrapper_start_before_role_placeholder_leaves_one_starting_card() {
+        // Issue #806, wrapper-origin half. `wrap` emits a `SessionStart` the
+        // instant its child is forked, which makes it the likeliest event to
+        // beat the deck's placeholder insert. Unlike the real agent hook
+        // `dashboard/placeholder/014` covers, this one is BOOT PROVENANCE: it
+        // creates an untyped session and resolves nothing
+        // (`dashboard/placeholder/009`/`013`), so the card that survives must
+        // still be AWAITING the agent's report — a `Starting…` card, not the
+        // genuinely-empty `No agent` one the event would leave on its own, and
+        // not two cards.
+        //
+        // The expected state is not asserted from first principles: it is
+        // whatever the placeholder-first order already produces for the same
+        // two inputs, built right here as the reference. The fix is
+        // order-independence, so that is the thing pinned.
+        const EARLY_PANE: &str = "1";
+        const QUIET_PANE: &str = "2";
+        // Not `orchestrator` / `worker`: the deck's own title row reads
+        // `worker-deck`, which would be counted as a card below.
+        const EARLY_ROLE: &str = "role-alpha";
+        const QUIET_ROLE: &str = "role-beta";
+        const WRAPPER_SESSION: &str = "wrapper-fork-early";
+        const WRAPPER_MODEL: &str = "gpt-5.1-codex";
+
+        // Everything the deck stamps from its own clock below is at or after
+        // this instant; the event is stamped an hour BEFORE it. That is what
+        // lets the two timestamps be compared across the two orders: whichever
+        // input arrives first, the card's `started_at` and `last_activity`
+        // must be the deck's insert time, never the producer's hour-old stamp.
+        let test_start = Utc::now();
+
+        /// The wrapper's fork-time `SessionStart`, as `Emitter` builds it: the
+        /// wrapper's own session id, the agent type it was launched for, the
+        /// pane and the daemon's agent id from its environment, and the
+        /// fork-time origin marker.
+        fn wrapper_fork_start() -> AgentEvent {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+            AgentEvent {
+                session_id: WRAPPER_SESSION.to_string(),
+                agent_type: AgentType::Codex,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some("/tmp".to_string()),
+                // Producer-supplied, and deliberately stale — see `test_start`.
+                timestamp: Utc::now() - chrono::Duration::hours(1),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(EARLY_PANE.to_string()),
+                agent_id: Some("d-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: Some(WRAPPER_MODEL.to_string()),
+            }
+        }
+
+        /// The production placeholder insert for the two-role orchestration.
+        fn insert_placeholders(state: &mut AppState) {
+            let role_pane_ids = vec![EARLY_PANE.to_string(), QUIET_PANE.to_string()];
+            let role_agent_ids = vec![Some("d-1".to_string()), Some("d-2".to_string())];
+            let roles: Vec<OrchestrationRoleConfig> = [(EARLY_ROLE, true), (QUIET_ROLE, false)]
+                .into_iter()
+                .map(|(name, start)| OrchestrationRoleConfig {
+                    name: name.to_string(),
+                    command: "codex".to_string(),
+                    agent: None,
+                    start,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                })
+                .collect();
+            insert_role_placeholder_sessions(
+                state,
+                &role_pane_ids,
+                &role_agent_ids,
+                &roles,
+                "/tmp",
+            );
+        }
+
+        /// A session as the map holds it: its key plus the fields a card is
+        /// built from.
+        #[derive(Debug, PartialEq)]
+        struct Card {
+            key: String,
+            session_id: String,
+            agent_type: AgentType,
+            agent_id: Option<String>,
+            status: SessionStatus,
+            expects_agent_report: bool,
+            agent_report_activity_seen: bool,
+            cwd: Option<String>,
+            display_name: Option<String>,
+            model: Option<String>,
+            outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
+            /// `ActiveTool` has no `PartialEq`; its `Debug` form is compared.
+            active_tool: String,
+            tool_count: u32,
+            first_prompts: Vec<String>,
+            last_user_prompt: Option<String>,
+            /// One entry per journalled event, so the journal's length is
+            /// compared along with the id each event carries.
+            journal_session_ids: Vec<String>,
+            /// Whether each timestamp came from the deck's clock (at or after
+            /// `test_start`) rather than from the event's hour-old stamp. The
+            /// instants themselves differ between two runs by construction.
+            started_at_is_deck_time: bool,
+            last_activity_is_deck_time: bool,
+        }
+
+        /// Every session on `pane`, sorted by key.
+        fn cards_on(state: &AppState, pane: &str, test_start: DateTime<Utc>) -> Vec<Card> {
+            let mut found: Vec<Card> = state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.pane_id.as_deref() == Some(pane))
+                .map(|(key, session)| Card {
+                    key: key.clone(),
+                    session_id: session.session_id.clone(),
+                    agent_type: session.agent_type.clone(),
+                    agent_id: session.agent_id.clone(),
+                    status: session.status.clone(),
+                    expects_agent_report: session.expects_agent_report,
+                    agent_report_activity_seen: session.agent_report_activity_seen,
+                    cwd: session.cwd.clone(),
+                    display_name: session.display_name.clone(),
+                    model: session.model.clone(),
+                    outstanding_delegation: session.outstanding_delegation.clone(),
+                    active_tool: format!("{:?}", session.active_tool),
+                    tool_count: session.tool_count,
+                    first_prompts: session.first_prompts.clone(),
+                    last_user_prompt: session.last_user_prompt.clone(),
+                    journal_session_ids: session
+                        .recent_events
+                        .iter()
+                        .map(|event| event.session_id.clone())
+                        .collect(),
+                    started_at_is_deck_time: session.started_at >= test_start,
+                    last_activity_is_deck_time: session.last_activity >= test_start,
+                })
+                .collect();
+            found.sort_by(|a, b| a.key.cmp(&b.key));
+            found
+        }
+
+        /// Name the cards the way the deck does (by pane, copied onto every
+        /// session on it) and draw the dashboard, optionally scoped to the
+        /// cards of one pane.
+        fn render_deck(state: &AppState, only_pane: Option<&str>) -> String {
+            let mut ui = default_ui();
+            for (pane_id, role) in [(EARLY_PANE, EARLY_ROLE), (QUIET_PANE, QUIET_ROLE)] {
+                ui.pane_display_names
+                    .insert(pane_id.to_string(), role.to_string());
+            }
+            for (session_id, session) in &state.sessions {
+                if let Some(pane_id) = session.pane_id.as_ref()
+                    && let Some(name) = ui.pane_display_names.get(pane_id).cloned()
+                {
+                    ui.display_names.insert(session_id.clone(), name);
+                }
+            }
+            let backend = TestBackend::new(120, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut filtered = filter_sessions(state, &ui);
+            if let Some(pane) = only_pane {
+                filtered.retain(|(_, session)| session.pane_id.as_deref() == Some(pane));
+            }
+            terminal
+                .draw(|frame| {
+                    let noop =
+                        crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                    let tab_view = ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                        zoomed: false,
+                    };
+                    let tab_bar =
+                        TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                    let layout = compute_frame_layout(
+                        frame.area(),
+                        &tab_view,
+                        &tab_bar,
+                        &[],
+                        PaneLayout::Stacked,
+                        None,
+                        1,
+                    );
+                    render_frame(
+                        frame, state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                        &layout,
+                    )
+                })
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+        }
+
+        // The reference: the order that has always had defined behaviour.
+        let mut placeholder_first = AppState::default();
+        insert_placeholders(&mut placeholder_first);
+        placeholder_first.apply_event(wrapper_fork_start());
+        let reference = cards_on(&placeholder_first, EARLY_PANE, test_start);
+        assert_eq!(
+            reference.len(),
+            1,
+            "setup: the placeholder-first order must leave one session on the \
+             role pane, or it is no reference to converge on; got {reference:#?}"
+        );
+
+        // The order under test: the wrapper's start arrives first, with no
+        // `register_pane` and no placeholder yet.
+        let mut hook_first = AppState::default();
+        hook_first.apply_event(wrapper_fork_start());
+        let before_insert = cards_on(&hook_first, EARLY_PANE, test_start);
+        assert_eq!(
+            before_insert.len(),
+            1,
+            "setup: the early wrapper SessionStart must have created exactly \
+             one session on the role pane before any placeholder exists, or \
+             this test is not exercising the hook-before-placeholder \
+             ordering; got {before_insert:#?}"
+        );
+        assert_eq!(
+            before_insert[0].key, WRAPPER_SESSION,
+            "setup: that session must live under the wrapper's own session \
+             id, not the pane-derived key — the differing-key shape issue \
+             #806 is about; got {before_insert:#?}"
+        );
+        insert_placeholders(&mut hook_first);
+
+        let whole_deck = render_deck(&hook_first, None);
+        let early = cards_on(&hook_first, EARLY_PANE, test_start);
+        let quiet = cards_on(&hook_first, QUIET_PANE, test_start);
+
+        // One card per pane.
+        assert_eq!(
+            early.len(),
+            1,
+            "issue #806: a wrapper boot SessionStart that reached the deck \
+             before the role pane's placeholder must leave that pane with \
+             exactly ONE session once `insert_role_placeholder_sessions` has \
+             run. Found {} on pane {EARLY_PANE}: {early:#?}\nrendered \
+             deck:\n{whole_deck}",
+            early.len()
+        );
+        assert_eq!(
+            quiet.len(),
+            1,
+            "the role pane that had NO early hook must still get its one \
+             placeholder card. Found {} on pane {QUIET_PANE}: \
+             {quiet:#?}\nrendered deck:\n{whole_deck}",
+            quiet.len()
+        );
+        assert_eq!(
+            whole_deck.matches(EARLY_ROLE).count(),
+            1,
+            "issue #806: the deck must draw exactly one {EARLY_ROLE:?} card; \
+             got:\n{whole_deck}"
+        );
+        assert_eq!(
+            whole_deck.matches(QUIET_ROLE).count(),
+            1,
+            "the deck must draw exactly one {QUIET_ROLE:?} card; \
+             got:\n{whole_deck}"
+        );
+
+        // The same card, whichever input arrived first: same key, same
+        // identity, same status, same awaiting-report flags, same journal,
+        // same model and prompt fields, timestamps from the same clock.
+        assert_eq!(
+            early, reference,
+            "issue #806: the role pane's session must be the same whether the \
+             wrapper's boot SessionStart or the placeholder insert arrived \
+             first. hook-first (left) vs placeholder-first (right)"
+        );
+        assert_eq!(
+            early[0].model.as_deref(),
+            Some(WRAPPER_MODEL),
+            "the model the early event reported must survive the adoption; \
+             got {early:#?}"
+        );
+        assert!(
+            early[0].started_at_is_deck_time && early[0].last_activity_is_deck_time,
+            "the adopted card's `started_at` and `last_activity` must be the \
+             deck's own insert time, as a placeholder's are — not the hour-old \
+             stamp the early event supplied, which would backdate the card; \
+             got {early:#?}"
+        );
+
+        // And what a user sees on it: the role, still starting.
+        let early_card = render_deck(&hook_first, Some(EARLY_PANE));
+        let reference_card = render_deck(&placeholder_first, Some(EARLY_PANE));
+        assert!(
+            early_card.contains(EARLY_ROLE),
+            "the early pane's one card must carry its role name \
+             {EARLY_ROLE:?}; got:\n{early_card}"
+        );
+        assert!(
+            early_card.contains("Starting…"),
+            "a wrapper boot SessionStart is not the agent reporting in, so \
+             the early pane's one card must still read 'Starting…' — what the \
+             placeholder-first order shows for the same event; \
+             got:\n{early_card}"
+        );
+        assert!(
+            !early_card.contains("No agent"),
+            "the role's command is a recognized agent CLI, so its one card \
+             must not read the genuinely-empty 'No agent' copy the wrapper's \
+             untyped session would show on its own; got:\n{early_card}"
+        );
+        assert!(
+            reference_card.contains("Starting…") && !reference_card.contains("No agent"),
+            "setup: the placeholder-first order must itself render \
+             'Starting…' for this event, or the expectation above is not the \
+             normal-order state; got:\n{reference_card}"
+        );
+    }
+
+    /// Scenario: An agent's `SessionStart` for an orchestration role pane
+    /// reaches the deck before the pane's placeholder, the production
+    /// `insert_role_placeholder_sessions` then adopts that session, and the
+    /// agent's NEXT event arrives still carrying its own original session id.
+    /// That event must land on the adopted card — one session on the pane,
+    /// under the pane-derived key, showing the new status — for every
+    /// combination of a tagged or untagged early event and a tagged or
+    /// untagged later one.
+    #[spec("dashboard/placeholder/016")]
+    #[test]
+    fn dashboard_placeholder_016_later_event_under_original_id_lands_on_the_adopted_card() {
+        // Issue #806 (review F1). Adoption MOVES the early session from the
+        // producer's own key to the pane-derived one, but the producer does not
+        // know that: every later frame it sends still names the ORIGINAL id.
+        // What puts those frames on the moved card is `apply_event`'s reuse
+        // guard, which matches by pane and `agent_id`. If the adoption ever
+        // stops leaving the card in a shape that guard recognises — most
+        // obviously by not stamping the daemon's `agent_id` onto an untagged
+        // early session — the second event mints a fresh session under the
+        // original id and the pane is back to two cards, or the adopted card is
+        // retired and its history lost. `014`/`015` stop at the insert and
+        // would not notice either.
+        const PANE: &str = "1";
+        const PANE_KEY: &str = "pane-1";
+        const AGENT: &str = "d-1";
+        const ORIGINAL_SESSION: &str = "claude-conversation-early";
+
+        fn frame(event_type: EventType, agent_id: Option<&str>) -> AgentEvent {
+            AgentEvent {
+                session_id: ORIGINAL_SESSION.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some("/tmp".to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some(PANE.to_string()),
+                agent_id: agent_id.map(str::to_string),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        fn insert_placeholder(state: &mut AppState) {
+            let roles = vec![OrchestrationRoleConfig {
+                name: "role-alpha".to_string(),
+                command: "claude".to_string(),
+                agent: None,
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            }];
+            insert_role_placeholder_sessions(
+                state,
+                &[PANE.to_string()],
+                &[Some(AGENT.to_string())],
+                &roles,
+                "/tmp",
+            );
+        }
+
+        /// `(key, status, agent_id, journalled event count)` for every session
+        /// in the state, sorted by key.
+        fn cards(state: &AppState) -> Vec<(String, SessionStatus, Option<String>, usize)> {
+            let mut found: Vec<_> = state
+                .sessions
+                .iter()
+                .map(|(key, session)| {
+                    (
+                        key.clone(),
+                        session.status.clone(),
+                        session.agent_id.clone(),
+                        session.recent_events.len(),
+                    )
+                })
+                .collect();
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            found
+        }
+
+        for (early_agent, later_agent) in [
+            (Some(AGENT), Some(AGENT)),
+            (Some(AGENT), None),
+            (None, Some(AGENT)),
+            (None, None),
+        ] {
+            let case = format!("early agent_id {early_agent:?}, later agent_id {later_agent:?}");
+
+            let mut state = AppState::default();
+            state.apply_event(frame(EventType::SessionStart, early_agent));
+            assert_eq!(
+                cards(&state).first().map(|card| card.0.as_str()),
+                Some(ORIGINAL_SESSION),
+                "[{case}] setup: the early SessionStart must have created its \
+                 session under the producer's own id; got {:#?}",
+                cards(&state)
+            );
+            insert_placeholder(&mut state);
+            assert_eq!(
+                cards(&state),
+                vec![(
+                    PANE_KEY.to_string(),
+                    SessionStatus::Idle,
+                    Some(AGENT.to_string()),
+                    1
+                )],
+                "[{case}] setup: the placeholder insert must have adopted the \
+                 early session onto the pane-derived key, carrying the daemon's \
+                 agent id"
+            );
+
+            // The agent carries on under the id it has always used.
+            state.apply_event(frame(EventType::Thinking, later_agent));
+
+            let expected = vec![(
+                PANE_KEY.to_string(),
+                SessionStatus::Thinking,
+                Some(AGENT.to_string()),
+                2,
+            )];
+            assert_eq!(
+                cards(&state),
+                expected,
+                "[{case}] issue #806: a later event still carrying the ORIGINAL \
+                 session id {ORIGINAL_SESSION:?} must land on the adopted card — \
+                 one session, under {PANE_KEY:?}, now `Thinking`, with both \
+                 events in its journal — not mint a second session under the \
+                 original id or replace the card"
+            );
+
+            // And that is exactly where the placeholder-first order puts the
+            // same two events.
+            let mut placeholder_first = AppState::default();
+            insert_placeholder(&mut placeholder_first);
+            placeholder_first.apply_event(frame(EventType::SessionStart, early_agent));
+            placeholder_first.apply_event(frame(EventType::Thinking, later_agent));
+            assert_eq!(
+                cards(&placeholder_first),
+                expected,
+                "[{case}] setup: the placeholder-first order must reach the \
+                 same state from the same two events, or the expectation above \
+                 is not the normal-order one"
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
