@@ -1985,6 +1985,19 @@ fn pump_reader(
     }
 }
 
+/// Issue #825: the answer of
+/// [`AgentPtyRegistry::bind_delegation_worker_agent_id_or_sweep_exited_reporting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitedWorkerBind {
+    /// The worker is alive (or its entry is gone): the delegation is bound and
+    /// nothing was swept.
+    Live,
+    /// The worker had already exited. `reported` is true when an exit sweep
+    /// took a worker-side record for it, so the orchestrator has been (or is
+    /// being) told it exited without work-done.
+    Exited { reported: bool },
+}
+
 /// Snapshot of the writer + bus needed to attach a streaming client.
 /// Returned by [`AgentPtyRegistry::subscribe`].
 ///
@@ -3673,6 +3686,16 @@ struct DelegationTracker {
     /// marks. Lets an in-flight wait (the M1 readiness gate) abandon promptly
     /// instead of sleeping out its remainder against a target that is gone.
     close_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+    /// Issue #825: agent ids whose exit sweep took a WORKER-side record, i.e.
+    /// for which "the orchestrator is told this worker exited without
+    /// work-done" has been (or is being) taken care of by whichever side swept.
+    /// Written under the same lock as the drain, so a dead-on-arrival
+    /// replacement's bind can tell "the reader thread already reported it" from
+    /// "nothing was ever registered for it" (see
+    /// [`AgentPtyRegistry::bind_delegation_worker_agent_id_or_sweep_exited_reporting`]).
+    /// Consumed by that bind; entries whose agent is no longer registered are
+    /// pruned on every insert, so it cannot grow past the live agent set.
+    exit_reported_agents: HashSet<String>,
 }
 
 /// PRD #249 M3 review (finding B4/S4): one armed silent-worker watch — the
@@ -4817,6 +4840,7 @@ impl AgentPtyRegistry {
     /// when the bind was made. `true` means the agent the caller is about to
     /// deliver to is gone: nothing can be delivered to it, and any record it
     /// was bound to has been swept, by this call or by its reader thread.
+    #[cfg(test)]
     #[must_use = "`true` means the worker is already gone and nothing can be delivered to it"]
     pub async fn bind_delegation_worker_agent_id_or_sweep_exited(
         self: &Arc<Self>,
@@ -4824,12 +4848,41 @@ impl AgentPtyRegistry {
         seq: Option<u64>,
         worker_agent_id: &str,
     ) -> bool {
+        self.bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+            worker_pane_id,
+            seq,
+            worker_agent_id,
+        )
+        .await
+            != ExitedWorkerBind::Live
+    }
+
+    /// Issue #825: [`Self::bind_delegation_worker_agent_id_or_sweep_exited`]
+    /// with the answer the pi-native caller needs to keep the orchestrator
+    /// informed exactly once.
+    ///
+    /// [`ExitedWorkerBind::Exited`] carries `reported`: whether the
+    /// orchestrator has been told (by this call, or by the worker's reader
+    /// thread, which may have swept first) that this agent exited without
+    /// `work-done`. It is decided from "did ANYONE's exit sweep take a
+    /// worker-side record for this agent", recorded under the tracker lock by
+    /// [`Self::sweep_delegations_on_exit`], never from "did THIS call's sweep
+    /// find something": a reader-first interleaving leaves this call's own
+    /// sweep empty while the notice is already on its way. When `reported` is
+    /// `false` nobody swept a record, so nobody has written or will write an
+    /// exited notice for this agent and the caller owes the orchestrator one.
+    pub async fn bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        seq: Option<u64>,
+        worker_agent_id: &str,
+    ) -> ExitedWorkerBind {
         if let Some(seq) = seq {
             self.bind_delegation_worker_agent_id(worker_pane_id, seq, worker_agent_id);
         }
         let Some(exited_pane_id_env) = self.pane_id_env_if_exited_while_registered(worker_agent_id)
         else {
-            return false;
+            return ExitedWorkerBind::Live;
         };
         if let Some(pane_id_env) = exited_pane_id_env.filter(|stored| stored == worker_pane_id) {
             let swept = self.sweep_delegations_on_exit(&pane_id_env, worker_agent_id);
@@ -4843,7 +4896,14 @@ impl AgentPtyRegistry {
                     .await;
             }
         }
-        true
+        // Consumes the marker the sweep above (or the reader thread's) left.
+        let reported = self
+            .delegations
+            .lock()
+            .unwrap()
+            .exit_reported_agents
+            .remove(worker_agent_id);
+        ExitedWorkerBind::Exited { reported }
     }
 
     /// Issue #815: `Some` when `agent_id`'s child has reached EOF while its
@@ -5910,7 +5970,21 @@ impl AgentPtyRegistry {
             Self::drain_silence_watches_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
         let swept =
             Self::drain_delegations_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
+        // Issue #825: record, atomically with the drain, that a worker-side
+        // record was taken for this agent (the same filter both callers apply
+        // before writing the exited notice).
+        let took_worker_record = swept
+            .iter()
+            .any(|(_, record)| record.orchestrator_pane_id != pane_id);
+        if took_worker_record {
+            tracker
+                .exit_reported_agents
+                .insert(exited_agent_id.to_string());
+        }
         drop(tracker);
+        if took_worker_record {
+            self.prune_exit_reported_agents();
+        }
         if cancelled_watches > 0 || !swept.is_empty() {
             tracing::debug!(
                 pane_id = %pane_id,
@@ -5929,6 +6003,19 @@ impl AgentPtyRegistry {
             self.fire_delegation_retired(worker_pane_id);
         }
         swept.into_iter().map(|(_, record)| record).collect()
+    }
+
+    /// Issue #825: drop [`DelegationTracker::exit_reported_agents`] entries
+    /// whose agent is no longer registered. Takes the two locks one after the
+    /// other, never nested.
+    fn prune_exit_reported_agents(&self) {
+        let registered: HashSet<String> =
+            self.inner.lock().unwrap().agents.keys().cloned().collect();
+        self.delegations
+            .lock()
+            .unwrap()
+            .exit_reported_agents
+            .retain(|id| registered.contains(id));
     }
 
     /// Whether `agent_id` still names a live entry in the
@@ -16298,6 +16385,74 @@ mod spawn_tests {
             &["worker".to_string()],
             "both sides swept, so exactly one retirement must be announced"
         );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #825: the reader thread swept first, so this call's own sweep is
+    /// empty, yet the orchestrator IS being told; the reporting bind must say
+    /// `reported: true` so the pi-native caller adds no "never came up" notice.
+    #[tokio::test]
+    async fn bind_or_sweep_exited_reporting_counts_a_reader_thread_sweep_as_reported() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let orchestrator = spawn_orchestrator_stand_in(&reg, "orch").await;
+        let worker = spawn_worker_that_exits_on_a_line(&reg, "worker");
+        let armed = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", &orchestrator, None)
+            .expect("arm delegation");
+        let bound = reg
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+                "worker",
+                Some(armed.seq),
+                &worker,
+            )
+            .await;
+        assert_eq!(bound, ExitedWorkerBind::Live, "precondition: alive at bind");
+        end_worker(&reg, "worker", &worker).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline
+            && reg
+                .delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let bound = reg
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+                "worker",
+                Some(armed.seq),
+                &worker,
+            )
+            .await;
+
+        assert_eq!(
+            bound,
+            ExitedWorkerBind::Exited { reported: true },
+            "the reader thread's sweep took the record, so the exit is already reported"
+        );
+        assert_eq!(settled_worker_exited_notices(&reg, &orchestrator).await, 1);
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #825: nothing was armed for the dead worker, so no sweep took a
+    /// record and the caller owes the orchestrator a notice (`reported: false`).
+    #[tokio::test]
+    async fn bind_or_sweep_exited_reporting_says_unreported_when_no_record_was_swept() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let exited_agent = spawn_and_await_natural_exit(&reg, Some("worker")).await;
+
+        let bound = reg
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+                "worker",
+                None,
+                &exited_agent,
+            )
+            .await;
+
+        assert_eq!(bound, ExitedWorkerBind::Exited { reported: false });
 
         reg.shutdown_all();
     }

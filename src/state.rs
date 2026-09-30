@@ -3363,6 +3363,82 @@ fn release_reserved_silence_watch(
     }
 }
 
+/// The "delegated worker never came up" notice (issue #825: shared by the
+/// injection path's dead-replacement arm and the pi-native dead-on-arrival
+/// exit, so both tell the orchestrator the same thing the same way).
+///
+/// A GUARDED write: the orchestrator's identity is resolved immediately before
+/// the call and the post-lock re-validation refuses a pane that is mid-close or
+/// re-homed into a different orchestration (PRD #249 finding B3), so one
+/// orchestration's diagnostics never land in a stranger's scrollback.
+///
+/// Issue #617: an unresolved orchestrator (`None` from `pane_current_agent_id`)
+/// is treated as no verified target and the notice is dropped into the log —
+/// handing the `Option` straight to `write_notice_guarded` would skip the
+/// identity gate and write to whoever inherited the pane id.
+async fn write_dead_replacement_notice(
+    registry: &Arc<AgentPtyRegistry>,
+    worker_pane_id: &str,
+    role: &str,
+    orchestrator_pane_id: &str,
+    orchestration: Option<&OrchestrationIdentity>,
+) {
+    let notice = compose_respawn_no_live_worker_notice(worker_pane_id);
+    let notice_registry = Arc::clone(registry);
+    let notice_pane = orchestrator_pane_id.to_string();
+    let notice_orchestration = orchestration.cloned();
+    let orchestrator_agent_id = registry.pane_current_agent_id(orchestrator_pane_id);
+    let notice_outcome = match orchestrator_agent_id.as_deref() {
+        Some(orchestrator_agent_id) => {
+            registry
+                .write_notice_guarded(
+                    orchestrator_pane_id,
+                    &notice,
+                    orchestrator_agent_id,
+                    || async move {
+                        if notice_registry.is_pane_closing(&notice_pane) {
+                            return false;
+                        }
+                        orchestration_still_matches(
+                            notice_orchestration.as_ref(),
+                            notice_registry.pane_orchestration(&notice_pane).as_ref(),
+                        )
+                    },
+                )
+                .await
+        }
+        None => Ok(crate::agent_pty::GuardedSend::NoLiveTarget),
+    };
+    match notice_outcome {
+        Ok(crate::agent_pty::GuardedSend::Applied) => {}
+        // Issue #617 (reviewer S1 / auditor finding 2): `Ambiguous` is NOT a
+        // refusal. Some notice bytes DID reach the authorized agent and the
+        // trailing LF did not complete. Not retried: a repeat would append the
+        // whole notice to the fragment already there.
+        Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
+            pane_id = %orchestrator_pane_id,
+            role = %role,
+            "delegate: the dead-replacement notice was written only partially \
+             (ambiguous); not retried, so the orchestrator pane may show a \
+             truncated notice"
+        ),
+        Ok(refused) => warn!(
+            pane_id = %orchestrator_pane_id,
+            role = %role,
+            outcome = ?refused,
+            "delegate: the dead-replacement notice was refused; the failure \
+             stays in this log only"
+        ),
+        Err(write_err) => warn!(
+            pane_id = %orchestrator_pane_id,
+            role = %role,
+            error = %write_err,
+            "delegate: failed to surface the dead-replacement notice in the \
+             orchestrator pane scrollback"
+        ),
+    }
+}
+
 /// Issue #815: the first thing the pi-native seed delivery does with the
 /// replacement `dispatch_one_owned` has just respawned — bind the delegation to
 /// it, and find out whether it is still there to be delivered to.
@@ -3390,45 +3466,47 @@ fn release_reserved_silence_watch(
 ///   through [`release_reserved_silence_watch`]. Arming it already superseded
 ///   the PREVIOUS generation's watch, and that half of issue #687 stands.
 ///
-/// **The orchestrator is told once, and not by this function.** The "exited
-/// without work-done" notice is the exit sweep's, written when the record bound
-/// to the replacement is drained — by the registry call above or by the
-/// replacement's own reader thread, whichever reaches the tracker first, never
-/// both. By the time that call returns `true` the record is already gone, so
-/// the retirement the release below attempts finds nothing to take and
-/// announces nothing, and no dead-replacement notice is written here on top of
-/// it: the injection path's `compose_respawn_no_live_worker_notice` has no
-/// counterpart on this exit on purpose.
-///
-/// What that leaves unannounced, deliberately: a delegate with no record of its
-/// own to sweep — `delegation_seq` is `None` (the idle-worker detector is off,
-/// the orchestrator had no live agent at arm time, or a pane was mid-close), or
-/// a newer delegate has already replaced the record — produces no notice here,
-/// exactly as it produced none before this exit existed. Its commission is
-/// still released, which is the part that must not depend on the detector.
+/// **The orchestrator is told exactly once (issue #825).** The "exited without
+/// work-done" notice is the exit sweep's, written when the record bound to the
+/// replacement is drained — by the registry call above or by the replacement's
+/// own reader thread, whichever reaches the tracker first, never both. The
+/// registry reports whether ANY exit sweep took a worker-side record for the
+/// agent (not merely whether this call's did — a reader-first interleaving
+/// leaves this call's sweep empty), and when one did, that notice is the whole
+/// story and nothing more is written here. When none did — `delegation_seq` is
+/// `None` (the idle-worker detector is off, the orchestrator had no live agent
+/// at arm time, or a pane was mid-close), or a newer delegate has already
+/// replaced the record — nobody will tell the orchestrator, so this function
+/// writes the injection path's "never came up" notice through
+/// [`write_dead_replacement_notice`]. Either way the commission is released,
+/// which is the part that must not depend on the detector.
 ///
 /// Returns `false` for a live replacement, having bound it and changed nothing
 /// else; the dispatch carries on to the stash.
 #[must_use = "`true` means the no-delivery exit has been taken and the dispatch must return \
               without stashing a seed"]
+#[allow(clippy::too_many_arguments)]
 async fn native_seed_replacement_already_exited(
     registry: &Arc<AgentPtyRegistry>,
     worker_pane_id: &str,
     role: &str,
+    orchestrator_pane_id: &str,
+    orchestration: Option<&OrchestrationIdentity>,
     delegation_seq: Option<u64>,
     replacement_agent_id: &str,
     reserved_silence: &mut Option<crate::agent_pty::ArmedSilenceWatch>,
 ) -> bool {
-    if !registry
-        .bind_delegation_worker_agent_id_or_sweep_exited(
+    let reported = match registry
+        .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
             worker_pane_id,
             delegation_seq,
             replacement_agent_id,
         )
         .await
     {
-        return false;
-    }
+        crate::agent_pty::ExitedWorkerBind::Live => return false,
+        crate::agent_pty::ExitedWorkerBind::Exited { reported } => reported,
+    };
     const REASON: &str =
         "the pi-native clear=true replacement worker exited before its seed was stashed";
     warn!(
@@ -3436,9 +3514,18 @@ async fn native_seed_replacement_already_exited(
         pane_id = %worker_pane_id,
         new_agent_id = %replacement_agent_id,
         "delegate: the pi-native clear=true replacement worker had already exited when its \
-         delegation was bound to it; the exit sweep reports it to the orchestrator, and the \
-         seed stash is skipped"
+         delegation was bound to it; the seed stash is skipped"
     );
+    if !reported {
+        write_dead_replacement_notice(
+            registry,
+            worker_pane_id,
+            role,
+            orchestrator_pane_id,
+            orchestration,
+        )
+        .await;
+    }
     release_undelivered_commission(registry, worker_pane_id, role, delegation_seq, REASON);
     release_reserved_silence_watch(registry, worker_pane_id, reserved_silence.take(), REASON);
     true
@@ -5915,9 +6002,10 @@ fn write_work_done_summary(
 ///    makes no guarded write that would say so, so it asks outright, at the
 ///    moment it binds the delegation to the replacement
 ///    ([`native_seed_replacement_already_exited`]), and leaves here when the
-///    answer is "already gone". It writes no notice of its own, unlike exit 3:
-///    the agent-exit sweep that retires the bound record is what tells the
-///    orchestrator, and a second notice here would tell it twice.
+///    answer is "already gone". The orchestrator is told exactly once (issue
+///    #825): by the agent-exit sweep's "exited without work-done" notice when a
+///    sweep took a bound record, otherwise by exit 3's "never came up" notice,
+///    which that helper writes itself.
 ///
 /// # The silent-worker watch's no-delivery invariant
 ///
@@ -6371,6 +6459,8 @@ async fn dispatch_one_owned(
                         &registry,
                         &pane_id,
                         &target_role,
+                        &orchestrator_pane_id,
+                        orchestration.as_ref(),
                         delegation_seq,
                         &new_agent_id,
                         &mut reserved_silence,
@@ -6559,69 +6649,14 @@ async fn dispatch_one_owned(
                     // write to whoever had inherited the pane id. An unresolved
                     // orchestrator is now treated as no verified target and the
                     // notice is dropped into this log instead.
-                    let notice = compose_respawn_no_live_worker_notice(&pane_id);
-                    let notice_registry = Arc::clone(&registry);
-                    let notice_pane = orchestrator_pane_id.clone();
-                    let notice_orchestration = orchestration.clone();
-                    let orchestrator_agent_id =
-                        registry.pane_current_agent_id(&orchestrator_pane_id);
-                    let notice_outcome = match orchestrator_agent_id.as_deref() {
-                        Some(orchestrator_agent_id) => {
-                            registry
-                                .write_notice_guarded(
-                                    &orchestrator_pane_id,
-                                    &notice,
-                                    orchestrator_agent_id,
-                                    || async move {
-                                        if notice_registry.is_pane_closing(&notice_pane) {
-                                            return false;
-                                        }
-                                        orchestration_still_matches(
-                                            notice_orchestration.as_ref(),
-                                            notice_registry
-                                                .pane_orchestration(&notice_pane)
-                                                .as_ref(),
-                                        )
-                                    },
-                                )
-                                .await
-                        }
-                        None => Ok(crate::agent_pty::GuardedSend::NoLiveTarget),
-                    };
-                    match notice_outcome {
-                        Ok(crate::agent_pty::GuardedSend::Applied) => {}
-                        // Issue #617 (reviewer S1 / auditor finding 2): `Ambiguous`
-                        // is NOT a refusal and must not be logged as one. It means
-                        // some notice bytes DID reach the authorized agent and the
-                        // trailing LF did not complete, so "the failure stays in
-                        // this log only" would be false — the operator can see a
-                        // truncated notice in the scrollback. Not retried, for the
-                        // same reason the submit sites do not retry it: a repeat
-                        // would append the whole notice to the fragment already
-                        // there. A notice appends an LF and never submits, so the
-                        // fragment cannot become a turn on its own.
-                        Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
-                            pane_id = %orchestrator_pane_id,
-                            role = %target_role,
-                            "delegate: the dead-replacement notice was written only partially \
-                             (ambiguous); not retried, so the orchestrator pane may show a \
-                             truncated notice"
-                        ),
-                        Ok(refused) => warn!(
-                            pane_id = %orchestrator_pane_id,
-                            role = %target_role,
-                            outcome = ?refused,
-                            "delegate: the dead-replacement notice was refused; the failure \
-                             stays in this log only"
-                        ),
-                        Err(write_err) => warn!(
-                            pane_id = %orchestrator_pane_id,
-                            role = %target_role,
-                            error = %write_err,
-                            "delegate: failed to surface the dead-replacement notice in the \
-                             orchestrator pane scrollback"
-                        ),
-                    }
+                    write_dead_replacement_notice(
+                        &registry,
+                        &pane_id,
+                        &target_role,
+                        &orchestrator_pane_id,
+                        orchestration.as_ref(),
+                    )
+                    .await;
                     // Commission audit exit 3: nothing was delivered and the
                     // worker is gone, so the debt has to go with it — otherwise
                     // the next completion on this pane id is laundered into a
@@ -15895,6 +15930,8 @@ clear = false
                 &registry,
                 WORKER_PANE,
                 ROLE,
+                ORCH_PANE,
+                None,
                 Some(armed.seq),
                 &replacement,
                 &mut reserved_silence,
@@ -15977,6 +16014,8 @@ clear = false
                 &registry,
                 WORKER_PANE,
                 ROLE,
+                ORCH_PANE,
+                None,
                 Some(armed.seq),
                 &replacement,
                 &mut reserved_silence,
@@ -16050,6 +16089,8 @@ clear = false
                 &registry,
                 WORKER_PANE,
                 ROLE,
+                ORCH_PANE,
+                None,
                 None,
                 &replacement,
                 &mut reserved_silence,
@@ -16107,6 +16148,8 @@ clear = false
                 &registry,
                 WORKER_PANE,
                 ROLE,
+                ORCH_PANE,
+                None,
                 Some(older.seq),
                 &replacement,
                 &mut reserved_silence,
