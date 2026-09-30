@@ -306,3 +306,216 @@ fn word_token_predicate_respects_identifier_boundaries() {
         "`beta` must not match as a substring of the longer identifier `beta-agent`"
     );
 }
+
+/// Build the grid an Orchestration tab paints for `cards` (top to bottom), with
+/// the embedded pane of `focused` drawn in the pane column to their right.
+///
+/// The shape is the one `session/restore/008` failed on in CI (issue #809), at
+/// a reduced width: a tab bar on row 0; on row 1 the deck's own chrome line
+/// with the focused pane's header — `┌<role>───…┐` — beside it, ABOVE every
+/// card; then one three-row card per role (numbered top border, the role name
+/// on the first body row with no pad, bottom border), the focused role's card
+/// drawn in the thick weight. Built rather than pasted so every row is a real
+/// rectangle by construction and the same deck can be re-drawn in a different
+/// order or with a different role focused.
+fn orchestration_tab_grid(cards: &[&str], focused: &str) -> String {
+    const CARD_INNER: usize = 26;
+    const PANE_INNER: usize = 20;
+    let plain = common::BORDER_WEIGHTS[0];
+    let thick = common::BORDER_WEIGHTS[1];
+    let pad = |text: &str, width: usize, fill: char| -> String {
+        let len = text.chars().count();
+        assert!(
+            len <= width,
+            "{text:?} does not fit a {width}-column fixture span"
+        );
+        let mut padded = text.to_string();
+        padded.extend(std::iter::repeat_n(fill, width - len));
+        padded
+    };
+
+    let mut sidebar = vec![pad(
+        &format!(" worker-deck — {} session(s)", cards.len()),
+        CARD_INNER + 2,
+        ' ',
+    )];
+    for (index, name) in cards.iter().enumerate() {
+        let weight = if *name == focused { thick } else { plain };
+        sidebar.push(format!(
+            "{}{}{}",
+            weight.top_left,
+            pad(&format!(" {} ", index + 1), CARD_INNER, weight.horizontal),
+            weight.top_right
+        ));
+        sidebar.push(format!(
+            "{}{}{}",
+            weight.vertical,
+            pad(name, CARD_INNER, ' '),
+            weight.vertical
+        ));
+        sidebar.push(format!(
+            "{}{}{}",
+            weight.bottom_left,
+            pad("", CARD_INNER, weight.horizontal),
+            weight.bottom_right
+        ));
+    }
+
+    let last = sidebar.len() - 1;
+    let mut rows = vec![" Dashboard │ tdd-cycle [×]".to_string()];
+    rows.extend(sidebar.iter().enumerate().map(|(row, left)| {
+        let pane = if row == 0 {
+            format!(
+                "{}{}{}",
+                plain.top_left,
+                pad(focused, PANE_INNER, plain.horizontal),
+                plain.top_right
+            )
+        } else if row == last {
+            format!(
+                "{}{}{}",
+                plain.bottom_left,
+                pad("", PANE_INNER, plain.horizontal),
+                plain.bottom_right
+            )
+        } else {
+            format!(
+                "{}{}{}",
+                plain.vertical,
+                pad("", PANE_INNER, ' '),
+                plain.vertical
+            )
+        };
+        format!("{left}{pane}")
+    }));
+    rows.join("\n")
+}
+
+/// Scenario: Draw the Orchestration tab `session/restore/008` failed on in CI —
+/// cards `orchestrator`, `coder`, `reviewer` in saved order, with `reviewer`
+/// the focused role so its embedded pane's header names it on row 1, above
+/// every card. The first-row-with-that-text lookup the test used to rely on
+/// must report row 1 for `reviewer` (the defect, reproduced), while
+/// `common::card_identity_row` must report each role's own card row, for every
+/// choice of focused role.
+#[test]
+fn card_identity_row_reads_the_card_and_never_the_focused_pane_header() {
+    const ROLES: [&str; 3] = ["orchestrator", "coder", "reviewer"];
+
+    let grid = orchestration_tab_grid(&ROLES, "reviewer");
+    let first_row_with_text = |needle: &str| grid.lines().position(|line| line.contains(needle));
+    assert_eq!(
+        first_row_with_text("reviewer"),
+        Some(1),
+        "this fixture must reproduce the failure it guards: the focused pane's header names \
+         `reviewer` on row 1, above every card, which is what a whole-grid text lookup \
+         finds first:\n{grid}"
+    );
+    assert_eq!(
+        first_row_with_text("coder"),
+        Some(6),
+        "…while `coder` is first seen on its own card, so the old lookup read the correctly \
+         ordered deck as `reviewer` (row 1) before `coder` (row 6):\n{grid}"
+    );
+
+    // Whichever role is focused — and so whichever name the pane header
+    // carries, in whichever border weight its card is drawn — every role's row
+    // is its own card's identity row.
+    for focused in ROLES {
+        let grid = orchestration_tab_grid(&ROLES, focused);
+        for (index, role) in ROLES.iter().enumerate() {
+            assert_eq!(
+                common::card_identity_row(&grid, role),
+                Some(3 + 3 * index),
+                "with `{focused}` focused, `{role}` must be located on its own card's first \
+                 body row, not on the pane header:\n{grid}"
+            );
+        }
+    }
+}
+
+/// Scenario: Draw the same Orchestration tab with the `coder` and `reviewer`
+/// cards swapped — the deck a broken restore would paint — once for each
+/// choice of focused role. `common::card_identity_row` must put `reviewer`
+/// above `coder` every time, so an ordering assertion built on it still fails
+/// when the order really is wrong, and is not merely immune to the pane header.
+#[test]
+fn card_identity_row_still_reports_a_genuinely_reversed_deck_as_reversed() {
+    const REVERSED: [&str; 3] = ["orchestrator", "reviewer", "coder"];
+
+    for focused in REVERSED {
+        let grid = orchestration_tab_grid(&REVERSED, focused);
+        let coder = common::card_identity_row(&grid, "coder");
+        let reviewer = common::card_identity_row(&grid, "reviewer");
+        assert_eq!(
+            (reviewer, coder),
+            (Some(6), Some(9)),
+            "with `{focused}` focused, a deck drawn reviewer-before-coder must be READ \
+             reviewer-before-coder — otherwise the saved-order assertion in \
+             `session/restore/008` could no longer fail:\n{grid}"
+        );
+    }
+}
+
+/// Scenario: Run `common::card_identity_row` against the boxes that are NOT a
+/// card for the role asked about: a deck whose focused pane header names a role
+/// that has no card at all, a pane box titled with the role whose first content
+/// row is agent output opening with that same name, a card named `coder-2`
+/// when `coder` is asked for, and a top border with no matching vertical
+/// beneath its right corner. Each must yield `None`, while the `coder-2` card
+/// is still found under its own full name.
+#[test]
+fn card_identity_row_rejects_every_box_that_is_not_that_roles_card() {
+    // The pane header names `reviewer`, but no card does.
+    let header_only = orchestration_tab_grid(&["orchestrator", "coder"], "reviewer");
+    assert!(
+        header_only.contains("┌reviewer"),
+        "the fixture must actually draw the `reviewer` pane header:\n{header_only}"
+    );
+    assert_eq!(
+        common::card_identity_row(&header_only, "reviewer"),
+        None,
+        "a role named ONLY by the focused pane's header has no card, so there is no row to \
+         report:\n{header_only}"
+    );
+
+    // A pane is a box too, and its first content row belongs to the agent —
+    // here a shell prompt that happens to open with the role name. The box's
+    // own title says it is that role's PANE, so it must not be read as a card.
+    const PANE_ECHOING_ITS_ROLE: &str = "\
+┌reviewer──────────┐
+│reviewer $        │
+└──────────────────┘";
+    assert_eq!(
+        common::card_identity_row(PANE_ECHOING_ITS_ROLE, "reviewer"),
+        None,
+        "a box TITLED with the role is that role's embedded pane; its content opening with \
+         the same name does not make it a card:\n{PANE_ECHOING_ITS_ROLE}"
+    );
+
+    // Token boundary: `coder` is not the card named `coder-2`.
+    let suffixed = orchestration_tab_grid(&["orchestrator", "coder-2", "reviewer"], "reviewer");
+    assert_eq!(
+        common::card_identity_row(&suffixed, "coder"),
+        None,
+        "`coder` must not match the longer role name `coder-2`:\n{suffixed}"
+    );
+    assert_eq!(
+        common::card_identity_row(&suffixed, "coder-2"),
+        Some(6),
+        "…and that card must still be found under its own full name:\n{suffixed}"
+    );
+
+    // Not a rectangle: the row below the border closes three columns short of
+    // the border's own right corner, so this is two unrelated runs of glyphs —
+    // a torn frame, say — rather than one card.
+    const RAGGED: &str = "\
+┌ 1 ───────┐
+│coder   │";
+    assert_eq!(
+        common::card_identity_row(RAGGED, "coder"),
+        None,
+        "a body row with no vertical under the top border's right corner is not that box's \
+         body row:\n{RAGGED}"
+    );
+}

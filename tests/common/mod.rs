@@ -4220,6 +4220,73 @@ pub fn label_in_box_body_row(grid: &str, label: &str) -> bool {
     })
 }
 
+/// Row (0-based, the same row numbering as [`TuiDeck::find_in_grid`]) of the
+/// IDENTITY row of the deck card named `label`, or `None` when no such card is
+/// drawn. When several cards carry the name, the topmost wins.
+///
+/// This is the positional sibling of [`label_in_box_body_row`], for a test
+/// that needs to know WHERE a card is — typically to assert the order two cards
+/// are drawn in — rather than whether it is there. Issue #809: a bare
+/// `find_in_grid("reviewer")` answers "the first row with that text on it",
+/// and on an Orchestration tab the focused role's embedded pane is titled with
+/// its role name on a row ABOVE every card (`┌reviewer────…┐`, beside the
+/// `worker-deck — N session(s)` line). Whenever the focused role was the one
+/// being looked for, the lookup returned the pane header's row and an ordering
+/// assertion built on it failed against a correctly ordered deck.
+///
+/// A card is recognised by its structure, not by where on the screen it sits,
+/// so this cannot return a pane header however the layout moves:
+///
+/// 1. a top-left corner of some weight and the SAME weight's top-right corner
+///    further along that row — the box's top border;
+/// 2. that border must NOT itself name `label`. A box whose title is the role
+///    name is that role's embedded PANE, and its first content row is the
+///    agent's own output, which may open with anything at all;
+/// 3. the row below must carry the same weight's verticals at exactly those
+///    two columns — a real rectangle, not two unrelated glyphs;
+/// 4. and that row's text must OPEN with `label`, directly after the left
+///    border with no pad (PRD fork#405 M1 put the name there), ending at a
+///    token boundary so `coder` does not match a card named `coder-2`.
+///
+/// Columns are counted in Unicode scalars, which is the terminal column only
+/// while every cell on the two rows is width-1 — the same limit every other
+/// box helper here accepts. `tests/grid_box_helpers.rs` guards this in the fast
+/// tier, including the two things the ordering assertion depends on: the pane
+/// header is never the answer, and a genuinely reversed deck still reads as
+/// reversed.
+pub fn card_identity_row(grid: &str, label: &str) -> Option<usize> {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let lines: Vec<Vec<char>> = grid.lines().map(|line| line.chars().collect()).collect();
+    lines.iter().enumerate().find_map(|(row, top)| {
+        let body = lines.get(row + 1)?;
+        BORDER_WEIGHTS.iter().find_map(|weight| {
+            top.iter()
+                .enumerate()
+                .filter(|(_, ch)| **ch == weight.top_left)
+                .find_map(|(start, _)| {
+                    let end = top
+                        .iter()
+                        .enumerate()
+                        .skip(start + 1)
+                        .find_map(|(index, ch)| (*ch == weight.top_right).then_some(index))?;
+                    let title: String = top[start + 1..end].iter().collect();
+                    if contains_word_token(&title, label) {
+                        return None;
+                    }
+                    if *body.get(start)? != weight.vertical || *body.get(end)? != weight.vertical {
+                        return None;
+                    }
+                    let inner: String = body[start + 1..end].iter().collect();
+                    let rest = inner.strip_prefix(label)?;
+                    rest.chars()
+                        .next()
+                        .is_none_or(|c| !is_word_char(c))
+                        .then_some(row + 1)
+                })
+        })
+    })
+}
+
 /// Whether `needle` appears in `haystack` as its own token — bounded on both
 /// sides by anything that is NOT an identifier character (alphanumeric, `-`,
 /// or `_`) rather than specifically by whitespace. Catches a needle abutted

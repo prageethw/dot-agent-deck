@@ -336,10 +336,10 @@ fn restore_006_empty_daemon_and_no_snapshot_lands_on_clean_dashboard() {
 /// The daemon-empty restore must rebuild the orchestration tab: the `coder` and
 /// `reviewer` role panes appear as deck cards in their saved order, and — unlike
 /// warm hydration — the saved `orchestrator_prompt` is replayed to the start
-/// (orchestrator) role, which the recorder captures (echo-immune). RED today:
-/// there is no snapshot-fallback orchestration restore branch, so the saved pane
-/// comes back as a single plain dashboard card and neither the role panes nor
-/// the prompt replay ever materialize.
+/// (orchestrator) role, which the recorder captures (echo-immune). Each role's
+/// position is read off its own CARD — the box whose first body row opens with
+/// the role name — never off the focused embedded pane's header, which names
+/// whichever role the rebuild happened to focus and sits above every card.
 #[spec("session/restore/008")]
 #[test]
 fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
@@ -384,11 +384,37 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
         )
         .launch_with_fixture("minimal");
 
-    // The orchestration tab must be rebuilt AND shown (start cursor): its
-    // non-start role panes render as deck cards by role name, in saved order.
-    let rebuilt = common::wait_until(Duration::from_secs(15), || {
-        let g = deck.snapshot_grid();
-        g.contains("coder") && g.contains("reviewer")
+    // The orchestration tab must be rebuilt AND shown: its non-start role panes
+    // render as deck cards by role name, in saved order.
+    //
+    // Issue #809: both rows are read off the role's CARD, via
+    // `common::card_identity_row`, never off "the first row with that text on
+    // it". The focused role's embedded pane is titled with its role name on
+    // row 1 — above every card — and which role the rebuild leaves focused is
+    // not fixed (the restore focuses `pane_ids().first()`, and those ids are no
+    // longer numeric, so the order is whatever the pane map iterates in). Every
+    // run that happened to focus `reviewer` therefore put `reviewer` on row 1,
+    // and a whole-grid `find_in_grid("reviewer")` reported the pane header
+    // there instead of the card on row 25: "coder at row Some(14) and reviewer
+    // at row Some(1)", against a deck that was in exactly the saved order. A
+    // card-scoped locator cannot return a pane header wherever focus lands, so
+    // the ordering below is decided by the cards alone.
+    //
+    // Both rows also come out of ONE grid read — the read that first showed
+    // both cards — rather than out of a wait followed by two fresh snapshots,
+    // so they describe a single frame.
+    let located = std::cell::RefCell::new(None);
+    let rebuilt = deck.wait_for_grid_predicate_within(Duration::from_secs(15), |g| {
+        match (
+            common::card_identity_row(g, "coder"),
+            common::card_identity_row(g, "reviewer"),
+        ) {
+            (Some(coder_row), Some(reviewer_row)) => {
+                *located.borrow_mut() = Some((coder_row, reviewer_row, g.to_string()));
+                true
+            }
+            _ => false,
+        }
     });
     assert!(
         rebuilt,
@@ -397,15 +423,16 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
          deck cards — but they never did.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
+    let (coder_row, reviewer_row, grid) = located
+        .into_inner()
+        .expect("the wait above returns true only after recording the card rows it located");
 
     // Saved display order: `coder` precedes `reviewer` in the role deck.
-    let grid = deck.snapshot_grid();
-    let coder_row = deck.find_in_grid("coder").map(|(_, r)| r);
-    let reviewer_row = deck.find_in_grid("reviewer").map(|(_, r)| r);
     assert!(
-        matches!((coder_row, reviewer_row), (Some(c), Some(rv)) if c < rv),
+        coder_row < reviewer_row,
         "the rebuilt role panes must appear in the SAVED order (coder before reviewer), but \
-         found coder at row {coder_row:?} and reviewer at row {reviewer_row:?}.\nFinal grid:\n{grid}"
+         found the coder CARD at row {coder_row} and the reviewer CARD at row {reviewer_row}.\n\
+         Grid the rows were read from:\n{grid}"
     );
 
     // start_role_index honored + orchestrator_prompt replayed: the saved prompt
