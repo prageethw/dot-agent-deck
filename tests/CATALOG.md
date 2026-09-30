@@ -8575,6 +8575,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** that no idle-worker prompt arrives when the timeout runs out — the test does not spend it, and the retired record is what that watch would have needed (`scheduler/idle-worker/028` spends a timeout in full for the no-delivery exits); the commission, which a natural exit leaves owed; the silence watch, which the native seed delivery never arms; an exit that lands before the dispatch has returned; a real Pi.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/034 — A pi-native `clear = true` replacement that is already dead when its task would be handed over, with no delegation record armed for the delegate, still releases its commission and the orchestrator is told exactly once that it never came up (issue #825).
+- **Layer:** fast integration (unit level, on the `native_seed_replacement_already_exited` helper the dispatch's no-delivery exit is made of; the exit is only reachable in a microseconds-wide window no role command can hit on demand); a stand-in orchestrator pane with echo off and a `sh` replacement that is ended before the call.
+- **Agent:** none (`cat` and `sh` stand-ins).
+- **Asserts:** the helper reports the replacement as already exited, the commission is released, the orchestrator pane holds exactly one "never came up" notice naming the worker pane and no "exited without work-done" notice, and no delegation retirement was announced.
+- **Does not assert:** the notice when a record was swept (`state::tests::native_seed_dead_replacement`'s already-exited test pins that one-notice path); a real Pi.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/035 — When a newer delegate has replaced the dead pi-native replacement's delegation record, the orchestrator is still told exactly once that the replacement never came up, and the newer record stays armed (issue #825).
+- **Layer:** fast integration (same seam as `scheduler/idle-worker/034`); two delegations are armed on the worker pane and the helper is called with the older one's generation.
+- **Agent:** none (`cat` and `sh` stand-ins).
+- **Asserts:** the helper reports the replacement as already exited, the newer delegation's record is still armed, and the orchestrator pane holds exactly one "never came up" notice naming the worker pane and no "exited without work-done" notice.
+- **Does not assert:** the commission release (`scheduler/idle-worker/034`); a real Pi.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).

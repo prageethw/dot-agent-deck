@@ -15814,6 +15814,7 @@ clear = false
     mod native_seed_dead_replacement {
         use super::super::native_seed_replacement_already_exited;
         use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        use spec::spec;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
@@ -15926,12 +15927,8 @@ clear = false
             let mut reserved_silence =
                 registry.arm_silence_watch(WORKER_PANE, ORCH_PANE, Some(&replacement));
 
-            let already_exited = native_seed_replacement_already_exited(
+            let already_exited = call_exited(
                 &registry,
-                WORKER_PANE,
-                ROLE,
-                ORCH_PANE,
-                None,
                 Some(armed.seq),
                 &replacement,
                 &mut reserved_silence,
@@ -16010,12 +16007,8 @@ clear = false
             let mut reserved_silence =
                 registry.arm_silence_watch(WORKER_PANE, ORCH_PANE, Some(&replacement));
 
-            let already_exited = native_seed_replacement_already_exited(
+            let already_exited = call_exited(
                 &registry,
-                WORKER_PANE,
-                ROLE,
-                ORCH_PANE,
-                None,
                 Some(armed.seq),
                 &replacement,
                 &mut reserved_silence,
@@ -16069,33 +16062,17 @@ clear = false
         /// by the "never came up" notice the injection path writes for the same
         /// situation (issue #825: it used to hear nothing at all).
         ///
-        /// Scenario: the replacement dies before the bind and the delegate has
-        /// no armed delegation record; the orchestrator pane must receive one
-        /// "never came up" notice naming the worker pane, and no "exited" one.
+        /// Scenario: The replacement dies before the bind and the delegate has no armed delegation record. The orchestrator pane must receive one "never came up" notice naming the worker pane and no "exited" one, and the commission must be released.
+        #[spec("scheduler/idle-worker/034")]
         #[tokio::test]
-        async fn a_dead_replacement_with_no_armed_delegation_still_releases_its_commission() {
+        async fn idle_worker_034_dead_replacement_without_a_record_is_reported_once() {
             let registry = Arc::new(AgentPtyRegistry::new());
             let fired = record_delegation_retirements(&registry);
-            let orchestrator = spawn_orchestrator_stand_in(&registry).await;
-            let replacement = spawn_replacement(&registry);
-            assert!(
-                registry.arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
-                "arm the commission"
-            );
-            end_replacement(&registry, &replacement).await;
+            let (orchestrator, replacement, _) = dead_replacement(&registry, 0).await;
             let mut reserved_silence = None;
 
-            let already_exited = native_seed_replacement_already_exited(
-                &registry,
-                WORKER_PANE,
-                ROLE,
-                ORCH_PANE,
-                None,
-                None,
-                &replacement,
-                &mut reserved_silence,
-            )
-            .await;
+            let already_exited =
+                call_exited(&registry, None, &replacement, &mut reserved_silence).await;
 
             assert!(already_exited, "the replacement is dead");
             let watches = registry.delegation_watch_snapshot(WORKER_PANE);
@@ -16119,42 +16096,18 @@ clear = false
         /// nothing, so the orchestrator is told once ("never came up"), and the
         /// newer delegate's record is left armed.
         ///
-        /// Scenario: two delegations are armed on the pane, the older delegate's
-        /// replacement is dead on arrival; the orchestrator pane must get one
-        /// "never came up" notice and the newer record must stay armed.
+        /// Scenario: Two delegations are armed on the pane and the older delegate's replacement is dead on arrival. The orchestrator pane must get one "never came up" notice and the newer record must stay armed.
+        #[spec("scheduler/idle-worker/035")]
         #[tokio::test]
-        async fn a_dead_replacement_whose_record_was_superseded_is_still_reported_once() {
+        async fn idle_worker_035_dead_replacement_with_a_superseded_record_is_reported_once() {
             let registry = Arc::new(AgentPtyRegistry::new());
-            let orchestrator = spawn_orchestrator_stand_in(&registry).await;
-            let replacement = spawn_replacement(&registry);
-            let older = registry
-                .arm_outstanding_delegation(WORKER_PANE, ROLE, ORCH_PANE, &orchestrator, None)
-                .expect("arm the older delegation");
-            let newer = registry
-                .arm_outstanding_delegation(WORKER_PANE, ROLE, ORCH_PANE, &orchestrator, None)
-                .expect("arm the newer delegation");
-            assert!(
-                newer.seq > older.seq,
-                "test prerequisite: newer supersedes older"
-            );
-            assert!(
-                registry.arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
-                "arm the commission"
-            );
-            end_replacement(&registry, &replacement).await;
+            let (orchestrator, replacement, seqs) = dead_replacement(&registry, 2).await;
+            let (older, newer) = (seqs[0], seqs[1]);
+            assert!(newer > older, "test prerequisite: newer supersedes older");
             let mut reserved_silence = None;
 
-            let already_exited = native_seed_replacement_already_exited(
-                &registry,
-                WORKER_PANE,
-                ROLE,
-                ORCH_PANE,
-                None,
-                Some(older.seq),
-                &replacement,
-                &mut reserved_silence,
-            )
-            .await;
+            let already_exited =
+                call_exited(&registry, Some(older), &replacement, &mut reserved_silence).await;
 
             assert!(already_exited, "the replacement is dead");
             assert!(
@@ -16167,6 +16120,59 @@ clear = false
             assert_told_once_never_came_up(&registry, &orchestrator).await;
 
             registry.shutdown_all();
+        }
+
+        /// Spawns the orchestrator stand-in and a replacement, arms `records`
+        /// delegations (oldest first, each superseding the last) and the
+        /// commission, then lets the replacement die. Returns the orchestrator
+        /// agent id, the replacement agent id and the armed generations.
+        async fn dead_replacement(
+            registry: &Arc<AgentPtyRegistry>,
+            records: usize,
+        ) -> (String, String, Vec<u64>) {
+            let orchestrator = spawn_orchestrator_stand_in(registry).await;
+            let replacement = spawn_replacement(registry);
+            let seqs = (0..records)
+                .map(|_| {
+                    registry
+                        .arm_outstanding_delegation(
+                            WORKER_PANE,
+                            ROLE,
+                            ORCH_PANE,
+                            &orchestrator,
+                            None,
+                        )
+                        .expect("arm a delegation")
+                        .seq
+                })
+                .collect();
+            assert!(
+                registry.arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
+                "arm the commission"
+            );
+            end_replacement(registry, &replacement).await;
+            (orchestrator, replacement, seqs)
+        }
+
+        /// The dispatch's call into the helper under test, with the fixed
+        /// worker/orchestrator identity these tests share.
+        async fn call_exited(
+            registry: &Arc<AgentPtyRegistry>,
+            seq: Option<u64>,
+            replacement: &str,
+            reserved_silence: &mut Option<crate::agent_pty::ArmedSilenceWatch>,
+        ) -> bool {
+            native_seed_replacement_already_exited(
+                registry,
+                WORKER_PANE,
+                ROLE,
+                ORCH_PANE,
+                None,
+                seq,
+                replacement,
+                reserved_silence,
+            )
+            .await
         }
 
         /// Waits for the "never came up" notice, gives any second notice of

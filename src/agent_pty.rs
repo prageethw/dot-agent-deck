@@ -3693,8 +3693,10 @@ struct DelegationTracker {
     /// replacement's bind can tell "the reader thread already reported it" from
     /// "nothing was ever registered for it" (see
     /// [`AgentPtyRegistry::bind_delegation_worker_agent_id_or_sweep_exited_reporting`]).
-    /// Consumed by that bind; entries whose agent is no longer registered are
-    /// pruned on every insert, so it cannot grow past the live agent set.
+    /// Consumed by that bind. Entries whose agent is no longer registered are
+    /// pruned on every insert, so the set is bounded by the registered agents
+    /// as of the last insert; agent ids are never reused, so a stale entry can
+    /// never suppress a later agent's fallback.
     exit_reported_agents: HashSet<String>,
 }
 
@@ -4756,7 +4758,7 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Issue #815: [`Self::bind_delegation_worker_agent_id`] for a delivery that
+    /// Issue #815 (reporting form: issue #825): [`Self::bind_delegation_worker_agent_id`] for a delivery that
     /// is NOT followed by an identity-guarded write to the worker — the
     /// pi-native seed delivery in `crate::state`'s `dispatch_one_owned`, which
     /// stashes the task pointer for the agent to pull and returns.
@@ -4825,7 +4827,10 @@ impl AgentPtyRegistry {
     /// caller's no-delivery release
     /// (`crate::state::release_undelivered_commission`) retires this
     /// delegate's own generation by `seq`, which does not depend on the record
-    /// having been swept here. Only the orchestrator's notice is lost.
+    /// having been swept here. The exited notice is not written in that case
+    /// (`reported` is `false`), and the pi-native caller writes its fallback
+    /// "never came up" notice instead, the same one its injection-path
+    /// counterpart writes.
     ///
     /// Like the sweep it stands in for, this does not touch the commission
     /// ledger — see [`Self::sweep_delegations_on_exit`] for why. Whether the
@@ -4836,41 +4841,26 @@ impl AgentPtyRegistry {
     /// this delegate; the bind is then skipped and only the exit is reported.
     /// When `Some`, the bind is `seq`-guarded exactly like the plain one.
     ///
-    /// Returns whether the worker had already exited (naturally — see above)
-    /// when the bind was made. `true` means the agent the caller is about to
-    /// deliver to is gone: nothing can be delivered to it, and any record it
-    /// was bound to has been swept, by this call or by its reader thread.
-    #[cfg(test)]
-    #[must_use = "`true` means the worker is already gone and nothing can be delivered to it"]
-    pub async fn bind_delegation_worker_agent_id_or_sweep_exited(
-        self: &Arc<Self>,
-        worker_pane_id: &str,
-        seq: Option<u64>,
-        worker_agent_id: &str,
-    ) -> bool {
-        self.bind_delegation_worker_agent_id_or_sweep_exited_reporting(
-            worker_pane_id,
-            seq,
-            worker_agent_id,
-        )
-        .await
-            != ExitedWorkerBind::Live
-    }
-
-    /// Issue #825: [`Self::bind_delegation_worker_agent_id_or_sweep_exited`]
-    /// with the answer the pi-native caller needs to keep the orchestrator
-    /// informed exactly once.
+    /// Returns [`ExitedWorkerBind::Live`] when the worker had not exited (or its
+    /// entry is gone) when the bind was made. [`ExitedWorkerBind::Exited`]
+    /// means the agent the caller is about to deliver to is gone: nothing can
+    /// be delivered to it, and any record it was bound to has been swept, by
+    /// this call or by its reader thread.
     ///
-    /// [`ExitedWorkerBind::Exited`] carries `reported`: whether the
-    /// orchestrator has been told (by this call, or by the worker's reader
-    /// thread, which may have swept first) that this agent exited without
-    /// `work-done`. It is decided from "did ANYONE's exit sweep take a
-    /// worker-side record for this agent", recorded under the tracker lock by
+    /// **Issue #825: `reported`.** `Exited` carries whether the orchestrator
+    /// has been told (by this call, or by the worker's reader thread, which may
+    /// have swept first) that this agent exited without `work-done`. It is
+    /// decided from "did ANYONE's exit sweep take a worker-side record for this
+    /// agent", recorded under the tracker lock by
     /// [`Self::sweep_delegations_on_exit`], never from "did THIS call's sweep
     /// find something": a reader-first interleaving leaves this call's own
-    /// sweep empty while the notice is already on its way. When `reported` is
-    /// `false` nobody swept a record, so nobody has written or will write an
-    /// exited notice for this agent and the caller owes the orchestrator one.
+    /// sweep empty while the notice is already on its way. The marker is read
+    /// and removed straight after the sweep and BEFORE any notice is awaited,
+    /// so a concurrent prune cannot lose it while this call is delivering. When
+    /// `reported` is `false` nobody swept a record, so nobody has written or
+    /// will write an exited notice for this agent and the caller owes the
+    /// orchestrator one.
+    #[must_use = "`Exited` means the worker is already gone and nothing can be delivered to it"]
     pub async fn bind_delegation_worker_agent_id_or_sweep_exited_reporting(
         self: &Arc<Self>,
         worker_pane_id: &str,
@@ -4884,25 +4874,31 @@ impl AgentPtyRegistry {
         else {
             return ExitedWorkerBind::Live;
         };
-        if let Some(pane_id_env) = exited_pane_id_env.filter(|stored| stored == worker_pane_id) {
-            let swept = self.sweep_delegations_on_exit(&pane_id_env, worker_agent_id);
-            // Same filter as `pump_reader`: only a record this pane touched as
-            // the WORKER has an orchestrator left to tell.
-            for delegation in swept
-                .into_iter()
-                .filter(|delegation| delegation.orchestrator_pane_id != pane_id_env)
-            {
-                self.deliver_worker_exited_notice(&pane_id_env, delegation)
-                    .await;
-            }
-        }
+        // Same filter as `pump_reader`: only a record this pane touched as the
+        // WORKER has an orchestrator left to tell.
+        let worker_exits: Vec<OutstandingDelegation> =
+            match exited_pane_id_env.filter(|stored| stored == worker_pane_id) {
+                Some(pane_id_env) => self
+                    .sweep_delegations_on_exit(&pane_id_env, worker_agent_id)
+                    .into_iter()
+                    .filter(|delegation| delegation.orchestrator_pane_id != pane_id_env)
+                    .collect(),
+                None => Vec::new(),
+            };
         // Consumes the marker the sweep above (or the reader thread's) left.
+        // Read BEFORE any await below: the delivery can take a while, and a
+        // prune triggered meanwhile by another agent's exit must not be able to
+        // take the marker away before it is read.
         let reported = self
             .delegations
             .lock()
             .unwrap()
             .exit_reported_agents
             .remove(worker_agent_id);
+        for delegation in worker_exits {
+            self.deliver_worker_exited_notice(worker_pane_id, delegation)
+                .await;
+        }
         ExitedWorkerBind::Exited { reported }
     }
 
@@ -5957,7 +5953,7 @@ impl AgentPtyRegistry {
     /// the one being closed.
     ///
     /// Private: both callers live in this same module — `pump_reader`, and
-    /// [`Self::bind_delegation_worker_agent_id_or_sweep_exited`] (issue #815),
+    /// [`Self::bind_delegation_worker_agent_id_or_sweep_exited_reporting`] (issue #815),
     /// which runs it in `pump_reader`'s place for a worker that reached EOF
     /// before its delegation was bound to it.
     fn sweep_delegations_on_exit(
@@ -6009,13 +6005,21 @@ impl AgentPtyRegistry {
     /// whose agent is no longer registered. Takes the two locks one after the
     /// other, never nested.
     fn prune_exit_reported_agents(&self) {
+        // Candidates are read BEFORE the registered list, so a marker inserted
+        // for an agent registered after that list was read is never among them.
+        let candidates: HashSet<String> = self
+            .delegations
+            .lock()
+            .unwrap()
+            .exit_reported_agents
+            .clone();
         let registered: HashSet<String> =
             self.inner.lock().unwrap().agents.keys().cloned().collect();
         self.delegations
             .lock()
             .unwrap()
             .exit_reported_agents
-            .retain(|id| registered.contains(id));
+            .retain(|id| !candidates.contains(id) || registered.contains(id));
     }
 
     /// Whether `agent_id` still names a live entry in the
@@ -16201,7 +16205,7 @@ mod spawn_tests {
     /// that reached EOF BEFORE the bind. Its reader thread's sweep found the
     /// record unbound and left it, and never runs again — so a plain bind
     /// would attach the record to a corpse and leave it armed until the
-    /// idle-worker timeout. `bind_delegation_worker_agent_id_or_sweep_exited`
+    /// idle-worker timeout. `bind_delegation_worker_agent_id_or_sweep_exited_reporting`
     /// must retire it on the spot and announce the retirement.
     #[tokio::test]
     async fn bind_or_sweep_exited_retires_the_delegation_of_a_worker_that_already_exited() {
@@ -16213,12 +16217,13 @@ mod spawn_tests {
         let fired = record_delegation_retirements(&reg);
 
         let already_exited = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited(
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
                 "worker",
                 Some(armed.seq),
                 &exited_agent,
             )
-            .await;
+            .await
+            != ExitedWorkerBind::Live;
 
         assert!(
             already_exited,
@@ -16285,8 +16290,13 @@ mod spawn_tests {
         );
 
         let already_exited = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited("worker", Some(armed.seq), &worker)
-            .await;
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+                "worker",
+                Some(armed.seq),
+                &worker,
+            )
+            .await
+            != ExitedWorkerBind::Live;
 
         assert!(already_exited, "the worker exited before the bind");
         assert!(
@@ -16337,8 +16347,13 @@ mod spawn_tests {
             .expect("arm delegation");
 
         let already_exited = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited("worker", Some(armed.seq), &worker)
-            .await;
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+                "worker",
+                Some(armed.seq),
+                &worker,
+            )
+            .await
+            != ExitedWorkerBind::Live;
         assert!(
             !already_exited
                 && reg
@@ -16366,8 +16381,13 @@ mod spawn_tests {
         );
 
         let already_exited = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited("worker", Some(armed.seq), &worker)
-            .await;
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+                "worker",
+                Some(armed.seq),
+                &worker,
+            )
+            .await
+            != ExitedWorkerBind::Live;
 
         assert!(
             already_exited,
@@ -16400,14 +16420,18 @@ mod spawn_tests {
         let armed = reg
             .arm_outstanding_delegation("worker", "coder", "orch", &orchestrator, None)
             .expect("arm delegation");
-        let bound = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+        let bind = || {
+            reg.bind_delegation_worker_agent_id_or_sweep_exited_reporting(
                 "worker",
                 Some(armed.seq),
                 &worker,
             )
-            .await;
-        assert_eq!(bound, ExitedWorkerBind::Live, "precondition: alive at bind");
+        };
+        assert_eq!(
+            bind().await,
+            ExitedWorkerBind::Live,
+            "precondition: alive at bind"
+        );
         end_worker(&reg, "worker", &worker).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline
@@ -16418,17 +16442,15 @@ mod spawn_tests {
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-
-        let bound = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
-                "worker",
-                Some(armed.seq),
-                &worker,
-            )
-            .await;
+        assert!(
+            reg.delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_none(),
+            "precondition: the reader thread swept the record before the second bind"
+        );
 
         assert_eq!(
-            bound,
+            bind().await,
             ExitedWorkerBind::Exited { reported: true },
             "the reader thread's sweep took the record, so the exit is already reported"
         );
@@ -16473,8 +16495,13 @@ mod spawn_tests {
             .expect("arm delegation");
 
         let already_exited = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited("worker", Some(armed.seq), &live_agent)
-            .await;
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+                "worker",
+                Some(armed.seq),
+                &live_agent,
+            )
+            .await
+            != ExitedWorkerBind::Live;
 
         assert!(!already_exited, "the worker is still running");
         assert!(
@@ -16511,12 +16538,13 @@ mod spawn_tests {
             .expect("arm delegation");
 
         let already_exited = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited(
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
                 "worker",
                 Some(armed.seq),
                 &closed_agent,
             )
-            .await;
+            .await
+            != ExitedWorkerBind::Live;
 
         assert!(
             !already_exited,
@@ -16547,12 +16575,13 @@ mod spawn_tests {
             .expect("arm #2 supersedes #1");
 
         let already_exited = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited(
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
                 "worker",
                 Some(first.seq),
                 &exited_agent,
             )
-            .await;
+            .await
+            != ExitedWorkerBind::Live;
 
         assert!(already_exited, "the agent it names has exited");
         assert!(
@@ -16578,8 +16607,13 @@ mod spawn_tests {
             .expect("arm delegation");
 
         let already_exited = reg
-            .bind_delegation_worker_agent_id_or_sweep_exited("worker", None, &exited_agent)
-            .await;
+            .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
+                "worker",
+                None,
+                &exited_agent,
+            )
+            .await
+            != ExitedWorkerBind::Live;
 
         assert!(
             already_exited,
@@ -16618,12 +16652,13 @@ mod spawn_tests {
                 .expect("arm delegation");
 
             let already_exited = reg
-                .bind_delegation_worker_agent_id_or_sweep_exited(
+                .bind_delegation_worker_agent_id_or_sweep_exited_reporting(
                     "worker",
                     Some(armed.seq),
                     exited_agent,
                 )
-                .await;
+                .await
+                != ExitedWorkerBind::Live;
 
             assert!(
                 already_exited,
