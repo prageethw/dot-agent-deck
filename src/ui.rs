@@ -28373,6 +28373,66 @@ mod tests {
         );
     }
 
+    /// `None` when `rects` tile `column` exactly top to bottom (first at the
+    /// column's top, each `y` equal to the previous bottom, last ending at the
+    /// column's bottom, every x/width equal to the column's).
+    fn tiling_problem(rects: &[Rect], column: Rect) -> Option<String> {
+        let mut y = column.y;
+        for (i, r) in rects.iter().enumerate() {
+            if r.y != y || r.x != column.x || r.width != column.width {
+                return Some(format!(
+                    "pane {i} rect {r:?} does not continue the tiling of column {column:?} (expected y={y})"
+                ));
+            }
+            y += r.height;
+        }
+        (y != column.y + column.height).then(|| {
+            format!(
+                "panes end at y={y}, column {column:?} ends at {}",
+                column.y + column.height
+            )
+        })
+    }
+
+    /// Scenario: issue 829 — `pane_stack_rects` under `Tiled` must tile any
+    /// column exactly, even in the awkward cases: fewer rows than panes (the
+    /// first panes get one row each, the rest none), a single pane, a zero-height
+    /// column, no panes at all, and a column that does not start at the origin.
+    #[spec("orchestration/layout/014")]
+    #[test]
+    fn orchestration_layout_014_tiled_pane_stack_edge_cases() {
+        let ids = |n: usize| -> Vec<String> { (0..n).map(|i| format!("p{i}")).collect() };
+        let heights = |rects: &[Rect]| rects.iter().map(|r| r.height).collect::<Vec<_>>();
+
+        // Offset area so an accumulation bug cannot hide at the origin.
+        let area = Rect::new(7, 5, 40, 3);
+        let rects = pane_stack_rects(area, &ids(5), PaneLayout::Tiled, None);
+        assert_eq!(
+            heights(&rects),
+            vec![1, 1, 1, 0, 0],
+            "3 rows across 5 panes"
+        );
+        assert_eq!(tiling_problem(&rects, area), None);
+
+        let area = Rect::new(3, 9, 30, 17);
+        let rects = pane_stack_rects(area, &ids(1), PaneLayout::Tiled, None);
+        assert_eq!(rects, vec![area], "one pane takes the whole column");
+
+        let area = Rect::new(3, 9, 30, 0);
+        let rects = pane_stack_rects(area, &ids(4), PaneLayout::Tiled, None);
+        assert_eq!(heights(&rects), vec![0, 0, 0, 0], "zero-height column");
+        assert_eq!(tiling_problem(&rects, area), None);
+
+        let rects = pane_stack_rects(Rect::new(1, 2, 30, 10), &[], PaneLayout::Tiled, None);
+        assert!(rects.is_empty(), "no panes => no rects");
+
+        // Offset column with an uneven split.
+        let area = Rect::new(11, 4, 25, 23);
+        let rects = pane_stack_rects(area, &ids(4), PaneLayout::Tiled, None);
+        assert_eq!(heights(&rects), vec![6, 6, 6, 5], "23 rows across 4 panes");
+        assert_eq!(tiling_problem(&rects, area), None);
+    }
+
     /// Scenario: issue 829 — with the Tiled layout, the role panes of an
     /// orchestration tab (and the side panes of a mode tab) must be sized as
     /// equally as whole rows allow: heights differ by at most one row, the extra
@@ -28416,9 +28476,22 @@ mod tests {
                     Some("p0"),
                     1,
                 );
-                let FrameContent::Cards { pane_rects, .. } = orch.content else {
+                let FrameContent::Cards {
+                    pane_rects,
+                    panes_area,
+                    ..
+                } = orch.content
+                else {
                     panic!("orchestration tab must produce FrameContent::Cards");
                 };
+                let rects: Vec<Rect> = pane_rects.iter().map(|(_, r)| *r).collect();
+                if let Some(problem) =
+                    tiling_problem(&rects, panes_area.expect("panes => a right column"))
+                {
+                    failures.push(format!(
+                        "orchestration: {n} panes in a {column_h}-row column: {problem}"
+                    ));
+                }
                 let got: Vec<usize> = pane_rects.iter().map(|(_, r)| r.height as usize).collect();
                 if got != expected {
                     failures.push(format!(
@@ -28441,11 +28514,19 @@ mod tests {
                     1,
                 );
                 let FrameContent::Mode {
-                    side_pane_rects, ..
+                    side_pane_rects,
+                    side_area,
+                    ..
                 } = mode.content
                 else {
                     panic!("mode tab must produce FrameContent::Mode");
                 };
+                let rects: Vec<Rect> = side_pane_rects.iter().map(|(_, r)| *r).collect();
+                if let Some(problem) = tiling_problem(&rects, side_area) {
+                    failures.push(format!(
+                        "mode side panes: {n} panes in a {column_h}-row column: {problem}"
+                    ));
+                }
                 let got: Vec<usize> = side_pane_rects
                     .iter()
                     .map(|(_, r)| r.height as usize)

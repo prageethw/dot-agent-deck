@@ -5509,8 +5509,15 @@ without depending on the config struct API.
 ##### orchestration/layout/013 — Tiled role panes (and mode side panes) are sized equally to within one row, with the extra rows on the first panes (issue 829).
 - **Layer:** L1 (`compute_frame_layout` over an `ActiveTabView::Orchestration` and an `ActiveTabView::Mode`; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout` and `FrameContent` are module-private.
 - **Agent:** none (synthetic pane ids; the layout pass is a pure function of its inputs).
-- **Asserts:** for pane counts 2 to 7 across several frame heights, most not divisible by the pane count, the per-pane heights equal `column / n` plus one extra row for each of the first `column % n` panes, so they sum to the column and never differ by more than one row, in both the orchestration pane column and the mode tab's side column. Today ratatui rounds each cumulative boundary, which puts the extra row in the middle panes (for example 3, 4, 3 rather than 4, 3, 3).
+- **Asserts:** for pane counts 2 to 7 across several frame heights, most not divisible by the pane count, the per-pane heights equal `column / n` plus one extra row for each of the first `column % n` panes, so they sum to the column and never differ by more than one row, in both the orchestration pane column and the mode tab's side column. The rects must also tile the column exactly (first at the top, each starting where the previous ends, last reaching the bottom, same x and width). Contract in force: integer division with the leftover rows given one each to the first panes (for example 4, 3, 3), rather than rounding each cumulative boundary, which had placed the extra row in the middle (3, 4, 3).
 - **Does not assert:** `Stacked` (deliberately unequal, one expanded pane), widths, or the PTY dims derived from these rects.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/014 — `pane_stack_rects` under `Tiled` tiles a column exactly in the edge cases: fewer rows than panes, one pane, zero height, no panes, and an offset column (issue 829).
+- **Layer:** L1 (direct `pane_stack_rects` calls; no PTY, no render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because the function is module-private.
+- **Agent:** none.
+- **Asserts:** 3 rows across 5 panes gives 1, 1, 1, 0, 0; one pane gets the whole column; a zero-height column gives all-zero heights; no panes gives an empty list; 23 rows across 4 panes at a non-zero x/y offset gives 6, 6, 6, 5. Each non-empty result tiles its area contiguously.
+- **Does not assert:** `Stacked`, or the frame-level layout (`orchestration/layout/013`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/dispatch
