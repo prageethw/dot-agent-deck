@@ -28359,6 +28359,102 @@ mod tests {
         );
     }
 
+    /// Scenario: issue 829 — with the Tiled layout, the role panes of an
+    /// orchestration tab (and the side panes of a mode tab) must be sized as
+    /// equally as whole rows allow: heights differ by at most one row, the extra
+    /// rows go to the FIRST panes, and the panes exactly fill the column. Drives
+    /// `compute_frame_layout` for pane counts 2 to 7 over several frame heights,
+    /// most of them not divisible by the pane count.
+    #[spec("orchestration/layout/013")]
+    #[test]
+    fn orchestration_layout_013_tiled_panes_are_equal_with_extra_rows_first() {
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Orch".into()],
+            active_index: 0,
+            tab_statuses: vec![],
+            is_orchestration: vec![true],
+        };
+        // Frame height minus tab bar (1) and hints bar (1) is the column height.
+        let mut uneven_cases = 0;
+        let mut failures: Vec<String> = Vec::new();
+        for n in 2usize..=7 {
+            for frame_h in [22u16, 27, 30, 33, 41, 50] {
+                let column_h = usize::from(frame_h - 2);
+                if !column_h.is_multiple_of(n) {
+                    uneven_cases += 1;
+                }
+                let ids: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+                let frame_area = Rect::new(0, 0, 100, frame_h);
+                let expected: Vec<usize> = (0..n)
+                    .map(|i| column_h / n + usize::from(i < column_h % n))
+                    .collect();
+
+                let orch = compute_frame_layout(
+                    frame_area,
+                    &ActiveTabView::Orchestration {
+                        role_pane_ids: ids.clone(),
+                        zoomed: false,
+                    },
+                    &tab_bar,
+                    &ids,
+                    PaneLayout::Tiled,
+                    Some("p0"),
+                    1,
+                );
+                let FrameContent::Cards { pane_rects, .. } = orch.content else {
+                    panic!("orchestration tab must produce FrameContent::Cards");
+                };
+                let got: Vec<usize> = pane_rects.iter().map(|(_, r)| r.height as usize).collect();
+                if got != expected {
+                    failures.push(format!(
+                        "orchestration: {n} panes in a {column_h}-row column: got heights {got:?}, expected {expected:?}"
+                    ));
+                }
+
+                let mode = compute_frame_layout(
+                    frame_area,
+                    &ActiveTabView::Mode {
+                        mode_name: "m".into(),
+                        agent_pane_id: "agent".into(),
+                        side_pane_ids: ids.clone(),
+                        focused_pane_id: None,
+                    },
+                    &tab_bar,
+                    &ids,
+                    PaneLayout::Tiled,
+                    None,
+                    1,
+                );
+                let FrameContent::Mode {
+                    side_pane_rects, ..
+                } = mode.content
+                else {
+                    panic!("mode tab must produce FrameContent::Mode");
+                };
+                let got: Vec<usize> = side_pane_rects
+                    .iter()
+                    .map(|(_, r)| r.height as usize)
+                    .collect();
+                if got != expected {
+                    failures.push(format!(
+                        "mode side panes: {n} panes in a {column_h}-row column: got heights {got:?}, expected {expected:?}"
+                    ));
+                }
+            }
+        }
+        // Setup guard: the sweep really exercises non-divisible heights.
+        assert!(
+            uneven_cases >= 20,
+            "setup: sweep must cover many non-divisible heights, got {uneven_cases}"
+        );
+        assert!(
+            failures.is_empty(),
+            "Tiled panes must differ by at most one row with extra rows on the first panes:\n{}",
+            failures.join("\n")
+        );
+    }
+
     /// Scenario: PRD #313 M1 — an orchestration tab's frame geometry must be the
     /// 34/66 default unzoomed, the narrower 25/75 split when `split_narrow`, and
     /// a ZERO-width sidebar with the pane column spanning the whole frame when

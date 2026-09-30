@@ -5506,6 +5506,13 @@ without depending on the config struct API.
 - **Does not assert:** the key that produces the toggle or its scoping (`orchestration/layout/007`, which covers both card-shaped tab kinds through the `tab_has_card_sidebar` predicate); that the Dashboard's zoom flag is independent of an orchestration tab's (they are separate fields on separate `Tab` variants, so no shared value exists to diverge); the `[Z]` marker on a zoomed Dashboard pane (`render/layout/006` pins the marker on the orchestration path, and the indicator is resolved once in `render_frame` for both); Mode tabs, which are deliberately excluded — two pane regions rather than sidebar-plus-panes, so "hide the sidebar" has no meaning there.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/layout/013 — Tiled role panes (and mode side panes) are sized equally to within one row, with the extra rows on the first panes (issue 829).
+- **Layer:** L1 (`compute_frame_layout` over an `ActiveTabView::Orchestration` and an `ActiveTabView::Mode`; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout` and `FrameContent` are module-private.
+- **Agent:** none (synthetic pane ids; the layout pass is a pure function of its inputs).
+- **Asserts:** for pane counts 2 to 7 across several frame heights, most not divisible by the pane count, the per-pane heights equal `column / n` plus one extra row for each of the first `column % n` panes, so they sum to the column and never differ by more than one row, in both the orchestration pane column and the mode tab's side column. Today ratatui rounds each cumulative boundary, which puts the extra row in the middle panes (for example 3, 4, 3 rather than 4, 3, 3).
+- **Does not assert:** `Stacked` (deliberately unequal, one expanded pane), widths, or the PTY dims derived from these rects.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/dispatch
 
 ##### orchestration/dispatch/001 — An agent-callable `dispatch --orchestration <name>` makes a full orchestration TAB surface live on the deck, and that orchestration can actually DELEGATE to its own workers (PRD #220 / #222).
