@@ -3700,8 +3700,9 @@ struct DelegationTracker {
     exit_reported_agents: HashSet<String>,
     /// Issue #812: generations armed by `handle_delegate` whose detached
     /// dispatch task has not yet taken the pane's dispatch lock, i.e. whose task
-    /// pointer has certainly not been handed to any worker. Generations are
-    /// unique across panes, so one set serves all of them. Filled by
+    /// pointer has certainly not been handed to any worker. One global set, not
+    /// keyed by pane: generations are unique across all panes, so a bare `seq`
+    /// identifies its delegate wherever it was armed. Filled by
     /// [`AgentPtyRegistry::mark_delegation_dispatch_pending`], emptied by
     /// [`AgentPtyRegistry::mark_delegation_dispatch_started`] as the dispatch
     /// starts; consulted only by

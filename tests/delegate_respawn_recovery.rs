@@ -1379,6 +1379,18 @@ async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_
          = {orchestrator:?}"
     );
 
+    // The notice above is written BEFORE the exit releases the commission and
+    // drops the owed generations, so wait for the exit to finish: the commission
+    // release comes first, and the dispatch task holds the pane's dispatch lock
+    // until it returns, i.e. until the drop has been performed. Taking the lock
+    // here therefore orders the assertion after the drop it is meant to catch.
+    assert!(
+        common::wait_for_commission_release(&fx.daemon.registry, WORKER_PANE).await,
+        "precondition: the newer delegate's commission was never released, so its dispatch has \
+         not reached the no-delivery exit under test"
+    );
+    drop(dispatch_lock.lock().await);
+
     assert!(
         fx.daemon
             .registry

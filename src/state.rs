@@ -3158,10 +3158,12 @@ fn record_delegation_commission(
     }
 }
 
-/// Issue #812: the two `clear = true` respawn exits (the respawn error and the
-/// dead replacement) have already TERMINATED the pane's previous worker, so
-/// they release the commission like every no-delivery exit and additionally
-/// drop every delegation that terminated worker still owed. See
+/// Issue #812: the no-delivery exits that follow a `clear = true` respawn which
+/// already TERMINATED the pane's previous worker -- the respawn error, the dead
+/// replacement and the pi-native dead-on-arrival replacement -- release the
+/// commission like every no-delivery exit and additionally drop every dispatched
+/// delegation that terminated worker still owed. (The tail's refusal exit picks
+/// its scope itself, depending on whether its dispatch respawned.) See
 /// [`RetireScope::TerminatedWorker`].
 fn release_undelivered_commission_of_terminated_worker(
     registry: &AgentPtyRegistry,
@@ -3190,7 +3192,8 @@ enum RetireScope {
     /// This delegate's generation and every OLDER one still owed: the
     /// `clear = true` respawn already terminated the worker that owed them, so
     /// nothing can ever answer them. A NEWER delegation's generation and
-    /// record are left alone.
+    /// record are left alone, and so is an older generation whose own dispatch
+    /// has not started yet: its task was never given to the terminated worker.
     TerminatedWorker,
 }
 
