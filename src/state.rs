@@ -3178,7 +3178,7 @@ fn record_delegation_commission(
 /// Routed through one helper rather than inlined at each site so the invariant is
 /// checkable by grep instead of by reading 300 lines of `dispatch_one_owned`: the
 /// release sites are exactly the callers of this function. The audit of
-/// `dispatch_one_owned`'s five exits, and why the two that release nothing are
+/// `dispatch_one_owned`'s six exits, and why the two that release nothing are
 /// already correct, is recorded at the top of that function.
 ///
 /// Issue #805: the same fan-out arms the PRD #126 outstanding-delegation record
@@ -3361,6 +3361,85 @@ fn release_reserved_silence_watch(
              fresh generation; that generation never received a task pointer"
         );
     }
+}
+
+/// Issue #815: the first thing the pi-native seed delivery does with the
+/// replacement `dispatch_one_owned` has just respawned — bind the delegation to
+/// it, and find out whether it is still there to be delivered to.
+///
+/// The native path stashes the task pointer for the replacement to pull and
+/// returns, so it never reaches the bind at the dispatch's tail and never makes
+/// the identity-guarded write that tells every other path its target is dead.
+/// Both halves are done here instead, through
+/// [`AgentPtyRegistry::bind_delegation_worker_agent_id_or_sweep_exited`]: the
+/// outstanding-delegation record learns the replacement's agent id, so a
+/// replacement that exits later without `work-done` is retired by the agent-exit
+/// sweep rather than by the idle-worker timeout; and a replacement that has
+/// ALREADY exited is swept on the spot and reported to the caller.
+///
+/// Returns `true` when the replacement was already gone, in which case this has
+/// taken the whole no-delivery exit and the dispatch must `return` without
+/// stashing anything (a stash resolves the pane's LIVE agent, so it would store
+/// nothing for a dead one, and a seed fallback armed for a corpse has nothing to
+/// deliver either):
+///
+/// * the commission is released and the delegation's own generation retired,
+///   through [`release_undelivered_commission`] like every other no-delivery
+///   exit — no task reached the worker, so no completion is owed for one;
+/// * the silent-worker watch the respawn armed for the replacement is released
+///   through [`release_reserved_silence_watch`]. Arming it already superseded
+///   the PREVIOUS generation's watch, and that half of issue #687 stands.
+///
+/// **The orchestrator is told once, and not by this function.** The "exited
+/// without work-done" notice is the exit sweep's, written when the record bound
+/// to the replacement is drained — by the registry call above or by the
+/// replacement's own reader thread, whichever reaches the tracker first, never
+/// both. By the time that call returns `true` the record is already gone, so
+/// the retirement the release below attempts finds nothing to take and
+/// announces nothing, and no dead-replacement notice is written here on top of
+/// it: the injection path's `compose_respawn_no_live_worker_notice` has no
+/// counterpart on this exit on purpose.
+///
+/// What that leaves unannounced, deliberately: a delegate with no record of its
+/// own to sweep — `delegation_seq` is `None` (the idle-worker detector is off,
+/// the orchestrator had no live agent at arm time, or a pane was mid-close), or
+/// a newer delegate has already replaced the record — produces no notice here,
+/// exactly as it produced none before this exit existed. Its commission is
+/// still released, which is the part that must not depend on the detector.
+///
+/// Returns `false` for a live replacement, having bound it and changed nothing
+/// else; the dispatch carries on to the stash.
+async fn native_seed_replacement_already_exited(
+    registry: &Arc<AgentPtyRegistry>,
+    worker_pane_id: &str,
+    role: &str,
+    delegation_seq: Option<u64>,
+    replacement_agent_id: &str,
+    reserved_silence: &mut Option<crate::agent_pty::ArmedSilenceWatch>,
+) -> bool {
+    if !registry
+        .bind_delegation_worker_agent_id_or_sweep_exited(
+            worker_pane_id,
+            delegation_seq,
+            replacement_agent_id,
+        )
+        .await
+    {
+        return false;
+    }
+    const REASON: &str =
+        "the pi-native clear=true replacement worker exited before its seed was stashed";
+    warn!(
+        role = %role,
+        pane_id = %worker_pane_id,
+        new_agent_id = %replacement_agent_id,
+        "delegate: the pi-native clear=true replacement worker had already exited when its \
+         delegation was bound to it; the exit sweep reports it to the orchestrator, and the \
+         seed stash is skipped"
+    );
+    release_undelivered_commission(registry, worker_pane_id, role, delegation_seq, REASON);
+    release_reserved_silence_watch(registry, worker_pane_id, reserved_silence.take(), REASON);
+    true
 }
 
 /// PRD #126: resolve the timeout, capture the orchestrator's identity, arm the
@@ -3807,7 +3886,12 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
 ///   [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub at
 ///   spawn, which admits no ANSI, C0 or newline byte regardless of source.
 ///   (`orchestrator_pane_id` and the delegate path's pane ids are not scrubbed
-///   this way; this notice never interpolates either.) Role and
+///   this way; this notice never interpolates either. Both callers hand in the
+///   exited agent's own stored `pane_id_env`: `pump_reader` directly, and
+///   [`AgentPtyRegistry::bind_delegation_worker_agent_id_or_sweep_exited`] —
+///   which IS reached from the delegate path — by reading it back off the
+///   agent's record and refusing to write at all unless it is the pane it was
+///   asked about, never by passing the dispatch's pane id through.) Role and
 ///   elapsed-armed detail stay in the `tracing::info!`/`warn!` that always
 ///   accompanies delivery — exactly #249's own resolution: the pane gets "a
 ///   worker exited, look at the log," the log gets the identifying detail.
@@ -5787,7 +5871,7 @@ fn write_work_done_summary(
 /// caller, *before* this function's first poll, so **every exit that leaves
 /// without the worker receiving a task pointer owes a release** — see
 /// [`release_undelivered_commission`], which states the rule and names the
-/// consequence of breaking it. This function has five exits, audited here so the
+/// consequence of breaking it. This function has six exits, audited here so the
 /// two that deliberately release nothing read as checked absences rather than as
 /// the ones that were simply missed:
 ///
@@ -5820,6 +5904,18 @@ fn write_work_done_summary(
 ///    as delivered on purpose: some bytes reached the authorized worker, so a
 ///    completion may genuinely be owed and keeping the commission is the
 ///    fail-safe direction.
+/// 6. **The pi-native dead-replacement return** (issue #815) — releases. Numbered
+///    last because it was found last; in the function it sits immediately before
+///    exit 1, on the same path. Exit 1's claim that the pointer IS handed over
+///    holds only while there is a live replacement to hand it to: a seed is
+///    stashed on the pane's live agent, so for a replacement that has already
+///    exited the stash stores nothing and nothing is delivered. The native path
+///    makes no guarded write that would say so, so it asks outright, at the
+///    moment it binds the delegation to the replacement
+///    ([`native_seed_replacement_already_exited`]), and leaves here when the
+///    answer is "already gone". It writes no notice of its own, unlike exit 3:
+///    the agent-exit sweep that retires the bound record is what tells the
+///    orchestrator, and a second notice here would tell it twice.
 ///
 /// # The silent-worker watch's no-delivery invariant
 ///
@@ -5847,6 +5943,10 @@ fn write_work_done_summary(
 ///    same lock hold that drops the close waiter this arm woke on.
 /// 4. **The tail** — reuses the record rather than arming a second one, and the
 ///    existing `!delivered` and unresolved-identity arms cancel it by `seq`.
+/// 5. **The pi-native dead-replacement return** (issue #815, commission exit 6)
+///    — releases. Usually a no-op for the reason exit 2 is: the sweep that
+///    retired the dead replacement's delegation drains this record too, on the
+///    `worker_agent_id` bound at arm time.
 ///
 /// The **respawn-error** exit is absent from this list on purpose: the record is
 /// armed inside the success arm, so a failed respawn never creates one.
@@ -5858,16 +5958,16 @@ fn write_work_done_summary(
 /// its generation. It follows the commission exit for exit, and is retired by
 /// the same call — [`release_undelivered_commission`] performs it, through
 /// [`retire_undelivered_delegation`] — so the two cannot drift apart. The same
-/// five exits, audited for the record:
+/// six exits, audited for the record:
 ///
 /// 1. **The pi-native `clear = true` return** — retires nothing, correctly. The
 ///    pointer is handed over as the respawned pi's seed, so the worker owes a
 ///    `work-done` and the orchestrator is genuinely waiting on one. Issue #815:
 ///    because this exit never reaches the tail's bind, the record is bound to
-///    the replacement's agent id as soon as the respawn returns it
-///    ([`AgentPtyRegistry::bind_delegation_worker_agent_id_or_sweep_exited`]),
-///    so a replacement that exits without reporting is retired by the
-///    agent-exit sweep rather than by the idle-worker timeout.
+///    the replacement's agent id on this path itself
+///    ([`native_seed_replacement_already_exited`]), so a replacement that exits
+///    without reporting is retired by the agent-exit sweep rather than by the
+///    idle-worker timeout.
 /// 2. **The respawn-error return** — retires.
 /// 3. **The dead-replacement return** — retires.
 /// 4. **The readiness-buffer close return** — retires, belt-and-braces, by
@@ -5884,6 +5984,14 @@ fn write_work_done_summary(
 ///    worker, so it may be working on the task, and an idle prompt for a
 ///    delegation that did not land is a discardable nudge where a retired record
 ///    for one that did is a silent worker nobody is watching.
+/// 6. **The pi-native dead-replacement return** (issue #815) — retires, and
+///    almost always has nothing left to retire: the record was bound to the
+///    replacement and swept on its exit, by the bind-time check or by the
+///    replacement's reader thread, and that sweep is what announced the
+///    retirement and wrote the orchestrator's one notice. The call through
+///    [`release_undelivered_commission`] only ever finds work when there was no
+///    bound record to sweep — a newer delegate has already replaced it and still
+///    counts this generation as owed — and then takes this generation out of it.
 ///
 /// "Retires" means one generation, this delegate's own, wherever it is still
 /// owed. An exit reached after a newer delegate re-armed the pane takes this
@@ -6163,43 +6271,6 @@ async fn dispatch_one_owned(
                 agent_id: new_agent_id,
                 recreated,
             }) => {
-                // Issue #815: the native seed delivery below returns without
-                // ever reaching the bind at this function's tail, so the
-                // outstanding-delegation record has to learn which agent the
-                // replacement is HERE — the first statement at which that agent
-                // id exists — or the agent-exit sweep can never match it and a
-                // replacement that exits before `work-done` leaves the worker
-                // reading `Idle (delegated)` and the orchestrator `Observing`
-                // until the idle-worker timeout.
-                //
-                // The `_or_sweep_exited` form, not the plain bind: the
-                // replacement's reader thread has been running since the spawn
-                // returned, so it can already have reached EOF and swept past a
-                // still-unbound record. The injection path needs no such check,
-                // which is why it keeps the plain bind at the tail — its guarded
-                // pointer write refuses a dead target (`NoLiveTarget`) and that
-                // no-delivery exit retires the record. A seed is stashed, not
-                // written, so nothing downstream on this path would notice.
-                //
-                // Scoped to the native path on purpose. Binding this early on
-                // the injection path would hand a replacement that dies during
-                // the `SessionStart` wait to the exit sweep AND to the
-                // dead-replacement exit below, and the orchestrator would be
-                // told twice.
-                //
-                // The dispatch carries on either way: the commission stands
-                // exactly as it does for a replacement that dies a moment
-                // after the stash (commission audit exit 1), and the exit sweep
-                // deliberately leaves the ledger alone.
-                if is_pi_native && let Some(seq) = delegation_seq {
-                    registry
-                        .bind_delegation_worker_agent_id_or_sweep_exited(
-                            &pane_id,
-                            seq,
-                            &new_agent_id,
-                        )
-                        .await;
-                }
                 if recreated {
                     // The pane was re-created rather than replaced, so a
                     // completed close has already taken this role's daemon-side
@@ -6288,6 +6359,24 @@ async fn dispatch_one_owned(
                     );
                 }
                 if is_pi_native {
+                    // Issue #815: this path returns without ever reaching the
+                    // bind at this function's tail, so the record learns which
+                    // agent the replacement is HERE — and, because a seed is
+                    // stashed rather than written through the identity gate,
+                    // this is also the only place a replacement that is already
+                    // dead can be noticed. Commission audit exit 6.
+                    if native_seed_replacement_already_exited(
+                        &registry,
+                        &pane_id,
+                        &target_role,
+                        delegation_seq,
+                        &new_agent_id,
+                        &mut reserved_silence,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     // PRD #201: NATIVE delivery — stash the pointer as the
                     // respawned pi's seed and arm the PTY-injection safety net.
                     // Skip the `SessionStart` wait (pi never emits
@@ -6987,7 +7076,7 @@ async fn dispatch_one_owned(
     // occupant. A no-op if the record is gone (superseded, retired, or the
     // detector was disabled at arm time). The pi-native seed delivery never
     // gets here — it returns from inside the respawn arm — and binds there
-    // instead (issue #815).
+    // instead (issue #815, `native_seed_replacement_already_exited`).
     if let (Some(seq), Some(worker_agent_id)) =
         (delegation_seq, expected_worker_agent_id.as_deref())
     {
@@ -15406,6 +15495,312 @@ clear = false
             "an identity-unresolved refusal must cancel the silence watch it armed, not leave \
              a taskless record behind to inflate the next watch's `superseded` counter"
         );
+    }
+
+    /// Issue #815: `native_seed_replacement_already_exited`, the pi-native
+    /// path's bind and its dead-replacement exit (commission audit exit 6).
+    ///
+    /// Pinned on the helper rather than through `dispatch_one_owned`: the exit
+    /// is only reached when the replacement dies between the respawn returning
+    /// and the very next statements of the dispatch, a window of microseconds no
+    /// role command can be made to hit on demand. The helper is that exit in
+    /// full — the dispatch only `return`s on its answer — and it can be handed a
+    /// replacement that is already dead.
+    #[cfg(unix)]
+    mod native_seed_dead_replacement {
+        use super::super::native_seed_replacement_already_exited;
+        use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        const ORCH_PANE: &str = "orch";
+        const WORKER_PANE: &str = "worker";
+        const ROLE: &str = "pi-worker";
+        const ORCH_STAND_IN_READY: &str = "ORCH-STAND-IN-READY";
+        /// The opening clauses of `compose_worker_exited_notice` and
+        /// `compose_respawn_no_live_worker_notice`, spelled out so a rewording
+        /// fails these tests instead of following it.
+        const WORKER_EXITED_NEEDLE: &str =
+            "delegated worker exited without work-done (dot-agent-deck daemon report)";
+        const NEVER_CAME_UP_NEEDLE: &str =
+            "delegated worker never came up (dot-agent-deck daemon report)";
+
+        fn pane_output(registry: &AgentPtyRegistry, agent_id: &str) -> String {
+            String::from_utf8_lossy(&registry.snapshot(agent_id).expect("the agent must exist"))
+                .into_owned()
+        }
+
+        /// A live orchestrator pane. Echo is turned off before `cat` takes
+        /// over, so each notice written into the pane comes back out of it
+        /// exactly once.
+        async fn spawn_orchestrator_stand_in(registry: &Arc<AgentPtyRegistry>) -> String {
+            let command = format!("stty -echo && printf {ORCH_STAND_IN_READY} && cat");
+            let agent_id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(&command),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn the orchestrator stand-in");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline
+                && !pane_output(registry, &agent_id).contains(ORCH_STAND_IN_READY)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                pane_output(registry, &agent_id).contains(ORCH_STAND_IN_READY),
+                "test prerequisite: the orchestrator stand-in never turned echo off"
+            );
+            agent_id
+        }
+
+        /// The replacement: alive until [`end_replacement`] feeds it a line.
+        fn spawn_replacement(registry: &Arc<AgentPtyRegistry>) -> String {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("sh -c 'read _line'"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn the replacement stand-in")
+        }
+
+        /// Ends the replacement by its own front door — a natural exit, which
+        /// keeps its registry entry — and waits until its child is gone.
+        async fn end_replacement(registry: &Arc<AgentPtyRegistry>, agent_id: &str) {
+            registry
+                .write_notice_guarded(
+                    WORKER_PANE,
+                    "the line that ends the read",
+                    agent_id,
+                    || async { true },
+                )
+                .await
+                .expect("the line that ends the replacement must reach its PTY");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline && registry.agent_is_live(agent_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                !registry.agent_is_live(agent_id),
+                "test prerequisite: the replacement must have exited on its own"
+            );
+        }
+
+        fn record_delegation_retirements(registry: &AgentPtyRegistry) -> Arc<Mutex<Vec<String>>> {
+            let fired = Arc::new(Mutex::new(Vec::new()));
+            let fired_for_sink = fired.clone();
+            registry.set_delegation_retired_sink(Arc::new(move |pane_id| {
+                fired_for_sink.lock().unwrap().push(pane_id);
+            }));
+            fired
+        }
+
+        /// The exit itself. A replacement that is already dead when the native
+        /// path binds its delegation received nothing, so the dispatch must be
+        /// told to leave (`true`), the commission, the delegation and the
+        /// silent-worker watch must all be gone, and the orchestrator must be
+        /// told exactly ONCE — by the exit sweep's "exited without work-done"
+        /// notice, with no dead-replacement notice on top of it.
+        #[tokio::test]
+        async fn a_replacement_that_already_exited_owes_nothing_and_is_reported_once() {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let fired = record_delegation_retirements(&registry);
+            let orchestrator = spawn_orchestrator_stand_in(&registry).await;
+            let replacement = spawn_replacement(&registry);
+            // What `handle_delegate`'s fan-out arms before the dispatch starts.
+            let armed = registry
+                .arm_outstanding_delegation(WORKER_PANE, ROLE, ORCH_PANE, &orchestrator, None)
+                .expect("arm the delegation");
+            assert!(
+                registry.arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
+                "arm the commission"
+            );
+            end_replacement(&registry, &replacement).await;
+            // What the dispatch arms once the respawn has returned.
+            let mut reserved_silence =
+                registry.arm_silence_watch(WORKER_PANE, ORCH_PANE, Some(&replacement));
+
+            let already_exited = native_seed_replacement_already_exited(
+                &registry,
+                WORKER_PANE,
+                ROLE,
+                Some(armed.seq),
+                &replacement,
+                &mut reserved_silence,
+            )
+            .await;
+
+            assert!(
+                already_exited,
+                "the replacement is dead, so the dispatch must be told to take the no-delivery exit"
+            );
+            let watches = registry.delegation_watch_snapshot(WORKER_PANE);
+            assert!(
+                watches.delegation_commission.is_none(),
+                "no task reached the dead replacement, so its commission must be released; \
+                 watches = {watches:?}"
+            );
+            assert!(
+                watches.outstanding_delegation.is_none(),
+                "the dead replacement's delegation must be retired; watches = {watches:?}"
+            );
+            assert!(
+                watches.silence_watch.is_none() && reserved_silence.is_none(),
+                "the silent-worker watch armed for the dead replacement must be released; \
+                 watches = {watches:?}"
+            );
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline
+                && !pane_output(&registry, &orchestrator).contains(WORKER_EXITED_NEEDLE)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // A second notice, of either kind, gets every chance to arrive.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let output = pane_output(&registry, &orchestrator);
+            assert_eq!(
+                output.match_indices(WORKER_EXITED_NEEDLE).count(),
+                1,
+                "the orchestrator must be told exactly once that the worker exited; output = \
+                 {output:?}"
+            );
+            assert!(
+                output.contains(&format!("pane {WORKER_PANE} ")),
+                "the notice must name the worker's pane; output = {output:?}"
+            );
+            assert!(
+                !output.contains(NEVER_CAME_UP_NEEDLE),
+                "the exit sweep's notice is the one report; a dead-replacement notice on top of \
+                 it tells the orchestrator twice; output = {output:?}"
+            );
+            assert_eq!(
+                fired.lock().unwrap().as_slice(),
+                &[WORKER_PANE.to_string()],
+                "exactly one retirement must be announced"
+            );
+
+            registry.shutdown_all();
+        }
+
+        /// The ordinary case. A live replacement is bound and nothing is
+        /// released: the dispatch goes on to stash its seed (`false`), the
+        /// commission stays owed — and, because the record now knows which
+        /// agent the replacement is, that replacement's later exit retires it.
+        #[tokio::test]
+        async fn a_live_replacement_is_bound_and_keeps_everything_armed() {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let orchestrator = spawn_orchestrator_stand_in(&registry).await;
+            let replacement = spawn_replacement(&registry);
+            let armed = registry
+                .arm_outstanding_delegation(WORKER_PANE, ROLE, ORCH_PANE, &orchestrator, None)
+                .expect("arm the delegation");
+            assert!(
+                registry.arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
+                "arm the commission"
+            );
+            let mut reserved_silence =
+                registry.arm_silence_watch(WORKER_PANE, ORCH_PANE, Some(&replacement));
+
+            let already_exited = native_seed_replacement_already_exited(
+                &registry,
+                WORKER_PANE,
+                ROLE,
+                Some(armed.seq),
+                &replacement,
+                &mut reserved_silence,
+            )
+            .await;
+
+            assert!(!already_exited, "the replacement is still running");
+            let watches = registry.delegation_watch_snapshot(WORKER_PANE);
+            assert_eq!(
+                watches
+                    .delegation_commission
+                    .as_ref()
+                    .map(|commission| commission.outstanding),
+                Some(1),
+                "a live replacement is about to be handed its seed, so its commission stands; \
+                 watches = {watches:?}"
+            );
+            assert!(
+                watches.outstanding_delegation.is_some()
+                    && watches.silence_watch.is_some()
+                    && reserved_silence.is_some(),
+                "nothing may be retired or released for a live replacement; watches = {watches:?}"
+            );
+
+            end_replacement(&registry, &replacement).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline
+                && registry
+                    .delegation_watch_snapshot(WORKER_PANE)
+                    .outstanding_delegation
+                    .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                registry
+                    .delegation_watch_snapshot(WORKER_PANE)
+                    .outstanding_delegation
+                    .is_none(),
+                "the helper must have bound the record to the replacement, so the replacement's \
+                 own exit retires it"
+            );
+
+            registry.shutdown_all();
+        }
+
+        /// The exit does not depend on the idle-worker detector. With nothing
+        /// armed for the delegate (`delegation_seq` is `None`) there is no
+        /// record to sweep and so no notice, but a dead replacement still
+        /// received nothing and its commission must still be released.
+        #[tokio::test]
+        async fn a_dead_replacement_with_no_armed_delegation_still_releases_its_commission() {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let fired = record_delegation_retirements(&registry);
+            let orchestrator = spawn_orchestrator_stand_in(&registry).await;
+            let replacement = spawn_replacement(&registry);
+            assert!(
+                registry.arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
+                "arm the commission"
+            );
+            end_replacement(&registry, &replacement).await;
+            let mut reserved_silence = None;
+
+            let already_exited = native_seed_replacement_already_exited(
+                &registry,
+                WORKER_PANE,
+                ROLE,
+                None,
+                &replacement,
+                &mut reserved_silence,
+            )
+            .await;
+
+            assert!(already_exited, "the replacement is dead");
+            let watches = registry.delegation_watch_snapshot(WORKER_PANE);
+            assert!(
+                watches.delegation_commission.is_none(),
+                "the commission of a delegate that delivered nothing must be released whether or \
+                 not the idle-worker detector armed a record for it; watches = {watches:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let output = pane_output(&registry, &orchestrator);
+            assert!(
+                !output.contains(WORKER_EXITED_NEEDLE)
+                    && !output.contains(NEVER_CAME_UP_NEEDLE)
+                    && fired.lock().unwrap().is_empty(),
+                "with no record to sweep there is nothing to announce; output = {output:?}, \
+                 retirements = {:?}",
+                fired.lock().unwrap()
+            );
+
+            registry.shutdown_all();
+        }
     }
 
     /// Issue #805: the retirement a no-delivery exit performs is conditional on
