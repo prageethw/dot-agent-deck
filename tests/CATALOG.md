@@ -5527,6 +5527,13 @@ without depending on the config struct API.
 - **Does not assert:** `Stacked`, or the sweep over pane counts (`orchestration/layout/013`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/layout/016 — The drawn Tiled orchestration boxes follow the orchestrator-takes-the-leftover rule and match the layout pass (issue 829).
+- **Layer:** L1 (a `TestBackend` render of a five-pane Tiled orchestration tab through the render seam's shared body, plus `compute_frame_layout` for the same view; no PTY). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because the shared render body and `compute_frame_layout` are module-private.
+- **Agent:** none (inert seam panes).
+- **Asserts:** with an orchestrator and four workers in a column height five does not divide, counting border rows on screen gives four identical worker boxes and an orchestrator box of `base + leftover` rows (orchestrator last, then first), and those drawn heights equal the rects `compute_frame_layout` returns, so drawing and PTY sizing cannot silently diverge.
+- **Does not assert:** `Stacked`, widths, or the pane counts swept by `orchestration/layout/013`.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/dispatch
 
 ##### orchestration/dispatch/001 — An agent-callable `dispatch --orchestration <name>` makes a full orchestration TAB surface live on the deck, and that orchestration can actually DELEGATE to its own workers (PRD #220 / #222).
