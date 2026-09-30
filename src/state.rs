@@ -3158,53 +3158,6 @@ fn record_delegation_commission(
     }
 }
 
-/// Issue #448 review (@prageethw, round 2): the counterpart to
-/// [`record_delegation_commission`], and the single place the ledger's
-/// no-delivery invariant is spelled out:
-///
-/// > **Every path that arms a commission and then fails to deliver the task
-/// > pointer must release it.**
-///
-/// A commission is armed in `handle_delegate`'s synchronous fan-out, before the
-/// dispatch task has done anything at all. Every way that task can then end
-/// without the worker receiving a pointer therefore owes a release, or the debt
-/// stands forever: a worker owing a completion for work it was never given. A
-/// later, genuinely uncommissioned `work-done` from that pane spends the phantom
-/// entry, reaches the orchestrator as `Solicited`, and either overwrites or
-/// (upstream #331 + fork #76) archives-and-replaces the report at
-/// `.dot-agent-deck/work-done-<role>-<pane digest>.md` — #448 and its summary
-/// clobber, reproduced through the very ledger added to prevent them.
-///
-/// Routed through one helper rather than inlined at each site so the invariant is
-/// checkable by grep instead of by reading 300 lines of `dispatch_one_owned`: the
-/// release sites are exactly the callers of this function. The audit of
-/// `dispatch_one_owned`'s six exits, and why the two that release nothing are
-/// already correct, is recorded at the top of that function.
-///
-/// Issue #805: the same fan-out arms the PRD #126 outstanding-delegation record
-/// beside the commission, and an exit that delivers nothing owes that record's
-/// retirement for exactly the reason it owes this release. So the retirement is
-/// not a second call each exit has to remember: this function takes the
-/// delegation's `seq` and performs it, which makes "released the commission but
-/// left the record armed" unwritable at a no-delivery exit. See
-/// [`retire_undelivered_delegation`].
-fn release_undelivered_commission(
-    registry: &AgentPtyRegistry,
-    worker_pane_id: &str,
-    role: &str,
-    delegation_seq: Option<u64>,
-    reason: &'static str,
-) {
-    release_undelivered_commission_scoped(
-        registry,
-        worker_pane_id,
-        role,
-        delegation_seq,
-        reason,
-        RetireScope::OwnGeneration,
-    );
-}
-
 /// Issue #812: the two `clear = true` respawn exits (the respawn error and the
 /// dead replacement) have already TERMINATED the pane's previous worker, so
 /// they release the commission like every no-delivery exit and additionally
@@ -3217,7 +3170,7 @@ fn release_undelivered_commission_of_terminated_worker(
     delegation_seq: Option<u64>,
     reason: &'static str,
 ) {
-    release_undelivered_commission_scoped(
+    release_undelivered_commission(
         registry,
         worker_pane_id,
         role,
@@ -3241,7 +3194,38 @@ enum RetireScope {
     TerminatedWorker,
 }
 
-fn release_undelivered_commission_scoped(
+/// Issue #448 review (@prageethw, round 2): the counterpart to
+/// [`record_delegation_commission`], and the single place the ledger's
+/// no-delivery invariant is spelled out:
+///
+/// > **Every path that arms a commission and then fails to deliver the task
+/// > pointer must release it.**
+///
+/// A commission is armed in `handle_delegate`'s synchronous fan-out, before the
+/// dispatch task has done anything at all. Every way that task can then end
+/// without the worker receiving a pointer therefore owes a release, or the debt
+/// stands forever: a worker owing a completion for work it was never given. A
+/// later, genuinely uncommissioned `work-done` from that pane spends the phantom
+/// entry, reaches the orchestrator as `Solicited`, and either overwrites or
+/// (upstream #331 + fork #76) archives-and-replaces the report at
+/// `.dot-agent-deck/work-done-<role>-<pane digest>.md` — #448 and its summary
+/// clobber, reproduced through the very ledger added to prevent them.
+///
+/// Routed through one helper rather than inlined at each site so the invariant is
+/// checkable by grep instead of by reading 300 lines of `dispatch_one_owned`: the
+/// release sites are exactly the callers of this function and of its wrapper
+/// [`release_undelivered_commission_of_terminated_worker`]. The audit of
+/// `dispatch_one_owned`'s six exits, and why the two that release nothing are
+/// already correct, is recorded at the top of that function.
+///
+/// Issue #805: the same fan-out arms the PRD #126 outstanding-delegation record
+/// beside the commission, and an exit that delivers nothing owes that record's
+/// retirement for exactly the reason it owes this release. So the retirement is
+/// not a second call each exit has to remember: this function takes the
+/// delegation's `seq` and performs it, which makes "released the commission but
+/// left the record armed" unwritable at a no-delivery exit. See
+/// [`retire_undelivered_delegation`].
+fn release_undelivered_commission(
     registry: &AgentPtyRegistry,
     worker_pane_id: &str,
     role: &str,
@@ -3625,7 +3609,15 @@ async fn native_seed_replacement_already_exited(
         )
         .await;
     }
-    release_undelivered_commission(registry, worker_pane_id, role, delegation_seq, REASON);
+    // This exit follows a `clear = true` respawn, which terminated the pane's
+    // previous worker (issue #812).
+    release_undelivered_commission_of_terminated_worker(
+        registry,
+        worker_pane_id,
+        role,
+        delegation_seq,
+        REASON,
+    );
     release_reserved_silence_watch(registry, worker_pane_id, reserved_silence.take(), REASON);
     true
 }
@@ -6146,8 +6138,12 @@ fn write_work_done_summary(
 /// in the same synchronous fan-out as the commission, and `delegation_seq` is
 /// its generation. It follows the commission exit for exit, and is retired by
 /// the same call — [`release_undelivered_commission`] performs it, through
-/// [`retire_undelivered_delegation`] — so the two cannot drift apart. The same
-/// six exits, audited for the record:
+/// [`retire_undelivered_delegation`] — so a no-delivery exit cannot release one
+/// and forget the other. They are not the same size: at exits 2, 3 and (after a
+/// respawn) 5 and 6 the record drops every generation the terminated worker
+/// owed while the commission ledger releases one, so the ledger can keep a
+/// phantom entry for an older generation; keying commissions on the generation
+/// is tracked as a follow-up. The same six exits, audited for the record:
 ///
 /// 1. **The pi-native `clear = true` return** — retires nothing, correctly. The
 ///    pointer is handed over as the respawned pi's seed, so the worker owes a
@@ -6168,15 +6164,17 @@ fn write_work_done_summary(
 ///    `begin_pane_close` drains every outstanding delegation touching the pane
 ///    under the same lock hold that drops the close waiter this arm woke on, and
 ///    that drain announces the retirement itself.
-/// 5. **The tail, after the guarded send** — retires whenever the send did not
-///    deliver (`WrongSession`, `Stale`, `NoLiveTarget`, `RefusedUserInput`,
+/// 5. **The tail, after the guarded send** — retires (like exit 2 when this
+///    dispatch respawned, its own generation only otherwise) whenever the send
+///    did not deliver (`WrongSession`, `Stale`, `NoLiveTarget`, `RefusedUserInput`,
 ///    `Err`); [`task_pointer_counts_as_delivered`] is that decision. `Applied`
 ///    keeps the record, which is the delegation working as intended.
 ///    `Ambiguous` keeps it too, on purpose: some bytes reached the authorized
 ///    worker, so it may be working on the task, and an idle prompt for a
 ///    delegation that did not land is a discardable nudge where a retired record
 ///    for one that did is a silent worker nobody is watching.
-/// 6. **The pi-native dead-replacement return** (issue #815) — retires, and
+/// 6. **The pi-native dead-replacement return** (issue #815) — retires like
+///    exit 2, and
 ///    almost always has nothing left to retire: the record was bound to the
 ///    replacement and swept on its exit, by the bind-time check or by the
 ///    replacement's reader thread, and that sweep is what announced the
@@ -6187,7 +6185,10 @@ fn write_work_done_summary(
 ///
 /// "Retires" means one generation, this delegate's own, wherever it is still
 /// owed — except at exits 2 and 3, which also drop the older generations the
-/// terminated worker owed ([`RetireScope::TerminatedWorker`]). An exit reached after a newer delegate re-armed the pane takes this
+/// terminated worker owed ([`RetireScope::TerminatedWorker`]), and so do exit 5
+/// when this dispatch respawned and exit 6. Older generations whose own dispatch
+/// has not started are kept: their task was never given to the terminated
+/// worker. An exit reached after a newer delegate re-armed the pane takes this
 /// generation out of the newer record and leaves that record armed; an exit of
 /// the NEWEST delegate, reached while an earlier delegation that was delivered
 /// is still unanswered, leaves the record and its idle-worker watch armed for
@@ -6218,6 +6219,10 @@ async fn dispatch_one_owned(
 ) {
     let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
+    // Issue #812: from here this generation's task is being handed to a worker.
+    if let Some(seq) = delegation_seq {
+        registry.mark_delegation_dispatch_started(seq);
+    }
 
     // Look the role config up by `(worker cwd, orchestration name,
     // target role)` so the per-role `prompt_template` wrapping is
@@ -6298,6 +6303,11 @@ async fn dispatch_one_owned(
     // send at the end of this function for why an unguarded, pane-id-keyed
     // write is not safe here.
     let mut expected_worker_agent_id: Option<String> = None;
+    // Issue #812: set once THIS dispatch's `clear = true` respawn succeeded,
+    // which terminated the pane's previous worker. A refusal at the tail then
+    // leaves the generations that worker owed unanswerable; on a
+    // `clear = false` dispatch the worker is still the old live one.
+    let mut respawned = false;
 
     // Issue #687: the silent-worker watch a `clear = true` respawn arms for its
     // fresh generation the moment that generation takes the pane, rather than
@@ -7064,6 +7074,7 @@ async fn dispatch_one_owned(
                 // whichever agent owns the pane at the END of the wait, which is
                 // precisely the successor this guard exists to exclude.
                 expected_worker_agent_id = Some(new_agent_id);
+                respawned = true;
             }
             Err(e) => {
                 // Fix round 3 (`orchestration/delegate/047` CI regression):
@@ -7485,6 +7496,11 @@ async fn dispatch_one_owned(
             &target_role,
             delegation_seq,
             "the identity gate refused the task pointer",
+            if respawned {
+                RetireScope::TerminatedWorker
+            } else {
+                RetireScope::OwnGeneration
+            },
         );
     }
     let Some((watch, armed, rx)) = silence else {
@@ -9626,6 +9642,13 @@ impl AppState {
                 orchestration_cwd.as_deref(),
                 cwd.as_deref(),
             );
+            // Issue #812: this generation's task has not been handed to any
+            // worker until its detached dispatch takes the pane's dispatch lock,
+            // so a NEWER delegate's failed-respawn exit must not treat it as
+            // one the terminated worker owed. Cleared by `dispatch_one_owned`.
+            if let Some(seq) = delegation_seq {
+                registry.mark_delegation_dispatch_pending(seq);
+            }
             // Issue #755: announce the freshly-armed delegation to every
             // already-attached TUI, live — no reconnect required. Sent only
             // when a record was actually armed (`arm_idle_worker_watch_for_delegation`
@@ -16203,6 +16226,42 @@ clear = false
                 "the newer delegate's record must be left armed"
             );
             assert_told_once_never_came_up(&registry, &orchestrator).await;
+
+            registry.shutdown_all();
+        }
+
+        /// Issue #812: the terminated worker's older delegation is dropped along
+        /// with the failing one; the newer record stays and the first `work-done`
+        /// then answers it.
+        ///
+        /// Scenario: Three delegations are armed on the pane and the middle delegate's replacement is dead on arrival. Only the newest record may stay armed, and a single work-done must retire it as the last one owed.
+        #[spec("scheduler/idle-worker/036")]
+        #[tokio::test]
+        async fn idle_worker_036_dead_replacement_drops_older_generations_and_keeps_the_newer() {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let (_orchestrator, replacement, seqs) = dead_replacement(&registry, 3).await;
+            let middle = seqs[1];
+            let mut reserved_silence = None;
+
+            let already_exited =
+                call_exited(&registry, Some(middle), &replacement, &mut reserved_silence).await;
+
+            assert!(already_exited, "the replacement is dead");
+            assert!(
+                registry
+                    .delegation_watch_snapshot(WORKER_PANE)
+                    .outstanding_delegation
+                    .is_some(),
+                "the newer delegate's record must be left armed"
+            );
+            assert!(
+                matches!(
+                    registry.retire_outstanding_delegation(WORKER_PANE),
+                    crate::agent_pty::DelegationRetirement::Retired(_)
+                ),
+                "the older generations were owed by the terminated worker and must be gone, so \
+                 the first work-done retires the newer one as the last owed"
+            );
 
             registry.shutdown_all();
         }

@@ -4813,6 +4813,13 @@ without depending on the config struct API.
 - **Does not assert:** the feedback the `work-done` writes into the orchestrator's pane.
 - **Platform coverage:** mac+linux (unix-only).
 
+##### orchestration/delegate/057 — A failed respawn keeps an OLDER delegation whose own dispatch has not started, so its task, if delivered later, stays watched (issue #812).
+- **Layer:** L1/fast (same parking construction as `orchestration/delegate/055`; the older delegation is armed directly and marked dispatch-pending through `mark_delegation_dispatch_pending`, the call the fan-out makes).
+- **Agent:** none (`cat` stand-ins; the worker role is re-pointed at a binary that does not exist).
+- **Asserts:** preconditions — the newer delegate reached the respawn-error exit; then `delegation_watch_snapshot(worker).outstanding_delegation` is still `Some`, and after `mark_delegation_dispatch_started` plus ONE `work-done` it is `None` and a `DelegationRetired` naming the worker pane was broadcast.
+- **Does not assert:** that the older dispatch then really runs (the dispatch task is private and cannot be started out of order deterministically).
+- **Platform coverage:** mac+linux (unix-only).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
@@ -8650,6 +8657,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (`cat` and `sh` stand-ins).
 - **Asserts:** the helper reports the replacement as already exited, the newer delegation's record is still armed, and the orchestrator pane holds exactly one "never came up" notice naming the worker pane and no "exited without work-done" notice.
 - **Does not assert:** the commission release (`scheduler/idle-worker/034`); a real Pi.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/036 — When a pi-native `clear = true` replacement is dead on arrival, every OLDER delegation the terminated worker owed is dropped while the newer delegate's record stays armed (issue #812).
+- **Layer:** fast integration (same seam as `scheduler/idle-worker/035`); three delegations are armed on the worker pane and the helper is called with the middle one's generation.
+- **Agent:** none (`cat` and `sh` stand-ins).
+- **Asserts:** the helper reports the replacement as already exited, the newer record is still armed, and one `retire_outstanding_delegation` then retires it as the last one owed (not as a superseded one).
+- **Does not assert:** the orchestrator notices (`scheduler/idle-worker/034`, `035`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

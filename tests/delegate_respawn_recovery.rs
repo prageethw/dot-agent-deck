@@ -1358,6 +1358,61 @@ async fn delegate_056_after_a_failed_respawn_the_first_work_done_answers_the_new
     );
 }
 
+/// Scenario: an older delegate's dispatch is still queued behind the pane's dispatch lock (its task never handed to any worker) when a newer delegate whose respawn will fail is dispatched first. After the newer delegate fails, the older generation must still be owed and watched, because if the failure was transient its dispatch will still deliver; one `work-done` then retires it and the retirement is broadcast.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/057")]
+async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_has_not_started() {
+    let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
+    point_worker_role_at(&fx, MISSING_WORKER_BINARY);
+    let mut broadcasts = fx.daemon.event_tx.subscribe();
+    let queued = arm_earlier_delivered_delegation(&fx);
+    fx.daemon.registry.mark_delegation_dispatch_pending(queued);
+    let dispatch_lock = fx.daemon.registry.pane_dispatch_lock(WORKER_PANE);
+    let parked = dispatch_lock.lock().await;
+    delegate(&fx, "list the files in this directory").await;
+    drop(parked);
+
+    let orchestrator = wait_for_orchestrator_text(&fx, RESPAWN_FAILED_NEEDLE).await;
+    assert!(
+        orchestrator.contains(RESPAWN_FAILED_NEEDLE),
+        "precondition: the newer delegate must reach the respawn-error exit; orchestrator pane \
+         = {orchestrator:?}"
+    );
+
+    assert!(
+        fx.daemon
+            .registry
+            .delegation_watch_snapshot(WORKER_PANE)
+            .outstanding_delegation
+            .is_some(),
+        "the older delegation's dispatch had not started, so its task was never given to the \
+         terminated worker; the newer delegate's failed respawn dropped it and would leave its \
+         task, if delivered later, unwatched; watches = {:?}",
+        fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
+    );
+    fx.daemon.registry.mark_delegation_dispatch_started(queued);
+    work_done(&fx).await;
+    assert!(
+        fx.daemon
+            .registry
+            .delegation_watch_snapshot(WORKER_PANE)
+            .outstanding_delegation
+            .is_none(),
+        "the one work-done must answer the one generation still owed"
+    );
+    let seen = common::delegation_broadcasts_for(
+        &mut broadcasts,
+        WORKER_PANE,
+        common::load_scaled(Duration::from_secs(3)),
+        true,
+    )
+    .await;
+    assert!(
+        seen.retired > 0,
+        "the retirement must be announced; broadcasts = {seen:?}"
+    );
+}
+
 /// Issue #706: an env-dumping worker stand-in — logs the vars that decide
 /// whether a recreated worker's `work-done` can pass the daemon's
 /// generation/boot-id staleness gate, then behaves like `cat`.
