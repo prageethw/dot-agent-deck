@@ -188,8 +188,8 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
     build_status_agents_with_delegations(records, &[])
 }
 
-/// [`build_status_agents`] plus issue #817's daemon-wide delegation list from
-/// the same reply. A delegation onto a worker pane with no live agent has no
+/// Reduce a reply to status rows using both the per-record delegations and issue
+/// #817's daemon-wide delegation list from the same reply. A delegation onto a worker pane with no live agent has no
 /// record to carry `outstanding_delegation`, so `delegations` supplies it;
 /// entries duplicating a record's own join are harmless (same pairs). An
 /// orchestrator pane absent from `records` simply gets no row to mark.

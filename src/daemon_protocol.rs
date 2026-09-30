@@ -1509,23 +1509,42 @@ impl RunningAgentsSummary {
     }
 }
 
-/// Issue #817: decode [`AttachResponse::outstanding_delegations`] without
-/// letting a malformed value fail the enclosing reply. Anything that does not
-/// parse as the expected list is logged at `warn` and read as `None`.
-fn lenient_outstanding_delegations<'de, D>(
-    deserializer: D,
-) -> Result<Option<Vec<crate::agent_pty::OutstandingDelegationEntry>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|v| match serde_json::from_value(v) {
-        Ok(list) => Some(list),
-        Err(e) => {
-            warn!("list-agents: ignoring malformed outstanding_delegations from daemon: {e}");
-            None
+/// Issue #817: the wire value of [`AttachResponse::outstanding_delegations`].
+///
+/// Serialises as the bare list. `Malformed` is only ever produced by decoding
+/// (a list of the wrong shape) so a client can tell "the daemon sent a list I
+/// could not read" from "no list"; a daemon never builds it, and if it were
+/// serialised it would go out as `null`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutstandingDelegations {
+    List(Vec<crate::agent_pty::OutstandingDelegationEntry>),
+    Malformed,
+}
+
+impl Serialize for OutstandingDelegations {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::List(list) => list.serialize(serializer),
+            Self::Malformed => serializer.serialize_none(),
         }
-    }))
+    }
+}
+
+impl<'de> Deserialize<'de> for OutstandingDelegations {
+    /// Lenient: a value that does not parse as the expected list is logged at
+    /// `warn` (error text clamped, since serde can embed the offending string)
+    /// and read as [`Self::Malformed`] rather than failing the enclosing reply.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match serde_json::from_value(value) {
+            Ok(list) => Self::List(list),
+            Err(e) => {
+                let msg = crate::daemon_client::clamp_bytes(e.to_string(), 256);
+                warn!("list-agents: ignoring malformed outstanding_delegations from daemon: {msg}");
+                Self::Malformed
+            }
+        })
+    }
 }
 
 /// Discriminated by the populated optional fields rather than a tag, since
@@ -1737,18 +1756,18 @@ pub struct AttachResponse {
     /// client ignores the extra key. So no [`PROTOCOL_VERSION`] bump. Absent
     /// when the daemon holds none.
     ///
-    /// **Decoded leniently** ([`lenient_outstanding_delegations`]): every
-    /// `ListAgents` consumer decodes this reply, so a malformed list must not
-    /// make the whole reply unparseable for all of them. A list this build
-    /// cannot parse becomes `None` (with a `warn!`), i.e. today's per-record
-    /// behaviour, at the cost of `daemon status` possibly reading `Idle` for an
-    /// orchestrator whose delegation sits in the dropped list.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "lenient_outstanding_delegations"
-    )]
-    pub outstanding_delegations: Option<Vec<crate::agent_pty::OutstandingDelegationEntry>>,
+    /// **Decoded leniently** ([`OutstandingDelegations`]): every `ListAgents`
+    /// consumer decodes this reply, so a list of the wrong shape, or an entry of
+    /// the wrong shape, must not make the whole reply unparseable for all of
+    /// them. It decodes to [`OutstandingDelegations::Malformed`] (with a `warn!`),
+    /// i.e. today's per-record behaviour, and `daemon status` prints one stderr
+    /// line so it does not silently read `Idle`. The tolerance covers only that:
+    /// broken JSON, or nesting beyond serde_json's recursion limit inside the
+    /// field, still fails the whole reply (which fails closed). The tolerant
+    /// decode buffers the field once as a `serde_json::Value` tree
+    /// (`RawValue` is not enabled for this crate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outstanding_delegations: Option<OutstandingDelegations>,
     /// PRD #365 M2: the daemon-minted `pane_id` for a `StartAgent` spawn.
     /// The daemon, not the client, is now authoritative for this value —
     /// see [`crate::agent_pty::mint_pane_id`]. Wire-additive
@@ -2775,7 +2794,8 @@ async fn handle_connection(
             // Issue #817: every outstanding delegation, including ones whose
             // worker pane has no record in this reply.
             let delegations = registry.outstanding_delegations();
-            resp.outstanding_delegations = (!delegations.is_empty()).then_some(delegations);
+            resp.outstanding_delegations =
+                (!delegations.is_empty()).then_some(OutstandingDelegations::List(delegations));
             // Issue #887: the client's only observable of the schedule seed the
             // daemon's project list draws on. See `AttachResponse::schedule_revision`.
             resp.schedule_revision = Some(scheduler.revision());
@@ -6877,8 +6897,8 @@ mod tests {
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-4"));
     }
 
-    /// Issue #817: `AttachResponse.outstanding_delegations` is additive and
-    /// optional in both directions, so it costs no `PROTOCOL_VERSION` bump.
+    /// Issue #817: an entry's wire shape is flat (no nested `watch` object)
+    /// and an unknown key inside an entry is ignored.
     #[test]
     fn outstanding_delegations_wire_shape_is_flat_and_tolerant() {
         // Unknown key inside an entry is ignored (forward compatibility).
@@ -6886,21 +6906,25 @@ mod tests {
             r#"{"ok":true,"outstanding_delegations":[{"worker_pane_id":"w","orchestrator_pane_id":"o","armed_secs_ago":3,"future_key":1}]}"#,
         )
         .unwrap();
-        let entry = &resp.outstanding_delegations.unwrap()[0];
+        let Some(OutstandingDelegations::List(list)) = resp.outstanding_delegations else {
+            panic!("a well-formed list must decode to List");
+        };
+        let entry = &list[0];
         assert_eq!(entry.worker_pane_id, "w");
         assert_eq!(entry.watch.orchestrator_pane_id, "o");
         assert_eq!(entry.watch.armed_secs_ago, 3);
 
         // Serialised entry is flat: no nested `watch` object.
         let v = serde_json::to_value(entry).unwrap();
-        assert_eq!(v["worker_pane_id"], "w");
-        assert_eq!(v["orchestrator_pane_id"], "o");
-        assert_eq!(v["armed_secs_ago"], 3);
-        assert!(v.get("watch").is_none());
+        assert_eq!(
+            v,
+            serde_json::json!({"worker_pane_id":"w","orchestrator_pane_id":"o","armed_secs_ago":3})
+        );
     }
 
     /// Issue #817: a malformed `outstanding_delegations` must not fail the
-    /// whole reply; it decodes to `None` with the rest intact.
+    /// whole reply; it decodes to `Malformed` (or `None` for `null`) with the
+    /// rest intact.
     #[test]
     fn malformed_outstanding_delegations_decodes_to_none_with_reply_intact() {
         for bad in [
@@ -6913,10 +6937,20 @@ mod tests {
             let resp: AttachResponse = serde_json::from_str(&json).unwrap();
             assert!(resp.ok, "{bad}");
             assert_eq!(resp.agents, Some(vec!["1".to_string()]), "{bad}");
-            assert!(resp.outstanding_delegations.is_none(), "{bad}");
+            if bad == "null" {
+                assert!(resp.outstanding_delegations.is_none(), "{bad}");
+            } else {
+                assert_eq!(
+                    resp.outstanding_delegations,
+                    Some(OutstandingDelegations::Malformed),
+                    "{bad}"
+                );
+            }
         }
     }
 
+    /// Issue #817: `AttachResponse.outstanding_delegations` is additive and
+    /// optional in both directions, so it costs no `PROTOCOL_VERSION` bump.
     #[test]
     fn outstanding_delegations_is_additive_and_optional_in_both_directions() {
         use crate::agent_pty::{OutstandingDelegationEntry, WatchSnapshot};
@@ -6931,13 +6965,15 @@ mod tests {
 
         // New daemon -> new client: round-trips.
         let mut resp = AttachResponse::agent_records(vec![]);
-        resp.outstanding_delegations = Some(vec![OutstandingDelegationEntry {
-            worker_pane_id: "w".into(),
-            watch: WatchSnapshot {
-                armed_secs_ago: 3,
-                orchestrator_pane_id: "o".into(),
+        resp.outstanding_delegations = Some(OutstandingDelegations::List(vec![
+            OutstandingDelegationEntry {
+                worker_pane_id: "w".into(),
+                watch: WatchSnapshot {
+                    armed_secs_ago: 3,
+                    orchestrator_pane_id: "o".into(),
+                },
             },
-        }]);
+        ]));
         let json = serde_json::to_string(&resp).unwrap();
         let back: AttachResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back.outstanding_delegations, resp.outstanding_delegations);

@@ -2798,7 +2798,15 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
             }
         };
 
-    let agents = build_status_agents_with_delegations(records, &delegations);
+    if delegations.malformed {
+        // Not on stdout (`--json` must stay clean); `daemon status` sets up no
+        // logging, so a `warn!` would go nowhere.
+        eprintln!(
+            "daemon status: the daemon's outstanding-delegation list was malformed and ignored; \
+             an orchestrator with a delegation on a pane without a live agent may read Idle"
+        );
+    }
+    let agents = build_status_agents_with_delegations(records, &delegations.entries);
     if json {
         match serde_json::to_string(&StatusDocument::new(agents)) {
             Ok(j) => {
