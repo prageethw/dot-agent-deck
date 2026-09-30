@@ -4733,6 +4733,80 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// Issue #815: [`Self::bind_delegation_worker_agent_id`] for a delivery that
+    /// is NOT followed by an identity-guarded write to the worker — the
+    /// pi-native seed delivery in `crate::state`'s `dispatch_one_owned`, which
+    /// stashes the task pointer for the agent to pull and returns.
+    ///
+    /// A bind on its own is only half of "the agent-exit sweep can match this
+    /// record": it covers an exit that happens AFTER the bind. The worker's
+    /// reader thread is running from the moment the spawn returns, so the
+    /// worker can also reach EOF BEFORE the bind — `pump_reader`'s
+    /// [`Self::sweep_delegations_on_exit`] then finds the record still unbound,
+    /// leaves it alone by design, and never runs again; a bind arriving after
+    /// that attaches the record to a corpse and it stays armed until the
+    /// idle-worker timeout. On the injection path the guarded pointer write
+    /// closes that window for free (`NoLiveTarget` is a no-delivery exit, which
+    /// retires the record). A seed delivery makes no such write, so the window
+    /// is closed here instead: bind first, THEN ask whether the worker has
+    /// already exited, and if it has, run the sweep its reader thread could not.
+    ///
+    /// The order is what makes this complete. `pump_reader` sets the agent's
+    /// `exited` flag before it sweeps, and the bind below is stored before the
+    /// flag is read, so every interleaving lands on one side or the other: a
+    /// flag still clear here means the reader thread's sweep is yet to come and
+    /// will see the bound record; a flag already set means that sweep may have
+    /// missed it, and this call sweeps in its place. When both run, the record
+    /// is removed under the tracker lock by exactly one of them, so the
+    /// orchestrator gets one "exited without work-done" notice, never two.
+    ///
+    /// Gated exactly as `pump_reader` gates its own sweep: only an agent whose
+    /// entry is STILL REGISTERED counts as a natural exit. An entry a close or
+    /// a respawn has already removed is that operation's decision to make (see
+    /// `pump_reader`'s doc), not this call's.
+    ///
+    /// Like the sweep it stands in for, this does not touch the commission
+    /// ledger — see [`Self::sweep_delegations_on_exit`] for why.
+    ///
+    /// Returns whether the worker had already exited, i.e. whether the sweep
+    /// was run here. `seq`-guarded exactly like the plain bind.
+    pub async fn bind_delegation_worker_agent_id_or_sweep_exited(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        seq: u64,
+        worker_agent_id: &str,
+    ) -> bool {
+        self.bind_delegation_worker_agent_id(worker_pane_id, seq, worker_agent_id);
+        if !self.agent_exited_while_registered(worker_agent_id) {
+            return false;
+        }
+        let swept = self.sweep_delegations_on_exit(worker_pane_id, worker_agent_id);
+        // Same filter as `pump_reader`: only a record this pane touched as the
+        // WORKER has an orchestrator left to tell.
+        for delegation in swept
+            .into_iter()
+            .filter(|delegation| delegation.orchestrator_pane_id != worker_pane_id)
+        {
+            self.deliver_worker_exited_notice(worker_pane_id, delegation)
+                .await;
+        }
+        true
+    }
+
+    /// Issue #815: whether `agent_id`'s child has reached EOF while its entry is
+    /// still in the registry — the "natural exit" `pump_reader` acts on, read
+    /// from outside the reader thread. `false` for a live agent and for one
+    /// whose entry is gone (a deliberate close or respawn, which owns its own
+    /// sweep decision — see [`Self::is_agent_still_registered`]).
+    fn agent_exited_while_registered(&self, agent_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .is_some_and(|agent| agent.exited.load(Ordering::SeqCst))
+    }
+
     /// PRD #249 M3 review (finding B4/S4): register the silent-worker watch for
     /// `worker_pane_id` and hand back the generation + cancellation channel its
     /// task must select on. The caller arms this BEFORE writing the task pointer
@@ -5767,7 +5841,10 @@ impl AgentPtyRegistry {
     /// in between for a fresher, not-yet-bound delegation to be mistaken for
     /// the one being closed.
     ///
-    /// Private: `pump_reader`, its only caller, lives in this same module.
+    /// Private: both callers live in this same module — `pump_reader`, and
+    /// [`Self::bind_delegation_worker_agent_id_or_sweep_exited`] (issue #815),
+    /// which runs it in `pump_reader`'s place for a worker that reached EOF
+    /// before its delegation was bound to it.
     fn sweep_delegations_on_exit(
         &self,
         pane_id: &str,
@@ -15835,6 +15912,170 @@ mod spawn_tests {
             swept.is_empty(),
             "a stale-seq bind must not attach to the delegation that superseded it"
         );
+    }
+
+    /// Spawns `/usr/bin/true` and waits for it to reach EOF, handing back the
+    /// id of an agent that exited NATURALLY: gone, with its entry still
+    /// registered. Spawned with no `pane_id_env`, so its own reader thread
+    /// skips the delegation sweep entirely — whatever retires a record in the
+    /// tests below can only be the bind-time check under test.
+    async fn spawn_and_await_natural_exit(registry: &Arc<AgentPtyRegistry>) -> String {
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a naturally-exiting agent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline && registry.agent_is_live(&agent_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !registry.agent_is_live(&agent_id) && registry.is_agent_still_registered(&agent_id),
+            "test prerequisite: /usr/bin/true must have exited with its entry still registered"
+        );
+        agent_id
+    }
+
+    /// Issue #815: the bind a native seed delivery makes has to cover a worker
+    /// that reached EOF BEFORE the bind. Its reader thread's sweep found the
+    /// record unbound and left it, and never runs again — so a plain bind
+    /// would attach the record to a corpse and leave it armed until the
+    /// idle-worker timeout. `bind_delegation_worker_agent_id_or_sweep_exited`
+    /// must retire it on the spot and announce the retirement.
+    #[tokio::test]
+    async fn bind_or_sweep_exited_retires_the_delegation_of_a_worker_that_already_exited() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let exited_agent = spawn_and_await_natural_exit(&reg).await;
+        let armed = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm delegation");
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let fired_for_sink = fired.clone();
+        reg.set_delegation_retired_sink(Arc::new(move |pane_id| {
+            fired_for_sink.lock().unwrap().push(pane_id);
+        }));
+
+        let already_exited = reg
+            .bind_delegation_worker_agent_id_or_sweep_exited("worker", armed.seq, &exited_agent)
+            .await;
+
+        assert!(
+            already_exited,
+            "the worker's child is gone and its entry is still registered: a natural exit"
+        );
+        assert!(
+            reg.delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_none(),
+            "a delegation bound to a worker that had already exited must be retired at the bind, \
+             not left armed for the idle-worker timeout"
+        );
+        assert_eq!(
+            fired.lock().unwrap().as_slice(),
+            &["worker".to_string()],
+            "the bind-time retirement must fire the retired sink exactly once for the worker pane"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #815, the ordinary case: the worker is alive at the bind, so the
+    /// record is bound and left armed — and its later exit is what retires it.
+    #[tokio::test]
+    async fn bind_or_sweep_exited_binds_and_keeps_a_live_workers_delegation() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let live_agent = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a live agent");
+        let armed = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm delegation");
+
+        let already_exited = reg
+            .bind_delegation_worker_agent_id_or_sweep_exited("worker", armed.seq, &live_agent)
+            .await;
+
+        assert!(!already_exited, "the worker is still running");
+        assert!(
+            reg.delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_some(),
+            "a live worker's delegation must stay armed after the bind"
+        );
+        assert_eq!(
+            reg.sweep_delegations_on_exit("worker", &live_agent).len(),
+            1,
+            "the record must now be bound to the worker, so the worker's own exit retires it"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #815: the bind-time check is gated the way `pump_reader` gates its
+    /// own sweep. An agent whose entry a deliberate close already removed is
+    /// not a natural exit — that close owns the sweep decision — so the bind
+    /// must not retire anything on its behalf.
+    #[tokio::test]
+    async fn bind_or_sweep_exited_leaves_a_deliberately_closed_workers_delegation_alone() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let closed_agent = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn an agent to close deliberately");
+        reg.close_agent(&closed_agent).expect("deliberate close");
+        let armed = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm delegation");
+
+        let already_exited = reg
+            .bind_delegation_worker_agent_id_or_sweep_exited("worker", armed.seq, &closed_agent)
+            .await;
+
+        assert!(
+            !already_exited,
+            "an entry removed by a deliberate close is not a natural exit"
+        );
+        assert!(
+            reg.delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_some(),
+            "a deliberate close decides its own sweep; the bind must not retire the record for it"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #815: the `seq` guard survives the new entry point. A stale
+    /// dispatch whose replacement has already exited must neither bind nor
+    /// retire the NEWER delegation that superseded its own.
+    #[tokio::test]
+    async fn bind_or_sweep_exited_ignores_a_stale_seq_even_when_the_worker_exited() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let exited_agent = spawn_and_await_natural_exit(&reg).await;
+        let first = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm #1");
+        reg.arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm #2 supersedes #1");
+
+        reg.bind_delegation_worker_agent_id_or_sweep_exited("worker", first.seq, &exited_agent)
+            .await;
+
+        assert!(
+            reg.delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_some(),
+            "a stale-seq bind must not retire the delegation that superseded it, even though the \
+             agent it names has exited"
+        );
+
+        reg.shutdown_all();
     }
 
     /// Silence-watch analogue of the unbound-delegation case above:

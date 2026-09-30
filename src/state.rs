@@ -5862,7 +5862,12 @@ fn write_work_done_summary(
 ///
 /// 1. **The pi-native `clear = true` return** — retires nothing, correctly. The
 ///    pointer is handed over as the respawned pi's seed, so the worker owes a
-///    `work-done` and the orchestrator is genuinely waiting on one.
+///    `work-done` and the orchestrator is genuinely waiting on one. Issue #815:
+///    because this exit never reaches the tail's bind, the record is bound to
+///    the replacement's agent id as soon as the respawn returns it
+///    ([`AgentPtyRegistry::bind_delegation_worker_agent_id_or_sweep_exited`]),
+///    so a replacement that exits without reporting is retired by the
+///    agent-exit sweep rather than by the idle-worker timeout.
 /// 2. **The respawn-error return** — retires.
 /// 3. **The dead-replacement return** — retires.
 /// 4. **The readiness-buffer close return** — retires, belt-and-braces, by
@@ -6158,6 +6163,43 @@ async fn dispatch_one_owned(
                 agent_id: new_agent_id,
                 recreated,
             }) => {
+                // Issue #815: the native seed delivery below returns without
+                // ever reaching the bind at this function's tail, so the
+                // outstanding-delegation record has to learn which agent the
+                // replacement is HERE — the first statement at which that agent
+                // id exists — or the agent-exit sweep can never match it and a
+                // replacement that exits before `work-done` leaves the worker
+                // reading `Idle (delegated)` and the orchestrator `Observing`
+                // until the idle-worker timeout.
+                //
+                // The `_or_sweep_exited` form, not the plain bind: the
+                // replacement's reader thread has been running since the spawn
+                // returned, so it can already have reached EOF and swept past a
+                // still-unbound record. The injection path needs no such check,
+                // which is why it keeps the plain bind at the tail — its guarded
+                // pointer write refuses a dead target (`NoLiveTarget`) and that
+                // no-delivery exit retires the record. A seed is stashed, not
+                // written, so nothing downstream on this path would notice.
+                //
+                // Scoped to the native path on purpose. Binding this early on
+                // the injection path would hand a replacement that dies during
+                // the `SessionStart` wait to the exit sweep AND to the
+                // dead-replacement exit below, and the orchestrator would be
+                // told twice.
+                //
+                // The dispatch carries on either way: the commission stands
+                // exactly as it does for a replacement that dies a moment
+                // after the stash (commission audit exit 1), and the exit sweep
+                // deliberately leaves the ledger alone.
+                if is_pi_native && let Some(seq) = delegation_seq {
+                    registry
+                        .bind_delegation_worker_agent_id_or_sweep_exited(
+                            &pane_id,
+                            seq,
+                            &new_agent_id,
+                        )
+                        .await;
+                }
                 if recreated {
                     // The pane was re-created rather than replaced, so a
                     // completed close has already taken this role's daemon-side
@@ -6943,7 +6985,9 @@ async fn dispatch_one_owned(
     // (unbound) back in the synchronous fan-out loop, so the EOF sweep can
     // finally tell this delegation's worker apart from the pane's previous
     // occupant. A no-op if the record is gone (superseded, retired, or the
-    // detector was disabled at arm time).
+    // detector was disabled at arm time). The pi-native seed delivery never
+    // gets here — it returns from inside the respawn arm — and binds there
+    // instead (issue #815).
     if let (Some(seq), Some(worker_agent_id)) =
         (delegation_seq, expected_worker_agent_id.as_deref())
     {
