@@ -327,6 +327,28 @@ pub async fn kept_worktree_preview(
     pane_ids: &[String],
     probe_timeout: Duration,
 ) -> Option<KeptWorktree> {
+    kept_worktree_preview_with(
+        records,
+        worktrees,
+        pane_ids,
+        probe_timeout,
+        worktree_is_dirty,
+    )
+    .await
+}
+
+/// [`kept_worktree_preview`] with the dirty-probe as a parameter. Production
+/// has exactly one caller, which passes [`worktree_is_dirty`]; the parameter
+/// exists so a test can hand in a probe that never answers and reach the
+/// deadline arm by construction, instead of racing a real `git status` against
+/// a deadline short enough to usually win (fork issue #811).
+async fn kept_worktree_preview_with(
+    records: &[AgentRecord],
+    worktrees: &WorktreeRegistry,
+    pane_ids: &[String],
+    probe_timeout: Duration,
+    probe: impl AsyncFn(&Path) -> Result<bool, String>,
+) -> Option<KeptWorktree> {
     let mut seen: Vec<PathBuf> = Vec::new();
     for pane_id in pane_ids {
         let Some(record) = records
@@ -350,34 +372,33 @@ pub async fn kept_worktree_preview(
         if policy != Some(RemovalPolicy::KeepIfDirty) {
             continue;
         }
-        let confirmed_dirty =
-            match tokio::time::timeout(probe_timeout, worktree_is_dirty(&worktree)).await {
-                Ok(Ok(true)) => true,
-                // Clean: this tree is about to be REMOVED, and saying so would be
-                // the noise that makes the warning worth ignoring. Say nothing.
-                Ok(Ok(false)) => continue,
-                // A failed probe is what `remove_worktree` itself treats as a
-                // reason to keep, so report the path — under wording that does not
-                // claim more than was measured.
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        worktree = %worktree.display(),
-                        error = %e,
-                        "close preview: could not check worktree status"
-                    );
-                    false
-                }
-                // A blown deadline is not an answer either way: the removal path
-                // runs the same probe with no deadline and may still find it clean.
-                // Report conditionally rather than dropping the path.
-                Err(_) => {
-                    tracing::debug!(
-                        worktree = %worktree.display(),
-                        "close preview: worktree status probe timed out"
-                    );
-                    false
-                }
-            };
+        let confirmed_dirty = match tokio::time::timeout(probe_timeout, probe(&worktree)).await {
+            Ok(Ok(true)) => true,
+            // Clean: this tree is about to be REMOVED, and saying so would be
+            // the noise that makes the warning worth ignoring. Say nothing.
+            Ok(Ok(false)) => continue,
+            // A failed probe is what `remove_worktree` itself treats as a
+            // reason to keep, so report the path — under wording that does not
+            // claim more than was measured.
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    worktree = %worktree.display(),
+                    error = %e,
+                    "close preview: could not check worktree status"
+                );
+                false
+            }
+            // A blown deadline is not an answer either way: the removal path
+            // runs the same probe with no deadline and may still find it clean.
+            // Report conditionally rather than dropping the path.
+            Err(_) => {
+                tracing::debug!(
+                    worktree = %worktree.display(),
+                    "close preview: worktree status probe timed out"
+                );
+                false
+            }
+        };
         return Some(KeptWorktree {
             path: worktree.to_string_lossy().into_owned(),
             confirmed_dirty,
@@ -7110,26 +7131,52 @@ exit 0
     /// The probe's deadline degrades the WORDING, never the report: the tree is
     /// kept whether or not the status walk finished, and the path is the half
     /// the user actually needs.
+    ///
+    /// Fork issue #811: the probe here is a stand-in that NEVER answers, so the
+    /// deadline is the only way the wait can end. The earlier form raced a real
+    /// `git status` against a 1 ns deadline, and `tokio::time::timeout` polls
+    /// the inner future before the timer: whenever the runtime was descheduled
+    /// long enough for `git` to exit, the probe won and reported the tree dirty.
+    ///
+    /// Nothing here touches the disk or runs `git`: with the probe stood in,
+    /// the preview only matches a pane's cwd against the registry, and both are
+    /// plain path values. The paths need not exist.
     #[tokio::test]
     async fn kept_worktree_preview_still_reports_the_path_when_the_probe_times_out() {
-        let tmp = crate::test_temp::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
-        std::fs::write(wt.join("scratch.txt"), "work").unwrap();
+        let repo = Path::new("/never-on-disk/repo");
+        let wt = Path::new("/never-on-disk/repo-dispatch-x");
 
         let reg = new_worktree_registry();
-        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
-        let records = vec![pane_in("pane-1", &wt)];
+        record_worktree(&reg, wt, repo, RemovalPolicy::KeepIfDirty);
+        let records = vec![pane_in("pane-1", wt)];
 
-        let kept = kept_worktree_preview(
-            &records,
-            &reg,
-            &["pane-1".to_string()],
-            Duration::from_nanos(1),
+        let probed = std::cell::Cell::new(0usize);
+        let never_answers = async |_: &Path| {
+            probed.set(probed.get() + 1);
+            std::future::pending::<Result<bool, String>>().await
+        };
+
+        // The outer guard only matters if the preview ever stops bounding its
+        // probe: that regression would otherwise sit on `pending()` until the
+        // test runner killed it, instead of failing here with a reason.
+        let kept = tokio::time::timeout(
+            Duration::from_secs(10),
+            kept_worktree_preview_with(
+                &records,
+                &reg,
+                &["pane-1".to_string()],
+                Duration::from_millis(1),
+                never_answers,
+            ),
         )
         .await
+        .expect("the preview did not honour its own probe deadline")
         .expect("an unanswered probe must still report the path");
+        assert_eq!(
+            probed.get(),
+            1,
+            "the deadline must have been reached by waiting on the probe"
+        );
         assert_eq!(kept.path, wt.to_string_lossy());
         assert!(
             !kept.confirmed_dirty,
