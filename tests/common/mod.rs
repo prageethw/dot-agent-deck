@@ -4220,6 +4220,119 @@ pub fn label_in_box_body_row(grid: &str, label: &str) -> bool {
     })
 }
 
+/// Row (0-based, the same row numbering as [`TuiDeck::find_in_grid`]) of the
+/// IDENTITY row of the deck card named `label`, or `None` when no such card is
+/// drawn. When several cards carry the name, the topmost wins.
+///
+/// This is the positional sibling of [`label_in_box_body_row`], for a test
+/// that needs to know WHERE a card is — typically to assert the order two cards
+/// are drawn in — rather than whether it is there. Issue #809: a bare
+/// `find_in_grid("reviewer")` answers "the first row with that text on it",
+/// and on an Orchestration tab the focused role's embedded pane is titled with
+/// its role name on a row ABOVE every card (`┌reviewer────…┐`, beside the
+/// `worker-deck — N session(s)` line). Whenever the focused role was the one
+/// being looked for, the lookup returned the pane header's row and an ordering
+/// assertion built on it failed against a correctly ordered deck.
+///
+/// A card is recognised POSITIVELY, by what only a card draws, rather than by
+/// ruling out the other boxes one at a time:
+///
+/// 1. a top-left corner of some weight and the SAME weight's top-right corner
+///    further along that row — the box's top border;
+/// 2. that border must open with a card's shortcut badge ([`is_card_title`]):
+///    ` N ` or, on the selected card, ` ▸ N `. An embedded PANE is a box on
+///    the same rows, but its title is its display name fused straight onto the
+///    corner (`┌reviewer──`), so it carries no badge and neither its header
+///    nor any row of the agent's own output inside it can be returned —
+///    whatever that output opens with, and whichever role the pane belongs to.
+///    Nothing here looks at whether the title mentions `label`: a card's title
+///    also carries its status text (`● No agent`), so a role named `agent` is
+///    found like any other;
+/// 3. the row below must carry the same weight's verticals at exactly those
+///    two columns — a real rectangle, not two unrelated glyphs;
+/// 4. and that row's text must OPEN with `label`, directly after the left
+///    border with no pad (PRD fork#405 M1 put the name there), ending at a
+///    token boundary so `coder` does not match a card named `coder-2`.
+///
+/// What it does not do, so a caller does not find out the hard way:
+///
+/// * **It reports a row, not a position, so it orders cards in ONE column.**
+///   Cards drawn side by side share a row and compare equal; a caller ordering
+///   a multi-column deck needs the column too and must not use this as is.
+/// * A name the card had to ellipsize (`orchestrat…`) is not `label`, so the
+///   card is not found — pick role names that fit, or match a prefix the way
+///   `role_card_status_row` in `tests/e2e_work_done_reporting.rs` does.
+/// * Only the bordered card is recognised. The two shorter tiers a cramped deck
+///   falls back to draw no corner, and a card past the 255th has no number.
+/// * A vt100 grid carries characters, not styles, so a pane whose display name
+///   itself began with a space, a number and a space would read as a badge.
+///   Role names never do.
+///
+/// Columns are counted in Unicode scalars, which is the terminal column only
+/// while every cell on the two rows is width-1 — the same limit every other
+/// box helper here accepts. `tests/grid_box_helpers.rs` guards this in the fast
+/// tier, including the things an ordering assertion depends on: neither the
+/// pane header nor the pane's content is ever the answer, a card whose title
+/// mentions the role is still found, and a genuinely reversed deck still reads
+/// as reversed.
+///
+/// `role_card_status_row` (`tests/e2e_work_done_reporting.rs`) is a second
+/// card locator with different matching rules — keep the two in step.
+pub fn card_identity_row(grid: &str, label: &str) -> Option<usize> {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let lines: Vec<Vec<char>> = grid.lines().map(|line| line.chars().collect()).collect();
+    lines.iter().enumerate().find_map(|(row, top)| {
+        let body = lines.get(row + 1)?;
+        BORDER_WEIGHTS.iter().find_map(|weight| {
+            top.iter()
+                .enumerate()
+                .filter(|(_, ch)| **ch == weight.top_left)
+                .find_map(|(start, _)| {
+                    let end = top
+                        .iter()
+                        .enumerate()
+                        .skip(start + 1)
+                        .find_map(|(index, ch)| (*ch == weight.top_right).then_some(index))?;
+                    if !is_card_title(&top[start + 1..end]) {
+                        return None;
+                    }
+                    if *body.get(start)? != weight.vertical || *body.get(end)? != weight.vertical {
+                        return None;
+                    }
+                    let inner: String = body[start + 1..end].iter().collect();
+                    let rest = inner.strip_prefix(label)?;
+                    rest.chars()
+                        .next()
+                        .is_none_or(|c| !is_word_char(c))
+                        .then_some(row + 1)
+                })
+        })
+    })
+}
+
+/// Whether `title` — the cells between a box's two top corners — opens with a
+/// deck card's shortcut badge: a space, the `▸ ` selection marker when the card
+/// is the selected one, the card's number, and a space (`┌ 1 ──…`,
+/// `┏ ▸ 3 ━━…`).
+///
+/// That prefix is what `render_session_card` (`src/ui.rs`) writes first into
+/// every bordered card's title, ahead of whatever else the title carries — a
+/// liveness marker, the agent-type badge, `orphaned`, the right-aligned status
+/// — so it holds with the badge toggle on or off. No other box the deck draws
+/// starts its title that way: an embedded pane's title is its display name with
+/// no leading pad.
+fn is_card_title(title: &[char]) -> bool {
+    let Some((&' ', rest)) = title.split_first() else {
+        return false;
+    };
+    let rest = match rest {
+        ['▸', ' ', tail @ ..] => tail,
+        unselected => unselected,
+    };
+    let digits = rest.iter().take_while(|ch| ch.is_ascii_digit()).count();
+    digits > 0 && rest.get(digits) == Some(&' ')
+}
+
 /// Whether `needle` appears in `haystack` as its own token — bounded on both
 /// sides by anything that is NOT an identifier character (alphanumeric, `-`,
 /// or `_`) rather than specifically by whitespace. Catches a needle abutted
