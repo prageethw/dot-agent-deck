@@ -329,6 +329,20 @@ struct Pane {
     /// shares with the command banner, so this records only the arming instant
     /// and the renderer decides whether it is still worth drawing.
     scroll_notice_armed_at: Option<Instant>,
+    /// Issue #824 — process-wide creation sequence, taken when the pane is
+    /// built. `pane_ids` sorts on this so the order is the order panes were
+    /// created, whatever shape the id string has (legacy numeric, daemon-minted
+    /// `pane-<nonce>-<seq>`, hydrated ids carrying another daemon's nonce). A
+    /// close that fails and re-inserts the pane carries the value over, so the
+    /// pane keeps its place.
+    created_seq: u64,
+}
+
+/// Source of [`Pane::created_seq`].
+static PANE_CREATION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_pane_creation_seq() -> u64 {
+    PANE_CREATION_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Thread-safe pane registry.
@@ -826,6 +840,7 @@ impl EmbeddedPaneController {
             // how much output it had consumed.
             bytes_since_spawn: Arc::new(AtomicU64::new(bytes.len() as u64)),
             scroll_notice_armed_at: None,
+            created_seq: next_pane_creation_seq(),
         };
         (pane, input_rx)
     }
@@ -842,12 +857,17 @@ impl EmbeddedPaneController {
         panes.get(pane_id).map(|p| Arc::clone(&p.hyperlinks))
     }
 
-    /// Return all pane IDs in insertion order (by numeric ID).
+    /// Return all pane IDs in creation order (the order the panes were built
+    /// in this process), independent of the id's shape. Ties cannot occur —
+    /// the sequence is unique — but the id breaks them anyway for determinism.
     pub fn pane_ids(&self) -> Vec<String> {
         let panes = self.panes.lock().unwrap();
-        let mut ids: Vec<String> = panes.keys().cloned().collect();
-        ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
-        ids
+        let mut ids: Vec<(u64, String)> = panes
+            .iter()
+            .map(|(id, p)| (p.created_seq, id.clone()))
+            .collect();
+        ids.sort();
+        ids.into_iter().map(|(_, id)| id).collect()
     }
 
     /// Get the currently focused pane ID, if any.
@@ -1523,6 +1543,7 @@ impl EmbeddedPaneController {
             hyperlinks,
             bytes_since_spawn,
             scroll_notice_armed_at: None,
+            created_seq: next_pane_creation_seq(),
         };
 
         self.panes.lock().unwrap().insert(pane_id, pane);
@@ -4048,6 +4069,7 @@ impl PaneController for EmbeddedPaneController {
                     // was showing survive a close that failed.
                     bytes_since_spawn: pane.bytes_since_spawn,
                     scroll_notice_armed_at: pane.scroll_notice_armed_at,
+                    created_seq: pane.created_seq,
                 };
                 self.panes
                     .lock()
@@ -4082,6 +4104,7 @@ impl PaneController for EmbeddedPaneController {
                     // was showing survive a close that failed.
                     bytes_since_spawn: pane.bytes_since_spawn,
                     scroll_notice_armed_at: pane.scroll_notice_armed_at,
+                    created_seq: pane.created_seq,
                 };
                 self.panes
                     .lock()
@@ -4100,7 +4123,7 @@ impl PaneController for EmbeddedPaneController {
             .iter()
             .map(|(id, p)| {
                 (
-                    id.parse::<u64>().unwrap_or(0),
+                    p.created_seq,
                     PaneInfo {
                         pane_id: id.clone(),
                         title: p.name.clone(),
@@ -4894,6 +4917,61 @@ mod tests {
         let screen = controller.get_screen("1").expect("pane registered");
         let size = screen.lock().unwrap().screen().size();
         assert_eq!(size, (21, 38), "usable dims must pass through unchanged");
+    }
+
+    /// Scenario: Register twelve panes whose ids have the shape the daemon
+    /// mints (`pane-<16 hex nonce>-<decimal seq>`, one shared nonce, seq rising
+    /// with creation), in creation order. `pane_ids()` must return them in that
+    /// creation order; ids that do not parse as numbers must not turn the order
+    /// into the pane map's arbitrary iteration order (issue #824). Twelve panes
+    /// keep a lucky accidental match negligible, and the seqs cross a digit
+    /// boundary so a plain string sort is also wrong.
+    #[cfg(unix)]
+    #[test]
+    fn pane_ids_returns_daemon_minted_ids_in_creation_order() {
+        let controller = EmbeddedPaneController::for_render_only_tests();
+        let rt = render_only_runtime();
+        let _enter = rt.enter();
+
+        let nonce = 0x9e37_79b9_7f4a_7c15_u64;
+        let created: Vec<String> = (0..12)
+            .map(|seq| format!("pane-{nonce:016x}-{seq}"))
+            .collect();
+        // Held for the duration: dropping one would EOF its reader half.
+        let mut peers = Vec::new();
+        for (i, pane_id) in created.iter().enumerate() {
+            let (conn, peer) = AttachConnection::connected_pair_for_test();
+            peers.push(peer);
+            controller.wire_stream_pane(
+                pane_id.clone(),
+                format!("agent-{i}"),
+                conn,
+                format!("role-{i}"),
+                None,
+                None,
+                24,
+                80,
+            );
+        }
+
+        assert_eq!(
+            controller.pane_ids(),
+            created,
+            "pane_ids() must return panes in creation order. On current code every \
+             daemon-minted id parses to 0 in the sort key, so the order is the pane \
+             HashMap's arbitrary iteration order, different run to run (issue #824)"
+        );
+
+        let listed: Vec<String> = controller
+            .list_panes()
+            .expect("list_panes")
+            .into_iter()
+            .map(|p| p.pane_id)
+            .collect();
+        assert_eq!(
+            listed, created,
+            "list_panes() must also be in creation order"
+        );
     }
 
     /// The shared constructor is the whole point of the fix: one definition of

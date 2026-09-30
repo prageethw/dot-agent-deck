@@ -390,10 +390,10 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
     // Issue #809: both rows are read off the role's CARD, via
     // `common::card_identity_row`, never off "the first row with that text on
     // it". The focused role's embedded pane is titled with its role name on
-    // row 1 — above every card — and which role the rebuild leaves focused is
-    // not fixed (the restore focuses `pane_ids().first()`, and those ids are no
-    // longer numeric, so the order is whatever the pane map iterates in). Every
-    // run that happened to focus `reviewer` therefore put `reviewer` on row 1,
+    // row 1 — above every card — and it names whichever role is focused. The
+    // rebuild now focuses the start role (`session/restore/025`–`027`), but this
+    // test deliberately does not depend on that. Back when the focused role was
+    // arbitrary (issue #824), every run that focused `reviewer` put `reviewer` on row 1,
     // and a whole-grid `find_in_grid("reviewer")` reported the pane header
     // there instead of the card on row 25: "coder at row Some(14) and reviewer
     // at row Some(1)", against a deck that was in exactly the saved order. A
@@ -1480,4 +1480,179 @@ fn restore_024_devbox_wrapped_restore_shows_starting_not_no_agent() {
          'No agent' status.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
+}
+
+/// Roles for the issue #824 focus tests. Six of them so that a restore which
+/// focuses "whichever pane the map yields first" lands on the start role only
+/// about one time in six, not one in two or three.
+const FOCUS_ROLES: [&str; 6] = [
+    "orchestrator",
+    "coder",
+    "reviewer",
+    "tester",
+    "auditor",
+    "scribe",
+];
+
+/// What one [`restore_and_probe_focus`] run observed.
+struct FocusObservation {
+    /// The role whose terminal pane header (`┌<role>─`) was drawn.
+    focused_pane: Option<&'static str>,
+    /// Every role whose recorder logged the typed probe line.
+    probe_recipients: Vec<&'static str>,
+    grid: String,
+}
+
+/// Rebuild a six-role orchestration tab from a daemon-empty snapshot. The
+/// CONFIG's `start = true` flag sits on `FOCUS_ROLES[config_start_idx]` while the
+/// snapshot's saved `start_role_index` is `saved_start_idx`; the two may differ.
+/// Wait until the restore has replayed the saved prompt to the saved start role,
+/// read which role's terminal pane is focused (its header is drawn as
+/// `┌<role>─`), then type a unique probe line and report which recorders got it.
+fn restore_and_probe_focus(config_start_idx: usize, saved_start_idx: usize) -> FocusObservation {
+    let project_dir = common::race_safe_tempdir();
+    let cmds: Vec<String> = FOCUS_ROLES
+        .iter()
+        .map(|r| write_recorder_agent(project_dir.path(), r))
+        .collect();
+    let roles: Vec<(&str, &str)> = FOCUS_ROLES
+        .iter()
+        .zip(cmds.iter())
+        .map(|(r, c)| (*r, c.as_str()))
+        .collect();
+    write_orchestration_config(project_dir.path(), "tdd-cycle", &roles, config_start_idx);
+
+    let session_dir = common::race_safe_tempdir();
+    let session_file = session_dir.path().join("session.toml");
+    stage_orchestration_snapshot(
+        &session_file,
+        project_dir.path(),
+        FOCUS_ROLES[saved_start_idx],
+        &cmds[saved_start_idx],
+        &FOCUS_ROLES,
+        saved_start_idx,
+        "Build the feature end to end",
+        "tdd-cycle",
+        project_dir.path(),
+        &[saved_start_idx],
+        None,
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("minimal");
+
+    // The prompt reaching the start role proves the tab was rebuilt and that
+    // every role pane exists; only then is the focus read meaningful.
+    let record_of = |role: &str| project_dir.path().join(format!("record-{role}.log"));
+    let start_record = record_of(FOCUS_ROLES[saved_start_idx]);
+    assert!(
+        common::wait_for_file_substr_count(
+            &start_record,
+            "Build the feature end to end",
+            1,
+            Duration::from_secs(20),
+        ),
+        "the rebuilt orchestration tab never replayed the saved prompt to the start role \
+         `{}` ({start_record:?}), so focus cannot be probed.\nFinal grid:\n{}",
+        FOCUS_ROLES[saved_start_idx],
+        deck.snapshot_grid()
+    );
+
+    // Read the focused pane off the grid: the embedded terminal pane is titled
+    // `┌<role>──…` (deck cards are titled `┌ N ──…`, so the two never collide),
+    // and it names the pane that holds focus.
+    let focused = std::cell::Cell::new(None);
+    common::wait_until(Duration::from_secs(15), || {
+        let grid = deck.snapshot_grid();
+        focused.set(
+            FOCUS_ROLES
+                .iter()
+                .copied()
+                .find(|role| grid.contains(&format!("┌{role}─"))),
+        );
+        focused.get().is_some()
+    });
+
+    // Type a unique line as the user would. It must reach the start role's
+    // stdin and no other role's: the restore leaves the deck ready to type into
+    // the pane that holds focus.
+    let probe = "focus-probe-824";
+    deck.send_keys(format!("{probe}\r").as_bytes());
+    common::wait_until(Duration::from_secs(10), || {
+        FOCUS_ROLES
+            .iter()
+            .any(|role| common::count_file_substr(&record_of(role), probe) >= 1)
+    });
+    // Give a misrouted copy time to land before reading every log.
+    common::wait_until(Duration::from_millis(500), || false);
+    let probe_recipients = FOCUS_ROLES
+        .iter()
+        .copied()
+        .filter(|role| common::count_file_substr(&record_of(role), probe) >= 1)
+        .collect();
+    FocusObservation {
+        focused_pane: focused.get(),
+        probe_recipients,
+        grid: deck.snapshot_grid(),
+    }
+}
+
+/// Assert both the focused pane and the typed probe point at `expected_idx`.
+fn assert_start_role_has_focus(obs: &FocusObservation, expected_idx: usize, what: &str) {
+    let expected = FOCUS_ROLES[expected_idx];
+    assert_eq!(
+        obs.focused_pane,
+        Some(expected),
+        "issue #824: after a daemon-empty orchestration restore focus must be on the saved START \
+         role `{expected}` ({what}), but the focused pane is {:?}. Pane ids are not numeric, so \
+         `pane_ids().first()` is arbitrary.\nFinal grid:\n{}",
+        obs.focused_pane,
+        obs.grid
+    );
+    assert_eq!(
+        obs.probe_recipients,
+        vec![expected],
+        "issue #824: a line typed right after the restore must reach ONLY the start role \
+         `{expected}` ({what}); recorders that logged it: {:?}.\nFinal grid:\n{}",
+        obs.probe_recipients,
+        obs.grid
+    );
+}
+
+/// Scenario: Rebuild a six-role orchestration tab from a daemon-empty snapshot
+/// whose start role is the role DECLARED first, every role running a stdin
+/// recorder. After the restore the focused terminal pane is the start role's,
+/// and a typed line reaches only that role (issue #824).
+#[spec("session/restore/025")]
+#[test]
+fn restore_025_rebuilt_orchestration_focuses_start_role_when_declared_first() {
+    let obs = restore_and_probe_focus(0, 0);
+    assert_start_role_has_focus(&obs, 0, "declared first");
+}
+
+/// Scenario: Same as the previous scenario, but the start role is the role
+/// DECLARED last of the six. Focus and a typed line still go to the start role
+/// (issue #824).
+#[spec("session/restore/026")]
+#[test]
+fn restore_026_rebuilt_orchestration_focuses_start_role_when_declared_last() {
+    let last = FOCUS_ROLES.len() - 1;
+    let obs = restore_and_probe_focus(last, last);
+    assert_start_role_has_focus(&obs, last, "declared last");
+}
+
+/// Scenario: Rebuild the six-role tab with the config's `start = true` flag on
+/// the FIRST role but a saved `start_role_index` pointing at a MIDDLE role
+/// (`tester`), which is neither the first- nor last-created pane. Focus and a
+/// typed line must follow the SAVED index, not the config flag and not the
+/// first or last pane (issue #824).
+#[spec("session/restore/027")]
+#[test]
+fn restore_027_rebuilt_orchestration_focuses_saved_middle_start_role_over_config_flag() {
+    let obs = restore_and_probe_focus(0, 3);
+    assert_start_role_has_focus(&obs, 3, "saved middle index, config flag elsewhere");
 }

@@ -6296,7 +6296,7 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (the orchestration's `coder`/`reviewer` roles run `sleep 600`; the `orchestrator` role runs a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-orchestrator.log` — no LLM tokens).
 - **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order — each role's row read off its own card via `common::card_identity_row` (the box with a ` N ` card badge in its title whose first body row opens with the role name), in one grid read, never off the first row carrying that text, which is the focused embedded pane's header whenever that role is the focused one (issue #809). Rows alone order the cards because an orchestration tab stacks them in one sidebar column. If the cards are never located, the failure prints each role's locator result beside whether its text is on the grid at all, so a locator miss reads differently from a tab that was not rebuilt — and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and recorded (echo-immune), which also proves the start role was identified from `start_role_index`.
-- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border; WHICH role pane the rebuild leaves focused — that is not fixed today (the restore focuses `pane_ids().first()`, whose order is the pane map's iteration order now that pane ids are not numeric), and the card locator is what keeps the order assertion independent of it.
+- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border; WHICH role pane the rebuild leaves focused (owned by `session/restore/025`–`026`), and the card locator is what keeps the order assertion independent of it.
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/009 — An orchestration snapshot whose config no longer resolves falls back to a plain dashboard pane with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift).
@@ -6409,6 +6409,27 @@ without depending on the config struct API.
 - **Agent:** none (a test-owned executable named `devbox`, placed ahead on `PATH`, runs `sleep 600`; no LLM or hook event).
 - **Asserts:** restoring a saved plain pane whose command is the bare literal `devbox run claude-sonnet-devbox` immediately renders the "Starting…" badge before any hook event — the same badge a FRESH spawn of the identical command already shows — rather than reverting to the genuinely-empty `No agent` placeholder.
 - **Does not assert:** the separate literal-token-vs-basename gap in `AgentType::from_command_including_devbox` (unit-pinned in `src/event.rs`'s `from_command_including_devbox_recognizes_devbox_run`) — this test deliberately stages the bare `devbox` token so PATH resolution finds the fake script while the parsed command text is unaffected by that gap; a devbox-wrapped MODE-tab or role-wiring restore path (separate call sites in `run_tui`); real devbox behaviour.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/025 — A daemon-empty orchestration restore focuses the START role's pane, and typed input reaches only it, when the start role is declared first (issue #824).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (six role panes each run a stdin-recording shell script that self-posts `SessionStart`; no LLM tokens).
+- **Asserts:** with a six-role orchestration snapshot whose `start_role_index` is 0 (config `start` flag also on role 0), after the saved prompt has been replayed to the start role (proving the tab is rebuilt), the focused embedded terminal pane (its header `┌<role>─`, distinct from the numbered deck cards) is the START role's, and a unique line typed afterwards is recorded by the start role's recorder and by no other role's.
+- **Does not assert:** the focus border styling; the last-declared and middle/disagreeing cases (`session/restore/026`/`027`); warm-daemon hydration focus; the issue #949 remembered-pane path (`session/restore/016`/`019`). Note the start role is always SPAWNED last (`open_orchestration_tab`), so "declared" position, not creation order, is what these cases vary.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/026 — A daemon-empty orchestration restore focuses the START role's pane, and typed input reaches only it, when the start role is declared last (issue #824).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (six role panes each run a stdin-recording shell script that self-posts `SessionStart`; no LLM tokens).
+- **Asserts:** same as `session/restore/025` but with the config flag and `start_role_index` both 5 (the last of six roles): focused pane and typed-line recipient are both the start role.
+- **Does not assert:** the focus border styling; the first-declared and middle/disagreeing cases (`session/restore/025`/`027`); warm-daemon hydration focus.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/027 — A daemon-empty orchestration restore focuses the role at the SAVED `start_role_index` even when it is a middle role and the config's `start` flag names a different role (issue #824).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (six role panes each run a stdin-recording shell script that self-posts `SessionStart`; no LLM tokens).
+- **Asserts:** with the config `start = true` on role 0 but a saved `start_role_index` of 3 (`tester`), the focused terminal pane and the recipient of a typed line are both `tester`, so only "focus the pane at the saved start index" passes; focusing the first pane, the last pane, or the config-flag role fails.
+- **Does not assert:** the focus border styling; warm-daemon hydration focus.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)

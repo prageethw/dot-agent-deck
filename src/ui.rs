@@ -15756,6 +15756,10 @@ pub fn run_tui(
         // so we can land on it (start cursor) after the loop rather than snapping
         // back to the dashboard — mirroring the hydration block's landing logic.
         let mut first_restored_orch_tab: Option<usize> = None;
+        // Issue #824 — the START role's pane on that same tab, so the landing
+        // focus targets it explicitly instead of whichever id `pane_ids()`
+        // lists first.
+        let mut first_restored_orch_start_pane: Option<String> = None;
         for saved_pane in &saved.panes {
             let dir = std::path::Path::new(&saved_pane.dir);
             if !dir.is_dir() {
@@ -16020,6 +16024,8 @@ pub fn run_tui(
                                 }
                                 if first_restored_orch_tab.is_none() {
                                     first_restored_orch_tab = Some(tab_idx);
+                                    first_restored_orch_start_pane =
+                                        role_pane_ids.get(saved_start_idx).cloned();
                                 }
                                 continue;
                             }
@@ -16433,13 +16439,17 @@ pub fn run_tui(
         let landing_tab = first_restored_orch_tab.unwrap_or(preferred_start_tab);
         tab_manager.switch_to(landing_tab);
 
-        // Focus the first restored pane and enter PaneInput mode so the user
-        // can type immediately. PRD #84 M4: PTY sizing is handled by the
+        // Focus the start role's pane on the daemon-empty orchestration
+        // rebuild path (the first pane otherwise) and enter PaneInput mode so
+        // the user can type immediately. PRD #84 M4: PTY sizing is handled by the
         // per-frame `resize_panes_to_layout` on the first loop iteration — no
         // startup resize sweep here.
         if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
             let ids = embedded.pane_ids();
-            if let Some(first_id) = ids.first() {
+            let landing_pane = first_restored_orch_start_pane
+                .as_ref()
+                .or_else(|| ids.first());
+            if let Some(first_id) = landing_pane {
                 let _ = pane.focus_pane(first_id);
                 ui.mode = UiMode::PaneInput;
             }
