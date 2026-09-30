@@ -38,7 +38,7 @@ use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
     DOT_AGENT_DECK_REGISTRATION_GENERATION, GuardedSend, SpawnOptions, TabMembership,
 };
-use dot_agent_deck::event::{AgentEvent, AgentType, DelegateSignal, EventType};
+use dot_agent_deck::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
 use dot_agent_deck::state::OrchestrationIdentity;
 use spec::spec;
 
@@ -601,6 +601,505 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         !String::from_utf8_lossy(&snapshot).contains("'coder'"),
         "the notice must not interpolate the role name; snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #805: a delegate that never reaches its worker must not leave the
+// worker owing a `work-done`.
+//
+// `handle_delegate` arms the outstanding-delegation record before the dispatch
+// task has run at all, so every way that task can end without handing the
+// worker a task pointer has to retire the record it was armed for — and only
+// that one. Left armed, the worker's card reads `Idle (delegated)` and the
+// orchestrator's `Observing` until the idle-worker timeout (two hours by
+// default), for a task nobody received.
+// ---------------------------------------------------------------------------
+
+/// A role command that cannot be exec'd. One word with no shell
+/// metacharacters is exec'd directly rather than through `$SHELL -c`, so this
+/// is a spawn ERROR and not a shell that starts and then exits 127.
+const MISSING_WORKER_BINARY: &str = "/nonexistent-worker-agent-deck-respawn-target";
+
+/// The daemon's own respawn-failure notice, written into the orchestrator's
+/// pane immediately before the respawn-error exit. Spelled out here rather
+/// than imported so a silent rewording fails the test instead of following it.
+const RESPAWN_FAILED_NEEDLE: &str = "respawn failed for role 'coder'";
+
+/// The daemon's dead-replacement notice (`orchestration/delegate/023`).
+const DEAD_REPLACEMENT_NEEDLE: &str = "delegated worker never came up";
+
+const READINESS_BUFFER_ENV: &str = "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS";
+
+/// Re-point the `coder` role at `worker_command` for every LATER delegate. The
+/// dispatch task re-reads `.dot-agent-deck.toml` on each delegate, so the
+/// worker the fixture already started is untouched.
+fn point_worker_role_at(fx: &Fixture, worker_command: &str) {
+    std::fs::write(
+        std::path::Path::new(&fx.cwd).join(".dot-agent-deck.toml"),
+        config(worker_command),
+    )
+    .expect("rewrite the orchestration config");
+}
+
+/// Poll the orchestrator's scrollback until it holds `needle`, returning the
+/// last snapshot either way so the caller can assert on (and print) it.
+async fn wait_for_orchestrator_text(fx: &Fixture, needle: &str) -> String {
+    let deadline = tokio::time::Instant::now() + common::load_scaled(Duration::from_secs(10));
+    loop {
+        let snapshot = String::from_utf8_lossy(
+            &fx.daemon
+                .registry
+                .snapshot(&fx.orchestrator_agent_id)
+                .unwrap_or_default(),
+        )
+        .into_owned();
+        if snapshot.contains(needle) || tokio::time::Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A stand-in that starts normally until a `die` marker sits beside it, and
+/// from then on exits before doing anything — the same one-shot worker
+/// `orchestration/delegate/023` uses to make a replacement die on arrival.
+fn write_one_shot_worker(dir: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = dir.join("one-shot-worker.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nif [ -e \"$(dirname \"$0\")/die\" ]; then exit 3; fi\nexec cat\n",
+    )
+    .expect("write one-shot worker stand-in");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod one-shot worker stand-in");
+    script.to_string_lossy().into_owned()
+}
+
+/// Pins `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` for one test and restores
+/// it afterwards. nextest runs each test in its own process, so nothing else
+/// reads the variable while it is set.
+struct ReadinessBufferGuard {
+    previous: Option<String>,
+}
+
+impl ReadinessBufferGuard {
+    fn set(millis: u64) -> Self {
+        let previous = std::env::var(READINESS_BUFFER_ENV).ok();
+        // SAFETY: set before the fixture starts any task that reads it, in a
+        // test process nextest gives this test alone.
+        unsafe { std::env::set_var(READINESS_BUFFER_ENV, millis.to_string()) };
+        Self { previous }
+    }
+}
+
+impl Drop for ReadinessBufferGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(READINESS_BUFFER_ENV, value),
+                None => std::env::remove_var(READINESS_BUFFER_ENV),
+            }
+        }
+    }
+}
+
+/// Scenario: start an orchestration with a live `cat` worker, re-point its `clear = true` role at a binary that does not exist, and delegate, so the respawn disposes of the worker and then fails to replace it. Once the orchestrator has been told the respawn failed, the worker pane must owe nothing: its outstanding delegation is retired and the daemon has broadcast that retirement.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/048")]
+async fn delegate_048_a_failed_respawn_retires_the_delegation_it_armed() {
+    let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
+    point_worker_role_at(&fx, MISSING_WORKER_BINARY);
+    let mut broadcasts = fx.daemon.event_tx.subscribe();
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let orchestrator = wait_for_orchestrator_text(&fx, RESPAWN_FAILED_NEEDLE).await;
+    assert!(
+        orchestrator.contains(RESPAWN_FAILED_NEEDLE),
+        "precondition: the dispatch must reach the respawn-error exit for this test to be \
+         testing anything; orchestrator pane = {orchestrator:?}"
+    );
+
+    common::assert_undelivered_delegation_is_retired(
+        &fx.daemon.registry,
+        &mut broadcasts,
+        WORKER_PANE,
+        "its clear=true respawn failed",
+    )
+    .await;
+}
+
+/// Scenario: start an orchestration whose `clear = true` worker refuses to start once a marker file sits beside it, drop that marker after the first worker is up, and delegate, so the replacement dies before it can receive anything. Once the orchestrator has been told the worker never came up, the worker pane must owe nothing: its outstanding delegation is retired and the daemon has broadcast that retirement.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/049")]
+async fn delegate_049_a_replacement_that_never_becomes_live_retires_the_delegation() {
+    let fx = fixture(write_one_shot_worker).await;
+    // The stand-in prints nothing of its own, so there is no output to wait
+    // for; the same settle `orchestration/delegate/023` gives it. A first
+    // worker still mid-boot when the marker lands only dies early — the
+    // replacement the delegate produces dies on arrival either way.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        fx.daemon.registry.agent_is_live(&fx.worker_agent_id),
+        "precondition: the first worker must be up before the next one is made to fail"
+    );
+    std::fs::write(std::path::Path::new(&fx.cwd).join("die"), "")
+        .expect("arm the stand-in's refusal to start again");
+    let mut broadcasts = fx.daemon.event_tx.subscribe();
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let orchestrator = wait_for_orchestrator_text(&fx, DEAD_REPLACEMENT_NEEDLE).await;
+    assert!(
+        orchestrator.contains(DEAD_REPLACEMENT_NEEDLE),
+        "precondition: the dispatch must reach the dead-replacement exit for this test to be \
+         testing anything; orchestrator pane = {orchestrator:?}"
+    );
+
+    common::assert_undelivered_delegation_is_retired(
+        &fx.daemon.registry,
+        &mut broadcasts,
+        WORKER_PANE,
+        "its clear=true replacement worker never became live",
+    )
+    .await;
+}
+
+/// Scenario: delegate to a `clear = true` worker, announce the replacement so the dispatch enters its readiness buffer, and during that buffer close the replacement and let a different agent take the worker pane. The task pointer is bound to the replacement, so the identity gate refuses it and nothing is written into the successor; the delegation must then be retired and that retirement broadcast.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/050")]
+async fn delegate_050_a_pointer_refused_for_the_wrong_session_retires_the_delegation() {
+    // Long enough that the hand-over below lands well inside it: the swap
+    // starts a quarter of the way in and takes milliseconds. Both figures grow
+    // together with how contended the machine is — four seconds and one second
+    // on an idle box, up to 24 s and 6 s at the scaling's ceiling, which stays
+    // under the 30 s the daemon clamps this override to. Measured ONCE, so the
+    // two cannot be scaled by different load readings.
+    let readiness_buffer = common::load_scaled(Duration::from_millis(4000));
+    let hand_over_after = readiness_buffer / 4;
+    let _buffer = ReadinessBufferGuard::set(
+        u64::try_from(readiness_buffer.as_millis()).expect("readiness buffer fits in u64 ms"),
+    );
+    let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
+    let mut broadcasts = fx.daemon.event_tx.subscribe();
+
+    delegate(&fx, "list the files in this directory").await;
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        common::load_scaled(Duration::from_secs(20)),
+    )
+    .await
+    .expect("precondition: the clear=true delegate must respawn the worker");
+    common::write_hook_line(
+        &fx.daemon.hook_path,
+        &session_start(WORKER_PANE, &replacement),
+    )
+    .expect("deliver synthetic SessionStart for the replacement worker");
+
+    // The dispatch re-checks that the replacement still owns the pane as soon
+    // as its readiness wait ends, and only then starts the buffer. Swapping
+    // before that check would take the dead-replacement exit instead, which
+    // `orchestration/delegate/049` covers; the precondition below tells the
+    // two apart.
+    tokio::time::sleep(hand_over_after).await;
+    fx.daemon
+        .registry
+        .close_agent(&replacement)
+        .expect("close the replacement worker mid-buffer");
+    let successor = fx
+        .daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&fx.cwd),
+            display_name: Some(WORKER_ROLE),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+            tab_membership: Some(membership(1, WORKER_ROLE, false, &fx.cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn the successor onto the worker pane");
+    assert_ne!(
+        successor, replacement,
+        "the hand-over must produce a NEW registry agent id"
+    );
+
+    assert!(
+        common::wait_for_commission_release(&fx.daemon.registry, WORKER_PANE).await,
+        "precondition: the dispatch never reached a no-delivery exit; watches = {:?}",
+        fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
+    );
+    let orchestrator = wait_for_orchestrator_text(&fx, "").await;
+    assert!(
+        !orchestrator.contains(DEAD_REPLACEMENT_NEEDLE),
+        "precondition: the hand-over landed before the readiness buffer began, so the dispatch \
+         left through the dead-replacement exit rather than through the identity gate this test \
+         is about; orchestrator pane = {orchestrator:?}"
+    );
+    let pointer =
+        common::expected_delegate_pointer(std::path::Path::new(&fx.cwd), WORKER_ROLE, WORKER_PANE);
+    let successor_snapshot = fx.daemon.registry.snapshot(&successor).unwrap_or_default();
+    assert!(
+        !snapshot_contains(&successor_snapshot, &pointer),
+        "precondition: a pointer bound to the replacement must not be written into the agent \
+         that inherited its pane; successor pane = {:?}",
+        String::from_utf8_lossy(&successor_snapshot)
+    );
+
+    common::assert_undelivered_delegation_is_retired(
+        &fx.daemon.registry,
+        &mut broadcasts,
+        WORKER_PANE,
+        "the identity gate refused its task pointer as WrongSession",
+    )
+    .await;
+}
+
+/// Scenario: hold the worker pane's dispatch lock so a delegate whose respawn is going to fail is armed but cannot run, arm a NEWER delegation on the same worker pane, then release the lock and let the older delegate fail. The older delegate's exit may retire only its own delegation: the newer one must still be armed afterwards, and no retirement may have been broadcast for the pane.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/051")]
+async fn delegate_051_an_undelivered_delegate_leaves_a_newer_delegation_armed() {
+    let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
+    point_worker_role_at(&fx, MISSING_WORKER_BINARY);
+    let mut broadcasts = fx.daemon.event_tx.subscribe();
+
+    // Every dispatch on a pane serializes on this lock, so holding it keeps the
+    // older delegate's task parked at its first statement while the newer
+    // delegation is armed — the ordering this test is about, fixed by
+    // construction rather than by timing.
+    let dispatch_lock = fx.daemon.registry.pane_dispatch_lock(WORKER_PANE);
+    let parked = dispatch_lock.lock().await;
+    delegate(&fx, "list the files in this directory").await;
+    assert!(
+        fx.daemon
+            .registry
+            .delegation_watch_snapshot(WORKER_PANE)
+            .outstanding_delegation
+            .is_some(),
+        "precondition: the older delegate must have armed its delegation"
+    );
+    // What `handle_delegate`'s fan-out does for the next delegate to this pane.
+    let newer = fx
+        .daemon
+        .registry
+        .arm_outstanding_delegation(
+            WORKER_PANE,
+            WORKER_ROLE,
+            ORCH_PANE,
+            &fx.orchestrator_agent_id,
+            Some(&OrchestrationIdentity::Instance {
+                id: ORCHESTRATION_ID.to_string(),
+                name: ORCHESTRATION.to_string(),
+            }),
+        )
+        .expect("precondition: neither pane is closing, so the newer delegation must arm");
+    drop(parked);
+
+    let orchestrator = wait_for_orchestrator_text(&fx, RESPAWN_FAILED_NEEDLE).await;
+    assert!(
+        orchestrator.contains(RESPAWN_FAILED_NEEDLE),
+        "precondition: the older delegate must reach the respawn-error exit; orchestrator pane \
+         = {orchestrator:?}"
+    );
+    assert!(
+        common::wait_for_commission_release(&fx.daemon.registry, WORKER_PANE).await,
+        "precondition: the older delegate never released its commission, so its no-delivery \
+         exit has not run; watches = {:?}",
+        fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
+    );
+
+    // A negative window, spent in full: whatever the exit does to the record
+    // it does in the same task as the commission release just observed.
+    let seen = common::delegation_broadcasts_for(
+        &mut broadcasts,
+        WORKER_PANE,
+        Duration::from_millis(750),
+        false,
+    )
+    .await;
+    assert_eq!(
+        seen.retired, 0,
+        "the older delegate never reached the worker, but the delegation left on the pane is a \
+         NEWER one and no retirement may be announced for it; broadcasts = {seen:?}"
+    );
+    assert!(
+        fx.daemon
+            .registry
+            .take_outstanding_delegation_if(WORKER_PANE, newer.seq)
+            .is_some(),
+        "the older delegate's no-delivery exit retired the NEWER delegation armed on the same \
+         worker pane; retirement must be conditional on the delegation's own generation. \
+         watches = {:?}",
+        fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
+    );
+}
+
+/// Report `work-done` from the worker pane, as the worker's own CLI call does.
+async fn work_done(fx: &Fixture) {
+    // Read back rather than assumed, so the signal is the one the pane's
+    // current registration would produce and cannot be refused as stale.
+    let (generation, daemon_boot_id) = {
+        let state = fx.daemon.state.read().await;
+        (
+            state
+                .pane_registration_generation
+                .get(WORKER_PANE)
+                .copied()
+                .expect("precondition: the fixture registered the worker pane"),
+            state.daemon_boot_id().to_string(),
+        )
+    };
+    fx.daemon
+        .state
+        .read()
+        .await
+        .handle_work_done(
+            WorkDoneSignal {
+                pane_id: WORKER_PANE.to_string(),
+                task: "The delegated test task is complete.".to_string(),
+                done: false,
+                timestamp: chrono::Utc::now(),
+                generation,
+                daemon_boot_id,
+                subject: None,
+            },
+            &fx.daemon.registry,
+            Some(&fx.daemon.event_tx),
+        )
+        .await;
+}
+
+/// Wait until the commission ledger holds exactly `expected` entries for the
+/// worker pane, returning whether that happened within the budget. Polled after
+/// a delegate call has returned, a count back at what it was before that call
+/// means the delegate's dispatch has run to a no-delivery exit.
+async fn wait_for_outstanding_commissions(fx: &Fixture, expected: u32) -> bool {
+    let deadline = tokio::time::Instant::now() + common::load_scaled(Duration::from_secs(10));
+    loop {
+        let outstanding = fx
+            .daemon
+            .registry
+            .delegation_watch_snapshot(WORKER_PANE)
+            .delegation_commission
+            .map_or(0, |commission| commission.outstanding);
+        if outstanding == expected {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Scenario: hold the worker pane's dispatch lock so a delegate whose respawn is going to fail is armed but cannot run, arm a NEWER delegation and its commission on the same worker pane, then release the lock and let the older delegate fail. The older delegation no longer counts, so the first `work-done` from the pane answers the newer one: the record must be retired and that retirement broadcast.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/052")]
+async fn delegate_052_work_done_after_an_overtaken_undelivered_delegate_retires_the_newer_one() {
+    let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
+    point_worker_role_at(&fx, MISSING_WORKER_BINARY);
+    let mut broadcasts = fx.daemon.event_tx.subscribe();
+
+    // As in `orchestration/delegate/051`: the older delegate's task stays
+    // parked at its first statement while the newer delegation is armed.
+    let dispatch_lock = fx.daemon.registry.pane_dispatch_lock(WORKER_PANE);
+    let parked = dispatch_lock.lock().await;
+    delegate(&fx, "list the files in this directory").await;
+    assert!(
+        fx.daemon
+            .registry
+            .delegation_watch_snapshot(WORKER_PANE)
+            .outstanding_delegation
+            .is_some(),
+        "precondition: the older delegate must have armed its delegation"
+    );
+    // What `handle_delegate`'s fan-out does for the next delegate to this
+    // pane. Held so the newer delegation's cancellation channel stays open.
+    let _newer = fx
+        .daemon
+        .registry
+        .arm_outstanding_delegation(
+            WORKER_PANE,
+            WORKER_ROLE,
+            ORCH_PANE,
+            &fx.orchestrator_agent_id,
+            Some(&OrchestrationIdentity::Instance {
+                id: ORCHESTRATION_ID.to_string(),
+                name: ORCHESTRATION.to_string(),
+            }),
+        )
+        .expect("precondition: neither pane is closing, so the newer delegation must arm");
+    assert!(
+        fx.daemon
+            .registry
+            .arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
+        "precondition: neither pane is closing, so the newer commission must arm"
+    );
+    drop(parked);
+
+    let orchestrator = wait_for_orchestrator_text(&fx, RESPAWN_FAILED_NEEDLE).await;
+    assert!(
+        orchestrator.contains(RESPAWN_FAILED_NEEDLE),
+        "precondition: the older delegate must reach the respawn-error exit; orchestrator pane \
+         = {orchestrator:?}"
+    );
+    assert!(
+        wait_for_outstanding_commissions(&fx, 1).await,
+        "precondition: the older delegate never released its commission, so its no-delivery \
+         exit has not run; watches = {:?}",
+        fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
+    );
+    // A negative window, spent in full: whatever the exit does to the record
+    // it does in the same task as the commission release just observed.
+    let seen = common::delegation_broadcasts_for(
+        &mut broadcasts,
+        WORKER_PANE,
+        Duration::from_millis(750),
+        false,
+    )
+    .await;
+    assert!(
+        seen.retired == 0
+            && fx
+                .daemon
+                .registry
+                .delegation_watch_snapshot(WORKER_PANE)
+                .outstanding_delegation
+                .is_some(),
+        "precondition: the older delegate's exit must leave the newer delegation armed and \
+         unannounced (`orchestration/delegate/051`); broadcasts = {seen:?}, watches = {:?}",
+        fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
+    );
+
+    work_done(&fx).await;
+
+    assert!(
+        fx.daemon
+            .registry
+            .delegation_watch_snapshot(WORKER_PANE)
+            .outstanding_delegation
+            .is_none(),
+        "the older delegate never reached the worker, but the newer delegation still counts it \
+         as owed: the first work-done was credited to the delegation that was never delivered, \
+         and the one it answers stays armed until the idle-worker timeout; watches = {:?}",
+        fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
+    );
+    let seen = common::delegation_broadcasts_for(
+        &mut broadcasts,
+        WORKER_PANE,
+        common::load_scaled(Duration::from_secs(3)),
+        true,
+    )
+    .await;
+    assert!(
+        seen.retired > 0,
+        "the work-done that answers the newer delegation must be announced as a retirement; \
+         broadcasts = {seen:?}"
     );
 }
 

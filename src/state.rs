@@ -3180,10 +3180,19 @@ fn record_delegation_commission(
 /// release sites are exactly the callers of this function. The audit of
 /// `dispatch_one_owned`'s five exits, and why the two that release nothing are
 /// already correct, is recorded at the top of that function.
+///
+/// Issue #805: the same fan-out arms the PRD #126 outstanding-delegation record
+/// beside the commission, and an exit that delivers nothing owes that record's
+/// retirement for exactly the reason it owes this release. So the retirement is
+/// not a second call each exit has to remember: this function takes the
+/// delegation's `seq` and performs it, which makes "released the commission but
+/// left the record armed" unwritable at a no-delivery exit. See
+/// [`retire_undelivered_delegation`].
 fn release_undelivered_commission(
     registry: &AgentPtyRegistry,
     worker_pane_id: &str,
     role: &str,
+    delegation_seq: Option<u64>,
     reason: &'static str,
 ) {
     if registry.release_delegation_commission(worker_pane_id) {
@@ -3193,6 +3202,125 @@ fn release_undelivered_commission(
             reason,
             "delegate: released the commission for an undelivered task pointer"
         );
+    }
+    retire_undelivered_delegation(registry, worker_pane_id, role, delegation_seq, reason);
+}
+
+/// Issue #805: the counterpart to [`release_undelivered_commission`] for the
+/// PRD #126 outstanding-delegation record, and the single place that invariant
+/// is spelled out:
+///
+/// > **Every path that arms an outstanding delegation and then fails to deliver
+/// > the task pointer must retire it.**
+///
+/// The record is armed in `handle_delegate`'s synchronous fan-out
+/// ([`arm_idle_worker_watch_for_delegation`]), before the dispatch task has done
+/// anything at all, so it outlives every exit that task takes without writing a
+/// pointer. Left armed it is wrong three times over: the worker's card reads
+/// `Idle (delegated)` and the orchestrator's `Observing` for a task nobody was
+/// given, for as long as `worker_response_timeout_minutes` (two hours by
+/// default); and when that window closes the watch injects a "worker has not
+/// responded" prompt into the orchestrator about work that was never handed over.
+///
+/// > **It retires exactly one generation, its own — never more, never less.**
+///
+/// The record is keyed by worker pane and holds at most one watch, but it stands
+/// for every delegation that pane still owes: arming a newer delegate replaces
+/// the record and carries the older generations forward inside it. So neither
+/// "remove the record" nor "remove the record if it is mine" is the retirement.
+/// The first disarms a newer delegation armed while this dispatch waited on the
+/// pane's dispatch lock. The second, when this delegate is the newest, discards
+/// an EARLIER delegation that was delivered and is still unanswered, together
+/// with the only idle-worker watch left on that worker; and when this delegate
+/// has been overtaken it removes nothing, leaving the newer record counting a
+/// delegation nobody was given, so the worker's first `work-done` is credited to
+/// it and the delegation it actually answers stays armed until the timeout.
+/// [`AgentPtyRegistry::retire_undelivered_delegation`] is the one registry
+/// operation that decides all of this atomically; its decision table is there.
+///
+/// When the generation was the last one owed, the record goes with it. Dropping
+/// it drops its `_watch_cancel` sender, which resolves the cancellation arm
+/// [`arm_idle_worker_watch`] selects on, so the watch task exits instead of
+/// sleeping out the timeout; and the registry fires its `DelegationRetired`
+/// sink, so an already-attached deck clears the delegation live. When other
+/// generations are still owed the record, its watch and the deck's view of the
+/// pane all stay as they are.
+///
+/// `delegation_seq` is `None` when nothing was armed for this delegate (the
+/// detector is off, the orchestrator had no live agent, or a pane was
+/// mid-close), and there is then nothing to retire.
+///
+/// Called from [`release_undelivered_commission`], and directly from the one
+/// no-delivery exit that owes no commission release (the readiness-buffer close
+/// return), so the retirement sites stay checkable by grep.
+fn retire_undelivered_delegation(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    role: &str,
+    delegation_seq: Option<u64>,
+    reason: &'static str,
+) {
+    let Some(seq) = delegation_seq else {
+        return;
+    };
+    match registry.retire_undelivered_delegation(worker_pane_id, seq) {
+        crate::agent_pty::UndeliveredDelegationRetirement::Nothing => {}
+        crate::agent_pty::UndeliveredDelegationRetirement::Retired => {
+            tracing::debug!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                seq,
+                reason,
+                "delegate: retired the outstanding delegation for an undelivered task pointer"
+            );
+        }
+        crate::agent_pty::UndeliveredDelegationRetirement::KeptOthers {
+            seq: armed_seq,
+            remaining,
+        } => {
+            tracing::debug!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                seq,
+                armed_seq,
+                remaining,
+                reason,
+                "delegate: an undelivered task pointer no longer counts as owed; the worker \
+                 pane's other delegations stay armed"
+            );
+        }
+    }
+}
+
+/// Issue #805: does the guarded send's result count as the task pointer having
+/// been DELIVERED? The one decision `dispatch_one_owned`'s tail hangs the
+/// commission release, the outstanding delegation's retirement and the
+/// silent-worker watch on, kept pure so every outcome can be pinned without a
+/// PTY that fails half-way.
+///
+/// * `Applied` — delivered.
+/// * `Ambiguous` — counts as delivered, on purpose. It is a partial write: some
+///   bytes reached the authorized worker, so the delegate may or may not have
+///   landed. Keeping everything armed costs at worst a discardable nudge;
+///   retiring would leave a worker that did get the task unwatched.
+/// * `RefusedUserInput`, `WrongSession`, `Stale`, `NoLiveTarget` — refused
+///   before a byte was written. An unresolved worker identity is not a distinct
+///   case: the caller never attempts that write and reports it as
+///   `NoLiveTarget`.
+/// * `Err` — the write failed with nothing written.
+fn task_pointer_counts_as_delivered(
+    outcome: &Result<GuardedSendDetail, crate::agent_pty::AgentPtyError>,
+) -> bool {
+    use crate::agent_pty::GuardedSend;
+    match outcome {
+        Ok(GuardedSendDetail::Outcome(GuardedSend::Applied | GuardedSend::Ambiguous)) => true,
+        Ok(
+            GuardedSendDetail::RefusedUserInput
+            | GuardedSendDetail::Outcome(
+                GuardedSend::WrongSession | GuardedSend::Stale | GuardedSend::NoLiveTarget,
+            ),
+        )
+        | Err(_) => false,
     }
 }
 
@@ -5722,6 +5850,43 @@ fn write_work_done_summary(
 ///
 /// The **respawn-error** exit is absent from this list on purpose: the record is
 /// armed inside the success arm, so a failed respawn never creates one.
+///
+/// # The outstanding delegation's no-delivery invariant
+///
+/// Issue #805. The PRD #126 outstanding-delegation record is armed by the caller
+/// in the same synchronous fan-out as the commission, and `delegation_seq` is
+/// its generation. It follows the commission exit for exit, and is retired by
+/// the same call — [`release_undelivered_commission`] performs it, through
+/// [`retire_undelivered_delegation`] — so the two cannot drift apart. The same
+/// five exits, audited for the record:
+///
+/// 1. **The pi-native `clear = true` return** — retires nothing, correctly. The
+///    pointer is handed over as the respawned pi's seed, so the worker owes a
+///    `work-done` and the orchestrator is genuinely waiting on one.
+/// 2. **The respawn-error return** — retires.
+/// 3. **The dead-replacement return** — retires.
+/// 4. **The readiness-buffer close return** — retires, belt-and-braces, by
+///    calling [`retire_undelivered_delegation`] directly (there is no commission
+///    to release here, see commission exit 4). Expected to find nothing:
+///    `begin_pane_close` drains every outstanding delegation touching the pane
+///    under the same lock hold that drops the close waiter this arm woke on, and
+///    that drain announces the retirement itself.
+/// 5. **The tail, after the guarded send** — retires whenever the send did not
+///    deliver (`WrongSession`, `Stale`, `NoLiveTarget`, `RefusedUserInput`,
+///    `Err`); [`task_pointer_counts_as_delivered`] is that decision. `Applied`
+///    keeps the record, which is the delegation working as intended.
+///    `Ambiguous` keeps it too, on purpose: some bytes reached the authorized
+///    worker, so it may be working on the task, and an idle prompt for a
+///    delegation that did not land is a discardable nudge where a retired record
+///    for one that did is a silent worker nobody is watching.
+///
+/// "Retires" means one generation, this delegate's own, wherever it is still
+/// owed. An exit reached after a newer delegate re-armed the pane takes this
+/// generation out of the newer record and leaves that record armed; an exit of
+/// the NEWEST delegate, reached while an earlier delegation that was delivered
+/// is still unanswered, leaves the record and its idle-worker watch armed for
+/// that earlier one. Only when nothing else is owed does the record go, and only
+/// then is `DelegationRetired` announced.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
@@ -6332,6 +6497,7 @@ async fn dispatch_one_owned(
                         &registry,
                         &pane_id,
                         &target_role,
+                        delegation_seq,
                         "the clear=true replacement worker never became live",
                     );
                     // Issue #687, silence audit exit 2: the generation this
@@ -6599,6 +6765,23 @@ async fn dispatch_one_owned(
                                 reserved_silence.take(),
                                 "the worker pane began closing during the readiness buffer",
                             );
+                            // Issue #805, delegation audit exit 4: the same
+                            // again for the outstanding delegation, which that
+                            // drain removed and announced. The retirement
+                            // removes this delegate's generation only where it
+                            // is still owed, so after the drain it finds
+                            // nothing, changes nothing and announces nothing.
+                            // Not `release_undelivered_commission`: that pops
+                            // the pane's newest commission unconditionally, and
+                            // after the drain the newest would be somebody
+                            // else's.
+                            retire_undelivered_delegation(
+                                &registry,
+                                &pane_id,
+                                &target_role,
+                                delegation_seq,
+                                "the worker pane began closing during the readiness buffer",
+                            );
                             return;
                         }
                         _ = tokio::time::sleep(buffer) => {}
@@ -6734,6 +6917,7 @@ async fn dispatch_one_owned(
                     &registry,
                     &pane_id,
                     &target_role,
+                    delegation_seq,
                     "respawn failed for clear=true",
                 );
                 // Skip the post-respawn prompt write — there is
@@ -6930,11 +7114,14 @@ async fn dispatch_one_owned(
     // `RefusedUserInput` flattens to `Stale` — nothing written — which is
     // precisely how the settle decision must read it.
     let submit_outcome = outcome.as_ref().ok().map(|detail| detail.outcome());
-    let delivered = match outcome {
+    // Decided by [`task_pointer_counts_as_delivered`]; the match below only
+    // reports the outcome.
+    let delivered = task_pointer_counts_as_delivered(&outcome);
+    match outcome {
         // `Ambiguous` is a partial write: some bytes reached the authorized
         // worker, so the delegate may or may not have landed — exactly the
         // question the silent-worker watch answers. Keep it armed.
-        Ok(GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Applied)) => true,
+        Ok(GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Applied)) => {}
         Ok(GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Ambiguous)) => {
             warn!(
                 pane_id = %pane_id,
@@ -6943,7 +7130,6 @@ async fn dispatch_one_owned(
                  its payload record is kept so a later identical pointer cannot submit the \
                  leftover bytes with the user's draft"
             );
-            true
         }
         Ok(GuardedSendDetail::RefusedUserInput) => {
             warn!(
@@ -6965,7 +7151,6 @@ async fn dispatch_one_owned(
                              would have sent your unsent draft too",
                 });
             }
-            false
         }
         Ok(GuardedSendDetail::Outcome(refused)) => {
             warn!(
@@ -6975,7 +7160,6 @@ async fn dispatch_one_owned(
                 outcome = ?refused,
                 "delegate: identity gate refused the task pointer; nothing written"
             );
-            false
         }
         Err(e) => {
             warn!(
@@ -6984,9 +7168,8 @@ async fn dispatch_one_owned(
                 error = %e,
                 "delegate: failed to write task prompt into target pane"
             );
-            false
         }
-    };
+    }
     // The two releases below settle two DIFFERENT records for two different
     // reasons — issue #424's payload record when the submit drained the input
     // box, issue #448's commission when the pointer may never have reached the
@@ -7045,6 +7228,7 @@ async fn dispatch_one_owned(
             &registry,
             &pane_id,
             &target_role,
+            delegation_seq,
             "the identity gate refused the task pointer",
         );
     }
@@ -15178,6 +15362,212 @@ clear = false
             "an identity-unresolved refusal must cancel the silence watch it armed, not leave \
              a taskless record behind to inflate the next watch's `superseded` counter"
         );
+    }
+
+    /// Issue #805: the retirement a no-delivery exit performs is conditional on
+    /// the delegation's OWN generation, and a genuine take stops that
+    /// delegation's watch. Pinned on the helper itself because it is the only
+    /// route to the retirement: a `None` or foreign generation must leave the
+    /// record armed, the matching one must take it and resolve the cancellation
+    /// channel `arm_idle_worker_watch` selects on, and a generation that has
+    /// since been superseded must leave the newer record alone.
+    #[tokio::test]
+    async fn retire_undelivered_delegation_takes_only_its_own_generation() {
+        let registry = AgentPtyRegistry::new();
+        let worker_pane = "worker-pane-undelivered";
+        let arm = || {
+            registry
+                .arm_outstanding_delegation(
+                    worker_pane,
+                    "worker-role",
+                    "orch-pane",
+                    "orch-agent",
+                    None,
+                )
+                .expect("neither pane is closing, so the delegation must arm")
+        };
+        let is_armed = || {
+            registry
+                .delegation_watch_snapshot(worker_pane)
+                .outstanding_delegation
+                .is_some()
+        };
+
+        let armed = arm();
+        retire_undelivered_delegation(&registry, worker_pane, "worker-role", None, "test");
+        assert!(
+            is_armed(),
+            "a delegate that armed nothing has nothing to retire, and must not take a record \
+             somebody else armed on the same pane"
+        );
+        retire_undelivered_delegation(
+            &registry,
+            worker_pane,
+            "worker-role",
+            Some(armed.seq + 1),
+            "test",
+        );
+        assert!(
+            is_armed(),
+            "a foreign generation must leave the record armed"
+        );
+
+        retire_undelivered_delegation(
+            &registry,
+            worker_pane,
+            "worker-role",
+            Some(armed.seq),
+            "test",
+        );
+        assert!(
+            !is_armed(),
+            "the delegation's own generation must retire its record"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), armed.cancel)
+            .await
+            .expect(
+                "retiring the record must resolve its watch's cancellation channel, or the \
+                 watch sleeps out the timeout and prompts the orchestrator about a task nobody \
+                 was given",
+            )
+            .expect_err("the channel resolves by its sender being dropped, never by a send");
+
+        let older = arm();
+        let newer = arm();
+        retire_undelivered_delegation(
+            &registry,
+            worker_pane,
+            "worker-role",
+            Some(older.seq),
+            "test",
+        );
+        assert!(
+            registry
+                .take_outstanding_delegation_if(worker_pane, newer.seq)
+                .is_some(),
+            "an undelivered delegate reached its exit after a newer one re-armed the pane; the \
+             newer delegation must still be armed"
+        );
+
+        // The newest delegate is the undelivered one, and an earlier
+        // delegation is still owed: the record and its watch stay for that
+        // earlier one, and one `work-done` then retires the record.
+        let _delivered = arm();
+        let mut refused = arm();
+        retire_undelivered_delegation(
+            &registry,
+            worker_pane,
+            "worker-role",
+            Some(refused.seq),
+            "test",
+        );
+        assert!(
+            is_armed(),
+            "an undelivered delegate took the earlier, delivered delegation with it"
+        );
+        assert!(
+            matches!(
+                refused.cancel.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the earlier delegation is left with no live idle-worker watch"
+        );
+        // Its exit runs once; a repeat must find nothing left to remove.
+        retire_undelivered_delegation(
+            &registry,
+            worker_pane,
+            "worker-role",
+            Some(refused.seq),
+            "test",
+        );
+        assert!(
+            is_armed(),
+            "one generation was removed twice, taking the delivered delegation with it"
+        );
+        assert!(
+            matches!(
+                registry.retire_outstanding_delegation(worker_pane),
+                crate::agent_pty::DelegationRetirement::Retired(_)
+            ),
+            "the undelivered delegate no longer counts, so one work-done must retire the record"
+        );
+
+        // Overtaken before its exit ran: the newer record stops counting it,
+        // so the first `work-done` retires that record.
+        let overtaken = arm();
+        let _overtaking = arm();
+        retire_undelivered_delegation(
+            &registry,
+            worker_pane,
+            "worker-role",
+            Some(overtaken.seq),
+            "test",
+        );
+        assert!(
+            matches!(
+                registry.retire_outstanding_delegation(worker_pane),
+                crate::agent_pty::DelegationRetirement::Retired(_)
+            ),
+            "the newer delegation still counted the undelivered one as owed"
+        );
+
+        // A generation that a `work-done` was already credited to is no longer
+        // counted, so its late no-delivery exit must not remove another one.
+        let credited = arm();
+        let _second = arm();
+        let _third = arm();
+        assert!(matches!(
+            registry.retire_outstanding_delegation(worker_pane),
+            crate::agent_pty::DelegationRetirement::RetiredSuperseded { remaining: 1, .. }
+        ));
+        retire_undelivered_delegation(
+            &registry,
+            worker_pane,
+            "worker-role",
+            Some(credited.seq),
+            "test",
+        );
+        assert!(
+            matches!(
+                registry.retire_outstanding_delegation(worker_pane),
+                crate::agent_pty::DelegationRetirement::RetiredSuperseded { remaining: 0, .. }
+            ),
+            "a generation already credited a work-done was removed a second time"
+        );
+    }
+
+    /// Issue #805: which guarded-send results count as the task pointer having
+    /// been delivered, for every result there is. `Ambiguous` is the one that
+    /// matters most: a partial write must keep the commission, the outstanding
+    /// delegation and the silent-worker watch, and no PTY fixture can produce
+    /// one on demand. An unresolved worker identity reaches this decision as
+    /// `NoLiveTarget`, so it has no case of its own.
+    #[test]
+    fn task_pointer_counts_as_delivered_for_applied_and_ambiguous_only() {
+        use crate::agent_pty::{AgentPtyError, GuardedSend};
+
+        let cases: [(Result<GuardedSendDetail, AgentPtyError>, bool); 7] = [
+            (Ok(GuardedSendDetail::Outcome(GuardedSend::Applied)), true),
+            (Ok(GuardedSendDetail::Outcome(GuardedSend::Ambiguous)), true),
+            (
+                Ok(GuardedSendDetail::Outcome(GuardedSend::WrongSession)),
+                false,
+            ),
+            (Ok(GuardedSendDetail::Outcome(GuardedSend::Stale)), false),
+            (
+                Ok(GuardedSendDetail::Outcome(GuardedSend::NoLiveTarget)),
+                false,
+            ),
+            (Ok(GuardedSendDetail::RefusedUserInput), false),
+            (Err(AgentPtyError::Writer("closed".to_string())), false),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(
+                task_pointer_counts_as_delivered(&outcome),
+                expected,
+                "outcome = {outcome:?}"
+            );
+        }
     }
 
     /// The dispatched spawn path registers its orchestrator by `orch_idx`, not
