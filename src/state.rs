@@ -16025,8 +16025,14 @@ clear = false
 
         /// The exit does not depend on the idle-worker detector. With nothing
         /// armed for the delegate (`delegation_seq` is `None`) there is no
-        /// record to sweep and so no notice, but a dead replacement still
-        /// received nothing and its commission must still be released.
+        /// record to sweep, but a dead replacement still received nothing: its
+        /// commission is released AND the orchestrator is told exactly once,
+        /// by the "never came up" notice the injection path writes for the same
+        /// situation (issue #825: it used to hear nothing at all).
+        ///
+        /// Scenario: the replacement dies before the bind and the delegate has
+        /// no armed delegation record; the orchestrator pane must receive one
+        /// "never came up" notice naming the worker pane, and no "exited" one.
         #[tokio::test]
         async fn a_dead_replacement_with_no_armed_delegation_still_releases_its_commission() {
             let registry = Arc::new(AgentPtyRegistry::new());
@@ -16057,18 +16063,95 @@ clear = false
                 "the commission of a delegate that delivered nothing must be released whether or \
                  not the idle-worker detector armed a record for it; watches = {watches:?}"
             );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let output = pane_output(&registry, &orchestrator);
+            assert_told_once_never_came_up(&registry, &orchestrator).await;
             assert!(
-                !output.contains(WORKER_EXITED_NEEDLE)
-                    && !output.contains(NEVER_CAME_UP_NEEDLE)
-                    && fired.lock().unwrap().is_empty(),
-                "with no record to sweep there is nothing to announce; output = {output:?}, \
-                 retirements = {:?}",
+                fired.lock().unwrap().is_empty(),
+                "no record existed, so no retirement may be announced; retirements = {:?}",
                 fired.lock().unwrap()
             );
 
             registry.shutdown_all();
+        }
+
+        /// Issue #825: the delegate's own record is gone because a NEWER
+        /// delegate re-armed the pane. The dead replacement still delivered
+        /// nothing, so the orchestrator is told once ("never came up"), and the
+        /// newer delegate's record is left armed.
+        ///
+        /// Scenario: two delegations are armed on the pane, the older delegate's
+        /// replacement is dead on arrival; the orchestrator pane must get one
+        /// "never came up" notice and the newer record must stay armed.
+        #[tokio::test]
+        async fn a_dead_replacement_whose_record_was_superseded_is_still_reported_once() {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let orchestrator = spawn_orchestrator_stand_in(&registry).await;
+            let replacement = spawn_replacement(&registry);
+            let older = registry
+                .arm_outstanding_delegation(WORKER_PANE, ROLE, ORCH_PANE, &orchestrator, None)
+                .expect("arm the older delegation");
+            let newer = registry
+                .arm_outstanding_delegation(WORKER_PANE, ROLE, ORCH_PANE, &orchestrator, None)
+                .expect("arm the newer delegation");
+            assert!(
+                newer.seq > older.seq,
+                "test prerequisite: newer supersedes older"
+            );
+            assert!(
+                registry.arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
+                "arm the commission"
+            );
+            end_replacement(&registry, &replacement).await;
+            let mut reserved_silence = None;
+
+            let already_exited = native_seed_replacement_already_exited(
+                &registry,
+                WORKER_PANE,
+                ROLE,
+                Some(older.seq),
+                &replacement,
+                &mut reserved_silence,
+            )
+            .await;
+
+            assert!(already_exited, "the replacement is dead");
+            assert!(
+                registry
+                    .delegation_watch_snapshot(WORKER_PANE)
+                    .outstanding_delegation
+                    .is_some(),
+                "the newer delegate's record must be left armed"
+            );
+            assert_told_once_never_came_up(&registry, &orchestrator).await;
+
+            registry.shutdown_all();
+        }
+
+        /// Waits for the "never came up" notice, gives any second notice of
+        /// either kind time to arrive, then requires exactly one, naming the
+        /// worker pane, and no "exited without work-done" notice.
+        async fn assert_told_once_never_came_up(registry: &Arc<AgentPtyRegistry>, orch: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline
+                && !pane_output(registry, orch).contains(NEVER_CAME_UP_NEEDLE)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let output = pane_output(registry, orch);
+            assert_eq!(
+                output.match_indices(NEVER_CAME_UP_NEEDLE).count(),
+                1,
+                "a dead-on-arrival replacement with no record of its own to sweep must still \
+                 be reported to the orchestrator exactly once (issue #825); output = {output:?}"
+            );
+            assert!(
+                output.contains(&format!("pane {WORKER_PANE} ")),
+                "the notice must name the worker's pane; output = {output:?}"
+            );
+            assert!(
+                !output.contains(WORKER_EXITED_NEEDLE),
+                "no record was swept, so no exited notice may appear; output = {output:?}"
+            );
         }
     }
 
