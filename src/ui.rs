@@ -395,6 +395,10 @@ enum ActiveTabView {
         /// function of its inputs. There is no global behind it — zoom is
         /// per-tab, so this field IS the value the tab holds.
         zoomed: bool,
+        /// Issue #829: the orchestrator's pane id (`role_pane_ids[start_role_index]`),
+        /// so the Tiled column can give it the leftover rows. `None` when the
+        /// start index is out of range.
+        orchestrator_pane_id: Option<String>,
     },
 }
 
@@ -16735,9 +16739,11 @@ pub fn run_tui(
             Tab::Orchestration {
                 role_pane_ids,
                 zoomed,
+                start_role_index,
                 ..
             } => ActiveTabView::Orchestration {
                 role_pane_ids: role_pane_ids.clone(),
+                orchestrator_pane_id: role_pane_ids.get(*start_role_index).cloned(),
                 // PRD #313: zoom stays per-tab — this tab's own value is the
                 // source of truth, unlike the deck-global split stage above.
                 zoomed: *zoomed,
@@ -18788,8 +18794,13 @@ fn compute_frame_layout(
             let side_pane_rects: Vec<(String, Rect)> = if side_pane_ids.is_empty() {
                 Vec::new()
             } else {
-                let chunks =
-                    pane_stack_rects(side_area, side_pane_ids, PaneLayout::Tiled, focused_pane_id);
+                let chunks = pane_stack_rects(
+                    side_area,
+                    side_pane_ids,
+                    PaneLayout::Tiled,
+                    focused_pane_id,
+                    None,
+                );
                 side_pane_ids.iter().cloned().zip(chunks).collect()
             };
             FrameContent::Mode {
@@ -18823,7 +18834,8 @@ fn compute_frame_layout(
             };
             let (dashboard_area, panes_area) =
                 split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
-            let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
+            let pane_rects =
+                cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id, None);
             FrameContent::Cards {
                 dashboard_area,
                 panes_area,
@@ -18835,7 +18847,7 @@ fn compute_frame_layout(
         ActiveTabView::Orchestration {
             role_pane_ids,
             zoomed,
-            ..
+            orchestrator_pane_id,
         } => {
             let pane_ids: Vec<String> = all_pane_ids
                 .iter()
@@ -18880,7 +18892,13 @@ fn compute_frame_layout(
             };
             let (dashboard_area, panes_area) =
                 split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
-            let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
+            let pane_rects = cards_pane_rects(
+                panes_area,
+                &pane_ids,
+                pane_layout,
+                focused_pane_id,
+                orchestrator_pane_id.as_deref(),
+            );
             FrameContent::Cards {
                 dashboard_area,
                 panes_area,
@@ -18906,10 +18924,17 @@ fn cards_pane_rects(
     pane_ids: &[String],
     pane_layout: PaneLayout,
     focused_pane_id: Option<&str>,
+    orchestrator_id: Option<&str>,
 ) -> Vec<(String, Rect)> {
     match panes_area {
         Some(area) if !pane_ids.is_empty() => {
-            let chunks = pane_stack_rects(area, pane_ids, pane_layout, focused_pane_id);
+            let chunks = pane_stack_rects(
+                area,
+                pane_ids,
+                pane_layout,
+                focused_pane_id,
+                orchestrator_id,
+            );
             pane_ids.iter().cloned().zip(chunks).collect()
         }
         _ => Vec::new(),
@@ -18960,10 +18985,12 @@ fn stacked_expanded_index(pane_ids: &[String], focused_id: Option<&str>) -> Opti
 /// `PaneLayout` and resolved focus. Single source of truth so the layout pass
 /// (which drives PTY resize) and the renderer can't disagree on a pane's rect.
 /// `Tiled`: integer division of the column height `H` across `n` panes —
-/// heights sum to `H`, differ by at most one row, and the leftover `H % n` rows
-/// go to the FIRST panes (`h[i] = H / n + (i < H % n)`); the cassowary `Ratio`
-/// solver instead rounded cumulative boundaries, scattering the extra rows into
-/// the middle (issue #829). `Stacked` (PRD #311): the expanded slot
+/// heights sum to `H` and the leftover `H % n` rows go to the FIRST panes
+/// (`h[i] = H / n + (i < H % n)`); the cassowary `Ratio` solver instead rounded
+/// cumulative boundaries, scattering the extra rows into the middle (issue
+/// #829). When `orchestrator_id` names a pane in the stack (orchestration tabs
+/// only), that pane instead takes ALL the leftover rows (`H / n + H % n`) and
+/// every other pane gets exactly `H / n`. `Stacked` (PRD #311): the expanded slot
 /// fills the whole area and every other pane reserves zero rows (`Length(0)`) —
 /// it is not drawn at all, rather than collapsing to a 1-row title bar.
 fn pane_stack_rects(
@@ -18971,6 +18998,7 @@ fn pane_stack_rects(
     pane_ids: &[String],
     layout: PaneLayout,
     focused_id: Option<&str>,
+    orchestrator_id: Option<&str>,
 ) -> Vec<Rect> {
     if pane_ids.is_empty() {
         return Vec::new();
@@ -18980,10 +19008,19 @@ fn pane_stack_rects(
             let n = pane_ids.len() as u16;
             let base = area.height / n;
             let extra = area.height % n;
+            // Issue #829: on an orchestration column the orchestrator pane (if
+            // live in this stack) takes ALL the leftover rows and every other
+            // pane gets exactly `base`; otherwise the leftover goes to the
+            // first panes.
+            let orch_index =
+                orchestrator_id.and_then(|oid| pane_ids.iter().position(|id| id.as_str() == oid));
             let mut y = area.y;
             return (0..n)
                 .map(|i| {
-                    let h = base + u16::from(i < extra);
+                    let h = match orch_index {
+                        Some(o) => base + if usize::from(i) == o { extra } else { 0 },
+                        None => base + u16::from(i < extra),
+                    };
                     let r = Rect::new(area.x, y, area.width, h);
                     y += h;
                     r
@@ -20654,7 +20691,16 @@ fn render_terminal_panes(
             rects
         }
         None => {
-            computed_chunks = pane_stack_rects(area, pane_ids, layout, focused_id.as_deref());
+            computed_chunks = pane_stack_rects(
+                area,
+                pane_ids,
+                layout,
+                focused_id.as_deref(),
+                // Issue #829: the only callers reaching this fallback are mode
+                // tabs (no orchestrator); every orchestration/dashboard draw
+                // passes the `FrameLayout` rects, which carry the orchestrator.
+                None,
+            );
             &computed_chunks
         }
     };
@@ -25406,6 +25452,7 @@ pub fn render_orchestration_frame_to_buffer(
         })
     });
     let tab_view = ActiveTabView::Orchestration {
+        orchestrator_pane_id: None,
         role_pane_ids: pane_ids.clone(),
         zoomed,
     };
@@ -27796,6 +27843,7 @@ mod tests {
         let pane_ids: Vec<String> = role_names.iter().map(|r| format!("role-{r}")).collect();
 
         let tab_view = ActiveTabView::Orchestration {
+            orchestrator_pane_id: None,
             role_pane_ids: pane_ids.clone(),
             zoomed: false,
         };
@@ -27882,6 +27930,7 @@ mod tests {
     ) -> (u16, u16) {
         ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
         let tab_view = ActiveTabView::Orchestration {
+            orchestrator_pane_id: None,
             role_pane_ids: role_pane_ids.to_vec(),
             zoomed,
         };
@@ -28406,7 +28455,7 @@ mod tests {
 
         // Offset area so an accumulation bug cannot hide at the origin.
         let area = Rect::new(7, 5, 40, 3);
-        let rects = pane_stack_rects(area, &ids(5), PaneLayout::Tiled, None);
+        let rects = pane_stack_rects(area, &ids(5), PaneLayout::Tiled, None, None);
         assert_eq!(
             heights(&rects),
             vec![1, 1, 1, 0, 0],
@@ -28415,20 +28464,20 @@ mod tests {
         assert_eq!(tiling_problem(&rects, area), None);
 
         let area = Rect::new(3, 9, 30, 17);
-        let rects = pane_stack_rects(area, &ids(1), PaneLayout::Tiled, None);
+        let rects = pane_stack_rects(area, &ids(1), PaneLayout::Tiled, None, None);
         assert_eq!(rects, vec![area], "one pane takes the whole column");
 
         let area = Rect::new(3, 9, 30, 0);
-        let rects = pane_stack_rects(area, &ids(4), PaneLayout::Tiled, None);
+        let rects = pane_stack_rects(area, &ids(4), PaneLayout::Tiled, None, None);
         assert_eq!(heights(&rects), vec![0, 0, 0, 0], "zero-height column");
         assert_eq!(tiling_problem(&rects, area), None);
 
-        let rects = pane_stack_rects(Rect::new(1, 2, 30, 10), &[], PaneLayout::Tiled, None);
+        let rects = pane_stack_rects(Rect::new(1, 2, 30, 10), &[], PaneLayout::Tiled, None, None);
         assert!(rects.is_empty(), "no panes => no rects");
 
         // Offset column with an uneven split.
         let area = Rect::new(11, 4, 25, 23);
-        let rects = pane_stack_rects(area, &ids(4), PaneLayout::Tiled, None);
+        let rects = pane_stack_rects(area, &ids(4), PaneLayout::Tiled, None, None);
         assert_eq!(heights(&rects), vec![6, 6, 6, 5], "23 rows across 4 panes");
         assert_eq!(tiling_problem(&rects, area), None);
     }
@@ -28439,12 +28488,10 @@ mod tests {
     /// must reach `compute_frame_layout` here, in whatever form the layout pass
     /// takes it.
     fn orch_tab_view(role_pane_ids: &[String], start_role_index: usize) -> ActiveTabView {
-        // The layout pass currently receives only the ids; the fix adds the
-        // orchestrator to the view and this is the one place to pass it.
-        let _ = start_role_index;
         ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.to_vec(),
             zoomed: false,
+            orchestrator_pane_id: role_pane_ids.get(start_role_index).cloned(),
         }
     }
 
@@ -29026,6 +29073,7 @@ mod tests {
         let layout = compute_frame_layout(
             frame_area,
             &ActiveTabView::Orchestration {
+                orchestrator_pane_id: None,
                 role_pane_ids: role_pane_ids.clone(),
                 zoomed: true,
             },
@@ -29081,6 +29129,7 @@ mod tests {
                 })
             });
             let tab_view = ActiveTabView::Orchestration {
+                orchestrator_pane_id: None,
                 role_pane_ids: role_pane_ids.clone(),
                 zoomed,
             };
@@ -29190,6 +29239,7 @@ mod tests {
 
             ACTIVE_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
             let tab_view = ActiveTabView::Orchestration {
+                orchestrator_pane_id: None,
                 role_pane_ids: role_pane_ids.clone(),
                 zoomed,
             };
@@ -29470,6 +29520,7 @@ mod tests {
             let layout = compute_frame_layout(
                 frame_area,
                 &ActiveTabView::Orchestration {
+                    orchestrator_pane_id: None,
                     role_pane_ids: role_pane_ids.clone(),
                     zoomed,
                 },
@@ -36822,6 +36873,7 @@ mod tests {
             _ => panic!("expected an active Orchestration tab"),
         };
         let tab_view = ActiveTabView::Orchestration {
+            orchestrator_pane_id: None,
             role_pane_ids: role_pane_ids.clone(),
             zoomed: false,
         };
@@ -37673,6 +37725,7 @@ mod tests {
         let frame_area = Rect::new(0, 0, 100, 40);
         let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
         let tab_view = ActiveTabView::Orchestration {
+            orchestrator_pane_id: None,
             role_pane_ids: role_pane_ids.clone(),
             zoomed: false,
         };
@@ -38030,6 +38083,7 @@ mod tests {
         // computed; every call site below resets it explicitly afterward.
         let role_pane_ids = vec!["orchestrator".to_string(), "worker".to_string()];
         let orch_tab_view = ActiveTabView::Orchestration {
+            orchestrator_pane_id: None,
             role_pane_ids: role_pane_ids.clone(),
             zoomed: false,
         };
@@ -38302,6 +38356,7 @@ mod tests {
         // while sharing Narrow/Hidden.
         let role_pane_ids = vec!["orchestrator".to_string()];
         let orch_view = ActiveTabView::Orchestration {
+            orchestrator_pane_id: None,
             role_pane_ids: role_pane_ids.clone(),
             zoomed: false,
         };
