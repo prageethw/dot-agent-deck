@@ -4788,6 +4788,22 @@ impl AgentPtyRegistry {
     /// record does not vouch for the caller's string, and `pump_reader` would
     /// not have swept `worker_pane_id` for it either.
     ///
+    /// That mismatch branch is a guard, not a path `dispatch_one_owned` takes:
+    /// the agent it passes here always carries the pane id it passes beside
+    /// it. An ordinary respawn finds the pane BY its stored `pane_id_env` and
+    /// replays the previous child's `spawn_env`, which holds that same value;
+    /// a re-creation injects `DOT_AGENT_DECK_PANE_ID` with the caller's pane
+    /// id into the new child's environment; and either way the value is
+    /// validated when the spawn captures it (`capture_pane_id_env`), so the
+    /// stored pane id can only differ from the caller's string when that
+    /// string would not have passed validation — the one case this gate
+    /// exists to keep out of the notice. Were the branch ever reached, the
+    /// delegation is still not left armed: the call reports the exit, and the
+    /// caller's no-delivery release
+    /// (`crate::state::release_undelivered_commission`) retires this
+    /// delegate's own generation by `seq`, which does not depend on the record
+    /// having been swept here. Only the orchestrator's notice is lost.
+    ///
     /// Like the sweep it stands in for, this does not touch the commission
     /// ledger — see [`Self::sweep_delegations_on_exit`] for why. Whether the
     /// delegate that was being delivered still owes anything is the caller's

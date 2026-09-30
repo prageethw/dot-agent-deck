@@ -3409,6 +3409,8 @@ fn release_reserved_silence_watch(
 ///
 /// Returns `false` for a live replacement, having bound it and changed nothing
 /// else; the dispatch carries on to the stash.
+#[must_use = "`true` means the no-delivery exit has been taken and the dispatch must return \
+              without stashing a seed"]
 async fn native_seed_replacement_already_exited(
     registry: &Arc<AgentPtyRegistry>,
     worker_pane_id: &str,
