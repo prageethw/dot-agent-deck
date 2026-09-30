@@ -329,6 +329,20 @@ struct Pane {
     /// shares with the command banner, so this records only the arming instant
     /// and the renderer decides whether it is still worth drawing.
     scroll_notice_armed_at: Option<Instant>,
+    /// Issue #824 — process-wide creation sequence, taken when the pane is
+    /// built. `pane_ids` sorts on this so the order is the order panes were
+    /// created, whatever shape the id string has (legacy numeric, daemon-minted
+    /// `pane-<nonce>-<seq>`, hydrated ids carrying another daemon's nonce). A
+    /// close that fails and re-inserts the pane carries the value over, so the
+    /// pane keeps its place.
+    created_seq: u64,
+}
+
+/// Source of [`Pane::created_seq`].
+static PANE_CREATION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_pane_creation_seq() -> u64 {
+    PANE_CREATION_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Thread-safe pane registry.
@@ -826,6 +840,7 @@ impl EmbeddedPaneController {
             // how much output it had consumed.
             bytes_since_spawn: Arc::new(AtomicU64::new(bytes.len() as u64)),
             scroll_notice_armed_at: None,
+            created_seq: next_pane_creation_seq(),
         };
         (pane, input_rx)
     }
@@ -842,12 +857,17 @@ impl EmbeddedPaneController {
         panes.get(pane_id).map(|p| Arc::clone(&p.hyperlinks))
     }
 
-    /// Return all pane IDs in insertion order (by numeric ID).
+    /// Return all pane IDs in creation order (the order the panes were built
+    /// in this process), independent of the id's shape. Ties cannot occur —
+    /// the sequence is unique — but the id breaks them anyway for determinism.
     pub fn pane_ids(&self) -> Vec<String> {
         let panes = self.panes.lock().unwrap();
-        let mut ids: Vec<String> = panes.keys().cloned().collect();
-        ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
-        ids
+        let mut ids: Vec<(u64, String)> = panes
+            .iter()
+            .map(|(id, p)| (p.created_seq, id.clone()))
+            .collect();
+        ids.sort();
+        ids.into_iter().map(|(_, id)| id).collect()
     }
 
     /// Get the currently focused pane ID, if any.
@@ -1523,6 +1543,7 @@ impl EmbeddedPaneController {
             hyperlinks,
             bytes_since_spawn,
             scroll_notice_armed_at: None,
+            created_seq: next_pane_creation_seq(),
         };
 
         self.panes.lock().unwrap().insert(pane_id, pane);
@@ -4048,6 +4069,7 @@ impl PaneController for EmbeddedPaneController {
                     // was showing survive a close that failed.
                     bytes_since_spawn: pane.bytes_since_spawn,
                     scroll_notice_armed_at: pane.scroll_notice_armed_at,
+                    created_seq: pane.created_seq,
                 };
                 self.panes
                     .lock()
@@ -4082,6 +4104,7 @@ impl PaneController for EmbeddedPaneController {
                     // was showing survive a close that failed.
                     bytes_since_spawn: pane.bytes_since_spawn,
                     scroll_notice_armed_at: pane.scroll_notice_armed_at,
+                    created_seq: pane.created_seq,
                 };
                 self.panes
                     .lock()
@@ -4100,7 +4123,7 @@ impl PaneController for EmbeddedPaneController {
             .iter()
             .map(|(id, p)| {
                 (
-                    id.parse::<u64>().unwrap_or(0),
+                    p.created_seq,
                     PaneInfo {
                         pane_id: id.clone(),
                         title: p.name.clone(),

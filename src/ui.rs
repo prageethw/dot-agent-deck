@@ -15756,6 +15756,10 @@ pub fn run_tui(
         // so we can land on it (start cursor) after the loop rather than snapping
         // back to the dashboard — mirroring the hydration block's landing logic.
         let mut first_restored_orch_tab: Option<usize> = None;
+        // Issue #824 — the START role's pane on that same tab, so the landing
+        // focus targets it explicitly instead of whichever id `pane_ids()`
+        // lists first.
+        let mut first_restored_orch_start_pane: Option<String> = None;
         for saved_pane in &saved.panes {
             let dir = std::path::Path::new(&saved_pane.dir);
             if !dir.is_dir() {
@@ -16020,6 +16024,8 @@ pub fn run_tui(
                                 }
                                 if first_restored_orch_tab.is_none() {
                                     first_restored_orch_tab = Some(tab_idx);
+                                    first_restored_orch_start_pane =
+                                        role_pane_ids.get(saved_start_idx).cloned();
                                 }
                                 continue;
                             }
@@ -16439,7 +16445,10 @@ pub fn run_tui(
         // startup resize sweep here.
         if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
             let ids = embedded.pane_ids();
-            if let Some(first_id) = ids.first() {
+            let landing_pane = first_restored_orch_start_pane
+                .as_ref()
+                .or_else(|| ids.first());
+            if let Some(first_id) = landing_pane {
                 let _ = pane.focus_pane(first_id);
                 ui.mode = UiMode::PaneInput;
             }
