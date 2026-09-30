@@ -5385,6 +5385,49 @@ impl AgentPtyRegistry {
         UndeliveredDelegationRetirement::Retired
     }
 
+    /// Issue #812: the `clear = true` respawn for the delegate whose generation
+    /// is `seq` failed or produced a dead replacement, and it had already
+    /// TERMINATED the pane's previous worker. Every delegation that worker still
+    /// owed (any generation `<= seq`) can therefore never be answered, so all of
+    /// them leave the outstanding set, not only `seq` as
+    /// [`Self::retire_undelivered_delegation`] does. Generations NEWER than `seq`
+    /// belong to a later delegate and stay owed, with the record and its watch.
+    ///
+    /// | Pane state | Result |
+    /// |---|---|
+    /// | no record, or nothing owed is `<= seq` | [`UndeliveredDelegationRetirement::Nothing`] |
+    /// | nothing owed is newer than `seq` | record removed, watch cancelled, `DelegationRetired` sink fired |
+    /// | a newer generation is still owed | older ones removed; record and watch kept, nothing announced |
+    ///
+    /// One operation under the tracker's mutex, sink fired after the lock is
+    /// released and only on a genuine removal.
+    pub fn retire_delegations_of_terminated_worker(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+    ) -> UndeliveredDelegationRetirement {
+        let mut tracker = self.delegations.lock().unwrap();
+        let Some(record) = tracker.records.get_mut(worker_pane_id) else {
+            return UndeliveredDelegationRetirement::Nothing;
+        };
+        let before = record.owed.len();
+        record.owed.retain(|owed| *owed > seq);
+        if record.owed.len() == before {
+            return UndeliveredDelegationRetirement::Nothing;
+        }
+        if !record.owed.is_empty() {
+            return UndeliveredDelegationRetirement::KeptOthers {
+                seq: record.seq,
+                remaining: record.owed.len() as u32,
+            };
+        }
+        // Dropping the record is what cancels its watch.
+        drop(tracker.records.remove(worker_pane_id));
+        drop(tracker);
+        self.fire_delegation_retired(worker_pane_id);
+        UndeliveredDelegationRetirement::Retired
+    }
+
     /// PRD #126: a `work-done` arrived from `worker_pane_id`, so one outstanding
     /// delegation is resolved and owes no idle prompt.
     ///

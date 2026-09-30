@@ -3195,6 +3195,60 @@ fn release_undelivered_commission(
     delegation_seq: Option<u64>,
     reason: &'static str,
 ) {
+    release_undelivered_commission_scoped(
+        registry,
+        worker_pane_id,
+        role,
+        delegation_seq,
+        reason,
+        RetireScope::OwnGeneration,
+    );
+}
+
+/// Issue #812: the two `clear = true` respawn exits (the respawn error and the
+/// dead replacement) have already TERMINATED the pane's previous worker, so
+/// they release the commission like every no-delivery exit and additionally
+/// drop every delegation that terminated worker still owed. See
+/// [`RetireScope::TerminatedWorker`].
+fn release_undelivered_commission_of_terminated_worker(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    role: &str,
+    delegation_seq: Option<u64>,
+    reason: &'static str,
+) {
+    release_undelivered_commission_scoped(
+        registry,
+        worker_pane_id,
+        role,
+        delegation_seq,
+        reason,
+        RetireScope::TerminatedWorker,
+    );
+}
+
+/// Issue #812: how much of the pane's outstanding-delegation record a
+/// no-delivery exit retires.
+#[derive(Clone, Copy)]
+enum RetireScope {
+    /// Only this delegate's own generation. Every exit where the pane's
+    /// previous worker may still be live and still owe its earlier delegations.
+    OwnGeneration,
+    /// This delegate's generation and every OLDER one still owed: the
+    /// `clear = true` respawn already terminated the worker that owed them, so
+    /// nothing can ever answer them. A NEWER delegation's generation and
+    /// record are left alone.
+    TerminatedWorker,
+}
+
+fn release_undelivered_commission_scoped(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    role: &str,
+    delegation_seq: Option<u64>,
+    reason: &'static str,
+    scope: RetireScope,
+) {
     if registry.release_delegation_commission(worker_pane_id) {
         tracing::debug!(
             pane_id = %worker_pane_id,
@@ -3203,7 +3257,14 @@ fn release_undelivered_commission(
             "delegate: released the commission for an undelivered task pointer"
         );
     }
-    retire_undelivered_delegation(registry, worker_pane_id, role, delegation_seq, reason);
+    retire_undelivered_delegation_scoped(
+        registry,
+        worker_pane_id,
+        role,
+        delegation_seq,
+        reason,
+        scope,
+    );
 }
 
 /// Issue #805: the counterpart to [`release_undelivered_commission`] for the
@@ -3260,10 +3321,34 @@ fn retire_undelivered_delegation(
     delegation_seq: Option<u64>,
     reason: &'static str,
 ) {
+    retire_undelivered_delegation_scoped(
+        registry,
+        worker_pane_id,
+        role,
+        delegation_seq,
+        reason,
+        RetireScope::OwnGeneration,
+    );
+}
+
+fn retire_undelivered_delegation_scoped(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    role: &str,
+    delegation_seq: Option<u64>,
+    reason: &'static str,
+    scope: RetireScope,
+) {
     let Some(seq) = delegation_seq else {
         return;
     };
-    match registry.retire_undelivered_delegation(worker_pane_id, seq) {
+    let retirement = match scope {
+        RetireScope::OwnGeneration => registry.retire_undelivered_delegation(worker_pane_id, seq),
+        RetireScope::TerminatedWorker => {
+            registry.retire_delegations_of_terminated_worker(worker_pane_id, seq)
+        }
+    };
+    match retirement {
         crate::agent_pty::UndeliveredDelegationRetirement::Nothing => {}
         crate::agent_pty::UndeliveredDelegationRetirement::Retired => {
             tracing::debug!(
@@ -6072,8 +6157,11 @@ fn write_work_done_summary(
 ///    ([`native_seed_replacement_already_exited`]), so a replacement that exits
 ///    without reporting is retired by the agent-exit sweep rather than by the
 ///    idle-worker timeout.
-/// 2. **The respawn-error return** — retires.
-/// 3. **The dead-replacement return** — retires.
+/// 2. **The respawn-error return** — retires its own generation AND every older
+///    one still owed (issue #812): the `clear = true` respawn already terminated
+///    the worker that owed them, so nothing can answer them. A newer
+///    delegation's generation and record are kept.
+/// 3. **The dead-replacement return** — retires like exit 2, for the same reason.
 /// 4. **The readiness-buffer close return** — retires, belt-and-braces, by
 ///    calling [`retire_undelivered_delegation`] directly (there is no commission
 ///    to release here, see commission exit 4). Expected to find nothing:
@@ -6098,7 +6186,8 @@ fn write_work_done_summary(
 ///    counts this generation as owed — and then takes this generation out of it.
 ///
 /// "Retires" means one generation, this delegate's own, wherever it is still
-/// owed. An exit reached after a newer delegate re-armed the pane takes this
+/// owed — except at exits 2 and 3, which also drop the older generations the
+/// terminated worker owed ([`RetireScope::TerminatedWorker`]). An exit reached after a newer delegate re-armed the pane takes this
 /// generation out of the newer record and leaves that record armed; an exit of
 /// the NEWEST delegate, reached while an earlier delegation that was delivered
 /// is still unanswered, leaves the record and its idle-worker watch armed for
@@ -6675,7 +6764,7 @@ async fn dispatch_one_owned(
                     // worker is gone, so the debt has to go with it — otherwise
                     // the next completion on this pane id is laundered into a
                     // solicited one. See this function's no-delivery invariant.
-                    release_undelivered_commission(
+                    release_undelivered_commission_of_terminated_worker(
                         &registry,
                         &pane_id,
                         &target_role,
@@ -7077,7 +7166,7 @@ async fn dispatch_one_owned(
                 // sits 100+ lines further on, so correctness would
                 // otherwise depend on WHICH arm the dispatch leaves
                 // through.
-                release_undelivered_commission(
+                release_undelivered_commission_of_terminated_worker(
                     &registry,
                     &pane_id,
                     &target_role,
