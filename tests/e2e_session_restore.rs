@@ -1496,9 +1496,9 @@ const FOCUS_ROLES: [&str; 6] = [
 
 /// Rebuild a six-role orchestration tab from a daemon-empty snapshot whose start
 /// role is `FOCUS_ROLES[start_idx]`, wait until the restore has replayed the
-/// saved prompt to that start role, then type one probe line and report which
-/// role's recorder received it (the role whose pane holds keyboard focus).
-/// Returns `(role_that_received_probe, final_grid)`.
+/// saved prompt to that start role, then report which role's terminal pane is the
+/// focused one (its header is drawn as `┌<role>─`). Returns
+/// `(focused_role, final_grid)`.
 fn restore_and_probe_focus(start_idx: usize) -> (Option<&'static str>, String) {
     let project_dir = common::race_safe_tempdir();
     let cmds: Vec<String> = FOCUS_ROLES
@@ -1553,18 +1553,20 @@ fn restore_and_probe_focus(start_idx: usize) -> (Option<&'static str>, String) {
         deck.snapshot_grid()
     );
 
-    // The restore leaves the deck in pane-input mode, so this line goes to the
-    // focused pane's stdin and that role's recorder logs it.
-    let probe = "focus-probe-824";
-    deck.send_keys(format!("{probe}\r").as_bytes());
+    // Read the focused pane off the grid: the embedded terminal pane is titled
+    // `┌<role>──…` (deck cards are titled `┌ N ──…`, so the two never collide),
+    // and it names the pane that holds focus. After the restore the deck is
+    // showing "Pane locked", so a typed probe would not reach any pane and is
+    // not a usable signal here; the pane header is.
     let received = std::cell::Cell::new(None);
     common::wait_until(Duration::from_secs(15), || {
-        received.set(FOCUS_ROLES.iter().copied().find(|role| {
-            common::count_file_substr(
-                &project_dir.path().join(format!("record-{role}.log")),
-                probe,
-            ) >= 1
-        }));
+        let grid = deck.snapshot_grid();
+        received.set(
+            FOCUS_ROLES
+                .iter()
+                .copied()
+                .find(|role| grid.contains(&format!("┌{role}─"))),
+        );
         received.get().is_some()
     });
     (received.get(), deck.snapshot_grid())
@@ -1572,8 +1574,8 @@ fn restore_and_probe_focus(start_idx: usize) -> (Option<&'static str>, String) {
 
 /// Scenario: Rebuild a six-role orchestration tab from a daemon-empty snapshot
 /// whose start role is the FIRST role, every role running a stdin recorder.
-/// After the restore, a typed probe line must reach the start role's pane: the
-/// restore leaves keyboard focus on the start role, not on whichever pane the
+/// After the restore, the focused terminal pane must be the start role's: the
+/// restore leaves focus on the start role, not on whichever pane the
 /// pane map happens to yield first (issue #824).
 #[spec("session/restore/025")]
 #[test]
@@ -1583,15 +1585,15 @@ fn restore_025_rebuilt_orchestration_focuses_start_role_when_created_first() {
         received,
         Some(FOCUS_ROLES[0]),
         "issue #824: after a daemon-empty orchestration restore the keyboard must be focused on \
-         the START role `{}` (created first), but the probe line reached {received:?}. Pane \
+         the START role `{}` (created first), but the focused pane is {received:?}. Pane \
          ids are no longer numeric, so `pane_ids().first()` is arbitrary.\nFinal grid:\n{grid}",
         FOCUS_ROLES[0]
     );
 }
 
 /// Scenario: Same as the previous scenario, but the start role is the LAST of
-/// the six roles (created last). A typed probe line after the restore must
-/// still reach the start role's pane, proving focus follows the start role and
+/// the six roles (created last). The focused terminal pane after the restore must
+/// still be the start role's, proving focus follows the start role and
 /// is not simply the first- or last-created pane (issue #824).
 #[spec("session/restore/026")]
 #[test]
@@ -1602,7 +1604,7 @@ fn restore_026_rebuilt_orchestration_focuses_start_role_when_created_last() {
         received,
         Some(FOCUS_ROLES[last]),
         "issue #824: after a daemon-empty orchestration restore the keyboard must be focused on \
-         the START role `{}` (created last), but the probe line reached {received:?}. Pane ids \
+         the START role `{}` (created last), but the focused pane is {received:?}. Pane ids \
          are no longer numeric, so `pane_ids().first()` is arbitrary.\nFinal grid:\n{grid}",
         FOCUS_ROLES[last]
     );

@@ -6414,14 +6414,14 @@ without depending on the config struct API.
 ##### session/restore/025 — A daemon-empty orchestration restore leaves keyboard focus on the START role's pane when the start role is the first-created role (issue #824).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (six role panes each run a stdin-recording shell script that self-posts `SessionStart`; no LLM tokens).
-- **Asserts:** with a six-role orchestration snapshot whose `start_role_index` is 0, after the saved prompt has been replayed to the start role (proving the tab is rebuilt), a probe line typed into the deck reaches the START role's recorder and no other role's — i.e. the restore leaves keyboard focus on the start role, not on whichever pane the pane map yields first.
-- **Does not assert:** the focus border styling; the case where the start role is created last (`session/restore/026`); warm-daemon hydration focus; the issue #949 remembered-pane path (`session/restore/016`/`019`).
+- **Asserts:** with a six-role orchestration snapshot whose `start_role_index` is 0, after the saved prompt has been replayed to the start role (proving the tab is rebuilt), the focused embedded terminal pane (its header `┌<role>─`, distinct from the numbered deck cards) is the START role's, not whichever pane the pane map yields first.
+- **Does not assert:** that typed keystrokes reach the pane (the deck reads "Pane locked" after this restore, which is a separate behaviour); the focus border styling; the case where the start role is created last (`session/restore/026`); warm-daemon hydration focus; the issue #949 remembered-pane path (`session/restore/016`/`019`).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/026 — A daemon-empty orchestration restore leaves keyboard focus on the START role's pane when the start role is the last-created role (issue #824).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (six role panes each run a stdin-recording shell script that self-posts `SessionStart`; no LLM tokens).
-- **Asserts:** same as `session/restore/025` but with `start_role_index` 5 (the last of six roles): the probe line typed after the restore reaches the start role's recorder, so focus follows the start role and is not simply the first-created pane.
+- **Asserts:** same as `session/restore/025` but with `start_role_index` 5 (the last of six roles): the focused terminal pane after the restore is the start role's, so focus follows the start role and is not simply the first-created pane.
 - **Does not assert:** the focus border styling; the start-first case (`session/restore/025`); warm-daemon hydration focus.
 - **Platform coverage:** mac+linux.
 
