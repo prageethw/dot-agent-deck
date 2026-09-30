@@ -7945,6 +7945,17 @@ impl AppState {
     /// CLI and therefore know, at mint time, that the placeholder is awaiting
     /// that agent's first report. Every other caller keeps using the plain
     /// constructor above, which seeds `expects_agent_report = false`.
+    ///
+    /// Issue #806: this is the SPAWN-TIME constructor, so it is also the one
+    /// that can lose a race. The daemon has already started the pane's process
+    /// by the time the deck gets here, and a hook from it (a real agent's boot
+    /// `SessionStart`, or `wrap`'s immediate fork-time one) can be applied
+    /// first. That event creates a session under ITS OWN id, which the
+    /// pane-derived key this constructor computes never collides with — so the
+    /// session already on the pane is adopted as the placeholder rather than
+    /// joined by a second card. See [`Self::adopt_early_pane_session`]. The
+    /// plain constructor deliberately does not do this: the `SessionEnd`
+    /// restore and the hydration seed depend on its always-overwrite behaviour.
     pub fn insert_placeholder_session_awaiting_report(
         &mut self,
         pane_id: String,
@@ -7953,6 +7964,17 @@ impl AppState {
         agent_id: Option<String>,
         expects_agent_report: bool,
     ) -> String {
+        let early = self.early_pane_session(&pane_id, agent_id.as_deref());
+        if let Some(early_id) = early {
+            return self.adopt_early_pane_session(
+                early_id,
+                pane_id,
+                cwd,
+                agent_type,
+                agent_id,
+                expects_agent_report,
+            );
+        }
         self.insert_placeholder_session_inner(
             pane_id,
             cwd,
@@ -7960,6 +7982,131 @@ impl AppState {
             agent_id,
             expects_agent_report,
         )
+    }
+
+    /// Issue #806: the session a hook event created on `pane_id` BEFORE the
+    /// pane's spawn-time placeholder was inserted, if there is exactly one the
+    /// placeholder may stand in for.
+    ///
+    /// The lookup is by PANE, because the two never share a key: the event's
+    /// session lives under the producer's own `session_id`, the placeholder
+    /// under [`session_id_for_pane`].
+    ///
+    /// It answers `Some` only for the shapes in which the OPPOSITE arrival
+    /// order (placeholder first, then the event) would have landed the event on
+    /// the placeholder — that is what makes the pane's card the same whichever
+    /// of the two gets there first:
+    ///
+    /// * the session names the same `agent_id` the placeholder is being minted
+    ///   for — the strict-equality half of [`Self::apply_event`]'s reuse guard;
+    /// * or the session names no `agent_id` at all — that guard's issue #398
+    ///   fallback, under which an untagged event adopts the pane's lone session.
+    ///
+    /// Everything else answers `None` and keeps the historical insert:
+    ///
+    /// * the pane-derived key is already occupied. That is the same-key
+    ///   ordering, which [`Self::insert_placeholder_session_inner`] owns — a
+    ///   resolved entry is left alone (issue #724) and an unresolved one is
+    ///   still armed (`dashboard/placeholder/007`/`008`);
+    /// * more than one session sits on the pane. There is no defensible winner,
+    ///   so nothing is guessed, exactly as the #398 fallback declines to;
+    /// * the session names a DIFFERENT agent (or names one where the
+    ///   placeholder names none). That is another generation, not this spawn's
+    ///   early report; the generation-retire block in `apply_event` is what
+    ///   reconciles those two, on the evidence of the next event.
+    fn early_pane_session(&self, pane_id: &str, agent_id: Option<&str>) -> Option<String> {
+        if self.sessions.contains_key(&session_id_for_pane(pane_id)) {
+            return None;
+        }
+        let mut on_pane = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.pane_id.as_deref() == Some(pane_id));
+        match (on_pane.next(), on_pane.next()) {
+            (Some((id, session)), None)
+                if session.agent_id.is_none() || session.agent_id.as_deref() == agent_id =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Issue #806: turn the session an early hook event created on a pane into
+    /// that pane's placeholder, instead of inserting a placeholder beside it.
+    ///
+    /// The session MOVES to the pane-derived key rather than staying where the
+    /// event put it. That is the key it would be living under had the
+    /// placeholder been inserted first (the reuse guard in
+    /// [`Self::apply_event`] remaps a same-agent event onto the placeholder's
+    /// id), and it is the key that guard will look for on every later event
+    /// from the same agent — so from here on the pane is indistinguishable from
+    /// one whose placeholder won the race.
+    ///
+    /// What the placeholder would have contributed is carried over, and only
+    /// that:
+    ///
+    /// * `expects_agent_report`, unless a real report has already resolved the
+    ///   session (`agent_report_activity_seen`). Arming a resolved session would
+    ///   wedge it at "Starting…" for good — the one `SessionStart` that clears
+    ///   the flag has already been consumed (the issue #724 rule). An
+    ///   unresolved session — all `wrap`'s boot-provenance `SessionStart`
+    ///   leaves behind — IS armed, which is what the placeholder-first order
+    ///   produces for that same event (`dashboard/placeholder/009`);
+    /// * the spawn-time `agent_type` when the caller knows one, which the
+    ///   placeholder-first order never lets an event overwrite;
+    /// * the daemon's `agent_id` and the spawn `cwd`, each only where the event
+    ///   supplied none.
+    ///
+    /// Everything the event recorded — status, journal, prompts, model,
+    /// friendly name, `started_at` — is the agent's and is kept as it is.
+    fn adopt_early_pane_session(
+        &mut self,
+        early_id: String,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        expects_agent_report: bool,
+    ) -> String {
+        let session_id = session_id_for_pane(&pane_id);
+        let Some(mut session) = self.sessions.remove(&early_id) else {
+            return self.insert_placeholder_session_inner(
+                pane_id,
+                cwd,
+                agent_type,
+                agent_id,
+                expects_agent_report,
+            );
+        };
+        session.session_id.clone_from(&session_id);
+        // The journal names the card it belongs to, as it does when the reuse
+        // guard remaps an event onto an existing placeholder before journalling.
+        for event in &mut session.recent_events {
+            event.session_id.clone_from(&session_id);
+        }
+        if let Some(agent_type) = agent_type {
+            session.agent_type = agent_type;
+        }
+        if session.agent_id.is_none() {
+            session.agent_id = agent_id;
+        }
+        if session.cwd.is_none() {
+            session.cwd = cwd;
+        }
+        if !session.agent_report_activity_seen {
+            session.expects_agent_report = expects_agent_report;
+        }
+        // A monitored wait is recorded against the CARD it was declared on and
+        // dies with it (see [`MonitoredWait::session_id`]). The card has not
+        // gone anywhere here, it has only been re-keyed, so the wait follows.
+        if let Some(wait) = self.monitored_waits.get_mut(&pane_id)
+            && wait.session_id == early_id
+        {
+            wait.session_id.clone_from(&session_id);
+        }
+        self.sessions.insert(session_id.clone(), session);
+        session_id
     }
 
     fn insert_placeholder_session_inner(
