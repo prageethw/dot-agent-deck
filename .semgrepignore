@@ -14,3 +14,15 @@ site/node_modules/
 # Go-templated YAML, not valid standalone YAML -- the YAML parser emits
 # non-fatal parse errors on these (log noise, not scan findings).
 site/helm/templates/
+
+# Deliberate bidirectional-control fixtures. These two tests embed U+202E
+# (RIGHT-TO-LEFT OVERRIDE) in a remote deck's host name on purpose, to prove
+# the desktop label rendering strips it. Semgrep's
+# generic.unicode.security.bidi.contains-bidirectional-characters rule cannot
+# tell a fixture from a Trojan-source attack, so it reported 3 blocking
+# findings on every run (issue #808). Ignoring the two files, not the rule,
+# keeps the rule live for the rest of the tree. Both files are upstream's
+# (vfarcic/dot-agent-deck, PR 1035), which runs no Semgrep, so an inline
+# `nosemgrep` marker there would be a sync conflict for nothing.
+desktop/src/components/EndpointsPanel.test.tsx
+desktop/e2e/decks.spec.ts
