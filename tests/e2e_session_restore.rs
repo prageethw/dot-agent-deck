@@ -1481,3 +1481,129 @@ fn restore_024_devbox_wrapped_restore_shows_starting_not_no_agent() {
         deck.snapshot_grid()
     );
 }
+
+/// Roles for the issue #824 focus tests. Six of them so that a restore which
+/// focuses "whichever pane the map yields first" lands on the start role only
+/// about one time in six, not one in two or three.
+const FOCUS_ROLES: [&str; 6] = [
+    "orchestrator",
+    "coder",
+    "reviewer",
+    "tester",
+    "auditor",
+    "scribe",
+];
+
+/// Rebuild a six-role orchestration tab from a daemon-empty snapshot whose start
+/// role is `FOCUS_ROLES[start_idx]`, wait until the restore has replayed the
+/// saved prompt to that start role, then type one probe line and report which
+/// role's recorder received it (the role whose pane holds keyboard focus).
+/// Returns `(role_that_received_probe, final_grid)`.
+fn restore_and_probe_focus(start_idx: usize) -> (Option<&'static str>, String) {
+    let project_dir = common::race_safe_tempdir();
+    let cmds: Vec<String> = FOCUS_ROLES
+        .iter()
+        .map(|r| write_recorder_agent(project_dir.path(), r))
+        .collect();
+    let roles: Vec<(&str, &str)> = FOCUS_ROLES
+        .iter()
+        .zip(cmds.iter())
+        .map(|(r, c)| (*r, c.as_str()))
+        .collect();
+    write_orchestration_config(project_dir.path(), "tdd-cycle", &roles, start_idx);
+
+    let session_dir = common::race_safe_tempdir();
+    let session_file = session_dir.path().join("session.toml");
+    stage_orchestration_snapshot(
+        &session_file,
+        project_dir.path(),
+        FOCUS_ROLES[start_idx],
+        &cmds[start_idx],
+        &FOCUS_ROLES,
+        start_idx,
+        "Build the feature end to end",
+        "tdd-cycle",
+        project_dir.path(),
+        &[start_idx],
+        None,
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("minimal");
+
+    // The prompt reaching the start role proves the tab was rebuilt and that
+    // every role pane exists; only then is a probe keystroke meaningful.
+    let start_record = project_dir
+        .path()
+        .join(format!("record-{}.log", FOCUS_ROLES[start_idx]));
+    assert!(
+        common::wait_for_file_substr_count(
+            &start_record,
+            "Build the feature end to end",
+            1,
+            Duration::from_secs(20),
+        ),
+        "the rebuilt orchestration tab never replayed the saved prompt to the start role \
+         `{}` ({start_record:?}), so focus cannot be probed.\nFinal grid:\n{}",
+        FOCUS_ROLES[start_idx],
+        deck.snapshot_grid()
+    );
+
+    // The restore leaves the deck in pane-input mode, so this line goes to the
+    // focused pane's stdin and that role's recorder logs it.
+    let probe = "focus-probe-824";
+    deck.send_keys(format!("{probe}\r").as_bytes());
+    let received = std::cell::Cell::new(None);
+    common::wait_until(Duration::from_secs(15), || {
+        received.set(FOCUS_ROLES.iter().copied().find(|role| {
+            common::count_file_substr(
+                &project_dir.path().join(format!("record-{role}.log")),
+                probe,
+            ) >= 1
+        }));
+        received.get().is_some()
+    });
+    (received.get(), deck.snapshot_grid())
+}
+
+/// Scenario: Rebuild a six-role orchestration tab from a daemon-empty snapshot
+/// whose start role is the FIRST role, every role running a stdin recorder.
+/// After the restore, a typed probe line must reach the start role's pane: the
+/// restore leaves keyboard focus on the start role, not on whichever pane the
+/// pane map happens to yield first (issue #824).
+#[spec("session/restore/025")]
+#[test]
+fn restore_025_rebuilt_orchestration_focuses_start_role_when_created_first() {
+    let (received, grid) = restore_and_probe_focus(0);
+    assert_eq!(
+        received,
+        Some(FOCUS_ROLES[0]),
+        "issue #824: after a daemon-empty orchestration restore the keyboard must be focused on \
+         the START role `{}` (created first), but the probe line reached {received:?}. Pane \
+         ids are no longer numeric, so `pane_ids().first()` is arbitrary.\nFinal grid:\n{grid}",
+        FOCUS_ROLES[0]
+    );
+}
+
+/// Scenario: Same as the previous scenario, but the start role is the LAST of
+/// the six roles (created last). A typed probe line after the restore must
+/// still reach the start role's pane, proving focus follows the start role and
+/// is not simply the first- or last-created pane (issue #824).
+#[spec("session/restore/026")]
+#[test]
+fn restore_026_rebuilt_orchestration_focuses_start_role_when_created_last() {
+    let last = FOCUS_ROLES.len() - 1;
+    let (received, grid) = restore_and_probe_focus(last);
+    assert_eq!(
+        received,
+        Some(FOCUS_ROLES[last]),
+        "issue #824: after a daemon-empty orchestration restore the keyboard must be focused on \
+         the START role `{}` (created last), but the probe line reached {received:?}. Pane ids \
+         are no longer numeric, so `pane_ids().first()` is arbitrary.\nFinal grid:\n{grid}",
+        FOCUS_ROLES[last]
+    );
+}

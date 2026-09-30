@@ -4896,6 +4896,50 @@ mod tests {
         assert_eq!(size, (21, 38), "usable dims must pass through unchanged");
     }
 
+    /// Scenario: Register twelve panes whose ids have the shape the daemon
+    /// mints (`pane-<16 hex nonce>-<decimal seq>`, one shared nonce, seq rising
+    /// with creation), in creation order. `pane_ids()` must return them in that
+    /// creation order; ids that do not parse as numbers must not turn the order
+    /// into the pane map's arbitrary iteration order (issue #824). Twelve panes
+    /// keep a lucky accidental match negligible, and the seqs cross a digit
+    /// boundary so a plain string sort is also wrong.
+    #[cfg(unix)]
+    #[test]
+    fn pane_ids_returns_daemon_minted_ids_in_creation_order() {
+        let controller = EmbeddedPaneController::for_render_only_tests();
+        let rt = render_only_runtime();
+        let _enter = rt.enter();
+
+        let nonce = 0x9e37_79b9_7f4a_7c15_u64;
+        let created: Vec<String> = (0..12)
+            .map(|seq| format!("pane-{nonce:016x}-{seq}"))
+            .collect();
+        // Held for the duration: dropping one would EOF its reader half.
+        let mut peers = Vec::new();
+        for (i, pane_id) in created.iter().enumerate() {
+            let (conn, peer) = AttachConnection::connected_pair_for_test();
+            peers.push(peer);
+            controller.wire_stream_pane(
+                pane_id.clone(),
+                format!("agent-{i}"),
+                conn,
+                format!("role-{i}"),
+                None,
+                None,
+                24,
+                80,
+            );
+        }
+
+        assert_eq!(
+            controller.pane_ids(),
+            created,
+            "pane_ids() must return panes in creation order. On current code every \
+             daemon-minted id parses to 0 in the sort key, so the order is the pane \
+             HashMap's arbitrary iteration order, different run to run (issue #824)"
+        );
+    }
+
     /// The shared constructor is the whole point of the fix: one definition of
     /// "valid parser geometry", applied in one place. Pin both halves.
     #[test]
