@@ -3363,6 +3363,42 @@ fn release_reserved_silence_watch(
     }
 }
 
+/// Writes `notice` into the orchestrator's pane through the identity-guarded
+/// notice primitive (issue #617): the orchestrator's current agent is resolved
+/// immediately before the call and the post-lock re-validation refuses a pane
+/// that is mid-close or re-homed into a different orchestration. An unresolved
+/// orchestrator is no verified target, so the notice is refused as
+/// `NoLiveTarget` rather than handed on without an identity.
+async fn write_guarded_orchestrator_notice(
+    registry: &Arc<AgentPtyRegistry>,
+    orchestrator_pane_id: &str,
+    orchestration: Option<&OrchestrationIdentity>,
+    notice: &str,
+) -> Result<crate::agent_pty::GuardedSend, crate::agent_pty::AgentPtyError> {
+    let notice_registry = Arc::clone(registry);
+    let notice_pane = orchestrator_pane_id.to_string();
+    let notice_orchestration = orchestration.cloned();
+    let Some(orchestrator_agent_id) = registry.pane_current_agent_id(orchestrator_pane_id) else {
+        return Ok(crate::agent_pty::GuardedSend::NoLiveTarget);
+    };
+    registry
+        .write_notice_guarded(
+            orchestrator_pane_id,
+            notice,
+            &orchestrator_agent_id,
+            || async move {
+                if notice_registry.is_pane_closing(&notice_pane) {
+                    return false;
+                }
+                orchestration_still_matches(
+                    notice_orchestration.as_ref(),
+                    notice_registry.pane_orchestration(&notice_pane).as_ref(),
+                )
+            },
+        )
+        .await
+}
+
 /// The "delegated worker never came up" notice (issue #825: shared by the
 /// injection path's dead-replacement arm and the pi-native dead-on-arrival
 /// exit, so both tell the orchestrator the same thing the same way).
@@ -3384,31 +3420,9 @@ async fn write_dead_replacement_notice(
     orchestration: Option<&OrchestrationIdentity>,
 ) {
     let notice = compose_respawn_no_live_worker_notice(worker_pane_id);
-    let notice_registry = Arc::clone(registry);
-    let notice_pane = orchestrator_pane_id.to_string();
-    let notice_orchestration = orchestration.cloned();
-    let orchestrator_agent_id = registry.pane_current_agent_id(orchestrator_pane_id);
-    let notice_outcome = match orchestrator_agent_id.as_deref() {
-        Some(orchestrator_agent_id) => {
-            registry
-                .write_notice_guarded(
-                    orchestrator_pane_id,
-                    &notice,
-                    orchestrator_agent_id,
-                    || async move {
-                        if notice_registry.is_pane_closing(&notice_pane) {
-                            return false;
-                        }
-                        orchestration_still_matches(
-                            notice_orchestration.as_ref(),
-                            notice_registry.pane_orchestration(&notice_pane).as_ref(),
-                        )
-                    },
-                )
-                .await
-        }
-        None => Ok(crate::agent_pty::GuardedSend::NoLiveTarget),
-    };
+    let notice_outcome =
+        write_guarded_orchestrator_notice(registry, orchestrator_pane_id, orchestration, &notice)
+            .await;
     match notice_outcome {
         Ok(crate::agent_pty::GuardedSend::Applied) => {}
         // Issue #617 (reviewer S1 / auditor finding 2): `Ambiguous` is NOT a
@@ -7013,31 +7027,13 @@ async fn dispatch_one_owned(
                 // re-validation do the real work, so the two sibling arms of the
                 // same `match` no longer disagree about whether a notice into the
                 // orchestrator pane needs an identity.
-                let notice_registry = Arc::clone(&registry);
-                let notice_pane = orchestrator_pane_id.clone();
-                let notice_orchestration = orchestration.clone();
-                let orchestrator_agent_id = registry.pane_current_agent_id(&orchestrator_pane_id);
-                let notice_outcome = match orchestrator_agent_id.as_deref() {
-                    Some(orchestrator_agent_id) => {
-                        registry
-                            .write_notice_guarded(
-                                &orchestrator_pane_id,
-                                &notice,
-                                orchestrator_agent_id,
-                                || async move {
-                                    if notice_registry.is_pane_closing(&notice_pane) {
-                                        return false;
-                                    }
-                                    orchestration_still_matches(
-                                        notice_orchestration.as_ref(),
-                                        notice_registry.pane_orchestration(&notice_pane).as_ref(),
-                                    )
-                                },
-                            )
-                            .await
-                    }
-                    None => Ok(crate::agent_pty::GuardedSend::NoLiveTarget),
-                };
+                let notice_outcome = write_guarded_orchestrator_notice(
+                    &registry,
+                    &orchestrator_pane_id,
+                    orchestration.as_ref(),
+                    &notice,
+                )
+                .await;
                 match notice_outcome {
                     Ok(crate::agent_pty::GuardedSend::Applied) => {}
                     // Issue #617 (reviewer S1 / auditor finding 2): `Ambiguous`
