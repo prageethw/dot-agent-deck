@@ -18959,7 +18959,11 @@ fn stacked_expanded_index(pane_ids: &[String], focused_id: Option<&str>) -> Opti
 /// exactly how `render_terminal_panes` lays panes out for the given
 /// `PaneLayout` and resolved focus. Single source of truth so the layout pass
 /// (which drives PTY resize) and the renderer can't disagree on a pane's rect.
-/// `Tiled`: equal vertical division. `Stacked` (PRD #311): the expanded slot
+/// `Tiled`: integer division of the column height `H` across `n` panes —
+/// heights sum to `H`, differ by at most one row, and the leftover `H % n` rows
+/// go to the FIRST panes (`h[i] = H / n + (i < H % n)`); the cassowary `Ratio`
+/// solver instead rounded cumulative boundaries, scattering the extra rows into
+/// the middle (issue #829). `Stacked` (PRD #311): the expanded slot
 /// fills the whole area and every other pane reserves zero rows (`Length(0)`) —
 /// it is not drawn at all, rather than collapsing to a 1-row title bar.
 fn pane_stack_rects(
@@ -18972,10 +18976,20 @@ fn pane_stack_rects(
         return Vec::new();
     }
     let constraints: Vec<Constraint> = match layout {
-        PaneLayout::Tiled => pane_ids
-            .iter()
-            .map(|_| Constraint::Ratio(1, pane_ids.len() as u32))
-            .collect(),
+        PaneLayout::Tiled => {
+            let n = pane_ids.len() as u16;
+            let base = area.height / n;
+            let extra = area.height % n;
+            let mut y = area.y;
+            return (0..n)
+                .map(|i| {
+                    let h = base + u16::from(i < extra);
+                    let r = Rect::new(area.x, y, area.width, h);
+                    y += h;
+                    r
+                })
+                .collect();
+        }
         PaneLayout::Stacked => {
             // PRD #311: the focused pane gets the ENTIRE area; non-focused
             // panes are not drawn at all, so they reserve zero rows rather
@@ -28356,6 +28370,183 @@ mod tests {
             0,
             "zoomed, a non-focused Dashboard pane must reserve zero rows \
              (PRD #311 M2's convention) rather than take a tiled slice"
+        );
+    }
+
+    /// `None` when `rects` tile `column` exactly top to bottom (first at the
+    /// column's top, each `y` equal to the previous bottom, last ending at the
+    /// column's bottom, every x/width equal to the column's).
+    fn tiling_problem(rects: &[Rect], column: Rect) -> Option<String> {
+        let mut y = column.y;
+        for (i, r) in rects.iter().enumerate() {
+            if r.y != y || r.x != column.x || r.width != column.width {
+                return Some(format!(
+                    "pane {i} rect {r:?} does not continue the tiling of column {column:?} (expected y={y})"
+                ));
+            }
+            y += r.height;
+        }
+        (y != column.y + column.height).then(|| {
+            format!(
+                "panes end at y={y}, column {column:?} ends at {}",
+                column.y + column.height
+            )
+        })
+    }
+
+    /// Scenario: issue 829 — `pane_stack_rects` under `Tiled` must tile any
+    /// column exactly, even in the awkward cases: fewer rows than panes (the
+    /// first panes get one row each, the rest none), a single pane, a zero-height
+    /// column, no panes at all, and a column that does not start at the origin.
+    #[spec("orchestration/layout/014")]
+    #[test]
+    fn orchestration_layout_014_tiled_pane_stack_edge_cases() {
+        let ids = |n: usize| -> Vec<String> { (0..n).map(|i| format!("p{i}")).collect() };
+        let heights = |rects: &[Rect]| rects.iter().map(|r| r.height).collect::<Vec<_>>();
+
+        // Offset area so an accumulation bug cannot hide at the origin.
+        let area = Rect::new(7, 5, 40, 3);
+        let rects = pane_stack_rects(area, &ids(5), PaneLayout::Tiled, None);
+        assert_eq!(
+            heights(&rects),
+            vec![1, 1, 1, 0, 0],
+            "3 rows across 5 panes"
+        );
+        assert_eq!(tiling_problem(&rects, area), None);
+
+        let area = Rect::new(3, 9, 30, 17);
+        let rects = pane_stack_rects(area, &ids(1), PaneLayout::Tiled, None);
+        assert_eq!(rects, vec![area], "one pane takes the whole column");
+
+        let area = Rect::new(3, 9, 30, 0);
+        let rects = pane_stack_rects(area, &ids(4), PaneLayout::Tiled, None);
+        assert_eq!(heights(&rects), vec![0, 0, 0, 0], "zero-height column");
+        assert_eq!(tiling_problem(&rects, area), None);
+
+        let rects = pane_stack_rects(Rect::new(1, 2, 30, 10), &[], PaneLayout::Tiled, None);
+        assert!(rects.is_empty(), "no panes => no rects");
+
+        // Offset column with an uneven split.
+        let area = Rect::new(11, 4, 25, 23);
+        let rects = pane_stack_rects(area, &ids(4), PaneLayout::Tiled, None);
+        assert_eq!(heights(&rects), vec![6, 6, 6, 5], "23 rows across 4 panes");
+        assert_eq!(tiling_problem(&rects, area), None);
+    }
+
+    /// Scenario: issue 829 — with the Tiled layout, the role panes of an
+    /// orchestration tab (and the side panes of a mode tab) must be sized as
+    /// equally as whole rows allow: heights differ by at most one row, the extra
+    /// rows go to the FIRST panes, and the panes exactly fill the column. Drives
+    /// `compute_frame_layout` for pane counts 2 to 7 over several frame heights,
+    /// most of them not divisible by the pane count.
+    #[spec("orchestration/layout/013")]
+    #[test]
+    fn orchestration_layout_013_tiled_panes_are_equal_with_extra_rows_first() {
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Orch".into()],
+            active_index: 0,
+            tab_statuses: vec![],
+            is_orchestration: vec![true],
+        };
+        // Frame height minus tab bar (1) and hints bar (1) is the column height.
+        let mut uneven_cases = 0;
+        let mut failures: Vec<String> = Vec::new();
+        for n in 2usize..=7 {
+            for frame_h in [22u16, 27, 30, 33, 41, 50] {
+                let column_h = usize::from(frame_h - 2);
+                if !column_h.is_multiple_of(n) {
+                    uneven_cases += 1;
+                }
+                let ids: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+                let frame_area = Rect::new(0, 0, 100, frame_h);
+                let expected: Vec<usize> = (0..n)
+                    .map(|i| column_h / n + usize::from(i < column_h % n))
+                    .collect();
+
+                let orch = compute_frame_layout(
+                    frame_area,
+                    &ActiveTabView::Orchestration {
+                        role_pane_ids: ids.clone(),
+                        zoomed: false,
+                    },
+                    &tab_bar,
+                    &ids,
+                    PaneLayout::Tiled,
+                    Some("p0"),
+                    1,
+                );
+                let FrameContent::Cards {
+                    pane_rects,
+                    panes_area,
+                    ..
+                } = orch.content
+                else {
+                    panic!("orchestration tab must produce FrameContent::Cards");
+                };
+                let rects: Vec<Rect> = pane_rects.iter().map(|(_, r)| *r).collect();
+                if let Some(problem) =
+                    tiling_problem(&rects, panes_area.expect("panes => a right column"))
+                {
+                    failures.push(format!(
+                        "orchestration: {n} panes in a {column_h}-row column: {problem}"
+                    ));
+                }
+                let got: Vec<usize> = pane_rects.iter().map(|(_, r)| r.height as usize).collect();
+                if got != expected {
+                    failures.push(format!(
+                        "orchestration: {n} panes in a {column_h}-row column: got heights {got:?}, expected {expected:?}"
+                    ));
+                }
+
+                let mode = compute_frame_layout(
+                    frame_area,
+                    &ActiveTabView::Mode {
+                        mode_name: "m".into(),
+                        agent_pane_id: "agent".into(),
+                        side_pane_ids: ids.clone(),
+                        focused_pane_id: None,
+                    },
+                    &tab_bar,
+                    &ids,
+                    PaneLayout::Tiled,
+                    None,
+                    1,
+                );
+                let FrameContent::Mode {
+                    side_pane_rects,
+                    side_area,
+                    ..
+                } = mode.content
+                else {
+                    panic!("mode tab must produce FrameContent::Mode");
+                };
+                let rects: Vec<Rect> = side_pane_rects.iter().map(|(_, r)| *r).collect();
+                if let Some(problem) = tiling_problem(&rects, side_area) {
+                    failures.push(format!(
+                        "mode side panes: {n} panes in a {column_h}-row column: {problem}"
+                    ));
+                }
+                let got: Vec<usize> = side_pane_rects
+                    .iter()
+                    .map(|(_, r)| r.height as usize)
+                    .collect();
+                if got != expected {
+                    failures.push(format!(
+                        "mode side panes: {n} panes in a {column_h}-row column: got heights {got:?}, expected {expected:?}"
+                    ));
+                }
+            }
+        }
+        // Setup guard: the sweep really exercises non-divisible heights.
+        assert!(
+            uneven_cases >= 20,
+            "setup: sweep must cover many non-divisible heights, got {uneven_cases}"
+        );
+        assert!(
+            failures.is_empty(),
+            "Tiled panes must differ by at most one row with extra rows on the first panes:\n{}",
+            failures.join("\n")
         );
     }
 
