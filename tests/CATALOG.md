@@ -5506,10 +5506,10 @@ without depending on the config struct API.
 - **Does not assert:** the key that produces the toggle or its scoping (`orchestration/layout/007`, which covers both card-shaped tab kinds through the `tab_has_card_sidebar` predicate); that the Dashboard's zoom flag is independent of an orchestration tab's (they are separate fields on separate `Tab` variants, so no shared value exists to diverge); the `[Z]` marker on a zoomed Dashboard pane (`render/layout/006` pins the marker on the orchestration path, and the indicator is resolved once in `render_frame` for both); Mode tabs, which are deliberately excluded — two pane regions rather than sidebar-plus-panes, so "hide the sidebar" has no meaning there.
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/layout/013 — Tiled role panes (and mode side panes) are sized equally to within one row, with the extra rows on the first panes (issue 829).
-- **Layer:** L1 (`compute_frame_layout` over an `ActiveTabView::Orchestration` and an `ActiveTabView::Mode`; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout` and `FrameContent` are module-private.
+##### orchestration/layout/013 — Tiled orchestration panes: every worker is exactly equal and the orchestrator takes the leftover rows; other Tiled stacks give the leftover to the first panes (issue 829).
+- **Layer:** L1 (`compute_frame_layout` over an `ActiveTabView::Orchestration`, an `ActiveTabView::Mode` and an `ActiveTabView::Dashboard`; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout` and `FrameContent` are module-private.
 - **Agent:** none (synthetic pane ids; the layout pass is a pure function of its inputs).
-- **Asserts:** for pane counts 2 to 7 across several frame heights, most not divisible by the pane count, the per-pane heights equal `column / n` plus one extra row for each of the first `column % n` panes, so they sum to the column and never differ by more than one row, in both the orchestration pane column and the mode tab's side column. The rects must also tile the column exactly (first at the top, each starting where the previous ends, last reaching the bottom, same x and width). Contract in force: integer division with the leftover rows given one each to the first panes (for example 4, 3, 3), rather than rounding each cumulative boundary, which had placed the extra row in the middle (3, 4, 3).
+- **Asserts:** for pane counts 2 to 7 across several frame heights, most not divisible by the pane count, an orchestration tab in `Tiled` gives every worker pane exactly `column / n` rows and the orchestrator pane (the start role's pane) `column / n + column % n`, with the orchestrator last (creation order), first and in the middle of the stack, so the workers are identical and the orchestrator is the same size or bigger. The mode tab's side column and the dashboard's pane column have no orchestrator and keep the earlier rule: `column / n` plus one extra row for each of the first `column % n` panes. Every stack must tile its column exactly (first at the top, each starting where the previous ends, last reaching the bottom, same x and width). Setup guards require at least 20 non-divisible cases and at least 20 cases each with the orchestrator first and not first, so the test cannot pass by a leftover-to-first accident.
 - **Does not assert:** `Stacked` (deliberately unequal, one expanded pane), widths, or the PTY dims derived from these rects.
 - **Platform coverage:** mac+linux+windows.
 
@@ -5518,6 +5518,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** 3 rows across 5 panes gives 1, 1, 1, 0, 0; one pane gets the whole column; a zero-height column gives all-zero heights; no panes gives an empty list; 23 rows across 4 panes at a non-zero x/y offset gives 6, 6, 6, 5. Each non-empty result tiles its area contiguously.
 - **Does not assert:** `Stacked`, or the frame-level layout (`orchestration/layout/013`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/015 — The orchestrator-takes-the-leftover rule in its awkward cases: one worker, fewer rows than panes, twelve panes at several heights, and an orchestrator that is absent or out of range (issue 829).
+- **Layer:** L1 (`compute_frame_layout` over an `ActiveTabView::Orchestration`; no PTY, no render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because the function is module-private.
+- **Agent:** none.
+- **Asserts:** an orchestrator plus one worker over 17 rows gives 8 and 9 (orchestrator last or first); 3 rows across 5 panes gives 0, 0, 0, 0 and 3 for the orchestrator; twelve panes with the orchestrator last at column heights 28, 38, 48, 53, 58 and 68 give every worker `height / 12` rows and the orchestrator `height / 12 + height % 12` (at 53 rows: 4 each and 9); when the orchestrator pane is not among the live panes, or the start index is beyond the role list, there is no orchestrator and 23 rows across 4 panes give 6, 6, 6, 5; a lone orchestrator takes all 23 rows. Every result tiles its column exactly.
+- **Does not assert:** `Stacked`, or the sweep over pane counts (`orchestration/layout/013`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/dispatch

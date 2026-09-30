@@ -28433,15 +28433,70 @@ mod tests {
         assert_eq!(tiling_problem(&rects, area), None);
     }
 
-    /// Scenario: issue 829 — with the Tiled layout, the role panes of an
-    /// orchestration tab (and the side panes of a mode tab) must be sized as
-    /// equally as whole rows allow: heights differ by at most one row, the extra
-    /// rows go to the FIRST panes, and the panes exactly fill the column. Drives
-    /// `compute_frame_layout` for pane counts 2 to 7 over several frame heights,
-    /// most of them not divisible by the pane count.
+    /// Build the `ActiveTabView` for an orchestration tab whose orchestrator is
+    /// `role_pane_ids[start_role_index]` (the start role's pane). Single seam
+    /// the issue-829 tests build the view through: the orchestrator's identity
+    /// must reach `compute_frame_layout` here, in whatever form the layout pass
+    /// takes it.
+    fn orch_tab_view(role_pane_ids: &[String], start_role_index: usize) -> ActiveTabView {
+        // The layout pass currently receives only the ids; the fix adds the
+        // orchestrator to the view and this is the one place to pass it.
+        let _ = start_role_index;
+        ActiveTabView::Orchestration {
+            role_pane_ids: role_pane_ids.to_vec(),
+            zoomed: false,
+        }
+    }
+
+    /// Resolve an unzoomed, Tiled orchestration tab with `frame_h` rows (column
+    /// height `frame_h - 2`), returning the pane column and each live pane's
+    /// rect. `live_ids` are the panes that actually exist (a role pane missing
+    /// from it is not drawn).
+    fn tiled_orch_rects(
+        frame_h: u16,
+        role_pane_ids: &[String],
+        live_ids: &[String],
+        start_role_index: usize,
+    ) -> (Rect, Vec<(String, Rect)>) {
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Orch".into()],
+            active_index: 0,
+            tab_statuses: vec![],
+            is_orchestration: vec![true],
+        };
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
+        let layout = compute_frame_layout(
+            Rect::new(0, 0, 100, frame_h),
+            &orch_tab_view(role_pane_ids, start_role_index),
+            &tab_bar,
+            live_ids,
+            PaneLayout::Tiled,
+            Some(role_pane_ids[0].as_str()),
+            1,
+        );
+        let FrameContent::Cards {
+            pane_rects,
+            panes_area,
+            ..
+        } = layout.content
+        else {
+            panic!("orchestration tab must produce FrameContent::Cards");
+        };
+        (panes_area.expect("panes => a right column"), pane_rects)
+    }
+
+    /// Scenario: issue 829 — with the Tiled layout, an orchestration tab's panes
+    /// must be sized so every worker is exactly `column / n` rows and the
+    /// orchestrator (the start role's pane) takes the leftover, `column / n +
+    /// column % n`, wherever it sits in the stack; a mode tab's side panes and
+    /// the dashboard's panes have no orchestrator and give the leftover rows one
+    /// each to the first panes. Every stack must tile its column exactly. Sweeps
+    /// pane counts 2 to 7 over several frame heights, most not divisible by the
+    /// pane count, with the orchestrator last, first and in the middle.
     #[spec("orchestration/layout/013")]
     #[test]
-    fn orchestration_layout_013_tiled_panes_are_equal_with_extra_rows_first() {
+    fn orchestration_layout_013_tiled_orchestrator_takes_leftover_rows_rest_equal() {
         let tab_bar = TabBarInfo {
             show: true,
             labels: vec!["Orch".into()],
@@ -28451,6 +28506,8 @@ mod tests {
         };
         // Frame height minus tab bar (1) and hints bar (1) is the column height.
         let mut uneven_cases = 0;
+        let mut orch_not_first = 0;
+        let mut orch_first = 0;
         let mut failures: Vec<String> = Vec::new();
         for n in 2usize..=7 {
             for frame_h in [22u16, 27, 30, 33, 41, 50] {
@@ -28459,46 +28516,46 @@ mod tests {
                     uneven_cases += 1;
                 }
                 let ids: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
-                let frame_area = Rect::new(0, 0, 100, frame_h);
-                let expected: Vec<usize> = (0..n)
+                // PR 832 rule (no orchestrator): leftover rows to the first panes.
+                let first_expected: Vec<usize> = (0..n)
                     .map(|i| column_h / n + usize::from(i < column_h % n))
                     .collect();
 
-                let orch = compute_frame_layout(
-                    frame_area,
-                    &ActiveTabView::Orchestration {
-                        role_pane_ids: ids.clone(),
-                        zoomed: false,
-                    },
-                    &tab_bar,
-                    &ids,
-                    PaneLayout::Tiled,
-                    Some("p0"),
-                    1,
-                );
-                let FrameContent::Cards {
-                    pane_rects,
-                    panes_area,
-                    ..
-                } = orch.content
-                else {
-                    panic!("orchestration tab must produce FrameContent::Cards");
-                };
-                let rects: Vec<Rect> = pane_rects.iter().map(|(_, r)| *r).collect();
-                if let Some(problem) =
-                    tiling_problem(&rects, panes_area.expect("panes => a right column"))
-                {
-                    failures.push(format!(
-                        "orchestration: {n} panes in a {column_h}-row column: {problem}"
-                    ));
-                }
-                let got: Vec<usize> = pane_rects.iter().map(|(_, r)| r.height as usize).collect();
-                if got != expected {
-                    failures.push(format!(
-                        "orchestration: {n} panes in a {column_h}-row column: got heights {got:?}, expected {expected:?}"
-                    ));
+                // Orchestration tab: the orchestrator last (creation order),
+                // first, and in the middle.
+                for start in [n - 1, 0, n / 2] {
+                    if start == 0 {
+                        orch_first += 1;
+                    } else {
+                        orch_not_first += 1;
+                    }
+                    let (column, pane_rects) = tiled_orch_rects(frame_h, &ids, &ids, start);
+                    let rects: Vec<Rect> = pane_rects.iter().map(|(_, r)| *r).collect();
+                    if let Some(problem) = tiling_problem(&rects, column) {
+                        failures.push(format!(
+                            "orchestration: {n} panes, orchestrator at {start}, {column_h}-row column: {problem}"
+                        ));
+                    }
+                    let orchestrator_id = format!("p{start}");
+                    assert!(
+                        pane_rects.iter().any(|(id, _)| *id == orchestrator_id),
+                        "setup: the orchestrator pane {orchestrator_id} must be in the stack"
+                    );
+                    let expected: Vec<usize> = (0..n)
+                        .map(|i| column_h / n + if i == start { column_h % n } else { 0 })
+                        .collect();
+                    let got: Vec<usize> =
+                        pane_rects.iter().map(|(_, r)| r.height as usize).collect();
+                    if got != expected {
+                        failures.push(format!(
+                            "orchestration: {n} panes, orchestrator {orchestrator_id} at stack index {start}, {column_h}-row column: got heights {got:?}, expected {expected:?} (workers {}, orchestrator {})",
+                            column_h / n,
+                            column_h / n + column_h % n
+                        ));
+                    }
                 }
 
+                let frame_area = Rect::new(0, 0, 100, frame_h);
                 let mode = compute_frame_layout(
                     frame_area,
                     &ActiveTabView::Mode {
@@ -28531,21 +28588,161 @@ mod tests {
                     .iter()
                     .map(|(_, r)| r.height as usize)
                     .collect();
-                if got != expected {
+                if got != first_expected {
                     failures.push(format!(
-                        "mode side panes: {n} panes in a {column_h}-row column: got heights {got:?}, expected {expected:?}"
+                        "mode side panes: {n} panes in a {column_h}-row column: got heights {got:?}, expected {first_expected:?}"
+                    ));
+                }
+
+                let dash = compute_frame_layout(
+                    frame_area,
+                    &ActiveTabView::Dashboard {
+                        exclude_pane_ids: vec![],
+                        zoomed: false,
+                    },
+                    &tab_bar,
+                    &ids,
+                    PaneLayout::Tiled,
+                    Some("p0"),
+                    1,
+                );
+                let FrameContent::Cards {
+                    pane_rects,
+                    panes_area,
+                    ..
+                } = dash.content
+                else {
+                    panic!("dashboard tab must produce FrameContent::Cards");
+                };
+                let rects: Vec<Rect> = pane_rects.iter().map(|(_, r)| *r).collect();
+                if let Some(problem) =
+                    tiling_problem(&rects, panes_area.expect("panes => a right column"))
+                {
+                    failures.push(format!(
+                        "dashboard: {n} panes in a {column_h}-row column: {problem}"
+                    ));
+                }
+                let got: Vec<usize> = pane_rects.iter().map(|(_, r)| r.height as usize).collect();
+                if got != first_expected {
+                    failures.push(format!(
+                        "dashboard: {n} panes in a {column_h}-row column: got heights {got:?}, expected {first_expected:?}"
                     ));
                 }
             }
         }
-        // Setup guard: the sweep really exercises non-divisible heights.
+        // Setup guards: the sweep really exercises non-divisible heights, an
+        // orchestrator that is not the first pane, and one that is (so the test
+        // cannot pass by a "leftover to the first pane" accident).
         assert!(
             uneven_cases >= 20,
             "setup: sweep must cover many non-divisible heights, got {uneven_cases}"
         );
         assert!(
+            orch_not_first >= 20 && orch_first >= 20,
+            "setup: sweep must cover the orchestrator both first ({orch_first}) and not first ({orch_not_first})"
+        );
+        assert!(
             failures.is_empty(),
-            "Tiled panes must differ by at most one row with extra rows on the first panes:\n{}",
+            "Tiled orchestration: workers equal, orchestrator = base + leftover; other Tiled stacks: leftover to first panes:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Scenario: issue 829 — the orchestrator-takes-the-leftover rule in its
+    /// awkward cases, through `compute_frame_layout`: an orchestrator with one
+    /// worker, a column shorter than the pane count (workers get zero rows, the
+    /// orchestrator gets the whole column), the twelve-pane case at several
+    /// heights (28, 38, 48, 53, 58, 68 rows), and stacks where the orchestrator
+    /// pane is not alive or the start index is out of range, which fall back to
+    /// leftover rows on the first panes.
+    #[spec("orchestration/layout/015")]
+    #[test]
+    fn orchestration_layout_015_tiled_orchestrator_leftover_edge_cases() {
+        let ids = |n: usize| -> Vec<String> { (0..n).map(|i| format!("p{i}")).collect() };
+        let heights = |rects: &[(String, Rect)]| -> Vec<u16> {
+            rects.iter().map(|(_, r)| r.height).collect()
+        };
+        let mut failures: Vec<String> = Vec::new();
+        let mut check = |label: &str,
+                         frame_h: u16,
+                         role_ids: &[String],
+                         live: &[String],
+                         start: usize,
+                         expected: Vec<u16>| {
+            let (column, rects) = tiled_orch_rects(frame_h, role_ids, live, start);
+            let rs: Vec<Rect> = rects.iter().map(|(_, r)| *r).collect();
+            if let Some(problem) = tiling_problem(&rs, column) {
+                failures.push(format!("{label}: {problem}"));
+            }
+            let got = heights(&rects);
+            if got != expected {
+                failures.push(format!(
+                    "{label} ({}-row column): got heights {got:?}, expected {expected:?}",
+                    column.height
+                ));
+            }
+        };
+
+        // Orchestrator + one worker: 17 rows -> worker 8, orchestrator 9.
+        let two = ids(2);
+        check("n=2, orchestrator last", 19, &two, &two, 1, vec![8, 9]);
+        check("n=2, orchestrator first", 19, &two, &two, 0, vec![9, 8]);
+
+        // Fewer rows than panes: base 0, the orchestrator gets everything.
+        let five = ids(5);
+        check("n=5, 3 rows", 5, &five, &five, 4, vec![0, 0, 0, 0, 3]);
+
+        // The maintainer's case: 12 panes in one column, orchestrator last.
+        let twelve = ids(12);
+        for (h, base, extra) in [
+            (28u16, 2u16, 4u16),
+            (38, 3, 2),
+            (48, 4, 0),
+            (53, 4, 5),
+            (58, 4, 10),
+            (68, 5, 8),
+        ] {
+            let mut expected = vec![base; 12];
+            expected[11] = base + extra;
+            check(
+                &format!("n=12, {h}-row column"),
+                h + 2,
+                &twelve,
+                &twelve,
+                11,
+                expected,
+            );
+        }
+
+        // The orchestrator pane is not alive: no orchestrator in the stack, so
+        // the leftover rows go to the first panes (23 rows over 4 panes).
+        let five = ids(5);
+        let four_live = ids(4);
+        check(
+            "orchestrator pane absent",
+            25,
+            &five,
+            &four_live,
+            4,
+            vec![6, 6, 6, 5],
+        );
+        // Start index beyond the role list: same fallback.
+        let four = ids(4);
+        check(
+            "start index out of range",
+            25,
+            &four,
+            &four,
+            9,
+            vec![6, 6, 6, 5],
+        );
+        // A lone orchestrator takes the whole column.
+        let one = ids(1);
+        check("n=1", 25, &one, &one, 0, vec![23]);
+
+        assert!(
+            failures.is_empty(),
+            "orchestrator-takes-leftover edge cases:\n{}",
             failures.join("\n")
         );
     }
