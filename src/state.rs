@@ -7988,6 +7988,23 @@ impl AppState {
     /// pane first ([`Self::remove_sessions_for_pane`]) or use the plain
     /// constructor.
     ///
+    /// **Second precondition: the pane is REGISTERED in the same critical
+    /// section as this call, not earlier.** Every production caller does
+    /// `register_pane` and then this insert under one write lock, so any event
+    /// applied before the insert found the pane unregistered — and
+    /// [`Self::apply_event`] admits an event for an unregistered pane only if
+    /// it is a `SessionStart`. That is what the different-agent outcome rests
+    /// on: leaving the pane to the early session is the placeholder-first end
+    /// state BECAUSE the frame that created that session was a `SessionStart`,
+    /// which retires a placeholder unconditionally. A caller that registered
+    /// the pane earlier would let an ordinary frame (`Thinking`, `Idle`, tool
+    /// traffic) create the early session instead, and such a frame retires a
+    /// placeholder only when its producer timestamp is not older than the
+    /// placeholder's `last_activity` — so the placeholder-first order could
+    /// keep BOTH cards where this constructor would still insert none, and the
+    /// two orders would no longer converge. Register and insert together, or do
+    /// not rely on the convergence.
+    ///
     /// Returns the id of the session that now stands for the pane: the
     /// pane-derived key in every case but one — when the pane is left to an
     /// early session naming a different agent, it is that session's own id.
@@ -8054,15 +8071,20 @@ impl AppState {
     ///   insert time, and an agent that boots and then waits sends no such
     ///   frame at all.
     ///
-    /// Two shapes answer `None` and keep the historical insert:
+    /// Two shapes answer `None` and keep the historical insert. Neither is
+    /// made order-independent here: in both, what the pane ends up holding can
+    /// still depend on which input arrived first.
     ///
     /// * the pane-derived key is already occupied. That is the same-key
     ///   ordering, which [`Self::insert_placeholder_session_inner`] owns — a
     ///   resolved entry is left alone (issue #724) and an unresolved one is
-    ///   still armed (`dashboard/placeholder/007`/`008`);
+    ///   still armed (`dashboard/placeholder/007`/`008`). Those rules predate
+    ///   this lookup and are unchanged by it, the order-dependence included: a
+    ///   resolved entry that is left alone keeps whatever `agent_id` its own
+    ///   event carried (none, for an untagged one), where the placeholder-first
+    ///   order would have kept the placeholder's;
     /// * more than one session sits on the pane. There is no defensible winner,
-    ///   so nothing is guessed, exactly as the #398 fallback declines to. This
-    ///   is the one shape in which the two arrival orders can still differ.
+    ///   so nothing is guessed, exactly as the #398 fallback declines to.
     fn early_pane_session(
         &self,
         pane_id: &str,
