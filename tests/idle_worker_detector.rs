@@ -2483,11 +2483,67 @@ async fn wait_for_outstanding_commissions(
 /// seed delivery. A declared Pi launches its command bare (no wrapper, nothing
 /// materialized at spawn), so the replacement is an ordinary `cat`.
 fn config_with_pi_native_role(role: &str) -> String {
+    config_with_pi_native_role_running(role, "cat")
+}
+
+/// [`config_with_pi_native_role`] with the replacement's command chosen by the
+/// caller. `command` lands inside a TOML basic string, so it must hold neither
+/// a double quote nor a backslash; one containing whitespace is launched
+/// through `$SHELL -c`, still with no wrapper around it.
+fn config_with_pi_native_role_running(role: &str, command: &str) -> String {
     format!(
         "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
          [[orchestrations.roles]]\nname = \"{role}\"\n\
-         command = \"cat\"\nagent = \"pi\"\nclear = true\n"
+         command = \"{command}\"\nagent = \"pi\"\nclear = true\n"
     )
+}
+
+/// File [`exits_on_flag_role_command`]'s stub polls for, relative to the
+/// worker's cwd. Its appearance is the test's remote control for a NATURAL exit
+/// of a respawned worker.
+const REPLACEMENT_EXIT_FLAG: &str = "replacement-worker-exit.flag";
+
+/// A role command whose own shell owns the pane and leaves as soon as
+/// [`REPLACEMENT_EXIT_FLAG`] appears in its cwd, the worker-side counterpart of
+/// [`spawn_exit_on_flag_observer`]. Nothing is `exec`d and nothing is
+/// backgrounded, so when the shell leaves the PTY reaches EOF with the agent's
+/// registry entry still in place: the natural exit, which no close or respawn
+/// stands in for, because both remove the entry before they kill the child.
+fn exits_on_flag_role_command() -> String {
+    format!("while [ ! -f {REPLACEMENT_EXIT_FLAG} ]; do sleep 0.05; done")
+}
+
+/// Make the native pull for `worker_pane_id` as the Pi extension does on
+/// `session_start`, once an agent other than `original_agent_id` holds the
+/// pane. Returns that replacement's agent id and the seed it pulled, or `None`
+/// when no replacement with a seed to pull appeared within the budget.
+///
+/// A seed to pull is what tells the native seed delivery apart from every other
+/// exit of the dispatch: no other path stashes the pointer instead of writing
+/// it.
+async fn pull_native_seed(
+    harness: &IdleHarness,
+    worker_pane_id: &str,
+    original_agent_id: &str,
+) -> Option<(String, String)> {
+    let deadline = tokio::time::Instant::now() + common::load_scaled(Duration::from_secs(10));
+    loop {
+        let replacement = harness
+            .registry
+            .pane_current_agent_id(worker_pane_id)
+            .filter(|agent_id| agent_id != original_agent_id);
+        if let Some(replacement) = replacement
+            && let Some(seed) = harness
+                .registry
+                .take_pending_seed_native_for(worker_pane_id, Some(&replacement))
+        {
+            return Some((replacement, seed));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Scenario: Delegate to a live worker and wait for the task pointer to land, then delegate to the same worker again while its input box holds unsent pointer bytes the user has typed after, so the second pointer is refused and nothing is written. The first delegation is still owed: the record must stay armed with no retirement broadcast, and the worker's later `work-done` must retire it, broadcast that, and reach the orchestrator.
@@ -2791,26 +2847,9 @@ fn idle_worker_032_native_seed_delivery_keeps_the_delegation_armed() {
         // seed to pull is what tells this exit apart from every other one: no
         // other path through the dispatch stashes the pointer instead of
         // writing it.
-        let deadline = tokio::time::Instant::now() + common::load_scaled(Duration::from_secs(10));
-        let pulled = loop {
-            let replacement = harness
-                .registry
-                .pane_current_agent_id(&worker_pane_id)
-                .filter(|agent_id| *agent_id != original_agent_id);
-            if let Some(replacement) = replacement
-                && let Some(seed) = harness
-                    .registry
-                    .take_pending_seed_native_for(&worker_pane_id, Some(&replacement))
-            {
-                break Some(seed);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break None;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        let pulled = pull_native_seed(&harness, &worker_pane_id, &original_agent_id).await;
         assert_eq!(
-            pulled.as_deref(),
+            pulled.as_ref().map(|(_, seed)| seed.as_str()),
             Some(pointer.as_str()),
             "precondition: the delegate must respawn the worker and stash the task pointer as \
              the replacement's seed, or this test is not on the native seed delivery exit"
@@ -2852,6 +2891,163 @@ fn idle_worker_032_native_seed_delivery_keeps_the_delegation_armed() {
             Some(1),
             "a delegation delivered as a native seed is still owed a completion; watches = \
              {watches:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to a `clear = true` role declared as a Pi agent, let the replacement worker pull its seed so the task counts as delivered, then have that replacement end its own process without ever reporting `work-done`. The delegation must be retired and that retirement broadcast, and the orchestrator's pane must show the daemon's "exited without work-done" notice and no idle-worker prompt.
+#[spec("scheduler/idle-worker/033")]
+#[test]
+fn idle_worker_033_native_seed_replacement_exit_retires_the_delegation() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Far longer than this test runs. The idle watch's own timeout ALSO removes
+    // the record and announces a retirement, so with a window this long a
+    // retirement seen below can only be the agent-exit sweep's.
+    let _env = EnvGuard::set(Some("60000"));
+    const WORKER_ROLE: &str = "pi-worker";
+    runtime().block_on(async {
+        let harness = IdleHarness::new(
+            &[WORKER_ROLE],
+            Some(&config_with_pi_native_role_running(
+                WORKER_ROLE,
+                &exits_on_flag_role_command(),
+            )),
+        )
+        .await;
+        forward_delegation_retirements(&harness);
+        let worker_pane_id = worker_pane(WORKER_ROLE);
+        let original_agent_id = harness.worker_agent_ids[WORKER_ROLE].clone();
+        let pointer = delegate_pointer(&harness, WORKER_ROLE);
+        let mut broadcasts = harness.event_tx.subscribe();
+
+        harness.delegate(&[WORKER_ROLE]).await;
+
+        let pulled = pull_native_seed(&harness, &worker_pane_id, &original_agent_id).await;
+        assert_eq!(
+            pulled.as_ref().map(|(_, seed)| seed.as_str()),
+            Some(pointer.as_str()),
+            "precondition: the delegate must respawn the worker and stash the task pointer as \
+             the replacement's seed, or this test is not on the native seed delivery exit"
+        );
+        let (replacement_agent_id, _) = pulled.expect("asserted `Some` just above");
+
+        // The dispatch holds this pane's dispatch lock from its first statement
+        // to its return, and the stash just observed happens inside that hold.
+        // Taking the lock is therefore the edge "the dispatch has returned":
+        // whatever it was ever going to record about this delegation's worker,
+        // it has recorded by now, so the exit below cannot outrun it.
+        let dispatch_lock = harness.registry.pane_dispatch_lock(&worker_pane_id);
+        let dispatch_returned = tokio::time::timeout(
+            common::load_scaled(Duration::from_secs(10)),
+            dispatch_lock.lock(),
+        )
+        .await
+        .is_ok();
+        assert!(
+            dispatch_returned,
+            "precondition: the delegate's dispatch never returned, so the worker cannot be made \
+             to exit AFTER it"
+        );
+
+        // Everything the dispatch broadcast is already queued, so this window
+        // only has to drain it.
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            Duration::from_millis(250),
+            false,
+        )
+        .await;
+        assert!(
+            seen.armed > 0 && seen.retired == 0,
+            "precondition: with the replacement still running the delegation must have been \
+             announced as armed and not as retired (`scheduler/idle-worker/032`), or a \
+             retirement seen after the exit proves nothing; broadcasts = {seen:?}"
+        );
+        assert!(
+            harness.registry.agent_is_live(&replacement_agent_id)
+                && harness
+                    .registry
+                    .delegation_watch_snapshot(&worker_pane_id)
+                    .outstanding_delegation
+                    .is_some(),
+            "precondition: the replacement must still be running with its delegation armed \
+             before it is told to exit; watches = {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+
+        // The replacement ends its own process: no `work-done`, no `StopAgent`,
+        // no close of any kind.
+        std::fs::write(harness.cwd.path().join(REPLACEMENT_EXIT_FLAG), b"exit\n")
+            .expect("write the replacement stub's exit flag");
+        let exited = tokio::time::timeout(common::load_scaled(Duration::from_secs(5)), async {
+            while harness.registry.agent_is_live(&replacement_agent_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            exited.is_ok(),
+            "precondition: the replacement stub never exited on its own, so the scenario under \
+             test could not occur"
+        );
+        assert_eq!(
+            harness
+                .registry
+                .agent_id_for_pane_any(&worker_pane_id)
+                .as_deref(),
+            Some(replacement_agent_id.as_str()),
+            "precondition: the exited replacement must still be the pane's registered agent. An \
+             entry that a close or a respawn removed is not a natural exit, and the agent-exit \
+             sweep skips it"
+        );
+        assert!(
+            !harness.registry.is_pane_closing(&worker_pane_id),
+            "precondition: the worker pane is in a close transition, so the close's own sweep \
+             and not the agent-exit sweep would be what retires the delegation"
+        );
+
+        let still_armed =
+            common::wait_for_outstanding_delegation_to_retire(&harness.registry, &worker_pane_id)
+                .await;
+        assert!(
+            still_armed.is_none(),
+            "a Pi worker that received its task as a native seed exited without work-done and \
+             its delegation is still armed: the native seed delivery never told the record which \
+             agent the replacement is (agent id {replacement_agent_id}), so the agent-exit sweep \
+             cannot match it and the orchestrator goes on observing a dead worker until the \
+             idle-worker timeout; still armed = {still_armed:?}, watches = {:?}",
+            harness.registry.delegation_watch_snapshot(&worker_pane_id)
+        );
+        let seen = common::delegation_broadcasts_for(
+            &mut broadcasts,
+            &worker_pane_id,
+            common::load_scaled(Duration::from_secs(3)),
+            true,
+        )
+        .await;
+        assert!(
+            seen.retired > 0,
+            "the exit of a Pi worker that owed a work-done must be announced as a retirement, or \
+             an attached deck keeps showing the delegation as outstanding; broadcasts = {seen:?}"
+        );
+
+        let snapshot = harness
+            .wait_for_snapshot(
+                |snapshot| snapshot.contains(WORKER_EXITED_NEEDLE),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            snapshot.contains(WORKER_EXITED_NEEDLE) && snapshot.contains(&worker_pane_id),
+            "the orchestrator's pane never received the 'exited without work-done' notice naming \
+             the Pi worker's pane; snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            idle_count(&snapshot),
+            0,
+            "an idle-worker prompt was written about a Pi worker whose exit had already been \
+             reported; snapshot = {snapshot:?}"
         );
     });
 }
