@@ -7137,17 +7137,18 @@ exit 0
     /// `git status` against a 1 ns deadline, and `tokio::time::timeout` polls
     /// the inner future before the timer: whenever the runtime was descheduled
     /// long enough for `git` to exit, the probe won and reported the tree dirty.
+    ///
+    /// Nothing here touches the disk or runs `git`: with the probe stood in,
+    /// the preview only matches a pane's cwd against the registry, and both are
+    /// plain path values. The paths need not exist.
     #[tokio::test]
     async fn kept_worktree_preview_still_reports_the_path_when_the_probe_times_out() {
-        let tmp = crate::test_temp::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
-        std::fs::write(wt.join("scratch.txt"), "work").unwrap();
+        let repo = Path::new("/never-on-disk/repo");
+        let wt = Path::new("/never-on-disk/repo-dispatch-x");
 
         let reg = new_worktree_registry();
-        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
-        let records = vec![pane_in("pane-1", &wt)];
+        record_worktree(&reg, wt, repo, RemovalPolicy::KeepIfDirty);
+        let records = vec![pane_in("pane-1", wt)];
 
         let probed = std::cell::Cell::new(0usize);
         let never_answers = async |_: &Path| {
@@ -7155,14 +7156,21 @@ exit 0
             std::future::pending::<Result<bool, String>>().await
         };
 
-        let kept = kept_worktree_preview_with(
-            &records,
-            &reg,
-            &["pane-1".to_string()],
-            Duration::from_millis(1),
-            never_answers,
+        // The outer guard only matters if the preview ever stops bounding its
+        // probe: that regression would otherwise sit on `pending()` until the
+        // test runner killed it, instead of failing here with a reason.
+        let kept = tokio::time::timeout(
+            Duration::from_secs(10),
+            kept_worktree_preview_with(
+                &records,
+                &reg,
+                &["pane-1".to_string()],
+                Duration::from_millis(1),
+                never_answers,
+            ),
         )
         .await
+        .expect("the preview did not honour its own probe deadline")
         .expect("an unanswered probe must still report the path");
         assert_eq!(
             probed.get(),
