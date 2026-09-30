@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::agent_pty::{AgentRecord, TabMembership};
+use crate::agent_pty::{AgentRecord, OutstandingDelegationEntry, TabMembership};
 use crate::state::{
     ActiveTool, SessionStatus, observes_own_delegations, observing_orchestrator_panes,
 };
@@ -184,14 +184,35 @@ fn role_of(tab_membership: &Option<TabMembership>) -> Option<String> {
 /// Reduce the daemon's `ListAgents` reply to the CLI's own status shape.
 /// Pure — no I/O — so it's unit-testable independent of a live daemon.
 pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
+    build_status_agents_with_delegations(records, &[])
+}
+
+/// [`build_status_agents`] plus issue #817's daemon-wide delegation list from
+/// the same reply. A delegation onto a worker pane with no live agent has no
+/// record to carry `outstanding_delegation`, so `delegations` supplies it;
+/// entries duplicating a record's own join are harmless (same pairs). An
+/// orchestrator pane absent from `records` simply gets no row to mark.
+pub fn build_status_agents_with_delegations(
+    records: Vec<AgentRecord>,
+    delegations: &[OutstandingDelegationEntry],
+) -> Vec<StatusAgent> {
     // Issue #803: derived from this one reply, so it can never outlive the
     // records it was read from.
-    let observing_panes = observing_orchestrator_panes(records.iter().filter_map(|record| {
-        Some((
-            record.pane_id_env.as_deref()?,
-            record.outstanding_delegation.as_ref()?,
-        ))
-    }));
+    let observing_panes = observing_orchestrator_panes(
+        records
+            .iter()
+            .filter_map(|record| {
+                Some((
+                    record.pane_id_env.as_deref()?,
+                    record.outstanding_delegation.as_ref()?,
+                ))
+            })
+            .chain(
+                delegations
+                    .iter()
+                    .map(|d| (d.worker_pane_id.as_str(), &d.watch)),
+            ),
+    );
     records
         .into_iter()
         .map(|record| {
@@ -1105,5 +1126,53 @@ mod tests {
             "with no delegation outstanding the orchestrator reads plain Idle; table:\n{table}"
         );
         assert!(!agents[0].wait_observing);
+    }
+
+    /// Issue #817: a delegation from the daemon-wide list whose worker pane has
+    /// no record still makes an `Idle` orchestrator read `Observing`; an
+    /// orchestrator pane absent from the records is ignored, and a non-`Idle`
+    /// orchestrator keeps its own status word.
+    #[test]
+    fn daemon_wide_delegation_without_worker_record_marks_idle_orchestrator() {
+        let entry = |orch: &str| OutstandingDelegationEntry {
+            worker_pane_id: "ghost-worker".into(),
+            watch: crate::agent_pty::WatchSnapshot {
+                armed_secs_ago: 1,
+                orchestrator_pane_id: orch.into(),
+            },
+        };
+        let agents = build_status_agents_with_delegations(
+            vec![record(
+                "a1",
+                "orch-pane",
+                Some(snapshot(SessionStatus::Idle)),
+            )],
+            &[entry("orch-pane")],
+        );
+        assert!(agents[0].observing_delegations);
+        assert_eq!(
+            status_cell(&format_human(&agents), "orch-pane"),
+            "Observing"
+        );
+
+        let agents = build_status_agents_with_delegations(
+            vec![record(
+                "a1",
+                "orch-pane",
+                Some(snapshot(SessionStatus::Idle)),
+            )],
+            &[entry("missing-orch")],
+        );
+        assert!(!agents[0].observing_delegations);
+
+        let agents = build_status_agents_with_delegations(
+            vec![record(
+                "a1",
+                "orch-pane",
+                Some(snapshot(SessionStatus::Working)),
+            )],
+            &[entry("orch-pane")],
+        );
+        assert_eq!(status_cell(&format_human(&agents), "orch-pane"), "Working");
     }
 }

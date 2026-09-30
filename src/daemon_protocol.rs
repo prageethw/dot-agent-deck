@@ -1705,6 +1705,20 @@ pub struct AttachResponse {
     /// between daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_revision: Option<u64>,
+    /// Issue #817: every outstanding delegation the daemon holds, populated on
+    /// the [`AttachRequest::ListAgents`] reply.
+    ///
+    /// The per-record `outstanding_delegation` only exists for a worker pane
+    /// that has an agent record, so a delegation onto a pane with no live agent
+    /// was invisible to a client reading the reply (`daemon status` then showed
+    /// the orchestrator as plain `Idle` while the deck showed `Observing`).
+    /// This list carries them regardless. Additive and optional in both
+    /// directions (JSON, no `deny_unknown_fields`): a daemon predating it omits
+    /// the key and the client falls back to the per-record join alone; an older
+    /// client ignores the extra key. So no [`PROTOCOL_VERSION`] bump. Absent
+    /// when the daemon holds none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outstanding_delegations: Option<Vec<crate::agent_pty::OutstandingDelegationEntry>>,
     /// PRD #365 M2: the daemon-minted `pane_id` for a `StartAgent` spawn.
     /// The daemon, not the client, is now authoritative for this value —
     /// see [`crate::agent_pty::mint_pane_id`]. Wire-additive
@@ -2728,6 +2742,10 @@ async fn handle_connection(
             }
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
+            // Issue #817: every outstanding delegation, including ones whose
+            // worker pane has no record in this reply.
+            let delegations = registry.outstanding_delegations();
+            resp.outstanding_delegations = (!delegations.is_empty()).then_some(delegations);
             // Issue #887: the client's only observable of the schedule seed the
             // daemon's project list draws on. See `AttachResponse::schedule_revision`.
             resp.schedule_revision = Some(scheduler.revision());
@@ -6827,6 +6845,45 @@ mod tests {
             serde_json::from_str(newer).expect("a newer peer's record must decode");
         assert_eq!(forward.spawned_at_ms, Some(1_756_684_800_123));
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-4"));
+    }
+
+    /// Issue #817: `AttachResponse.outstanding_delegations` is additive and
+    /// optional in both directions, so it costs no `PROTOCOL_VERSION` bump.
+    #[test]
+    fn outstanding_delegations_is_additive_and_optional_in_both_directions() {
+        use crate::agent_pty::{OutstandingDelegationEntry, WatchSnapshot};
+
+        // Old daemon -> new client: a reply without the key decodes to `None`.
+        let old: AttachResponse = serde_json::from_str(r#"{"ok":true,"agents":["1"]}"#).unwrap();
+        assert!(old.outstanding_delegations.is_none());
+
+        // Absent when the daemon holds none: nothing extra on the wire.
+        let none = serde_json::to_value(AttachResponse::agent_records(vec![])).unwrap();
+        assert!(none.get("outstanding_delegations").is_none());
+
+        // New daemon -> new client: round-trips.
+        let mut resp = AttachResponse::agent_records(vec![]);
+        resp.outstanding_delegations = Some(vec![OutstandingDelegationEntry {
+            worker_pane_id: "w".into(),
+            watch: WatchSnapshot {
+                armed_secs_ago: 3,
+                orchestrator_pane_id: "o".into(),
+            },
+        }]);
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: AttachResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.outstanding_delegations, resp.outstanding_delegations);
+
+        // New daemon -> old client: a reader whose struct lacks the field
+        // ignores the key and still reads the fields it knows.
+        #[derive(serde::Deserialize)]
+        struct OldResponse {
+            ok: bool,
+            agents: Option<Vec<String>>,
+        }
+        let old_reader: OldResponse = serde_json::from_str(&json).unwrap();
+        assert!(old_reader.ok);
+        assert_eq!(old_reader.agents, Some(vec![]));
     }
 
     /// Issue #856: `AgentRecord.cli_name` is additive and optional in BOTH

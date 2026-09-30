@@ -1279,6 +1279,22 @@ impl DaemonClient {
     /// the rest. Both go down one code path, so the sanitisation and the
     /// older-daemon fallback below cannot differ between them.
     pub async fn list_agents_detailed(&self) -> Result<AgentListing, ClientError> {
+        Ok(self.list_agents_full().await?.0)
+    }
+
+    /// [`Self::list_agents_detailed`] plus issue #817's daemon-wide outstanding
+    /// delegations (empty from a daemon that predates the field). Kept off
+    /// [`AgentListing`] so its other constructors are untouched; only
+    /// `daemon status` wants the list.
+    pub async fn list_agents_full(
+        &self,
+    ) -> Result<
+        (
+            AgentListing,
+            Vec<crate::agent_pty::OutstandingDelegationEntry>,
+        ),
+        ClientError,
+    > {
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents).await?;
         if !resp.ok {
@@ -1287,51 +1303,58 @@ impl DaemonClient {
             ));
         }
         let schedule_revision = resp.schedule_revision;
+        let delegations = resp.outstanding_delegations.unwrap_or_default();
         if let Some(mut records) = resp.agent_records {
             for rec in &mut records {
                 sanitize_record_tab_membership(rec);
             }
-            return Ok(AgentListing {
-                records,
-                schedule_revision,
-            });
+            return Ok((
+                AgentListing {
+                    records,
+                    schedule_revision,
+                },
+                delegations,
+            ));
         }
-        Ok(AgentListing {
-            records: resp
-                .agents
-                .unwrap_or_default()
-                .into_iter()
-                .map(|id| AgentRecord {
-                    id,
-                    pane_id_env: None,
-                    display_name: None,
-                    cwd: None,
-                    tab_membership: None,
-                    agent_type: None,
-                    rows: 0,
-                    cols: 0,
-                    // Legacy `agents`-only daemon shape carries no live session
-                    // state; the TUI falls back to a bare placeholder.
-                    live: None,
-                    // PRD #745 M11: and no spawn instant either — this daemon
-                    // predates the field, so it reported no spawn time and none may
-                    // be invented for it. Absence renders as nothing.
-                    spawned_at_ms: None,
-                    daemon_boot_id: None,
-                    registration_generation: None,
-                    // Issue #856: and no binary name. This daemon reported only
-                    // ids, so it vouched for no command — and a client that
-                    // filled one in from its own table would be reinstating the
-                    // derivation this field exists to remove.
-                    cli_name: None,
-                    crashed: None,
-                    outstanding_delegation: None,
-                    silence_watch: None,
-                    delegation_commission: None,
-                })
-                .collect(),
-            schedule_revision,
-        })
+        Ok((
+            AgentListing {
+                records: resp
+                    .agents
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|id| AgentRecord {
+                        id,
+                        pane_id_env: None,
+                        display_name: None,
+                        cwd: None,
+                        tab_membership: None,
+                        agent_type: None,
+                        rows: 0,
+                        cols: 0,
+                        // Legacy `agents`-only daemon shape carries no live session
+                        // state; the TUI falls back to a bare placeholder.
+                        live: None,
+                        // PRD #745 M11: and no spawn instant either — this daemon
+                        // predates the field, so it reported no spawn time and none may
+                        // be invented for it. Absence renders as nothing.
+                        spawned_at_ms: None,
+                        daemon_boot_id: None,
+                        registration_generation: None,
+                        // Issue #856: and no binary name. This daemon reported only
+                        // ids, so it vouched for no command — and a client that
+                        // filled one in from its own table would be reinstating the
+                        // derivation this field exists to remove.
+                        cli_name: None,
+                        crashed: None,
+                        outstanding_delegation: None,
+                        silence_watch: None,
+                        delegation_commission: None,
+                    })
+                    .collect(),
+                schedule_revision,
+            },
+            delegations,
+        ))
     }
 
     /// PRD #127 M1.3: ask a running daemon to re-read the global
