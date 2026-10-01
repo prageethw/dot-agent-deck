@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.50.4] - 2026-10-01
+
+### Fixed
+
+- **After a failed `clear = true` respawn, a delegation still owed by the old worker no longer keeps the orchestrator reading `Observing`**
+  When a `clear = true` delegate failed to respawn its worker (the respawn errored, or the replacement never became live), only that delegation's own record was retired. An earlier delegation to the same worker that was still unanswered stayed armed, even though the worker that owed it had already been terminated and could never answer. The worker's card read `Idle (delegated)` and the orchestrator's `Observing` until `worker_response_timeout_minutes` ran out, followed by an idle nudge on top of the failure notice already sent. Every delegation the terminated worker owed is now dropped on those two failures, and on a refused task pointer or a dead pi-native replacement after such a respawn; a newer delegation to the same pane keeps its record, and so does an older one whose dispatch has not started yet.
+- **`daemon status` and the deck card agree on `Observing` when a worker pane has no live agent**
+  When a worker pane had no live agent, `worker-agent-deck daemon status` printed no row for it, so the orchestrator's row was worked out without that pane's outstanding delegation: the table read `Idle` and `--json` reported `observing_delegations: false` while the deck card showed `Observing`. The status now counts every outstanding delegation the daemon holds, including one on a pane with no live agent.
+  The daemon survives an upgrade, so this takes effect once the daemon is restarted onto the new build: the CLI needs the new build to read the new field and the daemon needs it to send the field.
+- **The orchestrator is told when a pi-native replacement worker is already gone before its task arrives**
+  With `clear = true` on a pi-native worker, a replacement that was already dead by the time its task would be handed over was released quietly whenever the daemon held no delegation record for it to report on: the orchestrator got no notice and was left without a reason. The orchestrator now gets the same "never came up" notice the other agents' paths send, exactly once.
+- **Saved-session pane order and dashboard card order no longer depend on chance**
+  Two places still ordered panes and sessions by sorting their ids as numbers. Pane ids are now minted as `pane-<hex>-<n>`, so no id parsed as a number and the order came out arbitrary: the pane order written to the saved-session file (which decides the restored tab order and which orchestration tab you land on) and the order of the cards on the dashboard could change from run to run. Both now follow the order the panes and sessions were created.
+- **On an orchestration tab, every worker pane is now exactly the same height and the orchestrator takes the leftover rows**
+  Tiled panes share the column's rows in whole rows, so they cannot always be equal. The previous fix gave any leftover rows to the first panes, which with an orchestrator and many workers left the first few workers a row taller than the rest and read as unequal. On an orchestration tab the worker panes now all get the same height, and whatever rows are left over go to the orchestrator pane, where you normally type. Other tiled stacks (dashboard and mode side panes) still give leftover rows to the first panes.
+
+### Miscellaneous
+
+- **CI: the `desktop-browser` job no longer hangs for 20 minutes on a slow package mirror, and its pnpm version is pinned**
+  The job was cancelled at its 20-minute timeout on about one run in seven, from two separate causes. On 29 September every run that hung did so after all 112 tests had passed, and every one of them was on pnpm 12.6.0, which the workflow's floating "pnpm 12" had resolved to; later runs resolved to 12.8.x and did not hang, so the pnpm version is now pinned exactly in both desktop jobs (the cause is unproven, the pin removes the variable). On 30 September and 1 October the Ubuntu package mirror served WebKit's 125 MB of system packages at about 118 kB/s and the install step alone used the whole budget; that step now has its own 13-minute limit around one 12-minute install attempt with apt retries and per-connection timeouts, and the Playwright run has an 8-minute global timeout, so a stall fails in minutes with the step named and its report kept instead of ending as an unexplained cancel.
+- **Release workflow: the desktop build job no longer floats the pnpm version, runs with a read-only token and has a time limit**
+  The release workflow's desktop bundle job installed pnpm with `version: 12`, which floats to whatever 12.x is latest, ran with the workflow's write-scoped token (`contents: write` and `packages: write`) left in the git config of the checkout, and had no time limit beyond GitHub's six-hour default.
+  The pnpm version is now pinned exactly (the same version as the CI jobs), the job's token is read-only and is no longer stored in the git config, and a hang is capped at 30 minutes.
+  A compromised dependency still runs inside the build and could tamper with the bundle it produces; what changes is that it can no longer use a write-scoped token to modify the repository or its packages.
+
+
+
 ## [0.50.3] - 2026-09-30
 
 ### Added
