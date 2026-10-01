@@ -36,13 +36,10 @@ export default defineConfig({
   // narrowing to one test is never what the author meant.
   forbidOnly: !!process.env.CI,
   retries: 0,
-  // Issue #807: bound a hang. Healthy runs take ~3.8 minutes in total, so these
-  // sit well above that and below the CI step's 8-minute limit, which lets
-  // Playwright stop, write the report and exit on its own before the step is
-  // killed.
-  timeout: 30_000,
-  expect: { timeout: 10_000 },
-  globalTimeout: 7 * 60 * 1000,
+  // Issue #807: bound a hang. The suite takes ~3.5 minutes today; 8 minutes
+  // leaves ~2.3x headroom for it to grow, and it ends before the CI step's
+  // 9-minute limit so Playwright stops and writes its HTML report first.
+  globalTimeout: 8 * 60 * 1000,
   // One worker in CI to start. Layout is not timing-dependent, but browser
   // startup on a 4-vCPU runner contends with itself, and this job has no honest
   // runs yet — the same reason `e2e-deterministic` was added advisory. Raising
@@ -80,9 +77,6 @@ export default defineConfig({
     // The build is inside this command, so the default 60s is not enough on a
     // cold runner.
     timeout: 180_000,
-    // Bound the teardown too, so a preview server that ignores SIGTERM cannot
-    // hold the run open after the tests finish (issue #807).
-    gracefulShutdown: { signal: "SIGTERM", timeout: 5000 },
     stdout: "pipe",
     stderr: "pipe",
   },

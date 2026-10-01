@@ -402,13 +402,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # Issue #807: the pnpm version is pinned EXACTLY, never a floating major --
-      # every `desktop-browser` run that auto-switched to a newer 12.x (12.6.0)
-      # hung after the tests passed. It is not read from `packageManager` in
-      # `desktop/package.json` because that makes `pnpm install --frozen-lockfile`
-      # fail until the lockfile records pnpm itself. Renovate has no manager for
-      # this input, so bump it by hand, and keep it in step with the same pin in
-      # the other desktop job.
+      # Issue #807: the pnpm version is pinned EXACTLY, never a floating major.
+      # The floating `12` resolved to 12.6.0 on 2026-09-29 and every
+      # `desktop-browser` run on it hung after the tests passed; later runs
+      # resolved to 12.8.x and did not (causation unproven). It is not read from
+      # `packageManager` in `desktop/package.json` because that makes
+      # `pnpm install --frozen-lockfile` fail until the lockfile records pnpm
+      # itself. Renovate's github-actions manager does track this `version:`
+      # input, but `renovate.json`'s `uses-with` rule holds such bumps for manual
+      # review and it looks inactive on this fork, so bump it by hand and keep
+      # this pin in step with the one in the other desktop job.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 12.8.1
@@ -482,13 +485,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # Issue #807: the pnpm version is pinned EXACTLY, never a floating major --
-      # every `desktop-browser` run that auto-switched to a newer 12.x (12.6.0)
-      # hung after the tests passed. It is not read from `packageManager` in
-      # `desktop/package.json` because that makes `pnpm install --frozen-lockfile`
-      # fail until the lockfile records pnpm itself. Renovate has no manager for
-      # this input, so bump it by hand, and keep it in step with the same pin in
-      # the other desktop job.
+      # Issue #807: the pnpm version is pinned EXACTLY, never a floating major.
+      # The floating `12` resolved to 12.6.0 on 2026-09-29 and every
+      # `desktop-browser` run on it hung after the tests passed; later runs
+      # resolved to 12.8.x and did not (causation unproven). It is not read from
+      # `packageManager` in `desktop/package.json` because that makes
+      # `pnpm install --frozen-lockfile` fail until the lockfile records pnpm
+      # itself. Renovate's github-actions manager does track this `version:`
+      # input, but `renovate.json`'s `uses-with` rule holds such bumps for manual
+      # review and it looks inactive on this fork, so bump it by hand and keep
+      # this pin in step with the one in the other desktop job.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 12.8.1
@@ -530,29 +536,31 @@ jobs:
       # apt, so it is the slowest step here.
       #
       # Issue #807: the Ubuntu mirror once served WebKit's ~125 MB of apt
-      # packages at ~118 kB/s and this step ate the whole job budget. So apt
-      # retries and times out on a stalled connection, and the install gets two
-      # bounded attempts (a slow-but-progressing mirror gets one fresh try; a
-      # dead one fails here, named, in about 8 minutes). No `|| true`: a
-      # persistent failure still fails the step.
+      # packages at ~118 kB/s and this step ate the whole job budget. apt now
+      # retries and times out on a STALLED connection, and the install is one
+      # bounded attempt: slow-but-passing mirrors have taken ~9 minutes (230
+      # kB/s), so the limit is 12 minutes and there is deliberately no second
+      # attempt, which would need a mirror faster than that. `-k 30s` kills a
+      # child that ignores SIGTERM. No `|| true`: any failure fails the step.
       - name: Install Playwright browsers and system dependencies
-        timeout-minutes: 9
+        timeout-minutes: 13
         run: |
-          printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          for attempt in 1 2; do
-            if timeout 4m pnpm exec playwright install --with-deps chromium webkit; then
-              exit 0
-            fi
-            echo "playwright install attempt ${attempt} failed or timed out"
-          done
-          exit 1
+          printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' 'DPkg::Lock::Timeout "120";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          rc=0
+          timeout -k 30s 12m pnpm exec playwright install --with-deps chromium webkit || rc=$?
+          if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            echo "playwright install TIMED OUT after 12m (exit ${rc})"
+          elif [ "$rc" -ne 0 ]; then
+            echo "playwright install FAILED (exit ${rc})"
+          fi
+          exit "$rc"
       # Playwright transpiles specs without type-checking them, so a type error
       # under `desktop/e2e` would run happily and could pass. This is the gate
       # that makes it an error, and it is fast enough to run before the browsers
       # are launched.
       - run: pnpm test:browser:types
       - name: Run browser tests
-        timeout-minutes: 8
+        timeout-minutes: 9
         run: pnpm test:browser
       # `retries` is 0 in `playwright.config.ts` — a retry turns a flake into a
       # green tick and deletes the evidence — so the trace and the HTML report
@@ -562,7 +570,7 @@ jobs:
       # the conclusion in place, and upload-artifact v4+ refuses to overwrite an
       # existing name.
       - name: Preserve this attempt's browser report
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: playwright-attempt-${{ github.run_attempt }}
