@@ -600,13 +600,8 @@ impl SavedSession {
             .collect();
         let mut ids: Vec<&String> = pane_metadata.keys().collect();
         ids.sort_by(|a, b| {
-            let key = |id: &String| {
-                (
-                    position.get(id.as_str()).copied().unwrap_or(usize::MAX),
-                    id.parse::<u64>().unwrap_or(u64::MAX),
-                )
-            };
-            key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+            let pos = |id: &String| position.get(id.as_str()).copied().unwrap_or(usize::MAX);
+            pos(a).cmp(&pos(b)).then_with(|| pane_id_order(a, b))
         });
         Self {
             panes: ids
@@ -623,6 +618,29 @@ impl SavedSession {
             focus: None,
         }
     }
+}
+
+/// Issue #827: total order on pane ids for the places that must break a tie
+/// (equal card start times; panes the creation order does not know). Legacy
+/// numeric ids come first, numerically; daemon-minted `<prefix>-<seq>` ids
+/// next, by prefix (the per-daemon nonce) then NUMERIC trailing sequence, so
+/// `-2` precedes `-10`; anything else last, by string. The final id-string
+/// compare makes it total (`"7"` and `"007"` parse alike). It is a
+/// lexicographic order on `(class, prefix, number, id)`, hence transitive.
+pub fn pane_id_order(a: &str, b: &str) -> std::cmp::Ordering {
+    fn key(id: &str) -> (u8, &str, u64) {
+        if let Ok(n) = id.parse::<u64>() {
+            return (0, "", n);
+        }
+        if let Some((prefix, seq)) = id.rsplit_once('-')
+            && !prefix.is_empty()
+            && let Ok(n) = seq.parse::<u64>()
+        {
+            return (1, prefix, n);
+        }
+        (2, id, 0)
+    }
+    key(a).cmp(&key(b)).then_with(|| a.cmp(b))
 }
 
 /// PRD #89 M1.2 — leading-edge throttle that coalesces saved-session snapshot
@@ -2263,9 +2281,10 @@ mod tests {
 
     /// Scenario: Snapshot legacy numeric pane ids with no creation order
     /// supplied, and load a `session.toml` written by the previous build (no
-    /// order field of any kind). Numeric ids still come out in numeric order
-    /// and the old file loads with its panes in file order, so the ordering
-    /// fix cannot regress either.
+    /// order field of any kind). Numeric ids still come out in numeric order,
+    /// and the old file still parses with its panes in file order (a check on
+    /// the on-disk format staying unchanged; it exercises TOML parsing, not
+    /// the snapshot code).
     #[spec("config/saved-session/006")]
     #[test]
     fn saved_session_006_legacy_numeric_ids_and_old_files_still_work() {
@@ -2292,6 +2311,40 @@ command = "claude"
         let loaded: SavedSession = toml::from_str(old_file).unwrap();
         let names: Vec<&str> = loaded.panes.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["second-saved", "first-saved"]);
+    }
+
+    /// Scenario: Snapshot panes the creation order does not know that share one
+    /// daemon nonce, with sequence numbers 2, 9, 10 and 11 plus a legacy
+    /// numeric id and an unparseable id. Legacy numeric first, then minted by
+    /// numeric sequence (9 before 10, not string order), then the rest.
+    #[spec("config/saved-session/007")]
+    #[test]
+    fn saved_session_007_unknown_panes_order_by_numeric_sequence() {
+        let ids: Vec<String> = [
+            "pane-00000000000000aa-11",
+            "weird",
+            "pane-00000000000000aa-2",
+            "5",
+            "pane-00000000000000aa-10",
+            "pane-00000000000000aa-9",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (mut meta, names, live) = snapshot_inputs(&ids);
+        let session = SavedSession::snapshot(&mut meta, &names, &live, &[]);
+        let got: Vec<&str> = session.panes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            got,
+            [
+                "5",
+                "pane-00000000000000aa-2",
+                "pane-00000000000000aa-9",
+                "pane-00000000000000aa-10",
+                "pane-00000000000000aa-11",
+                "weird"
+            ]
+        );
     }
 
     #[test]

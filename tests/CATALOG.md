@@ -168,6 +168,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** mixed numeric and minted ids in one deck.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/022 — Equal start times in one daemon run break ties by numeric creation sequence (issue #827).
+- **Layer:** L1 (in-crate `#[cfg(test)]` unit test of `filter_sessions` over a hand-built `AppState`; no terminal).
+- **Agent:** none.
+- **Asserts:** four same-nonce minted ids with sequences 2, 9, 10, 11 and one shared `started_at` order `2, 9, 10, 11`, not string order.
+- **Does not assert:** ids from different nonces sharing a start time beyond the nonce-then-sequence rule.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/023 — `pane_creation_order` returns the embedded controller's creation-ordered pane ids and nothing for a non-embedded controller (issue #827).
+- **Layer:** L1 (in-crate `#[cfg(test)]` unit test using the render-only `EmbeddedPaneController` seam with in-process stream pairs; no daemon).
+- **Agent:** none.
+- **Asserts:** with three wired panes the result is non-empty and equals `pane_ids()`; a non-embedded controller yields an empty list.
+- **Does not assert:** the snapshot callers themselves.
+- **Platform coverage:** mac+linux (unix-only in-process stream pair; `#[cfg(unix)]`).
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
@@ -6766,11 +6780,18 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** hydrated panes from another daemon's nonce beyond this ordering rule.
 - **Platform coverage:** mac+linux+windows.
 
-##### config/saved-session/006 — Legacy numeric ids still snapshot numerically and a `session.toml` from the previous build still loads in file order (issue #827 compatibility guard).
+##### config/saved-session/006 — Legacy numeric ids still snapshot numerically and a `session.toml` from the previous build still parses in file order (issue #827 compatibility guard).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession::snapshot`; no TUI harness, no I/O).
 - **Agent:** none.
 - **Asserts:** eight numeric ids snapshotted with no creation order come out numerically; a file with no order field of any kind parses and keeps its `[[panes]]` order. This passes before and after the fix.
 - **Does not assert:** newer-writer to older-reader compatibility, since no field is added.
+- **Platform coverage:** mac+linux+windows.
+
+##### config/saved-session/007 — Panes missing from the creation order and sharing a daemon nonce snapshot by numeric sequence (issue #827).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession::snapshot`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** with no creation order, a legacy numeric id comes first, then same-nonce minted ids with sequences 2, 9, 10, 11 in numeric order, then an unparseable id.
+- **Does not assert:** the creation-order path (covered by `saved-session/003`-`005`).
 - **Platform coverage:** mac+linux+windows.
 
 ### CLI surface (PRD #89 Phase 3)

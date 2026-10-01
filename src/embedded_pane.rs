@@ -857,6 +857,31 @@ impl EmbeddedPaneController {
         panes.get(pane_id).map(|p| Arc::clone(&p.hyperlinks))
     }
 
+    /// Test seam (issue #827): wire one stream-backed pane per id, in the given
+    /// order, and return the peer halves, which the caller must keep alive
+    /// (dropping one EOFs its pane's reader).
+    #[cfg(all(test, unix))]
+    pub(crate) fn wire_test_stream_panes(&self, ids: &[String]) -> Vec<tokio::net::UnixStream> {
+        let rt = render_only_runtime();
+        let _enter = rt.enter();
+        let mut peers = Vec::new();
+        for (i, pane_id) in ids.iter().enumerate() {
+            let (conn, peer) = AttachConnection::connected_pair_for_test();
+            peers.push(peer);
+            self.wire_stream_pane(
+                pane_id.clone(),
+                format!("agent-{i}"),
+                conn,
+                format!("role-{i}"),
+                None,
+                None,
+                24,
+                80,
+            );
+        }
+        peers
+    }
+
     /// Return all pane IDs in creation order (the order the panes were built
     /// in this process), independent of the id's shape. Ties cannot occur —
     /// the sequence is unique — but the id breaks them anyway for determinism.

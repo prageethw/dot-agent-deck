@@ -4156,8 +4156,9 @@ fn register_restored_pane_placeholder(
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
     sessions.sort_by(|(_, a), (_, b)| {
-        // Sort by pane ID (numeric creation order) when available,
-        // falling back to started_at for sessions without a pane.
+        // Sort by pane-scoped start time, then (for equal times) the legacy
+        // numeric id / trailing creation sequence, then the id string; fall
+        // back to started_at alone for sessions without a pane.
         match (&a.pane_id, &b.pane_id) {
             // Issue #827: daemon-minted ids (`pane-<hex>-<n>`) do not parse as
             // numbers, so order by the pane-scoped start time first; legacy
@@ -4165,12 +4166,7 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
             (Some(pa), Some(pb)) => a
                 .started_at
                 .cmp(&b.started_at)
-                .then_with(|| {
-                    let na = pa.parse::<u64>().unwrap_or(u64::MAX);
-                    let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
-                    na.cmp(&nb)
-                })
-                .then_with(|| pa.cmp(pb)),
+                .then_with(|| config::pane_id_order(pa, pb)),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.started_at.cmp(&b.started_at),
@@ -14177,7 +14173,7 @@ fn dispatch_action(
 /// Issue #827: live pane ids in creation order, for the saved-session
 /// snapshot. Empty for a non-embedded controller (the snapshot then falls back
 /// to numeric-then-string order).
-fn pane_creation_order(pane: &dyn PaneController) -> Vec<String> {
+pub(crate) fn pane_creation_order(pane: &dyn PaneController) -> Vec<String> {
     pane.as_any()
         .downcast_ref::<EmbeddedPaneController>()
         .map(|e| e.pane_ids())
@@ -35245,6 +35241,46 @@ mod tests {
             "issue #827: equal start times must order by pane id; on the old build \
              all minted ids tie and the map's arbitrary order shows through"
         );
+    }
+
+    /// Scenario: Four sessions of one daemon run (same nonce) with sequence
+    /// numbers 2, 9, 10 and 11 start at the same instant. The tie must break
+    /// by the numeric sequence, so 10 and 11 come after 9, not between 1x and 2.
+    #[spec("dashboard/pane/022")]
+    #[test]
+    fn pane_022_equal_start_times_break_ties_by_numeric_sequence() {
+        let base = Utc::now();
+        let mut state = AppState::default();
+        let want: Vec<String> = [2, 9, 10, 11]
+            .iter()
+            .map(|n| format!("pane-00000000000000aa-{n}"))
+            .collect();
+        for id in want.iter().rev() {
+            card_session_at(&mut state, &format!("sess-{id}"), id, base, 0);
+        }
+        assert_eq!(card_pane_order(&state), want);
+    }
+
+    /// Scenario: `pane_creation_order` is handed a real embedded controller
+    /// holding three panes and must return its creation-ordered `pane_ids()`
+    /// (non-empty); handed a non-embedded controller it returns nothing.
+    #[spec("dashboard/pane/023")]
+    #[cfg(unix)]
+    #[test]
+    fn pane_023_pane_creation_order_reads_the_embedded_controller() {
+        let controller = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+        let created: Vec<String> = (0..3)
+            .map(|seq| format!("pane-9e3779b97f4a7c15-{seq}"))
+            .collect();
+        let _peers = controller.wire_test_stream_panes(&created);
+        let order = pane_creation_order(&controller);
+        assert!(
+            !order.is_empty(),
+            "embedded controller must yield its panes"
+        );
+        assert_eq!(order, controller.pane_ids());
+        assert_eq!(order, created);
+        assert!(pane_creation_order(&RecordingPaneController::default()).is_empty());
     }
 
     /// Scenario: Eight sessions were re-keyed by the early-event adoption:
