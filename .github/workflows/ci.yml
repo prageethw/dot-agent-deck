@@ -466,18 +466,17 @@ jobs:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
-    # NOT a measured runner wall clock — this job's own first run is the first
-    # measurement, so this is derived rather than observed. Measured on a warm
-    # 16-core dev box after #836's second phase took the suite from 20 tests to
-    # 54 across two engines, including the `vite build` the Playwright
-    # `webServer` runs first: 24.6s at 8 workers, 1m06s at `--workers=1`, which
-    # is the shape CI runs in. On top of that CI pays for `pnpm install`, the
-    # ~400 MiB browser download and the apt install for WebKit's runtime deps,
-    # and those three dominate. 20 minutes leaves room for all of it while still
-    # capping a wedged browser at a fraction of the 6-hour runner default.
-    # Re-tune downward once honest runs exist; do not raise it to paper over a
-    # hang.
-    timeout-minutes: 20
+    # Issue #807: this job cap is only a BACKSTOP behind the per-step caps (the
+    # Playwright install step has 13 minutes, `pnpm test:browser` has 9), and it
+    # must stay above their sum plus setup (checkout, pnpm, `pnpm install`, a
+    # couple of minutes), so a slow install cannot get the job cancelled before
+    # Playwright's own 8-minute `globalTimeout` fires and writes its report. A
+    # hang is now reported by the step that hung, not by this cap. Measured
+    # healthy: 4.5-7 minutes in total (install ~1 minute, the 112-test suite
+    # ~3.5 minutes at `--workers=1`, which is the shape CI runs in); the
+    # slowest passing run seen, on a slow package mirror, took ~14 minutes.
+    # It still caps a wedged browser at a fraction of the 6-hour runner default.
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: desktop
@@ -549,7 +548,7 @@ jobs:
           rc=0
           timeout -k 30s 12m pnpm exec playwright install --with-deps chromium webkit || rc=$?
           if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-            echo "playwright install TIMED OUT after 12m (exit ${rc})"
+            echo "playwright install TIMED OUT or was KILLED (exit ${rc})"
           elif [ "$rc" -ne 0 ]; then
             echo "playwright install FAILED (exit ${rc})"
           fi
