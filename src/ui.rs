@@ -32556,6 +32556,84 @@ mod tests {
                 "tier {tier}: expected the status text \"Idle\" to survive \
                  squeezing; got:\n{rendered}"
             );
+            // Issue #847: a 3-row card (border, 1 inner row, border) must still
+            // say where it lives — `Dir: <basename>` shares the role's row.
+            if tier == 3 {
+                assert!(
+                    rendered.contains("Dir:") && rendered.contains("tmp"),
+                    "tier 3: expected `Dir:` and the cwd basename `tmp` on the \
+                     single inner row; got:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    fn card_rows_847(width: u16, height: u16, role: &str, cwd: &str) -> Vec<String> {
+        let mut session = make_session(SessionStatus::Idle);
+        session.cwd = Some(cwd.to_string());
+        let buf = render_card_to_buffer(
+            &session,
+            Some(role),
+            None,
+            CardDensityKind::Compact,
+            0,
+            false,
+            width,
+            height,
+        );
+        buffer_to_string(&buf).lines().map(str::to_string).collect()
+    }
+
+    /// Scenario: Render one card at exactly 3 rows and check its single inner
+    /// row reads the role name followed by `Dir:` and the cwd basename; render
+    /// it again at 4 rows and check the role row stays role-only with `Dir:`
+    /// on its own row beneath (unchanged).
+    #[test]
+    fn card_height_847_three_row_card_shows_role_and_dir() {
+        let rows = card_rows_847(50, 3, "role1", "/work/myproject");
+        let inner = &rows[1];
+        assert!(
+            inner.contains("role1") && inner.contains("Dir:") && inner.contains("myproject"),
+            "3-row card inner row must read role + `Dir: <basename>`; got:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            inner.find("role1") < inner.find("Dir:"),
+            "role must come before `Dir:`; got {inner:?}"
+        );
+
+        let rows = card_rows_847(50, 4, "role1", "/work/myproject");
+        assert!(
+            rows[1].contains("role1") && !rows[1].contains("Dir:"),
+            "4-row card role row must stay role-only; got {:?}",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains("Dir:") && rows[2].contains("myproject"),
+            "4-row card keeps `Dir:` on its own row; got {:?}",
+            rows[2]
+        );
+    }
+
+    /// Scenario: Render a narrow 3-row card with a very long cwd basename and
+    /// check the role is still shown and `Dir:` is ellipsized rather than
+    /// dropped; then render absurdly narrow 3-row cards to check nothing
+    /// panics.
+    #[test]
+    fn card_height_847_narrow_three_row_card_ellipsizes_dir() {
+        let rows = card_rows_847(22, 3, "role1", "/work/a-very-long-directory-name");
+        let inner = &rows[1];
+        assert!(
+            inner.contains("role1") && inner.contains("Dir:") && inner.contains('…'),
+            "narrow 3-row card must keep role and an ellipsized Dir; got {inner:?}"
+        );
+        assert!(
+            !inner.contains("a-very-long-directory-name"),
+            "long basename must be truncated; got {inner:?}"
+        );
+        for w in [4u16, 6, 8, 10, 14] {
+            let rows = card_rows_847(w, 3, "role1", "/work/a-very-long-directory-name");
+            assert_eq!(rows.len(), 3);
         }
     }
 
