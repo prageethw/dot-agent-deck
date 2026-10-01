@@ -14181,7 +14181,13 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     }
     let live_panes = state.blocking_read().managed_pane_ids.clone();
     let mut session =
-        config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
+        // Issue #827: the coder wires the real creation order (`pane_ids()`) here.
+        config::SavedSession::snapshot(
+            &mut ui.pane_metadata,
+            &ui.pane_display_names,
+            &live_panes,
+            &[],
+        );
     // PRD #196: overlay the runtime last-command onto the live-pane snapshot so
     // it persists across restarts (the snapshot builder only knows panes).
     session.last_command = ui.last_command.clone();
@@ -18290,6 +18296,8 @@ pub fn run_tui(
             &mut ui.pane_metadata,
             &ui.pane_display_names,
             &live_panes,
+            // Issue #827: the coder wires the real creation order here.
+            &[],
         );
         // PRD #196: persist the global last-command alongside the panes so it
         // survives a clean exit/restart; keep the file when only it is set.
@@ -35147,6 +35155,130 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, "beta");
+    }
+
+    /// Issue #827 helper: a session for `pane` whose `started_at` is
+    /// `base + secs`, stored under `key` (the session id, not the pane id).
+    fn card_session_at(
+        state: &mut AppState,
+        key: &str,
+        pane: &str,
+        base: chrono::DateTime<Utc>,
+        secs: i64,
+    ) {
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = key.to_string();
+        s.pane_id = Some(pane.to_string());
+        s.started_at = base + chrono::Duration::seconds(secs);
+        state.sessions.insert(key.to_string(), s);
+    }
+
+    /// Daemon-minted-shaped ids in creation order, nonce decreasing so the
+    /// lexicographic order is the reverse of creation order.
+    fn card_minted_ids(n: u64) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("pane-{:016x}-{}", 0xfedc_ba98_7654_3210u64 - i * 0x1111, i))
+            .collect()
+    }
+
+    fn card_pane_order(state: &AppState) -> Vec<String> {
+        let ui = default_ui();
+        filter_sessions(state, &ui)
+            .iter()
+            .map(|(_, s)| s.pane_id.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// Scenario: Twelve sessions for daemon-minted pane ids, created one second
+    /// apart and inserted in reverse, give the dashboard its card list. Cards
+    /// (and so the number badges and jump shortcuts) must follow creation
+    /// order. On the old build every minted id parsed to the same key, so the
+    /// order was the map's arbitrary iteration order.
+    #[spec("dashboard/pane/018")]
+    #[test]
+    fn pane_018_cards_follow_creation_order_for_daemon_minted_ids() {
+        let ids = card_minted_ids(12);
+        let base = Utc::now();
+        let mut state = AppState::default();
+        for (i, id) in ids.iter().enumerate().rev() {
+            card_session_at(&mut state, &format!("sess-{id}"), id, base, i as i64);
+        }
+        assert_eq!(
+            card_pane_order(&state),
+            ids,
+            "issue #827: card order must be creation order; on the old build it is arbitrary"
+        );
+    }
+
+    /// Scenario: Eight sessions share one `started_at` and carry daemon-minted
+    /// ids. Their card order must be deterministic: the id string breaks the
+    /// tie, whatever order the map happens to iterate in.
+    #[spec("dashboard/pane/019")]
+    #[test]
+    fn pane_019_equal_start_times_break_ties_by_pane_id() {
+        let mut ids = card_minted_ids(8);
+        let base = Utc::now();
+        let mut state = AppState::default();
+        for id in &ids {
+            card_session_at(&mut state, &format!("sess-{id}"), id, base, 0);
+        }
+        ids.sort();
+        assert_eq!(
+            card_pane_order(&state),
+            ids,
+            "issue #827: equal start times must order by pane id; on the old build \
+             all minted ids tie and the map's arbitrary order shows through"
+        );
+    }
+
+    /// Scenario: Eight sessions were re-keyed by the early-event adoption:
+    /// their map keys are unrelated to pane order, yet each keeps the
+    /// `started_at` it had from its first event. The cards must still follow
+    /// `started_at` (creation) order, not the key or insertion order.
+    #[spec("dashboard/pane/020")]
+    #[test]
+    fn pane_020_rekeyed_sessions_keep_creation_order_from_started_at() {
+        let ids = card_minted_ids(8);
+        let base = Utc::now();
+        let mut state = AppState::default();
+        // Keys sort in the reverse of creation order, as an adopted key can.
+        for (i, id) in ids.iter().enumerate().rev() {
+            card_session_at(
+                &mut state,
+                &format!("session-{:02}", 99 - i),
+                id,
+                base,
+                i as i64,
+            );
+        }
+        assert_eq!(
+            card_pane_order(&state),
+            ids,
+            "issue #827: a re-keyed session keeps its place by started_at; on the old \
+             build the order is arbitrary for minted ids"
+        );
+    }
+
+    /// Scenario: Legacy numeric pane ids that share one start time still order
+    /// numerically, and a session with no pane sorts after every pane-backed
+    /// one, as before the ordering fix.
+    #[spec("dashboard/pane/021")]
+    #[test]
+    fn pane_021_legacy_numeric_ids_order_numerically_and_paneless_sorts_last() {
+        let base = Utc::now();
+        let mut state = AppState::default();
+        for id in ["10", "3", "1", "22", "2", "7", "11", "4"] {
+            card_session_at(&mut state, &format!("sess-{id}"), id, base, 0);
+        }
+        let mut paneless = make_session(SessionStatus::Idle);
+        paneless.session_id = "no-pane".to_string();
+        state.sessions.insert("no-pane".to_string(), paneless);
+        let mut want: Vec<String> = ["1", "2", "3", "4", "7", "10", "11", "22"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        want.push(String::new());
+        assert_eq!(card_pane_order(&state), want);
     }
 
     #[test]
