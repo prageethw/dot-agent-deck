@@ -627,8 +627,23 @@ jobs:
             # it is one word here once it is pinned. See PRD #740 Decision 7.
             bundles: deb
     runs-on: ${{ matrix.os }}
+    # Issue #844: a backstop, not a budget. GitHub's default is 360 minutes, so a
+    # hung pnpm/tauri/bundler step would hold a runner for six hours. Sized from
+    # measured healthy legs: the slowest of the last 8 fork releases (v0.48.0 to
+    # v0.50.3) was 864s (macOS dmg), and the slowest of 3 recent upstream
+    # releases was 874s (macOS app); 30 minutes is about 2x that. Re-tune if the
+    # build grows (a legitimately slower bundle must raise this, not be killed
+    # by it).
+    timeout-minutes: 30
     steps:
+      # Issue #844: `persist-credentials: false` keeps this job's write-scoped
+      # GITHUB_TOKEN (workflow-level `contents: write`) out of the git config,
+      # where pnpm and every dependency install script could read it. No step
+      # below runs `git push`/`fetch` against the remote; the only git use is
+      # build.rs's read-only `git describe`/`rev-parse`, which needs no token.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
@@ -646,11 +661,19 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libxdo-dev \
             patchelf fakeroot file desktop-file-utils
+      # Issues #807 and #844: the pnpm version is pinned EXACTLY, never a
+      # floating major (the floating `12` resolved to 12.6.0 and hung CI's
+      # desktop jobs). Keep this pin in step with the ones in ci.yml's two
+      # desktop jobs (`desktop-web`, `desktop-browser`) -- all three move
+      # together. Renovate's github-actions manager tracks this `version:`
+      # input as depType `uses-with`, which `renovate.json` holds for manual
+      # review, so a bump here is a hand edit (Renovate looks inactive on this
+      # fork anyway).
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 12
-      # Node 20 and pnpm 10 match ci.yml's `desktop-web` job rather than the
-      # devbox pin, so the floor that is tested is the floor that is shipped.
+          version: 12.8.1
+      # Node 24 and pnpm 12.8.1 match ci.yml's desktop jobs rather than the
+      # devbox pin, so the toolchain that is tested is the one that is shipped.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
