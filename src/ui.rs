@@ -4159,11 +4159,18 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
         // Sort by pane ID (numeric creation order) when available,
         // falling back to started_at for sessions without a pane.
         match (&a.pane_id, &b.pane_id) {
-            (Some(pa), Some(pb)) => {
-                let na = pa.parse::<u64>().unwrap_or(u64::MAX);
-                let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
-                na.cmp(&nb)
-            }
+            // Issue #827: daemon-minted ids (`pane-<hex>-<n>`) do not parse as
+            // numbers, so order by the pane-scoped start time first; legacy
+            // numeric ids then order numerically, and the id breaks ties.
+            (Some(pa), Some(pb)) => a
+                .started_at
+                .cmp(&b.started_at)
+                .then_with(|| {
+                    let na = pa.parse::<u64>().unwrap_or(u64::MAX);
+                    let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
+                    na.cmp(&nb)
+                })
+                .then_with(|| pa.cmp(pb)),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.started_at.cmp(&b.started_at),
@@ -14167,6 +14174,16 @@ fn dispatch_action(
     Flow::Continue
 }
 
+/// Issue #827: live pane ids in creation order, for the saved-session
+/// snapshot. Empty for a non-embedded controller (the snapshot then falls back
+/// to numeric-then-string order).
+fn pane_creation_order(pane: &dyn PaneController) -> Vec<String> {
+    pane.as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(|e| e.pane_ids())
+        .unwrap_or_default()
+}
+
 /// PRD #89 M1.2 — flush the saved-session snapshot to disk when the coalescer
 /// says a write is due (a state change is pending and the throttle interval has
 /// elapsed since the last write). Called once per main-loop iteration, so the
@@ -14174,20 +14191,19 @@ fn dispatch_action(
 /// without writing on every keystroke. Mirrors the pre-teardown snapshot block
 /// (build from the live panes, clear when empty), then records the write so the
 /// throttle re-arms.
-fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
+fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState, pane: &dyn PaneController) {
     let now = ui.session_epoch.elapsed();
     if !ui.session_coalescer.is_due(now) {
         return;
     }
     let live_panes = state.blocking_read().managed_pane_ids.clone();
-    let mut session =
-        // Issue #827: the coder wires the real creation order (`pane_ids()`) here.
-        config::SavedSession::snapshot(
-            &mut ui.pane_metadata,
-            &ui.pane_display_names,
-            &live_panes,
-            &[],
-        );
+    let creation_order = pane_creation_order(pane);
+    let mut session = config::SavedSession::snapshot(
+        &mut ui.pane_metadata,
+        &ui.pane_display_names,
+        &live_panes,
+        &creation_order,
+    );
     // PRD #196: overlay the runtime last-command onto the live-pane snapshot so
     // it persists across restarts (the snapshot builder only knows panes).
     session.last_command = ui.last_command.clone();
@@ -16527,7 +16543,7 @@ pub fn run_tui(
         // coalescer's throttle window has elapsed, flush it to disk now. This
         // runs every iteration (including the 16ms idle ticks below), so the
         // trailing write of a coalesced burst lands without further input.
-        flush_session_snapshot_if_due(&mut ui, &state);
+        flush_session_snapshot_if_due(&mut ui, &state, &*pane);
 
         // PRD #120: build live tabs for any orchestrations the daemon spawned
         // mid-session (issue dispatch). Done before the snapshot clone + tab
@@ -18292,12 +18308,12 @@ pub fn run_tui(
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
 
+        let creation_order = pane_creation_order(&*pane);
         let mut session = config::SavedSession::snapshot(
             &mut ui.pane_metadata,
             &ui.pane_display_names,
             &live_panes,
-            // Issue #827: the coder wires the real creation order here.
-            &[],
+            &creation_order,
         );
         // PRD #196: persist the global last-command alongside the panes so it
         // survives a clean exit/restart; keep the file when only it is set.

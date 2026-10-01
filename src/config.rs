@@ -581,9 +581,10 @@ impl SavedSession {
         pane_metadata: &mut HashMap<String, SavedPane>,
         pane_display_names: &HashMap<String, String>,
         live_panes: &HashSet<String>,
-        // Issue #827: pane ids in creation order. Not consumed yet; the
-        // ordering fix reads it to write `panes` in creation order.
-        _creation_order: &[String],
+        // Issue #827: pane ids in creation order (the controller's
+        // `pane_ids()`). Panes are written in this order; ids absent from it
+        // go last (legacy numeric ids numerically, then by id string).
+        creation_order: &[String],
     ) -> Self {
         pane_metadata.retain(|id, _| live_panes.contains(id));
         for (id, meta) in pane_metadata.iter_mut() {
@@ -591,8 +592,22 @@ impl SavedSession {
                 meta.name = name.clone();
             }
         }
+        let position: HashMap<&str, usize> = creation_order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .rev()
+            .collect();
         let mut ids: Vec<&String> = pane_metadata.keys().collect();
-        ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
+        ids.sort_by(|a, b| {
+            let key = |id: &String| {
+                (
+                    position.get(id.as_str()).copied().unwrap_or(usize::MAX),
+                    id.parse::<u64>().unwrap_or(u64::MAX),
+                )
+            };
+            key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+        });
         Self {
             panes: ids
                 .into_iter()
