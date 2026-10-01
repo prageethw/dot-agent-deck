@@ -3713,6 +3713,18 @@ struct DelegationTracker {
     /// as of the last insert; agent ids are never reused, so a stale entry can
     /// never suppress a later agent's fallback.
     exit_reported_agents: HashSet<String>,
+    /// Issue #812: generations armed by `handle_delegate` whose detached
+    /// dispatch task has not yet taken the pane's dispatch lock, i.e. whose task
+    /// pointer has certainly not been handed to any worker. One global set, not
+    /// keyed by pane: generations are unique across all panes, so a bare `seq`
+    /// identifies its delegate wherever it was armed. Filled by
+    /// [`AgentPtyRegistry::mark_delegation_dispatch_pending`], emptied by
+    /// [`AgentPtyRegistry::mark_delegation_dispatch_started`] as the dispatch
+    /// starts; consulted only by
+    /// [`AgentPtyRegistry::retire_delegations_of_terminated_worker`], which must
+    /// not treat a generation nobody has dispatched yet as one the terminated
+    /// worker owed.
+    undispatched: HashSet<u64>,
 }
 
 /// PRD #249 M3 review (finding B4/S4): one armed silent-worker watch — the
@@ -5417,6 +5429,79 @@ impl AgentPtyRegistry {
         // Dropping the record is what cancels its watch.
         drop(tracker.records.remove(worker_pane_id));
         drop(tracker);
+        self.fire_delegation_retired(worker_pane_id);
+        UndeliveredDelegationRetirement::Retired
+    }
+
+    /// Issue #812: record that the delegate armed as generation `seq` has been
+    /// queued for dispatch and its task has not yet been handed to any worker.
+    /// Called by `handle_delegate` right after arming, before the detached
+    /// dispatch task is spawned; the task clears it with
+    /// [`Self::mark_delegation_dispatch_started`] once it holds the pane's
+    /// dispatch lock.
+    pub fn mark_delegation_dispatch_pending(&self, seq: u64) {
+        self.delegations.lock().unwrap().undispatched.insert(seq);
+    }
+
+    /// Issue #812: the dispatch for generation `seq` now holds the pane's
+    /// dispatch lock, so from here on its task is being (or has been) handed to a
+    /// worker. The counterpart of [`Self::mark_delegation_dispatch_pending`].
+    pub fn mark_delegation_dispatch_started(&self, seq: u64) {
+        self.delegations.lock().unwrap().undispatched.remove(&seq);
+    }
+
+    /// Issue #812: the `clear = true` respawn for the delegate whose generation
+    /// is `seq` failed or produced a dead replacement (or its guarded send was
+    /// refused after one), and it had already TERMINATED the pane's previous
+    /// worker. Every delegation that worker was DISPATCHED and still owed
+    /// (any generation `<= seq`) can therefore never be answered, so all of them
+    /// leave the outstanding set, not only `seq` as
+    /// [`Self::retire_undelivered_delegation`] does. Generations NEWER than `seq`
+    /// belong to a later delegate and stay owed, with the record and its watch.
+    ///
+    /// **A generation `<= seq` whose own dispatch has not started is also kept**
+    /// (see [`Self::mark_delegation_dispatch_pending`]). Each delegate's dispatch
+    /// is a separate detached task racing for the pane's dispatch lock, so a
+    /// newer delegate can reach its failing exit before an older one has even
+    /// begun; that older task was never given to the terminated worker, and if
+    /// the failure was transient it still delivers afterwards, so its record and
+    /// idle-worker watch must survive to cover it. Without that mark the drop
+    /// assumes dispatches take the lock in arm order, which nothing guarantees.
+    ///
+    /// | Pane state | Result |
+    /// |---|---|
+    /// | no record, or no dispatched generation `<= seq` is owed | [`UndeliveredDelegationRetirement::Nothing`] |
+    /// | nothing else is owed afterwards | record removed, watch cancelled, `DelegationRetired` sink fired |
+    /// | a newer or not-yet-dispatched generation is still owed | dispatched older ones removed; record and watch kept, nothing announced |
+    ///
+    /// One operation under the tracker's mutex, sink fired after the lock is
+    /// released and only on a genuine removal.
+    pub fn retire_delegations_of_terminated_worker(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+    ) -> UndeliveredDelegationRetirement {
+        let mut guard = self.delegations.lock().unwrap();
+        let tracker = &mut *guard;
+        let Some(record) = tracker.records.get_mut(worker_pane_id) else {
+            return UndeliveredDelegationRetirement::Nothing;
+        };
+        let before = record.owed.len();
+        record
+            .owed
+            .retain(|owed| *owed > seq || tracker.undispatched.contains(owed));
+        if record.owed.len() == before {
+            return UndeliveredDelegationRetirement::Nothing;
+        }
+        if !record.owed.is_empty() {
+            return UndeliveredDelegationRetirement::KeptOthers {
+                seq: record.seq,
+                remaining: record.owed.len() as u32,
+            };
+        }
+        // Dropping the record is what cancels its watch.
+        drop(tracker.records.remove(worker_pane_id));
+        drop(guard);
         self.fire_delegation_retired(worker_pane_id);
         UndeliveredDelegationRetirement::Retired
     }
@@ -15897,6 +15982,115 @@ mod spawn_tests {
             &["worker".to_string()],
             "the idle-watch timeout's genuine take must fire the retired sink"
         );
+    }
+
+    fn arm_generation(reg: &AgentPtyRegistry, pane: &str) -> u64 {
+        reg.arm_outstanding_delegation(pane, "coder", "orch", "orch-agent", None)
+            .expect("arm delegation")
+            .seq
+    }
+
+    fn count_retired_sink(reg: &AgentPtyRegistry) -> Arc<Mutex<Vec<String>>> {
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let fired_for_sink = fired.clone();
+        reg.set_delegation_retired_sink(Arc::new(move |pane_id| {
+            fired_for_sink.lock().unwrap().push(pane_id);
+        }));
+        fired
+    }
+
+    /// Issue #812: the `Nothing` rows of `retire_delegations_of_terminated_worker`
+    /// -- no record, and a record none of whose generations is `<= seq` -- change
+    /// nothing and announce nothing.
+    #[test]
+    fn retire_delegations_of_terminated_worker_nothing_rows_change_nothing() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let fired = count_retired_sink(&reg);
+        assert!(matches!(
+            reg.retire_delegations_of_terminated_worker("worker", 1),
+            UndeliveredDelegationRetirement::Nothing
+        ));
+
+        let armed = arm_generation(&reg, "worker");
+        assert!(matches!(
+            reg.retire_delegations_of_terminated_worker("worker", armed - 1),
+            UndeliveredDelegationRetirement::Nothing
+        ));
+        assert!(
+            reg.delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_some(),
+            "a seq older than everything owed must leave the record armed"
+        );
+        assert!(fired.lock().unwrap().is_empty());
+    }
+
+    /// Issue #812: a `seq` that is itself already gone (credited a `work-done`)
+    /// still drops the older generations, and once nothing is left the record is
+    /// removed and announced exactly once.
+    #[test]
+    fn retire_delegations_of_terminated_worker_with_seq_already_gone_drops_the_older_ones() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let fired = count_retired_sink(&reg);
+        let older = arm_generation(&reg, "worker");
+        let failing = older + 5;
+        assert!(failing > older);
+        assert!(matches!(
+            reg.retire_delegations_of_terminated_worker("worker", failing),
+            UndeliveredDelegationRetirement::Retired
+        ));
+        assert_eq!(fired.lock().unwrap().as_slice(), &["worker".to_string()]);
+        assert!(
+            reg.delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_none()
+        );
+    }
+
+    /// Issue #812: a newer generation keeps the record with its own fields
+    /// (`seq`, `role`, `armed_at` ordering) untouched and announces nothing; a
+    /// generation whose dispatch has not started is kept too, until it starts.
+    #[test]
+    fn retire_delegations_of_terminated_worker_keeps_newer_and_undispatched_generations() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let fired = count_retired_sink(&reg);
+        let earlier = arm_generation(&reg, "worker");
+        let not_yet_dispatched = arm_generation(&reg, "worker");
+        reg.mark_delegation_dispatch_pending(not_yet_dispatched);
+        let failing = arm_generation(&reg, "worker");
+        let newer = arm_generation(&reg, "worker");
+
+        let result = reg.retire_delegations_of_terminated_worker("worker", failing);
+        assert!(
+            matches!(
+                result,
+                UndeliveredDelegationRetirement::KeptOthers { seq, remaining: 2 } if seq == newer
+            ),
+            "only `earlier` and `failing` may go; the undispatched and newer stay"
+        );
+        assert!(fired.lock().unwrap().is_empty());
+        let record = reg.take_outstanding_delegation_if("worker", newer).unwrap();
+        assert_eq!(
+            record.owed.iter().copied().collect::<Vec<_>>(),
+            vec![not_yet_dispatched, newer]
+        );
+        assert_eq!(record.role, "coder");
+        assert!(earlier < not_yet_dispatched);
+
+        // Once its dispatch has started, the generation is droppable.
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let first = arm_generation(&reg, "worker");
+        reg.mark_delegation_dispatch_pending(first);
+        let second = arm_generation(&reg, "worker");
+        assert!(matches!(
+            reg.retire_delegations_of_terminated_worker("worker", second),
+            UndeliveredDelegationRetirement::KeptOthers { remaining: 1, .. }
+        ));
+        reg.mark_delegation_dispatch_started(first);
+        assert!(matches!(
+            reg.retire_delegations_of_terminated_worker("worker", second),
+            UndeliveredDelegationRetirement::Retired
+        ));
     }
 
     /// PRD #126 M1 review (finding 6): a late `work-done` from a superseded
