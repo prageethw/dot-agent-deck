@@ -140,6 +140,48 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** that pressing a digit key 10+ jumps to that card — no such shortcut exists, before or after this fix, and none is added by it; badge color or styling; layout/alignment at card widths narrow enough to truncate a two-digit prefix (`truncate_styled_segments` already handles arbitrary-width truncation and is exercised elsewhere); scrolled/multi-column grid layouts, where `flat_index` still lines up with render order the same way but is not separately re-proven here (`dashboard/grid/*` owns column/scroll layout itself).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/018 — Dashboard cards follow creation order for daemon-minted pane ids (issue #827).
+- **Layer:** L1 (in-crate `#[cfg(test)]` unit test of `filter_sessions` over a hand-built `AppState`; no terminal).
+- **Agent:** none.
+- **Asserts:** twelve sessions for `pane-<nonce>-<seq>` ids, created one second apart (nonce decreasing, so id order is the reverse of creation order) and inserted in reverse, come out of `filter_sessions` in `started_at` (creation) order. Before the fix the comparator parsed the pane id as a number, every minted id fell to `u64::MAX`, and the card order was the map's arbitrary iteration order, which also scrambled the number badges and jump shortcuts.
+- **Does not assert:** badge rendering (`dashboard/pane/017`); filtering by text or type.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/019 — Sessions with equal start times order deterministically by pane id (issue #827).
+- **Layer:** L1 (in-crate `#[cfg(test)]` unit test of `filter_sessions` over a hand-built `AppState`; no terminal).
+- **Agent:** none.
+- **Asserts:** eight sessions with one shared `started_at` and minted pane ids come out sorted by the pane-id string, whatever the map iteration order.
+- **Does not assert:** which tie-break is best for users; only that it is deterministic.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/020 — A session re-keyed by the early-event adoption keeps its place by `started_at` (issue #827).
+- **Layer:** L1 (in-crate `#[cfg(test)]` unit test of `filter_sessions` over a hand-built `AppState`; no terminal).
+- **Agent:** none.
+- **Asserts:** eight sessions whose map keys sort in the reverse of creation order (as an adopted key can) still come out in `started_at` order.
+- **Does not assert:** the real `adopt_early_pane_session` path (private to `state.rs`); the fixture simulates its outcome: a re-keyed entry that keeps the earlier `started_at`.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/021 — Legacy numeric pane ids still order numerically and a pane-less session still sorts last (issue #827 compatibility guard).
+- **Layer:** L1 (in-crate `#[cfg(test)]` unit test of `filter_sessions` over a hand-built `AppState`; no terminal).
+- **Agent:** none.
+- **Asserts:** eight numeric ids sharing one `started_at` order numerically (`1, 2, 3, 4, 7, 10, 11, 22`), and a session with no pane id follows them. This passes before and after the fix.
+- **Does not assert:** mixed numeric and minted ids in one deck.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/022 — Equal start times in one daemon run break ties by numeric creation sequence (issue #827).
+- **Layer:** L1 (in-crate `#[cfg(test)]` unit test of `filter_sessions` over a hand-built `AppState`; no terminal).
+- **Agent:** none.
+- **Asserts:** four same-nonce minted ids with sequences 2, 9, 10, 11 and one shared `started_at` order `2, 9, 10, 11`, not string order.
+- **Does not assert:** ids from different nonces sharing a start time beyond the nonce-then-sequence rule.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/023 — `pane_creation_order` returns the embedded controller's creation-ordered pane ids and nothing for a non-embedded controller (issue #827).
+- **Layer:** L1 (in-crate `#[cfg(test)]` unit test using the render-only `EmbeddedPaneController` seam with in-process stream pairs; no daemon).
+- **Agent:** none.
+- **Asserts:** with three wired panes the result is non-empty and equals `pane_ids()`; a non-embedded controller yields an empty list.
+- **Does not assert:** the snapshot callers themselves.
+- **Platform coverage:** mac+linux (unix-only in-process stream pair; `#[cfg(unix)]`).
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
@@ -6715,6 +6757,41 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** (a) a populated `SavedFocus` (`version`, `dashboard_active`, `active_pane`, `tab_panes`) serializes to TOML and deserializes back equal; (b) a legacy `session.toml` with no `[focus]` table parses with `focus == None`, which the restore path reads as "nothing remembered" and which therefore leaves the deck's own landing choice untouched; (c) a `[focus]` table carrying only ONE key still parses, the saved panes beside it survive, and the absent keys take their `#[serde(default)]` values. (d) the OTHER compatibility direction — an OLDER build reading what this one writes — checked by deserializing the new writer's output into a local struct carrying only the pre-issue-#949 fields, which must still recover the panes and `last_command`. (c) and (d) are the cases that matter most: `SavedSession::load` turns any TOML error into "no session at all", so an unrecognised `[focus]` table must never cost either build every pane. (d) is a claim about `deny_unknown_fields` being absent, which is the kind of thing worth checking rather than asserting.
 - **Does not assert:** the capture that populates the field or the restore that consumes it (`session/restore/017`–`018`); the user-visible detach/reattach cycle (`session/restore/016`); the file's on-disk permissions or atomic-rename write (`session/save/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### config/saved-session/003 — `SavedSession::snapshot` writes `panes` in creation order for daemon-minted ids (issue #827).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession::snapshot`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** twelve live panes with `pane-<nonce>-<seq>` ids (nonce decreasing, so lexicographic order is reverse creation order), snapshotted with their creation order supplied, are written in that order. Before the fix the sort parsed each id as a number, every minted id became 0, and the written order was the map's arbitrary iteration order.
+- **Does not assert:** the production wiring that supplies `EmbeddedPaneController::pane_ids()` at the two call sites in `run_tui`.
+- **Platform coverage:** mac+linux+windows.
+
+##### config/saved-session/004 — Creation order survives the `session.toml` write and reload (issue #827).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession::snapshot`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** the snapshot of the same twelve panes, serialized to TOML and read back, still lists `panes` in creation order; the `[[panes]]` array order is the only order carrier on disk and no order field is added.
+- **Does not assert:** the restore block in `run_tui` that turns the array order into tabs and the landing tab (inline, not reachable in-process); no e2e covers that landing, because it needs several rebuilt orchestration tabs whose creation order is observable from the grid.
+- **Platform coverage:** mac+linux+windows.
+
+##### config/saved-session/005 — Panes missing from the supplied creation order go last: numeric ids numerically, then by id string (issue #827).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession::snapshot`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** twelve known panes followed by `2`, `10`, `pane-aa-9`, `pane-zz-1`, in the order `[known..., 2, 10, pane-aa-9, pane-zz-1]`.
+- **Does not assert:** hydrated panes from another daemon's nonce beyond this ordering rule.
+- **Platform coverage:** mac+linux+windows.
+
+##### config/saved-session/006 — Legacy numeric ids still snapshot numerically and a `session.toml` from the previous build still parses in file order (issue #827 compatibility guard).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession::snapshot`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** eight numeric ids snapshotted with no creation order come out numerically; a file with no order field of any kind parses and keeps its `[[panes]]` order. This passes before and after the fix.
+- **Does not assert:** newer-writer to older-reader compatibility, since no field is added.
+- **Platform coverage:** mac+linux+windows.
+
+##### config/saved-session/007 — Panes missing from the creation order and sharing a daemon nonce snapshot by numeric sequence (issue #827).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession::snapshot`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** with no creation order, a legacy numeric id comes first, then same-nonce minted ids with sequences 2, 9, 10, 11 in numeric order, then an unparseable id.
+- **Does not assert:** the creation-order path (covered by `saved-session/003`-`005`).
 - **Platform coverage:** mac+linux+windows.
 
 ### CLI surface (PRD #89 Phase 3)

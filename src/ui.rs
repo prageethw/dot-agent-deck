@@ -4156,14 +4156,17 @@ fn register_restored_pane_placeholder(
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
     sessions.sort_by(|(_, a), (_, b)| {
-        // Sort by pane ID (numeric creation order) when available,
-        // falling back to started_at for sessions without a pane.
+        // Sort by pane-scoped start time, then (for equal times) the legacy
+        // numeric id / trailing creation sequence, then the id string; fall
+        // back to started_at alone for sessions without a pane.
         match (&a.pane_id, &b.pane_id) {
-            (Some(pa), Some(pb)) => {
-                let na = pa.parse::<u64>().unwrap_or(u64::MAX);
-                let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
-                na.cmp(&nb)
-            }
+            // Issue #827: daemon-minted ids (`pane-<hex>-<n>`) do not parse as
+            // numbers, so order by the pane-scoped start time first; legacy
+            // numeric ids then order numerically, and the id breaks ties.
+            (Some(pa), Some(pb)) => a
+                .started_at
+                .cmp(&b.started_at)
+                .then_with(|| config::pane_id_order(pa, pb)),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.started_at.cmp(&b.started_at),
@@ -14167,6 +14170,16 @@ fn dispatch_action(
     Flow::Continue
 }
 
+/// Issue #827: live pane ids in creation order, for the saved-session
+/// snapshot. Empty for a non-embedded controller (the snapshot then falls back
+/// to numeric-then-string order).
+pub(crate) fn pane_creation_order(pane: &dyn PaneController) -> Vec<String> {
+    pane.as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(|e| e.pane_ids())
+        .unwrap_or_default()
+}
+
 /// PRD #89 M1.2 — flush the saved-session snapshot to disk when the coalescer
 /// says a write is due (a state change is pending and the throttle interval has
 /// elapsed since the last write). Called once per main-loop iteration, so the
@@ -14174,14 +14187,19 @@ fn dispatch_action(
 /// without writing on every keystroke. Mirrors the pre-teardown snapshot block
 /// (build from the live panes, clear when empty), then records the write so the
 /// throttle re-arms.
-fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
+fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState, pane: &dyn PaneController) {
     let now = ui.session_epoch.elapsed();
     if !ui.session_coalescer.is_due(now) {
         return;
     }
     let live_panes = state.blocking_read().managed_pane_ids.clone();
-    let mut session =
-        config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
+    let creation_order = pane_creation_order(pane);
+    let mut session = config::SavedSession::snapshot(
+        &mut ui.pane_metadata,
+        &ui.pane_display_names,
+        &live_panes,
+        &creation_order,
+    );
     // PRD #196: overlay the runtime last-command onto the live-pane snapshot so
     // it persists across restarts (the snapshot builder only knows panes).
     session.last_command = ui.last_command.clone();
@@ -16521,7 +16539,7 @@ pub fn run_tui(
         // coalescer's throttle window has elapsed, flush it to disk now. This
         // runs every iteration (including the 16ms idle ticks below), so the
         // trailing write of a coalesced burst lands without further input.
-        flush_session_snapshot_if_due(&mut ui, &state);
+        flush_session_snapshot_if_due(&mut ui, &state, &*pane);
 
         // PRD #120: build live tabs for any orchestrations the daemon spawned
         // mid-session (issue dispatch). Done before the snapshot clone + tab
@@ -18286,10 +18304,12 @@ pub fn run_tui(
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
 
+        let creation_order = pane_creation_order(&*pane);
         let mut session = config::SavedSession::snapshot(
             &mut ui.pane_metadata,
             &ui.pane_display_names,
             &live_panes,
+            &creation_order,
         );
         // PRD #196: persist the global last-command alongside the panes so it
         // survives a clean exit/restart; keep the file when only it is set.
@@ -35147,6 +35167,170 @@ mod tests {
         let filtered = filter_sessions(&state, &ui);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, "beta");
+    }
+
+    /// Issue #827 helper: a session for `pane` whose `started_at` is
+    /// `base + secs`, stored under `key` (the session id, not the pane id).
+    fn card_session_at(
+        state: &mut AppState,
+        key: &str,
+        pane: &str,
+        base: chrono::DateTime<Utc>,
+        secs: i64,
+    ) {
+        let mut s = make_session(SessionStatus::Idle);
+        s.session_id = key.to_string();
+        s.pane_id = Some(pane.to_string());
+        s.started_at = base + chrono::Duration::seconds(secs);
+        state.sessions.insert(key.to_string(), s);
+    }
+
+    /// Daemon-minted-shaped ids in creation order, nonce decreasing so the
+    /// lexicographic order is the reverse of creation order.
+    fn card_minted_ids(n: u64) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("pane-{:016x}-{}", 0xfedc_ba98_7654_3210u64 - i * 0x1111, i))
+            .collect()
+    }
+
+    fn card_pane_order(state: &AppState) -> Vec<String> {
+        let ui = default_ui();
+        filter_sessions(state, &ui)
+            .iter()
+            .map(|(_, s)| s.pane_id.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// Scenario: Twelve sessions for daemon-minted pane ids, created one second
+    /// apart and inserted in reverse, give the dashboard its card list. Cards
+    /// (and so the number badges and jump shortcuts) must follow creation
+    /// order. On the old build every minted id parsed to the same key, so the
+    /// order was the map's arbitrary iteration order.
+    #[spec("dashboard/pane/018")]
+    #[test]
+    fn pane_018_cards_follow_creation_order_for_daemon_minted_ids() {
+        let ids = card_minted_ids(12);
+        let base = Utc::now();
+        let mut state = AppState::default();
+        for (i, id) in ids.iter().enumerate().rev() {
+            card_session_at(&mut state, &format!("sess-{id}"), id, base, i as i64);
+        }
+        assert_eq!(
+            card_pane_order(&state),
+            ids,
+            "issue #827: card order must be creation order; on the old build it is arbitrary"
+        );
+    }
+
+    /// Scenario: Eight sessions share one `started_at` and carry daemon-minted
+    /// ids. Their card order must be deterministic: the id string breaks the
+    /// tie, whatever order the map happens to iterate in.
+    #[spec("dashboard/pane/019")]
+    #[test]
+    fn pane_019_equal_start_times_break_ties_by_pane_id() {
+        let mut ids = card_minted_ids(8);
+        let base = Utc::now();
+        let mut state = AppState::default();
+        for id in &ids {
+            card_session_at(&mut state, &format!("sess-{id}"), id, base, 0);
+        }
+        ids.sort();
+        assert_eq!(
+            card_pane_order(&state),
+            ids,
+            "issue #827: equal start times must order by pane id; on the old build \
+             all minted ids tie and the map's arbitrary order shows through"
+        );
+    }
+
+    /// Scenario: Four sessions of one daemon run (same nonce) with sequence
+    /// numbers 2, 9, 10 and 11 start at the same instant. The tie must break
+    /// by the numeric sequence, so 10 and 11 come after 9, not between 1x and 2.
+    #[spec("dashboard/pane/022")]
+    #[test]
+    fn pane_022_equal_start_times_break_ties_by_numeric_sequence() {
+        let base = Utc::now();
+        let mut state = AppState::default();
+        let want: Vec<String> = [2, 9, 10, 11]
+            .iter()
+            .map(|n| format!("pane-00000000000000aa-{n}"))
+            .collect();
+        for id in want.iter().rev() {
+            card_session_at(&mut state, &format!("sess-{id}"), id, base, 0);
+        }
+        assert_eq!(card_pane_order(&state), want);
+    }
+
+    /// Scenario: `pane_creation_order` is handed a real embedded controller
+    /// holding three panes and must return its creation-ordered `pane_ids()`
+    /// (non-empty); handed a non-embedded controller it returns nothing.
+    #[spec("dashboard/pane/023")]
+    #[cfg(unix)]
+    #[test]
+    fn pane_023_pane_creation_order_reads_the_embedded_controller() {
+        let controller = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+        let created: Vec<String> = (0..3)
+            .map(|seq| format!("pane-9e3779b97f4a7c15-{seq}"))
+            .collect();
+        let _peers = controller.wire_test_stream_panes(&created);
+        let order = pane_creation_order(&controller);
+        assert!(
+            !order.is_empty(),
+            "embedded controller must yield its panes"
+        );
+        assert_eq!(order, controller.pane_ids());
+        assert_eq!(order, created);
+        assert!(pane_creation_order(&RecordingPaneController::default()).is_empty());
+    }
+
+    /// Scenario: Eight sessions were re-keyed by the early-event adoption:
+    /// their map keys are unrelated to pane order, yet each keeps the
+    /// `started_at` it had from its first event. The cards must still follow
+    /// `started_at` (creation) order, not the key or insertion order.
+    #[spec("dashboard/pane/020")]
+    #[test]
+    fn pane_020_rekeyed_sessions_keep_creation_order_from_started_at() {
+        let ids = card_minted_ids(8);
+        let base = Utc::now();
+        let mut state = AppState::default();
+        // Keys sort in the reverse of creation order, as an adopted key can.
+        for (i, id) in ids.iter().enumerate().rev() {
+            card_session_at(
+                &mut state,
+                &format!("session-{:02}", 99 - i),
+                id,
+                base,
+                i as i64,
+            );
+        }
+        assert_eq!(
+            card_pane_order(&state),
+            ids,
+            "issue #827: a re-keyed session keeps its place by started_at; on the old \
+             build the order is arbitrary for minted ids"
+        );
+    }
+
+    /// Scenario: Legacy numeric pane ids that share one start time still order
+    /// numerically, and a session with no pane sorts after every pane-backed
+    /// one, as before the ordering fix.
+    #[spec("dashboard/pane/021")]
+    #[test]
+    fn pane_021_legacy_numeric_ids_order_numerically_and_paneless_sorts_last() {
+        let base = Utc::now();
+        let mut state = AppState::default();
+        for id in ["10", "3", "1", "22", "2", "7", "11", "4"] {
+            card_session_at(&mut state, &format!("sess-{id}"), id, base, 0);
+        }
+        let mut paneless = make_session(SessionStatus::Idle);
+        paneless.session_id = "no-pane".to_string();
+        state.sessions.insert("no-pane".to_string(), paneless);
+        let mut want: Vec<String> = ["1", "2", "3", "4", "7", "10", "11", "22"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        want.push(String::new());
+        assert_eq!(card_pane_order(&state), want);
     }
 
     #[test]

@@ -581,6 +581,10 @@ impl SavedSession {
         pane_metadata: &mut HashMap<String, SavedPane>,
         pane_display_names: &HashMap<String, String>,
         live_panes: &HashSet<String>,
+        // Issue #827: pane ids in creation order (the controller's
+        // `pane_ids()`). Panes are written in this order; ids absent from it
+        // go last (legacy numeric ids numerically, then by id string).
+        creation_order: &[String],
     ) -> Self {
         pane_metadata.retain(|id, _| live_panes.contains(id));
         for (id, meta) in pane_metadata.iter_mut() {
@@ -588,8 +592,17 @@ impl SavedSession {
                 meta.name = name.clone();
             }
         }
+        let position: HashMap<&str, usize> = creation_order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .rev()
+            .collect();
         let mut ids: Vec<&String> = pane_metadata.keys().collect();
-        ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
+        ids.sort_by(|a, b| {
+            let pos = |id: &String| position.get(id.as_str()).copied().unwrap_or(usize::MAX);
+            pos(a).cmp(&pos(b)).then_with(|| pane_id_order(a, b))
+        });
         Self {
             panes: ids
                 .into_iter()
@@ -605,6 +618,29 @@ impl SavedSession {
             focus: None,
         }
     }
+}
+
+/// Issue #827: total order on pane ids for the places that must break a tie
+/// (equal card start times; panes the creation order does not know). Legacy
+/// numeric ids come first, numerically; daemon-minted `<prefix>-<seq>` ids
+/// next, by prefix (the per-daemon nonce) then NUMERIC trailing sequence, so
+/// `-2` precedes `-10`; anything else last, by string. The final id-string
+/// compare makes it total (`"7"` and `"007"` parse alike). It is a
+/// lexicographic order on `(class, prefix, number, id)`, hence transitive.
+pub fn pane_id_order(a: &str, b: &str) -> std::cmp::Ordering {
+    fn key(id: &str) -> (u8, &str, u64) {
+        if let Ok(n) = id.parse::<u64>() {
+            return (0, "", n);
+        }
+        if let Some((prefix, seq)) = id.rsplit_once('-')
+            && !prefix.is_empty()
+            && let Ok(n) = seq.parse::<u64>()
+        {
+            return (1, prefix, n);
+        }
+        (2, id, 0)
+    }
+    key(a).cmp(&key(b)).then_with(|| a.cmp(b))
 }
 
 /// PRD #89 M1.2 — leading-edge throttle that coalesces saved-session snapshot
@@ -2137,6 +2173,177 @@ mod tests {
         assert!(
             !coalescer.is_due(after + interval + interval),
             "no write is due once the burst has been flushed and nothing new is dirty"
+        );
+    }
+
+    /// Twelve daemon-minted-shaped pane ids (`pane-<16 hex>-<seq>`) in creation
+    /// order, with the nonce DEcreasing so the lexicographic order of the ids
+    /// is the reverse of creation order and no numeric parse of an id helps.
+    fn minted_ids_in_creation_order() -> Vec<String> {
+        (0u64..12)
+            .map(|i| format!("pane-{:016x}-{}", 0xfedc_ba98_7654_3210u64 - i * 0x1111, i))
+            .collect()
+    }
+
+    fn saved_pane_named(name: &str) -> SavedPane {
+        SavedPane {
+            dir: "/repo/app".to_string(),
+            name: name.to_string(),
+            command: "claude".to_string(),
+            mode: None,
+            orchestration: None,
+        }
+    }
+
+    /// Build the snapshot inputs for `ids`: a metadata map named after each id.
+    fn snapshot_inputs(
+        ids: &[String],
+    ) -> (
+        HashMap<String, SavedPane>,
+        HashMap<String, String>,
+        HashSet<String>,
+    ) {
+        let meta = ids
+            .iter()
+            .map(|id| (id.clone(), saved_pane_named(id)))
+            .collect();
+        let live = ids.iter().cloned().collect();
+        (meta, HashMap::new(), live)
+    }
+
+    /// Scenario: Snapshot twelve panes whose daemon-minted ids are in creation
+    /// order but reverse-lexicographic, handing the snapshot that creation
+    /// order. The written `panes` array must be in creation order. On the old
+    /// build the order is arbitrary (every non-numeric id sorted as 0, so the
+    /// map's iteration order leaked into the file).
+    #[spec("config/saved-session/003")]
+    #[test]
+    fn saved_session_003_snapshot_writes_panes_in_creation_order() {
+        let ids = minted_ids_in_creation_order();
+        let (mut meta, names, live) = snapshot_inputs(&ids);
+        let session = SavedSession::snapshot(&mut meta, &names, &live, &ids);
+        let got: Vec<&str> = session.panes.iter().map(|p| p.name.as_str()).collect();
+        let want: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            got, want,
+            "issue #827: the snapshot must write panes in creation order; on the \
+             old build the order of daemon-minted ids is arbitrary (map iteration)"
+        );
+    }
+
+    /// Scenario: Snapshot twelve panes in creation order, serialize the result
+    /// to TOML and read it back, as the save then restore path does. The
+    /// reloaded `panes` array, which is the only order the restore consumes,
+    /// must still be creation order.
+    #[spec("config/saved-session/004")]
+    #[test]
+    fn saved_session_004_creation_order_survives_the_toml_round_trip() {
+        let ids = minted_ids_in_creation_order();
+        let (mut meta, names, live) = snapshot_inputs(&ids);
+        let session = SavedSession::snapshot(&mut meta, &names, &live, &ids);
+        let text = toml::to_string_pretty(&session).unwrap();
+        let reloaded: SavedSession = toml::from_str(&text).unwrap();
+        let got: Vec<&str> = reloaded.panes.iter().map(|p| p.name.as_str()).collect();
+        let want: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            got, want,
+            "issue #827: a saved then reloaded session must restore panes in creation \
+             order; on the old build the saved order is arbitrary"
+        );
+    }
+
+    /// Scenario: Snapshot a mix of panes the creation order knows about and
+    /// panes it does not (including legacy numeric ids). Known panes come
+    /// first in the given order; the unknown ones follow, the numeric ones in
+    /// numeric order and any others by id string.
+    #[spec("config/saved-session/005")]
+    #[test]
+    fn saved_session_005_panes_missing_from_creation_order_go_last() {
+        let known = minted_ids_in_creation_order();
+        let mut all = known.clone();
+        let unknown: Vec<String> = ["10", "2", "pane-zz-1", "pane-aa-9"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        all.extend(unknown.iter().cloned());
+        let (mut meta, names, live) = snapshot_inputs(&all);
+        let session = SavedSession::snapshot(&mut meta, &names, &live, &known);
+        let got: Vec<&str> = session.panes.iter().map(|p| p.name.as_str()).collect();
+        let mut want: Vec<&str> = known.iter().map(String::as_str).collect();
+        // Numeric legacy ids numerically (2 before 10), then the rest by id.
+        want.extend(["2", "10", "pane-aa-9", "pane-zz-1"]);
+        assert_eq!(
+            got, want,
+            "issue #827: panes absent from the creation order must follow the known \
+             ones, numeric ids numerically then the rest by id string"
+        );
+    }
+
+    /// Scenario: Snapshot legacy numeric pane ids with no creation order
+    /// supplied, and load a `session.toml` written by the previous build (no
+    /// order field of any kind). Numeric ids still come out in numeric order,
+    /// and the old file still parses with its panes in file order (a check on
+    /// the on-disk format staying unchanged; it exercises TOML parsing, not
+    /// the snapshot code).
+    #[spec("config/saved-session/006")]
+    #[test]
+    fn saved_session_006_legacy_numeric_ids_and_old_files_still_work() {
+        let ids: Vec<String> = ["10", "3", "1", "22", "2", "7", "11", "4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (mut meta, names, live) = snapshot_inputs(&ids);
+        let session = SavedSession::snapshot(&mut meta, &names, &live, &[]);
+        let got: Vec<&str> = session.panes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(got, ["1", "2", "3", "4", "7", "10", "11", "22"]);
+
+        let old_file = r#"
+[[panes]]
+dir = "/repo/a"
+name = "second-saved"
+command = "claude"
+
+[[panes]]
+dir = "/repo/b"
+name = "first-saved"
+command = "claude"
+"#;
+        let loaded: SavedSession = toml::from_str(old_file).unwrap();
+        let names: Vec<&str> = loaded.panes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["second-saved", "first-saved"]);
+    }
+
+    /// Scenario: Snapshot panes the creation order does not know that share one
+    /// daemon nonce, with sequence numbers 2, 9, 10 and 11 plus a legacy
+    /// numeric id and an unparseable id. Legacy numeric first, then minted by
+    /// numeric sequence (9 before 10, not string order), then the rest.
+    #[spec("config/saved-session/007")]
+    #[test]
+    fn saved_session_007_unknown_panes_order_by_numeric_sequence() {
+        let ids: Vec<String> = [
+            "pane-00000000000000aa-11",
+            "weird",
+            "pane-00000000000000aa-2",
+            "5",
+            "pane-00000000000000aa-10",
+            "pane-00000000000000aa-9",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (mut meta, names, live) = snapshot_inputs(&ids);
+        let session = SavedSession::snapshot(&mut meta, &names, &live, &[]);
+        let got: Vec<&str> = session.panes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            got,
+            [
+                "5",
+                "pane-00000000000000aa-2",
+                "pane-00000000000000aa-9",
+                "pane-00000000000000aa-10",
+                "pane-00000000000000aa-11",
+                "weird"
+            ]
         );
     }
 
