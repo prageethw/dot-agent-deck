@@ -36,6 +36,10 @@ export default defineConfig({
   // narrowing to one test is never what the author meant.
   forbidOnly: !!process.env.CI,
   retries: 0,
+  // Issue #807: bound a hang. The suite takes ~3.5 minutes today; 8 minutes
+  // leaves ~2.3x headroom for it to grow, and it ends before the CI step's
+  // 9-minute limit so Playwright stops and writes its HTML report first.
+  globalTimeout: 8 * 60 * 1000,
   // One worker in CI to start. Layout is not timing-dependent, but browser
   // startup on a 4-vCPU runner contends with itself, and this job has no honest
   // runs yet — the same reason `e2e-deterministic` was added advisory. Raising
