@@ -4,5 +4,5 @@ expression: rendered
 ---
  worker-deck — 7 session(s)  (↓5)                                                         
 ┏ ▸ 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Idle ┓┌ 2 ──────────────────────────────── ● Idle ┐
-┃orchestrator                               ┃│developer                                  │
+┃orchestrator  Dir: dot-agent-deck          ┃│developer  Dir: dot-agent-deck             │
 ┗━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 0 ┛└─────────────────────── Last: 0s  Tools: 0 ┘
