@@ -45,6 +45,10 @@ const CLI_DRIVEN_PANE: &str = "status-cli-driven-pane-6a8d31";
 #[cfg(unix)]
 const CLI_CONTROL_PANE: &str = "status-cli-control-pane-8c2f47";
 #[cfg(unix)]
+const OBS_ORCH_PANE: &str = "status-obs-orch-pane-5e1b83";
+#[cfg(unix)]
+const OBS_WORKER_PANE: &str = "status-obs-worker-pane-a47d20";
+#[cfg(unix)]
 const JSON_ORCH_PANE: &str = "status-json-orch-pane-3f7c9a";
 
 /// Build the same raw `AgentEvent` the `agent-event --type running` CLI path
@@ -905,6 +909,174 @@ async fn daemon_status_005_real_agent_event_cli_joins_live_state_inner() {
         observed.pane_id,
         observed.agent_id,
         observed.event_type
+    );
+
+    daemon.registry.shutdown_all();
+}
+
+/// The STATUS column (4th tab-separated field) of `pane`'s row in the human
+/// `daemon status` table, or `None` when the table prints no row for it.
+#[cfg(unix)]
+fn human_status_cell(table: &str, pane: &str) -> Option<String> {
+    table
+        .lines()
+        .find(|l| l.split('\t').next() == Some(pane))
+        .and_then(|l| l.split('\t').nth(3))
+        .map(str::to_string)
+}
+
+/// The `observing_delegations` flag of `pane`'s row in the `--json` document.
+#[cfg(unix)]
+fn json_observing_delegations(stdout: &str, pane: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("`daemon status --json` did not parse: {e}; stdout={stdout:?}"));
+    v["agents"]
+        .as_array()?
+        .iter()
+        .find(|a| a["pane_id"] == pane)?
+        .get("observing_delegations")?
+        .as_bool()
+}
+
+/// Scenario: Bring up an in-process daemon with an Idle orchestrator agent and no agent at all on a worker pane. With no delegation outstanding, run the real `daemon status` (human and `--json`) and confirm the orchestrator reads `Idle` / `observing_delegations: false`. Then arm an outstanding delegation from the orchestrator onto the agentless worker pane and run both again: the orchestrator must read `Observing` / `true`, because the daemon still holds the delegation even though the worker pane prints no row (issue #817).
+#[spec("daemon/status/006")]
+#[test]
+#[cfg(unix)]
+fn daemon_status_006_orchestrator_observes_delegation_on_agentless_worker_pane() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build daemon-status observing runtime")
+        .block_on(
+            daemon_status_006_orchestrator_observes_delegation_on_agentless_worker_pane_inner(),
+        );
+}
+
+#[cfg(unix)]
+async fn daemon_status_006_orchestrator_observes_delegation_on_agentless_worker_pane_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
+
+    {
+        let mut state = daemon.state.write().await;
+        state.register_pane(OBS_ORCH_PANE.to_string());
+    }
+    let orch_agent_id = daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd_str),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                OBS_ORCH_PANE.to_string(),
+            )],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn orchestrator stub");
+    let mut idle = thinking_event(OBS_ORCH_PANE, &orch_agent_id, None);
+    idle.event_type = EventType::Idle;
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&idle).expect("serialize orchestrator Idle event"),
+    )
+    .expect("write orchestrator Idle event");
+    wait_for_live_session(
+        &daemon,
+        OBS_ORCH_PANE,
+        &orch_agent_id,
+        Duration::from_secs(5),
+    )
+    .await;
+    // Let the Idle event land (the session may first exist from another frame).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let is_idle = {
+            let state = daemon.state.read().await;
+            state.sessions.values().any(|s| {
+                s.agent_id.as_deref() == Some(orch_agent_id.as_str())
+                    && s.status == SessionStatus::Idle
+            })
+        };
+        if is_idle {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setup: orchestrator session never reached Idle"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Negative control: nothing outstanding -> the orchestrator is plainly Idle.
+    let human = run_daemon_status_cli(&daemon.attach_path, false).await;
+    let json = run_daemon_status_cli(&daemon.attach_path, true).await;
+    assert!(human.status.success() && json.status.success());
+    assert_eq!(
+        human_status_cell(&human.stdout, OBS_ORCH_PANE).as_deref(),
+        Some("Idle"),
+        "control: with no delegation outstanding the orchestrator must read Idle; table:\n{}",
+        human.stdout
+    );
+    assert_eq!(
+        json_observing_delegations(&json.stdout, OBS_ORCH_PANE),
+        Some(false),
+        "control: with no delegation outstanding `observing_delegations` must be false; \
+         json={}",
+        json.stdout
+    );
+
+    // Setup guard: the delegation is armed on the worker pane, which has NO
+    // live agent.
+    assert!(
+        daemon
+            .registry
+            .arm_outstanding_delegation(
+                OBS_WORKER_PANE,
+                "coder",
+                OBS_ORCH_PANE,
+                &orch_agent_id,
+                None
+            )
+            .is_some(),
+        "setup: arming the outstanding delegation on the worker pane must succeed"
+    );
+    assert!(
+        daemon
+            .registry
+            .delegation_watch_snapshot(OBS_WORKER_PANE)
+            .outstanding_delegation
+            .is_some(),
+        "setup: the outstanding delegation must be held by the daemon for the worker pane"
+    );
+    assert!(
+        daemon
+            .registry
+            .agent_records()
+            .iter()
+            .all(|r| r.pane_id_env.as_deref() != Some(OBS_WORKER_PANE)),
+        "setup: the worker pane must have no live agent"
+    );
+
+    let human = run_daemon_status_cli(&daemon.attach_path, false).await;
+    let json = run_daemon_status_cli(&daemon.attach_path, true).await;
+    assert!(human.status.success() && json.status.success());
+    assert_eq!(
+        human_status_cell(&human.stdout, OBS_ORCH_PANE).as_deref(),
+        Some("Observing"),
+        "issue #817: the daemon holds a delegation from the orchestrator onto an agentless \
+         worker pane (armed, no live agent, so `daemon status` prints no row for it); the \
+         orchestrator must still read Observing like the TUI does. table:\n{}",
+        human.stdout
+    );
+    assert_eq!(
+        json_observing_delegations(&json.stdout, OBS_ORCH_PANE),
+        Some(true),
+        "issue #817: `--json` must report `observing_delegations: true` for the orchestrator \
+         whose delegation sits on an agentless worker pane; json={}",
+        json.stdout
     );
 
     daemon.registry.shutdown_all();

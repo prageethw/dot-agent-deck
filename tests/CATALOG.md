@@ -1325,6 +1325,13 @@ Issue #803: an orchestrator whose real status is `Idle` and which has at least o
 - **Does not assert:** exact human status wording or column layout; the exact JSON status string and schema field names (`daemon/status/002`); a literal TUI detach/reconnect (`session/live/012`).
 - **Platform coverage:** mac+linux.
 
+##### daemon/status/006 — An Idle orchestrator whose delegation sits on a worker pane with no live agent still reads `Observing` (table) and `observing_delegations: true` (`--json`), like the TUI.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status [--json]` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub orchestrator pane driven to `Idle` over the daemon's hook socket; the worker pane is never given an agent, and an outstanding delegation onto it is armed directly on the registry).
+- **Asserts:** control first (no delegation outstanding): the orchestrator row reads `Idle` and `observing_delegations` is `false`; then, after the delegation is armed on the agentless worker pane (setup-guarded: the daemon holds it, the pane has no live agent), the orchestrator row reads `Observing` and `--json` reports `observing_delegations: true`.
+- **Does not assert:** whether a row is printed for the agentless worker pane; wait-held `Observing` (`src/daemon_status.rs` unit tests).
+- **Platform coverage:** mac+linux.
+
 #### worktree/create
 
 ##### worktree/create/001 — Two concurrent callers of `create_worktree_sync`, both attaching to the SAME already-existing branch at the SAME target path (fork issue #282's "attach race"), never both report `Created`, and git's own worktree admin state never ends up registering the path twice.

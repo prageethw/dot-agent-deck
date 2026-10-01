@@ -3635,6 +3635,21 @@ pub struct WatchSnapshot {
     pub orchestrator_pane_id: String,
 }
 
+/// Issue #817: one outstanding delegation the daemon holds, keyed by the
+/// worker pane it was issued to. Rides the `ListAgents` reply
+/// ([`crate::daemon_protocol::AttachResponse::outstanding_delegations`]) so a
+/// client can see a delegation whose worker pane has no live agent record.
+///
+/// `watch` is flattened onto the entry, so [`WatchSnapshot`] must never gain a
+/// field named `worker_pane_id` (it would collide on the wire). The flat shape
+/// is pinned by a literal-JSON test in `daemon_protocol`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutstandingDelegationEntry {
+    pub worker_pane_id: String,
+    #[serde(flatten)]
+    pub watch: WatchSnapshot,
+}
+
 /// Issue #586 M1/M2: the wire-safe shape of an armed [`DelegationCommission`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommissionSnapshot {
@@ -5040,6 +5055,27 @@ impl AgentPtyRegistry {
         // pointing its close sweep at the dead pane.
         entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
         true
+    }
+
+    /// Issue #817: every outstanding delegation the daemon holds, one entry per
+    /// worker pane, independent of whether that pane currently has a live agent
+    /// record. Sorted by worker pane id so the reply is deterministic.
+    pub fn outstanding_delegations(&self) -> Vec<OutstandingDelegationEntry> {
+        let tracker = self.delegations.lock().unwrap();
+        let now = Instant::now();
+        let mut entries: Vec<OutstandingDelegationEntry> = tracker
+            .records
+            .iter()
+            .map(|(worker, r)| OutstandingDelegationEntry {
+                worker_pane_id: worker.clone(),
+                watch: WatchSnapshot {
+                    armed_secs_ago: now.duration_since(r.armed_at).as_secs(),
+                    orchestrator_pane_id: r.orchestrator_pane_id.clone(),
+                },
+            })
+            .collect();
+        entries.sort_by(|a, b| a.worker_pane_id.cmp(&b.worker_pane_id));
+        entries
     }
 
     /// Issue #586 M1/M2: a point-in-time snapshot of the delegation-watch state

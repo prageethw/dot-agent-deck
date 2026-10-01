@@ -2778,26 +2778,35 @@ fn run_daemon_hello_cli() -> ExitCode {
 #[tokio::main]
 async fn run_daemon_status_cli(json: bool) -> ExitCode {
     use dot_agent_deck::daemon_status::{
-        STATUS_REQUEST_TIMEOUT, StatusDocument, build_status_agents, format_human,
+        STATUS_REQUEST_TIMEOUT, StatusDocument, build_status_agents_with_delegations, format_human,
     };
 
     let client = DaemonClient::new(attach_socket_path());
-    let records = match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents()).await {
-        Ok(Ok(records)) => records,
-        Ok(Err(e)) => {
-            eprintln!("daemon status: unavailable ({e})");
-            return ExitCode::FAILURE;
-        }
-        Err(_elapsed) => {
-            eprintln!(
-                "daemon status: unavailable (no response within {}s)",
-                STATUS_REQUEST_TIMEOUT.as_secs()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    let (records, delegations) =
+        match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents_full()).await {
+            Ok(Ok((listing, delegations))) => (listing.records, delegations),
+            Ok(Err(e)) => {
+                eprintln!("daemon status: unavailable ({e})");
+                return ExitCode::FAILURE;
+            }
+            Err(_elapsed) => {
+                eprintln!(
+                    "daemon status: unavailable (no response within {}s)",
+                    STATUS_REQUEST_TIMEOUT.as_secs()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
 
-    let agents = build_status_agents(records);
+    if delegations.malformed {
+        // Not on stdout (`--json` must stay clean); `daemon status` sets up no
+        // logging, so a `warn!` would go nowhere.
+        eprintln!(
+            "daemon status: the daemon's outstanding-delegation list was malformed and ignored; \
+             an orchestrator with a delegation on a pane without a live agent may read Idle"
+        );
+    }
+    let agents = build_status_agents_with_delegations(records, &delegations.entries);
     if json {
         match serde_json::to_string(&StatusDocument::new(agents)) {
             Ok(j) => {
