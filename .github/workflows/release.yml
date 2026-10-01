@@ -635,12 +635,25 @@ jobs:
     # build grows (a legitimately slower bundle must raise this, not be killed
     # by it).
     timeout-minutes: 30
+    # Issue #844: job-level permissions REPLACE the workflow-level `contents:
+    # write` / `packages: write`, which is what is wanted here: this job only
+    # reads the repository and uploads an artifact (the runtime token, not
+    # GITHUB_TOKEN scopes), and `desktop-publish` does the release upload. A
+    # compromised build step therefore holds a read-only token. Same shape as
+    # `attest` below; pinned by `desktop_bundle_token_is_read_only` in
+    # xtask/linkage-check.
+    permissions:
+      contents: read
     steps:
-      # Issue #844: `persist-credentials: false` keeps this job's write-scoped
-      # GITHUB_TOKEN (workflow-level `contents: write`) out of the git config,
-      # where pnpm and every dependency install script could read it. No step
-      # below runs `git push`/`fetch` against the remote; the only git use is
-      # build.rs's read-only `git describe`/`rev-parse`, which needs no token.
+      # Issue #844: `persist-credentials: false` keeps the job's GITHUB_TOKEN out
+      # of the checked-out repo's git config, where every process in the job
+      # (pnpm, the vite and tauri builds, build scripts) could otherwise read it
+      # from disk. It is read-only now (see `permissions` above), and this
+      # removes the on-disk copy; it does not hide the token from code running
+      # in the job, nor stop a compromised dependency from tampering with the
+      # bundle it builds. No step below runs `git push`/`fetch` against the
+      # remote; the only git use is build.rs's read-only `git describe` /
+      # `rev-parse`, which needs no token.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -662,10 +675,10 @@ jobs:
             librsvg2-dev libxdo-dev \
             patchelf fakeroot file desktop-file-utils
       # Issues #807 and #844: the pnpm version is pinned EXACTLY, never a
-      # floating major (the floating `12` resolved to 12.6.0 and hung CI's
-      # desktop jobs). Keep this pin in step with the ones in ci.yml's two
-      # desktop jobs (`desktop-web`, `desktop-browser`) -- all three move
-      # together. Renovate's github-actions manager tracks this `version:`
+      # floating major (the floating `12` resolved to 12.6.0 and coincided with
+      # hangs in `desktop-browser`, causation unproven). Keep this pin in step
+      # with the ones in ci.yml's two desktop jobs (`desktop-web`,
+      # `desktop-browser`) -- all three move together. Renovate's github-actions manager tracks this `version:`
       # input as depType `uses-with`, which `renovate.json` holds for manual
       # review, so a bump here is a hand edit (Renovate looks inactive on this
       # fork anyway).
