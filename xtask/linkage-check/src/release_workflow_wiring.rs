@@ -400,6 +400,53 @@ fn the_attest_job_holds_no_credential_and_needs_none() {
     );
 }
 
+/// Why `desktop-bundle`'s token is pinned read-only (issue #844): it builds the
+/// bundles users install and runs third-party build code, and the workflow-level
+/// grant is `contents: write` + `packages: write`. Job-level `permissions`
+/// REPLACE that grant, so a deleted block silently restores write scopes.
+/// Returns the problem, or `None` when the block is exactly read-only.
+fn desktop_bundle_permission_problem(job_block: &str) -> Option<String> {
+    let code: String = job_block
+        .lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !code.contains("\n    permissions:") {
+        return Some("`desktop-bundle` declares no job-level `permissions:`".to_string());
+    }
+    if !code.contains("contents: read") {
+        return Some("`desktop-bundle` must declare `contents: read`".to_string());
+    }
+    if code.contains(": write") {
+        return Some("`desktop-bundle` declares a write-scoped permission".to_string());
+    }
+    None
+}
+
+#[test]
+fn desktop_bundle_token_is_read_only() {
+    let all = jobs(&workflow());
+    if let Some(problem) = desktop_bundle_permission_problem(job(&all, "desktop-bundle")) {
+        panic!(
+            "{problem}. The job holds no release credential and uploads only via \
+             the runtime token; `desktop-publish` owns the release upload. See \
+             issue #844."
+        );
+    }
+}
+
+#[test]
+fn the_desktop_bundle_permission_guard_rejects_missing_and_write_scopes() {
+    let ok = "  desktop-bundle:\n    permissions:\n      contents: read\n    steps: []";
+    assert!(desktop_bundle_permission_problem(ok).is_none());
+    let missing = "  desktop-bundle:\n    steps: []";
+    assert!(desktop_bundle_permission_problem(missing).is_some());
+    let write = "  desktop-bundle:\n    permissions:\n      contents: read\n      packages: write\n    steps: []";
+    assert!(desktop_bundle_permission_problem(write).is_some());
+    let commented = "  desktop-bundle:\n    # permissions:\n    #   contents: read\n    steps: []";
+    assert!(desktop_bundle_permission_problem(commented).is_some());
+}
+
 /// The code lines of `desktop-publish`'s "Note the unsigned alpha in the
 /// release body" step, from its `name:` to the next step at the same
 /// indentation.
