@@ -4028,29 +4028,15 @@ pub enum DelegationRetirement {
     /// Nothing was outstanding for that pane (the common case: no delegation,
     /// or one already resolved).
     Nothing,
-    /// The pane's only outstanding delegation was retired; dropping the
-    /// returned record cancels its watch.
-    Retired(OutstandingDelegation),
-    /// A *superseded* (older) delegation was retired. The newest record and its
-    /// watch stay armed — see `OutstandingDelegation::owed`.
-    RetiredSuperseded {
-        role: String,
-        /// Generation of the record left armed.
-        seq: u64,
-        /// Superseded delegations still unaccounted for after this one.
-        remaining: u32,
-        /// Issue #617 (finding 7): the orchestrator pane and registry agent id
-        /// the still-armed record carries, so a late completion credited to a
-        /// superseded delegation can have its feedback bound to an identity in
-        /// the same way `Retired` can. Copied from the record rather than
-        /// returning it, because the record STAYS in the tracker on this arm and
-        /// so cannot be moved out. Both are needed together: the pane says where
-        /// the feedback would go and the agent id says who must still be there,
-        /// and a caller that resolved the orchestrator pane by a different route
-        /// must not bind that pane to this record's agent without checking the
-        /// two panes agree.
-        orchestrator_pane_id: String,
-        orchestrator_agent_id: String,
+    /// The pane's outstanding delegation was retired; dropping the returned
+    /// record cancels its watch. `superseded_dropped` counts the OLDER
+    /// generations that went with it — normally 0, and non-zero only when the
+    /// pane was re-delegated to before it answered. Issue #849: those older
+    /// generations are dropped rather than carried forward as debt, so this is
+    /// the only non-`Nothing` outcome a `work-done` can have.
+    Retired {
+        delegation: Box<OutstandingDelegation>,
+        superseded_dropped: u32,
     },
 }
 
@@ -5506,50 +5492,51 @@ impl AgentPtyRegistry {
         UndeliveredDelegationRetirement::Retired
     }
 
-    /// PRD #126: a `work-done` arrived from `worker_pane_id`, so one outstanding
-    /// delegation is resolved and owes no idle prompt.
+    /// PRD #126: a `work-done` arrived from `worker_pane_id`, so that pane's
+    /// outstanding delegation is resolved and the pane owes no idle prompt —
+    /// including every older generation still held in
+    /// [`OutstandingDelegation::owed`].
     ///
-    /// PRD #126 M1 review (finding 6): "one" is deliberate. `WorkDoneSignal`
+    /// **Issue #849 (port of upstream #1125 / #1080) REVERSED PRD #126 M1
+    /// review finding 6's trade, on production evidence.** `WorkDoneSignal`
     /// carries no delegation generation, so the daemon cannot tell *which*
-    /// delegation a completion belongs to. It used to remove the record
-    /// outright, which meant a late `work-done` from a superseded delegation
-    /// disarmed the newest one and the second task could then go silent forever
-    /// — the exact failure the detector exists to prevent. Now completions are
-    /// applied oldest-first: while superseded delegations remain unaccounted
-    /// for, a `work-done` retires one of THEM and the newest record (with its
-    /// armed watch) survives.
+    /// delegation a completion belongs to, and the two readings fail in
+    /// opposite directions. Finding 6 chose oldest-first — a completion retired
+    /// one SUPERSEDED generation and the newest record stayed armed — and
+    /// accepted, as a hole that only occurs in a state the orchestrator
+    /// protocol forbids, a false idle prompt for finished work. It occurs, and
+    /// it does not recover on its own: the record SURVIVES each completion, so
+    /// the next delegate re-arms with an older generation still owed and the
+    /// next completion is credited to a phantom again — once per delegation
+    /// cycle for the rest of the orchestration. It also left the pane's
+    /// `outstanding_delegation` badge reading `Some` after the worker answered.
     ///
-    /// Remaining hole, deliberately accepted: with no generation on the wire,
-    /// an OUT-OF-ORDER completion (the newest task reports while an older one
-    /// never does) is still credited to the older delegation, so the newest
-    /// record stays armed and produces one idle prompt for work that is
-    /// actually done. That failure direction is a discardable, self-describing
-    /// nudge — strictly safer than silence — and it only occurs in a state the
-    /// orchestrator protocol already forbids (re-delegating before the worker
-    /// reports).
+    /// So the whole record goes. What is given up is finding 6's protection for
+    /// one shape: a worker re-delegated to BEFORE it answered the previous
+    /// task, whose completion now disarms the newer delegation's watch too, so a
+    /// stall on that newer task goes unreported until the next delegate to the
+    /// pane arms a fresh watch. Both holes live in the state the orchestrator
+    /// protocol forbids; this one is transient and self-correcting and fails as
+    /// a missing nudge rather than a false one. Reinstating oldest-first means
+    /// putting a generation on the wire, not flipping this back.
+    ///
+    /// [`Self::retire_silence_watch`] keeps its own oldest-first accounting
+    /// (`SilenceWatchRetirement::KeptNewer`) and is deliberately left alone: it
+    /// has a per-generation, event-driven cancellation the idle detector lacks
+    /// ([`Self::cancel_silence_watch_if`]), and it asserts something a
+    /// completion does not falsify ("no agent event within the window").
     pub fn retire_outstanding_delegation(&self, worker_pane_id: &str) -> DelegationRetirement {
         let mut tracker = self.delegations.lock().unwrap();
-        let Some(record) = tracker.records.get_mut(worker_pane_id) else {
+        let Some(delegation) = tracker.records.remove(worker_pane_id) else {
             return DelegationRetirement::Nothing;
         };
-        if record.owed.len() > 1 {
-            record.owed.pop_front();
-            return DelegationRetirement::RetiredSuperseded {
-                role: record.role.clone(),
-                seq: record.seq,
-                // The record stands for one of the generations left; the rest
-                // are the superseded ones still unaccounted for.
-                remaining: (record.owed.len() - 1) as u32,
-                orchestrator_pane_id: record.orchestrator_pane_id.clone(),
-                orchestrator_agent_id: record.orchestrator_agent_id.clone(),
-            };
+        // `owed` is never empty while a record exists; the record stands for
+        // one generation and the rest are the superseded ones going with it.
+        let superseded_dropped = delegation.owed.len().saturating_sub(1) as u32;
+        DelegationRetirement::Retired {
+            delegation: Box::new(delegation),
+            superseded_dropped,
         }
-        DelegationRetirement::Retired(
-            tracker
-                .records
-                .remove(worker_pane_id)
-                .expect("record present under the same lock"),
-        )
     }
 
     /// PRD #220 M2.0: retain `caller` as the recipient for the completion of the
@@ -16093,12 +16080,13 @@ mod spawn_tests {
         ));
     }
 
-    /// PRD #126 M1 review (finding 6): a late `work-done` from a superseded
-    /// delegation must retire THAT delegation, leaving the newest record (and
-    /// its watch) armed — it used to clobber the newest record, after which the
-    /// re-delegated worker could go silent forever with no nudge.
+    /// Issue #849: a `work-done` retires the pane's WHOLE record, superseded
+    /// generations included, and reports how many went with it. This replaces
+    /// PRD #126 M1 review finding 6's oldest-first accounting, under which the
+    /// newest record stayed armed and fired later against finished work — see
+    /// [`AgentPtyRegistry::retire_outstanding_delegation`] for the reversal.
     #[test]
-    fn retire_applies_work_done_to_the_oldest_outstanding_delegation() {
+    fn retire_drops_the_whole_record_including_superseded_generations() {
         let reg = Arc::new(AgentPtyRegistry::new());
         let first = reg
             .arm_outstanding_delegation("worker", "coder", "orch", "agent-1", None)
@@ -16108,19 +16096,34 @@ mod spawn_tests {
             .expect("arm #2");
         assert!(second.seq > first.seq, "seq must be monotonic");
 
-        // Delegation #1's late completion retires the superseded delegation.
         match reg.retire_outstanding_delegation("worker") {
-            DelegationRetirement::RetiredSuperseded { remaining, seq, .. } => {
-                assert_eq!(remaining, 0);
-                assert_eq!(seq, second.seq, "the newest record stays armed");
+            DelegationRetirement::Retired {
+                delegation,
+                superseded_dropped,
+            } => {
+                assert_eq!(
+                    delegation.seq, second.seq,
+                    "the newest record is the one retired"
+                );
+                assert_eq!(
+                    superseded_dropped, 1,
+                    "delegation #1 went unanswered and must be REPORTED as dropped, not carried \
+                     forward as debt"
+                );
             }
-            other => panic!("expected a superseded retirement, got {other:?}"),
+            other => panic!("expected a retirement, got {other:?}"),
         }
-        // #2's watch is still live and still owns the record.
-        let taken = reg
-            .take_outstanding_delegation_if("worker", second.seq)
-            .expect("delegation #2 must still be outstanding");
-        assert_eq!(taken.seq, second.seq);
+        assert!(
+            reg.delegation_watch_snapshot("worker")
+                .outstanding_delegation
+                .is_none(),
+            "the pane still reads as delegated after its work-done (#849)"
+        );
+        assert!(
+            reg.take_outstanding_delegation_if("worker", second.seq)
+                .is_none(),
+            "the newest record stayed armed over work that was already answered (#849)"
+        );
         assert!(matches!(
             reg.retire_outstanding_delegation("worker"),
             DelegationRetirement::Nothing
@@ -17529,7 +17532,7 @@ mod spawn_tests {
                 .arm_outstanding_delegation("worker", "coder", "orch", "agent-1", None)
                 .expect("arm");
             match reg.retire_outstanding_delegation("worker") {
-                DelegationRetirement::Retired(_) => {}
+                DelegationRetirement::Retired { .. } => {}
                 other => panic!("expected a plain retirement, got {other:?}"),
             }
             // The sender was dropped with the record, so the watch's select arm

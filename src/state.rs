@@ -10543,7 +10543,15 @@ impl AppState {
         let mut commissioning_orchestrator: Option<(String, String)> = None;
         match registry.retire_outstanding_delegation(&signal.pane_id) {
             crate::agent_pty::DelegationRetirement::Nothing => {}
-            crate::agent_pty::DelegationRetirement::Retired(delegation) => {
+            // Issue #849: the whole record goes, superseded generations
+            // included. A worker that has just answered is not silent, and a
+            // record left armed here fires later against finished work — see
+            // `AgentPtyRegistry::retire_outstanding_delegation` for the
+            // reversal of PRD #126 M1 finding 6 and what it gives up.
+            crate::agent_pty::DelegationRetirement::Retired {
+                delegation,
+                superseded_dropped,
+            } => {
                 commissioning_orchestrator = Some((
                     delegation.orchestrator_pane_id.clone(),
                     delegation.orchestrator_agent_id.clone(),
@@ -10551,16 +10559,16 @@ impl AppState {
                 tracing::debug!(
                     pane_id = %signal.pane_id,
                     role = %delegation.role,
+                    armed_seq = delegation.seq,
+                    superseded_dropped,
                     "work-done: retired the outstanding delegation and cancelled its idle watch"
                 );
                 // Issue #755: announce the retirement live, to every
                 // already-attached TUI — the symmetric counterpart of the
                 // `DelegationArmed` broadcast in `handle_delegate_with_state`.
-                // Sent ONLY here, on a full `Retired` (not
-                // `RetiredSuperseded` below): that outcome leaves the NEWER
-                // delegation still armed on this same pane, so the pane's
-                // `outstanding_delegation` genuinely stays `Some(..)` and
-                // must not be cleared.
+                // Issue #849: every `work-done` that retires anything is now a
+                // full retirement, so this fires for each of them and the
+                // pane's `outstanding_delegation` badge always clears.
                 if let Some(event_tx) = event_tx {
                     let _ = event_tx.send(BroadcastMsg::DelegationRetired(
                         crate::event::DelegationRetiredNotice {
@@ -10568,26 +10576,6 @@ impl AppState {
                         },
                     ));
                 }
-            }
-            // PRD #126 M1 review (finding 6): a late completion from a
-            // superseded delegation retires THAT one; the newest delegation's
-            // record and watch survive, so a re-delegated worker that then goes
-            // silent is still reported instead of never being nudged again.
-            crate::agent_pty::DelegationRetirement::RetiredSuperseded {
-                role,
-                seq,
-                remaining,
-                orchestrator_pane_id,
-                orchestrator_agent_id,
-            } => {
-                commissioning_orchestrator = Some((orchestrator_pane_id, orchestrator_agent_id));
-                tracing::debug!(
-                    pane_id = %signal.pane_id,
-                    role = %role,
-                    armed_seq = seq,
-                    remaining_superseded = remaining,
-                    "work-done: retired a superseded delegation; the newest one stays armed"
-                );
             }
         }
         // Issue #448: did the orchestrator commission any of this? Retired here,
@@ -16260,7 +16248,7 @@ clear = false
             assert!(
                 matches!(
                     registry.retire_outstanding_delegation(WORKER_PANE),
-                    crate::agent_pty::DelegationRetirement::Retired(_)
+                    crate::agent_pty::DelegationRetirement::Retired { .. }
                 ),
                 "the older generations were owed by the terminated worker and must be gone, so \
                  the first work-done retires the newer one as the last owed"
@@ -16474,7 +16462,7 @@ clear = false
         assert!(
             matches!(
                 registry.retire_outstanding_delegation(worker_pane),
-                crate::agent_pty::DelegationRetirement::Retired(_)
+                crate::agent_pty::DelegationRetirement::Retired { .. }
             ),
             "the undelivered delegate no longer counts, so one work-done must retire the record"
         );
@@ -16493,20 +16481,29 @@ clear = false
         assert!(
             matches!(
                 registry.retire_outstanding_delegation(worker_pane),
-                crate::agent_pty::DelegationRetirement::Retired(_)
+                crate::agent_pty::DelegationRetirement::Retired { .. }
             ),
             "the newer delegation still counted the undelivered one as owed"
         );
 
-        // A generation that a `work-done` was already credited to is no longer
-        // counted, so its late no-delivery exit must not remove another one.
+        // Issue #849: a `work-done` retires the pane's WHOLE record, so a
+        // generation it covered is gone with it and its late no-delivery exit
+        // must not remove anything belonging to a later delegation.
         let credited = arm();
         let _second = arm();
         let _third = arm();
         assert!(matches!(
             registry.retire_outstanding_delegation(worker_pane),
-            crate::agent_pty::DelegationRetirement::RetiredSuperseded { remaining: 1, .. }
+            crate::agent_pty::DelegationRetirement::Retired {
+                superseded_dropped: 2,
+                ..
+            }
         ));
+        assert!(
+            !is_armed(),
+            "a work-done left part of the record armed over answered work"
+        );
+        let _fresh = arm();
         retire_undelivered_delegation(
             &registry,
             worker_pane,
@@ -16515,11 +16512,8 @@ clear = false
             "test",
         );
         assert!(
-            matches!(
-                registry.retire_outstanding_delegation(worker_pane),
-                crate::agent_pty::DelegationRetirement::RetiredSuperseded { remaining: 0, .. }
-            ),
-            "a generation already credited a work-done was removed a second time"
+            is_armed(),
+            "a generation already retired by a work-done removed a later delegation"
         );
     }
 

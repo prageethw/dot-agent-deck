@@ -1766,50 +1766,48 @@ fn idle_worker_010_delegate_during_close_refuses_to_arm() {
     });
 }
 
-/// Scenario: Delegate twice to each of two worker panes on the same clock, then send ONE late work-done for the first worker (standing in for delegation one's belated completion) and TWO for the second. The first worker's delegation two must still be reported — on its own deadline, once — while the second worker, whose remaining delegation the second completion retired, must produce nothing at all.
+/// Scenario: Delegate twice to each of two worker panes on the same clock, then send ONE work-done for the first worker only. That worker has answered, so nothing about it may be reported afterwards — its superseded delegation one is dropped with the record rather than absorbing the completion. The second worker, delegated twice and never answering at all, must still be reported, exactly once and on delegation two's own deadline.
 #[spec("scheduler/idle-worker/013")]
 #[test]
-fn idle_worker_013_late_first_completion_leaves_the_second_watch_armed() {
+fn idle_worker_013_a_completion_retires_every_generation_for_the_pane() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(Some("1500"));
     let timeout = Duration::from_millis(1500);
     runtime().block_on(async {
-        // `fully-completed-worker` is the BEHAVIORAL CONTROL for the retirement
-        // itself. Asserting only that delegation two survives a late completion
-        // would pass just as happily if `work-done` retired NOTHING — the
-        // surviving watch proves nothing about which record was consumed. Its
-        // second completion must consume the record the first one left armed, so
-        // a `work-done` that did nothing shows up here as an extra prompt.
-        // Listed FIRST in both delegate calls so its (slightly earlier) deadline
-        // could not hide behind the other worker's.
-        let harness =
-            IdleHarness::new(&["fully-completed-worker", "twice-delegated-worker"], None).await;
+        // `never-answering-worker` is the BEHAVIORAL CONTROL. Asserting only
+        // that the answering worker goes unreported would pass just as happily
+        // if a supersede disarmed the detector outright, or if the test never
+        // waited long enough for a deadline: this worker is superseded in
+        // exactly the same way and must still be reported, on the NEWER
+        // delegation's clock. Listed FIRST in both delegate calls so its
+        // (slightly earlier) deadline could not hide behind the other's.
+        let harness = IdleHarness::new(&["never-answering-worker", "answering-worker"], None).await;
 
         harness
-            .delegate(&["fully-completed-worker", "twice-delegated-worker"])
+            .delegate(&["never-answering-worker", "answering-worker"])
             .await;
         tokio::time::sleep(Duration::from_millis(700)).await;
         let second_delegate_at = tokio::time::Instant::now();
         harness
-            .delegate(&["fully-completed-worker", "twice-delegated-worker"])
+            .delegate(&["never-answering-worker", "answering-worker"])
             .await;
 
-        // Each worker's delegation #1 finally reports, 300 ms after it was
-        // superseded. It owes exactly one retirement — and it must be #1's.
+        // One completion from the answering worker, 300 ms after its delegation
+        // one was superseded. Issue #849: this retires the pane's WHOLE record.
+        // Under PRD #126 M1 finding 6's oldest-first accounting it was credited
+        // to the superseded delegation one instead, leaving delegation two armed
+        // to fire later against work this very signal reported as finished.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        harness.work_done("fully-completed-worker").await;
-        harness.work_done("twice-delegated-worker").await;
-        // Only the control's delegation #2 also reports.
-        harness.work_done("fully-completed-worker").await;
+        harness.work_done("answering-worker").await;
 
         let observed = harness
-            .wait_for_idle_role("twice-delegated-worker", Duration::from_secs(4))
+            .wait_for_idle_role("never-answering-worker", Duration::from_secs(4))
             .await;
         let observed_at = tokio::time::Instant::now();
         assert!(
-            idle_mentions_role(&observed, "twice-delegated-worker"),
-            "delegation one's late work-done disarmed delegation two, so a re-delegated worker \
-             that then went silent was never reported; snapshot = {observed:?}"
+            idle_mentions_role(&observed, "never-answering-worker"),
+            "a re-delegated worker that never answered at all was not reported, so the negative \
+             assertion below would prove nothing; snapshot = {observed:?}"
         );
         assert!(
             observed_at >= second_delegate_at + timeout - Duration::from_millis(250),
@@ -1818,21 +1816,20 @@ fn idle_worker_013_late_first_completion_leaves_the_second_watch_armed() {
             observed_at - second_delegate_at
         );
 
-        // Settle before the negative assertions: the control's deadline is a
-        // hair EARLIER than the reported worker's, so anything it was going to
-        // emit has had its window and then some.
+        // Settle before the negative assertion: the answering worker's deadline
+        // is a hair LATER than the reported one's, so give it its window.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let snapshot = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
         assert!(
-            !idle_mentions_role(&snapshot, "fully-completed-worker"),
-            "the second work-done did not retire the delegation the first one deliberately left \
-             armed — a work-done that retired NOTHING at all would look exactly like this; \
-             snapshot = {snapshot:?}"
+            !idle_mentions_role(&snapshot, "answering-worker"),
+            "a worker that signalled work-done was reported as not having responded with \
+             work-done: its completion was spent on the superseded delegation one and left \
+             delegation two armed over finished work (issue #849); snapshot = {snapshot:?}"
         );
         assert_eq!(
             idle_count(&snapshot),
             1,
-            "exactly one of the four delegations may report; snapshot = {snapshot:?}"
+            "only the never-answering worker may report, and only once; snapshot = {snapshot:?}"
         );
     });
 }
