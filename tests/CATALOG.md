@@ -315,6 +315,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (in-process `TestBackend` render).
 - **Agent:** none.
 - **Asserts:** a narrow, single-column, 5-role dashboard sized so every card lands at exactly 1, 2, and 3 rows tall — both the role name and the "Idle" status text remain in the rendered output at each tier, the squeeze order (`Prmt:`/tool lines/`Dir:` give way first) the PRD requires.
+- **Also asserts (issue #847):** at the 3-row tier the single inner row also carries `Dir:` and the cwd basename.
 - **Does not assert:** which specific body line (`Dir:`, prompts, tools) is dropped at each tier, only that role name and status never are.
 - **Platform coverage:** mac+linux+windows.
 

@@ -113,7 +113,10 @@ impl CardDensity {
     ///   Role name (1) + Dir (1) + prompts + [non-compact: blank separator] +
     ///   tools, plus 2 rows for the top/bottom border.
     ///
-    /// Resulting heights: Compact 6, Normal 9, Spacious 11.
+    /// Resulting heights: Compact 6, Normal 9, Spacious 11. When the grid
+    /// squeezes a card to exactly 3 rows (border, one inner row, border) the
+    /// `Dir:` line folds onto the role row (`<role>  Dir: <basename>`, issue
+    /// #847) rather than being clipped; 1- and 2-row tiers are unchanged.
     ///
     /// Height is a function of density ALONE — PRD #339 moved the `Last` /
     /// `Tools` counters onto the bottom border, deleting the card-width axis
@@ -24489,26 +24492,47 @@ fn render_session_card(
     let role_name_text = display_name
         .map(|name| name.as_str())
         .unwrap_or(&id_display);
-    lines.push(if role_name_text.is_empty() {
-        Line::from("")
-    } else {
-        Line::from(Span::styled(
-            truncate_with_ellipsis(role_name_text, w),
+    let role_part = truncate_with_ellipsis(role_name_text, w);
+    // Issue #847: a 3-row card has a single inner row, so the separate `Dir:`
+    // row below is clipped. Fold it onto the role row instead: role keeps
+    // priority, `Dir:` takes whatever width remains (ellipsized), and is
+    // dropped only when there is no room for the label plus one cell.
+    let fold_dir = area.height == 3;
+    let mut role_spans: Vec<Span<'_>> = Vec::new();
+    let used = unicode_width::UnicodeWidthStr::width(role_part.as_str());
+    if !role_part.is_empty() {
+        role_spans.push(Span::styled(
+            role_part,
             Style::default().fg(palette::ROLE_NAME),
-        ))
-    });
+        ));
+    }
+    if fold_dir {
+        const FOLD_LABEL: &str = "  Dir: ";
+        let label_w = unicode_width::UnicodeWidthStr::width(FOLD_LABEL);
+        let remaining = w.saturating_sub(used);
+        if remaining > label_w {
+            role_spans.push(Span::styled(FOLD_LABEL, text_primary()));
+            let dir = truncate_with_ellipsis(cwd_display.as_ref(), remaining - label_w);
+            role_spans.push(Span::raw(dir));
+        }
+    }
+    lines.push(Line::from(role_spans));
 
     // PRD #339: with the counters on the border, `Dir:` gets the whole inner
     // width at every card width — one un-branched form, always ellipsized (the
     // old narrow branch bare-clipped the path with no `…`).
-    let dir_label_len = 6; // "Dir:  "
-    lines.push(Line::from(vec![
-        Span::styled("Dir:  ", text_primary()),
-        Span::raw(truncate_with_ellipsis(
-            cwd_display.as_ref(),
-            w.saturating_sub(dir_label_len),
-        )),
-    ]));
+    // (On a 3-row card the `Dir:` already rides the role row — see above —
+    // and this row would be clipped, so it is skipped there.)
+    if !fold_dir {
+        let dir_label_len = 6; // "Dir:  "
+        lines.push(Line::from(vec![
+            Span::styled("Dir:  ", text_primary()),
+            Span::raw(truncate_with_ellipsis(
+                cwd_display.as_ref(),
+                w.saturating_sub(dir_label_len),
+            )),
+        ]));
+    }
 
     // Issue #770: say what the title badge means, in the one place a reader
     // looks when a card stops behaving. Placed directly under `Dir:` so it
@@ -32556,6 +32580,84 @@ mod tests {
                 "tier {tier}: expected the status text \"Idle\" to survive \
                  squeezing; got:\n{rendered}"
             );
+            // Issue #847: a 3-row card (border, 1 inner row, border) must still
+            // say where it lives — `Dir: <basename>` shares the role's row.
+            if tier == 3 {
+                assert!(
+                    rendered.contains("Dir:") && rendered.contains("tmp"),
+                    "tier 3: expected `Dir:` and the cwd basename `tmp` on the \
+                     single inner row; got:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    fn card_rows_847(width: u16, height: u16, role: &str, cwd: &str) -> Vec<String> {
+        let mut session = make_session(SessionStatus::Idle);
+        session.cwd = Some(cwd.to_string());
+        let buf = render_card_to_buffer(
+            &session,
+            Some(role),
+            None,
+            CardDensityKind::Compact,
+            0,
+            false,
+            width,
+            height,
+        );
+        buffer_to_string(&buf).lines().map(str::to_string).collect()
+    }
+
+    /// Scenario: Render one card at exactly 3 rows and check its single inner
+    /// row reads the role name followed by `Dir:` and the cwd basename; render
+    /// it again at 4 rows and check the role row stays role-only with `Dir:`
+    /// on its own row beneath (unchanged).
+    #[test]
+    fn card_height_847_three_row_card_shows_role_and_dir() {
+        let rows = card_rows_847(50, 3, "role1", "/work/myproject");
+        let inner = &rows[1];
+        assert!(
+            inner.contains("role1") && inner.contains("Dir:") && inner.contains("myproject"),
+            "3-row card inner row must read role + `Dir: <basename>`; got:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            inner.find("role1") < inner.find("Dir:"),
+            "role must come before `Dir:`; got {inner:?}"
+        );
+
+        let rows = card_rows_847(50, 4, "role1", "/work/myproject");
+        assert!(
+            rows[1].contains("role1") && !rows[1].contains("Dir:"),
+            "4-row card role row must stay role-only; got {:?}",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains("Dir:") && rows[2].contains("myproject"),
+            "4-row card keeps `Dir:` on its own row; got {:?}",
+            rows[2]
+        );
+    }
+
+    /// Scenario: Render a narrow 3-row card with a very long cwd basename and
+    /// check the role is still shown and `Dir:` is ellipsized rather than
+    /// dropped; then render absurdly narrow 3-row cards to check nothing
+    /// panics.
+    #[test]
+    fn card_height_847_narrow_three_row_card_ellipsizes_dir() {
+        let rows = card_rows_847(22, 3, "role1", "/work/a-very-long-directory-name");
+        let inner = &rows[1];
+        assert!(
+            inner.contains("role1") && inner.contains("Dir:") && inner.contains('…'),
+            "narrow 3-row card must keep role and an ellipsized Dir; got {inner:?}"
+        );
+        assert!(
+            !inner.contains("a-very-long-directory-name"),
+            "long basename must be truncated; got {inner:?}"
+        );
+        for w in [4u16, 6, 8, 10, 14] {
+            let rows = card_rows_847(w, 3, "role1", "/work/a-very-long-directory-name");
+            assert_eq!(rows.len(), 3);
         }
     }
 
