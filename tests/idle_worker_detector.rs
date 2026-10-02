@@ -2325,6 +2325,82 @@ fn idle_worker_027_delivered_delegation_stays_armed_until_work_done() {
     });
 }
 
+/// Scenario: Delegate twice to one live worker pane with no work-done between (the second delegation supersedes the first), then send ONE work-done and read the pane's outstanding-delegation snapshot, the field the deck's `Idle (delegated)` badge and tab-bar idle count are built from. A control worker delegated once and completed once must already read as cleared; the twice-delegated worker must read as cleared too, because its single completion answered the worker's whole outstanding work.
+#[spec("scheduler/idle-worker/037")]
+#[test]
+fn idle_worker_037_one_work_done_clears_a_twice_delegated_pane() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("60000"));
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&["control-worker", "twice-delegated-worker"], None).await;
+        forward_delegation_retirements(&harness);
+        let control_pane = worker_pane("control-worker");
+        let twice_pane = worker_pane("twice-delegated-worker");
+        let mut broadcasts = harness.event_tx.subscribe();
+
+        // Control: one delegation, one completion.
+        harness.delegate(&["control-worker"]).await;
+        // Twice-delegated: second delegation lands before any completion.
+        harness.delegate(&["twice-delegated-worker"]).await;
+        harness.delegate(&["twice-delegated-worker"]).await;
+
+        // Let both dispatches settle (negative window spent in full), then pin
+        // the preconditions: both panes owe a delegation and none was retired.
+        for pane in [&control_pane, &twice_pane] {
+            let seen = common::delegation_broadcasts_for(
+                &mut broadcasts,
+                pane,
+                Duration::from_millis(750),
+                false,
+            )
+            .await;
+            assert!(
+                seen.armed > 0,
+                "precondition: the delegation to {pane} must have been announced as armed; \
+                 broadcasts = {seen:?}"
+            );
+        }
+        for pane in [&control_pane, &twice_pane] {
+            assert!(
+                harness
+                    .registry
+                    .delegation_watch_snapshot(pane)
+                    .outstanding_delegation
+                    .is_some(),
+                "precondition: {pane} must owe a delegation before any work-done"
+            );
+        }
+
+        harness.work_done("control-worker").await;
+        harness.work_done("twice-delegated-worker").await;
+
+        // CONTROL: the single-delegation path is already correct.
+        assert!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&control_pane)
+                .outstanding_delegation
+                .is_none(),
+            "control: a worker delegated once and completed once must have no outstanding \
+             delegation"
+        );
+        // Issue #849: the one completion must clear the whole record, including
+        // the superseded generation, so the pane no longer renders as
+        // `Idle (delegated)`.
+        let leftover = harness
+            .registry
+            .delegation_watch_snapshot(&twice_pane)
+            .outstanding_delegation;
+        assert!(
+            leftover.is_none(),
+            "a worker that reported work-done still has an outstanding delegation (the newest \
+             record stayed armed because the completion was spent on a superseded generation), \
+             so its card keeps reading `Idle (delegated)`; outstanding = {:?}",
+            leftover.map(|armed| armed.orchestrator_pane_id)
+        );
+    });
+}
+
 /// Scenario: With a tiny timeout, delegate in one call to a silent control worker and to a role whose `clear = true` respawn fails, so that second delegation never reaches a worker. After the timeout the orchestrator pane must hold the control's idle prompt, proving the detector fired, and no idle prompt about the worker that was never given a task.
 #[spec("scheduler/idle-worker/028")]
 #[test]
