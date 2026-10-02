@@ -3950,10 +3950,12 @@ pub struct OutstandingDelegation {
     /// owes a `work-done` for, oldest first — this record's own `seq` and every
     /// OLDER delegation it superseded that never reported. The orchestrator
     /// protocol forbids re-delegating before a worker reports, so this is
-    /// normally just `[seq]`; when it is not, a late `work-done` from
-    /// delegation #1 retires the oldest entry instead of clobbering delegation
-    /// #2's still-live record — which used to leave the newest delegation
-    /// silent forever with no nudge.
+    /// normally just `[seq]`; when it is not, the extra entries are reported as
+    /// `superseded_dropped` when the record is retired and are consulted by the
+    /// undelivered/terminated-worker paths. A `work-done` no longer spends them
+    /// one at a time: since issue #849 it retires the whole record, so a worker
+    /// that has answered is not left reading `Idle (delegated)` over finished
+    /// work.
     ///
     /// Issue #805: generations rather than the bare count this used to be,
     /// because a delegate whose task pointer never reached the worker has to
@@ -4703,9 +4705,11 @@ impl AgentPtyRegistry {
     /// Overwrites any previous record for the pane — the freshest delegation is
     /// the one the timer watches — but carries every generation the older one
     /// still owed forward in `OutstandingDelegation::owed` rather than
-    /// forgetting them, so a late `work-done` retires the *oldest* outstanding
-    /// delegation instead of disarming the newest. Dropping the replaced record
-    /// here also cancels its watch task immediately.
+    /// forgetting them, so the undelivered/terminated-worker paths can still
+    /// prune a specific generation and a retirement can report how many were
+    /// superseded. A `work-done` retires the whole record, owed generations
+    /// included (issue #849). Dropping the replaced record here also cancels its
+    /// watch task immediately.
     pub fn arm_outstanding_delegation(
         &self,
         worker_pane_id: &str,
@@ -5256,9 +5260,13 @@ impl AgentPtyRegistry {
     /// undelivered-prompt detector was silently disabled for exactly the failure
     /// it exists to surface.
     ///
-    /// Completions are therefore applied oldest-first, the same accounting
-    /// [`Self::retire_outstanding_delegation`] uses for the idle detector and for
-    /// the same reason (no generation on the wire). Deliberately NOT keyed to the
+    /// Completions are therefore applied oldest-first, which is the accounting
+    /// [`Self::retire_outstanding_delegation`] used for the idle detector before
+    /// issue #849. The idle detector now retires its whole record on a
+    /// `work-done`; this watch deliberately keeps oldest-first, because it guards
+    /// an undelivered task pointer per delegate and a completion for an older
+    /// delegation must not disarm a newer delegate's watch (no generation on the
+    /// wire). Deliberately NOT keyed to the
     /// idle detector's record: the two detectors are independently switchable, so
     /// with `worker_response_timeout = 0` there is no delegation record to derive
     /// a generation from, and the silence watch must still cancel on a timely

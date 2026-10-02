@@ -2331,6 +2331,10 @@ fn idle_worker_037_one_work_done_clears_a_twice_delegated_pane() {
     runtime().block_on(async {
         let harness = IdleHarness::new(&["control-worker", "twice-delegated-worker"], None).await;
         forward_delegation_retirements(&harness);
+        // One receiver per pane: `delegation_broadcasts_for` consumes every
+        // message it reads, so a shared receiver would lose the other pane's.
+        let mut control_broadcasts = harness.event_tx.subscribe();
+        let mut twice_broadcasts = harness.event_tx.subscribe();
         let control_pane = worker_pane("control-worker");
         let twice_pane = worker_pane("twice-delegated-worker");
         // Control: one delegation, one completion.
@@ -2379,6 +2383,79 @@ fn idle_worker_037_one_work_done_clears_a_twice_delegated_pane() {
              record stayed armed because the completion was spent on a superseded generation), \
              so its card keeps reading `Idle (delegated)`; outstanding = {:?}",
             leftover.map(|armed| armed.orchestrator_pane_id)
+        );
+
+        // The clear must also be announced, so an attached TUI drops the badge:
+        // the twice-delegated case previously broadcast nothing at all.
+        let control_seen = common::delegation_broadcasts_for(
+            &mut control_broadcasts,
+            &control_pane,
+            common::load_scaled(Duration::from_millis(750)),
+            false,
+        )
+        .await;
+        assert_eq!(
+            control_seen.retired, 1,
+            "control: one work-done must announce exactly one retirement; broadcasts = \
+             {control_seen:?}"
+        );
+        let twice_seen = common::delegation_broadcasts_for(
+            &mut twice_broadcasts,
+            &twice_pane,
+            common::load_scaled(Duration::from_secs(3)),
+            true,
+        )
+        .await;
+        assert!(
+            twice_seen.retired > 0,
+            "the twice-delegated pane's work-done cleared the record without announcing the \
+             retirement, so an attached TUI keeps the `Idle (delegated)` badge; broadcasts = \
+             {twice_seen:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to a worker, let it report work-done (its record is gone), then delegate to the same pane again and never answer. The idle-worker prompt must still reach the orchestrator for the fresh delegation, on that delegation's own deadline rather than before it, proving the whole-record retirement does not permanently disarm the pane.
+#[spec("scheduler/idle-worker/038")]
+#[test]
+fn idle_worker_038_a_fresh_delegation_after_a_work_done_is_still_reported() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("1500"));
+    let timeout = Duration::from_millis(1500);
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&["recycled-worker"], None).await;
+        let pane = worker_pane("recycled-worker");
+
+        harness.delegate(&["recycled-worker"]).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        harness.work_done("recycled-worker").await;
+        assert!(
+            harness
+                .registry
+                .delegation_watch_snapshot(&pane)
+                .outstanding_delegation
+                .is_none(),
+            "precondition: the work-done must retire the first delegation's record"
+        );
+
+        // The fresh delegation, never answered.
+        let second_delegate_at = tokio::time::Instant::now();
+        harness.delegate(&["recycled-worker"]).await;
+
+        let observed = harness
+            .wait_for_idle_role("recycled-worker", Duration::from_secs(5))
+            .await;
+        let observed_at = tokio::time::Instant::now();
+        assert!(
+            idle_mentions_role(&observed, "recycled-worker"),
+            "a fresh delegation to a pane whose earlier record a work-done retired was never \
+             reported: the retirement left the pane permanently disarmed; snapshot = {observed:?}"
+        );
+        assert!(
+            observed_at >= second_delegate_at + timeout - Duration::from_millis(250),
+            "the prompt arrived {:?} after the fresh delegate, before its own deadline \
+             (timeout {timeout:?})",
+            observed_at - second_delegate_at
         );
     });
 }

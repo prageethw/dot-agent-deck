@@ -10494,11 +10494,11 @@ impl AppState {
             return;
         }
 
-        // PRD #126: the worker answered, so one outstanding delegation is
-        // resolved. Retire FIRST — above every early return below — so an
-        // unknown pane, an orchestrator's own `--done`, or a missing
-        // orchestrator pane can never leave a record armed and produce a bogus
-        // idle prompt later. Dropping the retired record cancels its watch task
+        // PRD #126: the worker answered, so the pane's whole outstanding
+        // delegation record is resolved (issue #849). Retire FIRST — above every
+        // early return below — so an unknown pane, an orchestrator's own
+        // `--done`, or a missing orchestrator pane can never leave a record
+        // armed and produce a bogus idle prompt later. Dropping the retired record cancels its watch task
         // immediately instead of leaving it asleep for the rest of the timeout.
         // PRD #249 M3 review (finding B4): the same reasoning for the
         // silent-worker watch, and it matters MORE here. `work-done` is a CLI
@@ -16248,7 +16248,10 @@ clear = false
             assert!(
                 matches!(
                     registry.retire_outstanding_delegation(WORKER_PANE),
-                    crate::agent_pty::DelegationRetirement::Retired { .. }
+                    crate::agent_pty::DelegationRetirement::Retired {
+                        superseded_dropped: 0,
+                        ..
+                    }
                 ),
                 "the older generations were owed by the terminated worker and must be gone, so \
                  the first work-done retires the newer one as the last owed"
@@ -16462,7 +16465,10 @@ clear = false
         assert!(
             matches!(
                 registry.retire_outstanding_delegation(worker_pane),
-                crate::agent_pty::DelegationRetirement::Retired { .. }
+                crate::agent_pty::DelegationRetirement::Retired {
+                    superseded_dropped: 0,
+                    ..
+                }
             ),
             "the undelivered delegate no longer counts, so one work-done must retire the record"
         );
@@ -16481,7 +16487,10 @@ clear = false
         assert!(
             matches!(
                 registry.retire_outstanding_delegation(worker_pane),
-                crate::agent_pty::DelegationRetirement::Retired { .. }
+                crate::agent_pty::DelegationRetirement::Retired {
+                    superseded_dropped: 0,
+                    ..
+                }
             ),
             "the newer delegation still counted the undelivered one as owed"
         );
