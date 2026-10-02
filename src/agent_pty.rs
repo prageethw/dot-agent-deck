@@ -5266,10 +5266,10 @@ impl AgentPtyRegistry {
     /// `work-done`; this watch deliberately keeps oldest-first, because it guards
     /// an undelivered task pointer per delegate and a completion for an older
     /// delegation must not disarm a newer delegate's watch (no generation on the
-    /// wire). Deliberately NOT keyed to the
-    /// idle detector's record: the two detectors are independently switchable, so
-    /// with `worker_response_timeout = 0` there is no delegation record to derive
-    /// a generation from, and the silence watch must still cancel on a timely
+    /// wire). Deliberately NOT keyed to the idle detector's record: the two
+    /// detectors are independently switchable, so with
+    /// `worker_response_timeout = 0` there is no delegation record to derive a
+    /// generation from, and the silence watch must still cancel on a timely
     /// completion.
     ///
     /// It inherits PRD #126's accepted hole in the other direction: an

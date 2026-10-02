@@ -10498,8 +10498,9 @@ impl AppState {
         // delegation record is resolved (issue #849). Retire FIRST — above every
         // early return below — so an unknown pane, an orchestrator's own
         // `--done`, or a missing orchestrator pane can never leave a record
-        // armed and produce a bogus idle prompt later. Dropping the retired record cancels its watch task
-        // immediately instead of leaving it asleep for the rest of the timeout.
+        // armed and produce a bogus idle prompt later. Dropping the retired record
+        // cancels its watch task immediately instead of leaving it asleep for the
+        // rest of the timeout.
         // PRD #249 M3 review (finding B4): the same reasoning for the
         // silent-worker watch, and it matters MORE here. `work-done` is a CLI
         // signal, not an `AgentEvent`, so the watch's event wait can never see
