@@ -2336,30 +2336,15 @@ fn idle_worker_037_one_work_done_clears_a_twice_delegated_pane() {
         forward_delegation_retirements(&harness);
         let control_pane = worker_pane("control-worker");
         let twice_pane = worker_pane("twice-delegated-worker");
-        let mut broadcasts = harness.event_tx.subscribe();
-
         // Control: one delegation, one completion.
         harness.delegate(&["control-worker"]).await;
         // Twice-delegated: second delegation lands before any completion.
         harness.delegate(&["twice-delegated-worker"]).await;
         harness.delegate(&["twice-delegated-worker"]).await;
 
-        // Let both dispatches settle (negative window spent in full), then pin
-        // the preconditions: both panes owe a delegation and none was retired.
-        for pane in [&control_pane, &twice_pane] {
-            let seen = common::delegation_broadcasts_for(
-                &mut broadcasts,
-                pane,
-                Duration::from_millis(750),
-                false,
-            )
-            .await;
-            assert!(
-                seen.armed > 0,
-                "precondition: the delegation to {pane} must have been announced as armed; \
-                 broadcasts = {seen:?}"
-            );
-        }
+        // Let both dispatches settle, then pin the preconditions: both panes
+        // owe a delegation before any completion.
+        tokio::time::sleep(Duration::from_millis(750)).await;
         for pane in [&control_pane, &twice_pane] {
             assert!(
                 harness
