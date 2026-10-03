@@ -1821,14 +1821,11 @@ pub enum BroadcastMsg {
     /// delegation (`AgentPtyRegistry::retire_outstanding_delegation` returning
     /// `DelegationRetirement::Retired`, from `AppState::handle_work_done`).
     ///
-    /// **Deliberately NOT sent on `DelegationRetirement::RetiredSuperseded`**:
-    /// that outcome retires only the OLDER (superseded) of two delegations
-    /// stacked on the same worker pane, and the NEWER one stays armed on top
-    /// of it — the pane's `outstanding_delegation` genuinely stays `Some(..)`
-    /// in that case (it should still read as "delegated", just for the
-    /// newer task), so announcing a retirement there would be a lie the
-    /// badge would then have to un-tell itself on the next
-    /// hydration/reconnect.
+    /// Issue #849: a `work-done` now retires the pane's whole record, superseded
+    /// generations included, so every retirement it performs is announced and
+    /// the pane's `outstanding_delegation` never reads `Some(..)` after the
+    /// worker has answered. (The former partial-retirement outcome, which kept
+    /// the newer delegation armed and sent nothing, is gone.)
     ///
     /// This is also what closes the auditor-flagged staleness risk: without
     /// it, a delegation observed once at hydration (`Some(..)`) and then
