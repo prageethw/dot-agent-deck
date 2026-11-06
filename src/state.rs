@@ -599,6 +599,13 @@ pub struct HeldPlaceholder {
     pub agent_type: Option<AgentType>,
     pub agent_id: Option<String>,
     pub learned_from: Incarnation,
+    /// Fork #542's "Starting…" cue, carried through the hold: the spawn-time
+    /// constructor ([`AppState::insert_placeholder_session_awaiting_report_learned`])
+    /// knew, when it held this card, that its agent would report; the card
+    /// drawn once the stream names the process must still say so. The plain
+    /// constructor ([`AppState::insert_placeholder_session_learned`]) holds with
+    /// `false`.
+    pub expects_agent_report: bool,
 }
 
 /// Maximum number of first-prompt entries retained per session. The live-side
@@ -8823,7 +8830,9 @@ impl AppState {
     ///
     /// G-fix7e: each held placeholder ([`Self::held_placeholders`]) is settled
     /// once a stream opens on a named process: drawn when it was learned from
-    /// that process, and otherwise stale — queued for the notice as
+    /// that process, with the awaiting-report cue it was held with
+    /// ([`HeldPlaceholder::expects_agent_report`]), and otherwise stale — queued
+    /// for the notice as
     /// [`Self::insert_placeholder_session_learned`] queues one, without
     /// recording its process as replaced.
     pub fn learn_stream_incarnation(&mut self, incarnation: Incarnation) -> Vec<String> {
@@ -8851,7 +8860,7 @@ impl AppState {
                         held.agent_type,
                         held.agent_id,
                         held.learned_from,
-                        false,
+                        held.expects_agent_report,
                     );
                 } else {
                     self.queue_stale_placeholder(held);
@@ -9529,9 +9538,12 @@ impl AppState {
     ///
     /// When it is not drawable — an attach answered by a process this stream is
     /// not (yet) the deck's, or one already replaced — this is the learned
-    /// constructor's held/stale path verbatim: no card exists to reconcile, and
-    /// `expects_agent_report` is dropped with it, as the inline cue it replaces
-    /// found no card to arm there either.
+    /// constructor's held/stale path ([`Self::hold_placeholder`]): no card exists
+    /// to reconcile. A held card keeps `expects_agent_report`
+    /// ([`HeldPlaceholder::expects_agent_report`]), so that when the stream names
+    /// its process [`Self::learn_stream_incarnation`] draws it with fork #542's
+    /// "Starting…" cue, as the fork tip, which had no hold, always armed it. A
+    /// stale one is only named in the restart notice, which has no use for it.
     pub fn insert_placeholder_session_awaiting_report_learned(
         &mut self,
         pane_id: String,
@@ -9542,12 +9554,13 @@ impl AppState {
         expects_agent_report: bool,
     ) -> String {
         if !self.placeholder_drawable_now(&learned_from) {
-            return self.insert_placeholder_session_learned(
+            return self.hold_placeholder(
                 pane_id,
                 cwd,
                 agent_type,
                 agent_id,
                 learned_from,
+                expects_agent_report,
             );
         }
         match self.early_pane_session(&pane_id, agent_id.as_deref()) {
@@ -9821,6 +9834,28 @@ impl AppState {
         if self.placeholder_drawable_now(&learned_from) {
             return self.draw_placeholder(pane_id, cwd, agent_type, agent_id, learned_from, false);
         }
+        self.hold_placeholder(pane_id, cwd, agent_type, agent_id, learned_from, false)
+    }
+
+    /// The not-drawable half of [`Self::insert_placeholder_session_learned`]:
+    /// queue the placeholder as stale when the process it was learned from has
+    /// been replaced, and otherwise hold it until the stream names a process
+    /// ([`Self::held_placeholders`]). The caller has already decided, through
+    /// [`Self::placeholder_drawable_now`], that nothing is drawn.
+    ///
+    /// `expects_agent_report` rides with a held card
+    /// ([`HeldPlaceholder::expects_agent_report`]) so that the card drawn on
+    /// release keeps fork #542's "Starting…" cue; a stale one is only named in
+    /// the restart notice, which has no use for it.
+    fn hold_placeholder(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        learned_from: Incarnation,
+        expects_agent_report: bool,
+    ) -> String {
         let session_id = placeholder_session_id(&pane_id);
         let held = HeldPlaceholder {
             pane_id,
@@ -9828,6 +9863,7 @@ impl AppState {
             agent_type,
             agent_id,
             learned_from,
+            expects_agent_report,
         };
         if self.process_replaced(&held.learned_from) {
             self.queue_stale_placeholder(held);
@@ -24258,10 +24294,11 @@ clear = false
     }
 
     /// A pane learned from a process the stream is not (yet) on, or one the deck
-    /// replaced, is the learned constructor's held or stale path verbatim: no card
-    /// is reconciled with an early session, none is drawn, and the awaiting-report
-    /// flag is dropped with it (the inline cue this seam replaced found no card to
-    /// arm there either).
+    /// replaced, is the learned constructor's held or stale path: no card is
+    /// reconciled with an early session and none is drawn. A held card is drawn
+    /// once the stream names its process, and keeps the awaiting-report flag it
+    /// was held with (see
+    /// `a_held_spawn_time_placeholder_keeps_the_starting_cue_when_the_stream_names_its_process`).
     #[test]
     fn the_learned_spawn_time_constructor_holds_or_drops_a_card_the_plain_one_would() {
         let early = |state: &mut AppState| {
@@ -24293,15 +24330,16 @@ clear = false
         );
         assert_eq!(held.held_placeholders.len(), 1, "the placeholder is held");
 
-        // Held, then the stream opens on that process: drawn WITHOUT the flag.
+        // Held, then the stream opens on that process: drawn WITH the flag it
+        // was held with (the spawn above passes `true`).
         let mut drained = deck_streaming_from("p1");
         drained.register_pane(EARLY_PANE.to_string());
         spawn(&mut drained, process("p2"));
         drained.learn_stream_incarnation(process("p2"));
         let card = &drained.sessions[EARLY_PANE_KEY];
         assert!(
-            !card.expects_agent_report,
-            "a held placeholder loses the flag, exactly as the inline cue did: {card:#?}"
+            card.expects_agent_report,
+            "a held placeholder keeps the flag it was held with: {card:#?}"
         );
         assert_eq!(card.incarnation, process("p2"));
 
@@ -24320,6 +24358,95 @@ clear = false
             "and not drawn: {:?}",
             stale.sessions.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// Fork #542's "Starting…" cue survives a HOLD. The spawn-time constructor
+    /// knows its agent will report, but a pane learned from a process the event
+    /// stream has not named (or names as another's) is held, and drawn only when
+    /// the stream opens on that process. The card drawn then must still be armed:
+    /// a devbox-wrapped agent's card otherwise reads "No agent" until its first
+    /// hook. What the spawn did not arm stays unarmed, and the plain constructor
+    /// still seeds no cue, held or not.
+    #[test]
+    fn a_held_spawn_time_placeholder_keeps_the_starting_cue_when_the_stream_names_its_process() {
+        let spawn = |state: &mut AppState, expects: bool| {
+            state.register_pane(EARLY_PANE.to_string());
+            state.insert_placeholder_session_awaiting_report_learned(
+                EARLY_PANE.to_string(),
+                Some("/spawn".to_string()),
+                None,
+                Some("d-1".to_string()),
+                process("p2"),
+                expects,
+            )
+        };
+        let drawn = |mut state: AppState| {
+            assert!(
+                !state.sessions.contains_key(EARLY_PANE_KEY),
+                "precondition: nothing is drawn while the card is held"
+            );
+            assert_eq!(
+                state.held_placeholders.len(),
+                1,
+                "precondition: the placeholder is held"
+            );
+            state.learn_stream_incarnation(process("p2"));
+            assert!(
+                state.held_placeholders.is_empty(),
+                "the stream naming the process settles the hold"
+            );
+            state.sessions[EARLY_PANE_KEY].clone()
+        };
+
+        // The R1 shape: the attach's process is known, the stream is not open yet.
+        let mut no_stream = AppState::default();
+        spawn(&mut no_stream, true);
+        assert!(
+            no_stream.held_placeholders[0].expects_agent_report,
+            "the hold records the cue the spawn knew of"
+        );
+        let card = drawn(no_stream);
+        assert!(
+            card.expects_agent_report,
+            "released once the stream opens, the card is armed: {card:#?}"
+        );
+        assert_eq!(card.incarnation, process("p2"));
+
+        // The stream is on another process when the pane is learned.
+        let mut other_stream = deck_streaming_from("p1");
+        spawn(&mut other_stream, true);
+        let card = drawn(other_stream);
+        assert!(
+            card.expects_agent_report,
+            "armed also when the stream was on another process at spawn: {card:#?}"
+        );
+
+        // A spawn that did not expect a report holds, and draws, without a cue.
+        let mut unarmed = AppState::default();
+        spawn(&mut unarmed, false);
+        assert!(!unarmed.held_placeholders[0].expects_agent_report);
+        let card = drawn(unarmed);
+        assert!(
+            !card.expects_agent_report,
+            "no cue is invented for a spawn that did not arm one: {card:#?}"
+        );
+
+        // The plain constructor does not set it, held or not.
+        let mut plain = AppState::default();
+        plain.register_pane(EARLY_PANE.to_string());
+        plain.insert_placeholder_session_learned(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-1".to_string()),
+            process("p2"),
+        );
+        assert!(
+            !plain.held_placeholders[0].expects_agent_report,
+            "the plain constructor holds with no cue"
+        );
+        let card = drawn(plain);
+        assert!(!card.expects_agent_report, "and draws with none: {card:#?}");
     }
 
     /// Issue #806: a monitored wait is recorded against the CARD it was
