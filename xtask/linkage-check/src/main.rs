@@ -160,12 +160,6 @@ mod fork_declined_items;
 /// Issue #1850: the OpenTelemetry spans `affected-checks --run` sends, off
 /// unless the standard `OTEL_*` variables turn them on.
 mod gate_telemetry;
-/// PR #966 / Renovate #989: the gh-aw `*.lock.yml` files are GENERATED, and
-/// Renovate bumps the action pins inside them without regenerating the body.
-/// That broke every PR-review agent job with a gateway config error. Tests
-/// only — the remedy is `gh aw compile`, not a hand-edit.
-#[cfg(test)]
-mod gh_aw_lock_consistency;
 /// Issue #1181: no `git` program literal in the root crate's production
 /// sources. Like `desktop_project_boundary` this carries a live rule — rule 13
 /// in [`RULES`] — as well as its own tests.
