@@ -2266,6 +2266,16 @@ jobs:
           # the file is generated and not owned by this fork, there is nothing
           # to hand-fix here that would survive the next regen; excluded on
           # the same basis as the four rules above.
+          #
+          # `contains-bidirectional-characters` is NOT excluded as a rule (a
+          # stray bidi override in source is exactly what it should catch);
+          # one test file is excluded by path. `desktop/src/components/
+          # SelfUpgradeDialog.test.tsx` carries U+202E in a string on purpose:
+          # `self_upgrade_dialog_019` feeds the dialog a result path with a bidi
+          # override and asserts it is rendered with the override REMOVED, and a
+          # regexp of the bidi class asserting none survives. The characters are
+          # the fixture, they cannot be spelled any other way, and the file is
+          # test code that ships in no build.
           semgrep scan \
             --config p/rust \
             --config p/github-actions \
@@ -2275,6 +2285,7 @@ jobs:
             --exclude-rule rust.lang.security.args.args \
             --exclude-rule rust.lang.security.temp-dir.temp-dir \
             --exclude-rule yaml.github-actions.security.audit.unsafe-add-mask-workflow-command.unsafe-add-mask-workflow-command \
+            --exclude desktop/src/components/SelfUpgradeDialog.test.tsx \
             --sarif --output semgrep.sarif \
             --error
       - uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
