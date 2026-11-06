@@ -95,7 +95,22 @@ struct Scene {
 
 impl Scene {
     fn new() -> Self {
-        let daemon = inbox::daemon_unbound(&[]);
+        // These scenes delegate three or four tasks to one worker back to back,
+        // each straight after the previous report. The doorbell forgets how often
+        // it has rung only on a tick that sees the worker's queue empty, and with
+        // its defaults (a 200 ms tick, then 15 s before a second ring) a task
+        // posted within a tick of the last fetch waits out the schedule: longer
+        // than the 10 s the fixture waits for the in-pane fetch. Run 9 saw exactly
+        // that: the LAST delegation of `delegate_065` never rang, twice, and
+        // `delegate_036`'s last one on a first try that took 10.7 s, after which
+        // its retry passed in 0.9 s. A fast tick and a short schedule bound every
+        // ring to under a second (the settings `e2e_inbox_doorbell` and
+        // `e2e_idle_worker_detector` use); upstream's own multi-delegation test
+        // (`work_done_040`) has one follow-up, spaced out by its seams.
+        let daemon = inbox::daemon_unbound(&[
+            ("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25"),
+            ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "300,500,700,900"),
+        ]);
         let (orch, worker) = route::team(&daemon, false);
         Self {
             orch,
@@ -124,7 +139,20 @@ impl Scene {
     fn assign(&self, label: &str) -> String {
         let task = format!("NS-TASK-{label}: send your report with work-done");
         let id = route::delegate(&self.daemon, &self.orch, &task, false);
-        route::fetched(&self.daemon, &self.worker, &id, &task, "the orchestrator");
+        let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            route::fetched(&self.daemon, &self.worker, &id, &task, "the orchestrator")
+        }));
+        if let Err(panic) = fetched {
+            // The fixture's own message names the id it waited for and the bytes the
+            // worker saw; what it cannot say is what state the daemon holds each of
+            // the worker's messages in, which is what tells a lapsed or withheld
+            // ring from a ring that never came.
+            eprintln!(
+                "assign {label}: the worker's inbox when the task {id} was not fetched: {:#?}",
+                route::messages(&self.daemon, &self.worker)
+            );
+            std::panic::resume_unwind(panic);
+        }
         id
     }
 
