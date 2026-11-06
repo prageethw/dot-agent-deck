@@ -58518,6 +58518,15 @@ mod tests {
         use crate::daemon_client::restart_fixture::RestartingDaemon;
         use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
         use tokio::sync::RwLock;
+        // The footer names the first three agents in ONE row, cut at the frame's
+        // edge (`restart_notice_rows`: 100 columns here), so the label's width is
+        // part of what the test measures. The restart fixture mints `pane-N`
+        // (the daemon mints pane ids, PRD #365 M2) where the upstream-written
+        // test's controller counted `N`: a label built from the whole pane id is
+        // 5 columns wider per name, which made the summary 108 columns and cut
+        // "and 5 more." off the row. Label the card by the number alone, as the
+        // upstream test's pane ids did (93 columns).
+        let label = |pane: &str| format!("agent-on-{}", pane.trim_start_matches("pane-"));
         for delayed in [false, true] {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -58546,7 +58555,7 @@ mod tests {
                     let mut card = make_session(SessionStatus::Idle);
                     card.session_id = format!("s-{pane}");
                     card.pane_id = Some(pane.clone());
-                    card.display_name = Some(format!("agent-on-{pane}"));
+                    card.display_name = Some(label(pane));
                     st.sessions.insert(card.session_id.clone(), card);
                 }
             }
@@ -58565,17 +58574,14 @@ mod tests {
                 let late = panes.remove(2);
                 let first_batch = restart_notice_text(&ui).unwrap();
                 assert!(
-                    !first_batch.contains(&format!("agent-on-{late}")),
+                    !first_batch.contains(&label(&late)),
                     "delayed pane was already named: {first_batch}"
                 );
                 controller.mark_pane_lost_for_test(&late, PaneLostReason::DeckRestarted);
                 process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
                 panes.push(late);
             }
-            let names: Vec<String> = panes
-                .iter()
-                .map(|pane| format!("agent-on-{pane}"))
-                .collect();
+            let names: Vec<String> = panes.iter().map(|pane| label(pane)).collect();
             assert_eq!(
                 restart_notice_text(&ui),
                 Some(format!(
