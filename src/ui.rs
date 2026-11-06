@@ -54155,18 +54155,39 @@ mod tests {
             form.name_collision(),
             "[{path}] the refused title now counts as live, so the form's own guard holds it"
         );
+        let mut targets = None;
         let rendered = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
             let frame_area = frame.area();
-            render_new_pane_form(frame, frame_area, form);
+            targets = Some(render_new_pane_form(frame, frame_area, form));
         }));
+        let (_, _, buttons) = targets.expect("render_new_pane_form ran inside the draw");
         assert!(
             rendered.contains(NAME_COLLISION_WARNING[0].trim()),
             "[{path}] the restored form must show the existing collision warning, got:\n{rendered}"
         );
+        // Upstream's form drops `[Submit]` from the row when a collision is known.
+        // This fork keeps it on screen, INERT (fork#192 review F3, pinned by
+        // `guard_002`): painted but absent from the click rects, so `[Cancel]`
+        // stays in its ordinary slot and a muscle-memory click on the old
+        // `[Submit]` cannot cancel the form. "Exactly as a known collision does"
+        // therefore means present and inert, not absent.
         assert!(
-            !rendered.contains("[Submit]"),
-            "[{path}] the restored form must drop [Submit] exactly as a known collision does, \
+            rendered.contains("[Submit]"),
+            "[{path}] the restored form must keep [Submit] on screen as a known collision does, \
              got:\n{rendered}"
+        );
+        assert!(
+            !buttons
+                .iter()
+                .any(|(action, _)| matches!(action, Action::FormSubmit)),
+            "[{path}] the restored form's [Submit] must be INERT (no click rect) exactly as a \
+             known collision renders it, got:\n{rendered}"
+        );
+        assert!(
+            buttons
+                .iter()
+                .any(|(action, _)| matches!(action, Action::FormCancel)),
+            "[{path}] [Cancel] must stay clickable on the restored form, got:\n{rendered}"
         );
         assert!(
             ui.submitted_orchestration_form.is_none(),
