@@ -797,9 +797,9 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// failure the fork's #755 paragraph exists to prevent — so the merged wire
 /// takes a new number. The one-shot hook CLIs do not handshake (see "Where this
 /// constant is enforced" below), so the hook-verb break is declared in
-/// [`CONTRACT_BREAKS`] as `852-hook-verbs-require-capability-token`, beside the
-/// `852-write-and-submit-withdrawn-subject-removed` and
-/// `852-protocol-12-to-13-two-independent-twelves` entries.
+/// [`CONTRACT_BREAKS`] as `853-hook-verbs-require-capability-token`, beside the
+/// `853-write-and-submit-withdrawn-subject-removed` and
+/// `853-protocol-12-to-13-two-independent-twelves` entries.
 ///
 /// # Where this constant is enforced
 ///
@@ -1905,9 +1905,10 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // `changelog.d/1666-task-scoped-completion.breaking.md` is its fragment.
     "1666-task-scoped-completion-and-recovery",
     // The upstream sync merge (2026-11-05), at 13 -- the three entries below are
-    // all declared by `changelog.d/852.breaking.md`. 852 is the sync PR's
-    // expected number; if it is opened under another, rename the fragment and
-    // these three entries in the same commit (the pairing rule is keyed by it).
+    // all declared by `changelog.d/853.breaking.md`. 853 is the sync PR's
+    // number (it was first opened as 852 and replaced after the branch rename);
+    // if it is ever renumbered again, rename the fragment and these three
+    // entries in the same commit (the pairing rule is keyed by it).
     //
     // The hook socket is unversioned, so this one moves no wire number: `delegate`,
     // `work-done`, `wait start` and `wait done` from a fork-built CLI that
@@ -1921,21 +1922,21 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // version number cannot express. The CLI does not handshake, so
     // PROTOCOL_VERSION does not catch it either: reinstall the CLI before
     // restarting the daemon.
-    "852-hook-verbs-require-capability-token",
+    "853-hook-verbs-require-capability-token",
     // On the attach wire, at 13: `AttachRequest::WriteAndSubmit` (with
     // `AttachResponse::send_result` / `guarded_send`) is withdrawn, so a fork-12
     // client sending it fails the frame decode, and `delegate --subject` /
     // `work-done --subject` are removed, so a script passing the flag fails at
     // argument parsing. Listed beside the bump for #1049's reason: the fragment
     // exists, and the pairing rule is one-directional.
-    "852-write-and-submit-withdrawn-subject-removed",
+    "853-write-and-submit-withdrawn-subject-removed",
     // The 12 -> 13 bump itself. Fork and upstream had each reached 12
     // independently, on different wires; the merged daemon speaks neither (see
     // `PROTOCOL_VERSION`'s doc). A fork-12 peer loses `WriteAndSubmit` and its
     // hook verbs; an upstream-12 peer meets the fork's `WorktreeKept` payload
     // under upstream's tag, which fails the whole frame. The version equality
     // check refuses both upfront at the two sites that enforce it.
-    "852-protocol-12-to-13-two-independent-twelves",
+    "853-protocol-12-to-13-two-independent-twelves",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

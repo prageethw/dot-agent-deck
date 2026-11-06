@@ -92,7 +92,8 @@ export default defineConfig({
   retries: 0,
   // Issue #807: bound a hang. The suite is 435 tests on one worker and took
   // 374 of them in 8.0 minutes on the first CI run after the 2026-11-05
-  // upstream sync (PR #852), i.e. about 9.3 minutes in all: the 8-minute bound
+  // upstream sync (PR #853, opened as #852 before the branch rename), i.e.
+  // about 9.3 minutes in all: the 8-minute bound
   // this replaced (sized when the suite took ~3.5 minutes) cut that run off with
   // 60 tests not run, which reads as a failure but was no hang. 13 minutes is
   // ~1.4x the measured suite, and it still ends before the CI step's own
