@@ -19325,7 +19325,7 @@ fn render_frame(
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("— 0 session(s)", text_primary()),
+                Span::styled("— 0 agent(s)", text_primary()),
             ]));
             frame.render_widget(title, outer[0]);
 
