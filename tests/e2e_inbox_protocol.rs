@@ -1154,7 +1154,13 @@ fn inbox_protocol_023_a_refused_connection_renders_cause_and_remedy_on_the_card(
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     let pane = inbox_card::pane_with(&deck, "refused-card", json!({"agent_type":"codex"}));
-    assert!(deck.wait_for_grid_string_within("Codex", WAIT));
+    // Fork #339: the agent-type badge is off by default, so the card never draws
+    // "Codex" (upstream waited for that string to know the card was up). The
+    // card is up once its identity row (the display name, PRD fork#405 M1) is
+    // drawn; the refusal text below is what this test pins, not the type label.
+    deck.wait_until_grid("the stand-in's card is drawn", |grid| {
+        common::card_identity_row(grid, "refused-card").is_some()
+    });
     inbox_card::enqueue(&deck, &pane, "waiting for the refused agent");
     let mut request = inbox_card::request(&pane, "inbox_fetch");
     request["consumer"] = json!("cli");

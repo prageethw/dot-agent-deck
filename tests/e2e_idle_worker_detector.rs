@@ -186,8 +186,14 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         "has not reached the worker",
         "dot-agent-deck (daemon notice)",
     );
-    let (col, row) = deck.wait_for_in_grid("· orchestrator");
-    deck.click(col, row);
+    // The fork's card has no `<type> · <role>` title (fork #339 / PRD fork#405
+    // M1): the role is the card's identity row, so click the card found by it.
+    deck.wait_until_grid("the orchestrator's card is drawn", |grid| {
+        common::card_identity_row(grid, "orchestrator").is_some()
+    });
+    let row = common::card_identity_row(&deck.snapshot_grid(), "orchestrator")
+        .expect("the orchestrator's card is drawn");
+    deck.click(2, row as u16);
     assert!(
         common::wait_until(Duration::from_secs(20), || {
             let Some(pane) = common::role_pane_column(&deck.snapshot_grid(), "route-orchestrator")

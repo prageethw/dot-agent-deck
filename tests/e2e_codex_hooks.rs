@@ -300,8 +300,12 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
 }
 
 /// The Codex card's header row, from its left edge to the first top-right
-/// corner on that row: `┏ ▸ 1 Codex · <dir> ━━━ ● Idle ┓`, where the card shows
-/// its status.
+/// corner on that row: `┏ ▸ 1 ━━━ ● Idle ┓`, where the card shows its status.
+/// The fork draws no agent-type badge by default (fork #339) and puts the card's
+/// identity on a body row, so upstream's `Codex · <dir>` title text is not
+/// drawn; the card is found by its shortcut badge (` 1 ` or ` ▸ 1 `), which
+/// opens every bordered card's title, and Codex's own pane never starts a row's
+/// box that way. This run has a single card.
 ///
 /// Scoped to the card because the dashboard also shows the focused agent's
 /// pane, and that pane is real Codex painting its own words. PRD #1631's
@@ -310,7 +314,10 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
 /// line, which Codex paints while its turn-end hook runs, after the card had
 /// already gone Idle on that hook's event. The card read `● Idle` throughout.
 fn codex_card_header(grid: &str) -> Option<&str> {
-    let row = grid.lines().find(|line| line.contains("Codex · "))?;
+    const CARD_OPENINGS: [&str; 4] = ["┏ ▸ 1 ", "┌ ▸ 1 ", "┏ 1 ", "┌ 1 "];
+    let row = grid
+        .lines()
+        .find(|line| CARD_OPENINGS.iter().any(|opening| line.contains(opening)))?;
     let end = row.find(['┓', '┐']).unwrap_or(row.len());
     Some(&row[..end])
 }

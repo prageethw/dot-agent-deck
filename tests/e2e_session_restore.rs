@@ -1661,6 +1661,17 @@ fn detach_and_collect_output(deck: &mut TuiDeck) -> String {
     deck.stream_text()
 }
 
+/// Whether `grid` draws a deck card named `name` whose title row carries
+/// `status`. The fork has no agent-type badge by default and puts a card's
+/// identity on its own body row (fork #339, PRD fork#405 M1), so upstream's
+/// `No agent · <name>` title join is never drawn; the equivalent claim is "the
+/// card whose identity row is `name` shows `No agent` as its status".
+fn card_named_with_status(grid: &str, name: &str, status: &str) -> bool {
+    common::card_identity_row(grid, name)
+        .and_then(|row| grid.lines().nth(row - 1))
+        .is_some_and(|title| title.contains(status))
+}
+
 /// Scenario: Start the real TUI with an older session snapshot whose pane has a
 /// workspace mode name. The pane appears as a dashboard card without a mode
 /// tab, and a clean detach prints the legacy-mode warning.
@@ -1687,8 +1698,7 @@ fn restore_022_legacy_mode_snapshot_becomes_dashboard_card() {
         .launch_with_fixture("plain-project");
 
     deck.wait_until_grid("legacy pane is shown on a dashboard card", |grid| {
-        grid.lines()
-            .any(|line| line.contains("No agent · old-pane"))
+        card_named_with_status(grid, "old-pane", "No agent")
             && grid
                 .lines()
                 .next()
@@ -1767,8 +1777,7 @@ fn restore_023_legacy_mode_daemon_agent_becomes_dashboard_card() {
         .launch_with_fixture("minimal");
 
     deck.wait_until_grid("legacy daemon agent is shown on a dashboard card", |grid| {
-        grid.lines()
-            .any(|line| line.contains("No agent · old-agent"))
+        card_named_with_status(grid, "old-agent", "No agent")
             && grid
                 .lines()
                 .next()
@@ -1885,8 +1894,7 @@ fn restore_024_tokenless_orchestration_agent_becomes_dashboard_card() {
     deck.wait_until_grid(
         "token-less orchestration agent is a dashboard card",
         |grid| {
-            grid.lines()
-                .any(|line| line.contains("No agent · old-orchestrator"))
+            card_named_with_status(grid, "old-orchestrator", "No agent")
                 && grid
                     .lines()
                     .next()

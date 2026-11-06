@@ -506,6 +506,57 @@ fn missing_roles(grid: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// The agent type each orchestration role declares, as the card's type badge
+/// spells it (`AgentType`'s display).
+const ORCHESTRATION_ROLE_TYPES: [(&str, &str); 3] = [
+    ("coordinator", "ClaudeCode"),
+    ("builder", "OpenCode"),
+    ("reviewer", "Pi"),
+];
+
+/// Every orchestration role has its own card on `grid`: a bordered card whose
+/// identity row (the body row under the title, PRD fork#405 M1) opens with the
+/// role name.
+fn role_cards_drawn(grid: &str) -> bool {
+    ORCHESTRATION_ROLE_TYPES
+        .iter()
+        .all(|(role, _)| common::card_identity_row(grid, role).is_some())
+}
+
+/// Every orchestration role's card shows the role's declared agent type in its
+/// OWN title (cut at the card's top-right corner, so the focused role's pane
+/// beside it cannot satisfy the check). Needs the agent-type badge on.
+///
+/// Upstream drew `<type> · <role>` in one title; this fork's card (fork #339,
+/// PRD fork#405 M1) carries the type in the badge and the role on its own body
+/// row below, so the pairing is now "the card whose identity row is the role
+/// has the type in the title row above it".
+fn role_cards_carry_declared_types(grid: &str) -> bool {
+    ORCHESTRATION_ROLE_TYPES.iter().all(|(role, agent_type)| {
+        common::card_identity_row(grid, role)
+            .and_then(|row| grid.lines().nth(row - 1))
+            .map(|title| {
+                title
+                    .chars()
+                    .take_while(|c| !matches!(c, '┐' | '┓' | '╗'))
+                    .collect::<String>()
+            })
+            .is_some_and(|title| common::contains_word_token(&title, agent_type))
+    })
+}
+
+/// The fork draws no agent-type badge by default (fork #339, the deck-global
+/// bare `b` toggle), so a role card does not name its declared type until the
+/// badge is switched on. Waits for the tab to show `header_count` and all
+/// three role cards, then presses `b` and waits for the deck to confirm.
+fn show_agent_type_badges_once_role_cards_are_drawn(deck: &TuiDeck, header_count: &str) {
+    deck.wait_until_grid("the orchestration tab draws its three role cards", |grid| {
+        grid.contains(header_count) && role_cards_drawn(grid)
+    });
+    deck.send_keys(b"b");
+    deck.wait_for_string("Agent badge: shown");
+}
+
 /// The single-tab dashboard has a session-count header, one bordered card per
 /// plain agent, and the command-mode dashboard controls along the bottom.
 ///
@@ -1267,15 +1318,14 @@ fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_o
     });
     deck.send_bytes(b"\x1b[C"); // Right -> next tab -> Desktop prepared run
 
+    show_agent_type_badges_once_role_cards_are_drawn(&deck, "3 agent(s)");
     assert!(
         common::wait_until(Duration::from_secs(10), || {
             let grid = deck.snapshot_grid();
             grid.lines().next().is_some_and(|tabs| {
                 tabs.contains("Dashboard") && tabs.contains(ORCHESTRATION_TITLE)
             }) && grid.contains("3 agent(s)")
-                && grid.contains("ClaudeCode · coordinator")
-                && grid.contains("OpenCode · builder")
-                && grid.contains("Pi · reviewer")
+                && role_cards_carry_declared_types(&grid)
         }),
         "the already-attached TUI created tab {ORCHESTRATION_TITLE:?}, but switching into it \
          did not show exactly three sessions with the role-named ClaudeCode coordinator, \
@@ -1285,8 +1335,9 @@ fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_o
     // The prepared context is what the coordinator started with: its pane
     // shows the agents the daemon-published context lists — the two workers,
     // and not the coordinator itself, which the composer leaves out.
-    let (coordinator_col, coordinator_row) = deck.wait_for_in_grid("ClaudeCode · coordinator");
-    deck.click(coordinator_col, coordinator_row);
+    let coordinator_row = common::card_identity_row(&deck.snapshot_grid(), "coordinator")
+        .expect("the coordinator's card is drawn");
+    deck.click(2, coordinator_row as u16);
     assert!(
         common::wait_until(Duration::from_secs(10), || {
             let grid = deck.snapshot_grid();
@@ -1415,14 +1466,12 @@ fn visibility_002_desktop_prepared_orchestration_started_during_a_stream_gap_get
         deck.snapshot_grid()
     );
     deck.send_bytes(b"\x1b[C"); // Right -> next tab -> Desktop prepared run
+    // Three of the deck's four agents (the trigger pane is the fourth).
+    show_agent_type_badges_once_role_cards_are_drawn(&deck, "3/4 agent(s)");
     assert!(
         common::wait_until(Duration::from_secs(10), || {
             let grid = deck.snapshot_grid();
-            // Three of the deck's four agents (the trigger pane is the fourth).
-            grid.contains("3/4 agent(s)")
-                && grid.contains("ClaudeCode · coordinator")
-                && grid.contains("OpenCode · builder")
-                && grid.contains("Pi · reviewer")
+            grid.contains("3/4 agent(s)") && role_cards_carry_declared_types(&grid)
         }),
         "the rebuilt tab {ORCHESTRATION_TITLE:?} must show three of the four sessions, the \
          role-named ClaudeCode coordinator, OpenCode builder, and Pi reviewer cards. \
