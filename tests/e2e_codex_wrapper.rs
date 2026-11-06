@@ -329,7 +329,7 @@ fn codex_live_002_real_interactive_session_reports_active_model() {
         .expect("write bare Codex default command");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_imported_codex_credentials()
         .launch_with_fixture("codex-live");
