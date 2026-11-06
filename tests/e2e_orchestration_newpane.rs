@@ -191,16 +191,30 @@ fn newpane_003_ctrl_n_after_tab_switch_away_and_back_to_orchestrator_pane() {
 
     // Leave for the Dashboard, then return — landing back on the
     // orchestrator's own pane via the tab-switch restore path rather than a
-    // fresh tab open. Settled on quiescence (not a specific string) between
-    // the two switches: `capture_focus_on_switch_out`/`restore_focus_on_switch_in`
+    // fresh tab open. `capture_focus_on_switch_out`/`restore_focus_on_switch_in`
     // (`src/tab.rs`) are no-ops for the Dashboard, so which UiMode the deck
     // lands in while the Dashboard is up is deliberately left unasserted here
     // — the CSI-u sibling test above already covers mode-independence of
     // Ctrl+n's resolution; this test isolates the tab-switch-back angle alone.
+    //
+    // Each switch is settled on the observable it produces, not on terminal
+    // silence: a live deck with a daemon event stream repaints often enough
+    // that a 50 ms idle window may never occur (see `wait_until_grid`), and
+    // the run-8 dump never went quiet for 30 s on the Dashboard. The likely
+    // source is that the two `cat` role stand-ins never acknowledge the
+    // orchestrator prompt posted to their inbox, so the daemon's doorbell keeps
+    // ringing and `cat` keeps echoing it; that cause is not proven here. The
+    // Dashboard lists none of the orchestration's role cards, so it reads
+    // "No agents match filter."; the orchestration tab does not.
+    const DASHBOARD_BODY: &str = "No agents match filter.";
     deck.send_bytes(TAB_PREV);
-    deck.wait_until_quiescent();
+    deck.wait_until_grid("the Dashboard is the active tab", |grid| {
+        grid.contains(DASHBOARD_BODY)
+    });
     deck.send_bytes(TAB_NEXT);
-    deck.wait_until_quiescent();
+    deck.wait_until_grid("the orchestration tab is the active tab again", |grid| {
+        !grid.contains(DASHBOARD_BODY)
+    });
 
     // Ctrl+n with the orchestrator's own pane focused, reached via a tab
     // switch rather than a fresh tab open.
