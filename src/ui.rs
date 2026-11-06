@@ -12867,10 +12867,29 @@ fn dispatch_action(
                                 format!("could not verify orchestration name availability: {e}")
                             }
                         };
-                        ui.status_message = Some((
-                            format!("Orchestration failed: {reason}"),
-                            std::time::Instant::now(),
-                        ));
+                        // Issue #555 (upstream) meets this pre-spawn claim
+                        // (fork #201): the claim is the first place the daemon
+                        // can refuse a Name another client took since this
+                        // form opened, so the form comes back HERE too, by the
+                        // same marker and the same restore as the `StartAgent`
+                        // refusal in the `Err` arm below. Only a Name collision
+                        // carries it: a workspace collision between two
+                        // DIFFERENT Names (issue #760) keeps the status line,
+                        // since the Name the user typed is not itself in use.
+                        // Nothing was provisioned and no claim was granted, so
+                        // there is nothing to roll back or release.
+                        if let Some(form) = submitted_orchestration_form.filter(|_| {
+                            reason.contains(
+                                crate::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE,
+                            )
+                        }) {
+                            restore_form_after_title_refusal(ui, form);
+                        } else {
+                            ui.status_message = Some((
+                                format!("Orchestration failed: {reason}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
                         return Flow::Continue;
                     }
                     // PRD fork#544 M2b: isolation is now UNCONDITIONAL —
@@ -53967,10 +53986,20 @@ mod tests {
     /// known live, accept the suggested name, submit through the real key
     /// handler, and dispatch the `SpawnPane` it yields against `pane` — which
     /// also backs the `TabManager`, since that is what creates role panes.
-    fn submit_orchestration_form_against(pane: Arc<RefusingPaneController>) -> UiState {
+    ///
+    /// The pre-spawn `ClaimOrchestrationName` (fork #201) is the first daemon
+    /// round trip of that dispatch, so `daemon` stands up the stub attach daemon
+    /// that answers it; the project is a committed git repository because
+    /// isolation is unconditional (PRD fork#544 M2b) and a plain directory would
+    /// fail provisioning before the refusal under test.
+    fn submit_orchestration_form_against(
+        pane: Arc<RefusingPaneController>,
+        daemon: impl FnOnce(&std::path::Path) -> EmptyAgentsDaemonGuard,
+    ) -> UiState {
         let tmp = tempdir().expect("tempdir");
         let dir = tmp.path().join("myproj");
-        std::fs::create_dir_all(&dir).expect("project dir");
+        init_committed_git_repo(&dir);
+        let _daemon = daemon(tmp.path());
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
         ui.new_pane_form = Some(NewPaneFormState::new(
@@ -54005,50 +54034,35 @@ mod tests {
         ui
     }
 
-    /// Scenario: Open the new-pane form with no orchestration known live, so the
-    /// form suggests and admits `myproj-orchestrator-1`; meanwhile another
-    /// client has started an orchestration under that name, so the daemon
-    /// refuses the start. The form must come BACK — same selection, same name,
-    /// focus on Name — showing the existing "already in use by a live
-    /// orchestration" warning with `[Submit]` gone, rather than closing and
-    /// leaving a generic spawn failure on the status line. Any other spawn
-    /// failure still closes the form and reports itself as before.
-    #[spec("orchestration/identity/009")]
-    #[test]
-    fn identity_009_a_daemon_title_refusal_reopens_the_form_with_the_collision_warning() {
-        let refusal = format!(
-            "daemon returned error: {}: the name `myproj-orchestrator-1` is already in use by a \
-             live orchestration in /tmp/myproj; choose another name. Nothing was started.",
-            crate::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE
-        );
-        let refusing = Arc::new(RefusingPaneController {
-            error: refusal,
-            inner: CapturingPaneController::new(),
-        });
-        let ui = submit_orchestration_form_against(refusing);
-
+    /// The restored-form guarantee both refusal paths of
+    /// `identity_009_a_daemon_title_refusal_reopens_the_form_with_the_collision_warning`
+    /// must reach: the form is back, as submitted, warning about the collision.
+    fn assert_form_restored_with_collision_warning(ui: &UiState, path: &str) {
         assert_eq!(
             ui.mode,
             UiMode::NewPaneForm,
-            "a daemon title refusal must put the form back, not drop to the dashboard"
+            "[{path}] a daemon title refusal must put the form back, not drop to the dashboard"
         );
         let form = ui
             .new_pane_form
             .as_ref()
-            .expect("the submitted form must be restored after a title refusal");
-        assert_eq!(form.name, "myproj-orchestrator-1", "the typed name is kept");
+            .unwrap_or_else(|| panic!("[{path}] the submitted form must be restored"));
+        assert_eq!(
+            form.name, "myproj-orchestrator-1",
+            "[{path}] the typed name is kept"
+        );
         assert!(
             form.selected_orchestration().is_some(),
-            "the orchestration selection is kept"
+            "[{path}] the orchestration selection is kept"
         );
         assert_eq!(
             form.focused,
             FormField::Name,
-            "focus lands on the field to change"
+            "[{path}] focus lands on the field to change"
         );
         assert!(
             form.name_collision(),
-            "the refused title now counts as live, so the form's own guard holds it"
+            "[{path}] the refused title now counts as live, so the form's own guard holds it"
         );
         let rendered = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
             let frame_area = frame.area();
@@ -54056,39 +54070,138 @@ mod tests {
         }));
         assert!(
             rendered.contains(NAME_COLLISION_WARNING[0].trim()),
-            "the restored form must show the existing collision warning, got:\n{rendered}"
+            "[{path}] the restored form must show the existing collision warning, got:\n{rendered}"
         );
         assert!(
             !rendered.contains("[Submit]"),
-            "the restored form must drop [Submit] exactly as a known collision does, \
+            "[{path}] the restored form must drop [Submit] exactly as a known collision does, \
              got:\n{rendered}"
         );
         assert!(
             ui.submitted_orchestration_form.is_none(),
-            "the kept form is restored once and not held any longer"
+            "[{path}] the kept form is restored once and not held any longer"
+        );
+    }
+
+    /// Scenario: Open the new-pane form with no orchestration known live, so the
+    /// form suggests and admits `myproj-orchestrator-1`; meanwhile another
+    /// client has started an orchestration under that name. The daemon refuses
+    /// it either at the pre-spawn name claim (the first place it can see the
+    /// collision) or, when the claim was granted, at the start of the first role
+    /// pane — and on EITHER the form must come BACK, with the same selection,
+    /// the same name, focus on Name and the existing "already in use by a live
+    /// orchestration" warning with `[Submit]` gone, rather than closing and
+    /// leaving a generic spawn failure on the status line. A workspace refusal
+    /// between two DIFFERENT names, a claim that is refused for any other
+    /// reason, and any other spawn failure still close the form and report
+    /// themselves as before.
+    #[spec("orchestration/identity/009")]
+    #[test]
+    fn identity_009_a_daemon_title_refusal_reopens_the_form_with_the_collision_warning() {
+        let title_refusal = format!(
+            "{}: the name `myproj-orchestrator-1` is already in use by a live orchestration; \
+             choose another name. Nothing was started.",
+            crate::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE
+        );
+        let controller = |error: &str| {
+            Arc::new(RefusingPaneController {
+                error: error.to_string(),
+                inner: CapturingPaneController::new(),
+            })
+        };
+        let granting = |dir: &std::path::Path| {
+            with_recording_daemon(dir, Arc::new(std::sync::Mutex::new(Vec::new())))
+        };
+
+        // (1) Upstream's path (issue #555): the claim is granted and the daemon
+        // refuses the START of the first role pane.
+        let ui = submit_orchestration_form_against(
+            controller(&format!("daemon returned error: {title_refusal}")),
+            granting,
+        );
+        assert_form_restored_with_collision_warning(&ui, "refused at the start");
+
+        // (2) The fork's pre-spawn claim (issue #201) refuses first, in the
+        // daemon's Name-collision wording: the same restore, the same result.
+        let refused_title = title_refusal.clone();
+        let ui = submit_orchestration_form_against(
+            controller("the claim refused, so no pane may be created"),
+            move |dir| {
+                with_crafted_response_daemon(
+                    dir,
+                    crate::daemon_protocol::AttachResponse::err(refused_title),
+                )
+            },
+        );
+        assert_form_restored_with_collision_warning(&ui, "refused at the claim");
+
+        // Controls: everything that is NOT a Name collision keeps today's
+        // behaviour — the form stays closed and the failure is reported — so
+        // the reopen above is attributable to the title refusal and not to
+        // every failed orchestration start.
+        let assert_closed_and_reported = |ui: &UiState, what: &str, expected: &str| {
+            assert!(
+                ui.new_pane_form.is_none(),
+                "{what} must not reopen the form"
+            );
+            assert!(
+                ui.submitted_orchestration_form.is_none(),
+                "{what} must not keep the submitted form around for a later spawn to restore"
+            );
+            let status = ui.status_message.as_ref().map(|(m, _)| m.as_str());
+            assert!(
+                status.is_some_and(|m| m.starts_with(expected)),
+                "{what} is reported as before, wanted {expected:?}, got {status:?}"
+            );
+        };
+
+        let ui = submit_orchestration_form_against(
+            controller("daemon returned error: spawn failed: No such file or directory"),
+            granting,
+        );
+        assert_closed_and_reported(
+            &ui,
+            "a start failure that is not a title refusal",
+            "Orchestration failed:",
         );
 
-        // Control: a failure that is NOT a title refusal keeps today's
-        // behaviour — the form stays closed and the failure is reported — so
-        // the reopen above is attributable to the refusal and not to every
-        // failed orchestration start.
-        let failing = Arc::new(RefusingPaneController {
-            error: "daemon returned error: spawn failed: No such file or directory".to_string(),
-            inner: CapturingPaneController::new(),
-        });
-        let ui = submit_orchestration_form_against(failing);
-        assert!(
-            ui.new_pane_form.is_none(),
-            "any other failure must not reopen the form"
+        // A workspace refusal between two DIFFERENT Names (issue #760): the Name
+        // the user typed is not in use, so the form is not reopened to say so
+        // (`orchestration/worktree/028` waits for this status on screen).
+        let ui = submit_orchestration_form_against(
+            controller("the claim refused, so no pane may be created"),
+            |dir| {
+                with_crafted_response_daemon(
+                    dir,
+                    crate::daemon_protocol::AttachResponse::err(
+                        "another live orchestration already occupies this workspace (same \
+                         directory or same Name in this directory)",
+                    ),
+                )
+            },
         );
-        assert!(
-            ui.submitted_orchestration_form.is_none(),
-            "nor keep the submitted form around for a later spawn to restore"
+        assert_closed_and_reported(
+            &ui,
+            "a workspace collision between two different Names",
+            "Orchestration failed: another live orchestration already occupies this workspace",
         );
-        let status = ui.status_message.as_ref().map(|(m, _)| m.as_str());
-        assert!(
-            status.is_some_and(|m| m.starts_with("Orchestration failed:")),
-            "any other failure is reported as before, got {status:?}"
+
+        // A claim refused for a reason that is not a collision at all.
+        let ui = submit_orchestration_form_against(
+            controller("the claim refused, so no pane may be created"),
+            |dir| {
+                with_crafted_response_daemon(
+                    dir,
+                    crate::daemon_protocol::AttachResponse::err(
+                        "orchestration name \"myproj-orchestrator-1\" is not valid",
+                    ),
+                )
+            },
+        );
+        assert_closed_and_reported(
+            &ui,
+            "an invalid-name claim refusal",
+            "Orchestration failed: orchestration name",
         );
     }
 

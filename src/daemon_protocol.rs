@@ -7685,26 +7685,47 @@ async fn handle_connection(
                     &AttachResponse::err(format!("orchestration cwd {cwd:?} is not valid")),
                 )
                 .await?;
-            } else if registry.claim_orchestration_name(&name, cwd.as_deref(), &token) {
-                write_resp(&mut stream, &AttachResponse::ok()).await?;
             } else {
-                // Issue #760 (reviewer R2 / auditor N1): `claim_orchestration_name`
-                // refuses on EITHER a Name collision OR a resolved-workspace
-                // (`cwd`) collision against a different pane, and the boolean
-                // result doesn't say which branch fired. Word this generically
-                // rather than naming "the Name" specifically — a refusal caused
-                // by two different typed Names whose sanitized segments happen
-                // to collide on the same directory would otherwise tell the
-                // user the wrong thing is in conflict.
-                write_resp(
-                    &mut stream,
-                    &AttachResponse::err(
-                        "another live orchestration already occupies this workspace (same \
-                         directory or same Name in this directory)"
-                            .to_string(),
-                    ),
-                )
-                .await?;
+                match registry.try_claim_orchestration_name(&name, cwd.as_deref(), &token) {
+                    Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+                    // Upstream-sync round 30 (rule 24): the refusal is a NAME
+                    // collision, so it carries the SAME stable marker the
+                    // `StartAgent` title refusal does (issue #555). The TUI
+                    // puts the new-pane form back on either, with one
+                    // warning, instead of reporting a generic spawn failure —
+                    // and this claim is the one that fires first, so without
+                    // the marker that restore never happened for a collision
+                    // the claim could see.
+                    Err(crate::agent_pty::OrchestrationClaimConflict::Name) => {
+                        write_resp(
+                            &mut stream,
+                            &AttachResponse::err(format!(
+                                "{START_ERR_ORCHESTRATION_TITLE_IN_USE}: the name `{name}` is \
+                                 already in use by a live orchestration; choose another name. \
+                                 Nothing was started."
+                            )),
+                        )
+                        .await?
+                    }
+                    // Issue #760 (reviewer R2 / auditor N1): the refusal came
+                    // from the resolved-workspace (`cwd`) guard against a
+                    // DIFFERENT Name, so the Name the user typed is not in use
+                    // and must not be called so. Worded generically, as it
+                    // always was: two different typed Names whose sanitized
+                    // segments happen to collide on the same directory would
+                    // otherwise tell the user the wrong thing is in conflict.
+                    Err(crate::agent_pty::OrchestrationClaimConflict::Workspace) => {
+                        write_resp(
+                            &mut stream,
+                            &AttachResponse::err(
+                                "another live orchestration already occupies this workspace \
+                                 (same directory or same Name in this directory)"
+                                    .to_string(),
+                            ),
+                        )
+                        .await?
+                    }
+                }
             }
         }
         AttachRequest::ConfirmOrchestrationClaim { token, pane_id } => {
@@ -13668,6 +13689,79 @@ mod tests {
         assert!(
             good_claim.ok,
             "an invalid-cwd claim attempt must not leave the name held"
+        );
+    }
+
+    /// Upstream-sync round 30: the `ClaimOrchestrationName` handler words a
+    /// refusal by the guard that fired. A Name collision carries the same
+    /// stable marker as the `StartAgent` title refusal (issue #555), so the TUI
+    /// can put the new-pane form back on either; a workspace collision between
+    /// two DIFFERENT Names keeps the generic sentence (issue #760) with no
+    /// marker, because the Name the user typed is not in use. The workspace
+    /// sentence is pinned byte for byte: `orchestration/worktree/028` waits for
+    /// it on screen.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claim_orchestration_name_words_a_refusal_by_the_guard_that_fired() {
+        let registry = std::sync::Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("attach.sock");
+        let listener = bind_attach_listener(&socket_path).expect("bind stub attach listener");
+        let reg = registry.clone();
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        tokio::spawn(async move {
+            let _ = serve_attach(listener, reg, event_tx).await;
+        });
+
+        async fn claim(
+            socket_path: &std::path::Path,
+            name: &str,
+            token: &str,
+            cwd: &str,
+        ) -> AttachResponse {
+            let stream = IpcStream::connect(socket_path)
+                .await
+                .expect("connect to stub attach listener");
+            let (mut rd, mut wr) = stream.into_split();
+            crate::daemon_client::issue_command(
+                &mut rd,
+                &mut wr,
+                &AttachRequest::ClaimOrchestrationName {
+                    name: name.into(),
+                    token: token.into(),
+                    cwd: Some(cwd.into()),
+                },
+            )
+            .await
+            .expect("issue_command")
+        }
+
+        let first = claim(&socket_path, "alpha", "tok-1", "/work/proj").await;
+        assert!(first.ok, "a free Name in a free directory is granted");
+
+        let same_name = claim(&socket_path, "alpha", "tok-2", "/work/proj").await;
+        assert!(!same_name.ok);
+        let error = same_name.error.expect("a refusal carries its reason");
+        assert!(
+            error.starts_with(START_ERR_ORCHESTRATION_TITLE_IN_USE),
+            "a Name collision must carry the title-in-use marker the TUI keys on, \
+             got {error:?}"
+        );
+        assert!(
+            error.contains("`alpha`"),
+            "and name the Name that is in use, got {error:?}"
+        );
+
+        let other_name = claim(&socket_path, "beta", "tok-3", "/work/proj").await;
+        assert!(!other_name.ok);
+        assert_eq!(
+            other_name.error.as_deref(),
+            Some(
+                "another live orchestration already occupies this workspace (same directory \
+                 or same Name in this directory)"
+            ),
+            "a workspace collision between two different Names keeps the generic \
+             sentence, with no title marker"
         );
     }
 

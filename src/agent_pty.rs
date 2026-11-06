@@ -6123,6 +6123,17 @@ struct OrchestrationClaimKey {
     cwd: Option<String>,
 }
 
+/// Which guard of [`AgentPtyRegistry::try_claim_orchestration_name`] refused a
+/// claim. A [`Self::Name`] refusal means the Name the caller asked for is held
+/// by another live orchestration; a [`Self::Workspace`] refusal means a
+/// DIFFERENT Name already holds the identical resolved directory (issue #760),
+/// so the Name the user typed is not itself in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestrationClaimConflict {
+    Name,
+    Workspace,
+}
+
 /// Issue #586 M1/M2: a point-in-time snapshot of all delegation-watch state
 /// armed for one worker pane, for exposure via `daemon status --json`
 /// ([`crate::daemon_status`]) and the `ListAgents` attach response
@@ -8480,17 +8491,45 @@ impl AgentPtyRegistry {
     /// reverted — see that PRD's Decisions table — but the guard itself is
     /// genuinely independent of what feeds the segment and stays.)
     pub fn claim_orchestration_name(&self, name: &str, cwd: Option<&str>, pane_id: &str) -> bool {
+        self.try_claim_orchestration_name(name, cwd, pane_id)
+            .is_ok()
+    }
+
+    /// [`Self::claim_orchestration_name`], answering WHICH guard refused.
+    ///
+    /// Upstream-sync round 30 (CLAUDE.md rule 24, fork issue #201 meets
+    /// upstream's issue #555): the TUI puts the new-pane form back when a start
+    /// is refused because its Name is already taken, and the fork's pre-spawn
+    /// claim refuses that same collision FIRST — but it answered both guards
+    /// with one sentence, so a client could not tell a Name collision (the user
+    /// should pick another Name) from a workspace collision between two
+    /// DIFFERENT Names (issue #760: the sanitizer is not injective, and the
+    /// Name the user typed is not what is in use). The Name guard wins when both
+    /// fire: the same Name in the same directory is a Name collision.
+    pub fn try_claim_orchestration_name(
+        &self,
+        name: &str,
+        cwd: Option<&str>,
+        pane_id: &str,
+    ) -> Result<(), OrchestrationClaimConflict> {
         let mut claims = self.orchestration_name_claims.lock().unwrap();
-        let conflict = claims.iter().any(|(k, holder)| {
+        let mut conflict = None;
+        for (k, holder) in claims.iter() {
             let name_conflict = k.name == name
                 && holder != pane_id
                 && (k.cwd.is_none() || cwd.is_none() || k.cwd.as_deref() == cwd);
             let cwd_conflict =
                 holder != pane_id && k.cwd.is_some() && cwd.is_some() && k.cwd.as_deref() == cwd;
-            name_conflict || cwd_conflict
-        });
-        if conflict {
-            return false;
+            if name_conflict {
+                conflict = Some(OrchestrationClaimConflict::Name);
+                break;
+            }
+            if cwd_conflict {
+                conflict = Some(OrchestrationClaimConflict::Workspace);
+            }
+        }
+        if let Some(conflict) = conflict {
+            return Err(conflict);
         }
         // PRD fork#603 fix round (reviewer N1): the conflict scan above
         // already exempts `holder == pane_id`, so the same holder
@@ -8510,7 +8549,7 @@ impl AgentPtyRegistry {
             },
             pane_id.to_string(),
         );
-        true
+        Ok(())
     }
 
     /// Issue #201 option (b): release whatever orchestration-name claim (if
@@ -19140,6 +19179,48 @@ mod spawn_tests {
         // Releasing the real holder still works after the no-op release above.
         registry.release_orchestration_name("pane-y");
         assert!(registry.claim_orchestration_name("repo-orchestrator-2", Some(DIR2), "pane-z"));
+    }
+
+    /// Upstream-sync round 30: a refused claim says WHICH guard refused it, so a
+    /// client can tell a Name collision (pick another Name) from a workspace
+    /// collision between two different Names (issue #760). The Name guard wins
+    /// when both fire, and a refusal changes nothing the registry holds.
+    #[test]
+    fn a_refused_claim_names_the_guard_that_refused_it() {
+        use OrchestrationClaimConflict::{Name, Workspace};
+        const CWD: &str = "/tmp/proj-fix";
+        let registry = AgentPtyRegistry::new();
+        assert_eq!(
+            registry.try_claim_orchestration_name("alpha", Some(CWD), "pane-a"),
+            Ok(())
+        );
+
+        assert_eq!(
+            registry.try_claim_orchestration_name("alpha", Some(CWD), "pane-b"),
+            Err(Name),
+            "the same Name in the same directory is a Name collision, although \
+             the directory guard fires too"
+        );
+        assert_eq!(
+            registry.try_claim_orchestration_name("alpha", Some("/tmp/elsewhere"), "pane-b"),
+            Ok(()),
+            "the same Name in another directory is not a collision at all"
+        );
+        assert_eq!(
+            registry.try_claim_orchestration_name("alpha", None, "pane-c"),
+            Err(Name),
+            "a claim naming no directory is the wildcard: the Name collides"
+        );
+        assert_eq!(
+            registry.try_claim_orchestration_name("beta", Some(CWD), "pane-d"),
+            Err(Workspace),
+            "a DIFFERENT Name on the identical concrete directory is a \
+             workspace collision, and the Name the caller typed is not in use"
+        );
+        assert!(
+            !registry.claim_orchestration_name("beta", Some(CWD), "pane-d"),
+            "the bool form still refuses exactly when the classified form does"
+        );
     }
 
     /// Scenario: issue #760 (reviewer R2 / auditor N1) — the daemon-side
