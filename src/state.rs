@@ -27356,9 +27356,15 @@ clear = false
     /// card, and reports three times. The new card's accounting must equal what
     /// its journal holds, and its three reports must all stay whole, since the
     /// journal is far under budget.
+    ///
+    /// This fork clamps `tool_detail` to [`TOOL_DETAIL_MAX_LEN`] on ingest
+    /// (issue #562), so a 2 KiB detail would be stored cut and could not stay
+    /// "whole". The detail here is the longest one that survives the clamp, and
+    /// the lowered budget is measured from what the five reports retain rather
+    /// than computed from the detail's length.
     #[test]
     fn hook_provenance_journal_accounting_resets_when_a_card_is_superseded_under_its_key() {
-        const DETAIL: usize = 2048;
+        const DETAIL: usize = TOOL_DETAIL_MAX_LEN - 32;
         let session = "outside-reused";
         let pane = "outside-reused-pane";
         let report = |agent: &str, round: usize| {
@@ -27372,10 +27378,13 @@ clear = false
             event
         };
         let mut state = AppState::default();
-        state.set_unproven_journal_budget(6 * (DETAIL + 512));
         for round in 0..5 {
             state.apply_event(report("agent-old", round));
         }
+        // Just inside: the five reports fit with a fifth to spare, so the three
+        // of the card that supersedes them fit alone but would not beside them.
+        let (_, five_reports) = hook_provenance_journal_accounting(&state, session);
+        state.set_unproven_journal_budget(five_reports + five_reports / 5);
         let (cached, retained) = hook_provenance_journal_accounting(&state, session);
         assert_eq!(
             (cached, state.sessions[session].recent_events.len()),
