@@ -1262,7 +1262,7 @@ fn workspace_003_reopening_same_name_resumes_existing_workspace_preserving_local
     // --- Close the whole tab. ---
     deck.send_keys(b"\x04"); // Ctrl+D -> command mode
     deck.send_keys(b"\x17"); // Ctrl+W -> arm close confirmation
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     deck.send_keys(b"\x1b[B"); // Down -> select Close
     deck.send_keys(b"\r"); // Enter -> confirm
     deck.wait_for_string("No active agents"); // back to an empty Dashboard
@@ -1424,7 +1424,7 @@ fn workspace_004_resume_fetches_read_only_and_leaves_checked_out_branch_untouche
     // --- Close the whole tab. ---
     deck.send_keys(b"\x04");
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
     deck.wait_for_string("No active agents");
@@ -1659,7 +1659,7 @@ fn workspace_018_model_a_isolated_clone_is_registered_so_tab_close_reports_kept(
     // --- Close the whole tab. ---
     deck.send_keys(b"\x04"); // Ctrl+D -> command mode
     deck.send_keys(b"\x17"); // Ctrl+W -> arm close confirmation
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     deck.send_keys(b"\x1b[B"); // Down -> select Close
     deck.send_keys(b"\r"); // Enter -> confirm
     deck.wait_for_string("No active agents"); // back to an empty Dashboard
