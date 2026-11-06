@@ -4656,8 +4656,12 @@ fn dispatch_048_dry_run_then_real_run_still_dispatches_for_real() {
         stub.gh_calls().join("\n")
     );
 
+    // The claim writes run one `gh` process after another (comment, then label,
+    // then assignee), and the stub logs a call when its process STARTS, so the
+    // comment appearing in the log does not yet mean the label edit has run.
+    // Polled, like the assignee below.
     assert!(
-        stub.label_applied(repo, 21, IN_PROGRESS_LABEL),
+        common::wait_until(w(), || stub.label_applied(repo, 21, IN_PROGRESS_LABEL)),
         "the real run must actually apply the `in-progress` label to issue #21 — a skip caused \
          by the dry run's leftover worktree would leave this false"
     );
