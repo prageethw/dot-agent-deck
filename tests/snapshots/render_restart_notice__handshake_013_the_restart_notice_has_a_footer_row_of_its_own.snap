@@ -2,11 +2,11 @@
 source: tests/render_restart_notice.rs
 expression: shown
 ---
+ worker-deck — 0 agent(s)                                                                           
                                                                                                     
                                                                                                     
                                                                                                     
                          No active agents. Press Ctrl+n to create an agent.                         
-                                                                                                    
                                                                                                     
                                                                                                     
 The deck restarted; these agents were stopped: coder, reviewer.               [Agents a] [Dismiss c]

@@ -2,7 +2,7 @@
 source: tests/render_restart_notice.rs
 expression: end
 ---
-                                                                                
+ worker-deck — 0 agent(s)                                                       
     ┌ Restart notice · 13–20 of 20 ────────────────────────────────────────┐    
     │  The deck restarted; these agents were stopped:                      │    
     │                                                                      │    
