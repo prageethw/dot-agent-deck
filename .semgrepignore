@@ -26,3 +26,14 @@ site/helm/templates/
 # `nosemgrep` marker there would be a sync conflict for nothing.
 desktop/src/components/EndpointsPanel.test.tsx
 desktop/e2e/decks.spec.ts
+
+# A third deliberate bidi fixture, of the same kind and on the same terms
+# (upstream's file, byte-identical, which runs no Semgrep): the self-upgrade
+# dialog's `self_upgrade_dialog_019` feeds it a result path with a U+202E
+# override and asserts the dialog renders the path with the override REMOVED,
+# plus a regexp of the bidi class asserting none survives. The characters are
+# the fixture and cannot be spelled any other way; the file is test code that
+# ships in no build. Listed here, with its two siblings, rather than as a CLI
+# `--exclude` in ci.yml, so one file holds the policy and a local
+# `semgrep scan` agrees with CI.
+desktop/src/components/SelfUpgradeDialog.test.tsx
