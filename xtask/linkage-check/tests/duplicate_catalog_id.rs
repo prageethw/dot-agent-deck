@@ -77,6 +77,20 @@ fn linkage_check_fails_on_two_catalog_headings_sharing_one_id() {
         "linkage-check reported success on a catalog with two \
          `##### fixture/dupcat/001` headings (fork #148)\nstdout: {stdout}\nstderr: {stderr}"
     );
+    // A non-zero exit alone proves nothing: this fixture is a bare tempdir, so
+    // any rule that cannot read a project file it expects turns the run red
+    // without the duplicate heading being seen at all (it did, once upstream
+    // added rules that read `desktop/`, `site/` and `src/main.rs`, and this test
+    // kept passing). The run must be red BECAUSE of rule 19, the
+    // duplicate-heading rule, naming this id.
+    assert!(
+        stderr.contains(
+            "[19] catalog id `fixture/dupcat/001` has 2 `##### fixture/dupcat/001` headings"
+        ) && stderr.contains("(duplicate heading, fork #148)"),
+        "the run failed, but not with the duplicate-heading rule's finding for \
+         `fixture/dupcat/001` — a failure for another reason is not this test's \
+         guarantee (fork #148)\nstdout: {stdout}\nstderr: {stderr}"
+    );
 }
 
 /// Control case: the same fixture with the duplicate heading resolved

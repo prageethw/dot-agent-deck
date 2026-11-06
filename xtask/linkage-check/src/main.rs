@@ -1349,6 +1349,53 @@ fn rule_desktop_project_boundary(inputs: &Inputs) -> Vec<String> {
     desktop_project_boundary::run(&inputs.root)
 }
 
+/// This fork's "not this project's checkout" skip for the rules whose inputs
+/// are this project's own trees: for each rule number, the path whose absence
+/// means `root` is not a dot-agent-deck checkout at all.
+///
+/// Rule 12 carries the same skip inside `desktop_project_boundary::run`, keyed
+/// on `desktop/`. Rules 13, 14, 16, 17 and 18 are upstream's, added after this
+/// fork's synthetic fixture repos (`tests/duplicate_catalog_id.rs`,
+/// `tests/resurrected_changelog_fragment.rs`: a tempdir with a `[workspace]`
+/// `Cargo.toml`, `tests/` and `src/test_temp.rs`) were written, and each reports
+/// an input it cannot read as "a failure rather than a skip". They take the
+/// skip here, in the registered wrapper, and not inside each module's `run`,
+/// because upstream's own tests call those `run`s on bare tempdirs and assert
+/// the loud failure (`unit_test_endpoint_pin`'s "scanned nothing",
+/// `voice_capability_state`'s missing-root case): a skip inside `run` would
+/// change what they pin.
+///
+/// **The key is the PARENT, never the input the rule reads.** Rule 13 keys on
+/// `src/main.rs`, not `src/git_env.rs`, because `src/git_env.rs` going missing
+/// from a real checkout is exactly what the rule exists to report. A real
+/// checkout has every marker, so on this repository the skip cannot fire and a
+/// regression still fails (`the_checkout_skip_cannot_fire_on_this_project`); a
+/// rule absent from this table is never skipped.
+const CHECKOUT_MARKERS: &[(u16, &str)] = &[
+    (13, "src/main.rs"),
+    (14, "desktop"),
+    (16, "site"),
+    (17, "src/main.rs"),
+    (18, "desktop"),
+];
+
+/// Whether rule `rule` has nothing to say about `root` because `root` is not a
+/// dot-agent-deck checkout (see [`CHECKOUT_MARKERS`]). Says so on stderr when
+/// it is, in the wording rule 12's own skip uses, so a skip is never silent.
+fn not_this_projects_checkout(root: &Path, rule: u16) -> bool {
+    let Some((_, marker)) = CHECKOUT_MARKERS.iter().find(|(n, _)| *n == rule) else {
+        return false;
+    };
+    if root.join(marker).exists() {
+        return false;
+    }
+    eprintln!(
+        "linkage-check: [{rule}] skipped (no {marker} — not this project's checkout, e.g. a \
+         synthetic fixture repo)"
+    );
+    true
+}
+
 /// Rule 13 (issue #1181). Read straight off `src/` rather than folded into the
 /// shared scan, because that scan is line-based and this one has to track
 /// strings, comments, char literals and `#[cfg(test)]` item bodies across lines
@@ -1356,6 +1403,9 @@ fn rule_desktop_project_boundary(inputs: &Inputs) -> Vec<String> {
 /// `src/git_env.rs` going missing must be reported rather than quietly emptying
 /// the rule.
 fn rule_git_program_literal(inputs: &Inputs) -> Vec<String> {
+    if not_this_projects_checkout(&inputs.root, 13) {
+        return Vec::new();
+    }
     git_program_literal::run(&inputs.root)
 }
 
@@ -1366,6 +1416,9 @@ fn rule_git_program_literal(inputs: &Inputs) -> Vec<String> {
 /// going missing (the shell files, `VoiceActionContext`, a construction site)
 /// must be reported rather than quietly emptying the rule.
 fn rule_voice_capability_state(inputs: &Inputs) -> Vec<String> {
+    if not_this_projects_checkout(&inputs.root, 18) {
+        return Vec::new();
+    }
     voice_capability_state::run(&inputs.root)
 }
 
@@ -1373,6 +1426,9 @@ fn rule_voice_capability_state(inputs: &Inputs) -> Vec<String> {
 /// off its own files for rule 12's reason — a different tree, and an input
 /// going missing must be reported rather than quietly emptying the rule.
 fn rule_voice_command_registry(inputs: &Inputs) -> Vec<String> {
+    if not_this_projects_checkout(&inputs.root, 14) {
+        return Vec::new();
+    }
     voice_command_registry::run(&inputs.root)
 }
 
@@ -1384,6 +1440,9 @@ fn rule_no_bare_git_ctor(inputs: &Inputs) -> Vec<String> {
 /// `site/static/img/` — so, like rules 12–14, the inputs going missing is a
 /// finding rather than a vacuous pass.
 fn rule_site_image_refs(inputs: &Inputs) -> Vec<String> {
+    if not_this_projects_checkout(&inputs.root, 16) {
+        return Vec::new();
+    }
     site_image_refs::run(&inputs.root)
 }
 
@@ -1392,6 +1451,9 @@ fn rule_site_image_refs(inputs: &Inputs) -> Vec<String> {
 /// inputs going missing (the agent registry, the pin helpers) must be reported
 /// rather than quietly emptying the rule.
 fn rule_unit_test_emitter_pins_endpoints(inputs: &Inputs) -> Vec<String> {
+    if not_this_projects_checkout(&inputs.root, 17) {
+        return Vec::new();
+    }
     unit_test_endpoint_pin::run(&inputs.root)
 }
 
@@ -2914,6 +2976,76 @@ mod tests {
              renumber silently invalidates every `rule N` citation in CLAUDE.md, docs/ and tests/",
             RULES.len()
         );
+    }
+
+    // --- this fork's "not this project's checkout" skip (CHECKOUT_MARKERS) ---
+
+    /// The skip is only worth having if it cannot fire on the project it
+    /// guards. Every marker is a path THIS checkout has, so rules 13, 14, 16,
+    /// 17 and 18 still run here, and a rule moved or removed under a real
+    /// checkout still fails loudly in its own module rather than being skipped.
+    #[test]
+    fn the_checkout_skip_cannot_fire_on_this_project() {
+        let root = repo_root();
+        for (rule, marker) in CHECKOUT_MARKERS {
+            assert!(
+                RULES.iter().any(|r| r.number == *rule),
+                "CHECKOUT_MARKERS keys rule {rule}, which is not registered in RULES"
+            );
+            assert!(
+                root.join(marker).exists(),
+                "rule {rule}'s marker `{marker}` is missing from this checkout, so the skip \
+                 would silently turn the rule off here — re-key it on a parent that exists"
+            );
+            assert!(
+                !not_this_projects_checkout(&root, *rule),
+                "the skip fired for rule {rule} on this project's own checkout"
+            );
+        }
+    }
+
+    /// The shape `tests/duplicate_catalog_id.rs` builds — `src/` exists but
+    /// `src/main.rs` does not, and there is no `desktop/` or `site/` — skips
+    /// exactly the keyed rules, and no other (rule 12 carries its own skip, and
+    /// rules 19–22 their own handling).
+    #[test]
+    fn a_bare_fixture_root_skips_exactly_the_keyed_rules() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("mkdir src/");
+        std::fs::write(tmp.path().join("src/test_temp.rs"), "// fixture stand-in\n")
+            .expect("write src/test_temp.rs");
+        for rule in 1..=RULES.len() as u16 {
+            let keyed = CHECKOUT_MARKERS.iter().any(|(n, _)| *n == rule);
+            assert_eq!(
+                not_this_projects_checkout(tmp.path(), rule),
+                keyed,
+                "rule {rule}: a bare fixture root must skip a keyed rule and only a keyed rule"
+            );
+        }
+    }
+
+    /// The other direction: once the parent is there the rule runs, so a real
+    /// regression under it is reported. Each marker is created on its own, and
+    /// only the rules keyed on that marker stop being skipped.
+    #[test]
+    fn a_present_parent_means_the_rule_runs() {
+        for present in ["src/main.rs", "desktop", "site"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join(present);
+            if present.ends_with(".rs") {
+                std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir src/");
+                std::fs::write(&path, "fn main() {}\n").expect("write src/main.rs");
+            } else {
+                std::fs::create_dir_all(&path).expect("mkdir marker dir");
+            }
+            for (rule, marker) in CHECKOUT_MARKERS {
+                assert_eq!(
+                    not_this_projects_checkout(tmp.path(), *rule),
+                    *marker != present,
+                    "rule {rule} (marker `{marker}`) with only `{present}` present"
+                );
+            }
+        }
     }
 
     /// The name is the identity that does NOT renumber, so it has to be usable
