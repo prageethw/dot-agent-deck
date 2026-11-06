@@ -80,9 +80,12 @@
 //! and the registry's `delegation_watch_snapshot(..).outstanding_delegation`;
 //! `039` also needs `BroadcastMsg::DelegationArmed` from `handle_delegate` and
 //! `AppState::{apply_delegation_armed, apply_delegation_retired}`. `042` and
-//! `043` read only the orchestrator inbox. UNSURE (CI decides): `043` waits for
-//! the "respawn failed for role" notice the dispatch posts when a `clear = true`
-//! respawn fails; confirm upstream's dispatch still posts it.
+//! `043` read only the orchestrator inbox. `043` waits for the "delegated worker
+//! respawn failed" notice the dispatch posts there when a `clear = true`
+//! respawn fails (the CI run of the sync showed the text the dispatch posts is
+//! that one, not the fork's earlier "respawn failed for role" wording). `039`
+//! and `042` send their `work-done` only once the worker has acknowledged its
+//! task, because a report that names no task retires nothing.
 //!
 //! The fork's other changes to upstream's tests are dropped for the same
 //! reasons: the registration `generation` / `daemon_boot_id` / `subject` fields
@@ -498,6 +501,31 @@ impl IdleHarness {
         )
         .await;
         tokio::time::Instant::now()
+    }
+
+    /// PRD #1666 part 3a: wait until `role`'s worker has acknowledged the task
+    /// [`Self::delegate`] posted to it (the background taker acknowledges it the
+    /// way an agent component would). A `work-done` names the task its worker
+    /// has taken, so one sent before that is a note that "names no task": it
+    /// retires nothing, and the delegation it was meant to answer stays armed.
+    async fn wait_for_task_acknowledged(&self, role: &str) {
+        let pane_id = worker_pane(role);
+        let agent_id = self
+            .worker_agent_ids
+            .get(role)
+            .expect("worker agent id recorded at spawn")
+            .clone();
+        let delivered = tokio::time::timeout(common::load_scaled(Duration::from_secs(5)), async {
+            while !task_acknowledged_by(&self.registry, &pane_id, &agent_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            delivered.is_ok(),
+            "precondition: the {role} worker never acknowledged its task, so a work-done sent \
+             now would name no task and retire nothing"
+        );
     }
 
     fn snapshot_of(&self, agent_id: &str) -> String {
@@ -3519,6 +3547,9 @@ fn idle_worker_039_already_attached_client_sees_delegation_live_with_no_reconnec
              can be set at all"
         );
 
+        // The worker must hold its task before it can answer it: see
+        // `wait_for_task_acknowledged`.
+        harness.wait_for_task_acknowledged("coder").await;
         harness.work_done("coder").await;
 
         let retired_notice = loop {
@@ -3926,7 +3957,10 @@ fn idle_worker_042_work_done_immediately_before_exit_suppresses_the_exit_notice(
         // The worker reports completion BEFORE its process ends — the stub's
         // own `sleep 1` has not elapsed yet, so this is the legitimate
         // ordering this test exists to protect. `work_done()` retires both
-        // records synchronously via `AppState::handle_work_done`.
+        // records synchronously via `AppState::handle_work_done`, but only for
+        // the task its worker has taken, so wait for the acknowledgement that
+        // leaves the stub's `sleep 1` still running.
+        harness.wait_for_task_acknowledged(WORKER_ROLE).await;
         harness.work_done(WORKER_ROLE).await;
 
         // Now let the stub's own `sleep 1; exit 0` produce PTY EOF naturally.
@@ -3981,7 +4015,9 @@ fn idle_worker_043_undelivered_delegation_produces_no_idle_prompt() {
             .delegate(&["silent-control", "undelivered-worker"])
             .await;
 
-        let respawn_failed = "respawn failed for role 'undelivered-worker'";
+        // The respawn-error exit's report, posted to the orchestrator's inbox
+        // (PRD #1666) in the wording that names no role (issue #1337).
+        let respawn_failed = "delegated worker respawn failed";
         let notified = harness
             .wait_for_snapshot(
                 |snapshot| snapshot.contains(respawn_failed),
