@@ -143,9 +143,8 @@ pub(crate) const TEXT_CLASSES: &[TextClass] = &[
     },
     TextClass {
         name: "skills",
-        read_by: "read by xtask/linkage-check (skill_frontmatter, verify_pr_stream, \
-                  tag_release_cleanup) and tests/release_cleanup.rs, which runs the \
-                  tag-release skill's cleanup.sh",
+        read_by: "read by xtask/linkage-check (skill_frontmatter, verify_pr_stream) and \
+                  tests/release_cleanup.rs, which runs the tag-release skill's cleanup.sh",
         patterns: &[Pattern::Under(".claude/skills/")],
         root_tests: &[RootTest {
             name: "release_cleanup",
@@ -1047,7 +1046,7 @@ mod tests {
     #[test]
     fn a_skill_change_runs_linkage_check_with_verify_pr_stream() {
         // `XTASK_TESTS` is `xtask/linkage-check`'s whole suite, which is where
-        // `skill_frontmatter`, `verify_pr_stream` and `tag_release_cleanup` live.
+        // `skill_frontmatter` and `verify_pr_stream` live.
         // The fork's `tests/release_cleanup.rs` also runs the tag-release skill's
         // `cleanup.sh` from the checkout, so the "skills" class names it too.
         for path in [
