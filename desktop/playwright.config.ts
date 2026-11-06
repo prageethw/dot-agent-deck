@@ -90,10 +90,15 @@ export default defineConfig({
   // narrowing to one test is never what the author meant.
   forbidOnly: !!process.env.CI,
   retries: 0,
-  // Issue #807: bound a hang. The suite takes ~3.5 minutes today; 8 minutes
-  // leaves ~2.3x headroom for it to grow, and it ends before the CI step's
-  // 9-minute limit so Playwright stops and writes its HTML report first.
-  globalTimeout: 8 * 60 * 1000,
+  // Issue #807: bound a hang. The suite is 435 tests on one worker and took
+  // 374 of them in 8.0 minutes on the first CI run after the 2026-11-05
+  // upstream sync (PR #852), i.e. about 9.3 minutes in all: the 8-minute bound
+  // this replaced (sized when the suite took ~3.5 minutes) cut that run off with
+  // 60 tests not run, which reads as a failure but was no hang. 13 minutes is
+  // ~1.4x the measured suite, and it still ends before the CI step's own
+  // `timeout-minutes: 15` (`.github/workflows/ci.yml`, the `pnpm test:browser`
+  // step) so Playwright stops and writes its HTML report first.
+  globalTimeout: 13 * 60 * 1000,
   // One worker in CI to start. Layout is not timing-dependent, but browser
   // startup on a 4-vCPU runner contends with itself, and this job has no honest
   // runs yet — the same reason `e2e-deterministic` was added advisory. Raising
