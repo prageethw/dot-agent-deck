@@ -18626,6 +18626,283 @@ mod tests {
         );
     }
 
+    /// Issue #331, the destination side of what the `work-done` CLI's own
+    /// `--task-file` guard used to refuse by shape: a SYMLINK AT
+    /// `.dot-agent-deck/work-done-<role>.md` is refused by the open itself
+    /// (`O_NOFOLLOW`), before the replace check ever reads what it points at. The
+    /// guard never caught this case (canonicalising `link -> target` puts the
+    /// target outside the namespace). Each target below is chosen so that the
+    /// replace check WOULD have accepted it behind a regular file (the control
+    /// half proves that), so the refusal is the only thing between the report
+    /// and the target: untouched bytes, untouched mode, the link still a link,
+    /// nothing new beside it, and the report inlined rather than filed.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_summary_path_is_refused_whatever_it_points_at() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let framed = frame_untrusted_report_for_file("A report the deck could have written.");
+        let fingerprinted = frame_untrusted_report_for_file("What this daemon last wrote.");
+        // (what the target holds, bytes, does this daemon hold a record of
+        // writing them, is it replaceable behind a regular file)
+        let targets: [(&str, &str, bool, bool); 4] = [
+            (
+                "a worker's own non-empty report",
+                "# Review\n\n- BLOCKER one\n",
+                false,
+                false,
+            ),
+            ("an empty file", "", false, true),
+            (
+                "a file in the deck's frame, no record",
+                framed.as_str(),
+                false,
+                true,
+            ),
+            (
+                "the bytes this daemon last wrote",
+                fingerprinted.as_str(),
+                true,
+                true,
+            ),
+        ];
+        for (label, bytes, recorded, replaceable) in targets {
+            // Control: the same bytes in a REGULAR file at the role path.
+            let control = tempfile::tempdir().expect("tempdir");
+            let control_str = control.path().to_str().expect("utf8 cwd");
+            let control_role = control.path().join(".dot-agent-deck/work-done-coder.md");
+            std::fs::create_dir_all(control_role.parent().unwrap()).unwrap();
+            std::fs::write(&control_role, bytes).unwrap();
+            if recorded {
+                written_summaries().insert(
+                    control_role.clone(),
+                    SummaryFingerprint::of(bytes.as_bytes()),
+                );
+            }
+            assert_eq!(
+                write_work_done_summary(Some(control_str), "coder", "coder", "pane-1", "Report."),
+                if replaceable {
+                    SummaryWrite::Written
+                } else {
+                    SummaryWrite::Occupied
+                },
+                "control: {label} behind a regular file at the role path"
+            );
+
+            // The same bytes, reached through a symlink at the role path.
+            let cwd = tempfile::tempdir().expect("tempdir");
+            let cwd_str = cwd.path().to_str().expect("utf8 cwd");
+            let context = cwd.path().join(".dot-agent-deck");
+            std::fs::create_dir_all(&context).unwrap();
+            let role_path = context.join("work-done-coder.md");
+            let target = cwd.path().join("NOTES.md");
+            std::fs::write(&target, bytes).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            std::os::unix::fs::symlink(&target, &role_path).unwrap();
+            if recorded {
+                written_summaries()
+                    .insert(role_path.clone(), SummaryFingerprint::of(bytes.as_bytes()));
+            }
+
+            assert_eq!(
+                write_work_done_summary(Some(cwd_str), "coder", "coder", "pane-1", "Report."),
+                SummaryWrite::Failed,
+                "{label}: a symlink at the role path must be refused, not followed"
+            );
+            assert_eq!(
+                file_commissioned_report(Some(cwd_str), "coder", "coder", "pane-1", "Report."),
+                WorkDoneReportChannel::Unfiled,
+                "{label}: the report is inlined, and no file is named as holding it"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                bytes.as_bytes(),
+                "{label}: the target must survive byte for byte"
+            );
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o640,
+                "{label}: the target must not be re-moded"
+            );
+            assert_eq!(
+                std::fs::read_link(&role_path).unwrap(),
+                target,
+                "{label}: the link itself is left as it was"
+            );
+            assert_eq!(
+                std::fs::read_dir(&context).unwrap().count(),
+                1,
+                "{label}: nothing is written beside the link"
+            );
+        }
+    }
+
+    /// The same refusal as the test above, reached through the whole composition:
+    /// a task's report whose role path is a symlink to a worker's file reaches
+    /// the orchestrator inline, says the deck wrote no file for it, and sends it
+    /// nowhere near the file the link points at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_whose_role_path_is_a_symlink_is_delivered_inline() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cwd_str = cwd.path().to_str().expect("utf8 cwd").to_string();
+        let context = cwd.path().join(".dot-agent-deck");
+        std::fs::create_dir_all(&context).unwrap();
+        let target = cwd.path().join("NOTES.md");
+        std::fs::write(&target, "# The worker's own notes\n").unwrap();
+        std::os::unix::fs::symlink(&target, context.join("work-done-coder.md")).unwrap();
+
+        let content = compose_report_post(
+            ReportPost::Task {
+                task_id: "t-link".to_string(),
+                role: "coder".to_string(),
+                cwd: Some(cwd_str),
+            },
+            "pane-1",
+            "agent-1",
+            "THE-REPORT-TEXT",
+        )
+        .await;
+
+        assert_eq!(content.body, "THE-REPORT-TEXT", "the report is inlined");
+        let preface = content.preface.as_deref().expect("preface");
+        assert!(
+            preface.contains("could not write") && preface.contains("Do NOT read that path"),
+            "the orchestrator is told no file holds this report: {preface}"
+        );
+        assert_eq!(content.spill_path, None, "no copy was filed anywhere");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "# The worker's own notes\n",
+            "the link's target is untouched"
+        );
+    }
+
+    /// A `.dot-agent-deck` that is itself a symlink is never written through: not
+    /// by the role-keyed summary, not by the create-exclusive divert, and not
+    /// into a file already sitting at the role name on the other side — one the
+    /// replace check would accept (empty, or in the deck's frame). The report is
+    /// inlined (`Unfiled`) and nothing lands outside the project.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_context_directory_is_never_written_through_by_a_report() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let framed = frame_untrusted_report_for_file("A report the deck could have written.");
+        let seeds: [Option<&str>; 3] = [None, Some(""), Some(framed.as_str())];
+        for seed in seeds {
+            let cwd = tempfile::tempdir().expect("tempdir");
+            let cwd_str = cwd.path().to_str().expect("utf8 cwd");
+            let elsewhere = tempfile::tempdir().expect("tempdir");
+            let seeded = elsewhere.path().join("work-done-coder.md");
+            if let Some(bytes) = seed {
+                std::fs::write(&seeded, bytes).unwrap();
+                std::fs::set_permissions(&seeded, std::fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            std::os::unix::fs::symlink(elsewhere.path(), cwd.path().join(".dot-agent-deck"))
+                .unwrap();
+
+            assert_eq!(
+                write_work_done_summary(Some(cwd_str), "coder", "coder", "pane-1", "Report."),
+                SummaryWrite::Failed,
+                "seed {seed:?}: the summary must not be written through the directory link"
+            );
+            assert_eq!(
+                file_commissioned_report(Some(cwd_str), "coder", "coder", "pane-1", "Report."),
+                WorkDoneReportChannel::Unfiled,
+                "seed {seed:?}: the report is inlined"
+            );
+            assert_eq!(
+                save_full_report(Some(cwd_str), "work-done-coder", "Report."),
+                None,
+                "seed {seed:?}: the create-exclusive divert refuses the link as well"
+            );
+
+            let after: Vec<_> = std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            match seed {
+                None => assert!(after.is_empty(), "nothing is created outside: {after:?}"),
+                Some(bytes) => {
+                    assert_eq!(after, vec![seeded.clone()], "nothing is added beside it");
+                    assert_eq!(std::fs::read(&seeded).unwrap(), bytes.as_bytes());
+                    assert_eq!(
+                        std::fs::metadata(&seeded).unwrap().permissions().mode() & 0o777,
+                        0o640,
+                        "seed {seed:?}: the seeded file is not re-moded"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What the daemon does with a `--task-file` argument that is a symlink to
+    /// the role file, or reaches it through a directory alias of
+    /// `.dot-agent-deck` (the shapes the CLI guard used to refuse): the argument
+    /// is never written, because the daemon never sees it. The CLI has already
+    /// read the worker's text through it and sent that text, and the role file
+    /// holding that same text is a file the deck did not write, so it is kept
+    /// byte for byte and the report is diverted into a fresh, framed,
+    /// create-exclusive copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_task_file_that_is_a_link_to_the_role_file_leaves_both_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cwd_str = cwd.path().to_str().expect("utf8 cwd");
+        let context = cwd.path().join(".dot-agent-deck");
+        std::fs::create_dir_all(&context).unwrap();
+        let role_path = context.join("work-done-coder.md");
+        let report = "# Review\n\n- BLOCKER one\n";
+        std::fs::write(&role_path, report).unwrap();
+        std::fs::set_permissions(&role_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        std::fs::create_dir(cwd.path().join("notes")).unwrap();
+        let file_link = cwd.path().join("notes/external-report.md");
+        std::os::unix::fs::symlink(&role_path, &file_link).unwrap();
+        let dir_alias = cwd.path().join("alias");
+        std::os::unix::fs::symlink(&context, &dir_alias).unwrap();
+
+        // What the CLI would send for each supplied path: the bytes it read.
+        for supplied in [file_link.clone(), dir_alias.join("work-done-coder.md")] {
+            let sent = std::fs::read_to_string(&supplied).unwrap();
+            assert_eq!(sent, report, "premise: {supplied:?} reads as the role file");
+
+            let channel =
+                file_commissioned_report(Some(cwd_str), "coder", "coder", "pane-1", &sent);
+            let WorkDoneReportChannel::Diverted(copy) = channel else {
+                panic!("{supplied:?}: the report must be diverted, got {channel:?}");
+            };
+            assert_ne!(copy, role_path, "the copy is a new file");
+            assert!(
+                copy.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("full-report-work-done-coder-")),
+                "{copy:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&copy).unwrap(),
+                frame_untrusted_report_for_file(report),
+                "the copy holds the whole report inside the frame"
+            );
+
+            assert_eq!(std::fs::read_to_string(&role_path).unwrap(), report);
+            assert_eq!(
+                std::fs::metadata(&role_path).unwrap().permissions().mode() & 0o777,
+                0o640,
+                "the role file is not re-moded"
+            );
+            assert_eq!(
+                std::fs::read_link(&file_link).unwrap(),
+                role_path,
+                "the supplied path is still the link it was"
+            );
+            assert_eq!(std::fs::read_link(&dir_alias).unwrap(), context);
+        }
+    }
+
     /// Auditor A-02 (upstream sync): two same-role workers in one working
     /// directory each file a report longer than the inline bound. The role-keyed
     /// `work-done-<role>.md` holds whichever reported last, so the FIRST report's
