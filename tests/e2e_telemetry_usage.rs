@@ -303,25 +303,29 @@ fn start(
     cwd: &std::path::Path,
     command: String,
 ) -> (String, String) {
-    let pane = format!("usage-{name}");
+    let proposed_pane = format!("usage-{name}");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let id = runtime
+    let (id, minted_pane) = runtime
         .block_on(
-            DaemonClient::new(deck.attach_socket_path().to_path_buf()).start_agent(
+            DaemonClient::new(deck.attach_socket_path().to_path_buf()).start_agent_with_pane_id(
                 StartAgentOptions {
                     command: Some(command),
                     cwd: Some(cwd.to_string_lossy().into_owned()),
                     display_name: Some(name.into()),
                     agent_type: Some(kind),
-                    env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane.clone())],
+                    env: vec![("DOT_AGENT_DECK_PANE_ID".into(), proposed_pane)],
                     ..Default::default()
                 },
             ),
         )
         .expect("start offline usage stand-in");
+    // The daemon is authoritative for `pane_id` (fork PRD #365 M2): it discards
+    // the proposed name and returns the id it minted, which is the pane the
+    // stand-in's hook events must name.
+    let pane = minted_pane.expect("the start-agent reply carries the daemon-minted pane_id");
     // ListAgents omits exited processes, including commands that finish before
     // start_agent returns. Both identities are already known without that lookup.
     (id, pane)

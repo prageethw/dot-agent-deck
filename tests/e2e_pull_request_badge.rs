@@ -180,7 +180,10 @@ impl Fixture {
                 "event_type": "session_start",
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "agent_id": record.id,
-                "pane_id": "pr-fixture-pane"
+                // The daemon is authoritative for `pane_id` (fork PRD #365 M2):
+                // it discards the `pr-fixture-pane` proposed above and mints
+                // its own, which is the pane this agent's events belong to.
+                "pane_id": record.pane_id_env
             })
             .to_string(),
         )
@@ -516,6 +519,9 @@ impl ToolTraffic {
         let (stop, stopped) = std::sync::mpsc::channel();
         let socket = daemon.hook_socket.clone();
         let id = agent.id.clone();
+        // The daemon-minted pane id, not the name the fixture proposed (fork
+        // PRD #365 M2).
+        let pane_id = agent.pane_id_env.clone();
         let thread = std::thread::spawn(move || {
             loop {
                 common::write_hook_line(
@@ -527,7 +533,7 @@ impl ToolTraffic {
                         "tool_name": "Read",
                         "timestamp": chrono::Utc::now().to_rfc3339(),
                         "agent_id": id,
-                        "pane_id": "pr-fixture-pane"
+                        "pane_id": pane_id
                     })
                     .to_string(),
                 )
