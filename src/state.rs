@@ -9687,6 +9687,13 @@ impl AppState {
     ///
     /// Everything else the event recorded — status, journal, prompts, model,
     /// friendly name — is the agent's and is kept as it is.
+    // 8 counting `&mut self`: the five values the learned placeholder
+    // constructor takes (pane, cwd, agent type, agent id, `learned_from`) plus
+    // the early card's id and the `expects_agent_report` flag the spawn-time
+    // constructor (the fork's #806 reconciliation) hands over. A parameter
+    // struct for this one private call site would only rename them; the file's
+    // other wide constructor-shaped helpers (`seed_hydrated_session_learned`,
+    // `dispatch_one_owned`) allow the same lint.
     #[allow(clippy::too_many_arguments)]
     fn adopt_early_pane_session(
         &mut self,
