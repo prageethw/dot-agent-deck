@@ -7570,8 +7570,9 @@ start = true
 
     /// PRD #1223 M7 — the positive half, against the real dispatch: a daemon at
     /// this build advertises `authoring-kind`, the typed method sends the start
-    /// and answers the new agent's id, and a start the daemon cannot deliver a
-    /// seed for (no `DOT_AGENT_DECK_PANE_ID`) is its refusal — with nothing
+    /// and answers the new agent's id, and a start the daemon cannot compose a
+    /// seed for (no `cwd`; upstream used no `DOT_AGENT_DECK_PANE_ID`, which this
+    /// fork's daemon mints instead) is its refusal — with nothing
     /// started — rather than a withhold. Without it, a method that withheld
     /// unconditionally would pass the test above.
     #[cfg(unix)]
@@ -7581,20 +7582,23 @@ start = true
         let client = DaemonClient::new(path);
         let kind = crate::authoring_seeds::AuthoringKind::Dispatcher;
 
+        // A refusal only the daemon can give. Upstream used a start with no
+        // pane id here, but this fork's daemon is authoritative for the pane id
+        // (PRD #365 M2) and mints one for an omitted id, so that start is no
+        // longer refused; no `cwd` still is, by the same seed preconditions.
         let refusal = client
             .start_authoring_agent(
                 StartAgentOptions {
                     command: Some("/bin/sh".into()),
-                    cwd: Some("/tmp".into()),
                     ..StartAgentOptions::default()
                 },
                 kind,
             )
             .await
-            .expect_err("no pane id is the daemon's refusal, not a withhold");
+            .expect_err("no cwd is the daemon's refusal, not a withhold");
         assert!(
             matches!(&refusal, ClientError::Server(message)
-                if message.contains("DOT_AGENT_DECK_PANE_ID")),
+                if message.contains("needs a cwd")),
             "{refusal:?}"
         );
         assert!(
@@ -7824,16 +7828,24 @@ start = true
         else {
             panic!("a daemon at this build advertises `authoring-kind`");
         };
+        // The daemon is authoritative for the pane id (PRD #365 M2): the seed
+        // went to the pane it minted, which the agent's record names.
+        let pane = registry
+            .agent_records()
+            .into_iter()
+            .find(|record| record.id == id)
+            .and_then(|record| record.pane_id_env)
+            .expect("the started agent has the pane the daemon minted");
         // PRD #1666 S5: the seed is the pane's first inbox message, which the
         // agent's own receiver takes whole and settles.
         let seed = registry
             .inbox()
-            .test_take_acked("pi-authoring-pane", &id)
+            .test_take_acked(&pane, &id)
             .into_iter()
             .next()
             .expect("the Pi pane's first message is its seed");
         assert_eq!(
-            registry.inbox().list("pi-authoring-pane")[0].state,
+            registry.inbox().list(&pane)[0].state,
             crate::inbox::StateName::Acknowledged
         );
         assert!(
