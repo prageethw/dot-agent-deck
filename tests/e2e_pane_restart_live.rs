@@ -226,6 +226,15 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     // `cat`'s echo of it can only render if the still-attached TUI follows the
     // pane onto its restarted agent's live PTY.
     //
+    // A freshly opened orchestration tab starts with the command-entry lock
+    // LOCKED (`orchestration/lock/002`): only the orchestrator's pane accepts
+    // direct input, and a keystroke aimed at any other role's pane is dropped
+    // by `gate_pane_input_key`. The probe below targets `coder`, so the lock is
+    // released first, with the documented chord (Command Mode, then `Ctrl+e`),
+    // exactly as `orchestration/focus`'s unlock step does. Without this the
+    // probe never reaches the pane at all, which says nothing about whether the
+    // attached TUI follows the restarted agent.
+    //
     // A single `2` press, then a pure wait -- not a retry. The digit jump
     // only resolves in `UiMode::Normal`; a successful `focus_deck` switches
     // straight to `UiMode::PaneInput`, so only the FIRST `2` after `\x04` is
@@ -233,6 +242,14 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     // literal keystroke forwarded into whichever pane is already focused.
     deck.send_bytes(b"\x04"); // PaneInput -> Command Mode
     deck.wait_for_absence("[Command Mode Ctrl+D]");
+    deck.send_bytes(b"\x05"); // Ctrl+e -> Action::ToggleOrchestrationLock (unlock)
+    assert!(
+        deck.wait_for_grid_string_within("Pane entry: unlocked", Duration::from_secs(5)),
+        "Ctrl+e in Command Mode never released the command-entry lock, so a probe \
+         typed into coder's pane would be dropped by the lock rather than echoed.\n\
+         Grid:\n{}",
+        deck.snapshot_grid()
+    );
     deck.send_bytes(b"2"); // jump to role card 2 (coder) and focus it
     // Back in PaneInput: the probe below goes to the focused pane, never to
     // Command Mode's key bindings.
