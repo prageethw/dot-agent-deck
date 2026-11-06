@@ -1911,9 +1911,13 @@ impl TuiDeck {
                 return;
             }
             if Instant::now() > deadline {
+                // Diagnostic: the grid a deck that keeps repainting was
+                // showing, so a repaint source (an animation, a re-ringing
+                // doorbell echoing in a pane) can be read off the failure.
+                let grid = self.snapshot_grid();
                 panic!(
                     "deck did not become quiescent within {WAIT_TIMEOUT:?} \
-                     (idle window {QUIESCENT_IDLE_MS}ms)"
+                     (idle window {QUIESCENT_IDLE_MS}ms).\nFinal grid:\n{grid}"
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
