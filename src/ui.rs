@@ -13101,28 +13101,28 @@ fn dispatch_action(
                                     st.register_pane(id.clone());
                                     let learned_from = attached_on
                                         .unwrap_or_else(|| st.stream_incarnation.clone());
-                                    let placeholder_id = st.insert_placeholder_session_learned(
+                                    // Fork issue #542: a role whose command is a
+                                    // devbox-widened agent launch expects an agent
+                                    // report, so its card reads "Starting…" (not
+                                    // "No agent") until the first hook arrives.
+                                    //
+                                    // Fork issue #806 (rule 24, upstream-sync
+                                    // round 30): the spawn-time constructor, so a
+                                    // hook that beat this insert is reconciled with
+                                    // the placeholder rather than left beside it,
+                                    // and the card is still stamped from the attach
+                                    // that produced the pane (G-fix7).
+                                    st.insert_placeholder_session_awaiting_report_learned(
                                         id.clone(),
                                         Some(dir_str.clone()),
                                         None,
                                         agent_id.clone(),
                                         learned_from,
+                                        crate::event::AgentType::from_command_including_devbox(
+                                            orch_config.roles.get(i).map(|r| r.command.as_str()),
+                                        )
+                                        .is_some(),
                                     );
-                                    // Fork issue #542: a role whose command is a
-                                    // devbox-widened agent launch expects an agent
-                                    // report, so its card reads "Starting…" (not
-                                    // "No agent") until the first hook arrives. The
-                                    // incarnation-bound constructor above takes no
-                                    // such flag, so set it on the card it drew (a
-                                    // held or stale placeholder has no card yet).
-                                    if crate::event::AgentType::from_command_including_devbox(
-                                        orch_config.roles.get(i).map(|r| r.command.as_str()),
-                                    )
-                                    .is_some()
-                                        && let Some(session) = st.sessions.get_mut(&placeholder_id)
-                                    {
-                                        session.expects_agent_report = true;
-                                    }
                                 }
                                 // Register pane-to-role and pane-to-cwd
                                 // mappings. This line used to end "for
@@ -13503,22 +13503,18 @@ fn dispatch_action(
                                 st.register_pane(new_id.clone());
                                 let learned_from =
                                     attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
-                                let placeholder_id = st.insert_placeholder_session_learned(
+                                // Fork issue #542 (`spawn_expects_agent_report`) and
+                                // issue #806: the spawn-time constructor reconciles an
+                                // early hook with the placeholder, and stamps the card
+                                // from the attach that produced the pane (G-fix7).
+                                st.insert_placeholder_session_awaiting_report_learned(
                                     new_id.clone(),
                                     Some(dir_str.clone()),
                                     None,
                                     new_agent_id,
                                     learned_from,
+                                    spawn_expects_agent_report,
                                 );
-                                // Fork issue #542: the incarnation-bound constructor
-                                // above takes no `expects_agent_report` flag, so set
-                                // it on the card it drew (a held or stale placeholder
-                                // has no card yet).
-                                if spawn_expects_agent_report
-                                    && let Some(session) = st.sessions.get_mut(&placeholder_id)
-                                {
-                                    session.expects_agent_report = true;
-                                }
                             }
                             ui.pane_display_names
                                 .insert(new_id.clone(), resolved_name.clone());
@@ -15992,24 +15988,24 @@ pub fn run_tui(
                                         st.register_pane(id.clone());
                                         let learned_from = attached_on
                                             .unwrap_or_else(|| st.stream_incarnation.clone());
-                                        let placeholder_id = st.insert_placeholder_session_learned(
+                                        // Fork issues #542 and #806: the same
+                                        // spawn-time constructor, and the same
+                                        // `expects_agent_report`, as the live-spawn
+                                        // path.
+                                        st.insert_placeholder_session_awaiting_report_learned(
                                             id.clone(),
                                             Some(saved_pane.dir.clone()),
                                             None,
                                             agent_id.clone(),
                                             learned_from,
+                                            crate::event::AgentType::from_command_including_devbox(
+                                                orch_config
+                                                    .roles
+                                                    .get(i)
+                                                    .map(|r| r.command.as_str()),
+                                            )
+                                            .is_some(),
                                         );
-                                        // Fork issue #542: see the identical carry
-                                        // on the live-spawn path.
-                                        if crate::event::AgentType::from_command_including_devbox(
-                                            orch_config.roles.get(i).map(|r| r.command.as_str()),
-                                        )
-                                        .is_some()
-                                            && let Some(session) =
-                                                st.sessions.get_mut(&placeholder_id)
-                                        {
-                                            session.expects_agent_report = true;
-                                        }
                                     }
                                     // Issue #462: `pane_orchestration_map` is
                                     // deliberately omitted here too — the
@@ -16184,25 +16180,21 @@ pub fn run_tui(
                         st.register_pane(new_id.clone());
                         let learned_from =
                             attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
-                        let placeholder_id = st.insert_placeholder_session_learned(
+                        // Fork issue #542: a restored pane whose saved command is
+                        // a devbox-widened agent launch (`devbox run <agent
+                        // script>`) must show "Starting…" immediately, not "No
+                        // agent" — derived from `from_command_including_devbox`,
+                        // mirroring the fresh-spawn call sites. Fork issue #806:
+                        // the spawn-time constructor reconciles an early hook with
+                        // the placeholder.
+                        st.insert_placeholder_session_awaiting_report_learned(
                             new_id.clone(),
                             Some(saved_pane.dir.clone()),
                             agent_type,
                             new_agent_id,
                             learned_from,
+                            crate::event::AgentType::from_command_including_devbox(cmd).is_some(),
                         );
-                        // Fork issue #542: a restored pane whose saved command is
-                        // a devbox-widened agent launch (`devbox run <agent
-                        // script>`) must show "Starting…" immediately, not "No
-                        // agent" — derived from `from_command_including_devbox`,
-                        // mirroring the fresh-spawn call sites. The
-                        // incarnation-bound constructor takes no such flag, so it
-                        // is set on the card it drew.
-                        if crate::event::AgentType::from_command_including_devbox(cmd).is_some()
-                            && let Some(session) = st.sessions.get_mut(&placeholder_id)
-                        {
-                            session.expects_agent_report = true;
-                        }
                     }
                     if !saved_pane.name.is_empty() {
                         if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
