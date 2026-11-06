@@ -2383,7 +2383,18 @@ async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_
     let older_dispatch = hold_older_dispatch_in_flight(&fx, queued);
     let dispatch_lock = fx.daemon.registry.pane_dispatch_lock(fx.worker_pane());
     let parked = dispatch_lock.lock().await;
-    delegate(&fx, "list the files in this directory").await;
+    // `--supersede`: the older delegate's commission is outstanding (that is what
+    // "its dispatch is queued" means for upstream's ledger), and a plain delegate
+    // to a worker that still owes a `work-done` is refused as busy before
+    // anything is armed or dispatched (issue #580), which left this test with no
+    // dispatch at all and an empty inbox. A supersede keeps the older commission
+    // in the ledger beside the new one, so the older generation stays owed.
+    let response = delegate_with(&fx, "list the files in this directory", true).await;
+    assert!(
+        response.busy.is_empty() && response.delivered == [WORKER_ROLE.to_string()],
+        "precondition: the newer delegate must be admitted (superseding the queued one), not \
+         refused as busy; response = {response:?}"
+    );
     drop(parked);
 
     let orchestrator = wait_for_orchestrator_text(&fx, RESPAWN_FAILED_NEEDLE).await;
@@ -2395,14 +2406,19 @@ async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_
 
     // The notice above is posted from inside the exit, so the exit may not have
     // finished with the owed generations yet: wait for it to finish. The
-    // commission release is observable, and the dispatch task holds the pane's
+    // commission release is observable (the ledger is back to the one commission
+    // the queued older delegate holds, since the older commission stays armed
+    // while its dispatch is queued), and the dispatch task holds the pane's
     // dispatch lock until it returns, i.e. until the drop has been performed.
     // Taking the lock here therefore orders the assertion after the drop it is
     // meant to catch.
     assert!(
-        common::wait_for_commission_release(&fx.daemon.registry, fx.worker_pane()).await,
+        wait_for_outstanding_commissions(&fx, 1).await,
         "precondition: the newer delegate's commission was never released, so its dispatch has \
-         not reached the no-delivery exit under test"
+         not reached the no-delivery exit under test; watches = {:?}",
+        fx.daemon
+            .registry
+            .delegation_watch_snapshot(fx.worker_pane())
     );
     drop(dispatch_lock.lock().await);
 
