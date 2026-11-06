@@ -19215,6 +19215,61 @@ mod tests {
         }
     }
 
+    /// The degraded notice — a report cut at the inline bound that is `Filed`
+    /// but whose own copy could not be saved — is the one case that points the
+    /// orchestrator at the role-keyed file for "the rest", because it is all the
+    /// orchestrator has. `compose_work_done_message` and `WorkDoneReportChannel`
+    /// are private, so `tests/work_done_reporting.rs` (whose cut-report scenario
+    /// asserts the NEGATIVE of this phrase for a report that DID get a copy)
+    /// cannot render this case at all: this is where the phrase it keys on is
+    /// shown to be what the composer really writes, so that negative can fail.
+    #[test]
+    fn a_cut_report_with_no_copy_of_its_own_names_the_role_file_for_the_rest() {
+        let long = "word ".repeat(MAX_INLINED_WORK_DONE_REPORT_CHARS);
+        assert!(
+            report_exceeds_inline_bound(&long),
+            "the fixture must be cut at the inline bound, or this pins nothing"
+        );
+
+        // `safe_role` differs from the role name so the file name is shown to
+        // come from `safe_role`.
+        let degraded = compose_work_done_message(
+            "pane-1",
+            "agent-1",
+            "Code Writer",
+            "code-writer",
+            &WorkDoneReportChannel::Filed,
+            &long,
+            None,
+        );
+        let preface = degraded.preface.as_deref().expect("preface");
+        assert!(
+            preface.contains("read .dot-agent-deck/work-done-code-writer.md for the rest"),
+            "a cut report with no copy of its own must name the role-keyed file for the rest: \
+             {preface}"
+        );
+
+        // The contrast the integration test's negative rests on: with a copy of
+        // its own, the notice names that copy and never the role-keyed file,
+        // which the next same-role report replaces.
+        let copy = std::path::Path::new("/work/tree/.dot-agent-deck/full-report-1.md");
+        let with_copy = compose_work_done_message(
+            "pane-1",
+            "agent-1",
+            "Code Writer",
+            "code-writer",
+            &WorkDoneReportChannel::Filed,
+            &long,
+            Some(copy),
+        );
+        let preface = with_copy.preface.as_deref().expect("preface");
+        assert!(
+            !preface.contains("work-done-code-writer.md")
+                && preface.contains("saved at /work/tree/.dot-agent-deck/full-report-1.md"),
+            "a cut report with a copy must name the copy and not the role-keyed file: {preface}"
+        );
+    }
+
     /// Issue #508: a saved report never lands on another one — or on a file an
     /// agent parked in the directory (#331) — and a directory that cannot be
     /// written reports that rather than a path.
