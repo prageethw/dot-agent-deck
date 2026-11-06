@@ -3,25 +3,25 @@ source: tests/render_dashboard.rs
 assertion_line: 3649
 expression: rendered
 ---
- dot-agent-deck — 7 agent(s)                                                   
-┏ ▸ 1 ClaudeCode · orchestrator ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Idle ┓
-┃Dir:  dot-agent-deck                                                         ┃
+ worker-deck — 7 agent(s)                                                      
+┏ ▸ 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Idle ┓
+┃orchestrator  Dir: dot-agent-deck                                            ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 0 ┛
-┌ 2 ClaudeCode · developer ─────────────────────────────────────────── ● Idle ┐
-│Dir:  dot-agent-deck                                                         │
+┌ 2 ────────────────────────────────────────────────────────────────── ● Idle ┐
+│developer  Dir: dot-agent-deck                                               │
 └───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
-┌ 3 ClaudeCode · tester ────────────────────────────────────────────── ● Idle ┐
-│Dir:  dot-agent-deck                                                         │
+┌ 3 ────────────────────────────────────────────────────────────────── ● Idle ┐
+│tester  Dir: dot-agent-deck                                                  │
 └───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
-┌ 4 ClaudeCode · reviewer ──────────────────────────────────────────── ● Idle ┐
-│Dir:  dot-agent-deck                                                         │
+┌ 4 ────────────────────────────────────────────────────────────────── ● Idle ┐
+│reviewer  Dir: dot-agent-deck                                                │
 └───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
-┌ 5 ClaudeCode · releaser ──────────────────────────────────────────── ● Idle ┐
-│Dir:  dot-agent-deck                                                         │
+┌ 5 ────────────────────────────────────────────────────────────────── ● Idle ┐
+│releaser  Dir: dot-agent-deck                                                │
 └───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
-┌ 6 ClaudeCode · researcher ────────────────────────────────────────── ● Idle ┐
-│Dir:  dot-agent-deck                                                         │
+┌ 6 ────────────────────────────────────────────────────────────────── ● Idle ┐
+│researcher  Dir: dot-agent-deck                                              │
 └───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
-┌ 7 ClaudeCode · documenter ────────────────────────────────────────── ● Idle ┐
-│Dir:  dot-agent-deck                                                         │
+┌ 7 ────────────────────────────────────────────────────────────────── ● Idle ┐
+│documenter  Dir: dot-agent-deck                                              │
 └───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘

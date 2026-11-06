@@ -6639,110 +6639,106 @@ fn pane_025_declared_agent_pending_report_shows_starting_not_live_status() {
     );
 }
 
-/// Scenario: Render a card whose display name is `项目目录管理` — six characters
-/// but twelve terminal columns — into a 40-column Normal-density buffer, where
-/// the title region is only 26 columns wide. The card's top border must show the
-/// name cut short and marked with an `…` that is itself inside the budget, with
-/// the `● Thinking` badge still whole beside it, instead of the full name
-/// running over the badge and being bare-clipped at the right edge. An ASCII
-/// name of the same character count renders untouched, and a name of eight
-/// `❤️` — one column per `char`, two as drawn — is cut and marked the same way.
+/// Scenario: Render a card whose display name is twenty-three CJK characters —
+/// 46 terminal columns — into a 40-column Normal-density buffer. The fork draws
+/// a card's identity on its first body row (the badge is off by default, so the
+/// title holds only the index and the `● Thinking` status), and that row has 38
+/// columns. The row must show the name cut short and marked with a `…` that is
+/// itself inside the budget, with both borders still in place and the title's
+/// status badge whole, instead of the name running past the right edge. An
+/// ASCII name renders untouched, and twenty `❤️` — one column per `char`, two as
+/// drawn — are cut and marked the same way.
 #[spec("dashboard/pane/015")]
 #[test]
 fn pane_015_wide_title_is_ellipsized_within_the_column_budget() {
-    // Issue #357. `truncate_styled_segments` budgeted Unicode scalar values
-    // while its caller's budget is a slice of the card rectangle — cells on one
-    // row. `项目目录管理` is 6 scalars against 12 columns, so the whole title
-    // (` 1 `, the `ClaudeCode` badge and ` · 项目目录管理 `) measured 23
-    // "characters" inside a 26-cell budget and was returned untouched at 29
-    // columns; ratatui then clipped the overhang at the right edge with no `…`,
-    // so the card gave no sign it had shortened anything.
+    // Issue #357. Truncation budgeted Unicode scalar values while its caller's
+    // budget is a slice of the card rectangle — cells on one row. `项目目录管理`
+    // is 6 scalars against 12 columns, so a name was measured as half its real
+    // width and returned untouched; ratatui then clipped the overhang at the
+    // right edge with no `…`, so the card gave no sign it had shortened anything.
     //
-    // 40 columns is chosen for what it leaves rather than as a round number: the
-    // badge (` ● Thinking ` = 12 cells) and the two borders take 14, leaving 26
-    // for the title — which the ASCII control fits and the CJK name does not.
+    // Upstream drew the name in the title, a 26-cell region beside the
+    // `ClaudeCode` badge, and a 6-character CJK name was already too wide for it.
+    // The fork draws it on the identity row (PRD fork#405 M1), 40 - 2 borders = 38
+    // cells wide, so the same guarantee needs a name wider than THAT: the name
+    // below is 23 glyphs = 46 columns, and its last three glyphs (`终点站`) must
+    // never be drawn. 12 CJK columns, upstream's fixture, now fit whole.
     const WIDTH: u16 = 40;
     let density = CardDensityKind::Normal;
+    let render = |name: &str| {
+        buffer_to_text(&render_card_to_buffer(
+            &card_stats_session("/home/dev/example-project"),
+            Some(name),
+            Some(1),
+            density,
+            0,            // animation tick
+            render_now(), // render instant
+            false,        // not selected
+            WIDTH,
+            density.rendered_height(),
+        ))
+    };
 
-    let wide = buffer_to_text(&render_card_to_buffer(
-        &card_stats_session("/home/dev/example-project"),
-        Some("项目目录管理"),
-        Some(1),
-        density,
-        0,            // animation tick
-        render_now(), // render instant
-        false,        // not selected
-        WIDTH,
-        density.rendered_height(),
-    ));
-    let title_row = wide.lines().next().expect("the card draws a top border");
+    let wide = render("项目目录管理项目目录管理项目目录管理项目终点站");
+    let mut rows = wide.lines();
+    let title_row = rows.next().expect("the card draws a top border");
+    let identity_row = rows.next().expect("the card draws an identity row");
 
     assert!(
-        title_row.contains('…'),
-        "a name too wide for the title region must be marked as cut:\n{wide}"
+        identity_row.contains('…'),
+        "a name too wide for the identity row must be marked as cut:\n{wide}"
     );
     assert!(
-        !title_row.contains('管') && !title_row.contains('理'),
-        "the characters past the budget must be dropped, not drawn over the badge:\n{wide}"
+        !identity_row.contains('终') && !identity_row.contains('站'),
+        "the characters past the budget must be dropped, not drawn over the border:\n{wide}"
     );
-    // The badge is right-aligned on the same row, so an over-wide title shows up
-    // as the badge losing cells to it.
+    // The status badge lives on the title row, so an over-wide name can no longer
+    // take cells from it; what an overrun shows up as now is the closing border
+    // being pushed out or clipped.
     assert!(
         title_row.contains("● Thinking"),
-        "the status badge must survive the title beside it:\n{wide}"
+        "the status badge must stay whole on the title row:\n{wide}"
     );
     // Cells, not display columns: `buffer_to_text` joins a wide glyph's second
-    // (padding) cell in as a space, so the row holds exactly one `char` per cell
-    // and counting them is counting the card's width. A title that overran would
-    // have had to take cells from the badge to fit.
+    // (padding) cell in as a space, so a row holds exactly one `char` per cell
+    // and counting them is counting the card's width.
     assert_eq!(
-        title_row.chars().count(),
+        identity_row.chars().count(),
         WIDTH as usize,
-        "the top border must occupy exactly the card's width:\n{wide}"
+        "the identity row must occupy exactly the card's width:\n{wide}"
+    );
+    assert!(
+        identity_row.starts_with('│') && identity_row.ends_with('│'),
+        "both borders must survive an over-wide name:\n{wide}"
     );
 
     // The control: six ASCII characters are six columns, so the same card at the
     // same width draws the name whole and marks nothing. This is the property
     // that keeps every committed card snapshot from churning.
-    let ascii = buffer_to_text(&render_card_to_buffer(
-        &card_stats_session("/home/dev/example-project"),
-        Some("abcdef"),
-        Some(1),
-        density,
-        0,
-        render_now(),
-        false,
-        WIDTH,
-        density.rendered_height(),
-    ));
-    let ascii_title_row = ascii.lines().next().expect("the card draws a top border");
+    let ascii = render("abcdef");
+    let ascii_identity_row = ascii
+        .lines()
+        .nth(1)
+        .expect("the card draws an identity row");
     assert!(
-        ascii_title_row.contains("· abcdef") && !ascii_title_row.contains('…'),
+        ascii_identity_row.contains("abcdef") && !ascii_identity_row.contains('…'),
         "an ASCII name inside the budget renders untouched:\n{ascii}"
     );
 
     // A name whose glyphs are grapheme CLUSTERS wider than their `char`s:
     // `❤️` is U+2764 + VARIATION SELECTOR-16, one column summed per `char` and
-    // two as ratatui draws it. Eight of them are 16 columns, past what the
-    // title's 26-cell region has left once the 16-cell prefix is paid for, so
-    // the cut must be marked. Budgeting per `char` measured them at 8, passed
-    // the title whole, and the badge was drawn over its tail — no `…`, no
-    // border fill, the CJK symptom again, on input the char count had handled.
-    let hearts = buffer_to_text(&render_card_to_buffer(
-        &card_stats_session("/home/dev/example-project"),
-        Some(&"❤\u{fe0f}".repeat(8)),
-        Some(1),
-        density,
-        0,
-        render_now(),
-        false,
-        WIDTH,
-        density.rendered_height(),
-    ));
-    let hearts_title_row = hearts.lines().next().expect("the card draws a top border");
+    // two as ratatui draws it. Twenty of them are 40 columns, past the identity
+    // row's 38. Budgeting per `char` measures them at 20, passes the name whole,
+    // and the closing border is clipped away with no `…`: the CJK symptom again,
+    // on input the char count had handled.
+    let hearts = render(&"❤\u{fe0f}".repeat(20));
+    let hearts_identity_row = hearts
+        .lines()
+        .nth(1)
+        .expect("the card draws an identity row");
     assert!(
-        hearts_title_row.contains('…') && hearts_title_row.contains("● Thinking"),
-        "a name of VS16 emoji too wide for the title region must be marked as cut:\n{hearts}"
+        hearts_identity_row.contains('…') && hearts_identity_row.ends_with('│'),
+        "a name of VS16 emoji too wide for the identity row must be marked as cut:\n{hearts}"
     );
 
     insta::assert_snapshot!(wide);
@@ -8230,15 +8226,24 @@ fn single_column_card_heights(rendered: &str) -> Vec<usize> {
     heights
 }
 
-/// The rendered card whose top border carries `name`, as its rows — so an
-/// assertion can talk about one card of a grid without depending on where in
-/// the buffer the layout put it.
+/// The rendered card that names `name`, as its rows from top border to bottom
+/// border — so an assertion can talk about one card of a grid without depending
+/// on where in the buffer the layout put it.
+///
+/// The fork draws a card's identity (PRD fork#405 M1) on its first body row, not
+/// in the top border (the agent-type badge is off by default, so the title holds
+/// only the index and the status). The first row that names the card is
+/// therefore a body row, and the card starts at the nearest top border above it.
 fn card_rows<'a>(rendered: &'a str, name: &str) -> Vec<&'a str> {
     let lines: Vec<&str> = rendered.lines().collect();
-    let top = lines
+    let named = lines
         .iter()
         .position(|line| line.contains(name))
         .unwrap_or_else(|| panic!("no card titled {name:?}:\n{rendered}"));
+    let top = lines[..=named]
+        .iter()
+        .rposition(|line| line.starts_with('┌') || line.starts_with('┏'))
+        .unwrap_or_else(|| panic!("card {name:?} has no top border above its name:\n{rendered}"));
     let bottom = lines[top..]
         .iter()
         .position(|line| line.starts_with('└') || line.starts_with('┗'))
@@ -8248,25 +8253,30 @@ fn card_rows<'a>(rendered: &'a str, name: &str) -> Vec<&'a str> {
 
 /// Scenario: Render the seven-role orchestration into a 79-column deck — one
 /// column, since 79 columns cannot hold two cards — that is 25 rows tall, too
-/// short for seven 5-row Compact cards. Every card is drawn at 3 rows with its
-/// name and status on the top border, its `Dir:` row, and `Last:` / `Tools:`
-/// counters on the bottom border, and nothing scrolls. A 37-row control deck,
-/// where Compact fits, still draws every card at Compact's 5 rows.
+/// short for seven 6-row Compact cards (the fork's Compact card carries the
+/// identity row, so it is one taller than upstream's 5). Every card is drawn at
+/// 3 rows with its status on the top border, its role and `Dir:` folded onto
+/// the one body row, and `Last:` / `Tools:` counters on the bottom border, and
+/// nothing scrolls. A 44-row control deck, where Compact fits, still draws every
+/// card at Compact's 6 rows.
 #[spec("dashboard/density/006")]
 #[test]
 fn density_006_minimal_cards_replace_scrolling_when_compact_cannot_fit() {
     let sessions = reported_role_sessions();
     let cards = as_cards(&sessions);
 
-    // Control first: 37 rows leaves 35 for cards, exactly seven Compact cards.
+    // Control first. The fork's Compact card is `CardDensity::card_height()` =
+    // identity row 1 + Dir 1 + prompt 1 + tools 1 + 2 borders = 6 rows (upstream:
+    // 5, it has no identity row), so seven of them need 42 rows of cards and the
+    // deck needs those plus the title and the stats bar: 44 (upstream: 37).
     // The snapshot pins that a deck which fits at Compact renders exactly as it
     // did before the Minimal tier existed.
-    let (control_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 37);
+    let (control_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 44);
     let control = buffer_to_text(&control_buffer);
     assert_eq!(
         single_column_card_heights(&control),
-        vec![5; REPORTED_ROLES.len()],
-        "control: a deck that fits at Compact keeps its 5-row cards:\n{control}"
+        vec![6; REPORTED_ROLES.len()],
+        "control: a deck that fits at Compact keeps its 6-row cards:\n{control}"
     );
     assert!(
         !control.lines().next().unwrap_or_default().contains('↓'),
@@ -8274,7 +8284,7 @@ fn density_006_minimal_cards_replace_scrolling_when_compact_cannot_fit() {
     );
     insta::assert_snapshot!("density_006_compact_control", control);
 
-    // 25 rows leaves 23: seven Compact cards need 35, seven Minimal cards 21.
+    // 25 rows leaves 23: seven Compact cards need 42, seven Minimal cards 21.
     let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
     let rendered = buffer_to_text(&buffer);
     let title = rendered.lines().next().expect("a rendered title row");
@@ -8300,9 +8310,11 @@ fn density_006_minimal_cards_replace_scrolling_when_compact_cannot_fit() {
             card[0].contains("Idle"),
             "{role}: the top border keeps the status badge:\n{rendered}"
         );
+        // A 3-row card has one body row, so the fork folds the role (its
+        // identity row, PRD fork#405 M1) and `Dir:` onto it: `<role>  Dir: <dir>`.
         assert!(
-            card[1].contains("Dir:  dot-agent-deck"),
-            "{role}: the middle row is the Dir row:\n{rendered}"
+            card[1].contains(role) && card[1].contains("Dir: dot-agent-deck"),
+            "{role}: the middle row carries the role and the Dir:\n{rendered}"
         );
         assert!(
             card[2].contains("Last:") && card[2].contains("Tools:"),
@@ -8373,9 +8385,11 @@ fn density_007_minimal_status_row_takes_the_dir_rows_place() {
 }
 
 /// Scenario: Render the seven-role deck into a 79x20 deck, too short for seven
-/// cards even at the 3-row Minimal height. The grid scrolls exactly as it did
-/// before Minimal existed: three 5-row Compact cards are drawn and the title
-/// counts the four below the window.
+/// cards even at the 3-row Minimal height. The fork's fit-all mode (PRD
+/// fork#446) takes over instead of upstream's scrolling: no card is hidden, the
+/// 18 card rows are divided over the seven cards as 3,3,3,3,2,2,2, so four are
+/// drawn whole at 3 rows and the last three as two-row collapsed entries, and
+/// the title carries no scroll indicator.
 #[spec("dashboard/density/008")]
 #[test]
 fn density_008_a_deck_too_large_for_minimal_scrolls_at_compact() {
