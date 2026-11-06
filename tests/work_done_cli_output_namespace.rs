@@ -24,17 +24,79 @@ mod common;
 
 use std::process::{Command, Output};
 
-use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use spec::spec;
 
+/// The identity a worker's own `work-done` runs under: its pane, its agent and
+/// the capability the daemon issued that pane.
+#[cfg(unix)]
+struct Worker {
+    pane_id: String,
+    agent_id: String,
+    capability: String,
+}
+
+/// Start an orchestrator and a `coder` worker of one orchestration on the real
+/// `daemon`, both running in `cwd`, and answer the worker's identity.
+///
+/// Needed since the 2026-11-05 upstream merge: the daemon files a `work-done`
+/// only from a pane that is a worker of an orchestration (otherwise the CLI
+/// exits non-zero with `not_a_worker`) and only against the capability it issued
+/// that pane (upstream PRD #1077). A bare pane id on the socket was accepted
+/// before, so the "accepted" half of these tests passed without one. The
+/// daemon mints the pane id (fork PRD #365 M2), so the reply's is the one used.
+#[cfg(unix)]
+fn start_worker(daemon: &common::DaemonProc, cwd: &std::path::Path) -> Worker {
+    use dot_agent_deck::agent_pty::TabMembership;
+    use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+
+    let runtime = tokio::runtime::Runtime::new().expect("build a runtime to start the worker");
+    runtime.block_on(async {
+        let client = DaemonClient::new(daemon.attach_socket.clone());
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let role = |name: &str, role_index: usize, is_start_role: bool| StartAgentOptions {
+            command: Some(common::capability_export_command("exec /bin/cat")),
+            cwd: Some(cwd_str.clone()),
+            display_name: Some(name.to_string()),
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "namespace".to_string(),
+                role_index,
+                role_name: name.to_string(),
+                is_start_role,
+                orchestration_cwd: Some(cwd_str.clone()),
+                display_title: None,
+                orchestration_id: Some("namespace-fixture".to_string()),
+            }),
+            ..StartAgentOptions::default()
+        };
+        client
+            .start_agent(role("orchestrator", 0, true))
+            .await
+            .expect("start the orchestrator stand-in");
+        let (agent_id, pane_id) = client
+            .start_agent_with_pane_id(role("coder", 1, false))
+            .await
+            .expect("start the worker stand-in");
+        let capability = common::recorded_hook_capability(cwd, &agent_id)
+            .await
+            .expect("the worker stand-in exports its capability");
+        Worker {
+            pane_id: pane_id.expect("the daemon must mint the worker's pane_id (PRD #365 M2)"),
+            agent_id,
+            capability,
+        }
+    })
+}
+
 /// Run `dot-agent-deck work-done --task-file <relative_task_file>` from
-/// `cwd`, wired at the real daemon's socket so a non-refusing CLI would
-/// succeed. Env is intentionally minimal (PATH, a fresh HOME, the pane id,
-/// and the daemon socket) so nothing outside the check under test can
-/// influence the outcome.
+/// `cwd`, as `worker`'s agent would, wired at the real daemon's socket so a
+/// non-refusing CLI would succeed. Env is intentionally minimal (PATH, a fresh
+/// HOME, the worker's identity and the daemon socket) so nothing outside the
+/// check under test can influence the outcome.
 #[cfg(unix)]
 fn run_work_done_task_file(
     daemon: &common::DaemonProc,
+    worker: &Worker,
     cwd: &std::path::Path,
     home: &std::path::Path,
     relative_task_file: &str,
@@ -49,7 +111,9 @@ fn run_work_done_task_file(
         cmd.env("PATH", path);
     }
     cmd.env("HOME", home);
-    cmd.env(DOT_AGENT_DECK_PANE_ID, "cli-refusal-test-pane");
+    cmd.env(DOT_AGENT_DECK_PANE_ID, &worker.pane_id);
+    cmd.env(DOT_AGENT_DECK_AGENT_ID, &worker.agent_id);
+    cmd.env("DOT_AGENT_DECK_PANE_CAPABILITY", &worker.capability);
     cmd.env("DOT_AGENT_DECK_SOCKET", &daemon.hook_socket);
     cmd.output()
         .expect("run `dot-agent-deck work-done` subprocess")
@@ -69,6 +133,7 @@ fn run_work_done_task_file(
 fn delegate_063_work_done_refuses_task_file_inside_own_output_namespace() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let cwd = common::race_safe_tempdir();
+    let worker = start_worker(&daemon, cwd.path());
     let home = cwd.path().join("home");
     std::fs::create_dir_all(&home).expect("create fresh HOME for the CLI subprocess");
     let dot_dir = cwd.path().join(".dot-agent-deck");
@@ -81,6 +146,7 @@ fn delegate_063_work_done_refuses_task_file_inside_own_output_namespace() {
 
     let refused = run_work_done_task_file(
         &daemon,
+        &worker,
         cwd.path(),
         &home,
         ".dot-agent-deck/work-done-coder.md",
@@ -103,7 +169,7 @@ fn delegate_063_work_done_refuses_task_file_inside_own_output_namespace() {
         "an ordinary worker report",
     )
     .expect("seed non-collision file");
-    let allowed = run_work_done_task_file(&daemon, cwd.path(), &home, "worker-report.md");
+    let allowed = run_work_done_task_file(&daemon, &worker, cwd.path(), &home, "worker-report.md");
     assert!(
         allowed.status.success(),
         "a --task-file OUTSIDE the daemon's own output namespace must still be accepted; \
@@ -128,6 +194,7 @@ fn delegate_063_work_done_refuses_task_file_inside_own_output_namespace() {
 fn delegate_036_work_done_refuses_file_symlink_resolving_into_output_namespace() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let cwd = common::race_safe_tempdir();
+    let worker = start_worker(&daemon, cwd.path());
     let home = cwd.path().join("home");
     std::fs::create_dir_all(&home).expect("create fresh HOME for the CLI subprocess");
     let dot_dir = cwd.path().join(".dot-agent-deck");
@@ -145,7 +212,8 @@ fn delegate_036_work_done_refuses_file_symlink_resolving_into_output_namespace()
     std::os::unix::fs::symlink(&real_target, &symlink_path)
         .expect("create file symlink into the output namespace");
 
-    let bypassed = run_work_done_task_file(&daemon, cwd.path(), &home, "external-report.md");
+    let bypassed =
+        run_work_done_task_file(&daemon, &worker, cwd.path(), &home, "external-report.md");
     assert!(
         !bypassed.status.success(),
         "`work-done --task-file external-report.md`, a symlink whose target resolves \
@@ -165,7 +233,7 @@ fn delegate_036_work_done_refuses_file_symlink_resolving_into_output_namespace()
         "an ordinary worker report",
     )
     .expect("seed non-collision file");
-    let allowed = run_work_done_task_file(&daemon, cwd.path(), &home, "worker-report.md");
+    let allowed = run_work_done_task_file(&daemon, &worker, cwd.path(), &home, "worker-report.md");
     assert!(
         allowed.status.success(),
         "a plain --task-file OUTSIDE the daemon's own output namespace, with no symlink \
@@ -191,6 +259,7 @@ fn delegate_036_work_done_refuses_file_symlink_resolving_into_output_namespace()
 fn delegate_064_work_done_refuses_task_file_through_aliased_output_dir() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let cwd = common::race_safe_tempdir();
+    let worker = start_worker(&daemon, cwd.path());
     let home = cwd.path().join("home");
     std::fs::create_dir_all(&home).expect("create fresh HOME for the CLI subprocess");
     let dot_dir = cwd.path().join(".dot-agent-deck");
@@ -204,7 +273,13 @@ fn delegate_064_work_done_refuses_task_file_through_aliased_output_dir() {
     std::os::unix::fs::symlink(&dot_dir, &alias_dir)
         .expect("create intermediate directory symlink aliasing into .dot-agent-deck");
 
-    let bypassed = run_work_done_task_file(&daemon, cwd.path(), &home, "alias/work-done-coder.md");
+    let bypassed = run_work_done_task_file(
+        &daemon,
+        &worker,
+        cwd.path(),
+        &home,
+        "alias/work-done-coder.md",
+    );
     assert!(
         !bypassed.status.success(),
         "`work-done --task-file alias/work-done-coder.md`, reached through an \
@@ -224,7 +299,7 @@ fn delegate_064_work_done_refuses_task_file_through_aliased_output_dir() {
         "an ordinary worker report",
     )
     .expect("seed non-collision file");
-    let allowed = run_work_done_task_file(&daemon, cwd.path(), &home, "worker-report.md");
+    let allowed = run_work_done_task_file(&daemon, &worker, cwd.path(), &home, "worker-report.md");
     assert!(
         allowed.status.success(),
         "a plain --task-file OUTSIDE the daemon's own output namespace, reached through \
@@ -253,6 +328,7 @@ fn delegate_064_work_done_refuses_task_file_through_aliased_output_dir() {
 fn delegate_065_work_done_refuses_task_file_despite_cwd_drift() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let pane_cwd = common::race_safe_tempdir();
+    let worker = start_worker(&daemon, pane_cwd.path());
     let home = pane_cwd.path().join("home");
     std::fs::create_dir_all(&home).expect("create fresh HOME for the CLI subprocess");
 
@@ -278,7 +354,7 @@ fn delegate_065_work_done_refuses_task_file_despite_cwd_drift() {
         .to_str()
         .expect("real_target path is valid UTF-8")
         .to_string();
-    let refused_absolute = run_work_done_task_file(&daemon, &child_cwd, &home, &absolute);
+    let refused_absolute = run_work_done_task_file(&daemon, &worker, &child_cwd, &home, &absolute);
     assert!(
         !refused_absolute.status.success(),
         "`work-done --task-file <absolute path>` naming the PANE cwd's real work-done \
@@ -293,6 +369,7 @@ fn delegate_065_work_done_refuses_task_file_despite_cwd_drift() {
     // 2) Same target, via a relative `../` path from the child cwd.
     let refused_relative = run_work_done_task_file(
         &daemon,
+        &worker,
         &child_cwd,
         &home,
         "../.dot-agent-deck/work-done-coder.md",
@@ -319,6 +396,7 @@ fn delegate_065_work_done_refuses_task_file_despite_cwd_drift() {
     .expect("seed decoy file in the child cwd's own .dot-agent-deck");
     let refused_decoy = run_work_done_task_file(
         &daemon,
+        &worker,
         &child_cwd,
         &home,
         ".dot-agent-deck/work-done-decoy.md",
@@ -340,7 +418,7 @@ fn delegate_065_work_done_refuses_task_file_despite_cwd_drift() {
         "an ordinary worker report",
     )
     .expect("seed non-collision file");
-    let allowed = run_work_done_task_file(&daemon, &child_cwd, &home, "worker-report.md");
+    let allowed = run_work_done_task_file(&daemon, &worker, &child_cwd, &home, "worker-report.md");
     assert!(
         allowed.status.success(),
         "a plain --task-file outside any .dot-agent-deck must still be accepted; the \
