@@ -8053,60 +8053,60 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
 /// is added — is at most `max_width` **terminal columns**.
 ///
 /// Every caller's budget is a slice of a rectangle's width (`inner.width - 6`
-/// for the card's `Dir:` and `Prmt:` lines), so the budget is measured in cells,
-/// not scalar values. Counting `char`s instead under-counts wide characters — a
-/// four-scalar CJK basename is eight columns, so a six-cell budget accepted it
-/// unchanged and ratatui then bare-clipped it at the right edge with no `…`,
-/// violating PRD #339's "always ellipsizes" criterion — and over-counts
-/// zero-width ones, replacing a fitting combining sequence with a lone `…`.
+/// for the card's `Dir:` and `Prmt:` lines, and the whole identity row), so the
+/// budget is measured in cells, not scalar values. Counting `char`s instead
+/// under-counts wide characters — a four-scalar CJK basename is eight columns,
+/// so a six-cell budget accepted it unchanged and ratatui then bare-clipped it
+/// at the right edge with no `…`, violating PRD #339's "always ellipsizes"
+/// criterion — and over-counts zero-width ones, replacing a fitting combining
+/// sequence with a lone `…`.
 ///
-/// Mirrors `tab_layout::truncate_to_cap`: accumulate `UnicodeWidthChar` per
-/// character and stop before the first one that would overflow. The `…` column
-/// is reserved **only** when the input actually overflows, so a string that
-/// exactly fills the budget is returned whole. For single-width input (all
-/// ASCII text on a card) this is identical, character for character, to the
-/// former char-count implementation.
+/// The unit is the **grapheme cluster as ratatui draws it** (issue #357), the
+/// same one [`truncate_styled_segments`] budgets the card title in: see
+/// [`drawn_clusters`], which splits with `Span::styled_graphemes` and sizes each
+/// cluster with ratatui's own `CellWidth`. Summing `UnicodeWidthChar` per `char`,
+/// as this function used to, measures some clusters NARROWER than they draw —
+/// `❤️` (U+2764 + VS16) and a keycap `1️⃣` are one column per `char` and two on
+/// screen — so twenty hearts measured twenty and passed whole through the
+/// fork's 38-cell identity row, to be clipped at the border with no `…`. It
+/// also over-counted a ZWJ family (four columns per `char` sum, two drawn), so
+/// such input ellipsized early. No new dependency: the segmentation is
+/// ratatui's own, the one `Span::render` applies to the same text.
 ///
-/// Known limitation: iteration is per `char`, so a grapheme *cluster* — an emoji
-/// ZWJ sequence, or a base character followed by combining marks — can still be
-/// split at the cut point. Measuring clusters needs `unicode-segmentation`,
-/// which this crate deliberately does not depend on; the total width stays
-/// correct either way, so the failure mode is a cosmetically odd final glyph,
-/// never an overrun. Since the total below is summed the same way, a cluster is
-/// also *over*-counted against the budget — a ZWJ sequence ratatui draws in two
-/// cells measures four here — so such input ellipsizes a little early. That
-/// errs in the safe direction and keeps one rule for both decisions.
+/// Cutting on clusters means a ZWJ sequence, a keycap, or a letter with its
+/// combining marks is kept or dropped whole, never split at the cut point. The
+/// `…` column is reserved **only** when the input actually overflows, so a
+/// string that exactly fills the budget is returned whole. For input of
+/// single-column characters (all ASCII text on a card, plus the deck's own `▸`
+/// and `·`) this is identical, character for character, to the former
+/// implementation.
 ///
-/// Control characters measure **zero** columns, and deliberately so: ratatui
-/// 0.30's `Span::styled_graphemes` drops every grapheme containing a
-/// `char::is_control` before it reaches a cell, so such a character occupies no
-/// column on screen. `UnicodeWidthStr::width` disagrees — it counts a `\n` as
-/// one column — so the total below is summed with the same per-character rule
-/// the fill loop uses rather than with the string-level algorithm. Using both
-/// measures is what made `"abc\ndef"` (six rendered cells) get truncated inside
-/// a six-cell budget.
+/// Control characters occupy **no** column, and are not returned: ratatui
+/// 0.30's `Span::styled_graphemes` drops every cluster containing a
+/// `char::is_control` before it reaches a cell. `UnicodeWidthStr::width`
+/// disagrees — it counts a `\n` as one column — so a kept control would make a
+/// caller that pads with the string-level width (the shrunk-card role row,
+/// `render_session_card`) pad one column short. The output therefore holds only
+/// the clusters the renderer draws, as [`truncate_styled_segments`] does, and
+/// `"abc\ndef"` (six rendered cells) fits a six-cell budget as `"abcdef"`.
 fn truncate_with_ellipsis(input: &str, max_width: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
-
-    // The single per-character width rule governing both decisions below.
-    let cell_width = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
-
     if max_width == 0 {
         return String::new();
     }
-    if input.chars().map(cell_width).sum::<usize>() <= max_width {
-        return input.to_string();
+    let view = Span::raw(input);
+    let total: usize = drawn_clusters(&view).map(|(_, w)| w).sum();
+    if total <= max_width {
+        return drawn_clusters(&view).map(|(g, _)| g).collect();
     }
     // Overflow confirmed, so one column now belongs to the `…`.
     let budget = max_width - 1;
     let mut out = String::new();
     let mut used = 0usize;
-    for c in input.chars() {
-        let w = cell_width(c);
+    for (cluster, w) in drawn_clusters(&view) {
         if used + w > budget {
             break;
         }
-        out.push(c);
+        out.push_str(cluster);
         used += w;
     }
     out.push('…');
@@ -8307,14 +8307,15 @@ pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> O
 /// the renderer applies to that span, which also drops every cluster holding a
 /// control character — and each cluster is sized with ratatui's own
 /// [`CellWidth`](ratatui::buffer::CellWidth), the rule `Span::render` advances
-/// the cursor by. Summing `UnicodeWidthChar` per `char`, as
-/// [`truncate_with_ellipsis`] does, is not a safe substitute here, because it
-/// measures some clusters NARROWER than they draw: `❤️` (U+2764 + VS16) and a
-/// keycap `1️⃣` are one column per `char` and two on screen, and a halfwidth
-/// `ｶﾞ` is one against two. A title made of those passed the fit check and was
-/// drawn over by the badge — the #357 symptom again, on input the char count
-/// had handled correctly. Cutting on clusters also means a ZWJ sequence or a
-/// letter with its combining marks is kept or dropped whole, never split.
+/// the cursor by. Summing `UnicodeWidthChar` per `char` (as
+/// [`truncate_with_ellipsis`] did until the fork's identity row hit the same
+/// defect) is not a safe substitute, because it measures some clusters NARROWER
+/// than they draw: `❤️` (U+2764 + VS16) and a keycap `1️⃣` are one column per
+/// `char` and two on screen, and a halfwidth `ｶﾞ` is one against two. A title
+/// made of those passed the fit check and was drawn over by the badge — the #357
+/// symptom again, on input the char count had handled correctly. Cutting on
+/// clusters also means a ZWJ sequence or a letter with its combining marks is
+/// kept or dropped whole, never split.
 ///
 /// The output holds only the clusters the renderer will draw, so a control
 /// character never reaches it even on the fits-as-is path. That matters for the
@@ -56432,6 +56433,142 @@ mod tests {
         let cut = truncate_styled_segments(segments, 6);
         assert_eq!(title_text(&cut), " 1 ab…");
         assert!(!title_text(&cut).contains(char::is_control));
+    }
+
+    /// Issue #357 on the fork's identity row (and every other surface that
+    /// budgets with [`truncate_with_ellipsis`]): the budget is a slice of the
+    /// card's width, so a cluster is sized at the cells ratatui draws it in. A
+    /// heart with VS16 (`❤️`) is two scalars of which one is a column wide, so
+    /// the per-`char` sum measured twenty hearts at twenty and let them pass
+    /// whole through a 38-cell row, to be clipped at the card's border with no
+    /// `…`. Twenty hearts are forty columns: they must be cut to eighteen plus
+    /// the marker (37 columns), and nineteen — exactly the budget — stay whole.
+    #[test]
+    fn truncate_with_ellipsis_cuts_vs16_hearts_at_their_drawn_width() {
+        let heart = "❤\u{fe0f}";
+        let hearts = heart.repeat(20);
+        assert!(rendered_str_columns(&hearts) > 38, "forty columns drawn");
+
+        let cut = truncate_with_ellipsis(&hearts, 38);
+        assert_eq!(cut, format!("{}…", heart.repeat(18)));
+        assert_eq!(rendered_str_columns(&cut), 37);
+
+        let exact = heart.repeat(19);
+        assert_eq!(truncate_with_ellipsis(&exact, 38), exact);
+        assert_eq!(
+            truncate_with_ellipsis(&exact, 37),
+            format!("{}…", heart.repeat(18)),
+            "one column short: the last heart goes and the marker takes its place"
+        );
+    }
+
+    /// A CJK name is half as many scalars as it is columns (the original PRD
+    /// #339 / issue #357 defect): six glyphs are twelve columns. A glyph that
+    /// would straddle the budget is dropped rather than half-drawn, so a 10
+    /// cell budget keeps four glyphs (8) and the marker (1), not five.
+    #[test]
+    fn truncate_with_ellipsis_cuts_a_cjk_name_in_columns() {
+        let name = "项目目录管理";
+        assert_eq!(rendered_str_columns(name), 12);
+        assert_eq!(truncate_with_ellipsis(name, 12), name);
+        assert_eq!(truncate_with_ellipsis(name, 11), "项目目录管…");
+        assert_eq!(truncate_with_ellipsis(name, 10), "项目目录…");
+        assert_eq!(rendered_str_columns(&truncate_with_ellipsis(name, 10)), 9);
+    }
+
+    /// The other direction, which the per-`char` sum got wrong the other way: a
+    /// ZWJ family is three people joined by two zero-width joiners, which the
+    /// renderer draws in two cells, but which summed to six per `char`. Three of
+    /// them are six columns and fit a six-cell budget whole; at a three-cell
+    /// budget exactly one family is kept — never split at a joiner — and the
+    /// marker follows it. The same holds for a keycap and a halfwidth katakana
+    /// with its dakuten, both two cells that the `char` sum measured wrongly.
+    #[test]
+    fn truncate_with_ellipsis_keeps_a_zwj_sequence_whole() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let families = family.repeat(3);
+        assert_eq!(rendered_str_columns(&families), 6);
+        assert_eq!(truncate_with_ellipsis(&families, 6), families);
+        assert_eq!(truncate_with_ellipsis(&families, 3), format!("{family}…"));
+        assert_eq!(truncate_with_ellipsis(&families, 2), "…");
+
+        for body in ["1\u{fe0f}\u{20e3}2\u{fe0f}\u{20e3}3\u{fe0f}\u{20e3}", "ｶﾞｷﾞｸﾞ"] {
+            assert_eq!(rendered_str_columns(body), 6, "{body:?}");
+            assert_eq!(truncate_with_ellipsis(body, 6), body, "{body:?}");
+            let view = Span::raw(body);
+            let first = drawn_clusters(&view).next().expect("a first cluster").0;
+            assert_eq!(
+                truncate_with_ellipsis(body, 3),
+                format!("{first}…"),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// Plain text is unchanged: the budget is a character count for single
+    /// column characters, the marker is reserved only on overflow, a zero
+    /// budget is empty, and a combining sequence that fits by width is kept
+    /// (four accented letters are eight scalars and four columns).
+    #[test]
+    fn truncate_with_ellipsis_is_unchanged_for_single_column_text() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 6), "abcdef");
+        assert_eq!(truncate_with_ellipsis("abcdef", 5), "abcd…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+        assert_eq!(truncate_with_ellipsis("", 4), "");
+        assert_eq!(truncate_with_ellipsis("▸ a · b", 7), "▸ a · b");
+
+        let accented = "e\u{301}e\u{301}e\u{301}e\u{301}";
+        assert_eq!(truncate_with_ellipsis(accented, 4), accented);
+        assert_eq!(
+            truncate_with_ellipsis(accented, 3),
+            "e\u{301}e\u{301}…",
+            "a letter and its accent are kept or cut together"
+        );
+    }
+
+    /// A control character takes no column and the renderer never draws it, so
+    /// it is neither counted nor returned (`UnicodeWidthStr::width` would count a
+    /// `\n` as one and pad a caller one column short): `abc\ndef` is six drawn
+    /// cells and fits a six-cell budget as `abcdef`.
+    #[test]
+    fn truncate_with_ellipsis_neither_counts_nor_returns_control_characters() {
+        assert_eq!(truncate_with_ellipsis("abc\ndef", 6), "abcdef");
+        assert_eq!(truncate_with_ellipsis("ab\ncd\t", 3), "ab…");
+        assert!(!truncate_with_ellipsis("a\u{1b}[31mb\rc", 9).contains(char::is_control));
+    }
+
+    /// The guarantee every caller relies on, swept: whatever the input and the
+    /// budget, what comes back never draws wider than the budget, is the input
+    /// itself exactly when the input fits, and ends in `…` exactly when it was
+    /// cut.
+    #[test]
+    fn truncate_with_ellipsis_never_exceeds_its_column_budget() {
+        for input in [
+            "plain ascii text",
+            "❤\u{fe0f} ok ❤\u{fe0f}❤\u{fe0f}",
+            "1\u{fe0f}\u{20e3}2\u{fe0f}\u{20e3}3\u{fe0f}\u{20e3}",
+            "ｶﾞｷﾞｸﾞ",
+            "项目目录管理",
+            "e\u{301}e\u{301}e\u{301}e\u{301}",
+            "mixed 项目 😀 e\u{301}",
+            "👨\u{200d}👩\u{200d}👧👨\u{200d}👩\u{200d}👧",
+        ] {
+            let natural = rendered_str_columns(input);
+            for max in 1..=natural + 2 {
+                let out = truncate_with_ellipsis(input, max);
+                assert!(
+                    rendered_str_columns(&out) <= max,
+                    "{input:?} in {max}: {out:?} draws {}",
+                    rendered_str_columns(&out)
+                );
+                if natural <= max {
+                    assert_eq!(out, input, "{input:?} fits {max} columns");
+                } else {
+                    assert!(out.ends_with('…'), "{input:?} in {max}: {out:?}");
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
