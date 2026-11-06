@@ -35809,14 +35809,18 @@ mod tests {
         let (rendered, _ui) = render_dashboard_grid(50, 40, 8);
         let title_line = rendered.lines().next().unwrap_or_default();
 
-        let after_session_count = title_line
-            .find("session(s)")
-            .map(|i| title_line[i + "session(s)".len()..].trim())
+        // Upstream-sync round 29: the count word is the glossary's `agent(s)`
+        // (upstream issue #1369) where this test was written against
+        // `session(s)`; the indicator it asserts is upstream's `(↑a ↓b)` (issue
+        // #588), already merged, so only the anchor word moved.
+        let after_agent_count = title_line
+            .find("agent(s)")
+            .map(|i| title_line[i + "agent(s)".len()..].trim())
             .unwrap_or("");
         assert!(
-            !after_session_count.is_empty(),
+            !after_agent_count.is_empty(),
             "title must append a viewport-hidden indicator (distinct from \
-             the filter-based \"X/Y session(s)\" text) when cards exist but \
+             the filter-based \"X/Y agent(s)\" text) when cards exist but \
              didn't fit even at max_cols_for_width/Compact; got title line \
              {title_line:?}"
         );
@@ -42599,10 +42603,25 @@ mod tests {
                 .unwrap();
             buffer_to_string(terminal.backend().buffer())
         };
+        // Upstream-sync round 29: upstream's title reads `<type> · <name> ` and its
+        // assertions cut the NAME to make room for the word. The fork's card puts
+        // the identity on a row of its own and leaves the type badge off by
+        // default (PRD fork#405 M1, fork #339; the fork tip's
+        // `render_dashboard__pane_004_card_title_row` snapshot pins the same
+        // layout), so the title is just ` 1 ` and the word almost always fits
+        // beside it. What this test pins is therefore the word's placement, not
+        // which of two title segments loses: the seat's card says
+        // ORCHESTRATOR once, whole, in the title or (where the title has no
+        // room) on a row of its own; any other card never does; the name stays
+        // whole on its own row.
         let idle = make_session(SessionStatus::Idle);
         let seat = render(&idle, "lead", 74, true);
         let title = seat.lines().next().unwrap();
-        assert!(title.contains("· lead ORCHESTRATOR"), "{seat}");
+        assert!(title.contains("ORCHESTRATOR"), "{seat}");
+        assert!(
+            seat.lines().nth(1).is_some_and(|row| row.contains("lead")),
+            "the name is on the first body row: {seat}"
+        );
         assert!(!render(&idle, "lead", 74, false).contains("ORCHESTRATOR"));
 
         let mut busy = make_session(SessionStatus::Working);
@@ -42620,37 +42639,68 @@ mod tests {
         .unwrap();
         busy.recent_events.push_back(queued);
         let long = "orchestrator-with-a-very-long-role-name";
-        for width in [40, 41, 44] {
+        // Upstream pinned three widths (40, 41, 44) at which its title had room for
+        // the type, the name OR the word. The fork's title carries neither type
+        // nor name, so the width at which the word stops fitting beside the
+        // status badge and the queued-message badge is a different one; sweep
+        // the widths instead of restating a hand-computed threshold. At every
+        // width the word is drawn once and whole, a title that has no room for it
+        // is exactly the title the non-seat card draws, and the sweep must see
+        // BOTH placements or it proves nothing.
+        let (mut in_title, mut own_row) = (false, false);
+        for width in 20..=80u16 {
             let card = render(&busy, long, width, true);
+            let plain = render(&busy, long, width, false);
             let title = card.lines().next().unwrap();
-            assert!(title.contains("Working"), "{width}: {card}");
-            assert!(title.contains("queued"), "{width}: {card}");
-            // The title has no room for the word, so it takes a row of its
-            // own, whole, and the title cuts only what it cut before.
-            assert!(!title.contains("ORCHESTRATOR"), "{width}: {card}");
-            assert_eq!(
-                title,
-                render(&busy, long, width, false).lines().next().unwrap(),
-                "{width}: {card}"
-            );
             assert_eq!(
                 card.lines()
-                    .filter(|line| line.contains("│ORCHESTRATOR "))
+                    .filter(|line| line.contains("ORCHESTRATOR"))
                     .count(),
                 1,
-                "{width}: {card}"
+                "{width}: the word is drawn once, whole: {card}"
             );
-            assert!(!render(&busy, long, width, false).contains("ORCHESTRATOR"));
+            if title.contains("ORCHESTRATOR") {
+                in_title = true;
+            } else {
+                own_row = true;
+                // The title has no room for the word, so it takes a row of its
+                // own, whole, and the title cuts only what it cut before.
+                assert_eq!(title, plain.lines().next().unwrap(), "{width}: {card}");
+                assert_eq!(
+                    card.lines()
+                        .filter(|line| line.contains("│ORCHESTRATOR "))
+                        .count(),
+                    1,
+                    "{width}: {card}"
+                );
+            }
+            assert!(!plain.contains("ORCHESTRATOR"), "{width}: {plain}");
         }
+        assert!(
+            in_title && own_row,
+            "the sweep must reach the word in the title (in_title={in_title}) and on a row of \
+             its own (own_row={own_row})"
+        );
 
-        // CI red on PR #1956: a 40-column sidebar card has room for the whole
-        // `<type> · <role>` title or for the word, not both. The role name
-        // stays whole, and the badge moves to its own row.
+        // CI red on PR #1956: a 40-column sidebar card must not cut the role name
+        // to fit the word. Under the fork's layout the name is on its own row, so
+        // it stays whole whichever way the word is placed.
         let card = render(&idle, "coordinator", 40, true);
         let title = card.lines().next().unwrap();
-        assert!(title.contains(" · coordinator "), "{card}");
         assert!(!title.contains('…'), "{card}");
-        assert!(card.contains("│ORCHESTRATOR "), "{card}");
+        assert!(
+            card.lines()
+                .nth(1)
+                .is_some_and(|row| row.contains("coordinator")),
+            "{card}"
+        );
+        assert_eq!(
+            card.lines()
+                .filter(|line| line.contains("ORCHESTRATOR"))
+                .count(),
+            1,
+            "{card}"
+        );
     }
 
     /// An OpenCode card carrying the daemon's agent notice `notice` (beside a
@@ -42723,6 +42773,7 @@ mod tests {
             CardDensity::Normal,
         );
         insta::assert_snapshot!(card, @r"
+        │auditor                                                   │
         │Dir:  —                                                   │
         │Add --standalone to the command or run opencode service   │
         │set disabled true, then restart: OpenCode 2's shared      │
@@ -42743,6 +42794,7 @@ mod tests {
             CardDensity::Normal,
         );
         insta::assert_snapshot!(card, @r"
+        │auditor                                                   │
         │Dir:  —                                                   │
         │Run dot-agent-deck hooks install --agent opencode, then   │
         │restart: the deck's OpenCode plugin is not reporting from │
@@ -42765,6 +42817,7 @@ mod tests {
             CardDensity::Normal,
         );
         insta::assert_snapshot!(card, @r"
+        │auditor                                                   │
         │Dir:  —                                                   │
         │Add --standalone to the command (OpenCode 2) or run       │
         │dot-agent-deck hooks install --agent opencode, then       │
@@ -42782,6 +42835,7 @@ mod tests {
         let text = crate::agent_notice::AgentNotice::opencode_unsupported_version((1, 18, 28)).text;
         let card = opencode_card_with_agent_notice(&text, 60, CardDensity::Normal);
         insta::assert_snapshot!(card, @r"
+        │auditor                                                   │
         │Dir:  —                                                   │
         │Upgrade OpenCode to 1.18.29 or later, then restart:       │
         │version 1.18.28 is too old for the deck                   │
@@ -42803,9 +42857,10 @@ mod tests {
             CardDensity::Compact,
         );
         insta::assert_snapshot!(compact, @r"
-        │Dir:  —                                                   │
+        │auditor                                                   │
         │Add --standalone to the command or run opencode service   │
-        │set disabled true, then restart: OpenCode 2's shared serv…│
+        │set disabled true, then restart: OpenCode 2's shared      │
+        │service hides this agent                                  │
         ");
         let minimal = opencode_card_with_agent_notice(
             crate::agent_notice::OPENCODE_SHARED_SERVICE,
@@ -42813,7 +42868,7 @@ mod tests {
             CardDensity::Minimal,
         );
         insta::assert_snapshot!(minimal, @r"
-        │Add --standalone to the command or run opencode service s…│
+        │auditor  Add --standalone to the command or run opencode …│
         ");
     }
 
@@ -42981,19 +43036,27 @@ mod tests {
         });
     }
 
-    /// Whether `bell.on_idle` rings for `sess-moving` having just gone from
-    /// `Working` to the `Idle` it holds in `state`.
+    /// The card `sess-moving`'s frame from `worker-pane-b` lands on. Upstream
+    /// issue #925 (`8f9ac843`) re-keys a frame that names a pane other than the one
+    /// its session key resolves to onto that pane's own card,
+    /// `<pane>::<session id>`, instead of dragging the pane-A card across (the
+    /// relocation these two fork tests, written for issue #803, used to rely on).
+    const BELL_MOVED_CARD: &str = "worker-pane-b::sess-moving";
+
+    /// Whether `bell.on_idle` rings for the card `sess-moving` announced on
+    /// `worker-pane-b` (`BELL_MOVED_CARD`) having just gone from `Working` to the
+    /// `Idle` it holds in `state`.
     fn bell_rings_for_moving_session_going_idle(state: &AppState) -> bool {
         assert_eq!(
             state
                 .sessions
-                .get("sess-moving")
+                .get(BELL_MOVED_CARD)
                 .map(|session| (session.pane_id.as_deref(), session.status.clone())),
             Some((Some("worker-pane-b"), SessionStatus::Idle)),
-            "fixture precondition: sess-moving is Idle on worker-pane-b"
+            "fixture precondition: the card sess-moving announced on worker-pane-b is Idle there"
         );
         let mut last = HashMap::new();
-        last.insert("sess-moving".to_string(), SessionStatus::Working);
+        last.insert(BELL_MOVED_CARD.to_string(), SessionStatus::Working);
         let config = BellConfig {
             on_idle: true,
             ..Default::default()
@@ -43004,8 +43067,9 @@ mod tests {
 
     /// Scenario: issue #803. A session on a worker pane that owes a
     /// `work-done` carries on in another pane under the same session id, and
-    /// the first pane's delegation is then retired. The session goes `Idle`
-    /// on a pane that owes nothing, so `bell.on_idle` must ring.
+    /// the first pane's delegation is then retired. The agent goes `Idle` on a
+    /// pane that owes nothing (its own card there, since issue #925), so
+    /// `bell.on_idle` must ring.
     #[test]
     fn bell_rings_for_idle_session_that_left_a_pane_whose_delegation_was_retired() {
         let mut state = bell_state_with_session_on_pane_a();
@@ -43023,8 +43087,8 @@ mod tests {
     }
 
     /// Scenario: issue #803. A session moves onto a worker pane that already
-    /// owes a `work-done`. Its `Idle` is a delegated worker's, so
-    /// `bell.on_idle` must stay silent (issue #755).
+    /// owes a `work-done`. Its `Idle` (on its card there, since issue #925) is a
+    /// delegated worker's, so `bell.on_idle` must stay silent (issue #755).
     #[test]
     fn bell_suppressed_for_idle_session_that_moved_onto_a_delegated_pane() {
         let mut state = bell_state_with_session_on_pane_a();
@@ -43450,7 +43514,13 @@ mod tests {
     #[test]
     fn fit_card_rows_makes_room_for_status_rows() {
         let plan = |d: CardDensity, status| {
-            let budget = d.card_height() as usize - 2;
+            // The fork's identity row (PRD fork#405 M1) is the first body row, so
+            // `render_session_card` hands this function `inner.height - 1`, i.e.
+            // `card_height - 3`. The fork's tiers are one taller than upstream's,
+            // so this is exactly the budget upstream's `card_height - 2` gave each
+            // of the three taller tiers, and every one of those assertions stays
+            // as upstream wrote it.
+            let budget = d.card_height() as usize - 3;
             fit_card_rows(
                 budget,
                 status,
@@ -43473,9 +43543,14 @@ mod tests {
         assert_eq!(plan(CardDensity::Normal, 2), row(true, 0, false));
         assert_eq!(plan(CardDensity::Spacious, 2), row(true, 2, false));
         assert_eq!(plan(CardDensity::Compact, 2), row(false, 0, false));
-        // Issue #1568: Minimal's one inner row is `Dir:`, and a status row
-        // takes its place.
-        assert_eq!(plan(CardDensity::Minimal, 0), row(true, 0, false));
+        // Issue #1568: Minimal's one inner row carries `Dir:`, and a status row
+        // takes its place. Under the fork's layout that one row is the identity
+        // row, and `render_session_card` folds `Dir:` (or the status reason) onto
+        // it itself (`fold_dir`, issues #847/#1568) rather than asking this plan
+        // for a row, so the plan's budget is 0 and it keeps no `Dir:` row of its
+        // own either way. The fold is pinned by `card_height_847_*` and the
+        // `density/007` Minimal snapshot.
+        assert_eq!(plan(CardDensity::Minimal, 0), row(false, 0, false));
         assert_eq!(plan(CardDensity::Minimal, 1), row(false, 0, false));
     }
 
@@ -56263,9 +56338,11 @@ mod tests {
         );
 
         let rows = glossary_frame_rows(&state, &mut ui);
+        // The fork's TUI title is `worker-deck` (permanent rename, CLAUDE.md rule
+        // 21); upstream's test looked for `dot-agent-deck`.
         let title = rows
             .iter()
-            .find(|row| row.contains("dot-agent-deck"))
+            .find(|row| row.contains("worker-deck"))
             .expect("the dashboard title row is drawn");
         let message = rows
             .iter()
@@ -56274,7 +56351,7 @@ mod tests {
         insta::assert_snapshot!(
             format!("{}\n{}", title.trim(), message.trim()),
             @"
-            dot-agent-deck — 0/2 agent(s)
+            worker-deck — 0/2 agent(s)
             No agents match filter.
             "
         );
@@ -56370,15 +56447,21 @@ mod tests {
     }
 
     /// The names in `expected`, in the top-to-bottom order the frame draws
-    /// their cards. Each name is matched on a card title row, so a name that
-    /// is missing from the frame fails loudly rather than being skipped.
+    /// their cards. Each name is matched on the card's identity row, so a name
+    /// that is missing from the frame fails loudly rather than being skipped.
+    ///
+    /// Upstream matched `" {name} "` on the card TITLE, where its layout draws
+    /// `<type> · <name> `. The fork's card puts the identity on a row of its own
+    /// (PRD fork#405 M1), so the name is a whole cell between card borders
+    /// (`│name   │`, or `┃name   ┃` on the selected card, and several such cells
+    /// side by side on a multi-column deck).
     fn order_drawn_names<'a>(rows: &[String], expected: &[&'a str]) -> Vec<&'a str> {
         let mut found: Vec<(usize, &str)> = expected
             .iter()
             .map(|name| {
                 let row = rows
                     .iter()
-                    .position(|row| row.contains(&format!(" {name} ")))
+                    .position(|row| row.split(['│', '┃']).any(|cell| cell.trim() == *name))
                     .unwrap_or_else(|| {
                         panic!("`{name}` has no card in the frame:\n{}", rows.join("\n"))
                     });
