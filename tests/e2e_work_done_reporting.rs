@@ -1094,10 +1094,15 @@ fn observing_018_orchestrator_keeps_observing_after_the_respawned_worker_announc
 /// is a spawn ERROR and not a shell that starts and then exits 127.
 const MISSING_WORKER_BINARY: &str = "/nonexistent-worker-agent-deck-respawn-target";
 
-/// The daemon's respawn-failure notice, written into the orchestrator's pane
-/// immediately before the dispatch gives up. Spelled out here rather than
-/// imported, matching this file's convention.
-const RESPAWN_FAILED_NEEDLE: &str = "respawn failed for role 'worker'";
+/// The daemon's respawn-failure notice, posted to the orchestrator's inbox
+/// immediately before the dispatch gives up (`compose_respawn_failed_notice`,
+/// `src/state.rs`). Spelled out here rather than imported, matching this file's
+/// convention. The notice names the worker's PANE, not its role, inside the
+/// declared-untrusted pane-id frame, so the stable part to wait for is the
+/// notice's own headline, the one `delegate_respawn_recovery` and
+/// `work_done_reporting` already use; the older "respawn failed for role
+/// 'worker'" wording no longer exists in the daemon.
+const RESPAWN_FAILED_NEEDLE: &str = "delegated worker respawn failed";
 
 /// The daemon's notice for a replacement worker that died before it was ready.
 const DEAD_REPLACEMENT_NEEDLE: &str = "delegated worker never came up";
