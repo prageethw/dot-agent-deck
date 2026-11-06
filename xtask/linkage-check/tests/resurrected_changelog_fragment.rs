@@ -130,8 +130,9 @@ fn write_and_commit_base_fixture(root: &Path) {
 }
 
 /// The bug this file exists to catch, end to end: a resurrected fragment
-/// added on top of the base fixture must fail the real binary, with a
-/// `[12]`-tagged failure line naming the resurrected fragment.
+/// added on top of the base fixture must fail the real binary, with a failure
+/// line tagged `[20]` (`no-resurrected-changelog-fragment`) that starts with the
+/// resurrected fragment's path.
 #[test]
 fn linkage_check_fails_when_a_resurrected_fragment_is_added() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -161,9 +162,14 @@ fn linkage_check_fails_when_a_resurrected_fragment_is_added() {
         "linkage-check reported success on a fixture whose new fragment resurrects \
          already-shipped CHANGELOG.md content (issue #259)\nstdout: {stdout}\nstderr: {stderr}"
     );
+    // The tag is the rule's REGISTERED number: this was `[12]`, the fork's own
+    // numbering before the net merge, and `[12]` is now `desktop-project-boundary`
+    // — whose "skipped (no top-level desktop/ directory ...)" line this fixture
+    // always prints, so the old needle matched that line and proved nothing
+    // about the failure. `[20] <path>` can only come from the rule's finding.
     assert!(
-        stderr.contains("[12]") && stderr.contains("259.bugfix.md"),
-        "the failure must be tagged [12] and name the resurrected fragment: {stderr}"
+        stderr.contains("[20] changelog.d/259.bugfix.md"),
+        "the failure must be tagged [20] and lead with the resurrected fragment: {stderr}"
     );
 }
 
