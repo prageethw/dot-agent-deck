@@ -452,19 +452,33 @@ fn start_plain_from_tui(deck: &TuiDeck) {
     deck.send_keys(b"\r"); // submit
 }
 
-/// Issue #1507: the number on the card whose title carries `label`, read from
-/// the drawn grid (`┌ 3 third-desktop-agent …`, or `┏ ▸ 3 …` when selected).
-/// Matches the label's first ten characters so a title the narrowed sidebar
-/// cuts with `…` still matches.
+/// Issue #1507: the number on the card whose name carries `label`, read from
+/// the drawn grid. Matches the label's first ten characters so a name the
+/// narrowed sidebar cuts with `…` still matches.
+///
+/// Upstream draws the name on the card's top border (`┌ 3 third-desktop-agent
+/// …`, or `┏ ▸ 3 …` when selected), so one line carried both. This fork draws a
+/// card on two rows (PRD fork#405 M1): the number and status on the top border
+/// (`┌ 3 ──── No agent ┐`, or `┏ ▸ 3 ━━ …` when selected) and the identity, the
+/// name first, on the row directly beneath it (`│third-desktop-agent …│`). So
+/// the name is found on its own row, and the number is read from the border row
+/// directly above, starting at the corner over that card's left edge. A line
+/// that carries the name but no card edge before it (such as the focused pane's
+/// own title, `┌<name>───`) is not a card and is skipped.
 fn card_number(grid: &str, label: &str) -> Option<u32> {
     let key = &label[..label.len().min(10)];
-    grid.lines().find_map(|line| {
+    let lines: Vec<&str> = grid.lines().collect();
+    lines.iter().enumerate().find_map(|(row, line)| {
         let at = line.find(key)?;
-        let corner = line[..at].rfind(['┌', '┏'])?;
-        let title = &line[corner..at];
-        let digits: String = title
+        let left_edge = line[..at].rfind(['│', '┃'])?;
+        let left_col = line[..left_edge].chars().count();
+        let above = lines.get(row.checked_sub(1)?)?;
+        if !matches!(above.chars().nth(left_col)?, '┌' | '┏') {
+            return None;
+        }
+        let digits: String = above
             .chars()
-            .skip(1)
+            .skip(left_col + 1)
             .skip_while(|c| *c == ' ' || *c == '▸')
             .take_while(char::is_ascii_digit)
             .collect();
