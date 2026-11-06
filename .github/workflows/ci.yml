@@ -1834,16 +1834,31 @@ jobs:
   # red locally and is not a gate (issue #368). Porting the harness to Windows
   # named pipes + ConPTY and running full integration/e2e on a Windows VM is
   # tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9), not M8.
-  # FORK NOTE (upstream sync 2026-11-05): upstream switched this job off with
-  # `if: false` because no release so far carries a Windows build, leaving only
-  # `windows-cross-check` (a type-check) on pull requests. This fork keeps the
-  # native Windows leg running (CLAUDE.md rules 2 and 5 name all three build
-  # jobs), so the condition below is the fork's own, with the `docs_only` gate.
-  # Adopting upstream's saving is a maintainer decision, not a merge one: replace
-  # the condition with `false` and keep this note.
+  # SKIPPED UNTIL WINDOWS SHIPS. Upstream switched this job off in PR #1739; this
+  # fork adopted that on 2026-11-06 (maintainer decision, upstream sync
+  # 2026-11-05). No release so far has carried a Windows build: release.yml
+  # builds no `*-pc-windows-*` target for the CLI and no Windows desktop bundle
+  # (upstream checked all 108 releases up to v0.46.0 on 2026-10-18), so this job
+  # gated every PR, for 13-19 minutes, on a platform no user can install. Its last
+  # run, on the sync PR, failed `clippy -D warnings` with 24 errors, all in
+  # upstream-origin files.
+  #
+  # It is switched off with `if: false` rather than deleted or commented out so
+  # that Renovate keeps the pins below current while it is off. Nothing on this
+  # fork requires it (no ruleset, CLAUDE.md rule 8), and no `needs:` list is
+  # broken by a skipped job: the aggregate `build` gate does not list it, and
+  # `notify-main-red` only reacts to a `failure` result.
+  #
+  # What remains for Windows is `windows-cross-check` above, a type-check of the
+  # workspace, tests included, for the Windows target. It does not lint with
+  # `-D warnings`, so while this job is off a Windows-only lint or test break can
+  # merge with every check green.
+  #
+  # To re-enable it when Windows ships, restore the fork's condition:
+  #   if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
   build-windows:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    if: false
     runs-on: windows-latest
     env:
       # Issue #326: see the `changes` job's `version` step.
