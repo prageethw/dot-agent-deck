@@ -2,7 +2,8 @@
 source: tests/render_dashboard.rs
 expression: wide
 ---
-┌ 1 ClaudeCode · 项 目 目 录 …─ ● Thinking ┐
+┌ 1 ─────────────────────── ● Thinking ┐
+│项 目 目 录 管 理 项 目 目 录 管 理 项 目 目 录 管 理 … │
 │Dir:  example-project                 │
 │Prmt: move the stats into the border  │
 │                                      │
