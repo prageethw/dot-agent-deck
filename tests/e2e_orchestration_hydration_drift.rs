@@ -55,6 +55,30 @@ fn assert_drift_surfaced(deck: &TuiDeck, what: &str) {
     );
 }
 
+/// Open the fixture's single orchestration live and title its tab `demo-orch`.
+///
+/// Drives the new-pane dialog (mirrors `e2e_orchestration_focus.rs::open_orchestration`):
+/// Ctrl+n -> directory picker -> confirm current dir -> new-pane form -> Right
+/// selects the (only) orchestration chip -> Enter moves Mode -> Name. The fork
+/// titles an orchestration tab with the form's Name, and the Name is pre-filled
+/// with `<folder>-orchestrator-N` (fork#192 M1.0), which is also what a tab
+/// REBUILT on reattach shows. Upstream's tab carries the orchestration's own
+/// name, which is what these tests look for on the strip row, so the pre-filled
+/// Name is cleared and `demo-orch` typed (the idiom `e2e_orchestration_worktree.rs`
+/// uses; extra backspaces on an empty field are no-ops) before the final Enter
+/// submits. Command is hidden for an orchestration.
+fn open_demo_orchestration(deck: &TuiDeck) {
+    deck.send_bytes(b"\x0e");
+    deck.send_bytes(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_bytes(b"\x1b[C");
+    deck.send_bytes(b"\r");
+    deck.send_bytes(&[0x7fu8; 80]);
+    deck.send_bytes(b"demo-orch");
+    deck.send_bytes(b"\r");
+    deck.wait_for_absence("New Agent");
+}
+
 /// PRD fork#544 M2b: isolation is now unconditional, so the orchestration
 /// opened by the tests below does not run in `deck.workdir()` itself — it
 /// runs in a freshly `git clone`d SIBLING directory
@@ -115,18 +139,8 @@ fn hydration_001_renamed_orchestration_warns_on_reattach() {
     // bare `git init`) does not provide one.
     commit_fixture(deck.workdir());
 
-    // Open the fixture's single orchestration live (mirrors
-    // `e2e_orchestration_focus.rs::open_orchestration` / `dashboard_002`):
-    // Ctrl+n -> directory picker -> confirm current dir -> new-pane form ->
-    // Right selects the (only) orchestration chip -> Enter twice (Mode ->
-    // Name -> submit; Command is hidden for an orchestration).
-    deck.send_bytes(b"\x0e");
-    deck.send_bytes(b" ");
-    deck.wait_for_string("No mode");
-    deck.send_bytes(b"\x1b[C");
-    deck.send_bytes(b"\r");
-    deck.send_bytes(b"\r");
-    deck.wait_for_absence("New Agent");
+    // Open the fixture's single orchestration live, titled `demo-orch`.
+    open_demo_orchestration(&deck);
 
     let attach_socket = deck.attach_socket_path().to_string_lossy().into_owned();
     let hook_socket = deck.hook_socket_path().to_string_lossy().into_owned();
@@ -201,13 +215,7 @@ fn hydration_002_unparseable_config_warns_on_reattach() {
 
     // Open the fixture's single orchestration live -- identical setup to
     // `hydration_001`.
-    deck.send_bytes(b"\x0e");
-    deck.send_bytes(b" ");
-    deck.wait_for_string("No mode");
-    deck.send_bytes(b"\x1b[C");
-    deck.send_bytes(b"\r");
-    deck.send_bytes(b"\r");
-    deck.wait_for_absence("New Agent");
+    open_demo_orchestration(&deck);
 
     let attach_socket = deck.attach_socket_path().to_string_lossy().into_owned();
     let hook_socket = deck.hook_socket_path().to_string_lossy().into_owned();
