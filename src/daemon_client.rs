@@ -9590,7 +9590,15 @@ pub(crate) mod restart_fixture {
                     .expect("a minimal agent record"),
                 ])
             }
-            "start-agent" => AttachResponse::with_id("1".into()),
+            "start-agent" => {
+                // PRD #365 M2: the daemon mints the pane id and the client
+                // takes it from this reply, refusing a start that carries none
+                // ("start-agent ok but no pane_id in response"). Both processes
+                // answer for pane `pane-1`, as the fixture's doc says.
+                let mut reply = AttachResponse::with_id("1".into());
+                reply.pane_id = Some("pane-1".into());
+                reply
+            }
             "post-message" => AttachResponse::with_id("m-1".into()),
             "attach-stream" | "resize" => {
                 let mut reply = AttachResponse::ok();
