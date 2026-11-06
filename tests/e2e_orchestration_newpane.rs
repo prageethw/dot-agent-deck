@@ -406,10 +406,45 @@ fn newpane_005_ctrl_n_after_second_concurrent_orchestration_opened() {
     // FIRST orchestration's tab to check whether it is independently still
     // able to open the picker (per-tab) or also silently blocked
     // (deck-global) now that a second orchestration exists.
+    //
+    // Each step is settled on the observable it produces, not on terminal
+    // silence: a live deck with a daemon event stream repaints often enough
+    // that a 50 ms idle window may never occur (see `wait_until_grid`), and the
+    // run-8 dump never went quiet for 30 s here. The likely source is that the
+    // two `cat` role stand-ins never acknowledge the orchestrator prompt posted
+    // to their inbox, so the daemon's doorbell keeps ringing and `cat` keeps
+    // echoing it; that cause is not proven here.
+    //
+    // The Esc wait is more than a settle: a lone ESC byte followed at once by
+    // the tab chord's own leading ESC could be read as one key, so the chord is
+    // sent only once the picker is seen to be gone.
+    //
+    // Both orchestration tabs show the same cards, so no body text tells them
+    // apart; the tab strip does. The ACTIVE orchestration tab's label is drawn
+    // REVERSED and the other is not (`render_tab_strip`, PRD fork#405 M2), and
+    // a label is `<folder>-orchestrator-N`, the Name the form suggests. The
+    // starting position is checked too, so a cue that is not what this reads
+    // fails here, before the switch, instead of as a timeout after it.
+    let folder = work
+        .file_name()
+        .expect("the workdir has a basename")
+        .to_string_lossy()
+        .into_owned();
+    let tab_is_active = |n: u32| {
+        deck.visible_text_cell_styles(&format!("{folder}-orchestrator-{n}"))
+            .is_some_and(|cells| cells.iter().all(|cell| cell.inverse))
+    };
     deck.send_bytes(b"\x1b"); // Esc -> cancel/close whatever Ctrl+n opened, if anything
-    deck.wait_until_quiescent();
+    deck.wait_for_absence("Select Directory");
+    deck.wait_until_grid(
+        "the SECOND orchestration's tab is the highlighted one",
+        |_| tab_is_active(2) && !tab_is_active(1),
+    );
     deck.send_bytes(TAB_PREV); // Ctrl+PageUp -> previous tab -> first orchestration
-    deck.wait_until_quiescent();
+    deck.wait_until_grid(
+        "the FIRST orchestration's tab is the highlighted one",
+        |_| tab_is_active(1) && !tab_is_active(2),
+    );
 
     deck.send_bytes(b"\x0e");
     let first_tab_picker_opened =
