@@ -2471,13 +2471,31 @@ fn hold_older_dispatch_in_flight(fx: &Fixture, idle_seq: u64) -> CommissionDispa
     }
 }
 
-/// Scenario: an older delegate's dispatch is still queued behind the pane's dispatch lock (its task never handed to any worker) when a newer delegate whose respawn will fail is dispatched first. After the newer delegate fails, the older generation must still be owed and watched, because if the failure was transient its dispatch will still deliver; one `work-done` then retires it and the retirement is broadcast.
+/// Scenario: an older delegate's dispatch is still queued behind the pane's dispatch lock (its task never handed to any worker) when a newer `--supersede` delegate whose respawn will fail is dispatched first. After the newer delegate fails, the commission the older delegate armed must still be owed, because if the failure was transient its dispatch will still deliver: the failing delegate releases only its OWN commission, and handing the older dispatch over does not release the older one either.
+///
+/// NARROWED in the 2026-11-05 upstream sync (ruling 143, option A; for the
+/// maintainer). The test used to assert the idle-worker half as well: that the
+/// pane's delegation RECORD still read `Some` after the newer delegate's exit, so
+/// the older task, if delivered later, stayed watched, and that one `work-done`
+/// then retired it with a broadcast. That half is gone with the fork's
+/// per-generation accounting (`owed` / `undispatched`, dropped by ruling 67c):
+/// the pane keeps ONE record, the newer delegate's own retirement takes it, and a
+/// `work-done` credits a TASK's debt, never a pane's (PRD #1666 S5, #1080). It is
+/// also unreachable by real dispatches, because upstream's per-pane dispatch order
+/// lock (#544) runs them in the order they were queued, so "an older dispatch
+/// that has not started when a newer one fails" needs the artificial in-flight
+/// guard this test holds. What is NO LONGER pinned: after the failure the older
+/// delegation's task is still idle-watched, so a worker that stalls on it is nudged,
+/// and its card still reads `Idle (delegated)`. What is still pinned: the
+/// commission half (upstream's #590 in-flight protection) here; that a real
+/// delegation's own answer retires its record and announces it in `/056` and
+/// `/062`; and that a failed delegate's exit retires only its own record in `/055`
+/// and `/061`.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/057")]
-async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_has_not_started() {
+async fn delegate_057_a_failed_respawn_keeps_an_older_commission_whose_dispatch_has_not_started() {
     let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
     point_worker_role_at(&fx, MISSING_WORKER_BINARY);
-    let mut broadcasts = fx.daemon.event_tx.subscribe();
     let queued = arm_earlier_delivered_delegation(&fx);
     let older_dispatch = hold_older_dispatch_in_flight(&fx, queued);
     let dispatch_lock = fx.daemon.registry.pane_dispatch_lock(fx.worker_pane());
@@ -2504,13 +2522,12 @@ async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_
     );
 
     // The notice above is posted from inside the exit, so the exit may not have
-    // finished with the owed generations yet: wait for it to finish. The
-    // commission release is observable (the ledger is back to the one commission
-    // the queued older delegate holds, since the older commission stays armed
-    // while its dispatch is queued), and the dispatch task holds the pane's
-    // dispatch lock until it returns, i.e. until the drop has been performed.
-    // Taking the lock here therefore orders the assertion after the drop it is
-    // meant to catch.
+    // finished with the ledger yet: wait for it to finish. The commission release
+    // is observable (the ledger is back to the one commission the queued older
+    // delegate holds, since the older commission stays armed while its dispatch is
+    // queued), and the dispatch task holds the pane's dispatch lock until it
+    // returns, i.e. until the release has been performed. Taking the lock here
+    // therefore orders the assertion after the release it is meant to catch.
     assert!(
         wait_for_outstanding_commissions(&fx, 1).await,
         "precondition: the newer delegate's commission was never released, so its dispatch has \
@@ -2521,39 +2538,33 @@ async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_
     );
     drop(dispatch_lock.lock().await);
 
-    assert!(
+    let owed = |fx: &Fixture| {
         fx.daemon
             .registry
             .delegation_watch_snapshot(fx.worker_pane())
-            .outstanding_delegation
-            .is_some(),
+            .delegation_commission
+            .map_or(0, |commission| commission.outstanding)
+    };
+    assert_eq!(
+        owed(&fx),
+        1,
         "the older delegation's dispatch had not started, so its task was never given to the \
-         terminated worker; the newer delegate's failed respawn dropped it and would leave its \
-         task, if delivered later, unwatched; watches = {:?}",
+         terminated worker; the newer delegate's failed respawn released more than its own \
+         commission and would leave the older task, if delivered later, uncommissioned; \
+         watches = {:?}",
         fx.daemon
             .registry
             .delegation_watch_snapshot(fx.worker_pane())
     );
     drop(older_dispatch); // the older dispatch now holds the lock: its task is handed over
-    work_done(&fx).await;
-    assert!(
+    assert_eq!(
+        owed(&fx),
+        1,
+        "handing the older dispatch over must not release its commission: only an answer to \
+         the task may; watches = {:?}",
         fx.daemon
             .registry
             .delegation_watch_snapshot(fx.worker_pane())
-            .outstanding_delegation
-            .is_none(),
-        "the one work-done must answer the one generation still owed"
-    );
-    let seen = common::delegation_broadcasts_for(
-        &mut broadcasts,
-        fx.worker_pane(),
-        common::load_scaled(Duration::from_secs(3)),
-        true,
-    )
-    .await;
-    assert!(
-        seen.retired > 0,
-        "the retirement must be announced; broadcasts = {seen:?}"
     );
 }
 
