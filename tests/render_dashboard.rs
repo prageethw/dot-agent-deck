@@ -8100,8 +8100,16 @@ fn observing_017_pane_that_owes_a_work_done_is_drawn_as_a_delegated_worker() {
 
 /// The conversation that has been running on `from_pane` carries on in
 /// `to_pane`: the same agent, under the same session id, reports from the
-/// other pane, as a session resumed in another pane does. `to_pane` must be
-/// registered and hold no session of its own.
+/// other pane, as a session resumed in another pane does (`claude --resume`).
+/// `to_pane` must be registered and hold no session of its own.
+///
+/// Upstream's issue #925 (merged in the fifteenth sync) re-keys such a frame
+/// instead of dragging the old card across: `from_pane` keeps the card it had,
+/// and `to_pane` gets a card of its own for the frame, keyed under a derived id
+/// that still ends in the original session id. The fork tip relocated the card
+/// (leaving `from_pane` with none), so this helper's precondition used to be
+/// "no session is left on `from_pane`"; it now pins the #925 shape, which is the
+/// fixture every assertion below stands on.
 fn move_observing_session(state: &mut AppState, from_pane: &str, to_pane: &str) {
     state.apply_event(observing_hook_event(
         EventType::SessionStart,
@@ -8109,35 +8117,50 @@ fn move_observing_session(state: &mut AppState, from_pane: &str, to_pane: &str) 
         &observing_session_id(from_pane),
         &observing_agent_id(from_pane),
     ));
-    assert!(
-        observing_sessions_on(state, from_pane).is_empty(),
-        "fixture precondition: no session is left on {from_pane} once its conversation moved"
-    );
-    let moved: Vec<(&str, SessionStatus)> = observing_sessions_on(state, to_pane)
+    let left: Vec<&str> = observing_sessions_on(state, from_pane)
         .into_iter()
-        .map(|session| (session.session_id.as_str(), session.status.clone()))
+        .map(|session| session.session_id.as_str())
         .collect();
     assert_eq!(
-        moved,
-        vec![(
-            observing_session_id(from_pane).as_str(),
-            SessionStatus::Idle
-        )],
-        "fixture precondition: {from_pane}'s conversation is the one Idle session on {to_pane}"
+        left,
+        vec![observing_session_id(from_pane).as_str()],
+        "fixture precondition: {from_pane} keeps exactly the card it had once its conversation \
+         carried on in another pane (issue #925 re-keys the frame instead of relocating the card)"
+    );
+    let arrived: Vec<(bool, SessionStatus)> = observing_sessions_on(state, to_pane)
+        .into_iter()
+        .map(|session| {
+            (
+                session
+                    .session_id
+                    .ends_with(observing_session_id(from_pane).as_str()),
+                session.status.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        arrived,
+        vec![(true, SessionStatus::Idle)],
+        "fixture precondition: {from_pane}'s conversation is the one Idle card, under its \
+         session id, on {to_pane}"
     );
 }
 
 /// Scenario: The coder owes the lead a `work-done` when its conversation
-/// carries on in the tester's pane under the same session id, and the coder
-/// pane's delegation is then retired. The moved session's card must read plain
-/// `Idle` and count as idle, because the pane it now sits on owes nothing.
-/// Conversely, a session that moves onto a pane which already owes the
-/// bystander a `work-done` must read `Idle (delegated)` and stay out of the
-/// idle tally.
+/// carries on in the tester's pane under the same session id. A delegation is
+/// owed by the PANE, not by the conversation: the coder's pane keeps its card
+/// and still reads `Idle (delegated)`, while the card the conversation gets on
+/// the tester's pane (a pane that owes nothing) reads plain `Idle`; retiring
+/// the coder pane's delegation then leaves every card idle. Conversely, a
+/// conversation that carries on in a pane which already owes the bystander a
+/// `work-done` gets a card that reads `Idle (delegated)` and stays out of the
+/// idle tally, and reads plain `Idle` again once that pane's delegation is
+/// retired.
 #[spec("status/observing/019")]
 #[test]
 fn observing_019_delegation_stays_with_the_pane_when_a_session_changes_pane() {
-    // (a) The session leaves the pane that owes the work-done.
+    // (a) The conversation carries on in a pane that owes nothing; the pane it
+    // left is the one that owes the work-done.
     let mut state = observing_deck_state_without(&[TESTER_PANE]);
     arm_delegation(&mut state, CODER_PANE, LEAD_PANE);
     assert_card_delegated(
@@ -8147,25 +8170,45 @@ fn observing_019_delegation_stays_with_the_pane_when_a_session_changes_pane() {
     );
 
     move_observing_session(&mut state, CODER_PANE, TESTER_PANE);
+
+    let buffer = render_observing_deck(&state);
+    assert_card_delegated(
+        &buffer,
+        "bravo-coder",
+        "the delegation stays with the coder's PANE: the conversation carrying on elsewhere \
+         does not take the debt with it",
+    );
+    assert_card_plain_idle(
+        &buffer,
+        "charlie-tester",
+        "the card the conversation got on the tester's pane sits on a pane that never owed \
+         a work-done",
+    );
+
     retire_delegation(&mut state, CODER_PANE);
 
     let buffer = render_observing_deck(&state);
     assert_card_plain_idle(
         &buffer,
+        "bravo-coder",
+        "the coder pane's delegation has been retired",
+    );
+    assert_card_plain_idle(
+        &buffer,
         "charlie-tester",
-        "the session moved off the coder's pane, the coder pane's delegation has been \
-         retired, and the tester's pane never owed a work-done",
+        "the coder pane's delegation has been retired, and the tester's pane never owed a \
+         work-done",
     );
     assert_card_plain_idle(&buffer, "alpha-lead", "its only delegation was retired");
     assert_observing_tally(
         &state,
-        3,
-        3,
-        "nothing is outstanding, so the lead, the moved session and the bystander are all \
-         idle",
+        4,
+        4,
+        "nothing is outstanding, so the lead, the coder, the moved conversation's card and \
+         the bystander are all idle",
     );
 
-    // (b) The session arrives on a pane that owes a work-done of its own.
+    // (b) The conversation carries on in a pane that owes a work-done of its own.
     let mut state = observing_deck_state_without(&[TESTER_PANE]);
     arm_delegation(&mut state, TESTER_PANE, BYSTANDER_PANE);
     move_observing_session(&mut state, CODER_PANE, TESTER_PANE);
@@ -8174,19 +8217,25 @@ fn observing_019_delegation_stays_with_the_pane_when_a_session_changes_pane() {
     assert_card_delegated(
         &buffer,
         "charlie-tester",
-        "the session now sits on the tester's pane, which owes the bystander a work-done",
+        "the conversation now has a card on the tester's pane, which owes the bystander a \
+         work-done",
     );
     assert_card_observing(
         &buffer,
         "delta-bystander",
         "its delegation to the tester's pane is outstanding",
     );
+    assert_card_plain_idle(
+        &buffer,
+        "bravo-coder",
+        "the coder's pane kept its card and owes nothing",
+    );
     assert_observing_tally(
         &state,
-        3,
-        1,
-        "the moved session is a delegated worker and the bystander is observing, so only \
-         the lead is idle",
+        4,
+        2,
+        "the new card on the tester's pane is a delegated worker and the bystander is \
+         observing, so only the lead and the coder are idle",
     );
 
     retire_delegation(&mut state, TESTER_PANE);
@@ -8201,7 +8250,7 @@ fn observing_019_delegation_stays_with_the_pane_when_a_session_changes_pane() {
         "delta-bystander",
         "its only delegation was retired",
     );
-    assert_observing_tally(&state, 3, 3, "nothing is outstanding any more");
+    assert_observing_tally(&state, 4, 4, "nothing is outstanding any more");
 }
 
 // ---------------------------------------------------------------------------
