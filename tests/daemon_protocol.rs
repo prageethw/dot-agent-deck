@@ -2580,6 +2580,12 @@ async fn a_configured_prepared_start_refuses_a_missing_invalid_or_duplicated_pan
 /// the preparation's coordinator prompt (exactly the line the reply carried),
 /// while a Pi WORKER role and a non-Pi start role are not: the non-Pi start
 /// role's prompt stays the client's to deliver, as on the unflagged verb.
+///
+/// Scenario: a project with a planner (start) role and a builder (worker) role is prepared
+/// and both roles are started through the configured-command flag, once with a Pi start role
+/// and once with a non-Pi one. Only a Pi start role finds the coordinator prompt in its
+/// inbox; the worker role's inbox stays empty. Both inboxes are read under the pane id the
+/// daemon minted for each start, since the daemon ignores the pane id the request proposed.
 #[tokio::test]
 async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordinator_prompt() {
     let server = start_server().await;
@@ -2589,12 +2595,16 @@ async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordin
         let prepared = prepare_loop(&server, &project, "").await;
         assert!(!prepared.prompt.trim().is_empty());
 
-        let start_pane = format!("configured-start-{pi_start}");
-        let worker_pane = format!("configured-worker-{pi_start}");
+        // PRD #365 M2: the daemon is authoritative for `pane_id` — the one proposed
+        // in `env` is only what the configured-command flag requires the request to
+        // carry. Each start's inbox is keyed by the pane id the reply reports.
+        let proposed_start_pane = format!("configured-start-{pi_start}");
+        let proposed_worker_pane = format!("configured-worker-{pi_start}");
         let mut ids = Vec::new();
-        for (role, is_start, pane) in [
-            ("planner", true, start_pane.as_str()),
-            ("builder", false, worker_pane.as_str()),
+        let mut panes = Vec::new();
+        for (role, is_start, proposed) in [
+            ("planner", true, proposed_start_pane.as_str()),
+            ("builder", false, proposed_worker_pane.as_str()),
         ] {
             let resp = issue_json_request(
                 &server,
@@ -2603,13 +2613,18 @@ async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordin
                     &prepared.path,
                     role,
                     is_start,
-                    pane,
+                    proposed,
                 )),
             )
             .await;
             assert!(resp.ok, "pi_start={pi_start} {role}: {:?}", resp.error);
             ids.push(resp.id.expect("a served start reports its id"));
+            panes.push(
+                resp.pane_id
+                    .expect("a served start reports the pane id the daemon minted"),
+            );
         }
+        let (start_pane, worker_pane) = (panes[0].as_str(), panes[1].as_str());
 
         let expected_start_type = if pi_start {
             AgentType::Pi
@@ -2625,7 +2640,7 @@ async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordin
         let start_seed = server
             .registry
             .inbox()
-            .rendered(&start_pane)
+            .rendered(start_pane)
             .into_iter()
             .map(|delivery| delivery.text)
             .find(|text| text.contains(prepared.prompt.as_str()));
@@ -2636,7 +2651,7 @@ async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordin
              preparation's own coordinator prompt"
         );
         assert!(
-            server.registry.inbox().list(&worker_pane).is_empty(),
+            server.registry.inbox().list(worker_pane).is_empty(),
             "pi_start={pi_start}: a Pi worker role is never seeded — it is not the coordinator"
         );
         for id in ids {
