@@ -238,13 +238,13 @@ fn capability_of(key: &str) -> Option<String> {
 }
 
 /// Register a `cat`-stub pane directly on the daemon's own live
-/// `AgentPtyRegistry` (the same one `run_shell_activity_monitor` polls),
-/// seed it to a known `Idle` session over the hook socket, and wait for
-/// that baseline to land before returning — so every test below starts
-/// from a confirmed, deterministic `Idle` reading rather than racing the
-/// seed event.
+/// `AgentPtyRegistry` (the same one `run_shell_activity_monitor` polls) and
+/// record the capability it exported. No card exists yet: the caller seeds
+/// one, and which kind of frame seeds it decides whether the pane counts as
+/// an agent that reports its own turns (issue #1678 D1) or as one that never
+/// does — see [`setup_idle_pane`] and [`setup_unreported_pane`].
 #[cfg(unix)]
-async fn setup_idle_pane(daemon: &common::InProcDaemon, cwd: &str, pane_id: &str) -> TestPane {
+async fn spawn_stub_pane(daemon: &common::InProcDaemon, cwd: &str, pane_id: &str) -> TestPane {
     // The stub keeps its own injected capability in its cwd (`exec` so `cat`
     // replaces the shell and the pane still has no descendant process).
     let command = common::capability_export_command("exec cat");
@@ -266,10 +266,32 @@ async fn setup_idle_pane(daemon: &common::InProcDaemon, cwd: &str, pane_id: &str
         capabilities.insert(pane_id.to_string(), token);
     }
 
+    TestPane {
+        pane_id: pane_id.to_string(),
+        agent_id,
+    }
+}
+
+/// [`spawn_stub_pane`], seeded to a known `Idle` session by a REAL agent
+/// report (an `Idle` the way a Stop hook sends one), and wait for that
+/// baseline to land before returning — so every test below starts from a
+/// confirmed, deterministic `Idle` reading rather than racing the seed event.
+///
+/// That genuine report is also the evidence issue #1678 D1 reads as "this
+/// agent reports its own turn boundaries": from here on the pane's status
+/// belongs to the agent's own reports, and a shell scan (`ShellBusy` /
+/// `ShellIdle`) is background work that neither moves the status nor holds it
+/// up (`src/state.rs`, `shell_status_owned`). A test about how a shell signal
+/// COMPOSES with a monitored wait therefore seeds through
+/// [`setup_unreported_pane`] instead.
+#[cfg(unix)]
+async fn setup_idle_pane(daemon: &common::InProcDaemon, cwd: &str, pane_id: &str) -> TestPane {
+    let pane = spawn_stub_pane(daemon, cwd, pane_id).await;
+
     let session_id = format!("{pane_id}-session");
     write_event(
         daemon,
-        &idle_event(pane_id, &agent_id, &session_id),
+        &idle_event(pane_id, &pane.agent_id, &session_id),
         "seed Idle event",
     );
 
@@ -282,10 +304,49 @@ async fn setup_idle_pane(daemon: &common::InProcDaemon, cwd: &str, pane_id: &str
     .await
     .unwrap_or_else(|e| panic!("setup_idle_pane baseline seed for {pane_id:?}: {e}"));
 
-    TestPane {
-        pane_id: pane_id.to_string(),
-        agent_id,
-    }
+    pane
+}
+
+/// [`spawn_stub_pane`], seeded to a known `Idle` session by a frame the DAEMON
+/// authors (a `ShellIdle`, the frame its own shell-activity monitor emits), so
+/// the pane has a card but has never reported a turn boundary — the shape of
+/// a plain shell, or of any agent with no turn hooks. Issue #1678 D1 leaves
+/// such a pane's status to the shell scan (`shell_status_owned` stays false),
+/// which is the domain the fork's PRD #499 composition ("a pane is `Working`
+/// if EITHER the monitored wait OR a busy shell says so") still governs.
+///
+/// A card is born `Idle`, and `ShellIdle` on a card that is not holding
+/// anything changes nothing, so the baseline is the same `Idle` that
+/// [`setup_idle_pane`] reads; the revert target of `wait done` / `ShellIdle`
+/// is `Idle` too. Every later frame a test sends this pane must stay
+/// daemon-authored (`ShellBusy`, `ShellIdle`, the `wait` verbs): one genuine
+/// agent event (`Idle`, `ToolStart`, ...) latches the pane as a turn reporter
+/// for good and takes the composition out from under the test.
+#[cfg(unix)]
+async fn setup_unreported_pane(
+    daemon: &common::InProcDaemon,
+    cwd: &str,
+    pane_id: &str,
+) -> TestPane {
+    let pane = spawn_stub_pane(daemon, cwd, pane_id).await;
+
+    let session_id = format!("{pane_id}-session");
+    write_event(
+        daemon,
+        &shell_activity_event(pane_id, &pane.agent_id, &session_id, EventType::ShellIdle),
+        "seed synthetic ShellIdle event",
+    );
+
+    wait_for_status(
+        daemon,
+        pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("setup_unreported_pane baseline seed for {pane_id:?}: {e}"));
+
+    pane
 }
 
 /// Run the REAL `dot-agent-deck wait <args>` CLI as a subprocess against
@@ -1184,16 +1245,22 @@ async fn wait_monitored_010_repeated_start_refresh_still_lets_done_clear_inner()
 const PANE_011: &str = "wait-monitored-pane-011-composition-or-8b3d64";
 const LABEL_011: &str = "wait-monitored-label-011-composition-or";
 
-/// Scenario: after `wait start <label>` promotes an idle pane to `Working`,
-/// inject a synthetic `ShellBusy` event (the shape `run_shell_activity_monitor`
-/// itself would send for a real foreground descendant) for the SAME pane,
-/// then run `wait done <label> --outcome success`. Per the PRD's composition
-/// commitment ("a pane is `Working` if EITHER signal is active"), the pane
-/// must STAY `Working` — the shell descendant this `ShellBusy` represents is
-/// still running and never got a paired `ShellIdle`. Reviewer BLOCKER 2
-/// Direction A: today `wait done` reverts unconditionally whenever its OWN
-/// `promoted` bookkeeping says it should, without consulting whether a live
-/// shell signal is still asserting `Working` independently — clobbering it.
+/// Scenario: on a pane that never reports a turn boundary (its card comes
+/// from a daemon-authored `ShellIdle` alone), `wait start <label>` promotes
+/// the idle pane to `Working`, a synthetic `ShellBusy` event (the shape
+/// `run_shell_activity_monitor` itself would send for a real foreground
+/// descendant) lands on the SAME pane, then `wait done <label> --outcome
+/// success` runs. Per the PRD's composition commitment ("a pane is `Working`
+/// if EITHER signal is active"), the pane must STAY `Working` — the shell
+/// descendant this `ShellBusy` represents is still running and never got a
+/// paired `ShellIdle`. Reviewer BLOCKER 2 Direction A: `wait done` must not
+/// revert on its OWN `promoted` bookkeeping without consulting whether a live
+/// shell signal is still asserting `Working` independently.
+///
+/// Issue #1678 D1 (adopted in the upstream sync) hands the status of a pane
+/// whose agent reports its own turns to that agent, so this composition now
+/// governs only a pane that does not; the turn-reporting counterpart is
+/// `wait/monitored/023`, and `wait/monitored/024` runs both side by side.
 #[spec("wait/monitored/011")]
 #[test]
 #[cfg(unix)]
@@ -1209,7 +1276,7 @@ async fn wait_monitored_011_composition_is_or_not_mutual_clobber_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
-    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_011).await;
+    let pane = setup_unreported_pane(&daemon, &cwd_str, PANE_011).await;
     let session_id = format!("{PANE_011}-session");
 
     // A real foreground descendant starts on the SAME pane, the way
@@ -1698,7 +1765,9 @@ const LABEL_016_B: &str = "wait-monitored-label-016b-replay-shell";
 /// motivating scenario, an agent ending its turn with an external dependency
 /// still unresolved — and (B) `wait start`, an injected `ShellBusy`, then
 /// `wait done` while the shell signal is still live (OR composition,
-/// Direction A). After every event, assert the client's
+/// Direction A) on a pane whose card comes from daemon-authored frames only,
+/// since issue #1678 D1 gives a turn-reporting pane's status to its agent.
+/// After every event, assert the client's
 /// independently-replayed `(status, monitored_wait_active,
 /// wait_synthetic_working, shell_descendant_busy, wait_deferred_revert,
 /// shell_synthetic_working)` tuple is identical to the daemon's own — this
@@ -1842,7 +1911,10 @@ async fn wait_monitored_016_daemon_and_client_converge_across_replayed_events_in
     // --- Case B: MonitoredWaitStart, an injected ShellBusy, then wait done
     // while the shell signal is still live (Direction A, mirroring
     // `wait/monitored/011` daemon-side, now with client convergence). ---
-    let pane_b = setup_idle_pane(&daemon, &cwd_str, PANE_016_B).await;
+    // Case B composes a busy shell with the wait, which issue #1678 D1 leaves to
+    // a pane that never reports a turn boundary: seed it from a daemon-authored
+    // frame (`setup_unreported_pane`), unlike case A's agent-reported `Idle`.
+    let pane_b = setup_unreported_pane(&daemon, &cwd_str, PANE_016_B).await;
     let session_b = format!("{PANE_016_B}-session");
     let mut events_b = daemon.event_tx.subscribe();
     let mut client_b = AppState::default();
@@ -2269,6 +2341,10 @@ const LABEL_020: &str = "wait-monitored-label-020-direction-a-tail";
 /// `shell_synthetic_working == false` (never set, since `ShellBusy` only
 /// promotes a stale/no-opinion status) and declines too, wedging the pane
 /// `Working` forever.
+///
+/// The pane never reports a turn boundary (its card comes from a
+/// daemon-authored `ShellIdle`): issue #1678 D1 leaves the composition of a
+/// busy shell with a monitored wait to exactly such a pane.
 #[spec("wait/monitored/020")]
 #[test]
 #[cfg(unix)]
@@ -2284,7 +2360,7 @@ async fn wait_monitored_020_direction_a_tail_shell_idle_still_reverts_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
-    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_020).await;
+    let pane = setup_unreported_pane(&daemon, &cwd_str, PANE_020).await;
     let session_id = format!("{PANE_020}-session");
 
     // 1-2. `wait start` promotes an Idle pane (status = Working,
@@ -2333,6 +2409,10 @@ const LABEL_021: &str = "wait-monitored-label-021-direction-b-tail";
 /// regardless of whether it actually reverted, so by the time `wait done`
 /// runs neither marker was ever transferred to the wait, and it declines
 /// too, wedging the pane `Working` forever.
+///
+/// The pane never reports a turn boundary (its card comes from a
+/// daemon-authored `ShellIdle`): issue #1678 D1 leaves the composition of a
+/// busy shell with a monitored wait to exactly such a pane.
 #[spec("wait/monitored/021")]
 #[test]
 #[cfg(unix)]
@@ -2348,7 +2428,7 @@ async fn wait_monitored_021_direction_b_tail_wait_done_still_reverts_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
-    let pane = setup_idle_pane(&daemon, &cwd_str, PANE_021).await;
+    let pane = setup_unreported_pane(&daemon, &cwd_str, PANE_021).await;
     let session_id = format!("{PANE_021}-session");
 
     // 1. Injected ShellBusy on the Idle pane — promotes: status = Working,
@@ -2518,15 +2598,22 @@ const LABEL_023: &str = "wait-monitored-label-023-direction-a-deferred-tail";
 
 /// Scenario: the PRD's own headline flow (an agent runs `wait start` as a
 /// tool call, so the card is `Working` from a real `ToolStart`) plus a
-/// background shell descendant that is still busy when `wait done` lands.
-/// Reviewer BLOCKER I wedge 4a: `MonitoredWaitDone`'s Direction-A decline
-/// (it declines because `shell_descendant_busy` is live, same as `020`'s
-/// precondition) unconditionally clears `wait_deferred_revert` — the marker
-/// the agent's own suppressed `Idle` set — without transferring it to shell,
-/// so the paired `ShellIdle` that follows finds nothing still holding the
-/// card and also declines. Same failure class as `019`/`020`/`021`, but via
-/// the `wait_deferred_revert` marker those three never exercise together
-/// with a live `shell_descendant_busy` at the moment `wait done` runs.
+/// background shell descendant that is still busy when `wait done` lands, on a
+/// pane whose agent reports its own turns. Issue #1678 D1: such a pane's
+/// status belongs to its agent's reports, so the injected `ShellBusy` is
+/// background work, not a second signal holding `Working`; the agent's own
+/// suppressed `Idle` leaves the revert owed to the wait, and `wait done`
+/// therefore reverts the pane to `Idle` at once even though the shell never
+/// went idle, and the paired `ShellIdle` that follows changes nothing.
+/// Reviewer BLOCKER I wedge 4a (the revert owed by the suppressed `Idle` being
+/// lost while a shell descendant is busy) cannot arise there any more, and the
+/// pane must still not stay `Working` forever.
+///
+/// This test used to expect the opposite (a live shell keeps the pane
+/// `Working` after `wait done` until its `ShellIdle`); that holds only for a
+/// pane that never reports a turn boundary and is pinned for such a pane by
+/// `wait/monitored/011`, `/020`, `/021` and, side by side with this case, by
+/// `wait/monitored/024`.
 #[spec("wait/monitored/023")]
 #[test]
 #[cfg(unix)]
@@ -2569,10 +2656,10 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
     )
     .await;
 
-    // 4. The background shell watcher observes the descendant is busy —
-    // declines to promote (already Working); shell_descendant_busy = true
-    // unconditionally, shell_synthetic_working stays false (this mechanism
-    // did not cause the current Working, so it has no claim yet).
+    // 4. The background shell watcher observes a descendant is busy. This
+    // pane's agent reports its own turns (the `ToolStart` above), so the
+    // frame is background work (issue #1678 D1): the status stays where the
+    // agent put it and nothing about the shell is held for later.
     write_event(
         &daemon,
         &shell_activity_event(
@@ -2610,31 +2697,188 @@ async fn wait_monitored_023_direction_a_deferred_revert_tail_still_reverts_inner
     )
     .await;
 
-    // 6-7. `wait done` declines because shell_descendant_busy still holds
-    // the card up (Direction A, correct) — but BLOCKER I: MonitoredWaitDone
-    // unconditionally clears wait_deferred_revert on the way out without
-    // transferring it to shell, exactly as `020` showed for
-    // wait_synthetic_working. The paired ShellIdle then arrives — the
-    // descendant it represents has genuinely finished, so OR composition
-    // requires the pane to revert now that neither signal is live; but
-    // was_holding reads shell_synthetic_working == false (never set — step
-    // 6 never transferred wait_deferred_revert to it), so this also
-    // declines, and the pane is wedged Working forever with all four
-    // markers false.
-    done_then_inject_shell_idle_confirm_reverts(
+    // 6. `wait done` — the wait is the last signal standing: the agent's own
+    // Idle was swallowed into the revert it owes, and the busy shell is only
+    // background work for a pane that reports its own turns, so it does not
+    // hold the turn. The pane reverts to Idle although no ShellIdle has
+    // arrived (the fork's pre-D1 composition would have held it Working here).
+    let done = run_wait_cli(
         &daemon,
-        &pane,
-        &session_id,
-        LABEL_023,
-        "wait/monitored/023",
-        "wait/monitored/023 (after wait done, Direction A precondition)",
-        "wait/monitored/023 (BLOCKER I wedge 4a, the PRD's headline flow plus a live shell \
-         descendant): the pane must revert to Idle once the wait was the last live signal \
-         standing — the agent's own real Idle was already suppressed into wait_deferred_revert \
-         at step 5, and the shell descendant genuinely went idle at step 7 — but \
-         `MonitoredWaitDone`'s Direction-A decline at step 6 unconditionally cleared \
-         wait_deferred_revert without transferring it to shell, so nothing was left for \
-         ShellIdle to find still holding the card, and the pane stays wedged Working forever",
+        &pane.pane_id,
+        &["done", LABEL_023, "--outcome", "success"],
+        &[],
+    )
+    .await;
+    assert_wait_cli_succeeded(
+        &done,
+        &format!("wait/monitored/023: `wait done {LABEL_023} --outcome success` must succeed"),
+    );
+    assert_reaches_status(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+        "wait/monitored/023 (BLOCKER I wedge 4a under issue #1678 D1, the PRD's headline flow \
+         plus a busy shell descendant): the pane must revert to Idle after `wait done` once the \
+         wait was the last signal standing — the agent's own real Idle was suppressed into \
+         wait_deferred_revert at step 5 and the busy shell is background work for a pane that \
+         reports its own turns — but the pane stays Working",
+    )
+    .await;
+
+    // 7. The paired ShellIdle arrives later: background work ending, which
+    // changes no status on a pane that reports its own turns.
+    write_event(
+        &daemon,
+        &shell_activity_event(
+            &pane.pane_id,
+            &pane.agent_id,
+            &session_id,
+            EventType::ShellIdle,
+        ),
+        "synthetic ShellIdle event",
+    );
+    assert_status_holds(
+        &daemon,
+        &pane.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_millis(300),
+        "wait/monitored/023 (after the paired ShellIdle)",
+    )
+    .await;
+
+    daemon.registry.shutdown_all();
+}
+
+const PANE_024_UNREPORTED: &str = "wait-monitored-pane-024-unreported-2e6a91";
+const LABEL_024_UNREPORTED: &str = "wait-monitored-label-024-unreported";
+const PANE_024_REPORTING: &str = "wait-monitored-pane-024-reporting-8c3d05";
+const LABEL_024_REPORTING: &str = "wait-monitored-label-024-reporting";
+
+/// Scenario: run one and the same sequence — `wait start`, a synthetic
+/// `ShellBusy`, `wait done`, then the paired `ShellIdle` — on two panes in one
+/// daemon: a pane that never reports a turn boundary (its card comes from a
+/// daemon-authored `ShellIdle`) and a pane whose agent reports its own turns
+/// (its card was seeded by a real `Idle`). The first stays `Working` after
+/// `wait done` for as long as its shell is busy and reverts on the paired
+/// `ShellIdle` (the PRD #499 composition: `Working` if EITHER signal is
+/// active); the second reverts at `wait done` and the later `ShellIdle`
+/// changes nothing (issue #1678 D1: a busy shell is background work for a pane
+/// whose agent decides its own status). Side by side so the boundary of the
+/// fork's composition stays visible in one place.
+#[spec("wait/monitored/024")]
+#[test]
+#[cfg(unix)]
+fn wait_monitored_024_composition_governs_only_a_pane_that_reports_no_turns() {
+    run_async_test(
+        "wait/monitored/024",
+        wait_monitored_024_composition_governs_only_a_pane_that_reports_no_turns_inner(),
+    );
+}
+
+#[cfg(unix)]
+async fn wait_monitored_024_composition_governs_only_a_pane_that_reports_no_turns_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let unreported = setup_unreported_pane(&daemon, &cwd_str, PANE_024_UNREPORTED).await;
+    let reporting = setup_idle_pane(&daemon, &cwd_str, PANE_024_REPORTING).await;
+    let unreported_session = format!("{PANE_024_UNREPORTED}-session");
+    let reporting_session = format!("{PANE_024_REPORTING}-session");
+
+    // The same opening on both: `wait start` promotes the idle pane to
+    // Working, then a shell descendant surfaces. Both read Working after it
+    // (on the reporting pane only because of the wait).
+    start_wait_then_inject_shell_busy(
+        &daemon,
+        &unreported,
+        &unreported_session,
+        LABEL_024_UNREPORTED,
+        "wait/monitored/024 (pane that reports no turns)",
+    )
+    .await;
+    start_wait_then_inject_shell_busy(
+        &daemon,
+        &reporting,
+        &reporting_session,
+        LABEL_024_REPORTING,
+        "wait/monitored/024 (pane that reports its turns)",
+    )
+    .await;
+
+    // The same `wait done` on both.
+    for (pane, label) in [
+        (&unreported, LABEL_024_UNREPORTED),
+        (&reporting, LABEL_024_REPORTING),
+    ] {
+        let done = run_wait_cli(
+            &daemon,
+            &pane.pane_id,
+            &["done", label, "--outcome", "success"],
+            &[],
+        )
+        .await;
+        assert_wait_cli_succeeded(
+            &done,
+            &format!("wait/monitored/024: `wait done {label} --outcome success` must succeed"),
+        );
+    }
+
+    // The pane that reports no turns: its shell is still busy, so OR
+    // composition keeps it Working.
+    assert_status_holds(
+        &daemon,
+        &unreported.pane_id,
+        &SessionStatus::Working,
+        Duration::from_millis(500),
+        "wait/monitored/024 (pane that reports no turns, after wait done): its busy shell is \
+         still the one live signal, so the pane must stay Working",
+    )
+    .await;
+    // The pane whose agent reports its turns: the busy shell is background
+    // work, so nothing is left holding Working once the wait is done.
+    assert_reaches_status(
+        &daemon,
+        &reporting.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+        "wait/monitored/024 (pane that reports its turns, after wait done, issue #1678 D1): a \
+         busy shell is background work for a pane whose agent decides its own status, so the \
+         pane must revert to Idle with the wait",
+    )
+    .await;
+
+    // The paired ShellIdle on both.
+    for (pane, session_id) in [
+        (&unreported, &unreported_session),
+        (&reporting, &reporting_session),
+    ] {
+        write_event(
+            &daemon,
+            &shell_activity_event(
+                &pane.pane_id,
+                &pane.agent_id,
+                session_id,
+                EventType::ShellIdle,
+            ),
+            "synthetic ShellIdle event",
+        );
+    }
+    assert_reaches_status(
+        &daemon,
+        &unreported.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_secs(5),
+        "wait/monitored/024 (pane that reports no turns, after the paired ShellIdle): the shell \
+         it was waiting on has gone idle and the wait is long done, so the pane must revert",
+    )
+    .await;
+    assert_status_holds(
+        &daemon,
+        &reporting.pane_id,
+        &SessionStatus::Idle,
+        Duration::from_millis(300),
+        "wait/monitored/024 (pane that reports its turns, after the paired ShellIdle)",
     )
     .await;
 
