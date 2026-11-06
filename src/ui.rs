@@ -12915,8 +12915,19 @@ fn dispatch_action(
                         // since the Name the user typed is not itself in use.
                         // Nothing was provisioned and no claim was granted, so
                         // there is nothing to roll back or release.
+                        //
+                        // `starts_with`, not `contains`: `reason` is the raw
+                        // `resp.error`, and the daemon puts the marker FIRST on
+                        // the Name collision. Its invalid-name and invalid-cwd
+                        // refusals quote what the client sent, so a Name or
+                        // directory containing the marker text would carry it
+                        // mid-sentence and reopen the form with a warning that
+                        // the (invalid, not taken) name was just taken. (The
+                        // `StartAgent` arm below prefixes the daemon's text with
+                        // `daemon returned error:`, which is why it keeps
+                        // `contains`.)
                         if let Some(form) = submitted_orchestration_form.filter(|_| {
-                            reason.contains(
+                            reason.starts_with(
                                 crate::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE,
                             )
                         }) {
@@ -54315,6 +54326,66 @@ mod tests {
             "an invalid-name claim refusal",
             "Orchestration failed: orchestration name",
         );
+    }
+
+    /// A claim refusal that only ECHOES the title-refusal marker is not a title
+    /// refusal. The daemon's invalid-name and invalid-cwd refusals quote what the
+    /// client sent, so a Name or directory that contains the marker text carries
+    /// it mid-sentence, while the Name collision's own refusal puts the marker
+    /// FIRST. The form therefore stays closed and the invalid input is reported,
+    /// instead of reopening with a warning that the name was just taken
+    /// (sync round 35, review R3).
+    #[test]
+    fn a_claim_refusal_that_merely_echoes_the_title_marker_does_not_reopen_the_form() {
+        let marker = crate::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE;
+        let refusals = [
+            (
+                "an invalid Name that contains the marker",
+                format!(
+                    "orchestration name {:?} is not valid",
+                    format!("x-{marker}-y")
+                ),
+            ),
+            (
+                "an invalid directory that contains the marker",
+                format!(
+                    "orchestration cwd {:?} is not valid",
+                    Some(format!("/tmp/{marker}"))
+                ),
+            ),
+        ];
+        for (what, refusal) in refusals {
+            assert!(
+                refusal.contains(marker) && !refusal.starts_with(marker),
+                "precondition: {what} carries the marker mid-sentence: {refusal}"
+            );
+            let sent = refusal.clone();
+            let ui = submit_orchestration_form_against(
+                Arc::new(RefusingPaneController {
+                    error: "the claim refused, so no pane may be created".to_string(),
+                    inner: CapturingPaneController::new(),
+                }),
+                move |dir| {
+                    with_crafted_response_daemon(
+                        dir,
+                        crate::daemon_protocol::AttachResponse::err(sent),
+                    )
+                },
+            );
+            assert!(
+                ui.new_pane_form.is_none(),
+                "{what} must not reopen the form"
+            );
+            assert!(
+                ui.submitted_orchestration_form.is_none(),
+                "{what} must not keep the submitted form around for a later restore"
+            );
+            let status = ui.status_message.as_ref().map(|(m, _)| m.as_str());
+            assert!(
+                status.is_some_and(|m| m.starts_with("Orchestration failed: orchestration ")),
+                "{what} is reported as the invalid input it is, got {status:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
