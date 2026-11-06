@@ -42730,6 +42730,23 @@ mod tests {
             let card = render(&busy, long, width, true);
             let plain = render(&busy, long, width, false);
             let title = card.lines().next().unwrap();
+            // Upstream pinned that the status word and the queued-message badge
+            // survive beside the seat word at its three widths; the fork's title
+            // row (index, then the word where it fits, the status badge and the
+            // inbox line flush right) keeps that guarantee, so it is pinned at
+            // every width. `max_title` is what is left once the right-hand badge
+            // is paid for, so the word can take room only from the left, and the
+            // status word is never cut. The inbox line is the whole `✉1 queued`
+            // from 39 columns (`card_inbox_badge`: status 11 + line 10 + the two
+            // border cells + the 16 title columns it keeps for the words) and the
+            // bare count `✉1` below that, so `queued` is asserted from 40 (the
+            // first width of the issue's 40-column scenario, one column inside
+            // the threshold) and the count at every width.
+            assert!(title.contains("Working"), "{width}: {card}");
+            assert!(title.contains("✉1"), "{width}: {card}");
+            if width >= 40 {
+                assert!(title.contains("queued"), "{width}: {card}");
+            }
             assert_eq!(
                 card.lines()
                     .filter(|line| line.contains("ORCHESTRATOR"))
