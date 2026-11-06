@@ -462,6 +462,16 @@ fn assert_aged_generation_waits_for_ready(session_start: bool, old: chrono::Date
     assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
 }
 
+/// The ring-barrier seam (`doorbell::pause_rering_for_test`) parks only the pane
+/// whose id equals `DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE`, and that variable
+/// is fixed when the daemon starts. The fork's daemon mints every pane id after
+/// startup (PRD #365 M2) except one: a lone, unused `desktop-` id the client
+/// proposes is honoured (ruling 55 / E-365b). These tests therefore propose a
+/// `desktop-` id and arm the seam for that same string; each of their daemons
+/// runs exactly this one pane, so the id is never already held.
+const BARRIER_FENCED_PANE: &str = "desktop-fenced";
+const BARRIER_TIMEOUT_PANE: &str = "desktop-timeout-control";
+
 /// Scenario: Pause an outstanding task's retry after decision and acknowledge that task while the agent remains Idle and another message stays queued. Releasing the attempt must add no further bytes; an unchanged selected-message control still submits its retry.
 #[spec("inbox/doorbell/031")]
 #[test]
@@ -525,12 +535,15 @@ fn doorbell_031_timed_out_barrier_does_not_strand_slot() {
     for phase in ["completed", "after-delay"] {
         let daemon = daemon_unbound(&[
             ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
-            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "timeout-control"),
+            (
+                "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE",
+                BARRIER_TIMEOUT_PANE,
+            ),
             ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
         ]);
         let root = daemon.home.join("ring-barriers");
         std::fs::create_dir_all(&root).unwrap();
-        let pane = pane(&daemon, "timeout-control");
+        let pane = pane(&daemon, BARRIER_TIMEOUT_PANE);
         std::fs::write(root.join(format!("{phase}.armed")), "").unwrap();
         status(&daemon, &pane, "idle", "claude_code");
         let id = enqueue(&daemon, &pane, BODY);
@@ -557,13 +570,16 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
     for acknowledge in [false, true] {
         let daemon = daemon_unbound(&[
             ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
-            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "fenced"),
+            (
+                "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE",
+                BARRIER_FENCED_PANE,
+            ),
             ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
             ("RUST_LOG", "dot_agent_deck::doorbell=debug"),
         ]);
         let root = daemon.home.join("ring-barriers");
         std::fs::create_dir_all(&root).unwrap();
-        let pane = pane(&daemon, "fenced");
+        let pane = pane(&daemon, BARRIER_FENCED_PANE);
         // Attach before the writer is parked. The observation seam proves the
         // human frame arrived while its PTY write waits behind that writer.
         let mut user = common::AttachInput::attach(&daemon.attach_socket, &pane.agent);
@@ -620,7 +636,7 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
                     root.join("observations")
                 )
                 .unwrap_or_default()
-                .contains("human-arrived fenced")),
+                .contains(&format!("human-arrived {}", pane.id))),
                 "human frame must arrive before releasing the writer"
             );
         }

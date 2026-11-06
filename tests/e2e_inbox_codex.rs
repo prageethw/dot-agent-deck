@@ -111,7 +111,15 @@ while True:
         // The tests run Codex's hooks and fetch from the test process, outside
         // the stand-in pane's agent; inbox/protocol/014 and /015 pin the binding.
         let daemon = daemon_unbound(&env);
-        let pane = Self::start(&daemon, screen_text, &program);
+        // A test that arms the ring-barrier seam names the pane it parks in the
+        // daemon's spawn environment, before any pane exists. The daemon mints
+        // every other pane id; the one it honours is a lone unused `desktop-`
+        // id (ruling 55 / E-365b), so that test proposes the id it armed.
+        let proposed = extra
+            .iter()
+            .find(|(key, _)| *key == "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE")
+            .map(|(_, value)| *value);
+        let pane = Self::start(&daemon, screen_text, &program, proposed);
         let spool = pane_env(&pane, "DOT_AGENT_DECK_INBOX_SPOOL");
         Self {
             pane,
@@ -121,14 +129,19 @@ while True:
         }
     }
 
-    fn start(daemon: &common::DaemonProc, text: &str, program: &std::path::Path) -> Pane {
+    fn start(
+        daemon: &common::DaemonProc,
+        text: &str,
+        program: &std::path::Path,
+        proposed_pane_id: Option<&str>,
+    ) -> Pane {
         let base = daemon.home.join("codex-inbox");
         std::fs::write(base.with_extension("screen"), text).unwrap();
         let reply = attach(
             daemon,
             json!({"op":"start-agent","command":common::capability_export_command(&format!("exec '{}'",program.display())),
             "agent_type":"codex","cwd":daemon.home,"rows":40,"cols":140,
-            "env":[["DOT_AGENT_DECK_PANE_ID","codex-inbox"],["INBOX_CODEX_BASE",base],
+            "env":[["DOT_AGENT_DECK_PANE_ID",proposed_pane_id.unwrap_or("codex-inbox")],["INBOX_CODEX_BASE",base],
                 ["CODEX_HOME",daemon.home.join(".codex")],
                 ["PATH",format!("{}:/usr/bin:/bin",program.parent().unwrap().display())]],"display_name":"codex inbox"}),
         );
@@ -153,6 +166,12 @@ while True:
                 panic!("start-agent reply carries the daemon-minted pane_id: {reply}")
             })
             .to_string();
+        if let Some(proposed) = proposed_pane_id {
+            assert_eq!(
+                id, proposed,
+                "the daemon must honour a lone unused `desktop-` pane id: {reply}"
+            );
+        }
         let pane = Pane {
             id,
             agent,
@@ -369,7 +388,10 @@ fn doorbell_031_codex_flush_only_rechecks_selected_message() {
         COMPOSER,
         &[
             ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
-            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "codex-inbox"),
+            (
+                "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE",
+                "desktop-codex-inbox",
+            ),
             ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
         ],
     );
@@ -779,7 +801,12 @@ fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
     for suffix in ["pid", "bytes"] {
         let _ = std::fs::remove_file(codex.pane.capture.with_extension(suffix));
     }
-    codex.pane = Codex::start(&codex.daemon, UNKNOWN, &codex._bin.path().join("codex"));
+    codex.pane = Codex::start(
+        &codex.daemon,
+        UNKNOWN,
+        &codex._bin.path().join("codex"),
+        None,
+    );
     codex.queued("NEW-GENERATION-MESSAGE");
     codex.no_bytes();
 }

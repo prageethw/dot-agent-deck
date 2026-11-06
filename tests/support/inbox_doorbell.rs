@@ -320,6 +320,17 @@ while True:
         .as_str()
         .unwrap_or_else(|| panic!("start-agent reply carries the daemon-minted pane_id: {reply}"))
         .to_string();
+    // The one id a start can name in advance is a lone, unused `desktop-` id
+    // (ruling 55 / E-365b): the daemon honours it. A test that must know the
+    // pane id before the daemon starts (the ring-barrier seam is armed through
+    // the daemon's spawn environment) proposes one, and the reply must hand the
+    // same id back, or the seam would be armed for a pane that never exists.
+    if name.starts_with("desktop-") {
+        assert_eq!(
+            id, name,
+            "the daemon must honour a lone unused `desktop-` pane id: {reply}"
+        );
+    }
     let pane = Pane {
         id,
         agent,
