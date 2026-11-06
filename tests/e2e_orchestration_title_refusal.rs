@@ -116,8 +116,36 @@ fn identity_010_a_title_taken_by_another_client_after_the_form_opened_is_refused
     );
     let refused_grid = deck.snapshot_grid();
     assert!(
-        refused_grid.contains(&suggested) && !refused_grid.contains("[Submit]"),
-        "the restored form must keep the typed name and drop [Submit].\n\
+        refused_grid.contains(&suggested),
+        "the restored form must keep the typed name.\n\
+         === rendered grid ===\n{refused_grid}"
+    );
+    // Upstream's form drops `[Submit]` from the action row once a collision is
+    // known. This fork keeps it on screen but INERT (dimmed, with no click
+    // rect), so `[Cancel]` stays in its ordinary slot and a muscle-memory click
+    // on the old `[Submit]` cannot discard the form (fork#192 review F3). The
+    // observable end state here is therefore: `[Submit]` is still drawn, and it
+    // is drawn differently from the live `[Cancel]` beside it. NO LONGER PINNED
+    // at this layer: that `[Submit]` is absent from the row; the guarantee that
+    // matters (submission is unavailable while the warning stands, and the
+    // button has no click target) is pinned at L1 by
+    // `guard_002_name_collision_blocks_submit_distinct_name_does_not` and, for
+    // the form restored after a daemon refusal, by
+    // `identity_009_a_daemon_title_refusal_reopens_the_form_with_the_collision_warning`
+    // (`assert_form_restored_with_collision_warning`: `[Submit]` on screen and
+    // absent from the click rects).
+    let first_cell_style = |needle: &str| {
+        deck.visible_text_cell_styles(needle).unwrap_or_else(|| {
+            panic!(
+                "the restored form must keep `{needle}` on screen.\n\
+                     === rendered grid ===\n{refused_grid}"
+            )
+        })[0]
+    };
+    assert_ne!(
+        first_cell_style("Submit"),
+        first_cell_style("Cancel"),
+        "the restored form's [Submit] must be painted disabled, unlike the live [Cancel].\n\
          === rendered grid ===\n{refused_grid}"
     );
     let ours = |title: &str| {
