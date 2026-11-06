@@ -3797,16 +3797,44 @@ fn dispatch_025_skip_causes_render_distinguishably() {
     daemon.run_now("dispatch-task").expect("run-now (first)");
     assert!(
         common::wait_for_path(&p31.worktree_dir, w()),
-        "issue 31 (no signal) must dispatch — the proxy for 'the first fire completed'"
+        "issue 31 (no signal) must dispatch — the worktree appearing proves the flow started"
     );
+    // The worktree appearing is NOT the first fire finishing: the fork writes
+    // its `in-progress` claim (comment, label, assignee) and upstream's claim
+    // record only after the worktree exists and the agent is spawned, and
+    // `IssueDispatched` is the issue's last word. Snapshotting there and firing
+    // again would hit "previous run still active" and drop the second fire. The
+    // first fire is complete once its last issue (33) has rendered its line;
+    // the bounded wait does not assert, so a regression that makes 33 dispatch
+    // or stay silent still fails on the cause-C assertion below with its own
+    // message.
+    common::wait_until(w(), || {
+        let text = daemon.stderr_text();
+        text.contains("dispatched issue #31")
+            && find_non_dispatch_line_for(&text, 32).is_some()
+            && find_non_dispatch_line_for(&text, 33).is_some()
+    });
     let snapshot_1 = daemon.stderr_text();
     let line_b = find_non_dispatch_line_for(&snapshot_1, 32).unwrap_or_default();
     let line_c = find_non_dispatch_line_for(&snapshot_1, 33).unwrap_or_default();
 
     // Second fire: 31's worktree now exists → skipped (cause A). Captured from
     // the DELTA past snapshot_1 so it can't be confused with any line already
-    // seen (stderr is append-only).
-    daemon.run_now("dispatch-task").expect("run-now (second)");
+    // seen (stderr is append-only). The scheduler answers `run-now` with
+    // `started` or `skipped` (previous run still active), so a fire that lost
+    // the race against the first run's last bookkeeping is repeated until one
+    // is accepted instead of waiting 10 s for output that will never come.
+    let second_fire_accepted = common::wait_until(w(), || {
+        let response = daemon.run_now("dispatch-task").expect("run-now (second)");
+        dot_agent_deck::daemon_client::run_now_outcome_from_agents(&response.agents)
+            == dot_agent_deck::daemon_client::RunNowOutcome::Started
+    });
+    assert!(
+        second_fire_accepted,
+        "the scheduler never accepted the second fire (previous run still active); observed \
+         stderr:\n{}",
+        daemon.stderr_text()
+    );
     let cause_a_seen = common::wait_until(Duration::from_secs(10), || {
         daemon.stderr_text()[snapshot_1.len()..].contains("issue #31")
     });
