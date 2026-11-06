@@ -5580,6 +5580,29 @@ pub fn label_in_box_body_row(grid: &str, label: &str) -> bool {
 /// `role_card_status_row` (`tests/e2e_work_done_reporting.rs`) is a second
 /// card locator with different matching rules — keep the two in step.
 pub fn card_identity_row(grid: &str, label: &str) -> Option<usize> {
+    card_named(grid, label).map(|(row, _)| row)
+}
+
+/// The TITLE text (the cells between the two top corners, so the shortcut badge
+/// and the status badge such as `● Blocked`) of the deck card named `label`, or
+/// `None` when no such card is drawn. The same locator as [`card_identity_row`],
+/// with all of its rules and limits.
+///
+/// Upstream drew a card's name in that title (`┌ 2 ClaudeCode · worker ── ●
+/// Blocked ┐`), so `line.contains("· worker") && line.contains("Blocked")` read
+/// "the worker's card shows Blocked" off one row. The fork draws the name on the
+/// card's own first body row (PRD fork#405 M1), so the status badge and the name
+/// are on adjacent rows and only the card's own columns say they belong together.
+/// A caller that wants "this role's card carries this status" asks for the title
+/// of the card named after the role.
+#[allow(dead_code)]
+pub fn card_title_named(grid: &str, label: &str) -> Option<String> {
+    card_named(grid, label).map(|(_, title)| title)
+}
+
+/// [`card_identity_row`]'s search: the identity row and the title text of the
+/// topmost deck card named `label`.
+fn card_named(grid: &str, label: &str) -> Option<(usize, String)> {
     let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
     let lines: Vec<Vec<char>> = grid.lines().map(|line| line.chars().collect()).collect();
     lines.iter().enumerate().find_map(|(row, top)| {
@@ -5605,7 +5628,7 @@ pub fn card_identity_row(grid: &str, label: &str) -> Option<usize> {
                     rest.chars()
                         .next()
                         .is_none_or(|c| !is_word_char(c))
-                        .then_some(row + 1)
+                        .then(|| (row + 1, top[start + 1..end].iter().collect()))
                 })
         })
     })

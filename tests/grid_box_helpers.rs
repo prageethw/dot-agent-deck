@@ -732,3 +732,48 @@ fn selected_card_named_pairs_the_marker_with_the_name_under_it() {
          row:\n{name_in_title}"
     );
 }
+
+/// Scenario: Draw two cards side by side with different statuses in their title borders, a lone
+/// card, a card whose name is only a prefix of a longer one, and upstream's layout with the role
+/// name inside the title. `common::card_title_named` must return the title of the card the name
+/// sits under (so a status badge is attributed to the right card of a side-by-side pair), nothing
+/// for a prefix of a longer name, and nothing when the name is only in the title border.
+#[test]
+fn card_title_named_reads_the_status_of_the_card_the_name_is_under() {
+    let pair = "\
+┌ 1 ─ ● Blocked ┐┌ 2 ── ● Working ┐
+│worker         ││orchestrator    │
+└───────────────┘└────────────────┘";
+    let worker = common::card_title_named(pair, "worker").expect("the left-hand card is found");
+    assert!(
+        worker.contains("Blocked") && !worker.contains("Working"),
+        "`worker` sits under the left-hand title, not the right-hand one:\n{pair}\n{worker:?}"
+    );
+    let orchestrator =
+        common::card_title_named(pair, "orchestrator").expect("the right-hand card is found");
+    assert!(
+        orchestrator.contains("Working") && !orchestrator.contains("Blocked"),
+        "`orchestrator` sits under the right-hand title, not the left-hand one:\n{pair}\n{orchestrator:?}"
+    );
+
+    let longer = "\
+┌ 1 ─ ● Blocked ┐
+│worker-two     │
+└───────────────┘";
+    assert_eq!(
+        common::card_title_named(longer, "worker"),
+        None,
+        "a name that is only a prefix of the card's longer name is not that card:\n{longer}"
+    );
+
+    let name_in_title = "\
+┌ 1 ClaudeCode · worker ─ ● Blocked ┐
+│other                              │
+└───────────────────────────────────┘";
+    assert_eq!(
+        common::card_title_named(name_in_title, "worker"),
+        None,
+        "a name in the title border (upstream's layout) is not the fork's identity \
+         row:\n{name_in_title}"
+    );
+}

@@ -109,10 +109,13 @@ fn role_agent_exists(deck: &TuiDeck, role: &str) -> bool {
         })
 }
 
+/// Whether the deck card named `role` carries `badge` in its title. Upstream drew
+/// the role and the status badge on one title row (`ClaudeCode · worker ── ●
+/// Blocked`); this fork draws the role on the card's own first body row and keeps
+/// only the status in the title (PRD fork#405 M1), so the card is found by its
+/// name and its title is read from the same box.
 fn has_role_badge(grid: &str, role: &str, badge: &str) -> bool {
-    let role_needle = format!("· {role}");
-    grid.lines()
-        .any(|line| line.contains(&role_needle) && line.contains(badge))
+    common::card_title_named(grid, role).is_some_and(|title| title.contains(badge))
 }
 
 fn open_orchestration(deck: &TuiDeck) {
