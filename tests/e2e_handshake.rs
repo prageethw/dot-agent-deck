@@ -1049,6 +1049,23 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                             common::card_identity_row(&grid, "never-attached-card").is_none(),
                             "a card closed in this TUI returned after resync: {grid}"
                         );
+                        // The identity row alone would also pass while the card is
+                        // still drawn as a collapsed, cornerless entry or with an
+                        // ellipsized name, which a deck that fits every card
+                        // reaches. Nothing is attached in this branch and nothing
+                        // here may name the closed card, so no text on the grid may
+                        // carry the start of its name; the fresh card, drawn whole,
+                        // shows the deck is at a geometry that draws names.
+                        assert_eq!(
+                            common::card_is_gone(
+                                &grid,
+                                "never-attached-card",
+                                &[],
+                                "after-close-resync"
+                            ),
+                            Ok(()),
+                            "a card closed in this TUI is still drawn after resync: {grid}"
+                        );
                         assert!(
                             !grid.contains("The deck restarted"),
                             "same-process resync claimed a restart: {grid}"
@@ -1135,6 +1152,21 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                 assert!(
                     common::card_identity_row(&grid, "never-attached-card").is_none(),
                     "old card was kept: {grid}"
+                );
+                // The identity row alone would also pass while the old card is
+                // still drawn as a collapsed, cornerless entry or with an
+                // ellipsized name. With the notice cut out, no text on the grid
+                // may carry the start of its name, and `first`, drawn whole,
+                // shows the deck is at a geometry that draws names.
+                assert_eq!(
+                    common::card_is_gone(
+                        &grid,
+                        "never-attached-card",
+                        &["The deck restarted; these agents were stopped: never-attached-card."],
+                        earlier_title
+                    ),
+                    Ok(()),
+                    "old card is still drawn outside the restart notice: {grid}"
                 );
                 assert!(
                     common::selected_card_named(&grid, earlier_title),

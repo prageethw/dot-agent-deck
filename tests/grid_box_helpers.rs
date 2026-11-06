@@ -777,3 +777,111 @@ fn card_title_named_reads_the_status_of_the_card_the_name_is_under() {
          row:\n{name_in_title}"
     );
 }
+
+/// A bordered deck card `inner` columns wide, its number badge `n` and its name
+/// on its own first body row, the way the fork draws it (PRD fork#405 M1).
+fn whole_card(n: u8, name: &str, inner: usize) -> String {
+    let badge = format!(" {n} ");
+    format!(
+        "┌{badge}{}┐\n│{name:<inner$}│\n└{}┘",
+        "─".repeat(inner - badge.chars().count()),
+        "─".repeat(inner),
+    )
+}
+
+/// Scenario: Draw a deck whose only trace of the closed card `never-attached-card` is a collapsed
+/// two-row entry (a number and status rule, then the name, no corners), then the same name
+/// ellipsized inside a bordered card, then an ordinary bordered card, each beside a whole witness
+/// card. `common::card_identity_row` finds neither of the first two, so a "card is gone" check
+/// built on it alone passes while the card is still drawn; `common::card_is_gone` must refuse all
+/// three, each for the right reason.
+#[test]
+fn card_is_gone_refuses_a_card_the_identity_row_cannot_see() {
+    let name = "never-attached-card";
+    let witness = whole_card(1, "after-close-resync", 22);
+
+    let collapsed = format!("{witness}\n 2 ────────────────────────── ● Idle \n {name}");
+    assert_eq!(
+        common::card_identity_row(&collapsed, name),
+        None,
+        "precondition: a cornerless entry is invisible to the identity row:\n{collapsed}"
+    );
+    let err = common::card_is_gone(&collapsed, name, &[], "after-close-resync")
+        .expect_err("a collapsed entry is still the card");
+    assert!(
+        err.contains("is still drawn outside the allowed text"),
+        "{err}\n{collapsed}"
+    );
+
+    let ellipsized = format!("{witness}\n{}", whole_card(2, "never-atta…", 22));
+    assert_eq!(
+        common::card_identity_row(&ellipsized, name),
+        None,
+        "precondition: an ellipsized name is not the card's name:\n{ellipsized}"
+    );
+    let err = common::card_is_gone(&ellipsized, name, &[], "after-close-resync")
+        .expect_err("an ellipsized name is still the card");
+    assert!(
+        err.contains("is still drawn outside the allowed text"),
+        "{err}\n{ellipsized}"
+    );
+
+    let bordered = format!("{witness}\n{}", whole_card(2, name, 22));
+    assert!(
+        common::card_identity_row(&bordered, name).is_some(),
+        "precondition: a whole bordered card is found:\n{bordered}"
+    );
+    let err = common::card_is_gone(&bordered, name, &[], "after-close-resync")
+        .expect_err("a whole bordered card is the card");
+    assert!(err.contains("a bordered card named"), "{err}\n{bordered}");
+}
+
+/// Scenario: Draw a deck with one whole card and the restart notice that names a stopped agent.
+/// `common::card_is_gone` must accept it when the notice is the allowed text, refuse it when
+/// nothing is allowed (the notice itself carries the name), and still refuse it when the name
+/// is drawn anywhere else, so the allowance cuts out exactly that sentence and nothing more.
+#[test]
+fn card_is_gone_accepts_a_deck_without_the_card_and_cuts_out_only_the_allowed_text() {
+    let name = "never-attached-card";
+    let notice = "The deck restarted; these agents were stopped: never-attached-card.";
+    let grid = format!("{}\n{notice}", whole_card(1, "first", 22));
+
+    assert_eq!(
+        common::card_is_gone(&grid, name, &[notice], "first"),
+        Ok(()),
+        "the card is gone and only the allowed notice names it:\n{grid}"
+    );
+    let err = common::card_is_gone(&grid, name, &[], "first")
+        .expect_err("without the allowance the notice itself names the card");
+    assert!(
+        err.contains("is still drawn outside the allowed text"),
+        "{err}\n{grid}"
+    );
+
+    let echoed = format!("{grid}\n {name}");
+    assert!(
+        common::card_is_gone(&echoed, name, &[notice], "first").is_err(),
+        "the name drawn outside the allowed sentence is still seen:\n{echoed}"
+    );
+}
+
+/// Scenario: Ask whether a card is gone from grids that draw no whole bordered witness card: an
+/// empty grid, blank rows, and a witness drawn only as a cornerless entry. `common::card_is_gone`
+/// must refuse each and name the witness, so a deck too cramped or too blank to show names can
+/// never be taken as proof that a card is gone.
+#[test]
+fn card_is_gone_needs_the_witness_card_drawn_whole() {
+    let name = "never-attached-card";
+    for grid in [
+        "",
+        "\n\n",
+        " 1 ───────────────────────── ● Idle \n after-close-resync",
+    ] {
+        let err = common::card_is_gone(grid, name, &[], "after-close-resync")
+            .expect_err("no whole witness card is drawn");
+        assert!(
+            err.contains("is not drawn as a whole bordered card"),
+            "{err}\n{grid:?}"
+        );
+    }
+}

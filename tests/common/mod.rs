@@ -5683,6 +5683,57 @@ pub fn selected_card_named(grid: &str, label: &str) -> bool {
     })
 }
 
+/// How many leading characters of a card's name [`card_is_gone`] looks for:
+/// specific enough not to match other text, few enough to survive the ellipsis a
+/// narrow deck puts on a long name (`never-atta…`).
+const GONE_STEM_CHARS: usize = 8;
+
+/// `Ok(())` when the deck card named `name` can be called GONE from `grid`;
+/// otherwise the reason it cannot.
+///
+/// `card_identity_row(grid, name).is_none()` is not that proof on its own. It
+/// recognises only a BORDERED card whose name is drawn WHOLE, so a card the deck
+/// has collapsed to a cornerless two-row entry, or whose name it has ellipsized,
+/// makes it pass while the card is still on screen, and a deck that fits every
+/// card (PRD fork#446 fit-all) reaches both. This asks three things of the grid:
+///
+/// 1. `witness`, ANOTHER card of the deck, is drawn bordered with its name
+///    whole. The deck is then at a geometry that draws names, so the two checks
+///    below are not satisfied merely because nothing readable is on the grid;
+/// 2. no bordered card is named `name` ([`card_identity_row`]);
+/// 3. nothing else on the grid carries the first [`GONE_STEM_CHARS`] characters
+///    of `name`, once every `allowed` text (a sentence that may legitimately
+///    name the card, such as the restart notice) is cut out. That is what sees a
+///    collapsed entry and an ellipsized name.
+///
+/// Check 3 reads the WHOLE grid, so use it only where no agent pane is attached:
+/// an attached agent's own output could print the name. It also treats any other
+/// text that starts with the same characters as the card, so `name` must not
+/// share its first characters with a card that should still be there.
+pub fn card_is_gone(grid: &str, name: &str, allowed: &[&str], witness: &str) -> Result<(), String> {
+    if card_identity_row(grid, witness).is_none() {
+        return Err(format!(
+            "the witness card {witness:?} is not drawn as a whole bordered card, so this grid \
+             cannot show that {name:?} is gone"
+        ));
+    }
+    if card_identity_row(grid, name).is_some() {
+        return Err(format!("a bordered card named {name:?} is on the grid"));
+    }
+    let mut rest = grid.to_string();
+    for text in allowed {
+        rest = rest.replace(*text, "");
+    }
+    let stem: String = name.chars().take(GONE_STEM_CHARS).collect();
+    if rest.contains(&stem) {
+        return Err(format!(
+            "{stem:?}, the start of {name:?}, is still drawn outside the allowed text: a \
+             collapsed or ellipsized card"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `title` — the cells between a box's two top corners — opens with a
 /// deck card's shortcut badge: a space, the `▸ ` selection marker when the card
 /// is the selected one, the card's number, and a space (`┌ 1 ──…`,
