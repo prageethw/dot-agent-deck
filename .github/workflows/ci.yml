@@ -2242,6 +2242,17 @@ jobs:
           # `.skip(1)`/`.nth(1)` past it. Issue #146 triaged all 5 open
           # findings: 0 true positives.
           #
+          # `args-os` is the `std::env::args_os()` twin of `args`, excluded on the
+          # same basis: its threat model is `argv[0]` being attacker-controllable,
+          # which needs a privilege boundary this non-setuid, same-uid program
+          # does not have. Two findings, both in UPSTREAM code this fork has not
+          # modified: src/telemetry/shim.rs:130 (`args_os().skip(1)`, so it never
+          # reads `argv[0]`) and xtask/cross-version/src/outer.rs:449 (a
+          # developer-only harness, not part of any release binary, which reads
+          # `argv[0]` deliberately to tell it was hard-linked into a sandbox as
+          # `claude`). Nothing else is excluded: the bidi fixture stays handled by
+          # `.semgrepignore`.
+          #
           # `temp-dir` fires on every `std::env::temp_dir()` call. Unlike the
           # two rules above, this one's threat model CAN apply here -- a
           # predictable name in a shared directory is a real hazard -- so this
@@ -2273,6 +2284,7 @@ jobs:
             --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage \
             --exclude-rule rust.lang.security.current-exe.current-exe \
             --exclude-rule rust.lang.security.args.args \
+            --exclude-rule rust.lang.security.args-os.args-os \
             --exclude-rule rust.lang.security.temp-dir.temp-dir \
             --exclude-rule yaml.github-actions.security.audit.unsafe-add-mask-workflow-command.unsafe-add-mask-workflow-command \
             --sarif --output semgrep.sarif \
