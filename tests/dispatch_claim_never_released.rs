@@ -19,6 +19,29 @@ use std::path::{Path, PathBuf};
 /// flag, and the GraphQL mutation `removeLabelsFromLabelable`.
 const LABEL_REMOVAL: &[&str] = &["remove-label", "removeLabels"];
 
+/// Fork-only carve-out. `worker-agent-deck issue release` (fork issue #326)
+/// removes the FORK's own `in-progress` claim label through
+/// `issue_edit_remove_label_argv`, defined in this file. It is a different
+/// label from the `agent-deck/claimed` one this guard protects, so the guard
+/// tolerates the removal flag in exactly this file's doc comments and in the
+/// two argv-element lines of that builder and its shape test, and
+/// [`the_forks_label_removal_is_never_handed_the_claim_label`] holds the
+/// other half: nothing may hand that builder the dispatch claim label.
+const FORK_RELEASE_BUILDER_FILE: &str = "issue_dispatch.rs";
+
+/// The builder the fork's release goes through.
+const FORK_RELEASE_BUILDER: &str = "issue_edit_remove_label_argv";
+
+/// Whether `line` of `file` is one the fork-only carve-out covers.
+fn is_fork_release_spelling(file: &Path, line: &str) -> bool {
+    file.ends_with(FORK_RELEASE_BUILDER_FILE)
+        && (line.trim_start().starts_with("//")
+            || matches!(
+                line.trim(),
+                r#""--remove-label".to_string(),"# | r#""--remove-label","#
+            ))
+}
+
 /// Spellings of a REST deletion through `gh api` (or any HTTP client): the
 /// method as a string literal — `"DELETE"`, which is how an argv element or a
 /// method constant spells it — and the method flags written inline in a
@@ -66,7 +89,10 @@ fn no_source_file_spells_a_label_removal() {
             let hits: Vec<&str> = LABEL_REMOVAL
                 .iter()
                 .copied()
-                .filter(|needle| text.contains(needle))
+                .filter(|needle| {
+                    text.lines()
+                        .any(|line| line.contains(needle) && !is_fork_release_spelling(file, line))
+                })
                 .collect();
             (!hits.is_empty()).then(|| format!("{}: {hits:?}", file.display()))
         })
@@ -74,6 +100,42 @@ fn no_source_file_spells_a_label_removal() {
     assert!(
         offenders.is_empty(),
         "no file under src/ may spell a label removal (PRD #421 M3.3(b)); found: {offenders:?}"
+    );
+}
+
+/// Scenario: scan every file under `src/` for a call of the fork's label-removal builder (the one `issue release` uses to drop its `in-progress` label). Every call must be handed that `in-progress` label and none may name the dispatch claim label `agent-deck/claimed`, so the fork-only carve-out in the label guard above cannot be used to take the claim away.
+#[test]
+fn the_forks_label_removal_is_never_handed_the_claim_label() {
+    let call = regex::Regex::new(&format!(r"(?s){FORK_RELEASE_BUILDER}\(([^)]*)\)"))
+        .expect("valid pattern");
+    let mut calls = 0;
+    let mut offenders = Vec::new();
+    for (file, text) in source_files() {
+        for found in call.captures_iter(&text) {
+            let whole = found.get(0).expect("the whole match");
+            // The builder's own definition, not a call of it.
+            if text[..whole.start()].ends_with("fn ") {
+                continue;
+            }
+            calls += 1;
+            let args = &found[1];
+            if !args.contains("IN_PROGRESS_LABEL")
+                || args.contains("CLAIM_LABEL")
+                || args.contains("agent-deck/claimed")
+            {
+                offenders.push(format!("{}: {}", file.display(), whole.as_str()));
+            }
+        }
+    }
+    assert!(
+        calls > 0,
+        "the scan must find the fork's release calling its label-removal builder, or this guard \
+         checks nothing"
+    );
+    assert!(
+        offenders.is_empty(),
+        "the fork's label removal may only be handed the fork's `in-progress` label, never the \
+         dispatch claim label (PRD #421 M3.3(b)); found: {offenders:?}"
     );
 }
 
