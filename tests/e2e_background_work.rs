@@ -342,14 +342,15 @@ fn background_006_monitor_count_edges_no_idle_spam_and_replacement() {
 #[test]
 fn background_014_natural_exit_clears_the_attached_card_only() {
     let mut f = Fixture::new(AgentType::ClaudeCode);
+    // Upstream waited here for the stand-in's first `ShellIdle`. This fork's
+    // shell-activity poller deliberately emits none for a spawn's FIRST-EVER
+    // idle reading (PRD #499 reopened, round 2: such a frame corrects nothing
+    // and raced a monitored wait), so that frame never comes and waiting for it
+    // can only time out. It was a synchronisation point, not an assertion:
+    // `Fixture::hook` already waits for the broadcast of every hook it sends,
+    // and the departed-spawn sweep that clears the card works off the state's
+    // background tracker and the registry, not off the poller's first reading.
     f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
-    f.events.wait_for(
-        |event| {
-            event.agent_id.as_deref() == Some(&f.agent_id)
-                && event.event_type == EventType::ShellIdle
-        },
-        common::load_scaled(Duration::from_secs(10)),
-    );
     f.hook(
         "claude-code",
         "SubagentStart",
