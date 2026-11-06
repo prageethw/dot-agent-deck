@@ -5,18 +5,24 @@
 //! two PRs that are each green merged on 2026-10-04 and again on 2026-10-05
 //! and left `main` unable to compile its tests. The fix is a procedure, not
 //! code: `.claude/skills/merge-pr/SKILL.md` defines "The overlap check before
-//! a merge" once, and every other skill that merges goes through that skill or
-//! names the check. Prose
-//! has no compiler, so a skill added later that merges, or an edit that drops
-//! the pointer, would lose the check without anything going red. These tests
-//! are that red.
+//! a merge" once, and the skills that hand a merge to `merge-pr` go through it.
+//! Prose has no compiler, so an edit that drops the section's commands, or the
+//! pointer in a skill that merges through `merge-pr`, would lose the check
+//! without anything going red. These tests are that red.
 //!
-//! **What this does NOT claim.** It reads text. It checks that a skill which
-//! tells an agent to run `gh pr merge` without `--auto` names the check, and
-//! that the defining section still carries its commands; it does not check
-//! that an agent follows them, and it does not look at merges written some
-//! other way than `gh pr merge`. Auto-merge is exempt because GitHub performs that merge
-//! with nobody present to run a check; the skills that allow arming say so.
+//! **What this does NOT claim.** It reads text. It checks that the defining
+//! section still carries its commands and that `code-cleanup`, `issue-queue`
+//! and `land-prs` still hand their merge to `merge-pr`; it does not check that
+//! an agent follows the commands, and it does not look at merges written some
+//! other way than `gh pr merge`.
+//!
+//! **Fork difference.** Upstream also asserted that every skill running
+//! `gh pr merge` without `--auto` names the section (`merge_overlap_check_003`)
+//! and that CLAUDE.md's "Answer AND Resolve Review Findings" rule points a
+//! person merging by hand at it (`merge_overlap_check_004`). This fork dropped
+//! both (maintainer decision 2026-11-06, CLAUDE.md rule 24: the fork's way):
+//! `close-pending-prs` merges under CLAUDE.md rule 25's checklist, which has
+//! no overlap-check step, and this fork's rule 8 is a different rule.
 
 #[cfg(test)]
 mod tests {
@@ -44,24 +50,6 @@ mod tests {
         command
             .find_iter(text)
             .any(|m| !m.as_str().contains("--auto"))
-    }
-
-    /// Every `SKILL.md` under `.claude/skills/`, as (skill directory name,
-    /// contents). The `dot-ai-*` skills are included: they are project-owned
-    /// since syncing from `dot-ai` stopped (CLAUDE.md rule 13).
-    fn project_skills() -> Vec<(String, String)> {
-        let dir = repo_root().join(".claude/skills");
-        let mut skills = Vec::new();
-        for entry in fs::read_dir(&dir).expect("read .claude/skills") {
-            let entry = entry.expect("read a .claude/skills entry");
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let skill = entry.path().join("SKILL.md");
-            if let Ok(text) = fs::read_to_string(&skill) {
-                skills.push((name, text));
-            }
-        }
-        skills.sort();
-        skills
     }
 
     #[test]
@@ -124,36 +112,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn merge_overlap_check_003_every_skill_that_merges_names_the_check() {
-        let skills = project_skills();
-        let merging: Vec<&str> = skills
-            .iter()
-            .filter(|(_, text)| merges_directly(text))
-            .map(|(name, _)| name.as_str())
-            .collect();
-        // The two that run `gh pr merge` themselves today: merge-pr, and
-        // land-prs's admin case. A shrinking list means the scan stopped seeing
-        // a merge, which would make the next assertion pass vacuously.
-        for expected in ["land-prs", "merge-pr"] {
-            assert!(
-                merging.contains(&expected),
-                "{expected}/SKILL.md no longer runs `gh pr merge` without `--auto`; \
-                 if that is deliberate, drop it from this list"
-            );
-        }
-        let missing: Vec<&str> = skills
-            .iter()
-            .filter(|(_, text)| merges_directly(text) && !text.contains(SECTION))
-            .map(|(name, _)| name.as_str())
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "these skills merge a PR with `gh pr merge` but never name \"{SECTION}\" \
-             (.claude/skills/merge-pr/SKILL.md): {missing:?}"
-        );
-    }
-
     /// The skills that merge without running `gh pr merge` themselves hand the
     /// merge to merge-pr, which is what puts the overlap check and the watch of
     /// `main`'s run after it in front of their merges.
@@ -168,24 +126,5 @@ mod tests {
                 "{skill}/SKILL.md merges PRs but no longer hands the merge to merge-pr"
             );
         }
-    }
-
-    #[test]
-    fn merge_overlap_check_004_claude_md_rule_8_names_the_check() {
-        let text = fs::read_to_string(repo_root().join("CLAUDE.md")).expect("read CLAUDE.md");
-        let rule_8 = text
-            .find("8. **Answer AND Resolve Review Findings")
-            .expect("CLAUDE.md has rule 8");
-        let rule_9 = text[rule_8..]
-            .find("\n9. **")
-            .map_or(text.len(), |i| rule_8 + i);
-        assert!(
-            text[rule_8..rule_9].contains(SECTION),
-            "CLAUDE.md rule 8 no longer points a person merging by hand at \"{SECTION}\""
-        );
-        assert!(
-            text[rule_8..rule_9].contains("merge-pr"),
-            "CLAUDE.md rule 8 no longer names the merge-pr skill"
-        );
     }
 }

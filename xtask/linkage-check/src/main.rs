@@ -172,9 +172,10 @@ mod git_program_literal;
 #[cfg(test)]
 mod junit_strip;
 mod list_tests;
-/// Issue #1610: every project-local skill that runs `gh pr merge` without
-/// `--auto` names the overlap check `issue-queue` defines, and CLAUDE.md rule 8
-/// points a person merging by hand at it. Tests only — the rule is prose in
+/// Issue #1610: `merge-pr` defines the overlap check and keeps its commands,
+/// and the skills that merge through it still hand the merge over. This fork
+/// does not assert that every `gh pr merge` skill or CLAUDE.md names it (see
+/// the module's "Fork difference" note). Tests only — the rule is prose in
 /// repository files, which no compile step reads.
 #[cfg(test)]
 mod merge_overlap_check;
