@@ -68,7 +68,14 @@ const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task
 const STUBBORN_WORKER_ARMED: &[u8] = b"STUBBORN-WORKER-ARMED";
 
 fn config(worker_command: &str) -> String {
-    let worker_command = common::capability_export_command(worker_command);
+    config_with_command_line(&common::capability_export_command(worker_command))
+}
+
+/// [`config`] with `worker_command` as the worker role's command exactly as
+/// written, with no capability-recording prefix in front of it. Only a test whose
+/// scenario depends on the command being the bare program may use it:
+/// [`point_worker_role_at`] does, for a program that does not exist.
+fn config_with_command_line(worker_command: &str) -> String {
     format!(
         "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
          [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
@@ -1604,10 +1611,21 @@ const RESPAWN_FAILED_NEEDLE: &str = "delegated worker respawn failed";
 /// Re-point the `coder` role at `worker_command` for every LATER delegate. The
 /// dispatch task re-reads `.dot-agent-deck.toml` on each delegate, so the
 /// worker the fixture already started is untouched.
+///
+/// The command is written as it stands, NOT behind [`config`]'s
+/// capability-recording prefix. That prefix (`(umask 077; printf ...); <command>`)
+/// makes the role's command a multi-word line, which the spawn hands to
+/// `$SHELL -c`: the shell starts, and a program that does not exist is then "not
+/// found" with exit 127 AFTER the spawn succeeded. The respawn is no longer a
+/// failure at all: it returns a replacement that dies on arrival, which is the
+/// dead-replacement exit (`orchestration/delegate/059`), not the respawn-error
+/// exit the callers of this function are written for. Bare, the program is
+/// refused at spawn (`portable-pty`'s `search_path`), which is the exit they
+/// need. Nothing here reads the replacement's capability: none ever comes up.
 fn point_worker_role_at(fx: &Fixture, worker_command: &str) {
     std::fs::write(
         std::path::Path::new(&fx.cwd).join(".dot-agent-deck.toml"),
-        config(worker_command),
+        config_with_command_line(worker_command),
     )
     .expect("rewrite the orchestration config");
 }
