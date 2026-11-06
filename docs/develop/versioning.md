@@ -88,7 +88,7 @@ While the major version is `0`, the bump rules are deliberately shifted down one
 | feature (new user-facing functionality) | **patch** (`0.31.1 → 0.31.2`) | minor |
 | bugfix | **patch** | patch |
 
-The consequence worth internalizing: while in `0.x`, a feature-only release is a *patch* release, and **only a protocol-breaking change bumps the minor**. So the minor digit stops meaning "has new features" and starts meaning "compatibility broke" — if `0.31.x` becomes `0.32.0`, an older peer can no longer safely talk to a `0.32.x` one. This is already implemented on the release side in the vendored `.claude/skills/dot-ai-tag-release/analyze.sh` (the `breaking → minor`, `feature/bugfix → patch` recalibration); the table above is the policy that script encodes.
+The consequence worth internalizing: while in `0.x`, a feature-only release is a *patch* release, and **only a protocol-breaking change bumps the minor**. So the minor digit stops meaning "has new features" and starts meaning "compatibility broke" — if `0.31.x` becomes `0.32.0`, an older peer can no longer safely talk to a `0.32.x` one. This is already implemented on the release side in the project-local `.claude/skills/tag-release/analyze.sh` (the `breaking → minor`, `feature/bugfix → patch` recalibration); the table above is the policy that script encodes.
 
 ## When a change gets a changelog fragment at all
 
@@ -187,7 +187,7 @@ Every fork release tag cut **before the most recent sync** is unreachable — th
 Three consequences worth knowing:
 
 - **Published release artifacts are unaffected.** `release.yml`'s `prepare` job injects the version as `DAD_VERSION` (step 1), which wins over `describe` — the same seam described above for `workflow_dispatch` releases covers this case for free.
-- **Do not use `describe` to work out the next release number.** `.claude/skills/dot-ai-tag-release/analyze.sh` sorts the full tag list by version (`git tag --sort=-v:refname`) instead of walking reachability, which is why it correctly proposed `v0.37.2` from `v0.37.1` on a checkout where `describe` said `v0.35.10`.
+- **Do not use `describe` to work out the next release number.** `.claude/skills/tag-release/analyze.sh` sorts the full tag list by version (`git tag --sort=-v:refname`) instead of walking reachability, which is why it correctly proposed `v0.37.2` from `v0.37.1` on a checkout where `describe` said `v0.35.10`.
 - **To build a binary that reports honestly, do not build from `main`.** Build from a detached checkout **at the tag** — the procedure in [`upgrading-a-running-deck.md`](upgrading-a-running-deck.md) § "Installing a fork build" — or inject `DAD_VERSION` explicitly. A tag checkout is reachable from itself, so `describe` resolves it correctly.
 
 The orphaning recurs on **every** sync by construction, so a freshly-cut fork tag is orphaned again the next time `main` is reset. Re-tagging the post-sync commit does not fix it retroactively either: the tag is only reachable until the following sync rewrites that commit too.

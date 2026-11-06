@@ -2,7 +2,7 @@
 
 This repo has one work-type vocabulary — `bug | prd | doc | chore` — and every surface that used to carry its own spelling of that vocabulary now aliases onto it (PRD [fork#340](https://github.com/prageethw/dot-agent-deck/issues/340)).
 
-Before this PRD the repo had five surfaces carrying work-type vocabulary, three of which disagreed with each other, and two of which were already hard gates that could block a release: `pyproject.toml`'s towncrier types, `scripts/assemble-changelog.sh`'s hardcoded list, `.claude/skills/dot-ai-tag-release/analyze.sh`'s stricter list, GitHub labels, and the (upstream-only) `PRD` label convention that `prds/` files never actually used here.
+Before this PRD the repo had five surfaces carrying work-type vocabulary, three of which disagreed with each other, and two of which were already hard gates that could block a release: `pyproject.toml`'s towncrier types, `scripts/assemble-changelog.sh`'s hardcoded list, `.claude/skills/tag-release/analyze.sh`'s stricter list, GitHub labels, and the (upstream-only) `PRD` label convention that `prds/` files never actually used here.
 
 ## The vocabulary
 
@@ -17,7 +17,7 @@ Every branch and commit prefix in this table is already in use on this repo — 
 
 ## Why `chore` aliases onto `.misc.md` instead of getting its own changelog suffix
 
-The changelog-fragment suffix set is frozen at five (`feature`, `bugfix`, `breaking`, `doc`, `misc`) because `.claude/skills/dot-ai-tag-release/analyze.sh` hard-errors on any fragment suffix outside that set. That file lives in the sync-clobbered `dot-ai-*` mirror (CLAUDE.md rule 13) — a project-local edit to it does not survive the next sync, as recorded there: commit `04a3641` was reverted byte-for-byte by `e94388d` five days later. A new `.chore.md` suffix would break `/tag-release` at the very first release carrying a chore fragment, with a fix that cannot be carried in-repo.
+The changelog-fragment suffix set is frozen at five (`feature`, `bugfix`, `breaking`, `doc`, `misc`) because `.claude/skills/tag-release/analyze.sh` hard-errors on any fragment suffix outside that set. When this was decided that file lived in the sync-clobbered `dot-ai-*` mirror (CLAUDE.md rule 13), where a project-local edit did not survive the next sync, as recorded there: commit `04a3641` was reverted byte-for-byte by `e94388d` five days later. The skill has since become the project-local `tag-release/`, and the set is still five. A new `.chore.md` suffix would break `/tag-release` at the very first release carrying a chore fragment.
 
 So `chore` deliberately aliases onto the existing `.misc.md` suffix, rather than getting a suffix of its own. This is the same move `assemble-changelog.sh`'s `TYPE_HEADERS` table already makes elsewhere, collapsing nine historical names onto six changelog headers.
 
@@ -33,7 +33,7 @@ So `chore` deliberately aliases onto the existing `.misc.md` suffix, rather than
 
 **Upstream carries both `feature` and `enhancement`; this fork carries only `enhancement`.** On this fork, `enhancement` is the sole GitHub label for `prd`-type work, and a `feature` label is not to be created. This fork syncs from upstream and inherits its habits, so this is worth stating even though the fork has no `feature` label today.
 
-**`/dot-ai-prds-get` is inert on this fork.** That skill fetches open issues carrying the `PRD` label. That label exists upstream (`#0052CC`) and does not exist on this fork, so the skill silently returns nothing here. Per this repo's no-destructive-migration stance, the fix is not to create a `PRD` label — that would duplicate `enhancement`. `enhancement` plus the `prds/` directory is this fork's answer for tracking PRD work, and `/dot-ai-prds-get` should be treated as inert here. This is itself a live example of the empty-gate failure mode this vocabulary exists to close.
+**`/prds-get` is inert on this fork.** That skill fetches open issues carrying the `PRD` label. That label exists upstream (`#0052CC`) and does not exist on this fork, so the skill silently returns nothing here. Per this repo's no-destructive-migration stance, the fix is not to create a `PRD` label — that would duplicate `enhancement`. `enhancement` plus the `prds/` directory is this fork's answer for tracking PRD work, and `/prds-get` should be treated as inert here. This is itself a live example of the empty-gate failure mode this vocabulary exists to close.
 
 **`pyproject.toml` declares a changelog filename and issue format it never uses.** `pyproject.toml` declares `filename = "docs/CHANGELOG.md"` and a `vfarcic` `issue_format`, but towncrier itself is never invoked — `scripts/assemble-changelog.sh` is. This is harmless. Note it; do not "fix" it.
 
