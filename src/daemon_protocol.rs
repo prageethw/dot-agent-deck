@@ -10513,16 +10513,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let pane_id = "ordered-pane-1555";
-        let agent_id = DaemonClient::new(sock.clone())
-            .start_agent(StartAgentOptions {
+        // The daemon is authoritative for the pane id (fork PRD #365 M2): the
+        // id proposed here is discarded and the reply names the one it minted.
+        let (agent_id, pane_id) = DaemonClient::new(sock.clone())
+            .start_agent_with_pane_id(StartAgentOptions {
                 command: Some("cat".to_string()),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "ordered-pane-1555".to_string(),
+                )],
                 ..StartAgentOptions::default()
             })
             .await
             .expect("spawn a pane through the attach socket");
+        let pane_id = pane_id.expect("the daemon answers a start with the pane it minted");
+        let pane_id = pane_id.as_str();
         let event = |session: &str, event_type: EventType| crate::event::AgentEvent {
             session_id: session.to_string(),
             event_type,
@@ -10682,16 +10688,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let pane_id = "ordered-inbox-pane";
-        let agent_id = DaemonClient::new(sock.clone())
-            .start_agent(StartAgentOptions {
+        // The daemon is authoritative for the pane id (fork PRD #365 M2): the
+        // id proposed here is discarded and the reply names the one it minted.
+        let (agent_id, pane_id) = DaemonClient::new(sock.clone())
+            .start_agent_with_pane_id(StartAgentOptions {
                 command: Some("cat".to_string()),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "ordered-inbox-pane".to_string(),
+                )],
                 ..StartAgentOptions::default()
             })
             .await
             .expect("spawn a pane through the attach socket");
+        let pane_id = pane_id.expect("the daemon answers a start with the pane it minted");
+        let pane_id = pane_id.as_str();
         let post = |subject: &str| {
             registry
                 .inbox()
@@ -10934,16 +10946,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let pane_id = "startup-inbox-pane";
-        let agent_id = DaemonClient::new(sock.clone())
-            .start_agent(StartAgentOptions {
+        // The daemon is authoritative for the pane id (fork PRD #365 M2): the
+        // id proposed here is discarded and the reply names the one it minted.
+        let (agent_id, pane_id) = DaemonClient::new(sock.clone())
+            .start_agent_with_pane_id(StartAgentOptions {
                 command: Some("cat".to_string()),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "startup-inbox-pane".to_string(),
+                )],
                 ..StartAgentOptions::default()
             })
             .await
             .expect("spawn a pane through the attach socket");
+        let pane_id = pane_id.expect("the daemon answers a start with the pane it minted");
+        let pane_id = pane_id.as_str();
         let post = |subject: &str| {
             registry
                 .inbox()
@@ -11443,12 +11461,14 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // The ordinary stop.
-        let pane_id = "stopped-pane-1223";
-        let agent_id = client
-            .start_agent(spawn_on("/bin/cat", pane_id))
+        // The ordinary stop. The daemon is authoritative for the pane id (fork
+        // PRD #365 M2), so the pane is the one the start's reply names.
+        let (agent_id, pane_id) = client
+            .start_agent_with_pane_id(spawn_on("/bin/cat", "stopped-pane-1223"))
             .await
             .expect("spawn a live pane");
+        let pane_id = pane_id.expect("the daemon answers a start with the pane it minted");
+        let pane_id = pane_id.as_str();
         let _ = closures(&mut rx);
         client.stop_agent(&agent_id).await.expect("stop it");
         let announced = closures(&mut rx);
@@ -11468,11 +11488,12 @@ mod tests {
         );
 
         // The stale stop: A dies, B takes the pane, only then is A stopped.
-        let pane_id = "handover-pane-1223";
-        let old_id = client
-            .start_agent(spawn_on("/usr/bin/true", pane_id))
+        let (old_id, pane_id) = client
+            .start_agent_with_pane_id(spawn_on("/usr/bin/true", "handover-pane-1223"))
             .await
             .expect("spawn the first generation");
+        let pane_id = pane_id.expect("the daemon answers a start with the pane it minted");
+        let pane_id = pane_id.as_str();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while registry.live_count() != 0 {
             assert!(
@@ -11481,9 +11502,16 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let new_id = client
-            .start_agent(spawn_on("/bin/cat", pane_id))
-            .await
+        // A start never chooses its pane (the daemon would mint a new one), so
+        // the successor takes A's pane the way a respawn does: straight on the
+        // registry. A's record stays beside it, exited and handed over.
+        let new_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                cwd: Some(dir.path().to_str().expect("a UTF-8 tempdir")),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
             .expect("the pane is reusable once its child is gone");
         let _ = closures(&mut rx);
         client
@@ -11549,7 +11577,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let pane_id = "seed-refused-after-hook";
+        // The seed-post pause is keyed by the start's pane id, which the test
+        // must know before the start reply exists. The daemon mints every pane
+        // id itself (fork PRD #365 M2) except the desktop's own unused
+        // `desktop-` id, so that is the one id a start can name in advance.
+        let pane_id = "desktop-seed-refused-after-hook";
         let reached = Arc::new(tokio::sync::Notify::new());
         let resume = Arc::new(tokio::sync::Notify::new());
         SEED_POST_PAUSES
