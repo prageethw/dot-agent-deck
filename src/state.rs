@@ -9687,6 +9687,7 @@ impl AppState {
     ///
     /// Everything else the event recorded — status, journal, prompts, model,
     /// friendly name — is the agent's and is kept as it is.
+    #[allow(clippy::too_many_arguments)]
     fn adopt_early_pane_session(
         &mut self,
         early_id: String,
