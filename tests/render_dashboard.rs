@@ -8396,20 +8396,33 @@ fn density_008_a_deck_too_large_for_minimal_scrolls_at_compact() {
     let sessions = reported_role_sessions();
     let cards = as_cards(&sessions);
 
-    // 20 rows leaves 18: seven Minimal cards need 21.
+    // 20 rows leaves 18: seven Minimal cards need 21, and seven Compact cards
+    // (6 rows each in the fork) 42, so no density fits and `choose_grid_layout`
+    // returns its Compact fallback. Upstream then scrolls (three 5-row cards and
+    // `(↓4)`); the fork's fit-all mode (`even_row_heights`, PRD fork#446 M1, a
+    // permanent fork feature with no upstream counterpart) divides the 18 rows
+    // evenly instead: 18 / 7 = 2 remainder 4, so heights 3,3,3,3,2,2,2. A
+    // 3-row slot draws a whole Minimal-shaped card, a 2-row slot a collapsed
+    // entry (number and status, then the name).
     let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 20);
     let rendered = buffer_to_text(&buffer);
     let title = rendered.lines().next().expect("a rendered title row");
 
     assert_eq!(
         single_column_card_heights(&rendered),
-        vec![5; 3],
-        "an overflowing deck keeps Compact's 5-row cards, three of which fit:\n{rendered}"
+        vec![3; 4],
+        "an overflowing deck is divided evenly: four whole 3-row cards:\n{rendered}"
     );
     assert!(
-        title.contains("(↓4)"),
-        "the title counts the cards below the window:\n{title}"
+        !title.contains('↓') && !title.contains('↑'),
+        "fit-all hides no card, so the title carries no scroll indicator:\n{title}"
     );
+    for role in REPORTED_ROLES {
+        assert!(
+            rendered.contains(role),
+            "{role}: every card is still painted, the last three as collapsed entries:\n{rendered}"
+        );
+    }
     insta::assert_snapshot!(rendered);
 }
 
