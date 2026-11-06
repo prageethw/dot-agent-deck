@@ -52,8 +52,11 @@ const EXPERIMENTAL_LABEL: &str = "experimental: on";
 const ENTRY_UNLOCKED: &str = "Pane entry: unlocked";
 const ENTRY_LOCKED: &str = "Pane entry: locked";
 /// What the deck paints instead of forwarding a keystroke into a locked worker
-/// pane (`ORCHESTRATION_LOCK_STATUS_MESSAGE` in `src/ui.rs`).
-pub(crate) const ENTRY_REFUSED: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
+/// pane (`ORCHESTRATION_LOCK_STATUS_MESSAGE` in `src/ui.rs`). This fork's
+/// wording names the whole three-chord round trip back into the pane (fork
+/// issue #302, defect 2, pinned by `tests/e2e_orchestration_lock.rs`); upstream's
+/// reads `Pane locked — Ctrl+d then Ctrl+e to unlock`, one keypress short.
+pub(crate) const ENTRY_REFUSED: &str = "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here";
 /// How long the daemon gets after its one SIGTERM. Well past its 3 s agent
 /// grace (`AGENT_TERMINATE_GRACE`).
 pub(crate) const DAEMON_GRACE: Duration = Duration::from_secs(20);
