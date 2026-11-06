@@ -46,7 +46,14 @@ fn squeeze(text: &str) -> String {
 /// The production new-pane flow: `Ctrl+n` → confirm dir → Right selects the
 /// `[Orch: demo-orch]` chip → Enter → Enter. It is what registers the
 /// daemon-side role maps `delegate` routes on.
+///
+/// The fixture is committed first: this fork spawns every orchestration role in
+/// an isolated clone of the launch directory (PRD fork#544 M2b), and a clone
+/// carries only COMMITTED files, so the fixture's `worker.py` (named relative
+/// to the role's directory in its `command`) would otherwise not be there and
+/// every worker would exit at once.
 fn open_orchestration(deck: &TuiDeck) {
+    common::commit_fixture_repo(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.send_keys(b" ");
     deck.wait_for_string("No mode");
@@ -165,11 +172,20 @@ fn resize_role_pane(deck: &TuiDeck, role: &str) {
 /// Let `role`'s worker report its work and then exit on its own, and wait until
 /// the daemon no longer lists it as a live agent.
 fn let_worker_exit(deck: &TuiDeck, role: &str) {
-    let gone_agent = role_record(deck, role)
-        .unwrap_or_else(|| panic!("{role} must be live before it is told to exit"))
-        .id;
-    std::fs::write(deck.workdir().join(format!("{role}-exit")), b"go\n")
-        .unwrap_or_else(|e| panic!("create {role}'s exit trigger: {e}"));
+    let live = role_record(deck, role)
+        .unwrap_or_else(|| panic!("{role} must be live before it is told to exit"));
+    let gone_agent = live.id;
+    // `worker.py` watches `./<role>-exit` in ITS directory, which is the
+    // orchestration's isolated clone (PRD fork#544 M2b), not the launch
+    // directory.
+    let role_dir = live
+        .cwd
+        .unwrap_or_else(|| panic!("{role}'s record names no working directory"));
+    std::fs::write(
+        std::path::Path::new(&role_dir).join(format!("{role}-exit")),
+        b"go\n",
+    )
+    .unwrap_or_else(|e| panic!("create {role}'s exit trigger: {e}"));
     let exited = common::wait_until(Duration::from_secs(20), || {
         role_record(deck, role).is_none_or(|record| record.id != gone_agent)
     });

@@ -42,12 +42,19 @@ use spec::spec;
 
 /// Every byte a stand-in receives is copied by `tee`, raw — no line
 /// discipline, no local echo — to the pane and to `<role>.in` in the workdir.
+///
+/// The record file is named by ABSOLUTE path: this fork spawns every
+/// orchestration role in an isolated clone of the launch directory (PRD
+/// fork#544 M2b), so a relative `<role>.in` would be written into the clone,
+/// where [`received`] does not look.
 fn write_standin(dir: &std::path::Path, role: &str, sentinel: &str) {
     let path = dir.join(format!("seat-{role}.sh"));
+    let record = dir.join(format!("{role}.in"));
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\nstty -echo -icanon -icrnl -opost min 1 time 0\nprintf '{sentinel}\\n'\nexec tee -a {role}.in\n"
+            "#!/bin/sh\nstty -echo -icanon -icrnl -opost min 1 time 0\nprintf '{sentinel}\\n'\nexec tee -a '{}'\n",
+            record.display()
         ),
     )
     .expect("write stand-in");
@@ -60,16 +67,24 @@ fn write_standin(dir: &std::path::Path, role: &str, sentinel: &str) {
 
 /// Two roles, worker first. `start` says whether the `orchestrator` role
 /// carries `start = true`; the role is named `orchestrator` either way.
+///
+/// The stand-ins are named by ABSOLUTE path: the roles run in an isolated clone
+/// of the workdir (PRD fork#544 M2b) and a clone carries only COMMITTED files,
+/// which these freshly written scripts are not.
 fn write_config(deck: &TuiDeck, start: bool) {
     write_standin(deck.workdir(), "coder", "CODER-READY");
     write_standin(deck.workdir(), "orchestrator", "ORCH-READY");
+    let coder = deck.workdir().join("seat-coder.sh");
+    let orchestrator = deck.workdir().join("seat-orchestrator.sh");
     let start_line = if start { "start = true\n" } else { "" };
     let config = format!(
         "[[orchestrations]]\nname = \"seat\"\n\n\
-         [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"./seat-coder.sh\"\n\
+         [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{}\"\n\
          description = \"writes code\"\nclear = false\n\n\
-         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"./seat-orchestrator.sh\"\n\
-         prompt_template = \"SEAT-TEMPLATE-SENTINEL\"\nclear = false\n{start_line}"
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"{}\"\n\
+         prompt_template = \"SEAT-TEMPLATE-SENTINEL\"\nclear = false\n{start_line}",
+        coder.display(),
+        orchestrator.display()
     );
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), config)
         .expect("write orchestration config");
@@ -242,8 +257,18 @@ fn tabs_orchestration_001_ctrl_n_tab_seats_one_orchestrator() {
         // `coder` — not the orchestrator itself — offered as the team.
         let named = context_file_named(&inbox_view::text(attach, &orch_pane))
             .expect("the pointer names a context file");
-        let context = std::fs::read_to_string(deck.workdir().join(".dot-agent-deck").join(&named))
-            .unwrap_or_else(|e| panic!("[{case}] read the pointed-at {named}: {e}"));
+        // The context file is written into the orchestration's own directory,
+        // which is the isolated clone the roles run in (PRD fork#544 M2b), not
+        // the launch directory.
+        let orchestration_dir = role_agent(&deck, "orchestrator")
+            .cwd
+            .expect("the orchestrator's working directory");
+        let context = std::fs::read_to_string(
+            std::path::Path::new(&orchestration_dir)
+                .join(".dot-agent-deck")
+                .join(&named),
+        )
+        .unwrap_or_else(|e| panic!("[{case}] read the pointed-at {named}: {e}"));
         assert!(
             context.contains("SEAT-TEMPLATE-SENTINEL"),
             "[{case}] the context should open with the orchestrator's prompt_template:\n{context}"

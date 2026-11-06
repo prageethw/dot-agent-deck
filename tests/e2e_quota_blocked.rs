@@ -152,8 +152,15 @@ fn write_orchestration(deck: &TuiDeck, workers: &[(&str, &str, &str)]) {
         "quota-orchestrator.sh",
         "stty -echo -icanon -icrnl -opost min 1 time 0\nprintf ORCH-READY\nexec cat",
     );
-    let mut config = String::from(
-        "[[orchestrations]]\nname = \"quota-test\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"./quota-orchestrator.sh\"\nstart = true\nclear = false\n",
+    // The orchestrator role is named by ABSOLUTE path: this fork spawns every
+    // orchestration role in an isolated clone of the launch directory (PRD
+    // fork#544 M2b), and a clone carries only COMMITTED files, so the
+    // untracked `./quota-orchestrator.sh` just written beside the config is
+    // not there and the role exits at once ("no role panes attached").
+    let orchestrator = deck.workdir().join("quota-orchestrator.sh");
+    let mut config = format!(
+        "[[orchestrations]]\nname = \"quota-test\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"{}\"\nstart = true\nclear = false\n",
+        orchestrator.display()
     );
     for (role, command, agent) in workers {
         config.push_str(&format!(
