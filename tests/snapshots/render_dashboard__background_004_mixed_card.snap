@@ -2,7 +2,8 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
-┌ 1 ClaudeCode · background ─────────────────────────────────────────── ● Idle ┐
+┌ 1 ─────────────────────────────────────────────────────────────────── ● Idle ┐
+│background                                                                    │
 │Dir:  —                                                                       │
 │Background: 2 commands, 1 subagent · 3h 12m                                   │
 │                                                                              │

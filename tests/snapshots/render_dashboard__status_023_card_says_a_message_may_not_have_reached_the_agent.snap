@@ -2,7 +2,8 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
-┌ 1 ClaudeCode · api-svc ───────── ● Thinking ✉ may not have reached the agent ┐
+┌ 1 ────────────────────────────── ● Thinking ✉ may not have reached the agent ┐
+│api-svc                                                                       │
 │Dir:  api-svc                                                                 │
 │the agent has been idle for a few minutes and the deck has not seen it start …│
 │Prmt: move the stats into the border                                          │

@@ -2,7 +2,8 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
-┌ 1 ClaudeCode · api-svc ───────────────────────────────────────────── ● Error ┐
+┌ 1 ────────────────────────────────────────────────────────────────── ● Error ┐
+│api-svc                                                                       │
 │Dir:  api-svc                                                                 │
 │not delivered: review fixture (agent exited)                                  │
 │Prmt: move the stats into the border                                          │

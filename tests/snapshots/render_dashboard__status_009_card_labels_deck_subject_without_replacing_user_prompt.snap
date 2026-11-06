@@ -3,7 +3,8 @@ source: tests/render_dashboard.rs
 assertion_line: 365
 expression: rendered
 ---
-┌ 1 ClaudeCode · api-svc ────────────────────────────────────────── ● Thinking ┐
+┌ 1 ─────────────────────────────────────────────────────────────── ● Thinking ┐
+│api-svc                                                                       │
 │Dir:  api-svc                                                                 │
 │Prmt: ✉ review fixture                                                        │
 │                                                                              │
