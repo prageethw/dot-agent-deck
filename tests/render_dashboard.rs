@@ -529,18 +529,26 @@ fn background_017_minimal_card_keeps_the_delivery_notice_ahead_of_background() {
         ))
     };
 
+    // The fork's Minimal card shares its one body row between the role name and
+    // the status text (`<name>  <status>`, PRD fork#405), where upstream's row is
+    // the status text alone; the name is stripped so the row is compared as the
+    // status text, which is what this test is about.
+    let status_text = |card: &str| -> String {
+        let row = card.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+        row.strip_prefix("background  ")
+            .unwrap_or_else(|| panic!("the row must begin with the role name: {card}"))
+            .to_string()
+    };
     let minimal = render(CardDensityKind::Minimal, 120);
-    let row = minimal.lines().nth(1).unwrap().trim_matches(['│', ' ']);
     assert_eq!(
-        row,
+        status_text(&minimal),
         "Not delivered: review fixture (agent exited) · Background: 1 command, 1 subagent · 4m",
         "{minimal}"
     );
 
     // Narrow: the notice is kept whole and the background part is cut.
     let narrow = render(CardDensityKind::Minimal, 60);
-    let row = narrow.lines().nth(1).unwrap().trim_matches(['│', ' ']);
-    assert!(row.starts_with(notice), "{narrow}");
+    assert!(status_text(&narrow).starts_with(notice), "{narrow}");
 
     let normal = render(CardDensityKind::Normal, 120);
     let rows: Vec<&str> = normal
