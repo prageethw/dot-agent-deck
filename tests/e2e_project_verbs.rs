@@ -1049,10 +1049,13 @@ fn project_launch_005_prepared_roles_use_their_daemon_configured_commands() {
     let mut role_observations = Vec::new();
     let mut role_metadata_matches = true;
     for (role_name, is_start_role, agent) in &expected_roles {
-        let pane_id = format!("project-launch-005-{role_name}");
+        // Fork #365 (PRD #365 M2): the daemon, not the caller, is authoritative for
+        // `pane_id` — it discards the id each start proposes and mints its own — so
+        // the record is found by the id the start reply returned and the role name
+        // it was labelled with, not by the proposed pane id.
         let Some(record) = records.iter().find(|record| {
             configured_start_ids.contains(&record.id)
-                && record.pane_id_env.as_deref() == Some(pane_id.as_str())
+                && record.display_name.as_deref() == Some(*role_name)
         }) else {
             role_observations.push(format!("{role_name}: missing from {records:?}"));
             role_metadata_matches = false;

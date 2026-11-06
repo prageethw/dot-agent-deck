@@ -1448,6 +1448,12 @@ fn telemetry_otlp_015_ci_rounds_follow_polled_check_rollups() {
     close(&deck, &previous);
     let current = start_on_pane(&deck, &previous, &repo, "cat".into());
     let pane = current.pane_id_env.as_deref().unwrap();
+    // Fork #365 (PRD #365 M2): the daemon, not the caller, is authoritative for
+    // `pane_id`, so the successor `start_on_pane` starts "on the same pane" gets a
+    // NEW pane id and the bootstrap run stays on the previous one. The two runs
+    // this test counts are the previous pane's bootstrap run and the successor's
+    // linked-PR run; the CI assertions below read only the latest-started one.
+    let run_panes = [previous.pane_id_env.as_deref().unwrap(), pane];
     let hook = json!({"session_id": "telemetry-ci", "pane_id": pane, "agent_id": current.id,
         "agent_type": "claude_code", "event_type": "session_start", "cwd": repo,
         "timestamp": chrono::Utc::now().to_rfc3339()});
@@ -1479,7 +1485,12 @@ fn telemetry_otlp_015_ci_rounds_follow_polled_check_rollups() {
         common::wait_until(EXPORT_WAIT, || receiver
             .spans()
             .iter()
-            .filter(|span| span["name"] == "agent.run" && attribute(span, "deck.pane.id") == pane)
+            .filter(|span| {
+                span["name"] == "agent.run"
+                    && run_panes
+                        .iter()
+                        .any(|pane| attribute(span, "deck.pane.id") == *pane)
+            })
             .count()
             == 2),
         "bootstrap and linked PR runs must both finish"
@@ -1487,7 +1498,12 @@ fn telemetry_otlp_015_ci_rounds_follow_polled_check_rollups() {
     let runs: Vec<_> = receiver
         .spans()
         .into_iter()
-        .filter(|span| span["name"] == "agent.run" && attribute(span, "deck.pane.id") == pane)
+        .filter(|span| {
+            span["name"] == "agent.run"
+                && run_panes
+                    .iter()
+                    .any(|pane| attribute(span, "deck.pane.id") == *pane)
+        })
         .collect();
     let run = runs
         .iter()
