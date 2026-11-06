@@ -9698,10 +9698,16 @@ impl AppState {
         early_id
     }
 
-    /// The fork's single entry to the placeholder constructor, kept so every
-    /// fork call site (the early-pane reconciliation below, [`Self::seed_hydrated_session`])
-    /// reaches [`Self::draw_placeholder`] through one door: the card is learned from
-    /// the stream open now, which is what [`Self::insert_placeholder_session`] does.
+    /// The fork's entry to the placeholder constructor for the spawn-time
+    /// awaiting-report path (the early-pane reconciliation above): the card is
+    /// learned from the stream open now, which is what
+    /// [`Self::insert_placeholder_session`] does.
+    ///
+    /// It enters [`Self::mint_placeholder`], BELOW [`Self::draw_placeholder`]'s
+    /// same-agent reuse (upstream PRD #1223), on purpose: this is reached only
+    /// when [`Self::early_pane_session`] declined to reconcile (an occupied pane
+    /// key, or more than one session on the pane), and in both shapes the
+    /// historical insert is the fork's pinned behaviour (issue #806).
     fn insert_placeholder_session_inner(
         &mut self,
         pane_id: String,
@@ -9711,7 +9717,7 @@ impl AppState {
         expects_agent_report: bool,
     ) -> String {
         let learned_from = self.stream_incarnation.clone();
-        self.draw_placeholder(
+        self.mint_placeholder(
             pane_id,
             cwd,
             agent_type,
@@ -9797,6 +9803,14 @@ impl AppState {
 
     /// Draw the placeholder [`Self::insert_placeholder_session_learned`]
     /// decided to draw.
+    ///
+    /// PRD #1223 (upstream): an UPSERT for the generation it names — when the pane
+    /// already holds a session under another key carrying the same `agent_id`,
+    /// that card IS this placeholder's card and is returned untouched. The
+    /// spawn-time constructor ([`Self::insert_placeholder_session_awaiting_report`])
+    /// does NOT come through here: it reconciles the early session itself (issue
+    /// #806) and, on the two shapes it declines to guess at, keeps the historical
+    /// insert via [`Self::mint_placeholder`].
     fn draw_placeholder(
         &mut self,
         pane_id: String,
@@ -9817,6 +9831,38 @@ impl AppState {
         {
             return existing;
         }
+        self.mint_placeholder(
+            pane_id,
+            cwd,
+            agent_type,
+            agent_id,
+            learned_from,
+            expects_agent_report,
+        )
+    }
+
+    /// The body of [`Self::draw_placeholder`] below its same-agent reuse: write the
+    /// pane-derived key and leave every other session on the pane where it was.
+    ///
+    /// Fork issue #806 / CLAUDE.md rule 24: the spawn-time awaiting-report path
+    /// enters HERE, not through [`Self::draw_placeholder`]. Its reconciliation
+    /// ([`Self::early_pane_session`]) already handled the one-early-session shapes,
+    /// and answers `None` for exactly the two it will not guess at — more than one
+    /// session on the pane, or the pane key already occupied. Upstream's reuse
+    /// would pick a session there (the first one naming the agent) and mint
+    /// nothing, which is the guess that policy refuses; the historical insert is
+    /// what `spawn_placeholder_keeps_the_historical_insert_on_an_ambiguous_pane`
+    /// pins.
+    fn mint_placeholder(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        learned_from: Incarnation,
+        expects_agent_report: bool,
+    ) -> String {
+        let session_id = placeholder_session_id(&pane_id);
         // Issue #724: a real status-asserting event has already resolved this
         // session (agent_report_activity_seen == true) — do not clobber it back to
         // an unresolved "awaiting report" placeholder. Every other case (a vacant
@@ -23916,6 +23962,82 @@ clear = false
             "an occupied pane key keeps the same-key behaviour: the unresolved \
              entry is replaced by an armed placeholder, and the sibling stays \
              under its own id even though it names the placeholder's agent"
+        );
+    }
+
+    /// Upstream-sync round 29 (CLAUDE.md rule 24): the two constructors disagree
+    /// on purpose, and this pins BOTH halves on one and the same ambiguous pane.
+    /// The plain constructor keeps upstream's PRD #1223 upsert (a card already on
+    /// the pane for the same `Some(agent_id)` IS the placeholder's card: it is
+    /// returned and nothing is minted), while the fork's spawn-time constructor
+    /// (issue #806) declines to guess on such a pane and keeps the historical
+    /// insert under the pane-derived key.
+    #[test]
+    fn the_plain_constructor_reuses_an_announced_card_where_the_spawn_time_one_inserts() {
+        fn ambiguous_pane() -> AppState {
+            let now = Utc::now();
+            let mut state = AppState::default();
+            let mut first = untagged_event("first", EventType::SessionStart);
+            first.agent_id = Some("d-a".to_string());
+            first.timestamp = now;
+            state.apply_event(first);
+            let mut second = untagged_event("second", EventType::Thinking);
+            second.agent_id = Some("d-b".to_string());
+            second.timestamp = now - chrono::TimeDelta::hours(1);
+            state.apply_event(second);
+            state.register_pane(EARLY_PANE.to_string());
+            let mut keys: Vec<_> = state.sessions.keys().cloned().collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec!["first".to_string(), "second".to_string()],
+                "setup: two sessions on the pane, none under the pane key"
+            );
+            state
+        }
+        fn keys(state: &AppState) -> Vec<String> {
+            let mut keys: Vec<_> = state.sessions.keys().cloned().collect();
+            keys.sort();
+            keys
+        }
+
+        let mut plain = ambiguous_pane();
+        let returned = plain.insert_placeholder_session(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-a".to_string()),
+        );
+        assert_eq!(
+            returned, "first",
+            "the plain constructor returns the card the agent already drew"
+        );
+        assert_eq!(
+            keys(&plain),
+            vec!["first".to_string(), "second".to_string()],
+            "and mints nothing beside it"
+        );
+
+        let mut spawn_time = ambiguous_pane();
+        let returned = spawn_time.insert_placeholder_session_awaiting_report(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-a".to_string()),
+            true,
+        );
+        assert_eq!(
+            returned, EARLY_PANE_KEY,
+            "the spawn-time constructor answers the pane-derived key"
+        );
+        assert_eq!(
+            keys(&spawn_time),
+            vec![
+                "first".to_string(),
+                EARLY_PANE_KEY.to_string(),
+                "second".to_string()
+            ],
+            "and inserts it beside both sessions instead of guessing between them"
         );
     }
 
