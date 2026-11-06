@@ -47,7 +47,14 @@ use spec::spec;
 /// The pane the (synthetic) Pi extension reports under — the value the TUI
 /// passes as `DOT_AGENT_DECK_PANE_ID` when it asks the daemon to spawn the pane.
 /// Chosen so it carries no capital `Pi` and no hook of its own.
-const PI_PANE: &str = "pi-headless-pane";
+///
+/// It carries the `desktop-` prefix on purpose: the fork's daemon is
+/// authoritative for `pane_id` (PRD #365 M2) and replaces whatever a client
+/// proposes, except a lone, well-formed, unused `desktop-` id, which it honours.
+/// Any other name would be swapped for a minted one and every comparison below
+/// (the registered pane, the capability the daemon issued for it, the pane the
+/// events claim) would be against a pane that does not exist.
+const PI_PANE: &str = "desktop-pi-headless-pane";
 
 /// The stand-in for a Pi pane: a shell that, like the bundled extension, runs
 /// `dot-agent-deck agent-event --type <state>` from inside the pane for each
