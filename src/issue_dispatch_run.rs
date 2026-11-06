@@ -10148,6 +10148,12 @@ exit 0
     /// says the work was kept and what to do, leaves the file in place, and
     /// never reports the worktree removed. A CLEAN leftover is still removed
     /// (`the_abandoned_spawn_retry_removes_only_under_the_repository_worktree_lock`).
+    ///
+    /// The keep is not a one-off: the issue is retried on every fire, so the
+    /// same reclaim runs again and again against the same registries, and each
+    /// fire must keep the work and say the same thing. Once the work is resolved
+    /// (the file gone) the very next fire removes the leftover, so the issue is
+    /// dispatched once clean and is not stuck behind a stale keep.
     #[tokio::test]
     async fn a_dirty_abandoned_leftover_is_kept_and_reported_never_discarded() {
         let tmp = crate::test_temp::tempdir().unwrap();
@@ -10159,14 +10165,11 @@ exit 0
         crate::worktree_owner::mark_abandoned_spawn(&wt, &creator).unwrap();
         std::fs::write(wt.join("scratch.txt"), "the user's uncommitted work").unwrap();
 
-        let outcome = reclaim_abandoned_spawn(
-            &wt,
-            &repo,
-            creator,
-            &new_worktree_registry(),
-            &AgentPtyRegistry::new(),
-        )
-        .await;
+        let worktrees = new_worktree_registry();
+        let agents = AgentPtyRegistry::new();
+
+        let outcome =
+            reclaim_abandoned_spawn(&wt, &repo, creator.clone(), &worktrees, &agents).await;
         let Reclaim::Failed(message) = &outcome else {
             panic!("a dirty leftover must be reported, not removed: {outcome:?}");
         };
@@ -10179,6 +10182,28 @@ exit 0
             "the user's uncommitted work",
             "the uncommitted work is untouched"
         );
+
+        // The next fire: the same keep, the same message, the work still there.
+        let again = reclaim_abandoned_spawn(&wt, &repo, creator.clone(), &worktrees, &agents).await;
+        assert_eq!(
+            again, outcome,
+            "every fire must keep the dirty leftover and report it the same way"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("scratch.txt")).unwrap(),
+            "the user's uncommitted work",
+            "a second fire must not touch the uncommitted work either"
+        );
+
+        // The work is resolved: the next fire removes the now-clean leftover.
+        std::fs::remove_file(wt.join("scratch.txt")).unwrap();
+        let clean = reclaim_abandoned_spawn(&wt, &repo, creator, &worktrees, &agents).await;
+        assert_eq!(
+            clean,
+            Reclaim::Removed,
+            "once the work is resolved the leftover is removed, so the issue can be dispatched"
+        );
+        assert!(!wt.exists(), "the clean leftover is gone from disk");
     }
 
     #[tokio::test]
