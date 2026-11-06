@@ -681,3 +681,54 @@ fn card_identity_row_rejects_every_box_that_is_not_that_roles_card() {
          row:\n{TRUNCATED}"
     );
 }
+
+/// Scenario: Draw two cards side by side where only the right-hand one is selected (thick
+/// border, ` ▸ 2 ` badge), then a lone selected card, an unselected card, and a card with the
+/// name in its title border. `common::selected_card_named` must be true only for the selected
+/// card's own name under its own columns, never for the other card of the pair that shares the
+/// marker's row, a mere prefix of a longer name, an unselected card, or upstream's layout with
+/// the name beside the marker.
+#[test]
+fn selected_card_named_pairs_the_marker_with_the_name_under_it() {
+    let pair = "\
+┌ 1 ─────┐┏ ▸ 2 ━━━┓
+│first   │┃second  ┃
+└────────┘┗━━━━━━━━┛";
+    assert!(
+        common::selected_card_named(pair, "second"),
+        "the selected right-hand card is named `second`:\n{pair}"
+    );
+    assert!(
+        !common::selected_card_named(pair, "first"),
+        "`first` shares the marker's row but sits under the other card:\n{pair}"
+    );
+
+    let lone = "\
+┏ ▸ 1 ━━━━━━━━━━━━━━━┓
+┃never-attached-card ┃
+┗━━━━━━━━━━━━━━━━━━━━┛";
+    assert!(common::selected_card_named(lone, "never-attached-card"));
+    assert!(
+        !common::selected_card_named(lone, "never-attached"),
+        "a name that is only a prefix of the card's longer name is not that card:\n{lone}"
+    );
+
+    let unselected = "\
+┌ 1 ─────────────────┐
+│never-attached-card │
+└────────────────────┘";
+    assert!(
+        !common::selected_card_named(unselected, "never-attached-card"),
+        "an unselected card carries no marker:\n{unselected}"
+    );
+
+    let name_in_title = "\
+┏ ▸ 1 never-attached ┓
+┃other               ┃
+┗━━━━━━━━━━━━━━━━━━━━┛";
+    assert!(
+        !common::selected_card_named(name_in_title, "never-attached"),
+        "a name in the title border (upstream's layout) is not the fork's identity \
+         row:\n{name_in_title}"
+    );
+}

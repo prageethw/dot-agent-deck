@@ -1012,8 +1012,7 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
             deck.wait_for_string("never-attached-card");
             deck.send_keys(b"\x1b[B");
             deck.wait_until_grid("old never-attached card selected before restart", |grid| {
-                grid.lines()
-                    .any(|line| line.contains('▸') && line.contains("never-attached-card"))
+                common::selected_card_named(grid, "never-attached-card")
             });
             assert_eq!(
                 proxy.attach_count(),
@@ -1043,11 +1042,11 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                             },
                         );
                         let grid = deck.snapshot_grid();
+                        // The fork draws a card's name on the row under its border,
+                        // not on the border (PRD fork#405 M1), so the card is found by
+                        // its identity row.
                         assert!(
-                            !grid
-                                .lines()
-                                .any(|line| (line.contains('┌') || line.contains('┏'))
-                                    && line.contains("never-attached-card")),
+                            common::card_identity_row(&grid, "never-attached-card").is_none(),
                             "a card closed in this TUI returned after resync: {grid}"
                         );
                         assert!(
@@ -1134,16 +1133,11 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                 let grid = deck.snapshot_grid();
                 // The old label is allowed in the notice, never in a card.
                 assert!(
-                    !grid
-                        .lines()
-                        .any(|line| (line.contains('┌') || line.contains('┏'))
-                            && line.contains("never-attached-card")),
+                    common::card_identity_row(&grid, "never-attached-card").is_none(),
                     "old card was kept: {grid}"
                 );
                 assert!(
-                    grid.lines().any(|line| line
-                        .split(['┌', '┏'])
-                        .any(|card| { card.contains('▸') && card.contains(earlier_title) })),
+                    common::selected_card_named(&grid, earlier_title),
                     "selection inherited the same-pane successor instead of falling back: {grid}"
                 );
                 assert!(!grid.contains(" Gone "), "retired card was kept: {grid}");
@@ -1393,9 +1387,7 @@ fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
     proxy.hold_terminal_eof(false);
     deck.wait_for_string("The deck restarted; these agents were stopped: rename-control.");
     deck.wait_until_grid("the successor has its own named card", |grid| {
-        grid.lines().any(|line| {
-            (line.contains('┌') || line.contains('┏')) && line.contains("rename-successor")
-        })
+        common::card_identity_row(grid, "rename-successor").is_some()
     });
     deck.send_keys(b"r");
     deck.wait_for_string("Rename:");

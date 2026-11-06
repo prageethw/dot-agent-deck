@@ -5611,6 +5611,55 @@ pub fn card_identity_row(grid: &str, label: &str) -> Option<usize> {
     })
 }
 
+/// Whether the deck card named `label` is the SELECTED one: its title row opens
+/// with the ` ▸ N ` badge and its identity row, directly beneath and between the
+/// same two verticals, opens with `label`.
+///
+/// Upstream drew a card's name in the title border beside the `▸` marker, so
+/// `line.contains('▸') && line.contains(name)` read "the selected card named X"
+/// off one row. The fork draws the name on its own first body row (PRD fork#405
+/// M1), so the two are on adjacent rows and a row test cannot tell WHICH card of
+/// a side-by-side pair holds the marker. This pairs them by the card's own
+/// columns, every card on every row (unlike [`card_identity_row`], which stops at
+/// the first card named `label`), with the same name boundary rules.
+pub fn selected_card_named(grid: &str, label: &str) -> bool {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let lines: Vec<Vec<char>> = grid.lines().map(|line| line.chars().collect()).collect();
+    lines.iter().enumerate().any(|(row, top)| {
+        let Some(body) = lines.get(row + 1) else {
+            return false;
+        };
+        BORDER_WEIGHTS.iter().any(|weight| {
+            top.iter()
+                .enumerate()
+                .filter(|(_, ch)| **ch == weight.top_left)
+                .any(|(start, _)| {
+                    let Some(end) = top
+                        .iter()
+                        .enumerate()
+                        .skip(start + 1)
+                        .find_map(|(index, ch)| (*ch == weight.top_right).then_some(index))
+                    else {
+                        return false;
+                    };
+                    let title = &top[start + 1..end];
+                    if !is_card_title(title) || !title.starts_with(&[' ', '▸', ' ']) {
+                        return false;
+                    }
+                    if body.get(start) != Some(&weight.vertical)
+                        || body.get(end) != Some(&weight.vertical)
+                    {
+                        return false;
+                    }
+                    let inner: String = body[start + 1..end].iter().collect();
+                    inner
+                        .strip_prefix(label)
+                        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
+                })
+        })
+    })
+}
+
 /// Whether `title` — the cells between a box's two top corners — opens with a
 /// deck card's shortcut badge: a space, the `▸ ` selection marker when the card
 /// is the selected one, the card's number, and a space (`┌ 1 ──…`,

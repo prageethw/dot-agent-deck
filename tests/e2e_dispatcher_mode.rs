@@ -2164,7 +2164,7 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     assert!(
         common::wait_until(Duration::from_secs(10), || {
             let g = deck.snapshot_grid();
-            g.lines().any(|l| l.contains('▸') && l.contains(CARD))
+            common::selected_card_named(&g, CARD)
         }),
         "the dispatched card is not the selected one after the caller closed, so \
          Ctrl+W would not target it.\nGrid:\n{}",
