@@ -9878,14 +9878,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
 - **Layer:** L2 synthetic PTY-attached restore through the real wrapper; lane 1.
 - **Agent:** synthetic Codex argv oracle with an isolated config home.
-- **Asserts:** restoring persisted bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, and accepts pane input. An already-prefixed restore receives the pair once; config.toml bytes remain unchanged.
+- **Asserts:** restoring persisted bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, and accepts pane input. An already-prefixed restore receives the pair once; config.toml keeps the fixture bytes as an unmodified prefix and gains exactly the fork's one `[projects."<pane cwd>"] trust_level = "trusted"` record (fork #732; upstream's "byte for byte" pin, re-pinned in the 2026-11-05 sync: any other change to the file still fails).
 - **Does not assert:** real Codex config merging or daemon exclusion; orchestration paths (003).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/003 — Orchestration role Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
 - **Layer:** L2 synthetic PTY-attached new-pane orchestration flow through the real wrapper; lane 1.
 - **Agent:** synthetic Codex argv oracle as the start role.
-- **Asserts:** selecting an orchestration whose start-role command is bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, accepts pane input, and leaves config.toml bytes unchanged.
+- **Asserts:** selecting an orchestration whose start-role command is bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, accepts pane input, and config.toml keeps the fixture bytes as an unmodified prefix and gains exactly the fork's one `[projects."<pane cwd>"] trust_level = "trusted"` record (fork #732; upstream's "byte for byte" pin, re-pinned in the 2026-11-05 sync: any other change to the file still fails).
 - **Does not assert:** real Codex config merging or daemon exclusion; scheduler role spawning (`scheduler/spawn/006`) or respawn.
 - **Platform coverage:** mac+linux.
 
@@ -9920,7 +9920,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/spawn/009 — A config-declared Codex orchestration role wraps and badges a non-inferable launcher before the first task.
 - **Layer:** L2 synthetic PTY-attached new-pane orchestration flow through the real wrapper; lane 1.
 - **Agent:** synthetic `devbox run codex-big` launcher declared as Codex by the start role.
-- **Asserts:** the role crosses the real wrapper exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`; devbox receives exactly `run`, `codex-big` without Codex options. The fixture launcher selects embedded mode for its inner synthetic Codex, the pane visibly emits launcher and embedded success, accepts input, and its card reads `Codex` before a task or synthesized hook.
+- **Asserts:** the role crosses the real wrapper exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`; devbox receives exactly `run`, `codex-big` without Codex options. The fixture launcher selects embedded mode for its inner synthetic Codex, the pane visibly emits launcher and embedded success, accepts input, and its card reads `Codex` before a task or synthesized hook; config.toml keeps the fixture bytes as an unmodified prefix and gains exactly the fork's one `[projects."<pane cwd>"] trust_level = "trusted"` record (fork #732; upstream's "byte for byte" pin, re-pinned in the 2026-11-05 sync: any other change to the file still fails).
 - **Does not assert:** that a Codex declaration can configure an opaque launcher's inner argv; real Codex merging or daemon exclusion; `clear = true` re-create precedence (`codex/spawn/010`) or a real Codex process (`codex/spawn/012`).
 - **Platform coverage:** mac+linux.
 
@@ -9942,7 +9942,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/spawn/013 — A plain new-pane Codex command launches through the Wrapper strategy exactly once (issue #533).
 - **Layer:** L2 synthetic PTY-attached new-pane flow (no mode) through the real wrapper and real telemetry shim; lane 1.
 - **Agent:** synthetic Codex argv oracle at a recognized npm-shaped launcher path, rejecting `--no-daemon` as an older release would.
-- **Asserts:** submitting Ctrl+N crosses the wrapper once and prepends `-c shell_environment_policy.set={}` with telemetry off, exporter additions on, a user exporter configured, and an absolute Codex executable. The pane visibly emits `EMBEDDED_SUCCESS` and accepts input; whole-table and nested user `set` overrides follow the prepended pair unchanged, as do model and spaced prompt arguments; fixture config.toml bytes stay identical.
+- **Asserts:** submitting Ctrl+N crosses the wrapper once and prepends `-c shell_environment_policy.set={}` with telemetry off, exporter additions on, a user exporter configured, and an absolute Codex executable. The pane visibly emits `EMBEDDED_SUCCESS` and accepts input; whole-table and nested user `set` overrides follow the prepended pair unchanged, as do model and spaced prompt arguments; config.toml keeps the fixture bytes as an unmodified prefix and gains exactly the fork's one `[projects."<pane cwd>"] trust_level = "trusted"` record (fork #732; upstream's "byte for byte" pin, re-pinned in the 2026-11-05 sync: any other change to the file still fails).
 - **Does not assert:** Codex's own recursive config merging, implicit daemon exclusion, or environment inheritance; the fixture checks argv and visible synthetic output. Those runtime claims still need the isolated real-Codex lane-2 verification; renamed wrapper-build resolution remains unit-tested in `src/wrap.rs`.
 - **Platform coverage:** mac+linux.
 

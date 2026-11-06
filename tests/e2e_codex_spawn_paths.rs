@@ -123,10 +123,34 @@ impl EmbeddedFixture {
             wrapped.lines().collect::<Vec<_>>(),
             [format!("WRAPPED wrap --agent codex -- {expected_command}")]
         );
+        // Upstream pinned this launch as "config.toml byte for byte". This fork
+        // adds exactly one thing to the file on a deck-spawned Codex launch (fork
+        // #732): a persistent `[projects."<pane cwd>"] trust_level = "trusted"`
+        // record, so a pane nobody can answer for does not stop at Codex's own
+        // folder-trust prompt and never load its hooks. The guarantee is now
+        // "launch adds nothing except that one documented record": the fixture
+        // bytes stay an unmodified prefix (no reformat, no reorder, no lost
+        // content), then comes EXACTLY the record for the pane's directory, and
+        // anything else appended or changed still fails.
+        let mut expected = self.config.clone().into_bytes();
+        expected.extend_from_slice(
+            format!(
+                "\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                launched_pane_cwd(deck).display()
+            )
+            .as_bytes(),
+        );
+        let actual = std::fs::read(self.path("codex-home/config.toml")).unwrap();
+        assert!(
+            actual.starts_with(self.config.as_bytes()),
+            "launch must keep the fixture config.toml as an unmodified prefix; got:\n{}",
+            String::from_utf8_lossy(&actual)
+        );
         assert_eq!(
-            std::fs::read(self.path("codex-home/config.toml")).unwrap(),
-            self.config.as_bytes(),
-            "launch must preserve fixture config.toml byte for byte"
+            String::from_utf8_lossy(&actual),
+            String::from_utf8_lossy(&expected),
+            "launch must add nothing to config.toml except the fork's one project-trust record \
+             (fork #732) for the pane's directory"
         );
         // Both modes remain interactive, so RED reflects the missing prefix
         // rather than a fixture that exited before the pane could be attached.
@@ -146,6 +170,41 @@ impl EmbeddedFixture {
         let grid = deck.snapshot_grid();
         (args.into_iter().next().unwrap(), grid)
     }
+}
+
+/// The directory the launched Codex pane runs in, read from the daemon's own
+/// agent record rather than predicted: the working directory for a plain pane,
+/// the isolated clone `<workdir>-<dirname>-orchestrator-N` for an orchestration
+/// role (PRD fork#544 M2b). Canonical, as the project-trust record names it.
+/// Every Codex agent in these tests runs in one directory, so more than one is a
+/// fixture that no longer says which record to expect.
+#[cfg(unix)]
+fn launched_pane_cwd(deck: &TuiDeck) -> PathBuf {
+    use dot_agent_deck::event::AgentType;
+
+    let records = common::agent_records_on(deck.attach_socket_path());
+    let codex: Vec<_> = records
+        .iter()
+        .filter(|record| record.agent_type == Some(AgentType::Codex))
+        .collect();
+    let candidates = if codex.is_empty() {
+        records.iter().collect()
+    } else {
+        codex
+    };
+    let mut cwds: Vec<PathBuf> = candidates
+        .iter()
+        .filter_map(|record| record.cwd.as_deref())
+        .map(|cwd| std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd)))
+        .collect();
+    cwds.sort();
+    cwds.dedup();
+    assert_eq!(
+        cwds.len(),
+        1,
+        "expected the launched Codex pane to run in exactly one directory; records = {records:?}"
+    );
+    cwds.remove(0)
 }
 
 #[cfg(unix)]
@@ -189,7 +248,7 @@ fn open_form(deck: &TuiDeck) {
     deck.wait_for_string("No mode");
 }
 
-/// Scenario: Restore bare and already-prefixed synthetic Codex panes through the real wrapper. Each pane must visibly select embedded mode, remain usable, preserve its config, and receive the embedded pair exactly once.
+/// Scenario: Restore bare and already-prefixed synthetic Codex panes through the real wrapper. Each pane must visibly select embedded mode, remain usable, receive the embedded pair exactly once, and leave its config.toml as the fixture plus the one project-trust record the fork adds for the pane's directory.
 #[spec("codex/spawn/001")]
 #[test]
 #[cfg(unix)]
@@ -211,7 +270,7 @@ fn spawn_001_plain_restore_wraps_codex() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Scenario: Select an orchestration whose start role runs synthetic Codex through the real wrapper. The role pane must visibly select embedded mode, accept input, and retain the fixture configuration.
+/// Scenario: Select an orchestration whose start role runs synthetic Codex through the real wrapper. The role pane must visibly select embedded mode, accept input, and leave config.toml as the fixture plus the one project-trust record the fork adds for the role's isolated-clone directory.
 #[spec("codex/spawn/003")]
 #[test]
 #[cfg(unix)]
@@ -384,7 +443,7 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
     );
 }
 
-/// Scenario: Submit direct synthetic Codex commands through Ctrl+N with telemetry off, exporter additions, a user exporter, and an absolute executable path. The pane must visibly select embedded mode and accept input while user config overrides, model, prompt, and config-file bytes survive unchanged.
+/// Scenario: Submit direct synthetic Codex commands through Ctrl+N with telemetry off, exporter additions, a user exporter, and an absolute executable path. The pane must visibly select embedded mode and accept input while user config overrides, model, and prompt survive unchanged and the config file is the fixture bytes plus only the one project-trust record the fork adds for the pane's directory.
 #[spec("codex/spawn/013")]
 #[test]
 #[cfg(unix)]
