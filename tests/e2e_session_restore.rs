@@ -680,19 +680,15 @@ fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
 }
 
 /// Scenario: Stage an orchestration `.dot-agent-deck.toml` named `tdd-cycle`
-/// whose CONFIG default start role is `orchestrator` (index 0, `start = true`),
-/// with a recorder agent on BOTH roles (`orchestrator` at 0, `coder` at 1). Then
+/// whose config default start role is `orchestrator` (index 0, `start = true`),
+/// with a recorder agent on both roles (`orchestrator` at 0, `coder` at 1), then
 /// hand-stage a `session.toml` whose `[panes.orchestration]` block saves a
-/// `start_role_index` of 1 (`coder`) — a cursor that DIFFERS from the config
-/// default. Launch against a fresh (empty) daemon with NO flag. The saved start
-/// cursor must be HONORED: the replayed `orchestrator_prompt` must be posted to
-/// the inbox of the role at the SAVED index (`coder`, index 1), NOT to the
-/// config-default start role (`orchestrator`, index 0) — and `daemon status`
-/// must mark that same saved role, and only it, as the orchestrator, so the
-/// pane holding the prompt is the pane allowed to delegate. RED today: the restore
-/// branch recomputes the start from the live config
-/// (`roles.iter().position(|r| r.start)`) and never reads `snap.start_role_index`,
-/// so the prompt is delivered to `orchestrator` and `coder` never receives it.
+/// `start_role_index` of 1 (`coder`) and launch against a fresh daemon with no
+/// flag. The saved start cursor must be honored: the replayed
+/// `orchestrator_prompt` is posted to the inbox of the role at the saved index
+/// (`coder`), not to the config-default start role (`orchestrator`). `daemon
+/// status` must mark that same saved role, and only it, as the orchestrator, so
+/// the pane holding the prompt is the pane allowed to delegate.
 #[spec("session/restore/011")]
 #[test]
 fn restore_011_saved_start_role_index_is_honored_over_config_default() {
