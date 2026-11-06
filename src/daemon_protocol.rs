@@ -5119,6 +5119,41 @@ impl OrchestrationSpawnMeta {
             .or_else(|| cwd.map(str::to_string))
             .unwrap_or_default()
     }
+
+    /// The directory the run-title check keys on: the LOGICAL directory the run
+    /// was started for, which for this fork's isolated clones is not the
+    /// directory its panes run in.
+    ///
+    /// Upstream-sync round 35 (CLAUDE.md rule 24, `orchestration/identity/010`).
+    /// Upstream's check (issue #555) keys on [`Self::orchestration_cwd`], because
+    /// upstream's orchestrations run in the directory the user picked. The fork's
+    /// TUI provisions an isolated clone for every orchestration (fork#544 M2b),
+    /// so its role panes name that CLONE there, while every client that runs in
+    /// the picked directory itself — the desktop app, an older or upstream TUI —
+    /// names the SOURCE. The two never shared a key, so the same title from both,
+    /// in the same project, was admitted twice: the very pair of tabs with
+    /// indistinguishable labels the check exists to prevent, and the pair the
+    /// `Ctrl+n` form already treats as one (`live_orchestration_occupies` in
+    /// `src/ui.rs` matches a live entry by the source directory and by the clone
+    /// derived from it).
+    ///
+    /// The fork's start already says which source its clone came from:
+    /// `isolated_clone_origin`, sent on every role pane of such a tab. When it is
+    /// there (and a usable absolute path, as the cwd it stands in for must be),
+    /// it is the key, so a cloned start and a source-directory start of one
+    /// project share one. Without it the key is [`Self::orchestration_cwd`]
+    /// exactly as before, so a start that names no origin behaves as upstream's.
+    ///
+    /// Only the title's UNIQUENESS key moves. Where the panes run, what the tab
+    /// records as its cwd and what the worktree registry holds are untouched.
+    fn title_directory(&self, cwd: Option<&str>, isolated_clone_origin: Option<&str>) -> String {
+        match isolated_clone_origin {
+            Some(origin) if crate::agent_pty::is_valid_orchestration_cwd(origin) => {
+                origin.to_string()
+            }
+            _ => self.orchestration_cwd(cwd),
+        }
+    }
 }
 
 /// Issue #463 test seam: whether this daemon serves an orchestration start with
@@ -6656,10 +6691,17 @@ async fn handle_connection(
                 match (pane_id_env.as_deref(), orchestration_meta.as_ref()) {
                     (Some(_), Some(meta)) if membership_is_kept => {
                         let identity = meta.identity();
-                        let orch_cwd = crate::state::orchestration_title_cwd_key(
-                            &meta.orchestration_cwd(cwd_for_state.as_deref()),
-                        )
-                        .await;
+                        // Keyed by the LOGICAL directory — the clone's source when
+                        // this start carries one — so the fork's cloned
+                        // orchestrations and a source-directory client of the
+                        // same project collide on one title; see
+                        // `OrchestrationSpawnMeta::title_directory`.
+                        let orch_cwd =
+                            crate::state::orchestration_title_cwd_key(&meta.title_directory(
+                                cwd_for_state.as_deref(),
+                                isolated_clone_origin.as_deref(),
+                            ))
+                            .await;
                         let claimed = state.write().await.claim_orchestration_title(
                             &identity,
                             meta.display_title.as_deref(),
@@ -13762,6 +13804,206 @@ mod tests {
             ),
             "a workspace collision between two different Names keeps the generic \
              sentence, with no title marker"
+        );
+    }
+
+    /// Upstream-sync round 35 (CLAUDE.md rule 24, `orchestration/identity/010`):
+    /// the run-title check keys a start by the LOGICAL directory it was made
+    /// for, not by the directory its panes run in. The fork's TUI runs every
+    /// orchestration in an isolated clone, so its role panes name the clone as
+    /// their `orchestration_cwd` and the project they were cloned from as
+    /// `isolated_clone_origin`; a client that runs in the picked directory itself
+    /// (the desktop app, an older or upstream TUI) names that directory. Keyed by
+    /// `orchestration_cwd` alone, the same title in the same project from both was
+    /// admitted twice — issue #555's two indistinguishable tabs — in either order.
+    #[tokio::test]
+    async fn the_run_title_check_keys_a_cloned_start_by_the_directory_it_was_cloned_from() {
+        const SOURCE: &str = "/work/proj";
+        const CLONE: &str = "/work/proj-proj-orchestrator-1";
+        const TITLE: &str = "proj-orchestrator-1";
+        let meta = |tab: &str, orchestration_cwd: &str| OrchestrationSpawnMeta {
+            name: "demo-orch".into(),
+            role_name: "orchestrator".into(),
+            is_start_role: true,
+            orchestration_cwd: Some(orchestration_cwd.into()),
+            orchestration_id: tab.into(),
+            display_title: Some(TITLE.into()),
+        };
+        // One start, exactly as the handler runs it: key the directory, then
+        // claim. Nothing is released, so each admitted start holds its title the
+        // way an in-flight (or live) one does.
+        async fn start(
+            state: &mut crate::state::AppState,
+            registry: &crate::agent_pty::AgentPtyRegistry,
+            meta: &OrchestrationSpawnMeta,
+            origin: Option<&str>,
+        ) -> Result<(), crate::state::OrchestrationTitleInUse> {
+            let key =
+                crate::state::orchestration_title_cwd_key(&meta.title_directory(None, origin))
+                    .await;
+            state.claim_orchestration_title(
+                &meta.identity(),
+                meta.display_title.as_deref(),
+                &key,
+                registry,
+            )
+        }
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+
+        // A source-directory client first, then the fork's cloned start.
+        let mut state = crate::state::AppState::default();
+        start(&mut state, &registry, &meta("desktop-tab", SOURCE), None)
+            .await
+            .expect("a free title is admitted");
+        assert_eq!(
+            start(
+                &mut state,
+                &registry,
+                &meta("deck-tab", CLONE),
+                Some(SOURCE)
+            )
+            .await,
+            Err(crate::state::OrchestrationTitleInUse {
+                title: TITLE.into(),
+                cwd: SOURCE.into(),
+            }),
+            "a cloned start collides with a source-directory start of the project it \
+             was cloned from, and the refusal names the project's directory"
+        );
+
+        // The fork's cloned start first, then a source-directory client.
+        let mut state = crate::state::AppState::default();
+        start(
+            &mut state,
+            &registry,
+            &meta("deck-tab", CLONE),
+            Some(SOURCE),
+        )
+        .await
+        .expect("a free title is admitted");
+        assert!(
+            start(&mut state, &registry, &meta("desktop-tab", SOURCE), None)
+                .await
+                .is_err(),
+            "a source-directory start collides with a cloned start of its project"
+        );
+
+        // Two cloned starts of one project and title collide on the origin, too.
+        let mut state = crate::state::AppState::default();
+        start(&mut state, &registry, &meta("deck-a", CLONE), Some(SOURCE))
+            .await
+            .expect("a free title is admitted");
+        assert!(
+            start(
+                &mut state,
+                &registry,
+                &meta("deck-b", "/work/proj-proj-orchestrator-1-2"),
+                Some(SOURCE),
+            )
+            .await
+            .is_err(),
+            "the physical clone directory may differ (a disambiguated sibling); the project does not"
+        );
+
+        // Controls: the key moved only for a start that names an origin.
+        let mut state = crate::state::AppState::default();
+        start(
+            &mut state,
+            &registry,
+            &meta("deck-tab", CLONE),
+            Some(SOURCE),
+        )
+        .await
+        .expect("a free title is admitted");
+        assert!(
+            start(
+                &mut state,
+                &registry,
+                &meta("other", "/work/elsewhere"),
+                None
+            )
+            .await
+            .is_ok(),
+            "the same title in another project is another key"
+        );
+        let mut state = crate::state::AppState::default();
+        start(
+            &mut state,
+            &registry,
+            &meta("deck-tab", CLONE),
+            Some(SOURCE),
+        )
+        .await
+        .expect("a free title is admitted");
+        assert!(
+            start(
+                &mut state,
+                &registry,
+                &meta("deck-other", "/work/elsewhere-clone"),
+                Some("/work/elsewhere"),
+            )
+            .await
+            .is_ok(),
+            "a cloned start from another project is another key too"
+        );
+        // A start that names no origin keeps keying on its orchestration cwd, as
+        // upstream's does: two of them in one directory collide, and one that
+        // names a clone's own path is another key than the project it came from.
+        let mut state = crate::state::AppState::default();
+        start(&mut state, &registry, &meta("desktop-a", SOURCE), None)
+            .await
+            .expect("a free title is admitted");
+        assert!(
+            start(&mut state, &registry, &meta("desktop-b", SOURCE), None)
+                .await
+                .is_err(),
+            "two starts that name no origin collide on their orchestration cwd"
+        );
+        assert!(
+            start(&mut state, &registry, &meta("desktop-c", CLONE), None)
+                .await
+                .is_ok(),
+            "without an origin the clone's own path is the key, as it was"
+        );
+    }
+
+    /// The origin stands in for the orchestration cwd only when it could be one:
+    /// a relative or control-byte path is not a directory the title can be
+    /// scoped by, so the start keeps keying on its own cwd rather than on text a
+    /// client chose.
+    #[test]
+    fn the_run_title_directory_ignores_an_origin_that_is_not_a_usable_directory() {
+        let meta = OrchestrationSpawnMeta {
+            name: "demo-orch".into(),
+            role_name: "orchestrator".into(),
+            is_start_role: true,
+            orchestration_cwd: Some("/work/proj-clone".into()),
+            orchestration_id: "tab".into(),
+            display_title: None,
+        };
+        assert_eq!(
+            meta.title_directory(Some("/pane/cwd"), Some("/work/proj")),
+            "/work/proj",
+            "a usable origin is the key"
+        );
+        for unusable in ["relative/proj", "/work/pro\nj", ""] {
+            assert_eq!(
+                meta.title_directory(Some("/pane/cwd"), Some(unusable)),
+                "/work/proj-clone",
+                "{unusable:?} is not a directory to key on"
+            );
+        }
+        assert_eq!(
+            meta.title_directory(Some("/pane/cwd"), None),
+            "/work/proj-clone",
+            "no origin: the orchestration cwd, as before"
+        );
+        let mut no_cwd = meta;
+        no_cwd.orchestration_cwd = None;
+        assert_eq!(
+            no_cwd.title_directory(Some("/pane/cwd"), None),
+            "/pane/cwd",
+            "no origin and no orchestration cwd: the pane's cwd, as before"
         );
     }
 
