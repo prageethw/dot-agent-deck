@@ -9901,7 +9901,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/spawn/003 — Orchestration role Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
 - **Layer:** L2 synthetic PTY-attached new-pane orchestration flow through the real wrapper; lane 1.
 - **Agent:** synthetic Codex argv oracle as the start role.
-- **Asserts:** selecting an orchestration whose start-role command is bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, accepts pane input, and config.toml keeps the fixture bytes as an unmodified prefix and gains exactly the fork's one `[projects."<pane cwd>"] trust_level = "trusted"` record (fork #732; upstream's "byte for byte" pin, re-pinned in the 2026-11-05 sync: any other change to the file still fails).
+- **Asserts:** selecting an orchestration whose start-role command is bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, accepts pane input, and config.toml keeps the fixture bytes as an unmodified prefix and gains exactly the fork's one `[projects."<pane cwd>"] trust_level = "trusted"` record (fork #732; upstream's "byte for byte" pin, re-pinned in the 2026-11-05 sync: any other change to the file still fails, compared as bytes, not lossy text). The directory that record names is pinned independently of the daemon's own agent record: it is the role's isolated clone, not the deck's working directory, and its name ends in `-orchestrator-<N>`.
 - **Does not assert:** real Codex config merging or daemon exclusion; scheduler role spawning (`scheduler/spawn/006`) or respawn.
 - **Platform coverage:** mac+linux.
 

@@ -146,11 +146,16 @@ impl EmbeddedFixture {
             "launch must keep the fixture config.toml as an unmodified prefix; got:\n{}",
             String::from_utf8_lossy(&actual)
         );
-        assert_eq!(
-            String::from_utf8_lossy(&actual),
-            String::from_utf8_lossy(&expected),
+        // Compared as BYTES, not as lossy text: `from_utf8_lossy` turns every
+        // invalid sequence into the same U+FFFD, so a mutation that wrote
+        // different non-UTF-8 bytes could compare equal. The text is only the
+        // failure message, where a human has to read it.
+        assert!(
+            actual == expected,
             "launch must add nothing to config.toml except the fork's one project-trust record \
-             (fork #732) for the pane's directory"
+             (fork #732) for the pane's directory, byte for byte.\nlaunched:\n{}\nexpected:\n{}",
+            String::from_utf8_lossy(&actual),
+            String::from_utf8_lossy(&expected)
         );
         // Both modes remain interactive, so RED reflects the missing prefix
         // rather than a fixture that exited before the pane could be attached.
@@ -290,6 +295,30 @@ fn spawn_003_orchestration_role_wraps_codex() {
         embedded_failure("orchestration", &args, &grid).is_none(),
         "{}",
         embedded_failure("orchestration", &args, &grid).unwrap()
+    );
+    // `observe` takes the directory the trust record must name from the
+    // daemon's own agent record, so a daemon that recorded AND trusted the wrong
+    // directory, consistently, would satisfy it. An orchestration role runs in an
+    // ISOLATED CLONE of the deck's directory (PRD fork#544 M2b), never in the
+    // directory itself, and the clone's name ends in `-orchestrator-<N>`: so the
+    // directory the record names is pinned to that shape independently.
+    let record_dir = launched_pane_cwd(&deck);
+    let workdir = std::fs::canonicalize(deck.workdir()).expect("canonicalize the deck's workdir");
+    assert_ne!(
+        record_dir, workdir,
+        "the orchestration role must run, and be trusted, in its isolated clone, not in the \
+         deck's own working directory"
+    );
+    let clone_name = record_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert!(
+        clone_name
+            .rsplit_once("-orchestrator-")
+            .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        "the directory the trust record names must be an isolated clone named \
+         `...-orchestrator-<N>`; got {record_dir:?}"
     );
 }
 
