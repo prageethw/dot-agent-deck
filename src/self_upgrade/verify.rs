@@ -434,9 +434,13 @@ mod tests {
     const GH: &str = "/usr/bin/gh";
     const MANIFEST: &[u8] = b"the manifest bytes\n";
 
+    /// The command the check runs. It names the repository through the same
+    /// seam production does (`crate::repo_identity::SLUG`), which a fork
+    /// re-points at its own repository, rather than spelling upstream's out.
     fn verify_line(version: &str) -> String {
+        let repo = crate::repo_identity::SLUG;
         format!(
-            "{GH} attestation verify /s/checksums.txt --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml --source-ref refs/tags/v{version} --format json"
+            "{GH} attestation verify /s/checksums.txt --repo {repo} --signer-workflow {repo}/.github/workflows/release.yml --source-ref refs/tags/v{version} --format json"
         )
     }
 
