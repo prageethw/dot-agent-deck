@@ -43100,7 +43100,12 @@ mod tests {
 
     /// Whether `bell.on_idle` rings for the card `sess-moving` announced on
     /// `worker-pane-b` (`BELL_MOVED_CARD`) having just gone from `Working` to the
-    /// `Idle` it holds in `state`.
+    /// `Idle` it holds in `state`. Every OTHER card is taken to be unchanged
+    /// since the last frame: since issue #925 the card on the pane the session
+    /// left survives (`sess-moving` on `worker-pane-a`, Idle, owing nothing), and
+    /// a card the bell has never seen counts as a transition, so leaving it out
+    /// of `last` made it ring `bell.on_idle` in its own right and masked whether
+    /// the moved card's delegation suppressed anything.
     fn bell_rings_for_moving_session_going_idle(state: &AppState) -> bool {
         assert_eq!(
             state
@@ -43110,7 +43115,11 @@ mod tests {
             Some((Some("worker-pane-b"), SessionStatus::Idle)),
             "fixture precondition: the card sess-moving announced on worker-pane-b is Idle there"
         );
-        let mut last = HashMap::new();
+        let mut last: HashMap<String, SessionStatus> = state
+            .sessions
+            .iter()
+            .map(|(id, session)| (id.clone(), session.status.clone()))
+            .collect();
         last.insert(BELL_MOVED_CARD.to_string(), SessionStatus::Working);
         let config = BellConfig {
             on_idle: true,
