@@ -11,10 +11,11 @@
 //! `TabManager::open_orchestration_tab` (`src/tab.rs`) spawns one role at a
 //! time, synchronously, in DECLARATION order. For a Pi start role the
 //! orchestrator prompt rides as `seed` on that role's own `StartAgent`, and
-//! the daemon makes the seed pullable immediately after spawning the Pi
-//! child (`src/daemon_protocol.rs`), before the TUI has even issued the
+//! the daemon posts it to the Pi pane's inbox immediately after spawning the
+//! Pi child (`src/daemon_protocol.rs`; PRD #1666 S5 replaced the native
+//! `get-seed` pull, which is withdrawn), before the TUI has even issued the
 //! next role's `StartAgent`. A Pi start role listed before a worker can
-//! therefore pull its seed, act on it, and `delegate --to worker` while
+//! therefore start, act on its seed, and `delegate --to worker` while
 //! that worker's pane is still being created — `delegate_targets` finds
 //! nothing, the zero-resolution rejection added for fork #92 fires, and the
 //! agent's first task is lost with no retry anywhere.
@@ -26,21 +27,23 @@
 //! added to `src/daemon.rs`/`src/daemon_protocol.rs`) that parks the
 //! worker's `StartAgent` handling after its child process is spawned but
 //! before its `AppState` role/orchestrator maps are published. A real `pi`
-//! shell-script shim on `$PATH` immediately calls `get-seed` then
-//! `delegate --to coder` the moment it boots; a `cat` stand-in for the
+//! shell-script shim on `$PATH` records that it started and immediately
+//! issues `delegate --to coder` the moment it boots; a `cat` stand-in for the
 //! worker holds its pane open; a delivered delegate is observable as a task
 //! in the worker's inbox (PRD #1666: the deck posts it, it never types it).
 //!
 //! Pre-fix: nothing holds Pi back — it starts and races its delegate call
 //! while the gate (armed for the WORKER's registration, which Pi's own
-//! spawn never touches) is irrelevant to it, and the seed is consumed well
+//! spawn never touches) is irrelevant to it, and it has started well
 //! before release. Post-fix, Pi is the LAST role spawned, so its
 //! `StartAgent` cannot even be issued by `TabManager`'s synchronous loop
 //! until the worker's spawn call returns — which this test holds open
-//! indefinitely via the gate — so the seed cannot be consumed while the
-//! gate is held, and exactly one delegated task reaches the worker's inbox once it releases.
+//! indefinitely via the gate — so Pi cannot start while the gate is held,
+//! and exactly one delegated task reaches the worker's inbox once it
+//! releases. Pi's seed is in its own inbox by then.
 //!
-//! Assertions are outcome-based (seed-consumption timing, final inbox
+//! Assertions are outcome-based (whether Pi started during the hold, the seed
+//! in Pi's inbox, final worker inbox
 //! count), not a pin on which role spawns first — see `src/tab.rs`'s
 //! `delegate_039_pi_last_spawn_order_keeps_pane_ids_declaration_indexed`
 //! for the separate, spawn-order-agnostic pane-id-indexing guard.
@@ -154,31 +157,36 @@ fn write_executable(path: &Path, contents: &str) {
         .expect("chmod synthetic agent executable");
 }
 
+/// What the pi shim writes to its marker as its very first action.
+const STARTED: &str = "started";
+
 /// A real `pi` binary on `$PATH` (its literal name is what makes
 /// `AgentType::from_command` classify the start role as Pi, arming the
-/// native-seed path in `open_orchestration_tab`). On boot it immediately:
-/// (1) calls `get-seed` and writes whatever it got — even an empty string —
-/// to `seed_marker` BEFORE doing anything else, so the marker's mere
-/// EXISTENCE is proof `get-seed` returned control to the shim, independent
-/// of the delegate call that follows; (2) issues exactly one
-/// `delegate --to coder`; (3) execs into `cat` so the pane stays alive and
-/// echoes anything the daemon later injects (native-pull confirmation, the
-/// PTY-fallback safety net, or a stray second delivery all become visible
-/// in its own scrollback if they ever fire).
-fn write_pi_shim(dir: &Path, seed_marker: &Path) -> PathBuf {
+/// seeded start in `open_orchestration_tab`). On boot it immediately:
+/// (1) writes [`STARTED`] to `started_marker` BEFORE doing anything else, so
+/// the marker's mere EXISTENCE is proof the Pi child ran, independent of the
+/// delegate call that follows (it replaces the `get-seed` readback this shim
+/// used to write: `get-seed` is withdrawn, PRD #1666 part 3 H5, and the seed is
+/// the pane's first inbox message now); (2) issues exactly one
+/// `delegate --to coder` whose task is [`SEED_TEXT`]; (3) execs into `cat` so
+/// the pane stays alive and echoes anything the daemon later types (a stray
+/// second delivery would become visible in its own scrollback if it fired).
+fn write_pi_shim(dir: &Path, started_marker: &Path) -> PathBuf {
     let path = dir.join("pi");
     let script = format!(
-        "#!/bin/sh\nseed=\"$(dot-agent-deck get-seed)\"\nprintf '%s' \"$seed\" > '{marker}'\ndot-agent-deck delegate --to {role} --task \"$seed\"\nexec cat\n",
-        marker = seed_marker.display(),
+        "#!/bin/sh\nprintf '%s' '{started}' > '{marker}'\ndot-agent-deck delegate --to {role} --task '{task}'\nexec cat\n",
+        started = STARTED,
+        marker = started_marker.display(),
         role = WORKER_ROLE,
+        task = SEED_TEXT,
     );
     write_executable(&path, &script);
     path
 }
 
 /// Prepend `shim_dir` (for the `pi` script) and the built `dot-agent-deck`
-/// binary's own directory (for the `get-seed`/`delegate` subcommands the
-/// shim invokes) to the real `$PATH`. The daemon spawns children by
+/// binary's own directory (for the `delegate` subcommand the shim invokes) to
+/// the real `$PATH`. The daemon spawns children by
 /// inheriting ITS OWN process environment (see `agent_pty::spawn`'s
 /// `CommandBuilder` doc comment) — since the daemon here runs in-process in
 /// this same test binary, mutating this process's `PATH` is what the
@@ -201,9 +209,10 @@ fn path_with_shim_and_built_deck(shim_dir: &Path) -> String {
 /// against a real attach-protocol daemon. A registration gate (the fork #92
 /// test seam) holds the worker's `StartAgent` handling open after its `cat`
 /// stand-in is spawned but before its role/orchestrator maps publish. While
-/// held, assert the pi shim's `get-seed` call has NOT produced its marker
-/// file — proof the seed was not consumed. After release, assert the
-/// marker now holds the exact seed text and the worker's inbox
+/// held, assert the pi shim has NOT written its started marker — proof Pi has
+/// not started, so it cannot have delegated. After release, assert the
+/// marker now says the shim started, that Pi's own inbox holds the seed the
+/// deck posted to it, and that the worker's inbox
 /// holds the delegated task EXACTLY once (a duplicate would reproduce
 /// upstream #330's harm; the RED failure mode this pins is the opposite —
 /// today the marker appears almost immediately regardless of the gate, and
@@ -224,8 +233,8 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
     let shim_dir = common::race_safe_tempdir();
-    let seed_marker = shim_dir.path().join("pi-seed.marker");
-    write_pi_shim(shim_dir.path(), &seed_marker);
+    let started_marker = shim_dir.path().join("pi-started.marker");
+    write_pi_shim(shim_dir.path(), &started_marker);
     // SAFETY: this integration-test BINARY contains exactly one `#[test]`
     // function (nextest already gives it a dedicated process — see the
     // ENV_LOCK precedent in `tests/delegate_prompt_injection.rs`, not
@@ -336,7 +345,7 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
 
     // Confirm the worker's `StartAgent` handling has actually reached the
     // gate (its `cat` child is spawned, its maps are not yet published)
-    // before trusting the "seed not consumed" check below — otherwise an
+    // before trusting the "Pi has not started" check below — otherwise an
     // absent marker could just mean we checked too early, not that
     // anything held Pi back.
     tokio::time::timeout(Duration::from_secs(5), gate_entered_rx)
@@ -345,9 +354,8 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
         .expect("gate-entered sender dropped without signaling");
 
     // While the gate is held: poll for up to GATE_HOLD for the pi shim's
-    // seed marker. Its presence here — regardless of what it contains —
-    // proves `get-seed` returned control to the shim (and thus that Pi's
-    // own `StartAgent` was issued and answered) while the worker's
+    // started marker. Its presence here proves the Pi child ran (and thus
+    // that Pi's own `StartAgent` was issued and answered) while the worker's
     // registration is still gated open. That can only happen if nothing in
     // the spawn path is holding Pi back until the worker is registered —
     // exactly the pre-fix defect. It cannot fail for an unrelated reason:
@@ -356,12 +364,12 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
     // launch or failed to resolve `dot-agent-deck` produces an ABSENT
     // marker (indistinguishable from a correctly-gated Pi) rather than a
     // false positive here — the post-release phase below is what rules
-    // that ambiguity out, by requiring the marker to appear AND hold the
-    // real seed text once the gate opens.
+    // that ambiguity out, by requiring the marker to appear once the gate
+    // opens.
     let hold_deadline = tokio::time::Instant::now() + GATE_HOLD;
     let mut marker_seen_during_hold = false;
     while tokio::time::Instant::now() < hold_deadline {
-        if seed_marker.exists() {
+        if started_marker.exists() {
             marker_seen_during_hold = true;
             break;
         }
@@ -369,13 +377,13 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
     }
     assert!(
         !marker_seen_during_hold,
-        "the pi shim's seed marker at {} appeared while the worker's registration gate was \
-         still held — the daemon let Pi consume its native seed (and therefore run its \
-         `delegate --to coder`) before the worker pane's AppState maps were published. This is \
-         fork #92 P1: a Pi start role declared before its worker can delegate during the \
-         window between the worker's spawn and its registration, and `delegate_targets` will \
-         resolve nothing for that call",
-        seed_marker.display()
+        "the pi shim's started marker at {} appeared while the worker's registration gate was \
+         still held — the daemon let Pi start (and therefore run its `delegate --to coder`) \
+         before the worker pane's AppState maps were published. This is fork #92 P1: a Pi \
+         start role declared before its worker can delegate during the window between the \
+         worker's spawn and its registration, and `delegate_targets` will resolve nothing for \
+         that call",
+        started_marker.display()
     );
 
     // Release: the worker's `AppState` maps publish, its `StartAgent` reply
@@ -396,15 +404,14 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
         "one pane per declared role; got {role_pane_ids:?}"
     );
 
-    // Outcome 1: native seed consumption. The marker must now exist AND
-    // hold the exact seed text — proof `get-seed` genuinely returned the
-    // orchestrator prompt natively (not the PTY-injection fallback, which
-    // would leave the marker file untouched since the shim never sees
-    // fallback-injected bytes as a `get-seed` reply).
+    // Outcome 1: Pi started. The marker must now exist and say so — proof the
+    // Pi child ran after the worker was safely registered, which is what lets
+    // the delegate below resolve its target. (An empty or absent marker means
+    // Pi never started at all.)
     let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut marker_contents = String::new();
     loop {
-        if let Ok(contents) = std::fs::read_to_string(&seed_marker) {
+        if let Ok(contents) = std::fs::read_to_string(&started_marker) {
             marker_contents = contents;
             break;
         }
@@ -414,10 +421,27 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        marker_contents, SEED_TEXT,
-        "after releasing the gate, the pi shim's seed marker must hold the exact seed text \
-         `get-seed` returned — an empty or missing marker means Pi either never started or \
-         never received its native seed even after the worker was safely registered"
+        marker_contents, STARTED,
+        "after releasing the gate, the pi shim must have started and written its marker — an \
+         empty or missing marker means Pi never started even after the worker was safely \
+         registered"
+    );
+
+    // Outcome 1b: the seed. The deck posts the start role's prompt to the Pi
+    // pane's own inbox when it starts the pane (PRD #1666 S5) — what replaced
+    // the withdrawn native `get-seed` pull this test used to read back.
+    let attach = daemon.attach_path.clone();
+    let orchestrator_pane = role_pane_ids[0].clone();
+    assert!(
+        inbox_view::wait_for(
+            &attach,
+            &orchestrator_pane,
+            SEED_TEXT,
+            Duration::from_secs(5)
+        ),
+        "the Pi start role's inbox never received the seed the deck was started with; \
+         inbox = {:?}",
+        inbox_view::messages(&attach, &orchestrator_pane)
     );
 
     // Outcome 2: exactly one delegated task reaches the worker's inbox (PRD
@@ -429,9 +453,8 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
     // retry-on-failure "fix" could reintroduce. Waited with real settle time
     // after the first sighting so a stray SECOND post (e.g. a buggy fallback
     // re-arm) has a chance to land before the count is read. The task text is
-    // the seed the pi shim passed to `delegate --task`.
+    // the text the pi shim passed to `delegate --task`.
     let worker_pane = role_pane_ids[WORKER_ROLE_INDEX].clone();
-    let attach = daemon.attach_path.clone();
     assert!(
         inbox_view::wait_for(&attach, &worker_pane, SEED_TEXT, Duration::from_secs(5)),
         "the worker's inbox never received the delegated task within 5s of the gate \
