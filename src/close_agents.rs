@@ -1790,13 +1790,21 @@ pub async fn cleanup_worktree(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::agent_pty::DOT_AGENT_DECK_PANE_ID;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
     use crate::daemon_client::{DaemonClient, StartAgentOptions};
     use crate::daemon_protocol::{UnitSelector, bind_attach_listener, serve_attach_with_counter};
     use crate::dispatched_units::{Dispatcher, NewUnit};
 
     /// A real attach server over a real registry, with agents started through
     /// the socket the way a client starts them.
+    ///
+    /// The daemon, not the client, is authoritative for `pane_id` (fork PRD
+    /// #365 M2): it strips the id a start proposes under
+    /// `DOT_AGENT_DECK_PANE_ID` and mints its own. So a test's pane NAME
+    /// (`"disp"`, `"o-coder"`) is only a handle for the pane the daemon
+    /// minted, and every place that needs the pane's id (a caller's claim, a
+    /// unit's pane, a selector, a registry or state lookup, an assertion on a
+    /// report) goes through [`Deck::pane`].
     struct Deck {
         dir: tempfile::TempDir,
         registry: Arc<AgentPtyRegistry>,
@@ -1805,6 +1813,8 @@ mod tests {
         client: DaemonClient,
         event_tx: broadcast::Sender<BroadcastMsg>,
         server: tokio::task::JoinHandle<()>,
+        /// Pane name -> the pane id the daemon minted for it.
+        panes: std::sync::Mutex<std::collections::HashMap<String, String>>,
     }
 
     impl Deck {
@@ -1847,7 +1857,31 @@ mod tests {
                 client,
                 event_tx,
                 server,
+                panes: Default::default(),
             }
+        }
+
+        /// The pane id the daemon minted for the agent started under `name`. A
+        /// name nothing was started under (a dispatcher the test only
+        /// invents, a pane that never existed) is its own id, so it stays a
+        /// pane no agent holds.
+        fn pane(&self, name: &str) -> String {
+            self.panes
+                .lock()
+                .unwrap()
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_string())
+        }
+
+        /// Remember `pane_id` as the pane the daemon minted for `name`.
+        fn record_pane(&self, name: &str, pane_id: String) {
+            let earlier = self.panes.lock().unwrap().insert(name.to_string(), pane_id);
+            assert!(
+                earlier.is_none(),
+                "`{name}` was started twice: the daemon mints a new pane for every start, so a \
+                 second agent on the same pane is `successor`"
+            );
         }
 
         /// A second client on the same socket, for a request run alongside
@@ -1882,8 +1916,11 @@ mod tests {
                 display_title: None,
                 orchestration_id: Some(id.to_string()),
             });
-            self.client
-                .start_agent(StartAgentOptions {
+            // The proposed id is what a client sends and the daemon discards;
+            // the pane the agent really has comes back in the reply.
+            let (agent_id, pane_id) = self
+                .client
+                .start_agent_with_pane_id(StartAgentOptions {
                     command: Some(command.to_string()),
                     cwd: Some(cwd),
                     env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
@@ -1891,12 +1928,35 @@ mod tests {
                     ..StartAgentOptions::default()
                 })
                 .await
-                .expect("start an agent through the attach socket")
+                .expect("start an agent through the attach socket");
+            self.record_pane(
+                pane,
+                pane_id.expect("the daemon answers a start with the pane it minted"),
+            );
+            agent_id
+        }
+
+        /// A new agent on the pane `name` already has, once its previous
+        /// occupant stopped or exited: the pane changing hands that a
+        /// superseded caller is checked against. The daemon never lets a start
+        /// choose its pane (it mints a new one), so the successor goes
+        /// straight to the registry, as a respawn does; the previous
+        /// occupant's record, if it is still registered, stays beside it.
+        fn successor(&self, name: &str, command: &str) -> String {
+            let cwd = self.dir.path().to_string_lossy().into_owned();
+            self.registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(command),
+                    cwd: Some(cwd.as_str()),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), self.pane(name))],
+                    ..SpawnOptions::default()
+                })
+                .expect("a successor on the pane")
         }
 
         fn claim(&self, pane: &str, agent: &str) -> CallerClaim {
             CallerClaim {
-                pane_id: pane.to_string(),
+                pane_id: self.pane(pane),
                 token: self.registry.hook_token_of(agent).expect("a minted token"),
             }
         }
@@ -1914,11 +1974,11 @@ mod tests {
                 branch: format!("agent/dispatch-{name}"),
                 clone_dir: self.dir.path().to_path_buf(),
                 dispatcher: Dispatcher {
-                    pane_id: dispatcher.0.to_string(),
+                    pane_id: self.pane(dispatcher.0),
                     agent_id: dispatcher.1.to_string(),
                 },
                 kind: UnitKind::Single {
-                    pane_id: pane.to_string(),
+                    pane_id: self.pane(pane),
                     agent_id: agent.to_string(),
                 },
                 dispatched_at_ms: 1,
@@ -1939,13 +1999,13 @@ mod tests {
                 branch: format!("agent/dispatch-{name}"),
                 clone_dir: self.dir.path().to_path_buf(),
                 dispatcher: Dispatcher {
-                    pane_id: dispatcher.0.to_string(),
+                    pane_id: self.pane(dispatcher.0),
                     agent_id: dispatcher.1.to_string(),
                 },
                 kind: UnitKind::Orchestration {
                     orchestration_id: orch.to_string(),
                     name: "team".to_string(),
-                    terminal_pane_id: pane.to_string(),
+                    terminal_pane_id: self.pane(pane),
                     terminal_agent_id: agent.to_string(),
                 },
                 dispatched_at_ms: 1,
@@ -1956,12 +2016,14 @@ mod tests {
             assert!(
                 self.registry
                     .dispatched_units()
-                    .mark_completed(pane, agent, 2)
+                    .mark_completed(&self.pane(pane), agent, 2)
                     .is_some()
             );
         }
 
         async fn thinking(&self, pane: &str, agent: &str) {
+            let pane = self.pane(pane);
+            let pane = pane.as_str();
             self.state
                 .write()
                 .await
@@ -1995,6 +2057,8 @@ mod tests {
         /// what its card shows (issue #1678) — the way the daemon's
         /// shell-activity monitor records one.
         async fn idle_with_background(&self, pane: &str, agent: &str) {
+            let pane = self.pane(pane);
+            let pane = pane.as_str();
             let mut state = self.state.write().await;
             let frame = |event_type: &str| {
                 serde_json::from_value::<crate::event::AgentEvent>(serde_json::json!({
@@ -2070,7 +2134,7 @@ mod tests {
         deck.single_unit("u1", ("disp", &dispatcher), "unit", &unit_agent);
         deck.report_done("unit", &unit_agent);
         let forged = CallerClaim {
-            pane_id: "disp".to_string(),
+            pane_id: deck.pane("disp"),
             token: "0".repeat(crate::hook_provenance::TOKEN_LEN),
         };
         let report = deck.close(by_name("u1"), Some(forged), true, false).await;
@@ -2080,7 +2144,7 @@ mod tests {
         assert!(deck.live(&unit_agent), "nothing may be stopped");
         // A claim naming another pane with a real token is refused the same way.
         let wrong_pane = CallerClaim {
-            pane_id: "unit".to_string(),
+            pane_id: deck.pane("unit"),
             token: deck.registry.hook_token_of(&dispatcher).unwrap(),
         };
         let report = deck
@@ -2117,7 +2181,7 @@ mod tests {
             CloseRefusalReason::Superseded
         );
         // Handover: a new agent on the same pane.
-        let new = deck.start("disp", "sleep 30", None).await;
+        let new = deck.successor("disp", "sleep 30");
         let report = deck
             .close(by_name("u1"), Some(old_claim.clone()), false, false)
             .await;
@@ -2209,7 +2273,7 @@ mod tests {
         assert_eq!(target.forced_over, vec![CloseRefusalReason::Busy]);
         assert_eq!(
             target.panes[0].pane_id.as_deref(),
-            Some("o-orch"),
+            Some(deck.pane("o-orch").as_str()),
             "the orchestrator is stopped first"
         );
         assert!(target.panes.iter().all(|p| p.stopped == Some(true)));
@@ -2255,7 +2319,7 @@ mod tests {
                 "name" => by_name("team-bg"),
                 "unit-id" => CloseSelector::UnitIds { ids: vec![id] },
                 _ => CloseSelector::OrchestrationOf {
-                    pane_id: "o-coder".into(),
+                    pane_id: deck.pane("o-coder"),
                 },
             };
 
@@ -2360,7 +2424,7 @@ mod tests {
         let resp = send(&AttachRequest::CloseAgents {
             selector: by_name("u1"),
             caller: Some(CallerClaim {
-                pane_id: "disp".to_string(),
+                pane_id: deck.pane("disp"),
                 token: "0".repeat(crate::hook_provenance::TOKEN_LEN),
             }),
             force: true,
@@ -2489,7 +2553,7 @@ mod tests {
         let report = deck.close(by_name("team-2"), None, false, false).await;
         let target = &report.targets[0];
         assert_eq!(target.outcome, CloseOutcome::PartiallyClosed, "{target:?}");
-        assert_eq!(target.survivors, vec!["o-coder".to_string()]);
+        assert_eq!(target.survivors, vec![deck.pane("o-coder")]);
         assert!(!deck.live(&orch));
         assert!(deck.live(&worker));
         assert!(
@@ -2580,7 +2644,7 @@ mod tests {
             .map(|c| c.unit_id.as_str())
             .collect();
         assert_eq!(ids, vec![first.as_str(), second.as_str()]);
-        assert_eq!(target.candidates[0].panes, vec!["unit-a".to_string()]);
+        assert_eq!(target.candidates[0].panes, vec![deck.pane("unit-a")]);
         assert!(target.candidates[1].worktree.ends_with("wt-fix"));
         assert!(deck.live(&a) && deck.live(&b));
         deck.shutdown().await;
@@ -2609,7 +2673,7 @@ mod tests {
         let report = deck
             .close(
                 CloseSelector::Pane {
-                    pane_id: "plain".into(),
+                    pane_id: deck.pane("plain"),
                 },
                 Some(claim.clone()),
                 true,
@@ -2623,7 +2687,7 @@ mod tests {
         let report = deck
             .close(
                 CloseSelector::Pane {
-                    pane_id: "me".into(),
+                    pane_id: deck.pane("me"),
                 },
                 Some(claim),
                 true,
@@ -2663,7 +2727,7 @@ mod tests {
         let report = deck
             .close(
                 CloseSelector::Pane {
-                    pane_id: "unit".into(),
+                    pane_id: deck.pane("unit"),
                 },
                 Some(claim.clone()),
                 false,
@@ -2678,7 +2742,7 @@ mod tests {
         let report = deck
             .close(
                 CloseSelector::Pane {
-                    pane_id: "unit".into(),
+                    pane_id: deck.pane("unit"),
                 },
                 Some(claim),
                 true,
@@ -2886,7 +2950,7 @@ mod tests {
     ) {
         let (reached, release) = deck.registry.pause_next_respawn_for_test();
         let registry = deck.registry.clone();
-        let pane = pane.to_string();
+        let pane = deck.pane(pane);
         let respawn =
             tokio::spawn(async move { registry.respawn_agent_for_pane(&pane, "sleep 30").await });
         reached.await.expect("the respawn reaches its window");
@@ -2971,13 +3035,23 @@ mod tests {
         let target = &report.targets[0];
         assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
         assert_eq!(target.panes.len(), 1, "{target:?}");
-        assert_eq!(target.panes[0].pane_id.as_deref(), Some("orch-b1-w"));
+        assert_eq!(
+            target.panes[0].pane_id.as_deref(),
+            Some(deck.pane("orch-b1-w").as_str())
+        );
         assert_eq!(target.panes[0].agent_id, replaced);
         assert_eq!(target.panes[0].stopped, Some(true));
         assert!(!deck.live(&replaced));
-        assert!(deck.registry.pane_current_agent_id("orch-b1-w").is_none());
+        assert!(
+            deck.registry
+                .pane_current_agent_id(&deck.pane("orch-b1-w"))
+                .is_none()
+        );
         assert!(deck.registry.dispatched_units().get(&id).is_none());
-        assert!(!mapped_in_state(&*deck.state.read().await, "orch-b1-w"));
+        assert!(!mapped_in_state(
+            &*deck.state.read().await,
+            &deck.pane("orch-b1-w")
+        ));
         // A queued respawn after the close cannot bring it back either.
         assert!(deck.registry.is_instance_closing("orch-b1"));
         deck.shutdown().await;
@@ -3017,21 +3091,32 @@ mod tests {
             .expect("the worker's replacement lands");
         assert!(deck.live(&replaced));
         assert_eq!(
-            deck.registry.pane_current_agent_id("orch-b1r-w").as_deref(),
+            deck.registry
+                .pane_current_agent_id(&deck.pane("orch-b1r-w"))
+                .as_deref(),
             Some(replaced.as_str())
         );
-        assert!(mapped_in_state(&*deck.state.read().await, "orch-b1r-w"));
+        assert!(mapped_in_state(
+            &*deck.state.read().await,
+            &deck.pane("orch-b1r-w")
+        ));
         assert!(
             deck.registry.dispatched_units().get(&id).is_some(),
             "a refused unit is not tombstoned"
         );
-        assert_eq!(pane_closed_broadcasts(&mut events, "orch-b1r-w"), 0);
+        assert_eq!(
+            pane_closed_broadcasts(&mut events, &deck.pane("orch-b1r-w")),
+            0
+        );
 
         let report = deck.close(by_name("team-b1r"), None, true, false).await;
         assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
         assert!(!deck.live(&replaced));
         assert!(deck.registry.dispatched_units().get(&id).is_none());
-        assert!(!mapped_in_state(&*deck.state.read().await, "orch-b1r-w"));
+        assert!(!mapped_in_state(
+            &*deck.state.read().await,
+            &deck.pane("orch-b1r-w")
+        ));
         deck.shutdown().await;
     }
 
@@ -3065,10 +3150,10 @@ mod tests {
         // The reply says the dispatcher stopped, not that its pane id is free:
         // a caller reusing the pane waits for the stop's cleanup to finish.
         wait_until("the stopped dispatcher's pane is free", || {
-            !deck.registry.pane_close_in_flight("disp")
+            !deck.registry.pane_close_in_flight(&deck.pane("disp"))
         })
         .await;
-        deck.start("disp", "sleep 30", None).await;
+        deck.successor("disp", "sleep 30");
         let _ = release.send(());
         let replaced = respawn
             .await
@@ -3084,12 +3169,20 @@ mod tests {
         assert!(deck.registry.dispatched_units().get(&id).is_some());
         assert!(deck.live(&replaced), "the refused close stopped nothing");
         assert_eq!(
-            deck.registry.pane_current_agent_id("orch-b1s-w").as_deref(),
+            deck.registry
+                .pane_current_agent_id(&deck.pane("orch-b1s-w"))
+                .as_deref(),
             Some(replaced.as_str())
         );
-        assert!(mapped_in_state(&*deck.state.read().await, "orch-b1s-w"));
+        assert!(mapped_in_state(
+            &*deck.state.read().await,
+            &deck.pane("orch-b1s-w")
+        ));
         assert!(!deck.registry.is_instance_closing("orch-b1s"));
-        assert_eq!(pane_closed_broadcasts(&mut events, "orch-b1s-w"), 0);
+        assert_eq!(
+            pane_closed_broadcasts(&mut events, &deck.pane("orch-b1s-w")),
+            0
+        );
         deck.shutdown().await;
     }
 
@@ -3115,9 +3208,10 @@ mod tests {
             .registry
             .begin_instance_close("orch-b2")
             .expect("begins");
+        let w_pane = deck.pane("orch-b2-w");
         let err = deck
             .registry
-            .respawn_agent_for_pane("orch-b2-w", "sleep 30")
+            .respawn_agent_for_pane(&w_pane, "sleep 30")
             .await
             .expect_err("refused");
         assert!(
@@ -3127,7 +3221,7 @@ mod tests {
         );
         assert!(deck.live(&w), "the original generation is still running");
         assert_eq!(
-            deck.registry.pane_current_agent_id("orch-b2-w").as_deref(),
+            deck.registry.pane_current_agent_id(&w_pane).as_deref(),
             Some(w.as_str())
         );
         let identity = crate::agent_pty::PaneRecreateIdentity {
@@ -3139,14 +3233,14 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         deck.registry
-            .respawn_or_recreate_agent_for_pane("orch-b2-w", "sleep 30", &identity)
+            .respawn_or_recreate_agent_for_pane(&w_pane, "sleep 30", &identity)
             .await
             .expect_err("the recovering wrapper is refused too");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(deck.live(&w));
         let replaced = deck
             .registry
-            .respawn_agent_for_pane("other-w", "sleep 30")
+            .respawn_agent_for_pane(&deck.pane("other-w"), "sleep 30")
             .await
             .expect("another instance still respawns");
         assert_ne!(replaced, other);
@@ -3179,15 +3273,16 @@ mod tests {
             .iter()
             .map(|p| (p.pane_id.as_deref(), p.stopped))
             .collect();
+        let (o_pane, w_pane) = (deck.pane("orch-b2a-o"), deck.pane("orch-b2a-w"));
         assert_eq!(
             panes,
             vec![
-                (Some("orch-b2a-o"), Some(true)),
-                (Some("orch-b2a-w"), Some(true))
+                (Some(o_pane.as_str()), Some(true)),
+                (Some(w_pane.as_str()), Some(true))
             ]
         );
         assert!(!deck.live(&o));
-        assert!(deck.registry.pane_current_agent_id("orch-b2a-w").is_none());
+        assert!(deck.registry.pane_current_agent_id(&w_pane).is_none());
         assert!(deck.registry.dispatched_units().get(&id).is_none());
         deck.shutdown().await;
     }
@@ -3228,10 +3323,22 @@ mod tests {
                 .await
         });
         reached.await.expect("the start publishes and pauses");
-        let worker = deck
+        // The start is paused, so its reply (which carries the pane the daemon
+        // minted) has not been sent: read the pane off the published record.
+        let published = deck
             .registry
-            .pane_current_agent_id("s1-w")
+            .agent_records()
+            .into_iter()
+            .find(|r| {
+                r.id != o
+                    && crate::agent_pty::orchestration_instance_of(r.tab_membership.as_ref())
+                        == Some("orch-s1")
+            })
             .expect("published");
+        let worker = published.id;
+        let worker_pane = published
+            .pane_id_env
+            .expect("the published role has the pane the daemon minted");
         let report = deck.close(by_name("team-s1"), None, false, false).await;
         assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
         assert!(
@@ -3242,12 +3349,12 @@ mod tests {
         );
         let _ = release.send(());
         let _ = start.await.unwrap();
-        assert!(!mapped_in_state(&*deck.state.read().await, "s1-w"));
+        assert!(!mapped_in_state(&*deck.state.read().await, &worker_pane));
         assert!(!deck.live(&worker));
         while let Ok(msg) = events.try_recv() {
             if let BroadcastMsg::OrchestrationSurface(surface) = msg {
                 assert!(
-                    surface.roles.iter().all(|r| r.pane_id != "s1-w"),
+                    surface.roles.iter().all(|r| r.pane_id != worker_pane),
                     "a card was announced for the closed pane: {surface:?}"
                 );
             }
@@ -3276,10 +3383,10 @@ mod tests {
         // The reply says the dispatcher stopped, not that its pane id is free:
         // a caller reusing the pane waits for the stop's cleanup to finish.
         wait_until("the stopped dispatcher's pane is free", || {
-            !deck.registry.pane_close_in_flight("disp")
+            !deck.registry.pane_close_in_flight(&deck.pane("disp"))
         })
         .await;
-        deck.start("disp", "sleep 30", None).await;
+        deck.successor("disp", "sleep 30");
         let _ = release.send(());
         let report = close.await.unwrap();
         assert_eq!(
@@ -3424,15 +3531,16 @@ mod tests {
     async fn a_respawned_terminal_generation_still_completes_its_unit() {
         let deck = Deck::new().await;
         let (o, _w, id) = orchestration(&deck, "team-d5", "orch-d5", ("disp", "nobody")).await;
+        let o_pane = deck.pane("orch-d5-o");
         let new = deck
             .registry
-            .respawn_agent_for_pane("orch-d5-o", "sleep 30")
+            .respawn_agent_for_pane(&o_pane, "sleep 30")
             .await
             .expect("respawn the orchestrator");
         {
             let mut units = deck.registry.dispatched_units();
-            assert_eq!(units.mark_completed("orch-d5-o", &o, 2), None);
-            assert_eq!(units.mark_completed("orch-d5-o", &new, 2), Some(id));
+            assert_eq!(units.mark_completed(&o_pane, &o, 2), None);
+            assert_eq!(units.mark_completed(&o_pane, &new, 2), Some(id));
         }
         deck.shutdown().await;
     }
@@ -3460,7 +3568,7 @@ mod tests {
                 agent_id: "nobody".into(),
             },
             kind: UnitKind::Single {
-                pane_id: name.to_string(),
+                pane_id: deck.pane(name),
                 agent_id: agent.clone(),
             },
             dispatched_at_ms: 1,
@@ -3479,7 +3587,7 @@ mod tests {
         let report = deck
             .close(
                 CloseSelector::Pane {
-                    pane_id: "solo".into(),
+                    pane_id: deck.pane("solo"),
                 },
                 None,
                 false,
@@ -3538,13 +3646,15 @@ mod tests {
             kind: UnitKind::Orchestration {
                 orchestration_id: "orch-s3".into(),
                 name: "team".into(),
-                terminal_pane_id: "t-o".into(),
+                terminal_pane_id: deck.pane("t-o"),
                 terminal_agent_id: o.clone(),
             },
             dispatched_at_ms: 1,
         });
         deck.report_done("t-o", &o);
-        let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
+        let pane = |p: &str| CloseSelector::Pane {
+            pane_id: deck.pane(p),
+        };
 
         let report = deck.close(pane("t-o"), None, true, false).await;
         let target = &report.targets[0];
@@ -3597,7 +3707,7 @@ mod tests {
         let report = deck
             .close(
                 CloseSelector::Pane {
-                    pane_id: "rs-o".into(),
+                    pane_id: deck.pane("rs-o"),
                 },
                 None,
                 false,
@@ -3634,8 +3744,9 @@ mod tests {
         pane: &str,
     ) -> Result<String, crate::daemon_client::ClientError> {
         let cwd = deck.dir.path().to_string_lossy().into_owned();
-        deck.client
-            .start_agent(StartAgentOptions {
+        let (agent_id, pane_id) = deck
+            .client
+            .start_agent_with_pane_id(StartAgentOptions {
                 command: Some("sleep 30".to_string()),
                 cwd: Some(cwd.clone()),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
@@ -3650,7 +3761,12 @@ mod tests {
                 }),
                 ..StartAgentOptions::default()
             })
-            .await
+            .await?;
+        deck.record_pane(
+            pane,
+            pane_id.expect("the daemon answers a start with the pane it minted"),
+        );
+        Ok(agent_id)
     }
 
     /// Whether any live agent is a role of the instance `orch`.
@@ -3687,7 +3803,9 @@ mod tests {
             None,
         );
         let (reached, release) = deck.registry.pause_at_for_test("close-end-check");
-        let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
+        let pane = |p: &str| CloseSelector::Pane {
+            pane_id: deck.pane(p),
+        };
         let close = close_in_background(&deck, pane("pe-o"), None, true);
         reached
             .await
@@ -3745,7 +3863,9 @@ mod tests {
             .await;
         let id = deck.orch_unit("team-pf", ("disp", "nobody"), "orch-pf", "pf-o", &o);
         deck.report_done("pf-o", &o);
-        let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
+        let pane = |p: &str| CloseSelector::Pane {
+            pane_id: deck.pane(p),
+        };
 
         let report = deck.close(pane("pf-o"), None, true, false).await;
         assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
@@ -3810,7 +3930,7 @@ mod tests {
         assert_eq!(resolved[0].scope, Scope::Generation(a.clone()));
         let b = deck
             .registry
-            .respawn_agent_for_pane("solo-s2", "sleep 30")
+            .respawn_agent_for_pane(&deck.pane("solo-s2"), "sleep 30")
             .await
             .expect("respawn the unit's agent");
         let entry = match close_attempt(&deck, &resolved[0]).await {
@@ -3850,9 +3970,10 @@ mod tests {
         reached.await.expect("the close passes its respawn check");
         assert!(deck.registry.is_generation_closing(&a));
         let (mut window, _release_respawn) = deck.registry.pause_next_respawn_for_test();
+        let solo_pane = deck.pane("solo-s2b");
         let refused = tokio::time::timeout(
             Duration::from_secs(5),
-            deck.registry.respawn_agent_for_pane("solo-s2b", "sleep 30"),
+            deck.registry.respawn_agent_for_pane(&solo_pane, "sleep 30"),
         )
         .await
         .expect("refused at once, never paused in its remove→replace window")
@@ -3869,7 +3990,7 @@ mod tests {
         );
         assert!(deck.live(&a), "the refusal left A exactly as it was");
         assert_eq!(
-            deck.registry.pane_current_agent_id("solo-s2b").as_deref(),
+            deck.registry.pane_current_agent_id(&solo_pane).as_deref(),
             Some(a.as_str())
         );
         let _ = release.send(());
@@ -3885,7 +4006,7 @@ mod tests {
         );
         assert!(!deck.live(&a));
         assert!(
-            deck.registry.pane_current_agent_id("solo-s2b").is_none(),
+            deck.registry.pane_current_agent_id(&solo_pane).is_none(),
             "no replacement runs behind a Closed report"
         );
         assert!(deck.registry.dispatched_units().get(&id).is_none());
@@ -3927,7 +4048,11 @@ mod tests {
             "{entry:?}"
         );
         assert!(!deck.live(&b), "a Closed report never leaves B running");
-        assert!(deck.registry.pane_current_agent_id("solo-sf1").is_none());
+        assert!(
+            deck.registry
+                .pane_current_agent_id(&deck.pane("solo-sf1"))
+                .is_none()
+        );
         assert!(deck.registry.dispatched_units().get(&id).is_none());
         deck.shutdown().await;
     }
