@@ -204,7 +204,7 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
     // while the first is still live.
     deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
     deck.send_keys(b"\x1b[D"); // Left -> previous tab -> Dashboard
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
 
     open_orchestration_with_name(&deck, "clonegate2");
     deck.wait_for_string(second_label); // second orchestration deck is up, distinctly labeled
@@ -885,7 +885,7 @@ fn worktree_028_same_slug_different_name_concurrent_open_is_refused() {
     // live throughout this test.
     deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_keys(b"\x1b[D"); // Left -> previous tab -> Dashboard
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
 
     // Second open — a COMPLETELY DIFFERENT typed Name (NAME_B) that
     // sanitizes to the IDENTICAL segment, while the first orchestration is
@@ -1556,7 +1556,7 @@ fn workspace_005_reopening_name_held_by_live_orchestration_refuses_without_suffi
     // live throughout this test.
     deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_keys(b"\x1b[D"); // Left -> previous tab -> Dashboard
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
 
     // Attempt a second open under the IDENTICAL Name while the first is
     // still live.

@@ -365,7 +365,7 @@ fn newpane_005_ctrl_n_after_second_concurrent_orchestration_opened() {
     // Back to the Dashboard to open a second orchestration in the same dir.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
     deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
 
     // Second orchestration, same directory — every orchestration isolates
     // now, unconditionally.

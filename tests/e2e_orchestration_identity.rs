@@ -86,7 +86,7 @@ fn identity_013_two_orchestration_opens_land_as_distinctly_named_tabs() {
     // Back to the Dashboard to open a second orchestration in the same dir.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
     deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
 
     open_orchestration(&deck);
     // fork#192 review F7: waiting on " worker " here was vacuous — the grid
@@ -192,7 +192,7 @@ fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1()
     // Back to the Dashboard to open the second orchestration.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
     deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
 
     // Second open: team-b/proj — a DIFFERENT absolute path with the
     // IDENTICAL basename `proj`.
@@ -500,7 +500,7 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     // Back to the Dashboard to open the second orchestration.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
     deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
 
     // Second open: team-b/proj — a DIFFERENT absolute path with the
     // IDENTICAL basename `proj`.
